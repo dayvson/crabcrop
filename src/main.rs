@@ -1,4 +1,4 @@
-//! crabcrop: on-demand image optimization, inspired by thumbor.
+//! crabcrop: on-demand image optimization.
 //!
 //! Every image operation is encoded in the request URL:
 //!
