@@ -1,6 +1,6 @@
 # crabcrop
 
-On-demand image optimization in Rust, inspired by [thumbor](https://github.com/thumbor/thumbor).
+On-demand image optimization in Rust.
 
 Every image operation is encoded in the request URL:
 
@@ -24,7 +24,7 @@ time, each with tests.
 - [ ] HMAC-SHA1 request signing and verification
 - [ ] HTTP(S) source image loader
 - [ ] Image engine: decode, resize, crop, encode
-- [ ] Crop-to-aspect transformer (thumbor's algorithm)
+- [ ] Crop-to-aspect transformer
 - [ ] Filter pipeline: grayscale, quality, format, ...
 - [ ] HTTP server
 
