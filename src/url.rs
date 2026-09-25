@@ -1,4 +1,4 @@
-//! Parsing of crabcrop's thumbor-style image URLs.
+//! Parsing of crabcrop's image URLs.
 //!
 //! ```text
 //! /<signature>/<operations...>/<image-url>
@@ -11,8 +11,8 @@
 
 /// How the request proves it was minted by someone holding the server secret.
 ///
-/// Mirrors thumbor: either an HMAC-SHA1 (hex) of the rest of the URL, or the
-/// literal `unsafe` when the operator allows unsigned URLs.
+/// Either an HMAC-SHA1 (hex) of the rest of the URL, or the literal `unsafe`
+/// when the operator allows unsigned URLs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signature {
     /// Hex-encoded HMAC-SHA1 of the remainder of the path.
