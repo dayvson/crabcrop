@@ -1,0 +1,9 @@
+[package]
+name = "crabcrop"
+version = "0.1.0"
+edition = "2021"
+description = "On-demand image optimization service in Rust, inspired by thumbor"
+license = "MIT"
+repository = "https://github.com/dayvson/crabcrop"
+
+[dependencies]
