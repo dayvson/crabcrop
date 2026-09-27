@@ -20,7 +20,8 @@ time, each with tests.
 ## Roadmap
 
 - [x] URL signature parsing (`unsafe` vs HMAC)
-- [ ] Full URL grammar: crop, size, flip, alignment, filters, source URL
+- [x] URL size segment parsing (`300x200`, flips, proportional, `orig`)
+- [ ] Full URL grammar: crop, alignment, filters, source URL
 - [ ] HMAC-SHA1 request signing and verification
 - [ ] HTTP(S) source image loader
 - [ ] Image engine: decode, resize, crop, encode
