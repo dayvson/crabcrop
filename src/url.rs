@@ -4,10 +4,10 @@
 //! /<signature>/<operations...>/<image-url>
 //! ```
 //!
-//! This module starts with the smallest meaningful piece: the [`Signature`],
-//! the first path segment. Everything else (crop, size, filters, source URL)
-//! builds on top of [`parse_signature`], which splits the signature off and
-//! hands back the remainder of the path.
+//! [`parse_request`] parses a full path into its [`Signature`] and a
+//! [`Request`]: the [`Operation`]s in path order (size, crop, filters)
+//! plus the source image URL with its slashes intact. [`parse_signature`]
+//! and [`parse_operations`] are the two halves, usable on their own.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -35,6 +35,14 @@ pub enum ParseError {
     /// A size segment did not match `<width>x<height>`. Carries the
     /// offending segment.
     InvalidSize(String),
+    /// A `crop:...` segment did not match `crop:<WxH>[:<align>]`.
+    /// Carries the offending segment.
+    InvalidCrop(String),
+    /// A `filters:...` segment did not parse. Carries the offending
+    /// segment.
+    InvalidFilters(String),
+    /// No source URL followed the operations.
+    MissingSourceUrl,
 }
 
 /// One dimension of a requested image size.
@@ -58,6 +66,58 @@ pub struct ImageSize {
     pub height: Dimension,
     pub flip_horizontal: bool,
     pub flip_vertical: bool,
+}
+
+/// Where the crop keeps the image when aspect ratios differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    /// Center the crop (default).
+    Center,
+    /// Keep the top.
+    Top,
+    /// Keep the bottom.
+    Bottom,
+    /// Keep the left.
+    Left,
+    /// Keep the right.
+    Right,
+}
+
+/// Output image format requested by a `format(...)` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFormat {
+    Jpeg,
+    Png,
+    WebP,
+}
+
+/// One filter from a `filters:...` segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filter {
+    /// Desaturate the image.
+    Grayscale,
+    /// Encoding quality, 0-100.
+    Quality(u8),
+    /// Output container.
+    Format(ImageFormat),
+}
+
+/// One operation from the request path, in path order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operation {
+    /// Resize to a size segment (`300x200`, ...).
+    Size(ImageSize),
+    /// Crop to a size with an alignment, before resize.
+    Crop { size: ImageSize, align: Align },
+    /// Filters applied in order after resize.
+    Filters(Vec<Filter>),
+}
+
+/// A fully parsed request path: operations plus the source image URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request<'a> {
+    pub operations: Vec<Operation>,
+    pub source_url: &'a str,
 }
 
 fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
@@ -107,6 +167,134 @@ pub fn parse_signature(path: &str) -> Result<(Signature, &str), ParseError> {
         Signature::Hmac(first.to_string())
     };
     Ok((signature, rest))
+}
+
+/// Parse one path segment as an operation.
+///
+/// Returns `None` when the segment is not an operation at all, which
+/// means it starts the source URL. A segment that claims to be an
+/// operation (`crop:` / `filters:` prefix) but is malformed is an error.
+fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
+    if let Some(rest) = seg.strip_prefix("crop:") {
+        return Some(parse_crop(rest, seg));
+    }
+    if let Some(rest) = seg.strip_prefix("filters:") {
+        return Some(parse_filters(rest, seg));
+    }
+    match parse_size(seg) {
+        Ok(size) => Some(Ok(Operation::Size(size))),
+        Err(_) => None,
+    }
+}
+
+fn parse_align(s: &str) -> Option<Align> {
+    match s {
+        "center" => Some(Align::Center),
+        "top" => Some(Align::Top),
+        "bottom" => Some(Align::Bottom),
+        "left" => Some(Align::Left),
+        "right" => Some(Align::Right),
+        _ => None,
+    }
+}
+
+/// Parse the dimensions (and optional alignment) after `crop:`.
+fn parse_crop(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let invalid = || ParseError::InvalidCrop(seg.to_string());
+    let (dims, align) = match rest.split_once(':') {
+        Some((d, a)) => (d, parse_align(a).ok_or_else(invalid)?),
+        None => (rest, Align::Center),
+    };
+    let size = parse_size(dims).map_err(|_| invalid())?;
+    Ok(Operation::Crop { size, align })
+}
+
+fn parse_format(s: &str) -> Option<ImageFormat> {
+    match s {
+        "jpeg" | "jpg" => Some(ImageFormat::Jpeg),
+        "png" => Some(ImageFormat::Png),
+        "webp" => Some(ImageFormat::WebP),
+        _ => None,
+    }
+}
+
+/// Parse the filter list after `filters:`.
+fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let invalid = || ParseError::InvalidFilters(seg.to_string());
+    if rest.is_empty() {
+        return Err(invalid());
+    }
+    let mut filters = Vec::new();
+    for part in rest.split(':') {
+        let (name, params) = match part.find('(') {
+            Some(i) => {
+                let (n, p) = part.split_at(i);
+                let inner = p
+                    .strip_prefix('(')
+                    .and_then(|s| s.strip_suffix(')'))
+                    .ok_or_else(invalid)?;
+                // Empty parens mean no parameters: `grayscale()`.
+                (n, if inner.is_empty() { None } else { Some(inner) })
+            }
+            None => (part, None),
+        };
+        let filter = match (name, params) {
+            ("grayscale", None) => Filter::Grayscale,
+            ("quality", Some(p)) => {
+                let q: u8 = p.parse().map_err(|_| invalid())?;
+                if q > 100 {
+                    return Err(invalid());
+                }
+                Filter::Quality(q)
+            }
+            ("format", Some(p)) => Filter::Format(parse_format(p).ok_or_else(invalid)?),
+            _ => return Err(invalid()),
+        };
+        filters.push(filter);
+    }
+    Ok(Operation::Filters(filters))
+}
+
+/// Split operations off the front of the path remainder.
+///
+/// Returns the operations in path order and the source URL (with its
+/// slashes intact). The first segment that is not an operation starts
+/// the source URL.
+pub fn parse_operations(input: &str) -> Result<(Vec<Operation>, &str), ParseError> {
+    let mut operations = Vec::new();
+    let mut rest = input;
+    loop {
+        let (seg, remaining) = match rest.split_once('/') {
+            Some((s, r)) => (s, r),
+            None => (rest, ""),
+        };
+        match parse_operation(seg) {
+            Some(Ok(op)) => {
+                operations.push(op);
+                rest = remaining;
+            }
+            Some(Err(e)) => return Err(e),
+            None => {
+                if seg.is_empty() {
+                    return Err(ParseError::MissingSourceUrl);
+                }
+                return Ok((operations, rest));
+            }
+        }
+    }
+}
+
+/// Parse a full request path into its signature and [`Request`].
+pub fn parse_request(path: &str) -> Result<(Signature, Request<'_>), ParseError> {
+    let (signature, rest) = parse_signature(path)?;
+    let (operations, source_url) = parse_operations(rest)?;
+    Ok((
+        signature,
+        Request {
+            operations,
+            source_url,
+        },
+    ))
 }
 
 /// Verify a request signature against the server secret.
@@ -325,5 +513,149 @@ mod tests {
         let path = format!("/{KNOWN_HMAC}/{KNOWN_REMAINDER}");
         let (sig, rest) = parse_signature(&path).unwrap();
         assert!(verify(b"Jefe", &sig, rest, false));
+    }
+
+    fn size_op(width: u32, height: u32) -> Operation {
+        Operation::Size(ImageSize {
+            width: Dimension::Pixels(width),
+            height: Dimension::Pixels(height),
+            flip_horizontal: false,
+            flip_vertical: false,
+        })
+    }
+
+    #[test]
+    fn parses_size_operation() {
+        let (ops, url) = parse_operations("300x200/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![size_op(300, 200)]);
+        assert_eq!(url, "example.com/img.jpg");
+    }
+
+    #[test]
+    fn parses_crop_with_default_center() {
+        let (ops, _) = parse_operations("crop:300x200/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Crop {
+                size: ImageSize {
+                    width: Dimension::Pixels(300),
+                    height: Dimension::Pixels(200),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                align: Align::Center,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_crop_with_alignment() {
+        let (ops, _) = parse_operations("crop:300x200:top/example.com/img.jpg").unwrap();
+        assert!(matches!(
+            ops[0],
+            Operation::Crop {
+                align: Align::Top,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_crops() {
+        for seg in [
+            "crop:",
+            "crop:300",
+            "crop:300x200:sideways",
+            "crop:300x200:center:extra",
+        ] {
+            assert_eq!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")),
+                Err(ParseError::InvalidCrop(seg.to_string())),
+                "segment: {seg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_filters() {
+        let (ops, _) =
+            parse_operations("filters:grayscale():quality(80):format(webp)/example.com/img.jpg")
+                .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::Grayscale,
+                Filter::Quality(80),
+                Filter::Format(ImageFormat::WebP),
+            ])]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_filters() {
+        for seg in [
+            "filters:",
+            "filters:blur()",
+            "filters:quality(200)",
+            "filters:quality()",
+            "filters:grayscale(1)",
+            "filters:format(bmp)",
+            "filters:quality(80",
+        ] {
+            assert_eq!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")),
+                Err(ParseError::InvalidFilters(seg.to_string())),
+                "segment: {seg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_operations_in_path_order() {
+        let (ops, url) =
+            parse_operations("crop:100x100/300x200/filters:grayscale()/example.com/x.jpg").unwrap();
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], Operation::Crop { .. }));
+        assert!(matches!(ops[1], Operation::Size(_)));
+        assert!(matches!(ops[2], Operation::Filters(_)));
+        assert_eq!(url, "example.com/x.jpg");
+    }
+
+    #[test]
+    fn keeps_source_url_with_slashes_intact() {
+        let (ops, url) = parse_operations("300x200/https://example.com/a/b/c.jpg").unwrap();
+        assert_eq!(ops, vec![size_op(300, 200)]);
+        assert_eq!(url, "https://example.com/a/b/c.jpg");
+    }
+
+    #[test]
+    fn rejects_missing_source_url() {
+        for input in ["", "300x200", "crop:100x100/filters:grayscale()"] {
+            assert_eq!(
+                parse_operations(input),
+                Err(ParseError::MissingSourceUrl),
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_operation_segment_starts_source_url() {
+        // A segment is an operation only if it parses as one or carries a
+        // known prefix; otherwise it starts the source URL.
+        let (ops, url) = parse_operations("300xabc/example.com/img.jpg").unwrap();
+        assert!(ops.is_empty());
+        assert_eq!(url, "300xabc/example.com/img.jpg");
+    }
+
+    #[test]
+    fn parse_request_composes_signature_and_operations() {
+        let (sig, req) =
+            parse_request("/unsafe/300x200/filters:grayscale()/example.com/img.jpg").unwrap();
+        assert_eq!(sig, Signature::Unsafe);
+        assert_eq!(req.operations.len(), 2);
+        assert!(matches!(req.operations[0], Operation::Size(_)));
+        assert!(matches!(req.operations[1], Operation::Filters(_)));
+        assert_eq!(req.source_url, "example.com/img.jpg");
     }
 }

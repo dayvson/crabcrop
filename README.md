@@ -21,7 +21,7 @@ time, each with tests.
 
 - [x] URL signature parsing (`unsafe` vs HMAC)
 - [x] URL size segment parsing (`300x200`, flips, proportional, `orig`)
-- [ ] Full URL grammar: crop, alignment, filters, source URL
+- [x] Full URL grammar: crop, alignment, filters, source URL
 - [x] HMAC-SHA256 request signing and verification
 - [ ] HTTP(S) source image loader
 - [ ] Image engine: decode, resize, crop, encode
