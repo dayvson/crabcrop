@@ -9,13 +9,16 @@
 //! builds on top of [`parse_signature`], which splits the signature off and
 //! hands back the remainder of the path.
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 /// How the request proves it was minted by someone holding the server secret.
 ///
-/// Either an HMAC-SHA1 (hex) of the rest of the URL, or the literal `unsafe`
+/// Either an HMAC-SHA256 (hex) of the rest of the URL, or the literal `unsafe`
 /// when the operator allows unsigned URLs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signature {
-    /// Hex-encoded HMAC-SHA1 of the remainder of the path.
+    /// Hex-encoded HMAC-SHA256 of the remainder of the path.
     Hmac(String),
     /// Unsigned request; honored only when the server enables it.
     Unsafe,
@@ -104,6 +107,33 @@ pub fn parse_signature(path: &str) -> Result<(Signature, &str), ParseError> {
         Signature::Hmac(first.to_string())
     };
     Ok((signature, rest))
+}
+
+/// Verify a request signature against the server secret.
+///
+/// `remainder` is the path after the signature segment (operations and
+/// image URL, still slash-separated). The HMAC is computed over it with
+/// the server secret and compared to the presented signature in
+/// constant time. A signature that is not valid hex, or not the 64
+/// characters a SHA-256 tag needs, fails without panicking.
+///
+/// [`Signature::Unsafe`] is honored only when `allow_unsafe` is true.
+/// The server decides that from its own configuration; the secret
+/// itself always comes from config or environment, never from code.
+pub fn verify(secret: &[u8], signature: &Signature, remainder: &str, allow_unsafe: bool) -> bool {
+    match signature {
+        Signature::Unsafe => allow_unsafe,
+        Signature::Hmac(hex_digest) => {
+            let Ok(expected) = hex::decode(hex_digest) else {
+                return false;
+            };
+            let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret) else {
+                return false;
+            };
+            mac.update(remainder.as_bytes());
+            mac.verify_slice(&expected).is_ok()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -230,5 +260,70 @@ mod tests {
         assert_eq!(size.width, Dimension::Pixels(300));
         assert_eq!(size.height, Dimension::Pixels(200));
         assert_eq!(image, "example.com/img.jpg");
+    }
+
+    /// HMAC-SHA256 with secret `Jefe` over `KNOWN_REMAINDER`.
+    /// Cross-checked against Python's hmac module and OpenSSL before
+    /// it was written into this test.
+    const KNOWN_HMAC: &str = "ba5396e10039ec002bf1fde117eee48df8c2f06bc47b5f2d3272ea77f6862da9";
+    const KNOWN_REMAINDER: &str = "what do ye want for nothing?";
+
+    fn known_signature() -> Signature {
+        Signature::Hmac(KNOWN_HMAC.to_string())
+    }
+
+    #[test]
+    fn verify_accepts_valid_hmac_sha256() {
+        assert!(verify(b"Jefe", &known_signature(), KNOWN_REMAINDER, false));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_remainder() {
+        assert!(!verify(
+            b"Jefe",
+            &known_signature(),
+            "what do ye want for something?",
+            false
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_secret() {
+        assert!(!verify(
+            b"NotJefe",
+            &known_signature(),
+            KNOWN_REMAINDER,
+            false
+        ));
+    }
+
+    #[test]
+    fn verify_unsafe_honored_only_when_enabled() {
+        assert!(verify(b"secret", &Signature::Unsafe, "anything", true));
+        assert!(!verify(b"secret", &Signature::Unsafe, "anything", false));
+    }
+
+    #[test]
+    fn verify_rejects_malformed_signatures_without_panicking() {
+        for bad in [
+            "",
+            "abc",      // odd length, not decodable as hex bytes
+            "zz",       // not hex at all
+            "ba5396e1", // valid hex, wrong length
+            "ba5396e10039ec002bf1fde117eee48df8c2f06bc47b5f2d3272ea77f6862da", // 63 chars, odd
+        ] {
+            let sig = Signature::Hmac(bad.to_string());
+            assert!(
+                !verify(b"Jefe", &sig, KNOWN_REMAINDER, false),
+                "signature: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parsed_signature_verifies_against_remainder() {
+        let path = format!("/{KNOWN_HMAC}/{KNOWN_REMAINDER}");
+        let (sig, rest) = parse_signature(&path).unwrap();
+        assert!(verify(b"Jefe", &sig, rest, false));
     }
 }
