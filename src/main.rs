@@ -7,7 +7,7 @@
 //! ```
 //!
 //! The first path segment is the request [`url::Signature`]: either an
-//! HMAC-SHA1 of the rest of the path, or the literal `unsafe` when the
+//! HMAC-SHA256 of the rest of the path, or the literal `unsafe` when the
 //! server allows unsigned URLs.
 
 mod url;
