@@ -1,13 +1,20 @@
-//! The image engine: decode, resize, and encode.
+//! The image engine: decode, transform, and encode.
 //!
 //! [`Engine::process`] takes source bytes and the parsed [`Operation`]s,
-//! and returns encoded output bytes. Filter operations are rejected as
-//! unsupported until their phase lands (issue #5).
+//! and returns the encoded output plus its format.
 
-use image::DynamicImage;
+use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use crate::crop::crop_to_aspect;
-use crate::url::{Dimension, ImageSize, Operation};
+use crate::filters::apply_filters;
+use crate::url::{Dimension, ImageFormat, ImageSize, Operation};
+
+/// The encoded output plus its container format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessedImage {
+    pub bytes: Vec<u8>,
+    pub format: ImageFormat,
+}
 
 /// What went wrong while processing an image.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,14 +34,15 @@ pub struct Engine;
 impl Engine {
     /// Run the pipeline: decode, apply operations in order, encode.
     ///
-    /// The output format is the detected source format (JPEG when the
-    /// format cannot be detected). A `crop:W×H` crops to the W:H aspect
-    /// ratio and then resizes to exactly W×H. Filter operations return
-    /// [`EngineError::Unsupported`] until issue #5 lands.
-    pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<Vec<u8>, EngineError> {
-        let format = image::guess_format(bytes).unwrap_or(image::ImageFormat::Jpeg);
+    /// The output format is the detected source format unless a
+    /// `format(...)` filter overrides it (JPEG when the source format
+    /// cannot be detected and no filter overrides it). A `crop:W×H`
+    /// crops to the W:H aspect ratio and then resizes to exactly W×H.
+    pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<ProcessedImage, EngineError> {
         let mut img =
             image::load_from_memory(bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
+        let mut format = detect_format(bytes);
+        let mut quality = None;
         for op in ops {
             match op {
                 Operation::Size(size) => img = apply_size(img, size),
@@ -58,16 +66,64 @@ impl Engine {
                         },
                     );
                 }
-                Operation::Filters(_) => {
-                    return Err(EngineError::Unsupported("filters (issue #5)".to_string()));
+                Operation::Filters(filters) => {
+                    let (new_img, options) = apply_filters(img, filters);
+                    img = new_img;
+                    if let Some(f) = options.format {
+                        format = f;
+                    }
+                    if let Some(q) = options.quality {
+                        quality = Some(q);
+                    }
                 }
             }
         }
-        let mut buf = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut buf, format)
-            .map_err(|e| EngineError::Encode(e.to_string()))?;
-        Ok(buf.into_inner())
+        let bytes = encode(&img, format, quality)?;
+        Ok(ProcessedImage { bytes, format })
     }
+}
+
+/// The output container: detected source format, or JPEG when the
+/// source format is unknown or not one we emit.
+fn detect_format(bytes: &[u8]) -> ImageFormat {
+    match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Jpeg) => ImageFormat::Jpeg,
+        Ok(image::ImageFormat::Png) => ImageFormat::Png,
+        Ok(image::ImageFormat::WebP) => ImageFormat::WebP,
+        _ => ImageFormat::Jpeg,
+    }
+}
+
+/// Encode `img` to `format`. `quality` applies to JPEG only.
+fn encode(
+    img: &DynamicImage,
+    format: ImageFormat,
+    quality: Option<u8>,
+) -> Result<Vec<u8>, EngineError> {
+    let mut buf = Vec::new();
+    let (w, h) = (img.width(), img.height());
+    let (pixels, color) = (img.as_bytes(), ExtendedColorType::from(img.color()));
+    match format {
+        ImageFormat::Jpeg => {
+            // JPEG has no alpha channel.
+            let rgb = img.to_rgb8();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality.unwrap_or(80))
+                .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
+                .map_err(|e| EngineError::Encode(e.to_string()))?;
+        }
+        ImageFormat::Png => {
+            image::codecs::png::PngEncoder::new(&mut buf)
+                .write_image(pixels, w, h, color)
+                .map_err(|e| EngineError::Encode(e.to_string()))?;
+        }
+        ImageFormat::WebP => {
+            // The image crate's WebP encoder is lossless-only.
+            image::codecs::webp::WebPEncoder::new_lossless(&mut buf)
+                .write_image(pixels, w, h, color)
+                .map_err(|e| EngineError::Encode(e.to_string()))?;
+        }
+    }
+    Ok(buf)
 }
 
 /// Resize `img` per `size`, honoring proportional/original dimensions
@@ -108,7 +164,7 @@ fn apply_size(img: DynamicImage, size: &ImageSize) -> DynamicImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::url::{Align, Filter};
+    use crate::url::{Align, Filter, ImageFormat};
     use image::GenericImageView;
 
     fn png_bytes(img: &DynamicImage) -> Vec<u8> {
@@ -144,7 +200,8 @@ mod tests {
         let engine = Engine;
         let out = engine
             .process(&solid_png(100, 60, [10, 20, 30]), &[])
-            .unwrap();
+            .unwrap()
+            .bytes;
         assert_eq!(&out[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(decode_dims(&out), (100, 60));
     }
@@ -157,7 +214,8 @@ mod tests {
                 &solid_png(100, 60, [10, 20, 30]),
                 &[size_op(Dimension::Pixels(50), Dimension::Pixels(30))],
             )
-            .unwrap();
+            .unwrap()
+            .bytes;
         assert_eq!(decode_dims(&out), (50, 30));
     }
 
@@ -170,14 +228,16 @@ mod tests {
                 &bytes,
                 &[size_op(Dimension::Pixels(50), Dimension::Proportional)],
             )
-            .unwrap();
+            .unwrap()
+            .bytes;
         assert_eq!(decode_dims(&out), (50, 30));
         let out = engine
             .process(
                 &bytes,
                 &[size_op(Dimension::Proportional, Dimension::Pixels(30))],
             )
-            .unwrap();
+            .unwrap()
+            .bytes;
         assert_eq!(decode_dims(&out), (50, 30));
     }
 
@@ -189,7 +249,8 @@ mod tests {
                 &solid_png(100, 60, [10, 20, 30]),
                 &[size_op(Dimension::Original, Dimension::Original)],
             )
-            .unwrap();
+            .unwrap()
+            .bytes;
         assert_eq!(decode_dims(&out), (100, 60));
     }
 
@@ -210,7 +271,8 @@ mod tests {
                     flip_vertical: false,
                 })],
             )
-            .unwrap();
+            .unwrap()
+            .bytes;
         let decoded = image::load_from_memory(&out).unwrap();
         let left = decoded.get_pixel(0, 0);
         let right = decoded.get_pixel(1, 0);
@@ -226,7 +288,7 @@ mod tests {
             .unwrap();
         let buf = buf.into_inner();
         let engine = Engine;
-        let out = engine.process(&buf, &[]).unwrap();
+        let out = engine.process(&buf, &[]).unwrap().bytes;
         assert_eq!(&out[..2], b"\xff\xd8");
         assert_eq!(decode_dims(&out), (100, 60));
     }
@@ -256,18 +318,96 @@ mod tests {
                     align: Align::Center,
                 }],
             )
-            .unwrap();
+            .unwrap()
+            .bytes;
         assert_eq!(decode_dims(&out), (50, 50));
     }
 
+    fn gradient_png() -> Vec<u8> {
+        let mut img = DynamicImage::new_rgb8(64, 64);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            let v = ((x + y) % 256) as u8;
+            *p = image::Rgb([v, 255 - v, (x * y % 256) as u8]);
+        }
+        png_bytes(&img)
+    }
+
     #[test]
-    fn rejects_filters_for_now() {
+    fn grayscale_filter_desaturates() {
         let engine = Engine;
-        let bytes = solid_png(100, 60, [10, 20, 30]);
-        let filters = Operation::Filters(vec![Filter::Grayscale]);
-        assert!(matches!(
-            engine.process(&bytes, &[filters]),
-            Err(EngineError::Unsupported(_))
-        ));
+        let out = engine
+            .process(
+                &gradient_png(),
+                &[Operation::Filters(vec![Filter::Grayscale])],
+            )
+            .unwrap()
+            .bytes;
+        let decoded = image::load_from_memory(&out).unwrap();
+        for p in decoded.to_rgb8().pixels() {
+            assert_eq!(p[0], p[1]);
+            assert_eq!(p[1], p[2]);
+        }
+    }
+
+    #[test]
+    fn quality_filter_changes_jpeg_size() {
+        let engine = Engine;
+        let filters = |q| {
+            vec![Operation::Filters(vec![
+                Filter::Format(ImageFormat::Jpeg),
+                Filter::Quality(q),
+            ])]
+        };
+        let hi = engine.process(&gradient_png(), &filters(95)).unwrap();
+        let lo = engine.process(&gradient_png(), &filters(10)).unwrap();
+        assert_eq!(hi.format, ImageFormat::Jpeg);
+        assert!(hi.bytes.len() > lo.bytes.len());
+        assert_eq!(&hi.bytes[..2], b"\xff\xd8");
+    }
+
+    #[test]
+    fn format_filter_selects_container() {
+        let engine = Engine;
+        // PNG in, JPEG out.
+        let out = engine
+            .process(
+                &solid_png(100, 60, [10, 20, 30]),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jpeg);
+        assert_eq!(&out.bytes[..2], b"\xff\xd8");
+        // JPEG in, PNG out.
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(100, 60)
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let out = engine
+            .process(
+                &jpeg.into_inner(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Png);
+        assert_eq!(&out.bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn filters_combine_with_resize() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &gradient_png(),
+                &[
+                    size_op(Dimension::Pixels(32), Dimension::Pixels(32)),
+                    Operation::Filters(vec![Filter::Grayscale, Filter::Format(ImageFormat::Jpeg)]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jpeg);
+        let decoded = image::load_from_memory(&out.bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (32, 32));
+        let p = decoded.get_pixel(0, 0);
+        assert_eq!(p[0], p[1]);
     }
 }

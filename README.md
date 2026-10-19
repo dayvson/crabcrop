@@ -26,7 +26,7 @@ time, each with tests.
 - [x] HTTP(S) source image loader
 - [x] Image engine: decode, resize, crop, encode
 - [x] Crop-to-aspect transformer
-- [ ] Filter pipeline: grayscale, quality, format, ...
+- [x] Filter pipeline: grayscale, quality, format, ...
 - [ ] HTTP server
 
 ## Build
