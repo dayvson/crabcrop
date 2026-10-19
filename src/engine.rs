@@ -410,4 +410,22 @@ mod tests {
         let p = decoded.get_pixel(0, 0);
         assert_eq!(p[0], p[1]);
     }
+
+    #[test]
+    fn new_filters_flow_through_engine() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &gradient_png(),
+                &[Operation::Filters(vec![
+                    Filter::Blur(1.5),
+                    Filter::Invert,
+                    Filter::Format(ImageFormat::Png),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Png);
+        assert!(out.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+        image::load_from_memory(&out.bytes).unwrap();
+    }
 }
