@@ -12,6 +12,7 @@
 
 mod crop;
 mod engine;
+mod filters;
 mod loader;
 mod url;
 
