@@ -27,7 +27,7 @@ time, each with tests.
 - [x] Image engine: decode, resize, crop, encode
 - [x] Crop-to-aspect transformer
 - [x] Filter pipeline: grayscale, quality, format, ...
-- [ ] HTTP server
+- [x] HTTP server
 
 ## Build
 
