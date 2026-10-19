@@ -10,6 +10,7 @@
 //! HMAC-SHA256 of the rest of the path, or the literal `unsafe` when the
 //! server allows unsigned URLs.
 
+mod loader;
 mod url;
 
 fn main() {
