@@ -92,10 +92,23 @@ pub enum ImageFormat {
 }
 
 /// One filter from a `filters:...` segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `f32` parameters mean `Eq` cannot be derived; `PartialEq` is enough
+/// for the tests and the pipeline.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     /// Desaturate the image.
     Grayscale,
+    /// Invert every channel.
+    Invert,
+    /// Gaussian blur; sigma must be positive.
+    Blur(f32),
+    /// Add to every channel, clamped to 0-255.
+    Brighten(i32),
+    /// Adjust contrast.
+    Contrast(f32),
+    /// Rotate the hue, in degrees.
+    HueRotate(i32),
     /// Encoding quality, 0-100.
     Quality(u8),
     /// Output container.
@@ -103,7 +116,7 @@ pub enum Filter {
 }
 
 /// One operation from the request path, in path order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
     /// Resize to a size segment (`300x200`, ...).
     Size(ImageSize),
@@ -114,7 +127,7 @@ pub enum Operation {
 }
 
 /// A fully parsed request path: operations plus the source image URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Request<'a> {
     pub operations: Vec<Operation>,
     pub source_url: &'a str,
@@ -240,6 +253,29 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
         };
         let filter = match (name, params) {
             ("grayscale", None) => Filter::Grayscale,
+            ("invert", None) => Filter::Invert,
+            ("blur", Some(p)) => {
+                let sigma: f32 = p.parse().map_err(|_| invalid())?;
+                if !sigma.is_finite() || sigma <= 0.0 {
+                    return Err(invalid());
+                }
+                Filter::Blur(sigma)
+            }
+            ("brighten", Some(p)) => {
+                let amount: i32 = p.parse().map_err(|_| invalid())?;
+                Filter::Brighten(amount)
+            }
+            ("contrast", Some(p)) => {
+                let amount: f32 = p.parse().map_err(|_| invalid())?;
+                if !amount.is_finite() {
+                    return Err(invalid());
+                }
+                Filter::Contrast(amount)
+            }
+            ("huerotate", Some(p)) => {
+                let degrees: i32 = p.parse().map_err(|_| invalid())?;
+                Filter::HueRotate(degrees)
+            }
             ("quality", Some(p)) => {
                 let q: u8 = p.parse().map_err(|_| invalid())?;
                 if q > 100 {
@@ -601,6 +637,47 @@ mod tests {
             "filters:grayscale(1)",
             "filters:format(bmp)",
             "filters:quality(80",
+        ] {
+            assert_eq!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")),
+                Err(ParseError::InvalidFilters(seg.to_string())),
+                "segment: {seg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_new_filters() {
+        let (ops, _) = parse_operations(
+            "filters:invert():blur(2.5):brighten(10):contrast(1.2):huerotate(90)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::Invert,
+                Filter::Blur(2.5),
+                Filter::Brighten(10),
+                Filter::Contrast(1.2),
+                Filter::HueRotate(90),
+            ])]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_new_filter_params() {
+        for seg in [
+            "filters:blur()",
+            "filters:blur(0)",
+            "filters:blur(-1.5)",
+            "filters:blur(lots)",
+            "filters:brighten()",
+            "filters:brighten(lots)",
+            "filters:contrast()",
+            "filters:contrast(lots)",
+            "filters:huerotate()",
+            "filters:huerotate(lots)",
+            "filters:invert(1)",
         ] {
             assert_eq!(
                 parse_operations(&format!("{seg}/example.com/img.jpg")),
