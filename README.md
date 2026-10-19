@@ -23,7 +23,7 @@ time, each with tests.
 - [x] URL size segment parsing (`300x200`, flips, proportional, `orig`)
 - [x] Full URL grammar: crop, alignment, filters, source URL
 - [x] HMAC-SHA256 request signing and verification
-- [ ] HTTP(S) source image loader
+- [x] HTTP(S) source image loader
 - [ ] Image engine: decode, resize, crop, encode
 - [ ] Crop-to-aspect transformer
 - [ ] Filter pipeline: grayscale, quality, format, ...
