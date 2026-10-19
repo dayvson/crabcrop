@@ -1,11 +1,12 @@
 //! The image engine: decode, resize, and encode.
 //!
 //! [`Engine::process`] takes source bytes and the parsed [`Operation`]s,
-//! and returns encoded output bytes. Crop and filter operations are
-//! rejected as unsupported until their phases land (issues #4 and #5).
+//! and returns encoded output bytes. Filter operations are rejected as
+//! unsupported until their phase lands (issue #5).
 
 use image::DynamicImage;
 
+use crate::crop::crop_to_aspect;
 use crate::url::{Dimension, ImageSize, Operation};
 
 /// What went wrong while processing an image.
@@ -24,11 +25,12 @@ pub enum EngineError {
 pub struct Engine;
 
 impl Engine {
-    /// Run the pipeline: decode, apply size operations in order, encode.
+    /// Run the pipeline: decode, apply operations in order, encode.
     ///
     /// The output format is the detected source format (JPEG when the
-    /// format cannot be detected). Crop and filter operations return
-    /// [`EngineError::Unsupported`] until issues #4 and #5 land.
+    /// format cannot be detected). A `crop:W×H` crops to the W:H aspect
+    /// ratio and then resizes to exactly W×H. Filter operations return
+    /// [`EngineError::Unsupported`] until issue #5 lands.
     pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<Vec<u8>, EngineError> {
         let format = image::guess_format(bytes).unwrap_or(image::ImageFormat::Jpeg);
         let mut img =
@@ -36,8 +38,25 @@ impl Engine {
         for op in ops {
             match op {
                 Operation::Size(size) => img = apply_size(img, size),
-                Operation::Crop { .. } => {
-                    return Err(EngineError::Unsupported("crop (issue #4)".to_string()));
+                Operation::Crop { size, align } => {
+                    let (tw, th) = match (size.width, size.height) {
+                        (Dimension::Pixels(w), Dimension::Pixels(h)) => (w, h),
+                        _ => {
+                            return Err(EngineError::Unsupported(
+                                "crop with non-pixel dimensions".to_string(),
+                            ));
+                        }
+                    };
+                    img = crop_to_aspect(img, tw, th, *align);
+                    img = apply_size(
+                        img,
+                        &ImageSize {
+                            width: Dimension::Pixels(tw),
+                            height: Dimension::Pixels(th),
+                            flip_horizontal: false,
+                            flip_vertical: false,
+                        },
+                    );
                 }
                 Operation::Filters(_) => {
                     return Err(EngineError::Unsupported("filters (issue #5)".to_string()));
@@ -222,22 +241,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_operations_for_now() {
+    fn crops_then_resizes_to_exact_size() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &solid_png(100, 60, [10, 20, 30]),
+                &[Operation::Crop {
+                    size: ImageSize {
+                        width: Dimension::Pixels(50),
+                        height: Dimension::Pixels(50),
+                        flip_horizontal: false,
+                        flip_vertical: false,
+                    },
+                    align: Align::Center,
+                }],
+            )
+            .unwrap();
+        assert_eq!(decode_dims(&out), (50, 50));
+    }
+
+    #[test]
+    fn rejects_filters_for_now() {
         let engine = Engine;
         let bytes = solid_png(100, 60, [10, 20, 30]);
-        let crop = Operation::Crop {
-            size: ImageSize {
-                width: Dimension::Pixels(50),
-                height: Dimension::Pixels(50),
-                flip_horizontal: false,
-                flip_vertical: false,
-            },
-            align: Align::Center,
-        };
-        assert!(matches!(
-            engine.process(&bytes, &[crop]),
-            Err(EngineError::Unsupported(_))
-        ));
         let filters = Operation::Filters(vec![Filter::Grayscale]);
         assert!(matches!(
             engine.process(&bytes, &[filters]),

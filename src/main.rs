@@ -10,6 +10,7 @@
 //! HMAC-SHA256 of the rest of the path, or the literal `unsafe` when the
 //! server allows unsigned URLs.
 
+mod crop;
 mod engine;
 mod loader;
 mod url;

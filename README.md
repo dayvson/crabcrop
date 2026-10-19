@@ -25,7 +25,7 @@ time, each with tests.
 - [x] HMAC-SHA256 request signing and verification
 - [x] HTTP(S) source image loader
 - [x] Image engine: decode, resize, crop, encode
-- [ ] Crop-to-aspect transformer
+- [x] Crop-to-aspect transformer
 - [ ] Filter pipeline: grayscale, quality, format, ...
 - [ ] HTTP server
 
