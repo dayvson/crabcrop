@@ -24,7 +24,7 @@ time, each with tests.
 - [x] Full URL grammar: crop, alignment, filters, source URL
 - [x] HMAC-SHA256 request signing and verification
 - [x] HTTP(S) source image loader
-- [ ] Image engine: decode, resize, crop, encode
+- [x] Image engine: decode, resize, crop, encode
 - [ ] Crop-to-aspect transformer
 - [ ] Filter pipeline: grayscale, quality, format, ...
 - [ ] HTTP server
