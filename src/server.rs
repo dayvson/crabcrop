@@ -171,6 +171,7 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
 
 fn load_error_response(e: LoadError) -> Response {
     let (status, message) = match e {
+        LoadError::Forbidden(reason) => (StatusCode::FORBIDDEN, reason),
         LoadError::BadStatus(code) => (
             StatusCode::BAD_GATEWAY,
             format!("source returned status {code}"),

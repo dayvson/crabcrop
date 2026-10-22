@@ -16,6 +16,11 @@
 //! - `CRABCROP_ALLOW_UNSAFE`: `1` or `true` to honor `unsafe` URLs.
 //! - `CRABCROP_CACHE_MAX_MB`: result cache budget in megabytes,
 //!   default 256; `0` disables the cache.
+//! - `CRABCROP_ALLOWED_SOURCES`: comma-separated host suffixes the
+//!   loader may fetch from; unset allows every host.
+//! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: `1` or `true` to refuse
+//!   sources resolving to loopback, private, or link-local
+//!   addresses. Off by default.
 //! - `PORT`: listen port, default 3000.
 
 mod cache;
@@ -33,7 +38,7 @@ use std::sync::Arc;
 
 use crate::cache::Cache;
 use crate::engine::Engine;
-use crate::loader::Loader;
+use crate::loader::{Loader, SourcePolicy};
 use crate::observe::Metrics;
 use crate::server::{AppState, app};
 
@@ -53,11 +58,18 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(256);
+    let allowed_sources: Vec<String> = env::var("CRABCROP_ALLOWED_SOURCES")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let block_private = env::var("CRABCROP_BLOCK_PRIVATE_SOURCES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let policy = SourcePolicy::new(allowed_sources, block_private);
 
     let state = AppState {
         secret,
         allow_unsafe,
-        loader: Loader::with_defaults().expect("loader"),
+        loader: Loader::with_defaults().expect("loader").with_policy(policy),
         engine: Engine,
         metrics: Arc::new(Metrics::default()),
         cache: Arc::new(Cache::new(cache_mb * 1024 * 1024)),
