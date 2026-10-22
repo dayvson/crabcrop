@@ -35,6 +35,9 @@ pub struct RequestRecord {
     /// Whether the engine stage ran (attempted).
     pub process_ran: bool,
     pub cache_hit: bool,
+    /// Whether the configured fallback image was served
+    /// instead of the source.
+    pub fallback: bool,
     pub bytes_in: usize,
     pub bytes_out: usize,
     pub fail: FailStage,
@@ -52,6 +55,7 @@ impl Default for RequestRecord {
             load_ran: false,
             process_ran: false,
             cache_hit: false,
+            fallback: false,
             bytes_in: 0,
             bytes_out: 0,
             fail: FailStage::None,
@@ -90,7 +94,7 @@ impl RequestRecord {
         format!(
             "{{\"ts\":{ts},\"method\":\"GET\",\"ops\":\"{}\",\"status\":{},\
              \"verify_ms\":{:.1},\"load_ms\":{:.1},\"process_ms\":{:.1},\"total_ms\":{:.1},\
-             \"cache\":\"{}\",\"bytes_in\":{},\"bytes_out\":{}}}",
+             \"cache\":\"{}\",\"fallback\":{},\"bytes_in\":{},\"bytes_out\":{}}}",
             escape_json(&self.ops),
             self.status,
             ms(self.verify),
@@ -98,6 +102,7 @@ impl RequestRecord {
             ms(self.process),
             ms(self.total),
             if self.cache_hit { "hit" } else { "miss" },
+            self.fallback,
             self.bytes_in,
             self.bytes_out,
         )

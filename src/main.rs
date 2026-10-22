@@ -33,6 +33,10 @@
 //! - `CRABCROP_FONT_PATH`: path to a TTF/OTF font for the
 //!   `text(...)` overlay filter, loaded at boot. Unset
 //!   disables the filter (requests fail cleanly).
+//! - `CRABCROP_FALLBACK_IMAGE`: a URL or local file path for
+//!   the fallback image served (through the same operations,
+//!   marked `X-Crabcrop-Fallback: 1`) when a source cannot be
+//!   loaded or decoded. Unset keeps today's error behavior.
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
 //! - `PORT`: listen port, default 3000.
@@ -161,6 +165,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    // The fallback image: an http(s) value is fetched per
+    // fallback event through the loader; anything else is a
+    // local path read once now, broken is fatal like the rest
+    // of the boot config.
+    let fallback = match env::var("CRABCROP_FALLBACK_IMAGE") {
+        Ok(v) if !v.is_empty() => {
+            if v.starts_with("http://") || v.starts_with("https://") {
+                println!("fallback image will be fetched from {v}");
+                Some(server::Fallback::Url(v))
+            } else {
+                let bytes = std::fs::read(&v)
+                    .map_err(|e| format!("cannot read the fallback image {v}: {e}"))?;
+                println!("fallback image loaded from {v} ({} bytes)", bytes.len());
+                Some(server::Fallback::Bytes(Arc::new(bytes)))
+            }
+        }
+        _ => None,
+    };
+
     let state = AppState {
         secret,
         allow_unsafe,
@@ -174,6 +197,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         upscale,
         face,
         font,
+        fallback,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;

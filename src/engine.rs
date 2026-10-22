@@ -87,7 +87,7 @@ impl std::error::Error for EngineError {}
 
 /// Per-request context the caller hands to the engine: the
 /// things a pipeline run needs that are not in the URL.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ProcessContext<'a> {
     /// Negotiated format preference (from `Accept`); applies
     /// only when the operations name no format themselves.
