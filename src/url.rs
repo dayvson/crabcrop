@@ -49,6 +49,26 @@ pub enum ParseError {
     MissingSourceUrl,
 }
 
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::EmptyPath => write!(f, "empty path"),
+            ParseError::MissingSignature => write!(f, "missing signature segment"),
+            ParseError::InvalidSize(seg) => write!(f, "invalid size segment: {seg}"),
+            ParseError::InvalidCrop(seg) => write!(f, "invalid crop segment: {seg}"),
+            ParseError::InvalidCropRect(seg) => {
+                write!(f, "invalid crop-rect segment: {seg}")
+            }
+            ParseError::InvalidFilters(seg) => {
+                write!(f, "invalid filters segment: {seg}")
+            }
+            ParseError::MissingSourceUrl => write!(f, "missing source URL"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 /// One dimension of a requested image size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dimension {
@@ -171,6 +191,13 @@ pub enum Operation {
 }
 
 /// A fully parsed request path: operations plus the source image URL.
+///
+/// The composed parse result. The server does not use it: HMAC
+/// verification needs the raw remainder of the path, so the server
+/// works with [`parse_signature`] and [`parse_operations`]
+/// separately. This type and [`parse_request`] are the convenient
+/// whole-path form, kept for tests and future library use.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request<'a> {
     pub operations: Vec<Operation>,
@@ -465,7 +492,30 @@ pub fn parse_operations(input: &str) -> Result<(Vec<Operation>, &str), ParseErro
     }
 }
 
+/// The output format a request names explicitly, if any: the
+/// last `format(...)` filter wins, matching how the engine reads
+/// directives. Shared by the engine and the server (whose cache
+/// key must know whether negotiation can change the answer).
+pub fn explicit_format(ops: &[Operation]) -> Option<ImageFormat> {
+    ops.iter().rev().find_map(|op| match op {
+        Operation::Filters(filters) => filters.iter().rev().find_map(|f| match f {
+            Filter::Format(fmt) => Some(*fmt),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// Whether any filters segment in `ops` requests `no_upscale`.
+pub fn has_no_upscale(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::NoUpscale)),
+        _ => false,
+    })
+}
+
 /// Parse a full request path into its signature and [`Request`].
+#[allow(dead_code)]
 pub fn parse_request(path: &str) -> Result<(Signature, Request<'_>), ParseError> {
     let (signature, rest) = parse_signature(path)?;
     let (operations, source_url) = parse_operations(rest)?;
@@ -1034,5 +1084,32 @@ mod tests {
         assert!(matches!(req.operations[0], Operation::Size(_)));
         assert!(matches!(req.operations[1], Operation::Filters(_)));
         assert_eq!(req.source_url, "example.com/img.jpg");
+    }
+
+    #[test]
+    fn parse_errors_render() {
+        assert_eq!(
+            ParseError::InvalidSize("x".to_string()).to_string(),
+            "invalid size segment: x"
+        );
+        assert_eq!(
+            ParseError::MissingSourceUrl.to_string(),
+            "missing source URL"
+        );
+    }
+
+    #[test]
+    fn operation_queries_find_directives() {
+        let (ops, _) =
+            parse_operations("100x100/filters:format(png):no_upscale/example.com/i.jpg").unwrap();
+        assert_eq!(explicit_format(&ops), Some(ImageFormat::Png));
+        assert!(has_no_upscale(&ops));
+        let (ops, _) = parse_operations("100x100/example.com/i.jpg").unwrap();
+        assert_eq!(explicit_format(&ops), None);
+        assert!(!has_no_upscale(&ops));
+        // A later format filter wins over an earlier one.
+        let (ops, _) =
+            parse_operations("filters:format(jpeg):format(webp)/example.com/i.jpg").unwrap();
+        assert_eq!(explicit_format(&ops), Some(ImageFormat::WebP));
     }
 }

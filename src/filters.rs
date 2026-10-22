@@ -24,6 +24,27 @@ pub struct EncodeOptions {
     pub max_bytes: Option<u64>,
 }
 
+impl EncodeOptions {
+    /// Merge `other` into `self`: directives set in `other` win,
+    /// unset ones leave `self` alone. `no_upscale` is sticky:
+    /// once requested anywhere, it stays requested.
+    pub fn absorb(&mut self, other: EncodeOptions) {
+        if other.format.is_some() {
+            self.format = other.format;
+        }
+        if other.quality.is_some() {
+            self.quality = other.quality;
+        }
+        if other.fill.is_some() {
+            self.fill = other.fill;
+        }
+        if other.max_bytes.is_some() {
+            self.max_bytes = other.max_bytes;
+        }
+        self.no_upscale |= other.no_upscale;
+    }
+}
+
 /// Apply `filters` in order.
 ///
 /// Returns the transformed image plus the encoding directives.
@@ -137,7 +158,7 @@ fn equalize(img: &image::RgbImage) -> image::RgbImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{GenericImageView, Rgb};
+    use image::Rgb;
 
     fn striped() -> DynamicImage {
         let mut img = DynamicImage::new_rgb8(64, 64);
@@ -261,6 +282,35 @@ mod tests {
         );
         assert_eq!(opts.fill, Some([255, 136, 0]));
         assert_eq!(opts.max_bytes, Some(5000));
+    }
+
+    #[test]
+    fn absorb_merges_directives() {
+        let mut base = EncodeOptions::default();
+        base.absorb(EncodeOptions {
+            format: Some(ImageFormat::Png),
+            quality: None,
+            no_upscale: true,
+            fill: None,
+            max_bytes: Some(100),
+        });
+        base.absorb(EncodeOptions {
+            format: None,
+            quality: Some(Quality::Value(50)),
+            no_upscale: false,
+            fill: None,
+            max_bytes: None,
+        });
+        assert_eq!(
+            base,
+            EncodeOptions {
+                format: Some(ImageFormat::Png),
+                quality: Some(Quality::Value(50)),
+                no_upscale: true,
+                fill: None,
+                max_bytes: Some(100),
+            }
+        );
     }
 
     #[test]

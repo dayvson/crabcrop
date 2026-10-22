@@ -8,9 +8,9 @@ use std::sync::Once;
 use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use crate::crop::crop_to_aspect;
-use crate::filters::apply_filters;
+use crate::filters::{EncodeOptions, apply_filters};
 use crate::quality::auto_quality;
-use crate::url::{Dimension, Filter, ImageFormat, ImageSize, Operation, Quality};
+use crate::url::{Dimension, ImageFormat, ImageSize, Operation, Quality};
 
 /// Register the JPEG XL decoder with the image crate, once.
 ///
@@ -28,8 +28,10 @@ fn ensure_jxl_decoder() {
 pub struct ProcessedImage {
     pub bytes: Vec<u8>,
     pub format: ImageFormat,
-    /// The quality chosen for this output, set only when the request
-    /// asked for `quality(auto)` and content analysis picked one.
+    /// The quality chosen for this output, set when the service
+    /// picked it: `quality(auto)` content analysis, or a
+    /// `max_bytes` reduction. `None` when the request named the
+    /// quality (or the default stood).
     pub quality: Option<u8>,
 }
 
@@ -44,6 +46,24 @@ pub enum EngineError {
     Unsupported(String),
 }
 
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineError::Decode(cause) => {
+                write!(f, "cannot decode source image: {cause}")
+            }
+            EngineError::Encode(cause) => {
+                write!(f, "cannot encode output image: {cause}")
+            }
+            EngineError::Unsupported(what) => {
+                write!(f, "unsupported operation: {what}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
 /// Decodes, resizes, and encodes images.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Engine;
@@ -55,6 +75,11 @@ impl Engine {
     /// `format(...)` filter overrides it (JPEG when the source format
     /// cannot be detected and no filter overrides it). A `crop:W×H`
     /// crops to the W:H aspect ratio and then resizes to exactly W×H.
+    ///
+    /// The server calls [`Engine::process_preferred`] instead,
+    /// because it negotiates format from `Accept`; this composed
+    /// form is kept for tests and future library use.
+    #[allow(dead_code)]
     pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<ProcessedImage, EngineError> {
         self.process_preferred(bytes, ops, None)
     }
@@ -80,18 +105,11 @@ impl Engine {
             img = apply_orientation(img, orientation);
         }
         let mut format = detect_format(bytes);
-        let mut explicit_format = false;
-        let mut quality = None;
-        let mut fill = None;
-        let mut max_bytes = None;
+        let mut directives = EncodeOptions::default();
         // `no_upscale` is a request-wide directive, like the encoding
         // directives: wherever it appears, it caps every resize in
         // the request at the (oriented) source dimensions.
-        let no_upscale = ops.iter().any(|op| match op {
-            Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::NoUpscale)),
-            _ => false,
-        });
-        let cap = if no_upscale {
+        let cap = if crate::url::has_no_upscale(ops) {
             Some((img.width(), img.height()))
         } else {
             None
@@ -139,31 +157,19 @@ impl Engine {
                 Operation::Filters(filters) => {
                     let (new_img, options) = apply_filters(img, filters);
                     img = new_img;
-                    if let Some(f) = options.format {
-                        format = f;
-                        explicit_format = true;
-                    }
-                    if let Some(q) = options.quality {
-                        quality = Some(q);
-                    }
-                    if let Some(c) = options.fill {
-                        fill = Some(c);
-                    }
-                    if let Some(n) = options.max_bytes {
-                        max_bytes = Some(n);
-                    }
+                    directives.absorb(options);
                 }
             }
         }
-        if !explicit_format {
-            if let Some(p) = preferred {
-                format = p;
-            }
+        if let Some(f) = directives.format {
+            format = f;
+        } else if let Some(p) = preferred {
+            format = p;
         }
         // Resolve the quality directive against the final image.
         // `quality(auto)` is reported back: it is the one the caller
         // did not choose themselves.
-        let (encode_quality, mut chosen_quality) = match quality {
+        let (encode_quality, mut chosen_quality) = match directives.quality {
             Some(Quality::Value(q)) => (Some(q), None),
             Some(Quality::Auto) => {
                 let q = auto_quality(&img);
@@ -171,24 +177,30 @@ impl Engine {
             }
             None => (None, None),
         };
-        let mut bytes = encode(&img, format, encode_quality, fill)?;
+        let mut bytes = encode(&img, format, encode_quality, directives.fill)?;
         // `max_bytes` is a budget, pursued by re-encoding at
         // decreasing quality. Only the quality-bearing formats have
         // a lever; for the others the directive cannot be honored
         // and the single encode stands. If quality bottoms out over
         // budget, the smallest attempt is returned: an image that
-        // misses its budget beats an error.
-        if let Some(budget) = max_bytes {
-            if matches!(
-                format,
-                ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif
-            ) {
-                let mut current = encode_quality.unwrap_or(80);
-                while bytes.len() as u64 > budget && current > 1 {
-                    current = ((current as u32 * 7 / 10) as u8).max(1);
-                    bytes = encode(&img, format, Some(current), fill)?;
-                    chosen_quality = Some(current);
-                }
+        // misses its budget beats an error. The ladder is bounded
+        // per format so a budget cannot multiply an expensive
+        // encode without limit.
+        let quality_bearing = matches!(
+            format,
+            ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif
+        );
+        if let Some(budget) = directives.max_bytes.filter(|_| quality_bearing) {
+            let mut current = encode_quality.unwrap_or(80);
+            let mut attempts = 0;
+            while bytes.len() as u64 > budget
+                && current > 1
+                && attempts < max_quality_attempts(format)
+            {
+                current = next_quality(format, current);
+                bytes = encode(&img, format, Some(current), directives.fill)?;
+                chosen_quality = Some(current);
+                attempts += 1;
             }
         }
         Ok(ProcessedImage {
@@ -249,6 +261,25 @@ fn is_jxl(bytes: &[u8]) -> bool {
         || bytes.starts_with(&[
             0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
         ])
+}
+
+/// One step down the `max_bytes` quality ladder. AVIF encodes
+/// are the pipeline's most expensive step by far, so they halve;
+/// JPEG and JPEG XL shave 30% per step.
+fn next_quality(format: ImageFormat, current: u8) -> u8 {
+    match format {
+        ImageFormat::Avif => (current / 2).max(1),
+        _ => ((current as u32 * 7 / 10) as u8).max(1),
+    }
+}
+
+/// How many re-encodes `max_bytes` may attempt per format before
+/// returning the smallest result it has.
+fn max_quality_attempts(format: ImageFormat) -> u32 {
+    match format {
+        ImageFormat::Avif => 4,
+        _ => 12,
+    }
 }
 
 /// Encode `img` to `format`. `quality` applies to JPEG, JPEG XL,
@@ -858,7 +889,8 @@ mod tests {
         // The stored pattern has its white quadrant top-left. Each
         // orientation value states where the stored pixels must move
         // for the image to display upright.
-        let cases: [(u16, (u32, u32, [bool; 4])); 8] = [
+        type OrientationCase = (u16, (u32, u32, [bool; 4]));
+        let cases: [OrientationCase; 8] = [
             (1, (8, 4, [true, false, false, false])),
             (2, (8, 4, [false, true, false, false])),
             (3, (8, 4, [false, false, false, true])),
@@ -1163,6 +1195,24 @@ mod tests {
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         let p = img.get_pixel(8, 8);
         assert!(p[1] > 200, "pixel {p:?}");
+    }
+
+    #[test]
+    fn quality_ladder_steps_by_format() {
+        assert_eq!(next_quality(ImageFormat::Jpeg, 80), 56);
+        assert_eq!(next_quality(ImageFormat::Jxl, 80), 56);
+        assert_eq!(next_quality(ImageFormat::Avif, 80), 40);
+        assert_eq!(next_quality(ImageFormat::Avif, 1), 1);
+        assert_eq!(max_quality_attempts(ImageFormat::Avif), 4);
+        assert!(max_quality_attempts(ImageFormat::Jpeg) > 4);
+    }
+
+    #[test]
+    fn errors_render() {
+        assert_eq!(
+            EngineError::Unsupported("crop".to_string()).to_string(),
+            "unsupported operation: crop"
+        );
     }
 
     /// Timing reference for the issue thread; run explicitly with
