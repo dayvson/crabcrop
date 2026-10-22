@@ -20,6 +20,7 @@ mod crop;
 mod engine;
 mod filters;
 mod loader;
+mod quality;
 mod server;
 mod url;
 

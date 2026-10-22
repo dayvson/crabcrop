@@ -6,15 +6,15 @@
 
 use image::DynamicImage;
 
-use crate::url::{Filter, ImageFormat};
+use crate::url::{Filter, ImageFormat, Quality};
 
 /// Encoding directives collected from filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EncodeOptions {
     /// Output container override. `None` keeps the detected source format.
     pub format: Option<ImageFormat>,
-    /// JPEG quality 0-100. `None` means the default.
-    pub quality: Option<u8>,
+    /// Encoding quality directive. `None` means the encoder default.
+    pub quality: Option<Quality>,
 }
 
 /// Apply `filters` in order.
@@ -77,8 +77,8 @@ mod tests {
         let (img, opts) = apply_filters(
             striped(),
             &[
-                Filter::Quality(10),
-                Filter::Quality(90),
+                Filter::Quality(Quality::Value(10)),
+                Filter::Quality(Quality::Value(90)),
                 Filter::Format(ImageFormat::Png),
                 Filter::Format(ImageFormat::Jpeg),
             ],
@@ -88,7 +88,7 @@ mod tests {
             opts,
             EncodeOptions {
                 format: Some(ImageFormat::Jpeg),
-                quality: Some(90),
+                quality: Some(Quality::Value(90)),
             }
         );
     }
