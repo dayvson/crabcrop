@@ -34,6 +34,13 @@ pub struct ProcessedImage {
     /// `max_bytes` reduction. `None` when the request named the
     /// quality (or the default stood).
     pub quality: Option<u8>,
+    /// Output dimensions in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Source dimensions in pixels, after EXIF orientation (the
+    /// dimensions the pipeline treats as the source).
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 /// What went wrong while processing an image.
@@ -133,6 +140,7 @@ impl Engine {
             img
         };
         let mut format = detected;
+        let (source_width, source_height) = (img.width(), img.height());
         // `no_upscale` is a request-wide directive, like the encoding
         // directives: wherever it appears, it caps every resize in
         // the request at the (oriented) source dimensions.
@@ -188,6 +196,10 @@ impl Engine {
             bytes,
             format,
             quality: chosen_quality,
+            width: img.width(),
+            height: img.height(),
+            source_width,
+            source_height,
         })
     }
 
@@ -200,6 +212,10 @@ impl Engine {
         frames: Vec<image::Frame>,
         ops: &[Operation],
     ) -> Result<ProcessedImage, EngineError> {
+        let (source_width, source_height) = {
+            let b = frames[0].buffer();
+            (b.width(), b.height())
+        };
         let first = frames[0].buffer();
         let cap = if crate::url::has_no_upscale(ops) {
             Some((first.width(), first.height()))
@@ -213,6 +229,10 @@ impl Engine {
             let (img, _) = apply_operations(img, ops, cap)?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
+        let (width, height) = out_frames
+            .first()
+            .map(|f| (f.buffer().width(), f.buffer().height()))
+            .unwrap_or((source_width, source_height));
         let mut out = Vec::new();
         image::codecs::gif::GifEncoder::new(&mut out)
             .encode_frames(out_frames)
@@ -221,6 +241,10 @@ impl Engine {
             bytes: out,
             format: ImageFormat::Gif,
             quality: None,
+            width,
+            height,
+            source_width,
+            source_height,
         })
     }
 }
@@ -1384,6 +1408,20 @@ mod tests {
         // The first frame is solid red.
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
+    }
+
+    #[test]
+    fn processed_image_reports_dimensions() {
+        let engine = Engine;
+        let src = png_bytes(&DynamicImage::new_rgb8(400, 200));
+        let out = engine
+            .process(
+                &src,
+                &[size_op(Dimension::Pixels(100), Dimension::Pixels(50))],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (100, 50));
+        assert_eq!((out.source_width, out.source_height), (400, 200));
     }
 
     #[test]
