@@ -54,6 +54,8 @@ pub struct AppState {
     /// is configured. `None` means `text(...)` requests fail
     /// cleanly.
     pub font: Option<Arc<dyn crate::text::TextRenderer>>,
+    /// Fallback image for source failures, when configured.
+    pub fallback: Option<Fallback>,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
@@ -89,6 +91,30 @@ fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<f32>().ok())
         .filter(|f| [1.0, 1.5, 2.0, 3.0].contains(f))
+}
+
+/// The operator-configured fallback image: processed and
+/// served in place of a source that cannot be loaded or
+/// decoded, so a dead origin degrades to a placeholder instead
+/// of a broken image.
+#[derive(Debug, Clone)]
+pub enum Fallback {
+    /// A local file, read once at boot.
+    Bytes(Arc<Vec<u8>>),
+    /// A URL, fetched per fallback event through the loader
+    /// (and its bounds and source policy).
+    Url(String),
+}
+
+/// The fallback's bytes, when one is configured and reachable.
+/// A URL fallback that itself fails to load yields `None`, and
+/// the caller answers with the original source error.
+async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
+    match &state.fallback {
+        Some(Fallback::Bytes(bytes)) => Some(bytes.as_ref().clone()),
+        Some(Fallback::Url(url)) => state.loader.load(url).await.ok(),
+        None => None,
+    }
 }
 
 async fn handle(
@@ -191,12 +217,30 @@ async fn serve(
 
     record.load_ran = true;
     let load_start = Instant::now();
+    let mut used_fallback = false;
     let bytes = match state.loader.load(source_url).await {
         Ok(b) => b,
         Err(e) => {
             record.load = load_start.elapsed();
-            record.fail = FailStage::Load;
-            return (load_error_response(e), record);
+            // A policy refusal (Forbidden) is a decision, not a
+            // failure: it never falls back. Any other load
+            // failure degrades to the configured fallback when
+            // there is one.
+            let fb = if matches!(e, LoadError::Forbidden(_)) {
+                None
+            } else {
+                fallback_source_bytes(state).await
+            };
+            match fb {
+                Some(b) => {
+                    used_fallback = true;
+                    b
+                }
+                None => {
+                    record.fail = FailStage::Load;
+                    return (load_error_response(e), record);
+                }
+            }
         }
     };
     record.load = load_start.elapsed();
@@ -260,19 +304,42 @@ async fn serve(
         text_renderer: state.font.as_deref(),
         dpr: dpr_hint,
     };
-    let processed = match state.engine.process_preferred(&bytes, &ops, ctx) {
+    let processed = match state.engine.process_preferred(&bytes, &ops, ctx.clone()) {
         Ok(p) => p,
         Err(e) => {
             record.process = process_start.elapsed();
-            record.fail = FailStage::Engine;
-            return (engine_error_response(e), record);
+            // A source that loads but does not decode is the
+            // other fallback case. Other engine errors are
+            // properties of the request or the configuration,
+            // not of the source, and stay honest.
+            let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
+                fallback_source_bytes(state)
+                    .await
+                    .and_then(|fb| state.engine.process_preferred(&fb, &ops, ctx).ok())
+            } else {
+                None
+            };
+            match retry {
+                Some(p) => {
+                    used_fallback = true;
+                    record.process = process_start.elapsed();
+                    p
+                }
+                None => {
+                    record.fail = FailStage::Engine;
+                    return (engine_error_response(e), record);
+                }
+            }
         }
     };
     record.process = process_start.elapsed();
 
     // Only successful responses are cached; errors never are.
     // Meta responses are not image entries and are not cached.
-    if !meta {
+    // Fallback responses are not cached either: the placeholder
+    // must never be stored as if it were the real image, so the
+    // origin gets retried on the next request.
+    if !meta && !used_fallback {
         state.cache.put(
             cache_key,
             CachedImage {
@@ -283,13 +350,18 @@ async fn serve(
         );
     }
     record.bytes_out = processed.bytes.len();
-    if meta {
-        return (meta_response(&processed), record);
+    let mut response = if meta {
+        meta_response(&processed)
+    } else {
+        respond(processed.format, processed.quality, processed.bytes)
+    };
+    if used_fallback {
+        record.fallback = true;
+        response
+            .headers_mut()
+            .insert("x-crabcrop-fallback", "1".parse().unwrap());
     }
-    (
-        respond(processed.format, processed.quality, processed.bytes),
-        record,
-    )
+    (response, record)
 }
 
 /// Pick a format from the client's `Accept` header, in negotiation
@@ -592,6 +664,40 @@ mod tests {
             upscale: None,
             face: None,
             font: None,
+            fallback: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// An app whose fallback image is the red 40x30 PNG the
+    /// fallback tests assert against.
+    async fn spawn_app_with_fallback() -> String {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            40,
+            30,
+            image::Rgb([255, 0, 0]),
+        ));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let state = AppState {
+            secret: SECRET.to_vec(),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            font: None,
+            fallback: Some(Fallback::Bytes(Arc::new(png))),
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -815,6 +921,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn fallback_serves_through_the_operations_on_a_dead_source() {
+        let base = spawn_app_with_fallback().await;
+        let (dead, hits) = spawn_counting_server(404, "image/png", test_png()).await;
+        let remainder = format!("20x15/{dead}");
+        let sig = sign(&remainder);
+        let url = format!("{base}/{sig}/{remainder}");
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-crabcrop-fallback").unwrap(), "1");
+        let bytes = resp.bytes().await.unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        // The operations ran on the fallback (red 40x30), not on
+        // anything the origin said.
+        assert_eq!((img.width(), img.height()), (20, 15));
+        assert_eq!(img.to_rgb8().get_pixel(10, 7), &image::Rgb([255, 0, 0]));
+        // Never cached: the origin is retried and the header
+        // appears again, instead of a cached placeholder being
+        // served as if it were the real image.
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.headers().get("x-crabcrop-fallback").unwrap(), "1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fallback_covers_undecodable_sources_but_not_bad_signatures() {
+        let base = spawn_app_with_fallback().await;
+        let (garbage, _) = spawn_counting_server(200, "image/png", b"not an image".to_vec()).await;
+        let remainder = format!("10x10/{garbage}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers().get("x-crabcrop-fallback").is_some());
+        // A bad signature stays an honest 403, no fallback.
+        let resp = client()
+            .get(format!("{base}/deadbeef/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert!(resp.headers().get("x-crabcrop-fallback").is_none());
     }
 
     #[tokio::test]
