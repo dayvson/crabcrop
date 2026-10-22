@@ -3,11 +3,24 @@
 //! [`Engine::process`] takes source bytes and the parsed [`Operation`]s,
 //! and returns the encoded output plus its format.
 
+use std::sync::Once;
+
 use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use crate::crop::crop_to_aspect;
 use crate::filters::apply_filters;
 use crate::url::{Dimension, ImageFormat, ImageSize, Operation};
+
+/// Register the JPEG XL decoder with the image crate, once.
+///
+/// The image crate has no JPEG XL support of its own; the jxl-rs
+/// integration hooks its format detection and decoder in globally.
+fn ensure_jxl_decoder() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        jxl_image_rs_integration::register_image_decoding_hook();
+    });
+}
 
 /// The encoded output plus its container format.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +52,7 @@ impl Engine {
     /// cannot be detected and no filter overrides it). A `crop:W×H`
     /// crops to the W:H aspect ratio and then resizes to exactly W×H.
     pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<ProcessedImage, EngineError> {
+        ensure_jxl_decoder();
         let mut img =
             image::load_from_memory(bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
         let mut format = detect_format(bytes);
@@ -86,6 +100,10 @@ impl Engine {
 /// The output container: detected source format, or JPEG when the
 /// source format is unknown or not one we emit.
 fn detect_format(bytes: &[u8]) -> ImageFormat {
+    // The image crate's guess_format does not know JPEG XL.
+    if is_jxl(bytes) {
+        return ImageFormat::Jxl;
+    }
     match image::guess_format(bytes) {
         Ok(image::ImageFormat::Jpeg) => ImageFormat::Jpeg,
         Ok(image::ImageFormat::Png) => ImageFormat::Png,
@@ -94,14 +112,36 @@ fn detect_format(bytes: &[u8]) -> ImageFormat {
     }
 }
 
-/// Encode `img` to `format`. `quality` applies to JPEG only.
+/// JPEG XL detection: the bare codestream signature, or the first
+/// bytes of the ISO BMFF container signature.
+fn is_jxl(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0x0A])
+        || bytes.starts_with(&[
+            0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
+        ])
+}
+
+/// Encode `img` to `format`. `quality` applies to JPEG and JPEG XL.
 fn encode(
     img: &DynamicImage,
     format: ImageFormat,
     quality: Option<u8>,
 ) -> Result<Vec<u8>, EngineError> {
-    let mut buf = Vec::new();
     let (w, h) = (img.width(), img.height());
+    if format == ImageFormat::Jxl {
+        // Pure-Rust encoder (jixel). Its quality is a libjpeg-like
+        // 0-100 scale, matching the quality filter's semantics.
+        let config = jixel::EncodeConfig::default().with_quality(quality.unwrap_or(80) as f32);
+        let encoded = if img.color().has_alpha() {
+            let rgba = img.to_rgba8();
+            jixel::encode_image_with_alpha(rgba.as_raw(), w as usize, h as usize, &config)
+        } else {
+            let rgb = img.to_rgb8();
+            jixel::encode_image(rgb.as_raw(), w as usize, h as usize, &config)
+        };
+        return encoded.map_err(|e| EngineError::Encode(e.to_string()));
+    }
+    let mut buf = Vec::new();
     let (pixels, color) = (img.as_bytes(), ExtendedColorType::from(img.color()));
     match format {
         ImageFormat::Jpeg => {
@@ -122,6 +162,7 @@ fn encode(
                 .write_image(pixels, w, h, color)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
+        ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
     }
     Ok(buf)
 }
@@ -427,5 +468,58 @@ mod tests {
         assert_eq!(out.format, ImageFormat::Png);
         assert!(out.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
         image::load_from_memory(&out.bytes).unwrap();
+    }
+
+    #[test]
+    fn jxl_format_encodes() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &gradient_png(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jxl);
+        // Bare codestream signature.
+        assert!(out.bytes.starts_with(&[0xFF, 0x0A]));
+    }
+
+    #[test]
+    fn jxl_source_decodes_and_round_trips() {
+        let engine = Engine;
+        let jxl = engine
+            .process(
+                &gradient_png(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])],
+            )
+            .unwrap();
+        // The JXL output becomes the source: resize with no format
+        // filter. Detection must keep JPEG XL and decoding must work.
+        let out = engine
+            .process(
+                &jxl.bytes,
+                &[size_op(Dimension::Pixels(16), Dimension::Pixels(16))],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jxl);
+        let decoded = image::load_from_memory(&out.bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (16, 16));
+    }
+
+    #[test]
+    fn jxl_quality_changes_size() {
+        let engine = Engine;
+        let mk = |q| {
+            engine
+                .process(
+                    &gradient_png(),
+                    &[Operation::Filters(vec![
+                        Filter::Quality(q),
+                        Filter::Format(ImageFormat::Jxl),
+                    ])],
+                )
+                .unwrap()
+        };
+        assert!(mk(95).bytes.len() > mk(10).bytes.len());
     }
 }
