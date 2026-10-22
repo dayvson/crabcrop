@@ -10,7 +10,7 @@ use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 use crate::crop::crop_to_aspect;
 use crate::filters::apply_filters;
 use crate::quality::auto_quality;
-use crate::url::{Dimension, ImageFormat, ImageSize, Operation, Quality};
+use crate::url::{Dimension, Filter, ImageFormat, ImageSize, Operation, Quality};
 
 /// Register the JPEG XL decoder with the image crate, once.
 ///
@@ -82,9 +82,37 @@ impl Engine {
         let mut format = detect_format(bytes);
         let mut explicit_format = false;
         let mut quality = None;
+        // `no_upscale` is a request-wide directive, like the encoding
+        // directives: wherever it appears, it caps every resize in
+        // the request at the (oriented) source dimensions.
+        let no_upscale = ops.iter().any(|op| match op {
+            Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::NoUpscale)),
+            _ => false,
+        });
+        let cap = if no_upscale {
+            Some((img.width(), img.height()))
+        } else {
+            None
+        };
         for op in ops {
             match op {
-                Operation::Size(size) => img = apply_size(img, size),
+                Operation::Size(size) => img = apply_size(img, size, cap),
+                Operation::FitIn(size) => img = apply_fit_in(img, size, cap),
+                Operation::CropRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                } => {
+                    if *right > img.width() || *bottom > img.height() {
+                        return Err(EngineError::Unsupported(format!(
+                            "crop-rect {left}x{top}:{right}x{bottom} exceeds image bounds {}x{}",
+                            img.width(),
+                            img.height()
+                        )));
+                    }
+                    img = img.crop_imm(*left, *top, right - left, bottom - top);
+                }
                 Operation::Crop { size, align } => {
                     let (tw, th) = match (size.width, size.height) {
                         (Dimension::Pixels(w), Dimension::Pixels(h)) => (w, h),
@@ -103,6 +131,7 @@ impl Engine {
                             flip_horizontal: false,
                             flip_vertical: false,
                         },
+                        cap,
                     );
                 }
                 Operation::Filters(filters) => {
@@ -254,9 +283,25 @@ fn encode(
     Ok(buf)
 }
 
+/// Shrink `(w, h)` proportionally to fit inside `cap`, if a cap is
+/// set and the size exceeds it. Never grows the size.
+fn cap_dimensions(w: u32, h: u32, cap: Option<(u32, u32)>) -> (u32, u32) {
+    let Some((cw, ch)) = cap else {
+        return (w, h);
+    };
+    if w <= cw && h <= ch {
+        return (w, h);
+    }
+    let scale = (cw as f64 / w as f64).min(ch as f64 / h as f64);
+    (
+        ((w as f64 * scale).round() as u32).max(1),
+        ((h as f64 * scale).round() as u32).max(1),
+    )
+}
+
 /// Resize `img` per `size`, honoring proportional/original dimensions
-/// and flips.
-fn apply_size(img: DynamicImage, size: &ImageSize) -> DynamicImage {
+/// and flips. `cap` (from `no_upscale`) bounds the result.
+fn apply_size(img: DynamicImage, size: &ImageSize, cap: Option<(u32, u32)>) -> DynamicImage {
     let (sw, sh) = (img.width(), img.height());
     let w = match size.width {
         Dimension::Pixels(n) => n,
@@ -274,6 +319,7 @@ fn apply_size(img: DynamicImage, size: &ImageSize) -> DynamicImage {
             _ => sh,
         },
     };
+    let (w, h) = cap_dimensions(w, h, cap);
     let mut img = if w == sw && h == sh {
         img
     } else {
@@ -287,6 +333,40 @@ fn apply_size(img: DynamicImage, size: &ImageSize) -> DynamicImage {
         img = img.flipv();
     }
     img
+}
+
+/// Scale proportionally to fit inside the `fit-in` box, preserving
+/// aspect and never distorting. A 0 dimension bounds nothing;
+/// `orig` bounds at the source dimension (a scale of 1).
+fn apply_fit_in(img: DynamicImage, size: &ImageSize, cap: Option<(u32, u32)>) -> DynamicImage {
+    let (sw, sh) = (img.width(), img.height());
+    let mut scale = f64::INFINITY;
+    match size.width {
+        Dimension::Pixels(n) => scale = scale.min(n as f64 / sw as f64),
+        Dimension::Original => scale = scale.min(1.0),
+        Dimension::Proportional => {}
+    }
+    match size.height {
+        Dimension::Pixels(n) => scale = scale.min(n as f64 / sh as f64),
+        Dimension::Original => scale = scale.min(1.0),
+        Dimension::Proportional => {}
+    }
+    if !scale.is_finite() {
+        return img;
+    }
+    let w = ((sw as f64 * scale).round() as u32).max(1);
+    let h = ((sh as f64 * scale).round() as u32).max(1);
+    let (w, h) = cap_dimensions(w, h, cap);
+    if w == sw && h == sh {
+        img
+    } else {
+        DynamicImage::ImageRgba8(image::imageops::resize(
+            &img,
+            w,
+            h,
+            image::imageops::FilterType::Lanczos3,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -824,6 +904,158 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Png);
+    }
+
+    fn fit_in_op(w: Dimension, h: Dimension) -> Operation {
+        Operation::FitIn(ImageSize {
+            width: w,
+            height: h,
+            flip_horizontal: false,
+            flip_vertical: false,
+        })
+    }
+
+    fn dims_of(out: &ProcessedImage) -> (u32, u32) {
+        let img = image::load_from_memory(&out.bytes).unwrap();
+        (img.width(), img.height())
+    }
+
+    #[test]
+    fn fit_in_fits_the_box_and_keeps_aspect() {
+        let engine = Engine;
+        let src = png_bytes(&DynamicImage::new_rgb8(400, 200));
+        // Both bounds: the tighter one rules.
+        let out = engine
+            .process(
+                &src,
+                &[fit_in_op(Dimension::Pixels(100), Dimension::Pixels(100))],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (100, 50));
+        // Single-axis bound.
+        let out = engine
+            .process(
+                &src,
+                &[fit_in_op(Dimension::Pixels(300), Dimension::Proportional)],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (300, 150));
+        // Upscaling is allowed without no_upscale.
+        let out = engine
+            .process(
+                &src,
+                &[fit_in_op(Dimension::Pixels(1000), Dimension::Pixels(1000))],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (1000, 500));
+    }
+
+    #[test]
+    fn crop_rect_extracts_the_exact_region() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        let out = engine
+            .process(
+                &src,
+                &[Operation::CropRect {
+                    left: 0,
+                    top: 0,
+                    right: 4,
+                    bottom: 2,
+                }],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert_eq!((img.width(), img.height()), (4, 2));
+        assert!(img.pixels().all(|p| p[0] == 255));
+        let out = engine
+            .process(
+                &src,
+                &[Operation::CropRect {
+                    left: 4,
+                    top: 2,
+                    right: 8,
+                    bottom: 4,
+                }],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().all(|p| p[0] == 0));
+    }
+
+    #[test]
+    fn crop_rect_out_of_bounds_is_an_error() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        let err = engine
+            .process(
+                &src,
+                &[Operation::CropRect {
+                    left: 0,
+                    top: 0,
+                    right: 9,
+                    bottom: 4,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn no_upscale_caps_every_resize_mode() {
+        let engine = Engine;
+        let src = png_bytes(&DynamicImage::new_rgb8(200, 200));
+        let directive = Operation::Filters(vec![Filter::NoUpscale]);
+        // Exact size, with the directive after the size on purpose:
+        // the cap is request-wide, not positional.
+        let out = engine
+            .process(
+                &src,
+                &[
+                    size_op(Dimension::Pixels(1000), Dimension::Pixels(500)),
+                    directive.clone(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (200, 100));
+        // Fit-in.
+        let out = engine
+            .process(
+                &src,
+                &[
+                    directive.clone(),
+                    fit_in_op(Dimension::Pixels(1000), Dimension::Pixels(1000)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (200, 200));
+        // Crop (aspect crop plus exact resize).
+        let out = engine
+            .process(
+                &src,
+                &[
+                    directive,
+                    Operation::Crop {
+                        size: ImageSize {
+                            width: Dimension::Pixels(500),
+                            height: Dimension::Pixels(500),
+                            flip_horizontal: false,
+                            flip_vertical: false,
+                        },
+                        align: Align::Center,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (200, 200));
+        // Sanity: without the directive the same size upscales freely.
+        let out = engine
+            .process(
+                &src,
+                &[size_op(Dimension::Pixels(1000), Dimension::Pixels(500))],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (1000, 500));
     }
 
     /// Timing reference for the issue thread; run explicitly with
