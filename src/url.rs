@@ -157,6 +157,9 @@ pub enum Filter {
     Equalize,
     /// Rotate by a multiple of 90 degrees.
     Rotate(i32),
+    /// Crop away the uniform border, keeping pixels that differ
+    /// from the corner color by more than this tolerance (0-255).
+    Trim(u8),
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Encoding directive: re-encode at lower quality until the
@@ -437,6 +440,11 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 Filter::Rgb(offsets[0], offsets[1], offsets[2])
             }
             ("equalize", None) => Filter::Equalize,
+            ("trim", None) => Filter::Trim(10),
+            ("trim", Some(p)) => {
+                let tolerance: u8 = p.parse().map_err(|_| invalid())?;
+                Filter::Trim(tolerance)
+            }
             ("rotate", Some(p)) => {
                 let degrees: i32 = p.parse().map_err(|_| invalid())?;
                 if degrees % 90 != 0 {
@@ -939,6 +947,16 @@ mod tests {
     fn parses_no_upscale() {
         let (ops, _) = parse_operations("filters:no_upscale/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::NoUpscale])]);
+    }
+
+    #[test]
+    fn parses_trim() {
+        let (ops, _) = parse_operations("filters:trim/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Trim(10)])]);
+        let (ops, _) = parse_operations("filters:trim(0)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Trim(0)])]);
+        assert!(parse_operations("filters:trim(256)/example.com/img.jpg").is_err());
+        assert!(parse_operations("filters:trim(-1)/example.com/img.jpg").is_err());
     }
 
     #[test]

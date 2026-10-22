@@ -1411,6 +1411,35 @@ mod tests {
     }
 
     #[test]
+    fn trim_composes_with_a_following_resize() {
+        let engine = Engine;
+        // 60x40 white with a centered black box, 20x20 at (20, 10).
+        let mut img = DynamicImage::new_rgb8(60, 40);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if (20..40).contains(&x) && (10..30).contains(&y) {
+                image::Rgb([0, 0, 0])
+            } else {
+                image::Rgb([255, 255, 255])
+            };
+        }
+        let src = png_bytes(&img);
+        let out = engine
+            .process(
+                &src,
+                &[
+                    Operation::Filters(vec![Filter::Trim(10)]),
+                    size_op(Dimension::Pixels(10), Dimension::Pixels(10)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (10, 10));
+        // Every output pixel is black: the resize saw only the
+        // trimmed box, not the white frame.
+        let decoded = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(decoded.pixels().all(|p| p[0] == 0));
+    }
+
+    #[test]
     fn processed_image_reports_dimensions() {
         let engine = Engine;
         let src = png_bytes(&DynamicImage::new_rgb8(400, 200));

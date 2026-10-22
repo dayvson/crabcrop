@@ -96,6 +96,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
                     _ => img,
                 };
             }
+            Filter::Trim(tolerance) => img = trim(img, *tolerance),
             Filter::Fill(color) => options.fill = Some(*color),
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::Quality(q) => options.quality = Some(*q),
@@ -104,6 +105,37 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
         }
     }
     (img, options)
+}
+
+/// Crop away the uniform border: keep the bounding box of
+/// pixels that differ from the top-left corner color by more
+/// than `tolerance` in any channel (alpha included). A fully
+/// uniform image is returned unchanged, never emptied.
+fn trim(img: DynamicImage, tolerance: u8) -> DynamicImage {
+    let rgba = img.to_rgba8();
+    let corner = *rgba.get_pixel(0, 0);
+    let tol = tolerance as i32;
+    let differs =
+        |p: &image::Rgba<u8>| (0..4).any(|c| (p[c] as i32 - corner[c] as i32).abs() > tol);
+    let (mut min_x, mut min_y) = (rgba.width(), rgba.height());
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    let mut found = false;
+    for (x, y, p) in rgba.enumerate_pixels() {
+        if differs(p) {
+            found = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if !found {
+        return img;
+    }
+    DynamicImage::ImageRgba8(
+        image::imageops::crop_imm(&rgba, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+            .to_image(),
+    )
 }
 
 /// Scale each pixel's distance from its luma by `amount`:
@@ -395,5 +427,56 @@ mod tests {
         // invert then brighten(10): (10 -> 245 -> 255).
         let (img, _) = apply_filters(solid(10, 10, 10), &[Filter::Invert, Filter::Brighten(10)]);
         assert_eq!(first_pixel(&img), [255, 255, 255]);
+    }
+
+    /// 40x30 `bg` with an `fg` rectangle at (10..30, 8..22).
+    fn bordered(bg: [u8; 3], fg: [u8; 3]) -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(40, 30);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if (10..30).contains(&x) && (8..22).contains(&y) {
+                Rgb(fg)
+            } else {
+                Rgb(bg)
+            };
+        }
+        img
+    }
+
+    #[test]
+    fn trim_crops_to_the_inner_box() {
+        let (img, _) = apply_filters(bordered([255, 255, 255], [255, 0, 0]), &[Filter::Trim(0)]);
+        assert_eq!((img.width(), img.height()), (20, 14));
+        assert_eq!(first_pixel(&img), [255, 0, 0]);
+    }
+
+    #[test]
+    fn trim_tolerance_decides_what_counts_as_border() {
+        // Corner 255, an inner ring of 245, black center 10..20.
+        let build = || {
+            let mut img = DynamicImage::new_rgb8(30, 30);
+            for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+                *p = if (10..20).contains(&x) && (10..20).contains(&y) {
+                    Rgb([0, 0, 0])
+                } else if (5..25).contains(&x) && (5..25).contains(&y) {
+                    Rgb([245, 245, 245])
+                } else {
+                    Rgb([255, 255, 255])
+                };
+            }
+            img
+        };
+        // Tolerance 10: the ring (10 away) is still border.
+        let (img, _) = apply_filters(build(), &[Filter::Trim(10)]);
+        assert_eq!((img.width(), img.height()), (10, 10));
+        // Tolerance 5: the ring is content.
+        let (img, _) = apply_filters(build(), &[Filter::Trim(5)]);
+        assert_eq!((img.width(), img.height()), (20, 20));
+    }
+
+    #[test]
+    fn trim_uniform_image_is_a_noop() {
+        let (img, _) = apply_filters(solid(77, 77, 77), &[Filter::Trim(10)]);
+        assert_eq!((img.width(), img.height()), (4, 4));
+        assert_eq!(first_pixel(&img), [77, 77, 77]);
     }
 }
