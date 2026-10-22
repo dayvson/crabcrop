@@ -57,6 +57,8 @@ pub enum EngineError {
     Unsupported(String),
     /// An AI model failed at inference time. Carries the cause.
     Inference(String),
+    /// A text overlay could not be rendered. Carries the cause.
+    Render(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -73,6 +75,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::Inference(cause) => {
                 write!(f, "AI inference failed: {cause}")
+            }
+            EngineError::Render(cause) => {
+                write!(f, "cannot render text overlay: {cause}")
             }
         }
     }
@@ -98,6 +103,8 @@ pub struct ProcessContext<'a> {
     pub upscale_provider: Option<&'a dyn crate::ai::UpscaleProvider>,
     /// Face provider for smart crops, when configured.
     pub face_provider: Option<&'a dyn crate::ai::FaceProvider>,
+    /// Text renderer, when a font is configured.
+    pub text_renderer: Option<&'a dyn crate::text::TextRenderer>,
 }
 
 /// Decodes, resizes, and encodes images.
@@ -164,6 +171,11 @@ impl Engine {
         if crate::url::has_upscale(ops) && ctx.upscale_provider.is_none() {
             return Err(EngineError::Unsupported(
                 "upscale is not configured on this server".to_string(),
+            ));
+        }
+        if crate::url::has_text(ops) && ctx.text_renderer.is_none() {
+            return Err(EngineError::Unsupported(
+                "text is not configured on this server (no font)".to_string(),
             ));
         }
         let img = if detected == ImageFormat::Gif {
@@ -469,6 +481,21 @@ fn apply_operations(
                                 )
                             })?;
                             img = upscale_image(img, *factor, provider)?;
+                        }
+                        Filter::Text {
+                            text,
+                            size,
+                            color,
+                            anchor,
+                        } => {
+                            let renderer = ctx.text_renderer.ok_or_else(|| {
+                                EngineError::Unsupported(
+                                    "text is not configured on this server (no font)".to_string(),
+                                )
+                            })?;
+                            img = renderer
+                                .draw(&img, text, *size, *color, *anchor)
+                                .map_err(EngineError::Render)?;
                         }
                         other => {
                             let (new_img, options) =
@@ -2022,6 +2049,71 @@ mod tests {
         assert_eq!((out.width, out.height), (50, 100));
         let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(result.get_pixel(25, 50), &image::Rgb([0, 0, 255]));
+    }
+
+    /// A renderer that stamps one white pixel at the origin:
+    /// proof of routing and ordering, nothing more.
+    #[derive(Debug)]
+    struct MarkerRenderer;
+
+    impl crate::text::TextRenderer for MarkerRenderer {
+        fn draw(
+            &self,
+            img: &DynamicImage,
+            _text: &str,
+            _size: u32,
+            _color: [u8; 4],
+            _anchor: crate::url::Anchor,
+        ) -> Result<DynamicImage, String> {
+            let mut out = img.to_rgba8();
+            out.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
+            Ok(DynamicImage::ImageRgba8(out))
+        }
+    }
+
+    fn text_op() -> Operation {
+        Operation::Filters(vec![Filter::Text {
+            text: "HI".to_string(),
+            size: 20,
+            color: [255, 255, 255, 255],
+            anchor: crate::url::Anchor::BottomRight,
+        }])
+    }
+
+    #[test]
+    fn text_routes_to_the_renderer_after_the_resize() {
+        let engine = Engine;
+        let ops = vec![
+            Operation::Size(ImageSize {
+                width: Dimension::Pixels(50),
+                height: Dimension::Pixels(50),
+                flip_horizontal: false,
+                flip_vertical: false,
+            }),
+            text_op(),
+        ];
+        let out = engine
+            .process_preferred(
+                &solid_png(100, 100, [0, 0, 0]),
+                &ops,
+                ProcessContext {
+                    text_renderer: Some(&MarkerRenderer),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (50, 50));
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert_eq!(result.get_pixel(0, 0), &image::Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn text_without_a_renderer_is_a_clean_error() {
+        let engine = Engine;
+        assert!(matches!(
+            engine.process(&solid_png(10, 10, [0, 0, 0]), &[text_op()]),
+            Err(EngineError::Unsupported(msg)) if msg.contains("text is not configured")
+        ));
     }
 
     #[test]

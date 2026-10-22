@@ -50,6 +50,10 @@ pub struct AppState {
     /// `CRABCROP_FACE_MODEL` is configured. `None` means smart
     /// crops use the saliency estimate.
     pub face: Option<Arc<dyn crate::ai::FaceProvider>>,
+    /// Text renderer, loaded at boot when `CRABCROP_FONT_PATH`
+    /// is configured. `None` means `text(...)` requests fail
+    /// cleanly.
+    pub font: Option<Arc<dyn crate::text::TextRenderer>>,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
@@ -227,6 +231,7 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
         mask_provider: state.removebg.as_deref(),
         upscale_provider: state.upscale.as_deref(),
         face_provider: state.face.as_deref(),
+        text_renderer: state.font.as_deref(),
     };
     let processed = match state.engine.process_preferred(&bytes, &ops, ctx) {
         Ok(p) => p,
@@ -448,6 +453,7 @@ fn engine_error_response(e: EngineError) -> Response {
         EngineError::Encode(cause) => (StatusCode::INTERNAL_SERVER_ERROR, cause),
         EngineError::Unsupported(what) => (StatusCode::BAD_REQUEST, what),
         EngineError::Inference(cause) => (StatusCode::INTERNAL_SERVER_ERROR, cause),
+        EngineError::Render(cause) => (StatusCode::INTERNAL_SERVER_ERROR, cause),
     };
     (status, message).into_response()
 }
@@ -558,6 +564,7 @@ mod tests {
             removebg: None,
             upscale: None,
             face: None,
+            font: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -781,6 +788,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn text_without_a_font_is_400() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:text(HI,20,ffffff,bottom-right)/{src}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("text is not configured"), "{body}");
     }
 
     #[tokio::test]

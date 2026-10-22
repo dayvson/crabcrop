@@ -113,6 +113,9 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // Upscaling is applied by the engine, which owns the
             // upscale provider. (Same routing.)
             Filter::Upscale(_) => {}
+            // Text is drawn by the engine, which owns the
+            // configured font renderer. (Same routing.)
+            Filter::Text { .. } => {}
             Filter::Fill(color) => options.fill = Some(*color),
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::Quality(q) => options.quality = Some(*q),

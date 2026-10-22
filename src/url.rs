@@ -109,6 +109,55 @@ pub enum Align {
     Smart,
 }
 
+/// Where a text overlay anchors: one of the nine grid points
+/// of the image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl Anchor {
+    fn parse(s: &str) -> Option<Anchor> {
+        Some(match s {
+            "top-left" => Anchor::TopLeft,
+            "top-center" => Anchor::TopCenter,
+            "top-right" => Anchor::TopRight,
+            "center-left" => Anchor::CenterLeft,
+            "center" => Anchor::Center,
+            "center-right" => Anchor::CenterRight,
+            "bottom-left" => Anchor::BottomLeft,
+            "bottom-center" => Anchor::BottomCenter,
+            "bottom-right" => Anchor::BottomRight,
+            _ => return None,
+        })
+    }
+
+    /// (is-left, is-center-x, is-right) style placement axes:
+    /// returns (horizontal, vertical) each in 0..=2 (start,
+    /// middle, end).
+    pub fn axes(self) -> (u8, u8) {
+        match self {
+            Anchor::TopLeft => (0, 0),
+            Anchor::TopCenter => (1, 0),
+            Anchor::TopRight => (2, 0),
+            Anchor::CenterLeft => (0, 1),
+            Anchor::Center => (1, 1),
+            Anchor::CenterRight => (2, 1),
+            Anchor::BottomLeft => (0, 2),
+            Anchor::BottomCenter => (1, 2),
+            Anchor::BottomRight => (2, 2),
+        }
+    }
+}
+
 /// Output image format requested by a `format(...)` filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -177,6 +226,14 @@ pub enum Filter {
     /// AI super-resolution by the given factor (2 or 4),
     /// backed by the server's upscale model.
     Upscale(u32),
+    /// Rendered text overlaid at one of the nine grid anchors.
+    /// The text is the percent-decoded label; color is RGBA.
+    Text {
+        text: String,
+        size: u32,
+        color: [u8; 4],
+        anchor: Anchor,
+    },
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Encoding directive: re-encode at lower quality until the
@@ -465,6 +522,32 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 }
                 Filter::Upscale(factor)
             }
+            ("text", Some(p)) => {
+                // <text>,<size>,<color>,<anchor>. The text is
+                // percent-encoded and may contain commas, so
+                // split from the right where the fixed fields
+                // are.
+                let parts: Vec<&str> = p.rsplitn(4, ',').collect();
+                if parts.len() != 4 {
+                    return Err(invalid());
+                }
+                let anchor = Anchor::parse(parts[0]).ok_or_else(invalid)?;
+                let color = parse_text_color(parts[1]).ok_or_else(invalid)?;
+                let size: u32 = parts[2].parse().map_err(|_| invalid())?;
+                if !(1..=1000).contains(&size) {
+                    return Err(invalid());
+                }
+                let text = percent_decode(parts[3]).ok_or_else(invalid)?;
+                if text.is_empty() {
+                    return Err(invalid());
+                }
+                Filter::Text {
+                    text,
+                    size,
+                    color,
+                    anchor,
+                }
+            }
             ("trim", None) => Filter::Trim(10),
             ("trim", Some(p)) => {
                 let tolerance: u8 = p.parse().map_err(|_| invalid())?;
@@ -602,6 +685,28 @@ pub fn has_smart_crop(ops: &[Operation]) -> bool {
                 ..
             }
         )
+    })
+}
+
+/// The `text(...)` color field: `rrggbb` (opaque) or
+/// `rrggbbaa`, as RGBA bytes.
+fn parse_text_color(s: &str) -> Option<[u8; 4]> {
+    if !matches!(s.len(), 6 | 8) {
+        return None;
+    }
+    let v = u32::from_str_radix(s, 16).ok()?;
+    if s.len() == 6 {
+        Some([(v >> 16) as u8, (v >> 8) as u8, v as u8, 255])
+    } else {
+        Some([(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8])
+    }
+}
+
+/// Whether any filters segment in `ops` requests `text`.
+pub fn has_text(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Text { .. })),
+        _ => false,
     })
 }
 
@@ -968,6 +1073,55 @@ mod tests {
                 parse_operations(&format!("{seg}/example.com/img.jpg")),
                 Err(ParseError::InvalidFilters(seg.to_string())),
                 "segment: {seg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_text_with_encoded_unicode_and_commas() {
+        let (ops, _) = parse_operations(
+            "filters:text(Hello%2C%20World!%20%E2%9C%93,32,ff8800,bottom-right)/example.com/i.png",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Text {
+                text: "Hello, World! ✓".to_string(),
+                size: 32,
+                color: [255, 136, 0, 255],
+                anchor: Anchor::BottomRight,
+            }])]
+        );
+        // An 8-digit color carries its own alpha.
+        let (ops, _) =
+            parse_operations("filters:text(X,10,ff880080,center)/example.com/i.png").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Text {
+                text: "X".to_string(),
+                size: 10,
+                color: [255, 136, 0, 128],
+                anchor: Anchor::Center,
+            }])]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_text_params() {
+        for bad in [
+            "filters:text(X,0,ff8800,center)",    // size 0
+            "filters:text(X,1001,ff8800,center)", // size too big
+            "filters:text(X,10,ff88,center)",     // short color
+            "filters:text(X,10,zzzzzz,center)",   // non-hex color
+            "filters:text(X,10,ff8800,middle)",   // unknown anchor
+            "filters:text(X,10,ff8800)",          // missing field
+            "filters:text(,10,ff8800,center)",    // empty text
+            "filters:text(%zz,10,ff8800,center)", // bad encoding
+        ] {
+            let path = format!("{bad}/example.com/i.png");
+            assert!(
+                matches!(parse_operations(&path), Err(ParseError::InvalidFilters(_))),
+                "input: {bad}"
             );
         }
     }
