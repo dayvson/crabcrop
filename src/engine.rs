@@ -9,7 +9,8 @@ use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use crate::crop::crop_to_aspect;
 use crate::filters::apply_filters;
-use crate::url::{Dimension, ImageFormat, ImageSize, Operation};
+use crate::quality::auto_quality;
+use crate::url::{Dimension, ImageFormat, ImageSize, Operation, Quality};
 
 /// Register the JPEG XL decoder with the image crate, once.
 ///
@@ -27,6 +28,9 @@ fn ensure_jxl_decoder() {
 pub struct ProcessedImage {
     pub bytes: Vec<u8>,
     pub format: ImageFormat,
+    /// The quality chosen for this output, set only when the request
+    /// asked for `quality(auto)` and content analysis picked one.
+    pub quality: Option<u8>,
 }
 
 /// What went wrong while processing an image.
@@ -92,8 +96,23 @@ impl Engine {
                 }
             }
         }
-        let bytes = encode(&img, format, quality)?;
-        Ok(ProcessedImage { bytes, format })
+        // Resolve the quality directive against the final image.
+        // `quality(auto)` is the only directive reported back: it is
+        // the one the caller did not choose themselves.
+        let (encode_quality, chosen_quality) = match quality {
+            Some(Quality::Value(q)) => (Some(q), None),
+            Some(Quality::Auto) => {
+                let q = auto_quality(&img);
+                (Some(q), Some(q))
+            }
+            None => (None, None),
+        };
+        let bytes = encode(&img, format, encode_quality)?;
+        Ok(ProcessedImage {
+            bytes,
+            format,
+            quality: chosen_quality,
+        })
     }
 }
 
@@ -205,7 +224,7 @@ fn apply_size(img: DynamicImage, size: &ImageSize) -> DynamicImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::url::{Align, Filter, ImageFormat};
+    use crate::url::{Align, Filter, ImageFormat, Quality};
     use image::GenericImageView;
 
     fn png_bytes(img: &DynamicImage) -> Vec<u8> {
@@ -396,7 +415,7 @@ mod tests {
         let filters = |q| {
             vec![Operation::Filters(vec![
                 Filter::Format(ImageFormat::Jpeg),
-                Filter::Quality(q),
+                Filter::Quality(Quality::Value(q)),
             ])]
         };
         let hi = engine.process(&gradient_png(), &filters(95)).unwrap();
@@ -514,12 +533,61 @@ mod tests {
                 .process(
                     &gradient_png(),
                     &[Operation::Filters(vec![
-                        Filter::Quality(q),
+                        Filter::Quality(Quality::Value(q)),
                         Filter::Format(ImageFormat::Jxl),
                     ])],
                 )
                 .unwrap()
         };
         assert!(mk(95).bytes.len() > mk(10).bytes.len());
+    }
+
+    fn flat_png() -> Vec<u8> {
+        png_bytes(&DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
+            120,
+            120,
+            image::Luma([128]),
+        )))
+    }
+
+    fn noise_png() -> Vec<u8> {
+        let mut state: u32 = 0x2545_F491;
+        let mut img = DynamicImage::new_rgb8(120, 120);
+        for p in img.as_mut_rgb8().unwrap().pixels_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *p = image::Rgb([(state >> 24) as u8, (state >> 16) as u8, state as u8]);
+        }
+        png_bytes(&img)
+    }
+
+    #[test]
+    fn auto_quality_resolves_and_reports() {
+        let engine = Engine;
+        let ops = &[Operation::Filters(vec![
+            Filter::Quality(Quality::Auto),
+            Filter::Format(ImageFormat::Jpeg),
+        ])];
+        let flat = engine.process(&flat_png(), ops).unwrap();
+        assert_eq!(flat.quality, Some(50));
+        let noisy = engine.process(&noise_png(), ops).unwrap();
+        let q = noisy.quality.expect("auto quality is reported");
+        assert!((50..=95).contains(&q), "chosen quality {q}");
+        assert!(q > flat.quality.unwrap());
+        // The detailed image ends up larger than the flat one.
+        assert!(noisy.bytes.len() > flat.bytes.len());
+    }
+
+    #[test]
+    fn explicit_quality_reports_nothing() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &gradient_png(),
+                &[Operation::Filters(vec![Filter::Quality(Quality::Value(
+                    70,
+                ))])],
+            )
+            .unwrap();
+        assert_eq!(out.quality, None);
     }
 }

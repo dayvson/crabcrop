@@ -74,6 +74,12 @@ async fn handle(State(state): State<AppState>, Path(path): Path<String>) -> Resp
         header::CACHE_CONTROL,
         "public, max-age=31536000, immutable".parse().unwrap(),
     );
+    if let Some(q) = processed.quality {
+        headers.insert(
+            axum::http::HeaderName::from_static("x-crabcrop-quality"),
+            q.to_string().parse().unwrap(),
+        );
+    }
     (headers, processed.bytes).into_response()
 }
 
@@ -205,6 +211,22 @@ mod tests {
         );
         let body = resp.bytes().await.unwrap();
         assert!(body.starts_with(&[0xFF, 0x0A]));
+    }
+
+    #[tokio::test]
+    async fn auto_quality_sets_header() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:quality(auto):format(jpeg)/{src}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The source image is solid black, so analysis picks the floor.
+        assert_eq!(resp.headers().get("x-crabcrop-quality").unwrap(), "50");
     }
 
     #[tokio::test]

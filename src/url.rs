@@ -92,6 +92,15 @@ pub enum ImageFormat {
     Jxl,
 }
 
+/// Encoding quality from a `quality(...)` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quality {
+    /// An explicit value, 0-100.
+    Value(u8),
+    /// Chosen per image by content analysis at encode time.
+    Auto,
+}
+
 /// One filter from a `filters:...` segment.
 ///
 /// `f32` parameters mean `Eq` cannot be derived; `PartialEq` is enough
@@ -110,8 +119,8 @@ pub enum Filter {
     Contrast(f32),
     /// Rotate the hue, in degrees.
     HueRotate(i32),
-    /// Encoding quality, 0-100.
-    Quality(u8),
+    /// Encoding quality.
+    Quality(Quality),
     /// Output container.
     Format(ImageFormat),
 }
@@ -279,11 +288,15 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 Filter::HueRotate(degrees)
             }
             ("quality", Some(p)) => {
-                let q: u8 = p.parse().map_err(|_| invalid())?;
-                if q > 100 {
-                    return Err(invalid());
+                if p == "auto" {
+                    Filter::Quality(Quality::Auto)
+                } else {
+                    let q: u8 = p.parse().map_err(|_| invalid())?;
+                    if q > 100 {
+                        return Err(invalid());
+                    }
+                    Filter::Quality(Quality::Value(q))
                 }
-                Filter::Quality(q)
             }
             ("format", Some(p)) => Filter::Format(parse_format(p).ok_or_else(invalid)?),
             _ => return Err(invalid()),
@@ -623,7 +636,7 @@ mod tests {
             ops,
             vec![Operation::Filters(vec![
                 Filter::Grayscale,
-                Filter::Quality(80),
+                Filter::Quality(Quality::Value(80)),
                 Filter::Format(ImageFormat::WebP),
             ])]
         );
@@ -636,6 +649,7 @@ mod tests {
             "filters:blur()",
             "filters:quality(200)",
             "filters:quality()",
+            "filters:quality(autoo)",
             "filters:grayscale(1)",
             "filters:format(bmp)",
             "filters:quality(80",
@@ -654,6 +668,15 @@ mod tests {
         assert_eq!(
             ops,
             vec![Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])]
+        );
+    }
+
+    #[test]
+    fn parses_auto_quality() {
+        let (ops, _) = parse_operations("filters:quality(auto)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Quality(Quality::Auto)])]
         );
     }
 
