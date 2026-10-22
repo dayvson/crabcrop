@@ -15,6 +15,8 @@ pub struct EncodeOptions {
     pub format: Option<ImageFormat>,
     /// Encoding quality directive. `None` means the encoder default.
     pub quality: Option<Quality>,
+    /// Cap every resize at the source dimensions.
+    pub no_upscale: bool,
 }
 
 /// Apply `filters` in order.
@@ -38,6 +40,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             }
             Filter::HueRotate(degrees) => img = img.huerotate(*degrees),
             Filter::Quality(q) => options.quality = Some(*q),
+            Filter::NoUpscale => options.no_upscale = true,
             Filter::Format(f) => options.format = Some(*f),
         }
     }
@@ -89,8 +92,16 @@ mod tests {
             EncodeOptions {
                 format: Some(ImageFormat::Jpeg),
                 quality: Some(Quality::Value(90)),
+                no_upscale: false,
             }
         );
+    }
+
+    #[test]
+    fn no_upscale_is_collected_as_a_directive() {
+        let img = DynamicImage::new_rgb8(8, 8);
+        let (_, opts) = apply_filters(img, &[Filter::NoUpscale]);
+        assert!(opts.no_upscale);
     }
 
     #[test]

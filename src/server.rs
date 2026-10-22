@@ -387,6 +387,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_fit_in() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("fit-in:30x30/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.bytes().await.unwrap();
+        let img = image::load_from_memory(&body).unwrap();
+        // 100x60 into a 30x30 box: width rules, aspect preserved.
+        assert_eq!((img.width(), img.height()), (30, 18));
+    }
+
+    #[tokio::test]
     async fn serves_jxl_when_asked() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;

@@ -38,6 +38,10 @@ pub enum ParseError {
     /// A `crop:...` segment did not match `crop:<WxH>[:<align>]`.
     /// Carries the offending segment.
     InvalidCrop(String),
+    /// A `crop-rect:...` segment did not match
+    /// `crop-rect:<left>x<top>:<right>x<bottom>` with right > left
+    /// and bottom > top. Carries the offending segment.
+    InvalidCropRect(String),
     /// A `filters:...` segment did not parse. Carries the offending
     /// segment.
     InvalidFilters(String),
@@ -124,6 +128,8 @@ pub enum Filter {
     Quality(Quality),
     /// Output container.
     Format(ImageFormat),
+    /// Cap every resize at the source dimensions.
+    NoUpscale,
 }
 
 /// One operation from the request path, in path order.
@@ -133,6 +139,16 @@ pub enum Operation {
     Size(ImageSize),
     /// Crop to a size with an alignment, before resize.
     Crop { size: ImageSize, align: Align },
+    /// Scale proportionally to fit inside a box (`fit-in:300x200`).
+    FitIn(ImageSize),
+    /// Cut an exact pixel rectangle
+    /// (`crop-rect:<left>x<top>:<right>x<bottom>`).
+    CropRect {
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+    },
     /// Filters applied in order after resize.
     Filters(Vec<Filter>),
 }
@@ -199,8 +215,14 @@ pub fn parse_signature(path: &str) -> Result<(Signature, &str), ParseError> {
 /// means it starts the source URL. A segment that claims to be an
 /// operation (`crop:` / `filters:` prefix) but is malformed is an error.
 fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
+    if let Some(rest) = seg.strip_prefix("crop-rect:") {
+        return Some(parse_crop_rect(rest, seg));
+    }
     if let Some(rest) = seg.strip_prefix("crop:") {
         return Some(parse_crop(rest, seg));
+    }
+    if let Some(rest) = seg.strip_prefix("fit-in:") {
+        return Some(parse_fit_in(rest, seg));
     }
     if let Some(rest) = seg.strip_prefix("filters:") {
         return Some(parse_filters(rest, seg));
@@ -209,6 +231,42 @@ fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
         Ok(size) => Some(Ok(Operation::Size(size))),
         Err(_) => None,
     }
+}
+
+/// Parse the box after `fit-in:`. Flips make no sense when fitting,
+/// so a flipped size is invalid here.
+fn parse_fit_in(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let invalid = || ParseError::InvalidSize(seg.to_string());
+    let size = parse_size(rest).map_err(|_| invalid())?;
+    if size.flip_horizontal || size.flip_vertical {
+        return Err(invalid());
+    }
+    Ok(Operation::FitIn(size))
+}
+
+/// Parse `<left>x<top>:<right>x<bottom>` after `crop-rect:`.
+/// Ordering is validated here; bounds against the actual image are
+/// the engine's job, since they depend on the source.
+fn parse_crop_rect(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let invalid = || ParseError::InvalidCropRect(seg.to_string());
+    let (lt, rb) = rest.split_once(':').ok_or_else(invalid)?;
+    let (left, top) = parse_point(lt).ok_or_else(invalid)?;
+    let (right, bottom) = parse_point(rb).ok_or_else(invalid)?;
+    if right <= left || bottom <= top {
+        return Err(invalid());
+    }
+    Ok(Operation::CropRect {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+/// Parse an `<x>x<y>` point with unsigned coordinates.
+fn parse_point(s: &str) -> Option<(u32, u32)> {
+    let (x, y) = s.split_once('x')?;
+    Some((x.parse().ok()?, y.parse().ok()?))
 }
 
 fn parse_align(s: &str) -> Option<Align> {
@@ -267,6 +325,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
         let filter = match (name, params) {
             ("grayscale", None) => Filter::Grayscale,
             ("invert", None) => Filter::Invert,
+            ("no_upscale", None) => Filter::NoUpscale,
             ("blur", Some(p)) => {
                 let sigma: f32 = p.parse().map_err(|_| invalid())?;
                 if !sigma.is_finite() || sigma <= 0.0 {
@@ -689,6 +748,76 @@ mod tests {
             ops,
             vec![Operation::Filters(vec![Filter::Format(ImageFormat::Avif)])]
         );
+    }
+
+    #[test]
+    fn parses_fit_in() {
+        let (ops, _) = parse_operations("fit-in:300x200/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::FitIn(ImageSize {
+                width: Dimension::Pixels(300),
+                height: Dimension::Pixels(200),
+                flip_horizontal: false,
+                flip_vertical: false,
+            })]
+        );
+        let (ops, _) = parse_operations("fit-in:300x0/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::FitIn(ImageSize {
+                width: Dimension::Pixels(300),
+                height: Dimension::Proportional,
+                flip_horizontal: false,
+                flip_vertical: false,
+            })]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_fit_in() {
+        for seg in ["fit-in:-300x200", "fit-in:wide", "fit-in:"] {
+            let path = format!("{seg}/example.com/img.jpg");
+            assert!(parse_operations(&path).is_err(), "{seg}");
+        }
+    }
+
+    #[test]
+    fn parses_crop_rect() {
+        let (ops, _) = parse_operations("crop-rect:10x20:110x220/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::CropRect {
+                left: 10,
+                top: 20,
+                right: 110,
+                bottom: 220,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_crop_rect() {
+        for seg in [
+            "crop-rect:10x20",
+            "crop-rect:110x220:10x20",
+            "crop-rect:10x20:10x220",
+            "crop-rect:10x20:110x20",
+            "crop-rect:-1x0:10x10",
+            "crop-rect:axbx:cxdx",
+        ] {
+            let path = format!("{seg}/example.com/img.jpg");
+            assert!(
+                matches!(parse_operations(&path), Err(ParseError::InvalidCropRect(_))),
+                "{seg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_no_upscale() {
+        let (ops, _) = parse_operations("filters:no_upscale/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::NoUpscale])]);
     }
 
     #[test]
