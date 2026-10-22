@@ -2,7 +2,9 @@
 //!
 //! `GET /<signature>/<operations...>/<image-url>` verifies the
 //! signature, loads the source image, runs the engine, and responds
-//! with the optimized bytes. `GET /health` is the health check and
+//! with the optimized bytes. When the URL names no format, the
+//! response format is negotiated from the request's `Accept`
+//! header. `GET /health` is the health check and
 //! `GET /metrics` serves Prometheus metrics. Every image request
 //! leaves one structured JSON log line and one metrics update.
 
@@ -12,7 +14,7 @@ use std::time::Instant;
 use axum::{
     Router,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -21,7 +23,7 @@ use crate::cache::{Cache, CachedImage};
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
-use crate::url::{ImageFormat, parse_operations, parse_signature, verify};
+use crate::url::{Filter, ImageFormat, Operation, parse_operations, parse_signature, verify};
 
 /// Shared state for the handlers.
 #[derive(Debug, Clone)]
@@ -59,9 +61,17 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn handle(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+async fn handle(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let started = Instant::now();
-    let (response, mut record) = serve(&state, &path).await;
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let (response, mut record) = serve(&state, &path, accept.as_deref()).await;
     record.status = response.status().as_u16();
     record.total = started.elapsed();
     state.metrics.record(&record);
@@ -70,7 +80,7 @@ async fn handle(State(state): State<AppState>, Path(path): Path<String>) -> Resp
 }
 
 /// Run one image request, timing each stage into the returned record.
-async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
+async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response, RequestRecord) {
     let mut record = RequestRecord::default();
     let full = format!("/{path}");
 
@@ -96,9 +106,24 @@ async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
         .trim_end_matches('/')
         .to_string();
 
+    // Without an explicit format in the URL, the response depends
+    // on the Accept class as well as the path, so the cache key
+    // carries the class. Explicit-format URLs key on the path alone.
+    let preferred = negotiate_format(accept);
+    let cache_key = if has_explicit_format(&ops) {
+        rest.to_string()
+    } else {
+        let class = match preferred {
+            Some(ImageFormat::Avif) => "avif",
+            Some(ImageFormat::WebP) => "webp",
+            _ => "source",
+        };
+        format!("{rest}#{class}")
+    };
+
     // The verified path is content-addressed: a stored response can
     // be served without touching the loader or the engine.
-    if let Some(hit) = state.cache.get(rest) {
+    if let Some(hit) = state.cache.get(&cache_key) {
         record.cache_hit = true;
         record.bytes_out = hit.bytes.len();
         return (respond(hit.format, hit.quality, hit.bytes), record);
@@ -119,7 +144,7 @@ async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
 
     record.process_ran = true;
     let process_start = Instant::now();
-    let processed = match state.engine.process(&bytes, &ops) {
+    let processed = match state.engine.process_preferred(&bytes, &ops, preferred) {
         Ok(p) => p,
         Err(e) => {
             record.process = process_start.elapsed();
@@ -131,7 +156,7 @@ async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
 
     // Only successful responses are cached; errors never are.
     state.cache.put(
-        rest.to_string(),
+        cache_key,
         CachedImage {
             bytes: processed.bytes.clone(),
             format: processed.format,
@@ -145,6 +170,50 @@ async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
     )
 }
 
+/// Pick a format from the client's `Accept` header, in negotiation
+/// order: AVIF first, then WebP. `None` keeps the detected source
+/// format. A format the client explicitly refuses (q=0) is never
+/// picked, and wildcards do not count as an offer: a bare `*/*` from
+/// a generic HTTP client should not trigger the expensive AVIF
+/// encode.
+fn negotiate_format(accept: Option<&str>) -> Option<ImageFormat> {
+    let accept = accept?;
+    let (mut avif, mut webp) = (false, false);
+    for part in accept.split(',') {
+        let mut segments = part.split(';');
+        let media = segments.next().unwrap_or("").trim();
+        let refused = segments.any(|p| {
+            p.trim()
+                .strip_prefix("q=")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .is_some_and(|q| q == 0.0)
+        });
+        if refused {
+            continue;
+        }
+        match media {
+            "image/avif" => avif = true,
+            "image/webp" => webp = true,
+            _ => {}
+        }
+    }
+    if avif {
+        Some(ImageFormat::Avif)
+    } else if webp {
+        Some(ImageFormat::WebP)
+    } else {
+        None
+    }
+}
+
+/// Whether the operations name an output format explicitly.
+fn has_explicit_format(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Format(_))),
+        _ => false,
+    })
+}
+
 /// Build a successful image response: content type, immutable cache
 /// headers, and the auto-quality header when quality was chosen.
 fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response {
@@ -153,6 +222,7 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
         ImageFormat::Png => "image/png",
         ImageFormat::WebP => "image/webp",
         ImageFormat::Jxl => "image/jxl",
+        ImageFormat::Avif => "image/avif",
     };
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
@@ -160,6 +230,8 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
         header::CACHE_CONTROL,
         "public, max-age=31536000, immutable".parse().unwrap(),
     );
+    // The format may have been negotiated from the request's Accept.
+    headers.insert(header::VARY, "Accept".parse().unwrap());
     if let Some(q) = quality {
         headers.insert(
             axum::http::HeaderName::from_static("x-crabcrop-quality"),
@@ -448,6 +520,115 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         }
         // Both attempts reached the source: nothing was cached.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn negotiates_avif_from_accept() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("accept", "image/avif,image/webp,*/*")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/avif"
+        );
+        assert_eq!(resp.headers().get(header::VARY).unwrap(), "Accept");
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(&body[4..8], b"ftyp");
+    }
+
+    #[tokio::test]
+    async fn negotiates_webp_from_accept() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("accept", "image/webp")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/webp"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_accept_keeps_source_format() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiation_respects_refusal() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("accept", "image/avif;q=0, image/webp")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/webp"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_format_beats_accept() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(jpeg)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("accept", "image/avif")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_classes_have_separate_cache_entries() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let types = ["image/avif", "image/webp", "image/avif"];
+        let expected = ["image/avif", "image/webp", "image/avif"];
+        for (accept, want) in types.iter().zip(expected) {
+            let resp = client()
+                .get(&url)
+                .header("accept", *accept)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), want);
+        }
+        // Two fetches: one per Accept class; the repeat was cached.
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
