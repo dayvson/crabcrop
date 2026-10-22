@@ -56,6 +56,9 @@ pub struct AppState {
     pub font: Option<Arc<dyn crate::text::TextRenderer>>,
     /// Fallback image for source failures, when configured.
     pub fallback: Option<Fallback>,
+    /// Disk-backed result storage, the persistent tier under
+    /// the memory cache, when configured.
+    pub store: Option<Arc<crate::storage::DiskStore>>,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
@@ -66,6 +69,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/purge/{*path}", axum::routing::post(purge_handle))
         .route("/{*path}", get(handle))
         .with_state(state)
 }
@@ -115,6 +119,32 @@ async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
         Some(Fallback::Url(url)) => state.loader.load(url).await.ok(),
         None => None,
     }
+}
+
+/// `POST /purge/<signature>/<path>`: invalidate every stored
+/// variant of one result. The signature is the HMAC scheme over
+/// the literal remainder `purge/<path>`, so only the secret
+/// holder can purge; a bad signature is a 403 and purges
+/// nothing. Idempotent: purging an absent entry answers 200
+/// with a count of 0.
+async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+    let Some(tail) = uri.path().strip_prefix("/purge/") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let full = format!("/{tail}");
+    let (signature, target) = match parse_signature(&full) {
+        Ok(v) => v,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let remainder = format!("purge/{target}");
+    if !verify(&state.secret, &signature, &remainder, state.allow_unsafe) {
+        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+    }
+    let mut removed = state.cache.purge_matching(target);
+    if let Some(store) = &state.store {
+        removed += store.purge_matching(target);
+    }
+    (StatusCode::OK, format!("purged {removed}\n")).into_response()
 }
 
 async fn handle(
@@ -208,6 +238,22 @@ async fn serve(
         None
     } else {
         state.cache.get(&cache_key)
+    };
+    // Memory first, disk second: a disk hit is promoted into
+    // memory so the next repeat skips the file read.
+    let hit = match hit {
+        Some(h) => Some(h),
+        None if meta => None,
+        None => match &state.store {
+            Some(store) => {
+                let found = store.get(&cache_key);
+                if let Some(image) = &found {
+                    state.cache.put(cache_key.clone(), image.clone());
+                }
+                found
+            }
+            None => None,
+        },
     };
     if let Some(hit) = hit {
         record.cache_hit = true;
@@ -340,14 +386,15 @@ async fn serve(
     // must never be stored as if it were the real image, so the
     // origin gets retried on the next request.
     if !meta && !used_fallback {
-        state.cache.put(
-            cache_key,
-            CachedImage {
-                bytes: processed.bytes.clone(),
-                format: processed.format,
-                quality: processed.quality,
-            },
-        );
+        let entry = CachedImage {
+            bytes: processed.bytes.clone(),
+            format: processed.format,
+            quality: processed.quality,
+        };
+        state.cache.put(cache_key.clone(), entry.clone());
+        if let Some(store) = &state.store {
+            store.put(&cache_key, &entry);
+        }
     }
     record.bytes_out = processed.bytes.len();
     let mut response = if meta {
@@ -665,6 +712,7 @@ mod tests {
             face: None,
             font: None,
             fallback: None,
+            store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -698,6 +746,7 @@ mod tests {
             face: None,
             font: None,
             fallback: Some(Fallback::Bytes(Arc::new(png))),
+            store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -921,6 +970,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// An app with disk result storage rooted at `dir`.
+    async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
+        let state = AppState {
+            secret: SECRET.to_vec(),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            font: None,
+            fallback: None,
+            store: Some(Arc::new(
+                crate::storage::DiskStore::open(dir, 16 * 1024 * 1024).unwrap(),
+            )),
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn disk_results_survive_a_fresh_instance_and_purge_invalidates() {
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let remainder = format!("25x25/{src}");
+        let sig = sign(&remainder);
+        let url_path = format!("{sig}/{remainder}");
+        // First instance: processes and stores to disk.
+        let base1 = spawn_app_with_storage(&dir).await;
+        let resp = client()
+            .get(format!("{base1}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Second instance, cold memory, same directory: the
+        // disk tier answers and the origin is not touched.
+        let base2 = spawn_app_with_storage(&dir).await;
+        let resp = client()
+            .get(format!("{base2}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "served from disk");
+        // A purge with a bad signature is a 403 and removes
+        // nothing.
+        let bad = client()
+            .post(format!("{base2}/purge/deadbeef/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 403);
+        let resp = client()
+            .get(format!("{base2}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // A correctly signed purge removes it from both tiers,
+        // so the next request refetches the origin.
+        let purge_sig = sign(&format!("purge/{remainder}"));
+        let ok = client()
+            .post(format!("{base2}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        assert!(ok.text().await.unwrap().contains("purged 2"));
+        let resp = client()
+            .get(format!("{base2}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "purged: origin refetched");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

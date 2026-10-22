@@ -54,6 +54,28 @@ impl Cache {
         Some(image)
     }
 
+    /// Remove every entry equal to `base` or carrying it as a
+    /// `#`-suffixed prefix (the cache's variant keys). Returns
+    /// how many entries were removed.
+    pub fn purge_matching(&self, base: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let keys: Vec<String> = inner
+            .entries
+            .keys()
+            .filter(|k| k.as_str() == base || k.starts_with(&format!("{base}#")))
+            .cloned()
+            .collect();
+        let mut removed = 0;
+        for key in keys {
+            if let Some(old) = inner.entries.remove(&key) {
+                inner.total_bytes -= old.bytes.len();
+                remove_from_order(&mut inner, &key);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Store `image` under `key`, evicting least recently used
     /// entries until it fits. Entries larger than the whole budget
     /// are not stored.
