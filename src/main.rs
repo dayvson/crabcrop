@@ -27,6 +27,9 @@
 //!   the filter (requests fail cleanly).
 //! - `CRABCROP_UPSCALE_MODEL`: path to a super-resolution ONNX
 //!   model for the `upscale` filter. Same preload rule.
+//! - `CRABCROP_FACE_MODEL`: path to a YuNet ONNX model for
+//!   face-aware smart crops. Same preload rule; unset means
+//!   smart crops use the saliency estimate.
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
 //! - `PORT`: listen port, default 3000.
@@ -132,6 +135,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => None,
         };
+    let face: Option<Arc<dyn crate::ai::FaceProvider>> = match env::var("CRABCROP_FACE_MODEL") {
+        Ok(path) if !path.is_empty() => {
+            let provider = crate::ai::OnnxFaceProvider::load(ort_dylib.as_deref(), &path)
+                .map_err(|e| format!("cannot load the face detection model: {e}"))?;
+            println!("face detection model loaded from {path}");
+            Some(Arc::new(provider))
+        }
+        _ => None,
+    };
 
     let state = AppState {
         secret,
@@ -144,6 +156,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         cache: Arc::new(Cache::new(cache_bytes)),
         removebg,
         upscale,
+        face,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;

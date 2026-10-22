@@ -46,6 +46,10 @@ pub struct AppState {
     /// `CRABCROP_UPSCALE_MODEL` is configured. `None` means the
     /// feature is off; `upscale` requests then fail cleanly.
     pub upscale: Option<Arc<dyn crate::ai::UpscaleProvider>>,
+    /// Face provider for smart crops, preloaded at boot when
+    /// `CRABCROP_FACE_MODEL` is configured. `None` means smart
+    /// crops use the saliency estimate.
+    pub face: Option<Arc<dyn crate::ai::FaceProvider>>,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
@@ -201,7 +205,10 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
     let process_start = Instant::now();
     // AI inference is gated process-wide: a burst of removebg
     // requests must not starve the transform pipeline.
-    let _ai_permit = if crate::url::has_removebg(&ops) || crate::url::has_upscale(&ops) {
+    let _ai_permit = if crate::url::has_removebg(&ops)
+        || crate::url::has_upscale(&ops)
+        || crate::url::has_smart_crop(&ops)
+    {
         Some(
             state
                 .ai_gate
@@ -219,6 +226,7 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
         placeholders,
         mask_provider: state.removebg.as_deref(),
         upscale_provider: state.upscale.as_deref(),
+        face_provider: state.face.as_deref(),
     };
     let processed = match state.engine.process_preferred(&bytes, &ops, ctx) {
         Ok(p) => p,
@@ -549,6 +557,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            face: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
