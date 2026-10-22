@@ -16,6 +16,8 @@ ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
 jxl-image-rs-integration = "0.8"
 kamadak-exif = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+resvg = "0.45"
+roxmltree = "0.20"
 sha2 = "0.10"
 image = { version = "0.25", features = ["avif"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
