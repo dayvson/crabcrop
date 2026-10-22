@@ -105,6 +105,9 @@ pub struct ProcessContext<'a> {
     pub face_provider: Option<&'a dyn crate::ai::FaceProvider>,
     /// Text renderer, when a font is configured.
     pub text_renderer: Option<&'a dyn crate::text::TextRenderer>,
+    /// DPR fallback from the request's client hint, used when
+    /// the URL carries no explicit `dpr` directive.
+    pub dpr: Option<f32>,
 }
 
 /// Decodes, resizes, and encodes images.
@@ -222,7 +225,7 @@ impl Engine {
         } else {
             None
         };
-        let (img, directives) = apply_operations(img, ops, cap, &ctx)?;
+        let (img, directives) = apply_operations(img, ops, cap, dpr_factor(ops, &ctx), &ctx)?;
         // Placeholders describe the final pixels, so they are
         // computed here, before encoding.
         let placeholder = if ctx.placeholders {
@@ -304,11 +307,12 @@ impl Engine {
         } else {
             None
         };
+        let dpr = dpr_factor(ops, ctx);
         let mut out_frames = Vec::with_capacity(frames.len());
         for frame in frames {
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _) = apply_operations(img, ops, cap, ctx)?;
+            let (img, _) = apply_operations(img, ops, cap, dpr, ctx)?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
         let (width, height) = out_frames
@@ -403,17 +407,24 @@ fn upscale_image(
 /// Apply the operations to one image, collecting the encoding
 /// directives along the way. Shared by the still pipeline and
 /// the animated-GIF path, which runs it once per frame.
+/// The effective DPR factor: an explicit `dpr(...)` directive
+/// wins, then the client hint carried on the context, else 1.
+fn dpr_factor(ops: &[Operation], ctx: &ProcessContext<'_>) -> f32 {
+    crate::url::explicit_dpr(ops).or(ctx.dpr).unwrap_or(1.0)
+}
+
 fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
+    dpr: f32,
     ctx: &ProcessContext<'_>,
 ) -> Result<(DynamicImage, EncodeOptions), EngineError> {
     let mut directives = EncodeOptions::default();
     for op in ops {
         match op {
-            Operation::Size(size) => img = apply_size(img, size, cap),
-            Operation::FitIn(size) => img = apply_fit_in(img, size, cap),
+            Operation::Size(size) => img = apply_size(img, size, cap, dpr),
+            Operation::FitIn(size) => img = apply_fit_in(img, size, cap, dpr),
             Operation::CropRect {
                 left,
                 top,
@@ -431,7 +442,9 @@ fn apply_operations(
             }
             Operation::Crop { size, align } => {
                 let (tw, th) = match (size.width, size.height) {
-                    (Dimension::Pixels(w), Dimension::Pixels(h)) => (w, h),
+                    (Dimension::Pixels(w), Dimension::Pixels(h)) => {
+                        (scale_px(w, dpr), scale_px(h, dpr))
+                    }
                     _ => {
                         return Err(EngineError::Unsupported(
                             "crop with non-pixel dimensions".to_string(),
@@ -448,6 +461,7 @@ fn apply_operations(
                         flip_vertical: false,
                     },
                     cap,
+                    1.0,
                 );
             }
             Operation::Filters(filters) => {
@@ -753,9 +767,42 @@ fn cap_dimensions(w: u32, h: u32, cap: Option<(u32, u32)>) -> (u32, u32) {
     )
 }
 
+/// One pixel target under DPR: whole pixels, never zero.
+/// A factor of 1 returns the input unchanged.
+fn scale_px(n: u32, dpr: f32) -> u32 {
+    if dpr == 1.0 {
+        n
+    } else {
+        ((n as f32 * dpr).round() as u32).max(1)
+    }
+}
+
+/// DPR applies to pixel targets only: `orig` already means the
+/// source dimension and proportional dimensions derive from
+/// the dimension they follow (which is scaled itself).
+fn scale_dimension(d: Dimension, dpr: f32) -> Dimension {
+    match d {
+        Dimension::Pixels(n) => Dimension::Pixels(scale_px(n, dpr)),
+        other => other,
+    }
+}
+
 /// Resize `img` per `size`, honoring proportional/original dimensions
-/// and flips. `cap` (from `no_upscale`) bounds the result.
-fn apply_size(img: DynamicImage, size: &ImageSize, cap: Option<(u32, u32)>) -> DynamicImage {
+/// and flips. Pixel targets are DPR-scaled first; `cap` (from
+/// `no_upscale`) bounds the result afterwards, so DPR can never
+/// push past the source when the cap is set.
+fn apply_size(
+    img: DynamicImage,
+    size: &ImageSize,
+    cap: Option<(u32, u32)>,
+    dpr: f32,
+) -> DynamicImage {
+    let size = &ImageSize {
+        width: scale_dimension(size.width, dpr),
+        height: scale_dimension(size.height, dpr),
+        flip_horizontal: size.flip_horizontal,
+        flip_vertical: size.flip_vertical,
+    };
     let (sw, sh) = (img.width(), img.height());
     let w = match size.width {
         Dimension::Pixels(n) => n,
@@ -792,7 +839,18 @@ fn apply_size(img: DynamicImage, size: &ImageSize, cap: Option<(u32, u32)>) -> D
 /// Scale proportionally to fit inside the `fit-in` box, preserving
 /// aspect and never distorting. A 0 dimension bounds nothing;
 /// `orig` bounds at the source dimension (a scale of 1).
-fn apply_fit_in(img: DynamicImage, size: &ImageSize, cap: Option<(u32, u32)>) -> DynamicImage {
+fn apply_fit_in(
+    img: DynamicImage,
+    size: &ImageSize,
+    cap: Option<(u32, u32)>,
+    dpr: f32,
+) -> DynamicImage {
+    let size = &ImageSize {
+        width: scale_dimension(size.width, dpr),
+        height: scale_dimension(size.height, dpr),
+        flip_horizontal: size.flip_horizontal,
+        flip_vertical: size.flip_vertical,
+    };
     let (sw, sh) = (img.width(), img.height());
     let mut scale = f64::INFINITY;
     match size.width {
@@ -2078,6 +2136,104 @@ mod tests {
             color: [255, 255, 255, 255],
             anchor: crate::url::Anchor::BottomRight,
         }])
+    }
+
+    #[test]
+    fn dpr_scales_size_and_crop_targets() {
+        let engine = Engine;
+        let src = solid_png(100, 100, [9, 9, 9]);
+        let dims = |ops: &[Operation]| {
+            let out = engine.process(&src, ops).unwrap();
+            (out.width, out.height)
+        };
+        // dpr(2) doubles the size target.
+        assert_eq!(
+            dims(&[
+                size_op(Dimension::Pixels(25), Dimension::Pixels(25)),
+                Operation::Filters(vec![Filter::Dpr(2.0)])
+            ]),
+            (50, 50)
+        );
+        // A fractional factor rounds to whole pixels: 33 * 1.5.
+        assert_eq!(
+            dims(&[
+                size_op(Dimension::Pixels(33), Dimension::Pixels(33)),
+                Operation::Filters(vec![Filter::Dpr(1.5)])
+            ]),
+            (50, 50)
+        );
+        // dpr(1) is a no-op.
+        assert_eq!(
+            dims(&[
+                size_op(Dimension::Pixels(25), Dimension::Pixels(25)),
+                Operation::Filters(vec![Filter::Dpr(1.0)])
+            ]),
+            (25, 25)
+        );
+        // Crop targets scale too.
+        assert_eq!(
+            dims(&[
+                Operation::Crop {
+                    size: ImageSize {
+                        width: Dimension::Pixels(25),
+                        height: Dimension::Pixels(30),
+                        flip_horizontal: false,
+                        flip_vertical: false,
+                    },
+                    align: Align::Center,
+                },
+                Operation::Filters(vec![Filter::Dpr(2.0)]),
+            ]),
+            (50, 60)
+        );
+    }
+
+    #[test]
+    fn dpr_runs_into_the_no_upscale_cap_not_past_it() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &solid_png(60, 60, [9, 9, 9]),
+                &[
+                    size_op(Dimension::Pixels(50), Dimension::Pixels(50)),
+                    Operation::Filters(vec![Filter::Dpr(2.0), Filter::NoUpscale]),
+                ],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (60, 60));
+    }
+
+    #[test]
+    fn dpr_hint_applies_without_a_directive_and_loses_to_one() {
+        let engine = Engine;
+        let src = solid_png(100, 100, [9, 9, 9]);
+        // The hint alone doubles.
+        let out = engine
+            .process_preferred(
+                &src,
+                &[size_op(Dimension::Pixels(25), Dimension::Pixels(25))],
+                ProcessContext {
+                    dpr: Some(2.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (50, 50));
+        // An explicit directive beats the hint: 40 * 1.5, not * 2.
+        let out = engine
+            .process_preferred(
+                &src,
+                &[
+                    size_op(Dimension::Pixels(40), Dimension::Pixels(40)),
+                    Operation::Filters(vec![Filter::Dpr(1.5)]),
+                ],
+                ProcessContext {
+                    dpr: Some(2.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (60, 60));
     }
 
     #[test]
