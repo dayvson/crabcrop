@@ -116,6 +116,7 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
     // carries the class. Explicit-format URLs key on the path alone.
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);
+    let placeholders = meta && wants_placeholders(accept);
     let cache_key = if explicit_format(&ops).is_some() {
         rest.to_string()
     } else {
@@ -187,10 +188,13 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
 
     record.process_ran = true;
     let process_start = Instant::now();
-    let processed = match state
-        .engine
-        .process_preferred(&bytes, &ops, preferred, &watermark_images)
-    {
+    let processed = match state.engine.process_preferred(
+        &bytes,
+        &ops,
+        preferred,
+        &watermark_images,
+        placeholders,
+    ) {
         Ok(p) => p,
         Err(e) => {
             record.process = process_start.elapsed();
@@ -283,6 +287,37 @@ fn wants_meta(accept: Option<&str>) -> bool {
     false
 }
 
+/// Whether the accepted `application/json` entry also asks for
+/// placeholder fields: a `placeholders` parameter on that entry,
+/// bare or set to a truthy value (`0`/`false` decline).
+fn wants_placeholders(accept: Option<&str>) -> bool {
+    let Some(accept) = accept else {
+        return false;
+    };
+    for part in accept.split(',') {
+        let mut segments = part.split(';');
+        if segments.next().unwrap_or("").trim() != "application/json" {
+            continue;
+        }
+        let params: Vec<&str> = segments.collect();
+        let refused = params.iter().any(|p| {
+            p.trim()
+                .strip_prefix("q=")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .is_some_and(|q| q == 0.0)
+        });
+        if refused {
+            continue;
+        }
+        return params.iter().any(|p| {
+            let mut kv = p.trim().splitn(2, '=');
+            kv.next() == Some("placeholders")
+                && !matches!(kv.next().map(str::trim), Some("0") | Some("false"))
+        });
+    }
+    false
+}
+
 /// The wire name of a format, as used in meta responses.
 fn format_name(format: ImageFormat) -> &'static str {
     match format {
@@ -298,8 +333,8 @@ fn format_name(format: ImageFormat) -> &'static str {
 /// The meta response: what the pipeline produced, as JSON,
 /// without the image bytes.
 fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
-    let body = format!(
-        "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}}}",
+    let mut body = format!(
+        "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}",
         processed.width,
         processed.height,
         format_name(processed.format),
@@ -307,6 +342,13 @@ fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
         processed.source_width,
         processed.source_height,
     );
+    if let Some(ph) = &processed.placeholder {
+        body.push_str(&format!(
+            ",\"dominant_color\":\"{}\",\"placeholder\":\"{}\"",
+            ph.dominant_color, ph.data_uri
+        ));
+    }
+    body.push('}');
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
     headers.insert(
@@ -604,6 +646,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn meta_includes_placeholders_only_when_asked() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("40x24/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        // Asked via the Accept parameter: both fields present.
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json; placeholders=1")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let color = meta["dominant_color"].as_str().unwrap();
+        assert!(color.starts_with('#') && color.len() == 7, "{color}");
+        assert!(
+            meta["placeholder"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
+        // Not asked: both fields absent, plain fields unchanged.
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(meta.get("dominant_color").is_none());
+        assert!(meta.get("placeholder").is_none());
+        assert_eq!(meta["width"].as_u64(), Some(40));
     }
 
     #[tokio::test]
