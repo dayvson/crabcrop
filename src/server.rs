@@ -110,6 +110,7 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
     // on the Accept class as well as the path, so the cache key
     // carries the class. Explicit-format URLs key on the path alone.
     let preferred = negotiate_format(accept);
+    let meta = wants_meta(accept);
     let cache_key = if explicit_format(&ops).is_some() {
         rest.to_string()
     } else {
@@ -122,8 +123,16 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
     };
 
     // The verified path is content-addressed: a stored response can
-    // be served without touching the loader or the engine.
-    if let Some(hit) = state.cache.get(&cache_key) {
+    // be served without touching the loader or the engine. Meta
+    // requests bypass the cache in both directions: they must
+    // never be answered with image bytes, and their JSON is never
+    // stored as an image entry.
+    let hit = if meta {
+        None
+    } else {
+        state.cache.get(&cache_key)
+    };
+    if let Some(hit) = hit {
         record.cache_hit = true;
         record.bytes_out = hit.bytes.len();
         return (respond(hit.format, hit.quality, hit.bytes), record);
@@ -155,15 +164,21 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
     record.process = process_start.elapsed();
 
     // Only successful responses are cached; errors never are.
-    state.cache.put(
-        cache_key,
-        CachedImage {
-            bytes: processed.bytes.clone(),
-            format: processed.format,
-            quality: processed.quality,
-        },
-    );
+    // Meta responses are not image entries and are not cached.
+    if !meta {
+        state.cache.put(
+            cache_key,
+            CachedImage {
+                bytes: processed.bytes.clone(),
+                format: processed.format,
+                quality: processed.quality,
+            },
+        );
+    }
     record.bytes_out = processed.bytes.len();
+    if meta {
+        return (meta_response(&processed), record);
+    }
     (
         respond(processed.format, processed.quality, processed.bytes),
         record,
@@ -204,6 +219,65 @@ fn negotiate_format(accept: Option<&str>) -> Option<ImageFormat> {
     } else {
         None
     }
+}
+
+/// Whether the client asked for the meta response: an explicit
+/// `application/json` in `Accept` that is not refused with q=0.
+fn wants_meta(accept: Option<&str>) -> bool {
+    let Some(accept) = accept else {
+        return false;
+    };
+    for part in accept.split(',') {
+        let mut segments = part.split(';');
+        let media = segments.next().unwrap_or("").trim();
+        if media != "application/json" {
+            continue;
+        }
+        let refused = segments.any(|p| {
+            p.trim()
+                .strip_prefix("q=")
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .is_some_and(|q| q == 0.0)
+        });
+        if !refused {
+            return true;
+        }
+    }
+    false
+}
+
+/// The wire name of a format, as used in meta responses.
+fn format_name(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Jpeg => "jpeg",
+        ImageFormat::Png => "png",
+        ImageFormat::WebP => "webp",
+        ImageFormat::Jxl => "jxl",
+        ImageFormat::Avif => "avif",
+        ImageFormat::Gif => "gif",
+    }
+}
+
+/// The meta response: what the pipeline produced, as JSON,
+/// without the image bytes.
+fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
+    let body = format!(
+        "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}}}",
+        processed.width,
+        processed.height,
+        format_name(processed.format),
+        processed.bytes.len(),
+        processed.source_width,
+        processed.source_height,
+    );
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    headers.insert(
+        header::CACHE_CONTROL,
+        "public, max-age=31536000, immutable".parse().unwrap(),
+    );
+    headers.insert(header::VARY, "Accept".parse().unwrap());
+    (StatusCode::OK, headers, body).into_response()
 }
 
 /// Build a successful image response: content type, immutable cache
@@ -295,13 +369,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                png.len()
-            );
-            let _ = socket.write_all(head.as_bytes()).await;
-            let _ = socket.write_all(&png).await;
+            // Serves every connection: cache-bypassing requests
+            // (meta mode) fetch the source more than once.
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&png).await;
+            }
         });
         format!("http://{addr}/src.png")
     }
@@ -394,6 +474,83 @@ mod tests {
         let img = image::load_from_memory(&body).unwrap();
         // 100x60 into a 30x30 box: width rules, aspect preserved.
         assert_eq!((img.width(), img.height()), (30, 18));
+    }
+
+    #[tokio::test]
+    async fn serves_meta_as_json() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("100x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        // The real processed output, fetched first (which also
+        // populates the result cache) for comparison.
+        let img_resp = client().get(&url).send().await.unwrap();
+        assert_eq!(
+            img_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let img_body = img_resp.bytes().await.unwrap();
+        // The meta response for the same URL: JSON describing the
+        // same processed output, never the cached image bytes.
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["width"].as_u64(), Some(100));
+        assert_eq!(meta["height"].as_u64(), Some(50));
+        assert_eq!(meta["format"], "png");
+        assert_eq!(meta["bytes"].as_u64(), Some(img_body.len() as u64));
+        assert_eq!(meta["source_width"].as_u64(), Some(100));
+        assert_eq!(meta["source_height"].as_u64(), Some(60));
+    }
+
+    #[tokio::test]
+    async fn meta_requests_do_not_populate_the_image_cache() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("90x45/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        // Meta first: it must not leave an entry the image request
+        // could be answered with.
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(&body[..4], b"\x89PNG");
+    }
+
+    #[tokio::test]
+    async fn meta_mode_keeps_error_mapping() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("100x50/{src}");
+        let resp = client()
+            .get(format!("{base}/deadbeef/{remainder}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
