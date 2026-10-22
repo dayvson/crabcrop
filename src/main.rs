@@ -27,6 +27,7 @@ mod cache;
 mod crop;
 mod engine;
 mod filters;
+mod focus;
 mod loader;
 mod observe;
 mod quality;

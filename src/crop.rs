@@ -35,6 +35,7 @@ pub fn crop_to_aspect(
         let x = match align {
             Align::Left => 0,
             Align::Right => w.saturating_sub(cw),
+            Align::Smart => smart_start(&img, cw, w, true),
             _ => (w.saturating_sub(cw)) / 2,
         };
         (x, 0, cw, h)
@@ -44,12 +45,24 @@ pub fn crop_to_aspect(
         let y = match align {
             Align::Top => 0,
             Align::Bottom => h.saturating_sub(ch),
+            Align::Smart => smart_start(&img, ch, h, false),
             _ => (h.saturating_sub(ch)) / 2,
         };
         (0, y, w, ch)
     };
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
     DynamicImage::ImageRgba8(cropped)
+}
+
+/// Window start along one axis for smart alignment: center the
+/// `window` span on the focal point's coordinate along that
+/// axis, clamped so the window stays inside the image.
+fn smart_start(img: &DynamicImage, window: u32, extent: u32, horizontal: bool) -> u32 {
+    let f = crate::focus::focal_point(img);
+    let frac = if horizontal { f.x } else { f.y };
+    let center = (frac * extent as f32).round() as i32;
+    let max_start = extent.saturating_sub(window) as i32;
+    (center - window as i32 / 2).clamp(0, max_start) as u32
 }
 
 #[cfg(test)]
@@ -143,5 +156,49 @@ mod tests {
         assert_eq!((out.width(), out.height()), (100, 60));
         assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
         assert_eq!(rgb(&out, 99, 0), [0, 0, 255]);
+    }
+
+    /// 200x100 mid-gray, with a noisy red block at the far right
+    /// (x 170..196, y 30..70).
+    fn right_block() -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(200, 100);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if (170..196).contains(&x) && (30..70).contains(&y) {
+                if (x + y) % 2 == 0 {
+                    Rgb([255, 0, 0])
+                } else {
+                    Rgb([128, 0, 0])
+                }
+            } else {
+                Rgb([128, 128, 128])
+            };
+        }
+        img
+    }
+
+    fn has_pure_red(img: &DynamicImage) -> bool {
+        img.to_rgb8()
+            .pixels()
+            .any(|p| p[0] == 255 && p[1] == 0 && p[2] == 0)
+    }
+
+    #[test]
+    fn smart_crop_keeps_the_off_center_subject() {
+        // A square crop of the 200x100 source is 100 wide: centered
+        // it spans x 50..150 and misses the block entirely, while
+        // smart alignment centers the window on the block.
+        let centered = crop_to_aspect(right_block(), 1, 1, Align::Center);
+        assert!(!has_pure_red(&centered));
+        let smart = crop_to_aspect(right_block(), 1, 1, Align::Smart);
+        assert_eq!((smart.width(), smart.height()), (100, 100));
+        assert!(has_pure_red(&smart));
+    }
+
+    #[test]
+    fn smart_crop_on_a_uniform_image_matches_center() {
+        let img = DynamicImage::new_rgb8(200, 100);
+        let smart = crop_to_aspect(img.clone(), 1, 1, Align::Smart);
+        let centered = crop_to_aspect(img, 1, 1, Align::Center);
+        assert_eq!(smart.to_rgb8(), centered.to_rgb8());
     }
 }
