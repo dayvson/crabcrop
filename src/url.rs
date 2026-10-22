@@ -117,6 +117,7 @@ pub enum ImageFormat {
     WebP,
     Jxl,
     Avif,
+    Gif,
 }
 
 /// Encoding quality from a `quality(...)` filter.
@@ -343,6 +344,7 @@ fn parse_format(s: &str) -> Option<ImageFormat> {
         "webp" => Some(ImageFormat::WebP),
         "jxl" => Some(ImageFormat::Jxl),
         "avif" => Some(ImageFormat::Avif),
+        "gif" => Some(ImageFormat::Gif),
         _ => None,
     }
 }
@@ -937,6 +939,15 @@ mod tests {
     fn parses_no_upscale() {
         let (ops, _) = parse_operations("filters:no_upscale/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::NoUpscale])]);
+    }
+
+    #[test]
+    fn parses_gif_format() {
+        let (ops, _) = parse_operations("filters:format(gif)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Format(ImageFormat::Gif)])]
+        );
     }
 
     #[test]

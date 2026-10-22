@@ -214,6 +214,7 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
         ImageFormat::Png => "image/png",
         ImageFormat::WebP => "image/webp",
         ImageFormat::Jxl => "image/jxl",
+        ImageFormat::Gif => "image/gif",
         ImageFormat::Avif => "image/avif",
     };
     let mut headers = axum::http::HeaderMap::new();
