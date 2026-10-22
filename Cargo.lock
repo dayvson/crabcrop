@@ -325,6 +325,7 @@ dependencies = [
  "jixel",
  "jxl-image-rs-integration",
  "reqwest",
+ "serde_json",
  "sha2",
  "tokio",
 ]

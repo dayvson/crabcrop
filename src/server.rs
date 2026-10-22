@@ -2,7 +2,12 @@
 //!
 //! `GET /<signature>/<operations...>/<image-url>` verifies the
 //! signature, loads the source image, runs the engine, and responds
-//! with the optimized bytes. `GET /health` is the health check.
+//! with the optimized bytes. `GET /health` is the health check and
+//! `GET /metrics` serves Prometheus metrics. Every image request
+//! leaves one structured JSON log line and one metrics update.
+
+use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     Router,
@@ -14,6 +19,7 @@ use axum::{
 
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
+use crate::observe::{FailStage, Metrics, RequestRecord};
 use crate::url::{ImageFormat, parse_operations, parse_signature, verify};
 
 /// Shared state for the handlers.
@@ -25,12 +31,15 @@ pub struct AppState {
     pub allow_unsafe: bool,
     pub loader: Loader,
     pub engine: Engine,
+    /// Request metrics, shared behind an `Arc` so clones agree.
+    pub metrics: Arc<Metrics>,
 }
 
 /// Build the router.
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/{*path}", get(handle))
         .with_state(state)
 }
@@ -39,28 +48,75 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn metrics(State(state): State<AppState>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render(),
+    )
+        .into_response()
+}
+
 async fn handle(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    let started = Instant::now();
+    let (response, mut record) = serve(&state, &path).await;
+    record.status = response.status().as_u16();
+    record.total = started.elapsed();
+    state.metrics.record(&record);
+    println!("{}", record.to_json());
+    response
+}
+
+/// Run one image request, timing each stage into the returned record.
+async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
+    let mut record = RequestRecord::default();
     let full = format!("/{path}");
 
     let (signature, rest) = match parse_signature(&full) {
         Ok(v) => v,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST.into_response(), record),
     };
-    if !verify(&state.secret, &signature, rest, state.allow_unsafe) {
-        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+    let verify_start = Instant::now();
+    let verified = verify(&state.secret, &signature, rest, state.allow_unsafe);
+    record.verify = verify_start.elapsed();
+    if !verified {
+        return (
+            (StatusCode::FORBIDDEN, "bad signature").into_response(),
+            record,
+        );
     }
     let (ops, source_url) = match parse_operations(rest) {
         Ok(v) => v,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST.into_response(), record),
     };
+    // The operation summary is everything before the source URL.
+    record.ops = rest[..rest.len() - source_url.len()]
+        .trim_end_matches('/')
+        .to_string();
+
+    record.load_ran = true;
+    let load_start = Instant::now();
     let bytes = match state.loader.load(source_url).await {
         Ok(b) => b,
-        Err(e) => return load_error_response(e),
+        Err(e) => {
+            record.load = load_start.elapsed();
+            record.fail = FailStage::Load;
+            return (load_error_response(e), record);
+        }
     };
+    record.load = load_start.elapsed();
+    record.bytes_in = bytes.len();
+
+    record.process_ran = true;
+    let process_start = Instant::now();
     let processed = match state.engine.process(&bytes, &ops) {
         Ok(p) => p,
-        Err(e) => return engine_error_response(e),
+        Err(e) => {
+            record.process = process_start.elapsed();
+            record.fail = FailStage::Engine;
+            return (engine_error_response(e), record);
+        }
     };
+    record.process = process_start.elapsed();
 
     let content_type = match processed.format {
         ImageFormat::Jpeg => "image/jpeg",
@@ -80,7 +136,8 @@ async fn handle(State(state): State<AppState>, Path(path): Path<String>) -> Resp
             q.to_string().parse().unwrap(),
         );
     }
-    (headers, processed.bytes).into_response()
+    record.bytes_out = processed.bytes.len();
+    ((headers, processed.bytes).into_response(), record)
 }
 
 fn load_error_response(e: LoadError) -> Response {
@@ -159,6 +216,7 @@ mod tests {
             allow_unsafe,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            metrics: Arc::new(Metrics::default()),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -272,6 +330,55 @@ mod tests {
         let sig = sign("");
         let resp = client().get(format!("{base}/{sig}/")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn metrics_reflect_traffic() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // One served request.
+        let remainder = format!("300x50/{src}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // One failed request.
+        let resp = client()
+            .get(format!("{base}/deadbeef/300x50/{src}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = client()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("crabcrop_requests_total{status_class=\"2xx\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("crabcrop_requests_total{status_class=\"4xx\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("crabcrop_request_duration_ms_count 2"),
+            "{body}"
+        );
+        let served: u64 = body
+            .lines()
+            .find_map(|l| l.strip_prefix("crabcrop_bytes_served_total "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(served > 0);
     }
 
     #[tokio::test]
