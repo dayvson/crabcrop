@@ -151,7 +151,20 @@ impl Engine {
                 "HEIC/HEIF source: no HEIC decoder in this build".to_string(),
             ));
         }
-        let detected = detect_format(bytes);
+        // SVG sources are sniffed by content (the declared type
+        // can lie), sanitized, and parsed up front: the raster
+        // becomes the decoded image below, and the output
+        // format defaults to PNG (SVG has no raster format).
+        let prepared_svg = if crate::svg::is_svg(bytes) {
+            Some(crate::svg::prepare(bytes).map_err(EngineError::Decode)?)
+        } else {
+            None
+        };
+        let detected = if prepared_svg.is_some() {
+            ImageFormat::Png
+        } else {
+            detect_format(bytes)
+        };
         // Background removal is validated before any real work:
         // its output is transparency, so the resolved format
         // must carry alpha, and a provider must be configured.
@@ -203,6 +216,13 @@ impl Engine {
                     .expect("decode_gif_frames returns at least one frame")
                     .into_buffer(),
             )
+        } else if let Some(prep) = &prepared_svg {
+            // Rasterize at the size the request is heading for
+            // (or the intrinsic size when it asks for none), so
+            // vectors stay crisp; the normal pipeline runs on
+            // the raster from here.
+            let (tw, th) = svg_raster_target(ops, prep.intrinsic(), dpr_factor(ops, &ctx));
+            prep.render(tw, th).map_err(EngineError::Decode)?
         } else {
             let mut img =
                 image::load_from_memory(bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
@@ -550,6 +570,88 @@ fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
         8 => img.rotate270(),
         _ => img,
     }
+}
+
+/// The largest raster the SVG path will produce per axis:
+/// an intrinsic size is source-controlled, so it is capped
+/// like AI upscaling output is.
+const MAX_SVG_RASTER: u32 = 4096;
+
+fn clamp_raster(w: u32, h: u32) -> (u32, u32) {
+    let m = w.max(h);
+    if m <= MAX_SVG_RASTER {
+        (w.max(1), h.max(1))
+    } else {
+        let scale = MAX_SVG_RASTER as f64 / m as f64;
+        (
+            ((w as f64 * scale).round() as u32).max(1),
+            ((h as f64 * scale).round() as u32).max(1),
+        )
+    }
+}
+
+/// Where an SVG raster should be rendered: the first size-like
+/// operation's target (DPR-scaled, resolved against the
+/// intrinsic size exactly as the pipeline will resolve it), or
+/// the intrinsic size when the request asks for none.
+fn svg_raster_target(ops: &[Operation], intrinsic: (f32, f32), dpr: f32) -> (u32, u32) {
+    let (iw, ih) = (
+        (intrinsic.0.round() as u32).max(1),
+        (intrinsic.1.round() as u32).max(1),
+    );
+    for op in ops {
+        match op {
+            Operation::Size(size) => {
+                let w = match size.width {
+                    Dimension::Pixels(n) => scale_px(n, dpr),
+                    Dimension::Original => iw,
+                    Dimension::Proportional => match size.height {
+                        Dimension::Pixels(h) => {
+                            ((iw as u64 * scale_px(h, dpr) as u64) / ih as u64).max(1) as u32
+                        }
+                        _ => iw,
+                    },
+                };
+                let h = match size.height {
+                    Dimension::Pixels(n) => scale_px(n, dpr),
+                    Dimension::Original => ih,
+                    Dimension::Proportional => match size.width {
+                        Dimension::Pixels(w) => {
+                            ((ih as u64 * scale_px(w, dpr) as u64) / iw as u64).max(1) as u32
+                        }
+                        _ => ih,
+                    },
+                };
+                return clamp_raster(w, h);
+            }
+            Operation::FitIn(size) => {
+                let mut scale = f64::INFINITY;
+                match size.width {
+                    Dimension::Pixels(n) => scale = scale.min(scale_px(n, dpr) as f64 / iw as f64),
+                    Dimension::Original => scale = scale.min(1.0),
+                    Dimension::Proportional => {}
+                }
+                match size.height {
+                    Dimension::Pixels(n) => scale = scale.min(scale_px(n, dpr) as f64 / ih as f64),
+                    Dimension::Original => scale = scale.min(1.0),
+                    Dimension::Proportional => {}
+                }
+                if scale.is_finite() {
+                    return clamp_raster(
+                        ((iw as f64 * scale).round() as u32).max(1),
+                        ((ih as f64 * scale).round() as u32).max(1),
+                    );
+                }
+            }
+            Operation::Crop { size, .. } => {
+                if let (Dimension::Pixels(w), Dimension::Pixels(h)) = (size.width, size.height) {
+                    return clamp_raster(scale_px(w, dpr), scale_px(h, dpr));
+                }
+            }
+            _ => {}
+        }
+    }
+    clamp_raster(iw, ih)
 }
 
 /// The output container: detected source format, or JPEG when the
@@ -2136,6 +2238,35 @@ mod tests {
             color: [255, 255, 255, 255],
             anchor: crate::url::Anchor::BottomRight,
         }])
+    }
+
+    #[test]
+    fn svg_sources_rasterize_through_the_pipeline() {
+        let engine = Engine;
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100"><rect width="100" height="100" fill="#00ff00"/><circle cx="50" cy="50" r="20" fill="#ff0000"/></svg>"##;
+        // No size asked: intrinsic size, PNG output.
+        let out = engine.process(svg, &[]).unwrap();
+        assert_eq!((out.width, out.height), (100, 100));
+        assert_eq!(out.format, ImageFormat::Png);
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(50, 50), &image::Rgba([255, 0, 0, 255]));
+        // A size op renders the vector at that size, crisply:
+        // the circle scales with it.
+        let out = engine
+            .process(
+                svg,
+                &[size_op(Dimension::Pixels(50), Dimension::Pixels(50))],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (50, 50));
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(25, 25), &image::Rgba([255, 0, 0, 255]));
+        assert_eq!(img.get_pixel(2, 2), &image::Rgba([0, 255, 0, 255]));
+        // Non-SVG XML is a bad source, not a render.
+        assert!(matches!(
+            engine.process(b"<note><to>x</to></note>", &[]),
+            Err(EngineError::Decode(_))
+        ));
     }
 
     #[test]

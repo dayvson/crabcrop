@@ -60,6 +60,7 @@ mod placeholder;
 mod quality;
 mod server;
 mod storage;
+mod svg;
 mod text;
 mod url;
 
