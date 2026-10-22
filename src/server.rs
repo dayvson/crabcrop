@@ -66,6 +66,7 @@ async fn handle(State(state): State<AppState>, Path(path): Path<String>) -> Resp
         ImageFormat::Jpeg => "image/jpeg",
         ImageFormat::Png => "image/png",
         ImageFormat::WebP => "image/webp",
+        ImageFormat::Jxl => "image/jxl",
     };
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
@@ -184,6 +185,26 @@ mod tests {
         let body = resp.bytes().await.unwrap();
         let img = image::load_from_memory(&body).unwrap();
         assert_eq!((img.width(), img.height()), (300, 50));
+    }
+
+    #[tokio::test]
+    async fn serves_jxl_when_asked() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(jxl)/{src}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jxl"
+        );
+        let body = resp.bytes().await.unwrap();
+        assert!(body.starts_with(&[0xFF, 0x0A]));
     }
 
     #[tokio::test]

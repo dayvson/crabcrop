@@ -89,6 +89,7 @@ pub enum ImageFormat {
     Jpeg,
     Png,
     WebP,
+    Jxl,
 }
 
 /// One filter from a `filters:...` segment.
@@ -227,6 +228,7 @@ fn parse_format(s: &str) -> Option<ImageFormat> {
         "jpeg" | "jpg" => Some(ImageFormat::Jpeg),
         "png" => Some(ImageFormat::Png),
         "webp" => Some(ImageFormat::WebP),
+        "jxl" => Some(ImageFormat::Jxl),
         _ => None,
     }
 }
@@ -644,6 +646,15 @@ mod tests {
                 "segment: {seg:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_jxl_format() {
+        let (ops, _) = parse_operations("filters:format(jxl)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])]
+        );
     }
 
     #[test]
