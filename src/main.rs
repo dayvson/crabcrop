@@ -23,6 +23,8 @@
 //!   addresses. Off by default.
 //! - `PORT`: listen port, default 3000.
 
+#![forbid(unsafe_code)]
+
 mod cache;
 mod crop;
 mod engine;
@@ -45,20 +47,43 @@ use crate::server::{AppState, app};
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("crabcrop: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Read an environment variable as `T`, or fall back to `default`
+/// when it is unset. A set-but-invalid value is a startup error
+/// naming the variable: silently serving on the wrong port or
+/// with the wrong cache budget is worse than refusing to start.
+fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
+    parse_env_value(name, env::var(name).ok(), default)
+}
+
+fn parse_env_value<T: std::str::FromStr>(
+    name: &str,
+    value: Option<String>,
+    default: T,
+) -> Result<T, String> {
+    match value {
+        Some(v) => v.parse().map_err(|_| format!("invalid {name}: {v:?}")),
+        None => Ok(default),
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let secret = env::var("CRABCROP_SECRET")
-        .expect("CRABCROP_SECRET must be set")
+        .map_err(|_| "CRABCROP_SECRET must be set")?
         .into_bytes();
     let allow_unsafe = env::var("CRABCROP_ALLOW_UNSAFE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let port: u16 = env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
-    let cache_mb: usize = env::var("CRABCROP_CACHE_MAX_MB")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(256);
+    let port: u16 = parse_env("PORT", 3000)?;
+    let cache_mb: usize = parse_env("CRABCROP_CACHE_MAX_MB", 256)?;
+    let cache_bytes = cache_mb
+        .checked_mul(1024 * 1024)
+        .ok_or("CRABCROP_CACHE_MAX_MB is too large")?;
     let allowed_sources: Vec<String> = env::var("CRABCROP_ALLOWED_SOURCES")
         .map(|v| v.split(',').map(str::to_string).collect())
         .unwrap_or_default();
@@ -70,14 +95,31 @@ async fn main() {
     let state = AppState {
         secret,
         allow_unsafe,
-        loader: Loader::with_defaults().expect("loader").with_policy(policy),
+        loader: Loader::with_defaults()
+            .map_err(|e| format!("cannot build the loader: {e}"))?
+            .with_policy(policy),
         engine: Engine,
         metrics: Arc::new(Metrics::default()),
-        cache: Arc::new(Cache::new(cache_mb * 1024 * 1024)),
+        cache: Arc::new(Cache::new(cache_bytes)),
     };
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-        .await
-        .expect("bind");
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     println!("crabcrop listening on port {port}");
-    axum::serve(listener, app(state)).await.expect("serve");
+    axum::serve(listener, app(state)).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_env_value_defaults_parses_and_rejects() {
+        assert_eq!(parse_env_value::<u16>("PORT", None, 3000).unwrap(), 3000);
+        assert_eq!(
+            parse_env_value::<u16>("PORT", Some("8080".to_string()), 3000).unwrap(),
+            8080
+        );
+        let err = parse_env_value::<u16>("PORT", Some("abc".to_string()), 3000).unwrap_err();
+        assert!(err.contains("PORT"), "{err}");
+    }
 }

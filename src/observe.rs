@@ -3,9 +3,8 @@
 //!
 //! The log never contains the full source URL, only the operation
 //! summary (the path segments between the signature and the source).
-//! There is no cache yet, so `cache_hit` is always false and every
-//! request counts as a miss; the fields exist so the cache (#11)
-//! only has to start answering truthfully.
+//! `cache_hit` records whether the result cache answered the
+//! request, as reported by the handler.
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

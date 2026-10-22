@@ -51,6 +51,30 @@ pub enum LoadError {
     Forbidden(String),
 }
 
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Network(cause) => write!(f, "network error: {cause}"),
+            LoadError::BadStatus(code) => write!(f, "source answered HTTP {code}"),
+            LoadError::TooLarge { limit } => {
+                write!(f, "source exceeded the {limit}-byte limit")
+            }
+            LoadError::WrongContentType(Some(ct)) => {
+                write!(f, "source content type is not an image: {ct}")
+            }
+            LoadError::WrongContentType(None) => {
+                write!(f, "source content type is not readable")
+            }
+            LoadError::Timeout => write!(f, "source fetch timed out"),
+            LoadError::Forbidden(reason) => {
+                write!(f, "source refused by policy: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
 /// Which sources the loader may fetch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourcePolicy {
@@ -154,7 +178,7 @@ impl Loader {
             }
             if let Some(value) = resp.headers().get(header::CONTENT_TYPE) {
                 let content_type = value.to_str().ok();
-                let is_image = content_type.map_or(false, |ct| ct.starts_with("image/"));
+                let is_image = content_type.is_some_and(|ct| ct.starts_with("image/"));
                 if !is_image {
                     return Err(LoadError::WrongContentType(
                         content_type.map(str::to_string),
@@ -307,6 +331,18 @@ mod tests {
         let base = spawn_server(Respond::Bytes(ok_image_response())).await;
         let loader = Loader::with_defaults().unwrap();
         assert_eq!(fetch(&loader, &base).await.unwrap(), b"\xff\xd8\xff\xd9");
+    }
+
+    #[test]
+    fn errors_render() {
+        assert_eq!(
+            LoadError::BadStatus(404).to_string(),
+            "source answered HTTP 404"
+        );
+        assert_eq!(
+            LoadError::TooLarge { limit: 10 }.to_string(),
+            "source exceeded the 10-byte limit"
+        );
     }
 
     #[tokio::test]

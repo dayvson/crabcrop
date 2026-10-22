@@ -23,7 +23,7 @@ use crate::cache::{Cache, CachedImage};
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
-use crate::url::{Filter, ImageFormat, Operation, parse_operations, parse_signature, verify};
+use crate::url::{ImageFormat, explicit_format, parse_operations, parse_signature, verify};
 
 /// Shared state for the handlers.
 #[derive(Debug, Clone)]
@@ -110,7 +110,7 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
     // on the Accept class as well as the path, so the cache key
     // carries the class. Explicit-format URLs key on the path alone.
     let preferred = negotiate_format(accept);
-    let cache_key = if has_explicit_format(&ops) {
+    let cache_key = if explicit_format(&ops).is_some() {
         rest.to_string()
     } else {
         let class = match preferred {
@@ -204,14 +204,6 @@ fn negotiate_format(accept: Option<&str>) -> Option<ImageFormat> {
     } else {
         None
     }
-}
-
-/// Whether the operations name an output format explicitly.
-fn has_explicit_format(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| match op {
-        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Format(_))),
-        _ => false,
-    })
 }
 
 /// Build a successful image response: content type, immutable cache
