@@ -3,6 +3,7 @@
 //! [`Engine::process`] takes source bytes and the parsed [`Operation`]s,
 //! and returns the encoded output plus its format.
 
+use std::io::Cursor;
 use std::sync::Once;
 
 use image::{DynamicImage, ExtendedColorType, ImageEncoder};
@@ -96,16 +97,42 @@ impl Engine {
         preferred: Option<ImageFormat>,
     ) -> Result<ProcessedImage, EngineError> {
         ensure_jxl_decoder();
-        let mut img =
-            image::load_from_memory(bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
-        // Phone photos store rotation in the EXIF orientation tag
-        // instead of the pixels. Honor it before any operation, so
-        // sizes and crops see the image as the viewer would.
-        if let Some(orientation) = exif_orientation(bytes) {
-            img = apply_orientation(img, orientation);
-        }
-        let mut format = detect_format(bytes);
-        let mut directives = EncodeOptions::default();
+        let detected = detect_format(bytes);
+        let img = if detected == ImageFormat::Gif {
+            // GIF sources decode frame by frame: an animated source
+            // whose output stays GIF keeps its frames (each runs the
+            // operations, delays preserved); anything else continues
+            // with the first frame, which is also what converting an
+            // animated GIF to a still format means.
+            let frames = decode_gif_frames(bytes)?;
+            if frames.len() > 1
+                && crate::url::explicit_format(ops)
+                    .or(preferred)
+                    .unwrap_or(detected)
+                    == ImageFormat::Gif
+            {
+                return self.process_animated_gif(frames, ops);
+            }
+            DynamicImage::ImageRgba8(
+                frames
+                    .into_iter()
+                    .next()
+                    .expect("decode_gif_frames returns at least one frame")
+                    .into_buffer(),
+            )
+        } else {
+            let mut img =
+                image::load_from_memory(bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
+            // Phone photos store rotation in the EXIF orientation
+            // tag instead of the pixels. Honor it before any
+            // operation, so sizes and crops see the image as the
+            // viewer would. (GIFs carry no EXIF, hence the split.)
+            if let Some(orientation) = exif_orientation(bytes) {
+                img = apply_orientation(img, orientation);
+            }
+            img
+        };
+        let mut format = detected;
         // `no_upscale` is a request-wide directive, like the encoding
         // directives: wherever it appears, it caps every resize in
         // the request at the (oriented) source dimensions.
@@ -114,53 +141,7 @@ impl Engine {
         } else {
             None
         };
-        for op in ops {
-            match op {
-                Operation::Size(size) => img = apply_size(img, size, cap),
-                Operation::FitIn(size) => img = apply_fit_in(img, size, cap),
-                Operation::CropRect {
-                    left,
-                    top,
-                    right,
-                    bottom,
-                } => {
-                    if *right > img.width() || *bottom > img.height() {
-                        return Err(EngineError::Unsupported(format!(
-                            "crop-rect {left}x{top}:{right}x{bottom} exceeds image bounds {}x{}",
-                            img.width(),
-                            img.height()
-                        )));
-                    }
-                    img = img.crop_imm(*left, *top, right - left, bottom - top);
-                }
-                Operation::Crop { size, align } => {
-                    let (tw, th) = match (size.width, size.height) {
-                        (Dimension::Pixels(w), Dimension::Pixels(h)) => (w, h),
-                        _ => {
-                            return Err(EngineError::Unsupported(
-                                "crop with non-pixel dimensions".to_string(),
-                            ));
-                        }
-                    };
-                    img = crop_to_aspect(img, tw, th, *align);
-                    img = apply_size(
-                        img,
-                        &ImageSize {
-                            width: Dimension::Pixels(tw),
-                            height: Dimension::Pixels(th),
-                            flip_horizontal: false,
-                            flip_vertical: false,
-                        },
-                        cap,
-                    );
-                }
-                Operation::Filters(filters) => {
-                    let (new_img, options) = apply_filters(img, filters);
-                    img = new_img;
-                    directives.absorb(options);
-                }
-            }
-        }
+        let (img, directives) = apply_operations(img, ops, cap)?;
         if let Some(f) = directives.format {
             format = f;
         } else if let Some(p) = preferred {
@@ -209,6 +190,114 @@ impl Engine {
             quality: chosen_quality,
         })
     }
+
+    /// Process an animated GIF frame by frame: every frame runs
+    /// the same operations and keeps its delay, so the output
+    /// stays animated. Encoding directives do not apply (GIF has
+    /// no quality lever and keeps its alpha).
+    fn process_animated_gif(
+        &self,
+        frames: Vec<image::Frame>,
+        ops: &[Operation],
+    ) -> Result<ProcessedImage, EngineError> {
+        let first = frames[0].buffer();
+        let cap = if crate::url::has_no_upscale(ops) {
+            Some((first.width(), first.height()))
+        } else {
+            None
+        };
+        let mut out_frames = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let delay = frame.delay();
+            let img = DynamicImage::ImageRgba8(frame.into_buffer());
+            let (img, _) = apply_operations(img, ops, cap)?;
+            out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
+        }
+        let mut out = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut out)
+            .encode_frames(out_frames)
+            .map_err(|e| EngineError::Encode(e.to_string()))?;
+        Ok(ProcessedImage {
+            bytes: out,
+            format: ImageFormat::Gif,
+            quality: None,
+        })
+    }
+}
+
+/// Decode all frames of a GIF source. Errors when the GIF is
+/// malformed or carries no frames.
+fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
+    use image::AnimationDecoder;
+    let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+        .map_err(|e| EngineError::Decode(e.to_string()))?;
+    let frames = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|e| EngineError::Decode(e.to_string()))?;
+    if frames.is_empty() {
+        return Err(EngineError::Decode("GIF has no frames".to_string()));
+    }
+    Ok(frames)
+}
+
+/// Apply the operations to one image, collecting the encoding
+/// directives along the way. Shared by the still pipeline and
+/// the animated-GIF path, which runs it once per frame.
+fn apply_operations(
+    mut img: DynamicImage,
+    ops: &[Operation],
+    cap: Option<(u32, u32)>,
+) -> Result<(DynamicImage, EncodeOptions), EngineError> {
+    let mut directives = EncodeOptions::default();
+    for op in ops {
+        match op {
+            Operation::Size(size) => img = apply_size(img, size, cap),
+            Operation::FitIn(size) => img = apply_fit_in(img, size, cap),
+            Operation::CropRect {
+                left,
+                top,
+                right,
+                bottom,
+            } => {
+                if *right > img.width() || *bottom > img.height() {
+                    return Err(EngineError::Unsupported(format!(
+                        "crop-rect {left}x{top}:{right}x{bottom} exceeds image bounds {}x{}",
+                        img.width(),
+                        img.height()
+                    )));
+                }
+                img = img.crop_imm(*left, *top, right - left, bottom - top);
+            }
+            Operation::Crop { size, align } => {
+                let (tw, th) = match (size.width, size.height) {
+                    (Dimension::Pixels(w), Dimension::Pixels(h)) => (w, h),
+                    _ => {
+                        return Err(EngineError::Unsupported(
+                            "crop with non-pixel dimensions".to_string(),
+                        ));
+                    }
+                };
+                img = crop_to_aspect(img, tw, th, *align);
+                img = apply_size(
+                    img,
+                    &ImageSize {
+                        width: Dimension::Pixels(tw),
+                        height: Dimension::Pixels(th),
+                        flip_horizontal: false,
+                        flip_vertical: false,
+                    },
+                    cap,
+                );
+            }
+            Operation::Filters(filters) => {
+                let (new_img, options) = apply_filters(img, filters);
+                img = new_img;
+                directives.absorb(options);
+            }
+        }
+    }
+    Ok((img, directives))
 }
 
 /// The EXIF orientation stored in the source bytes (1-8), if the
@@ -250,6 +339,7 @@ fn detect_format(bytes: &[u8]) -> ImageFormat {
         Ok(image::ImageFormat::Png) => ImageFormat::Png,
         Ok(image::ImageFormat::WebP) => ImageFormat::WebP,
         Ok(image::ImageFormat::Avif) => ImageFormat::Avif,
+        Ok(image::ImageFormat::Gif) => ImageFormat::Gif,
         _ => ImageFormat::Jpeg,
     }
 }
@@ -342,6 +432,11 @@ fn encode(
             )
             .write_image(pixels, w, h, color)
             .map_err(|e| EngineError::Encode(e.to_string()))?;
+        }
+        ImageFormat::Gif => {
+            image::codecs::gif::GifEncoder::new(&mut buf)
+                .encode(img.to_rgba8().as_raw(), w, h, ExtendedColorType::Rgba8)
+                .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
     }
@@ -1195,6 +1290,100 @@ mod tests {
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         let p = img.get_pixel(8, 8);
         assert!(p[1] > 200, "pixel {p:?}");
+    }
+
+    fn gif_bytes(img: &DynamicImage) -> Vec<u8> {
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Gif)
+            .unwrap();
+        out
+    }
+
+    /// Two 40x20 frames: red, then blue.
+    fn animated_gif_bytes() -> Vec<u8> {
+        let red = image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255]));
+        let blue = image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 0, 255, 255]));
+        let delay = image::Delay::from_numer_denom_ms(100, 1);
+        let frames = vec![
+            image::Frame::from_parts(red, 0, 0, delay),
+            image::Frame::from_parts(blue, 0, 0, delay),
+        ];
+        let mut out = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut out)
+            .encode_frames(frames)
+            .unwrap();
+        out
+    }
+
+    fn decoded_gif_frames(bytes: &[u8]) -> Vec<image::Frame> {
+        use image::AnimationDecoder;
+        let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).unwrap();
+        decoder.into_frames().collect_frames().unwrap()
+    }
+
+    #[test]
+    fn static_gif_round_trips_as_gif() {
+        let engine = Engine;
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            24,
+            16,
+            image::Rgb([10, 200, 30]),
+        ));
+        let src = gif_bytes(&img);
+        let out = engine.process(&src, &[]).unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        assert_eq!(&out.bytes[..6], b"GIF89a");
+        assert_eq!(dims_of(&out), (24, 16));
+    }
+
+    #[test]
+    fn format_gif_converts_a_png_source() {
+        let engine = Engine;
+        let src = png_bytes(&DynamicImage::new_rgb8(20, 12));
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Gif)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        assert_eq!(&out.bytes[..6], b"GIF89a");
+    }
+
+    #[test]
+    fn animated_gif_keeps_its_frames_through_resize() {
+        let engine = Engine;
+        let src = animated_gif_bytes();
+        let out = engine
+            .process(
+                &src,
+                &[size_op(Dimension::Pixels(20), Dimension::Pixels(10))],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        let frames = decoded_gif_frames(&out.bytes);
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.buffer().width() == 20 && f.buffer().height() == 10)
+        );
+    }
+
+    #[test]
+    fn animated_gif_to_a_still_format_keeps_the_first_frame() {
+        let engine = Engine;
+        let src = animated_gif_bytes();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Png);
+        // The first frame is solid red.
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(img.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
     }
 
     #[test]
