@@ -45,6 +45,11 @@ impl EncodeOptions {
     }
 }
 
+/// Watermark images resolved by the server, keyed by the URL
+/// the request referenced. The engine only ever sees pixels;
+/// fetching happens outside it.
+pub type WatermarkImages = std::collections::HashMap<String, DynamicImage>;
+
 /// Apply `filters` in order.
 ///
 /// Returns the transformed image plus the encoding directives.
@@ -97,6 +102,11 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
                 };
             }
             Filter::Trim(tolerance) => img = trim(img, *tolerance),
+            // Watermarks are applied by the engine, which owns
+            // the resolved images; one reaching this function is
+            // unresolved by construction and leaves pixels alone.
+            // (The engine never routes them here.)
+            Filter::Watermark { .. } => {}
             Filter::Fill(color) => options.fill = Some(*color),
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::Quality(q) => options.quality = Some(*q),

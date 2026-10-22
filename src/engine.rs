@@ -9,9 +9,9 @@ use std::sync::Once;
 use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use crate::crop::crop_to_aspect;
-use crate::filters::{EncodeOptions, apply_filters};
+use crate::filters::{EncodeOptions, WatermarkImages, apply_filters};
 use crate::quality::auto_quality;
-use crate::url::{Dimension, ImageFormat, ImageSize, Operation, Quality};
+use crate::url::{Dimension, Filter, ImageFormat, ImageSize, Operation, Quality};
 
 /// Register the JPEG XL decoder with the image crate, once.
 ///
@@ -89,7 +89,7 @@ impl Engine {
     /// form is kept for tests and future library use.
     #[allow(dead_code)]
     pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<ProcessedImage, EngineError> {
-        self.process_preferred(bytes, ops, None)
+        self.process_preferred(bytes, ops, None, &WatermarkImages::new())
     }
 
     /// Like [`Engine::process`], with a negotiated format preference.
@@ -97,11 +97,14 @@ impl Engine {
     /// `preferred` (from the client's `Accept` header, chosen by the
     /// server) applies only when the operations name no format
     /// themselves; an explicit `format(...)` filter always wins.
+    /// `watermarks` carries the images the server resolved for any
+    /// `watermark(...)` filters in the operations.
     pub fn process_preferred(
         &self,
         bytes: &[u8],
         ops: &[Operation],
         preferred: Option<ImageFormat>,
+        watermarks: &WatermarkImages,
     ) -> Result<ProcessedImage, EngineError> {
         ensure_jxl_decoder();
         let detected = detect_format(bytes);
@@ -118,7 +121,7 @@ impl Engine {
                     .unwrap_or(detected)
                     == ImageFormat::Gif
             {
-                return self.process_animated_gif(frames, ops);
+                return self.process_animated_gif(frames, ops, watermarks);
             }
             DynamicImage::ImageRgba8(
                 frames
@@ -149,7 +152,7 @@ impl Engine {
         } else {
             None
         };
-        let (img, directives) = apply_operations(img, ops, cap)?;
+        let (img, directives) = apply_operations(img, ops, cap, watermarks)?;
         if let Some(f) = directives.format {
             format = f;
         } else if let Some(p) = preferred {
@@ -211,6 +214,7 @@ impl Engine {
         &self,
         frames: Vec<image::Frame>,
         ops: &[Operation],
+        watermarks: &WatermarkImages,
     ) -> Result<ProcessedImage, EngineError> {
         let (source_width, source_height) = {
             let b = frames[0].buffer();
@@ -226,7 +230,7 @@ impl Engine {
         for frame in frames {
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _) = apply_operations(img, ops, cap)?;
+            let (img, _) = apply_operations(img, ops, cap, watermarks)?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
         let (width, height) = out_frames
@@ -272,6 +276,7 @@ fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
+    watermarks: &WatermarkImages,
 ) -> Result<(DynamicImage, EncodeOptions), EngineError> {
     let mut directives = EncodeOptions::default();
     for op in ops {
@@ -315,9 +320,28 @@ fn apply_operations(
                 );
             }
             Operation::Filters(filters) => {
-                let (new_img, options) = apply_filters(img, filters);
-                img = new_img;
-                directives.absorb(options);
+                // One filter at a time, in order: watermark
+                // filters resolve against the server-fetched
+                // images, everything else goes through
+                // `apply_filters` as before.
+                for filter in filters {
+                    match filter {
+                        Filter::Watermark { url, x, y, alpha } => {
+                            let wm = watermarks.get(url).ok_or_else(|| {
+                                EngineError::Unsupported(format!(
+                                    "watermark was not resolved: {url}"
+                                ))
+                            })?;
+                            img = overlay_watermark(&img, wm, *x, *y, *alpha);
+                        }
+                        other => {
+                            let (new_img, options) =
+                                apply_filters(img, std::slice::from_ref(other));
+                            img = new_img;
+                            directives.absorb(options);
+                        }
+                    }
+                }
             }
         }
     }
@@ -465,6 +489,53 @@ fn encode(
         ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
     }
     Ok(buf)
+}
+
+/// Overlay `wm` onto `base` at (x, y) with `alpha` percent
+/// opacity, honoring the watermark's own alpha channel.
+/// Negative coordinates anchor from the right/bottom edges
+/// (x = -1 puts the watermark's right edge one pixel from the
+/// base's right edge). Parts falling outside the base are
+/// clipped, never a panic.
+fn overlay_watermark(
+    base: &DynamicImage,
+    wm: &DynamicImage,
+    x: i32,
+    y: i32,
+    alpha: u8,
+) -> DynamicImage {
+    let mut out = base.to_rgba8();
+    let wm = wm.to_rgba8();
+    let left = if x >= 0 {
+        x as i64
+    } else {
+        out.width() as i64 - wm.width() as i64 + x as i64
+    };
+    let top = if y >= 0 {
+        y as i64
+    } else {
+        out.height() as i64 - wm.height() as i64 + y as i64
+    };
+    let opacity = alpha as f32 / 100.0;
+    let (bw, bh) = (out.width() as i64, out.height() as i64);
+    for wy in 0..wm.height() as i64 {
+        for wx in 0..wm.width() as i64 {
+            let (bx, by) = (left + wx, top + wy);
+            if bx < 0 || by < 0 || bx >= bw || by >= bh {
+                continue;
+            }
+            let top_px = wm.get_pixel(wx as u32, wy as u32);
+            let a = opacity * (top_px[3] as f32 / 255.0);
+            if a <= 0.0 {
+                continue;
+            }
+            let bot = out.get_pixel_mut(bx as u32, by as u32);
+            for c in 0..3 {
+                bot[c] = (bot[c] as f32 * (1.0 - a) + top_px[c] as f32 * a).round() as u8;
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(out)
 }
 
 /// Composite an image over a solid background color, dropping the
@@ -1090,7 +1161,12 @@ mod tests {
     fn preferred_format_applies_only_without_explicit_format() {
         let engine = Engine;
         let out = engine
-            .process_preferred(&gradient_png(), &[], Some(ImageFormat::WebP))
+            .process_preferred(
+                &gradient_png(),
+                &[],
+                Some(ImageFormat::WebP),
+                &WatermarkImages::new(),
+            )
             .unwrap();
         assert_eq!(out.format, ImageFormat::WebP);
         let out = engine
@@ -1098,6 +1174,7 @@ mod tests {
                 &gradient_png(),
                 &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
                 Some(ImageFormat::WebP),
+                &WatermarkImages::new(),
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Png);
@@ -1408,6 +1485,95 @@ mod tests {
         // The first frame is solid red.
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
+    }
+
+    fn watermark_map() -> WatermarkImages {
+        let mut map = WatermarkImages::new();
+        map.insert(
+            "wm".to_string(),
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255]))),
+        );
+        map
+    }
+
+    fn red_source() -> Vec<u8> {
+        png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            20,
+            20,
+            image::Rgb([255, 0, 0]),
+        )))
+    }
+
+    #[test]
+    fn watermark_overlays_and_blends() {
+        let engine = Engine;
+        let src = red_source();
+        let map = watermark_map();
+        let wm_op = |x: i32, y: i32, alpha: u8| {
+            Operation::Filters(vec![Filter::Watermark {
+                url: "wm".to_string(),
+                x,
+                y,
+                alpha,
+            }])
+        };
+        // Full opacity at the top-left corner.
+        let out = engine
+            .process_preferred(&src, &[wm_op(0, 0, 100)], None, &map)
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(img.get_pixel(0, 0), &image::Rgb([0, 0, 255]));
+        assert_eq!(img.get_pixel(10, 10), &image::Rgb([255, 0, 0]));
+        // Half opacity blends evenly.
+        let out = engine
+            .process_preferred(&src, &[wm_op(0, 0, 50)], None, &map)
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(img.get_pixel(0, 0), &image::Rgb([128, 0, 128]));
+    }
+
+    #[test]
+    fn watermark_negative_coordinates_anchor_from_the_edges() {
+        let engine = Engine;
+        let src = red_source();
+        let map = watermark_map();
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::Watermark {
+                    url: "wm".to_string(),
+                    x: -2,
+                    y: -2,
+                    alpha: 100,
+                }])],
+                None,
+                &map,
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // The 4x4 watermark lands at (14, 14): 20 - 4 - 2.
+        assert_eq!(img.get_pixel(14, 14), &image::Rgb([0, 0, 255]));
+        assert_eq!(img.get_pixel(17, 17), &image::Rgb([0, 0, 255]));
+        assert_eq!(img.get_pixel(19, 19), &image::Rgb([255, 0, 0]));
+        assert_eq!(img.get_pixel(13, 13), &image::Rgb([255, 0, 0]));
+    }
+
+    #[test]
+    fn unresolved_watermark_is_an_error() {
+        let engine = Engine;
+        let src = red_source();
+        let err = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Watermark {
+                    url: "missing".to_string(),
+                    x: 0,
+                    y: 0,
+                    alpha: 100,
+                }])],
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
     }
 
     #[test]
