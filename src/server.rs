@@ -80,6 +80,17 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// The `DPR` client hint, when it names one of the settled
+/// factors. Anything else (absent, unparsable, out of set) is
+/// no hint: hints are advisory, never an error.
+fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
+    headers
+        .get("DPR")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|f| [1.0, 1.5, 2.0, 3.0].contains(f))
+}
+
 async fn handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -95,7 +106,8 @@ async fn handle(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (response, mut record) = serve(&state, path, accept.as_deref()).await;
+    let dpr = dpr_hint(&headers);
+    let (response, mut record) = serve(&state, path, accept.as_deref(), dpr).await;
     record.status = response.status().as_u16();
     record.total = started.elapsed();
     state.metrics.record(&record);
@@ -104,7 +116,12 @@ async fn handle(
 }
 
 /// Run one image request, timing each stage into the returned record.
-async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response, RequestRecord) {
+async fn serve(
+    state: &AppState,
+    path: &str,
+    accept: Option<&str>,
+    dpr_hint: Option<f32>,
+) -> (Response, RequestRecord) {
     let mut record = RequestRecord::default();
     let full = format!("/{path}");
 
@@ -130,13 +147,19 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
         .trim_end_matches('/')
         .to_string();
 
+    // The DPR client hint settles sizing when the URL has no
+    // explicit `dpr` directive; the effective factor is part of
+    // what the response is, so it joins the cache key whenever
+    // it changes the output.
+    let effective_dpr = crate::url::explicit_dpr(&ops).or(dpr_hint).unwrap_or(1.0);
+
     // Without an explicit format in the URL, the response depends
     // on the Accept class as well as the path, so the cache key
     // carries the class. Explicit-format URLs key on the path alone.
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);
     let placeholders = meta && wants_placeholders(accept);
-    let cache_key = if explicit_format(&ops).is_some() {
+    let mut cache_key = if explicit_format(&ops).is_some() {
         rest.to_string()
     } else {
         let class = match preferred {
@@ -146,6 +169,9 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
         };
         format!("{rest}#{class}")
     };
+    if effective_dpr != 1.0 {
+        cache_key = format!("{cache_key}#dpr{effective_dpr}");
+    }
 
     // The verified path is content-addressed: a stored response can
     // be served without touching the loader or the engine. Meta
@@ -232,6 +258,7 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
         upscale_provider: state.upscale.as_deref(),
         face_provider: state.face.as_deref(),
         text_renderer: state.font.as_deref(),
+        dpr: dpr_hint,
     };
     let processed = match state.engine.process_preferred(&bytes, &ops, ctx) {
         Ok(p) => p,
@@ -394,7 +421,7 @@ fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
         header::CACHE_CONTROL,
         "public, max-age=31536000, immutable".parse().unwrap(),
     );
-    headers.insert(header::VARY, "Accept".parse().unwrap());
+    headers.insert(header::VARY, "Accept, DPR".parse().unwrap());
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -416,7 +443,7 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
         "public, max-age=31536000, immutable".parse().unwrap(),
     );
     // The format may have been negotiated from the request's Accept.
-    headers.insert(header::VARY, "Accept".parse().unwrap());
+    headers.insert(header::VARY, "Accept, DPR".parse().unwrap());
     if let Some(q) = quality {
         headers.insert(
             axum::http::HeaderName::from_static("x-crabcrop-quality"),
@@ -791,6 +818,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dpr_header_scales_and_caches_separately() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("20x20/{src}");
+        let sig = sign(&remainder);
+        let url = format!("{base}/{sig}/{remainder}");
+        let dims = |bytes: &[u8]| {
+            let img = image::load_from_memory(bytes).unwrap();
+            (img.width(), img.height())
+        };
+        // With the hint, the 20x20 target becomes 40x40.
+        let hinted = client()
+            .get(&url)
+            .header("DPR", "2")
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(dims(&hinted), (40, 40));
+        // Without it, the same URL serves 20x20: the two results
+        // live in separate cache entries, neither pollutes the
+        // other.
+        let plain = client()
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(dims(&plain), (20, 20));
+        let hinted_again = client()
+            .get(&url)
+            .header("DPR", "2")
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(dims(&hinted_again), (40, 40));
+        // A nonsense hint is ignored, never an error.
+        let bogus = client()
+            .get(&url)
+            .header("DPR", "banana")
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(dims(&bogus), (20, 20));
+    }
+
+    #[tokio::test]
     async fn text_without_a_font_is_400() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;
@@ -959,7 +1043,7 @@ mod tests {
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/avif"
         );
-        assert_eq!(resp.headers().get(header::VARY).unwrap(), "Accept");
+        assert_eq!(resp.headers().get(header::VARY).unwrap(), "Accept, DPR");
         let body = resp.bytes().await.unwrap();
         assert_eq!(&body[4..8], b"ftyp");
     }

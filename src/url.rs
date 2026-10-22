@@ -226,6 +226,10 @@ pub enum Filter {
     /// AI super-resolution by the given factor (2 or 4),
     /// backed by the server's upscale model.
     Upscale(u32),
+    /// Device-pixel-ratio directive: scale size and crop
+    /// targets by the factor (1, 1.5, 2, or 3) before the
+    /// no-upscale cap sees them.
+    Dpr(f32),
     /// Rendered text overlaid at one of the nine grid anchors.
     /// The text is the percent-decoded label; color is RGBA.
     Text {
@@ -522,6 +526,13 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 }
                 Filter::Upscale(factor)
             }
+            ("dpr", Some(p)) => {
+                let factor: f32 = p.parse().map_err(|_| invalid())?;
+                if ![1.0, 1.5, 2.0, 3.0].contains(&factor) {
+                    return Err(invalid());
+                }
+                Filter::Dpr(factor)
+            }
             ("text", Some(p)) => {
                 // <text>,<size>,<color>,<anchor>. The text is
                 // percent-encoded and may contain commas, so
@@ -700,6 +711,23 @@ fn parse_text_color(s: &str) -> Option<[u8; 4]> {
     } else {
         Some([(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8])
     }
+}
+
+/// The request's explicit DPR factor, if a `dpr` directive is
+/// present. Like format and quality it is request-wide: the
+/// last segment that sets it wins.
+pub fn explicit_dpr(ops: &[Operation]) -> Option<f32> {
+    let mut found = None;
+    for op in ops {
+        if let Operation::Filters(filters) = op {
+            for f in filters {
+                if let Filter::Dpr(factor) = f {
+                    found = Some(*factor);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Whether any filters segment in `ops` requests `text`.
@@ -1073,6 +1101,26 @@ mod tests {
                 parse_operations(&format!("{seg}/example.com/img.jpg")),
                 Err(ParseError::InvalidFilters(seg.to_string())),
                 "segment: {seg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_dpr_directive() {
+        let (ops, _) = parse_operations("filters:dpr(2)/example.com/i.png").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Dpr(2.0)])]);
+        assert_eq!(explicit_dpr(&ops), Some(2.0));
+        for bad in [
+            "filters:dpr(1.25)", // not one of the settled factors
+            "filters:dpr(0)",
+            "filters:dpr(4)",
+            "filters:dpr(abc)",
+            "filters:dpr", // the factor is required
+        ] {
+            let path = format!("{bad}/example.com/i.png");
+            assert!(
+                matches!(parse_operations(&path), Err(ParseError::InvalidFilters(_))),
+                "input: {bad}"
             );
         }
     }

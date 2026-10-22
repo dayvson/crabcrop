@@ -116,6 +116,10 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // Text is drawn by the engine, which owns the
             // configured font renderer. (Same routing.)
             Filter::Text { .. } => {}
+            // DPR scales size targets in the engine, which
+            // resolves it against the request as a whole (with
+            // the client-hint fallback). (Same routing.)
+            Filter::Dpr(_) => {}
             Filter::Fill(color) => options.fill = Some(*color),
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::Quality(q) => options.quality = Some(*q),
