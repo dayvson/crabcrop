@@ -30,6 +30,9 @@
 //! - `CRABCROP_FACE_MODEL`: path to a YuNet ONNX model for
 //!   face-aware smart crops. Same preload rule; unset means
 //!   smart crops use the saliency estimate.
+//! - `CRABCROP_FONT_PATH`: path to a TTF/OTF font for the
+//!   `text(...)` overlay filter, loaded at boot. Unset
+//!   disables the filter (requests fail cleanly).
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
 //! - `PORT`: listen port, default 3000.
@@ -47,6 +50,7 @@ mod observe;
 mod placeholder;
 mod quality;
 mod server;
+mod text;
 mod url;
 
 use std::env;
@@ -145,6 +149,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    // The overlay font follows the same rule as the models:
+    // configured by path, loaded at boot, broken is fatal.
+    let font: Option<Arc<dyn crate::text::TextRenderer>> = match env::var("CRABCROP_FONT_PATH") {
+        Ok(path) if !path.is_empty() => {
+            let renderer = crate::text::FontRenderer::load(&path)
+                .map_err(|e| format!("cannot load the overlay font: {e}"))?;
+            println!("overlay font loaded from {path}");
+            Some(Arc::new(renderer))
+        }
+        _ => None,
+    };
+
     let state = AppState {
         secret,
         allow_unsafe,
@@ -157,6 +173,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         removebg,
         upscale,
         face,
+        font,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
