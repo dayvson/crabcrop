@@ -8,7 +8,6 @@ use std::sync::Once;
 
 use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
-use crate::crop::crop_to_aspect;
 use crate::filters::{EncodeOptions, WatermarkImages, apply_filters};
 use crate::quality::auto_quality;
 use crate::url::{Dimension, Filter, ImageFormat, ImageSize, Operation, Quality};
@@ -97,6 +96,8 @@ pub struct ProcessContext<'a> {
     pub mask_provider: Option<&'a dyn crate::ai::MaskProvider>,
     /// Upscale provider, when the deployment configured a model.
     pub upscale_provider: Option<&'a dyn crate::ai::UpscaleProvider>,
+    /// Face provider for smart crops, when configured.
+    pub face_provider: Option<&'a dyn crate::ai::FaceProvider>,
 }
 
 /// Decodes, resizes, and encodes images.
@@ -425,7 +426,7 @@ fn apply_operations(
                         ));
                     }
                 };
-                img = crop_to_aspect(img, tw, th, *align);
+                img = crate::crop::crop_to_aspect_with(img, tw, th, *align, ctx.face_provider);
                 img = apply_size(
                     img,
                     &ImageSize {
@@ -1967,6 +1968,60 @@ mod tests {
             EngineError::Unsupported(msg) => assert!(msg.contains("not configured"), "{msg}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// A face provider reporting a face over the right half.
+    #[derive(Debug)]
+    struct RightFace;
+
+    impl crate::ai::FaceProvider for RightFace {
+        fn detect(&self, img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+            Ok(vec![crate::ai::FaceBox {
+                x: img.width() / 2,
+                y: 0,
+                w: img.width() / 2,
+                h: img.height(),
+                score: 0.95,
+            }])
+        }
+    }
+
+    #[test]
+    fn smart_crop_lands_on_a_detected_face() {
+        let engine = Engine;
+        // Left half red, right half blue; the face is on the
+        // right. A 1:2 smart crop (50x100 out of 100x100) must
+        // take the right half wholesale.
+        let mut img = image::RgbImage::new(100, 100);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            *p = if x < 50 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        let src = png_bytes(&DynamicImage::ImageRgb8(img));
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Crop {
+                    size: ImageSize {
+                        width: Dimension::Pixels(50),
+                        height: Dimension::Pixels(100),
+                        flip_horizontal: false,
+                        flip_vertical: false,
+                    },
+                    align: Align::Smart,
+                }],
+                ProcessContext {
+                    face_provider: Some(&RightFace),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (50, 100));
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(result.get_pixel(25, 50), &image::Rgb([0, 0, 255]));
     }
 
     #[test]

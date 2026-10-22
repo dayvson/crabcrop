@@ -13,11 +13,29 @@ use crate::url::Align;
 ///
 /// Uses the full source height (or width); returns `img` unchanged when
 /// the ratios already match or the target dimensions are zero.
+///
+/// The engine calls [`crop_to_aspect_with`] (it may have a face
+/// provider); this composed form is kept for tests and future
+/// library use.
+#[allow(dead_code)]
 pub fn crop_to_aspect(
     img: DynamicImage,
     target_w: u32,
     target_h: u32,
     align: Align,
+) -> DynamicImage {
+    crop_to_aspect_with(img, target_w, target_h, align, None)
+}
+
+/// [`crop_to_aspect`] with an optional face provider: when one
+/// is configured, smart alignment prefers detected faces over
+/// the saliency estimate.
+pub fn crop_to_aspect_with(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    align: Align,
+    faces: Option<&dyn crate::ai::FaceProvider>,
 ) -> DynamicImage {
     if target_w == 0 || target_h == 0 {
         return img;
@@ -35,7 +53,7 @@ pub fn crop_to_aspect(
         let x = match align {
             Align::Left => 0,
             Align::Right => w.saturating_sub(cw),
-            Align::Smart => smart_start(&img, cw, w, true),
+            Align::Smart => smart_start(&img, cw, w, true, faces),
             _ => (w.saturating_sub(cw)) / 2,
         };
         (x, 0, cw, h)
@@ -45,7 +63,7 @@ pub fn crop_to_aspect(
         let y = match align {
             Align::Top => 0,
             Align::Bottom => h.saturating_sub(ch),
-            Align::Smart => smart_start(&img, ch, h, false),
+            Align::Smart => smart_start(&img, ch, h, false, faces),
             _ => (h.saturating_sub(ch)) / 2,
         };
         (0, y, w, ch)
@@ -57,8 +75,14 @@ pub fn crop_to_aspect(
 /// Window start along one axis for smart alignment: center the
 /// `window` span on the focal point's coordinate along that
 /// axis, clamped so the window stays inside the image.
-fn smart_start(img: &DynamicImage, window: u32, extent: u32, horizontal: bool) -> u32 {
-    let f = crate::focus::focal_point(img);
+fn smart_start(
+    img: &DynamicImage,
+    window: u32,
+    extent: u32,
+    horizontal: bool,
+    faces: Option<&dyn crate::ai::FaceProvider>,
+) -> u32 {
+    let f = crate::focus::focal_point_with(img, faces);
     let frac = if horizontal { f.x } else { f.y };
     let center = (frac * extent as f32).round() as i32;
     let max_start = extent.saturating_sub(window) as i32;

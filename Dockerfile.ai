@@ -20,6 +20,9 @@ RUN tar -xzf /tmp/ort.tgz -C /tmp \
 ADD https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx /models/u2netp.onnx
 RUN echo "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  /models/u2netp.onnx" | sha256sum -c -
 
+ADD https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx /models/yunet.onnx
+RUN echo "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  /models/yunet.onnx" | sha256sum -c -
+
 # The upscale model follows the same rule (layered artifact,
 # preloaded at boot). Super-resolution ONNX exports are less
 # standardized than u2netp, so the operator layers their own:
@@ -27,4 +30,5 @@ RUN echo "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  /mod
 # ENV CRABCROP_UPSCALE_MODEL=/models/sr.onnx
 
 ENV CRABCROP_ORT_DYLIB=/opt/onnxruntime/libonnxruntime.so \
-    CRABCROP_REMOVEBG_MODEL=/models/u2netp.onnx
+    CRABCROP_REMOVEBG_MODEL=/models/u2netp.onnx \
+    CRABCROP_FACE_MODEL=/models/yunet.onnx

@@ -591,6 +591,20 @@ pub fn has_upscale(ops: &[Operation]) -> bool {
     })
 }
 
+/// Whether any operation in `ops` is a smart-aligned crop
+/// (which may run face detection when one is configured).
+pub fn has_smart_crop(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            Operation::Crop {
+                align: Align::Smart,
+                ..
+            }
+        )
+    })
+}
+
 /// The distinct watermark URLs a request references, in order of
 /// first appearance. The server fetches each one before the
 /// engine runs.

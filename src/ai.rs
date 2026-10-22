@@ -287,6 +287,169 @@ impl UpscaleProvider for OnnxUpscaleProvider {
     }
 }
 
+/// A detected face, in source-image pixels, with the
+/// detector's confidence in 0.0..=1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FaceBox {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub score: f32,
+}
+
+/// Detects faces in an image. Implemented by the ONNX provider
+/// in production and by fakes in tests.
+pub trait FaceProvider: Send + Sync + std::fmt::Debug {
+    fn detect(&self, img: &DynamicImage) -> Result<Vec<FaceBox>, String>;
+}
+
+/// Face detection backed by YuNet (the 2023mar ONNX export):
+/// a fixed 640x640 input, three stride heads (8/16/32), and
+/// boxes regressed directly from cell offsets, decoded exactly
+/// as the reference implementation does. Detections below a
+/// 0.6 confidence are dropped, then non-maximum suppression at
+/// 0.3 IoU keeps the best box of each cluster.
+pub struct OnnxFaceProvider {
+    session: Mutex<Session>,
+    input_name: String,
+}
+
+impl OnnxFaceProvider {
+    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, String> {
+        let (session, input_name) = build_session(dylib, model_path)?;
+        Ok(Self {
+            session: Mutex::new(session),
+            input_name,
+        })
+    }
+}
+
+impl std::fmt::Debug for OnnxFaceProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxFaceProvider")
+            .field("input_name", &self.input_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The export's fixed input edge.
+const FACE_INPUT: u32 = 640;
+/// Confidence floor, matching the reference defaults.
+const FACE_SCORE_THRESHOLD: f32 = 0.6;
+/// NMS IoU ceiling, matching the reference defaults.
+const FACE_NMS_THRESHOLD: f32 = 0.3;
+
+impl FaceProvider for OnnxFaceProvider {
+    fn detect(&self, img: &DynamicImage) -> Result<Vec<FaceBox>, String> {
+        let (ow, oh) = (img.width(), img.height());
+        if ow == 0 || oh == 0 {
+            return Ok(Vec::new());
+        }
+        // The export takes exactly 640x640. The image is scaled
+        // to fit (the reference wrapper resizes the same way);
+        // boxes map back with independent axis scales.
+        let small = img
+            .resize_exact(FACE_INPUT, FACE_INPUT, FilterType::Triangle)
+            .to_rgb8();
+        // BGR planar floats at 0..255: the channel order and
+        // scale the model was trained with.
+        let plane = (FACE_INPUT * FACE_INPUT) as usize;
+        let mut input = vec![0f32; 3 * plane];
+        for (i, px) in small.pixels().enumerate() {
+            input[i] = px[2] as f32;
+            input[plane + i] = px[1] as f32;
+            input[2 * plane + i] = px[0] as f32;
+        }
+        let tensor = ort::value::Tensor::from_array((
+            [1, 3, FACE_INPUT as usize, FACE_INPUT as usize],
+            input.into_boxed_slice(),
+        ))
+        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| "face provider lock poisoned".to_string())?;
+        let outputs = session
+            .run(ort::inputs![self.input_name.as_str() => tensor])
+            .map_err(|e| format!("inference failed: {e}"))?;
+        let mut by_name: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        for (name, value) in outputs.into_iter() {
+            let (_, data) = value
+                .try_extract_tensor::<f32>()
+                .map_err(|e| format!("cannot read the model output: {e}"))?;
+            by_name.insert(name.to_string(), data.to_vec());
+        }
+        drop(session);
+        let get = |name: &str| -> Result<&Vec<f32>, String> {
+            by_name
+                .get(name)
+                .ok_or_else(|| format!("the model produced no {name} output"))
+        };
+        let mut candidates: Vec<FaceBox> = Vec::new();
+        for stride in [8u32, 16, 32] {
+            let cls = get(&format!("cls_{stride}"))?;
+            let obj = get(&format!("obj_{stride}"))?;
+            let bbox = get(&format!("bbox_{stride}"))?;
+            let grid = FACE_INPUT / stride;
+            for r in 0..grid {
+                for c in 0..grid {
+                    let idx = (r * grid + c) as usize;
+                    let score = (cls[idx].clamp(0.0, 1.0) * obj[idx].clamp(0.0, 1.0)).sqrt();
+                    if score < FACE_SCORE_THRESHOLD {
+                        continue;
+                    }
+                    let cx = (c as f32 + bbox[idx * 4]) * stride as f32;
+                    let cy = (r as f32 + bbox[idx * 4 + 1]) * stride as f32;
+                    let w = bbox[idx * 4 + 2].exp() * stride as f32;
+                    let h = bbox[idx * 4 + 3].exp() * stride as f32;
+                    // Map back to source coordinates, clamped
+                    // to the image: boxes may hang off an edge.
+                    let fx = (cx - w / 2.0) * ow as f32 / FACE_INPUT as f32;
+                    let fy = (cy - h / 2.0) * oh as f32 / FACE_INPUT as f32;
+                    let fw = w * ow as f32 / FACE_INPUT as f32;
+                    let fh = h * oh as f32 / FACE_INPUT as f32;
+                    let x = fx.round().clamp(0.0, ow as f32) as u32;
+                    let y = fy.round().clamp(0.0, oh as f32) as u32;
+                    candidates.push(FaceBox {
+                        x,
+                        y,
+                        w: (fw.round() as u32).min(ow - x),
+                        h: (fh.round() as u32).min(oh - y),
+                        score,
+                    });
+                }
+            }
+        }
+        Ok(nms(candidates))
+    }
+}
+
+/// Greedy non-maximum suppression: best score first, a
+/// candidate survives only if it overlaps every kept box by
+/// at most the IoU threshold.
+fn nms(mut boxes: Vec<FaceBox>) -> Vec<FaceBox> {
+    boxes.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut kept: Vec<FaceBox> = Vec::new();
+    for b in boxes {
+        if kept.iter().all(|k| iou(k, &b) <= FACE_NMS_THRESHOLD) {
+            kept.push(b);
+        }
+    }
+    kept
+}
+
+fn iou(a: &FaceBox, b: &FaceBox) -> f32 {
+    let x1 = a.x.max(b.x);
+    let y1 = a.y.max(b.y);
+    let x2 = (a.x + a.w).min(b.x + b.w);
+    let y2 = (a.y + a.h).min(b.y + b.h);
+    let inter = x2.saturating_sub(x1) as f32 * y2.saturating_sub(y1) as f32;
+    let union = (a.w * a.h + b.w * b.h) as f32 - inter;
+    if union <= 0.0 { 0.0 } else { inter / union }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +492,37 @@ mod tests {
         // is (0 - 0.485) / 0.229 = -2.1179...
         let input = preprocess(&solid(0, 0, 0, 8, 8));
         assert!((input[0] - -2.1179).abs() < 0.001, "got {}", input[0]);
+    }
+
+    /// Real-model verification, run manually with the deployment
+    /// artifacts in place:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_FACE_MODEL=...
+    /// cargo test -- --ignored face_detection_with_the_real_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn face_detection_with_the_real_model() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_FACE_MODEL").unwrap();
+        let provider = OnnxFaceProvider::load(Some(&dylib), &model).unwrap();
+        let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
+        let img = image::load_from_memory(bytes).unwrap();
+        let faces = provider.detect(&img).unwrap();
+        assert_eq!(faces.len(), 1, "faces: {faces:?}");
+        let f = faces[0];
+        assert!(f.score > 0.8, "score {}", f.score);
+        // The fixture portrait's face, measured: the box lands
+        // on it with room for build-to-build wobble.
+        assert!((130..=175).contains(&f.x), "x {}", f.x);
+        assert!((15..=50).contains(&f.y), "y {}", f.y);
+        assert!((70..=110).contains(&f.w), "w {}", f.w);
+        assert!((115..=165).contains(&f.h), "h {}", f.h);
+        // A flat image has no faces.
+        assert!(
+            provider
+                .detect(&solid(10, 20, 30, 120, 90))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Real-model verification, run manually with the deployment
