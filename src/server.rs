@@ -38,6 +38,13 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// Processed-response cache, shared like the metrics.
     pub cache: Arc<Cache>,
+    /// Background-removal provider, preloaded at boot when
+    /// `CRABCROP_REMOVEBG_MODEL` is configured. `None` means the
+    /// feature is off; `removebg` requests then fail cleanly.
+    pub removebg: Option<Arc<dyn crate::ai::MaskProvider>>,
+    /// Bounds concurrent AI inference so it cannot starve the
+    /// transform pipeline.
+    pub ai_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// Build the router.
@@ -188,13 +195,27 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
 
     record.process_ran = true;
     let process_start = Instant::now();
-    let processed = match state.engine.process_preferred(
-        &bytes,
-        &ops,
+    // AI inference is gated process-wide: a burst of removebg
+    // requests must not starve the transform pipeline.
+    let _ai_permit = if crate::url::has_removebg(&ops) {
+        Some(
+            state
+                .ai_gate
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the AI gate is never closed"),
+        )
+    } else {
+        None
+    };
+    let ctx = crate::engine::ProcessContext {
         preferred,
-        &watermark_images,
+        watermarks: Some(&watermark_images),
         placeholders,
-    ) {
+        mask_provider: state.removebg.as_deref(),
+    };
+    let processed = match state.engine.process_preferred(&bytes, &ops, ctx) {
         Ok(p) => p,
         Err(e) => {
             record.process = process_start.elapsed();
@@ -413,6 +434,7 @@ fn engine_error_response(e: EngineError) -> Response {
         EngineError::Decode(cause) => (StatusCode::BAD_GATEWAY, cause),
         EngineError::Encode(cause) => (StatusCode::INTERNAL_SERVER_ERROR, cause),
         EngineError::Unsupported(what) => (StatusCode::BAD_REQUEST, what),
+        EngineError::Inference(cause) => (StatusCode::INTERNAL_SERVER_ERROR, cause),
     };
     (status, message).into_response()
 }
@@ -520,6 +542,8 @@ mod tests {
             engine: Engine,
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -531,6 +555,18 @@ mod tests {
 
     fn client() -> reqwest::Client {
         reqwest::Client::new()
+    }
+
+    #[tokio::test]
+    async fn removebg_without_a_configured_model_is_a_clean_400() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:removebg:format(png)/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("not configured"), "body: {body}");
     }
 
     #[tokio::test]

@@ -107,6 +107,9 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // unresolved by construction and leaves pixels alone.
             // (The engine never routes them here.)
             Filter::Watermark { .. } => {}
+            // Background removal is applied by the engine, which
+            // owns the mask provider. (Same routing as above.)
+            Filter::RemoveBg => {}
             Filter::Fill(color) => options.fill = Some(*color),
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::Quality(q) => options.quality = Some(*q),

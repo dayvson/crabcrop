@@ -1,0 +1,24 @@
+# crabcrop with AI background removal.
+#
+# The base image carries no AI payload. This variant layers
+# the ONNX Runtime and the segmentation model onto it and
+# enables the `removebg` filter by configuration: the model
+# is preloaded at boot, so a broken payload fails the
+# container at startup, not at first use.
+#
+# Both downloads are pinned and hash-checked. The model is a
+# deployment artifact: it is never committed to this repo.
+FROM crabcrop:latest
+
+ADD https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz /tmp/ort.tgz
+RUN tar -xzf /tmp/ort.tgz -C /tmp \
+    && mkdir -p /opt/onnxruntime \
+    && cp /tmp/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0 /opt/onnxruntime/libonnxruntime.so \
+    && echo "469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e  /opt/onnxruntime/libonnxruntime.so" | sha256sum -c - \
+    && rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-x64-1.31.0
+
+ADD https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx /models/u2netp.onnx
+RUN echo "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  /models/u2netp.onnx" | sha256sum -c -
+
+ENV CRABCROP_ORT_DYLIB=/opt/onnxruntime/libonnxruntime.so \
+    CRABCROP_REMOVEBG_MODEL=/models/u2netp.onnx

@@ -170,6 +170,10 @@ pub enum Filter {
         y: i32,
         alpha: u8,
     },
+    /// Remove the background with the server's segmentation
+    /// model, keeping the subject over transparency. The model
+    /// is operator-configured; the engine applies its mask.
+    RemoveBg,
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Encoding directive: re-encode at lower quality until the
@@ -450,6 +454,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 Filter::Rgb(offsets[0], offsets[1], offsets[2])
             }
             ("equalize", None) => Filter::Equalize,
+            ("removebg", None) => Filter::RemoveBg,
             ("trim", None) => Filter::Trim(10),
             ("trim", Some(p)) => {
                 let tolerance: u8 = p.parse().map_err(|_| invalid())?;
@@ -556,6 +561,14 @@ pub fn explicit_format(ops: &[Operation]) -> Option<ImageFormat> {
 pub fn has_no_upscale(ops: &[Operation]) -> bool {
     ops.iter().any(|op| match op {
         Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::NoUpscale)),
+        _ => false,
+    })
+}
+
+/// Whether any filters segment in `ops` requests `removebg`.
+pub fn has_removebg(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::RemoveBg)),
         _ => false,
     })
 }
@@ -934,6 +947,9 @@ mod tests {
             ops,
             vec![Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])]
         );
+        // `removebg` parses, and takes no parameters.
+        let (ops, _) = parse_operations("filters:removebg/example.com/img.png").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::RemoveBg])]);
     }
 
     #[test]
@@ -1052,6 +1068,8 @@ mod tests {
             let path = format!("filters:{seg}/example.com/img.jpg");
             assert!(parse_operations(&path).is_err(), "{seg}");
         }
+        // `removebg` accepts no parameters.
+        assert!(parse_operations("filters:removebg(1)/example.com/img.png").is_err());
     }
 
     #[test]
