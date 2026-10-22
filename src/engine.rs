@@ -107,6 +107,17 @@ impl Engine {
         watermarks: &WatermarkImages,
     ) -> Result<ProcessedImage, EngineError> {
         ensure_jxl_decoder();
+        // HEIC/HEIF sources are detected explicitly so the failure
+        // names the real problem instead of a generic decode error.
+        // The decoder evaluation (issue #24) found no option that
+        // is both license-compatible with this MIT crate and
+        // buildable in the project's environments today; this
+        // check is the seam a future decoder plugs into.
+        if is_heic(bytes) {
+            return Err(EngineError::Decode(
+                "HEIC/HEIF source: no HEIC decoder in this build".to_string(),
+            ));
+        }
         let detected = detect_format(bytes);
         let img = if detected == ImageFormat::Gif {
             // GIF sources decode frame by frame: an animated source
@@ -399,6 +410,30 @@ fn is_jxl(bytes: &[u8]) -> bool {
         || bytes.starts_with(&[
             0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
         ])
+}
+
+/// Whether `bytes` carry a HEIC/HEIF file type box: an ISO-BMFF
+/// `ftyp` box whose major brand is one of the HEVC image brands
+/// (or the generic HEIF brands). AVIF shares the container but
+/// not the brands, and is not matched.
+fn is_heic(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    matches!(
+        &bytes[8..12],
+        b"heic"
+            | b"heix"
+            | b"hevc"
+            | b"hevx"
+            | b"heim"
+            | b"heis"
+            | b"hevm"
+            | b"hevs"
+            | b"mif1"
+            | b"mif2"
+            | b"msf1"
+    )
 }
 
 /// One step down the `max_bytes` quality ladder. AVIF encodes
@@ -1485,6 +1520,29 @@ mod tests {
         // The first frame is solid red.
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
+    }
+
+    #[test]
+    fn heic_detection_reads_ftyp_brands() {
+        assert!(is_heic(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1"));
+        assert!(is_heic(b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00mif1heic"));
+        // AVIF shares the BMFF container but not the brands.
+        assert!(!is_heic(
+            b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1"
+        ));
+        assert!(!is_heic(&[0u8; 4]));
+        assert!(!is_heic(b"not an image at all"));
+    }
+
+    #[test]
+    fn heic_source_fails_with_a_specific_error() {
+        let engine = Engine;
+        let heic: &[u8] = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1....";
+        let err = engine.process(heic, &[]).unwrap_err();
+        match err {
+            EngineError::Decode(msg) => assert!(msg.contains("HEIC"), "{msg}"),
+            other => panic!("expected Decode, got {other:?}"),
+        }
     }
 
     fn watermark_map() -> WatermarkImages {
