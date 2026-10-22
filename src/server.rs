@@ -17,6 +17,7 @@ use axum::{
     routing::get,
 };
 
+use crate::cache::{Cache, CachedImage};
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
@@ -33,6 +34,8 @@ pub struct AppState {
     pub engine: Engine,
     /// Request metrics, shared behind an `Arc` so clones agree.
     pub metrics: Arc<Metrics>,
+    /// Processed-response cache, shared like the metrics.
+    pub cache: Arc<Cache>,
 }
 
 /// Build the router.
@@ -93,6 +96,14 @@ async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
         .trim_end_matches('/')
         .to_string();
 
+    // The verified path is content-addressed: a stored response can
+    // be served without touching the loader or the engine.
+    if let Some(hit) = state.cache.get(rest) {
+        record.cache_hit = true;
+        record.bytes_out = hit.bytes.len();
+        return (respond(hit.format, hit.quality, hit.bytes), record);
+    }
+
     record.load_ran = true;
     let load_start = Instant::now();
     let bytes = match state.loader.load(source_url).await {
@@ -118,7 +129,26 @@ async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
     };
     record.process = process_start.elapsed();
 
-    let content_type = match processed.format {
+    // Only successful responses are cached; errors never are.
+    state.cache.put(
+        rest.to_string(),
+        CachedImage {
+            bytes: processed.bytes.clone(),
+            format: processed.format,
+            quality: processed.quality,
+        },
+    );
+    record.bytes_out = processed.bytes.len();
+    (
+        respond(processed.format, processed.quality, processed.bytes),
+        record,
+    )
+}
+
+/// Build a successful image response: content type, immutable cache
+/// headers, and the auto-quality header when quality was chosen.
+fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response {
+    let content_type = match format {
         ImageFormat::Jpeg => "image/jpeg",
         ImageFormat::Png => "image/png",
         ImageFormat::WebP => "image/webp",
@@ -130,14 +160,13 @@ async fn serve(state: &AppState, path: &str) -> (Response, RequestRecord) {
         header::CACHE_CONTROL,
         "public, max-age=31536000, immutable".parse().unwrap(),
     );
-    if let Some(q) = processed.quality {
+    if let Some(q) = quality {
         headers.insert(
             axum::http::HeaderName::from_static("x-crabcrop-quality"),
             q.to_string().parse().unwrap(),
         );
     }
-    record.bytes_out = processed.bytes.len();
-    ((headers, processed.bytes).into_response(), record)
+    (headers, bytes).into_response()
 }
 
 fn load_error_response(e: LoadError) -> Response {
@@ -173,7 +202,8 @@ fn engine_error_response(e: EngineError) -> Response {
 mod tests {
     use super::*;
     use image::DynamicImage;
-    use tokio::io::AsyncWriteExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     const SECRET: &[u8] = b"test-secret";
@@ -210,6 +240,37 @@ mod tests {
         format!("http://{addr}/src.png")
     }
 
+    /// Persistent source server that counts its hits.
+    async fn spawn_counting_server(
+        status: u16,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = hits.clone();
+        let content_type = content_type.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        (format!("http://{addr}/src.png"), hits)
+    }
+
     async fn spawn_app(allow_unsafe: bool) -> String {
         let state = AppState {
             secret: SECRET.to_vec(),
@@ -217,6 +278,7 @@ mod tests {
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
             metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -330,6 +392,62 @@ mod tests {
         let sig = sign("");
         let resp = client().get(format!("{base}/{sig}/")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn second_identical_request_hits_the_cache() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let first = client().get(&url).send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = first.bytes().await.unwrap();
+        let second = client().get(&url).send().await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(second.bytes().await.unwrap(), first_body);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = client()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(body.contains("crabcrop_cache_hits_total 1"), "{body}");
+        assert!(body.contains("crabcrop_cache_misses_total 1"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn different_operations_are_different_entries() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        for size in ["300x50", "200x50", "300x50"] {
+            let remainder = format!("{size}/{src}");
+            let resp = client()
+                .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // Two distinct operations fetched once each; the repeat was cached.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_requests_are_not_cached() {
+        let (src, hits) = spawn_counting_server(404, "text/plain", b"nope".to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        for _ in 0..2 {
+            let resp = client().get(&url).send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        }
+        // Both attempts reached the source: nothing was cached.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
