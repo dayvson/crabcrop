@@ -59,6 +59,12 @@ impl Engine {
         ensure_jxl_decoder();
         let mut img =
             image::load_from_memory(bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
+        // Phone photos store rotation in the EXIF orientation tag
+        // instead of the pixels. Honor it before any operation, so
+        // sizes and crops see the image as the viewer would.
+        if let Some(orientation) = exif_orientation(bytes) {
+            img = apply_orientation(img, orientation);
+        }
         let mut format = detect_format(bytes);
         let mut quality = None;
         for op in ops {
@@ -113,6 +119,33 @@ impl Engine {
             format,
             quality: chosen_quality,
         })
+    }
+}
+
+/// The EXIF orientation stored in the source bytes (1-8), if the
+/// container carries a readable one. Missing or malformed metadata
+/// yields `None`; re-encoding drops EXIF from outputs, so this read
+/// is the only place orientation exists.
+fn exif_orientation(bytes: &[u8]) -> Option<u32> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+    let field = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?;
+    field.value.get_uint(0)
+}
+
+/// Apply the transform an EXIF orientation value prescribes.
+/// Values outside 1-8 leave the image untouched.
+fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        // Transpose and anti-transpose: a rotation plus a mirror.
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
     }
 }
 
@@ -589,5 +622,123 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.quality, None);
+    }
+
+    /// 8x4 pattern with only the top-left quadrant white.
+    fn quadrant_pattern() -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(8, 4);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            let v = if x < 4 && y < 2 { 255 } else { 0 };
+            *p = image::Rgb([v, v, v]);
+        }
+        img
+    }
+
+    /// Encode as JPEG and splice in an EXIF APP1 segment carrying
+    /// `orientation`, the way a phone camera writes it.
+    fn jpeg_with_orientation(img: &DynamicImage, orientation: u16) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 100)
+            .write_image(
+                img.as_bytes(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::from(img.color()),
+            )
+            .unwrap();
+        let jpeg = buf.into_inner();
+        assert_eq!(&jpeg[..2], b"\xff\xd8", "JPEG starts with SOI");
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II"); // little-endian TIFF
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset
+        tiff.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+        tiff.extend_from_slice(&1u32.to_le_bytes()); // count
+        tiff.extend_from_slice(&orientation.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]); // value padding
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+
+        let mut app1 = Vec::new();
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&tiff);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&jpeg[..2]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    /// (width, height, [TL, TR, BL, BR] brightness) of an image.
+    fn shape_and_quadrants(bytes: &[u8]) -> (u32, u32, [bool; 4]) {
+        let img = image::load_from_memory(bytes).unwrap().to_luma8();
+        let (w, h) = (img.width(), img.height());
+        let bright = |x: u32, y: u32| img.get_pixel(x, y)[0] > 128;
+        (
+            w,
+            h,
+            [
+                bright(w / 4, h / 4),
+                bright(3 * w / 4, h / 4),
+                bright(w / 4, 3 * h / 4),
+                bright(3 * w / 4, 3 * h / 4),
+            ],
+        )
+    }
+
+    #[test]
+    fn exif_orientations_come_out_upright() {
+        let engine = Engine;
+        // The stored pattern has its white quadrant top-left. Each
+        // orientation value states where the stored pixels must move
+        // for the image to display upright.
+        let cases: [(u16, (u32, u32, [bool; 4])); 8] = [
+            (1, (8, 4, [true, false, false, false])),
+            (2, (8, 4, [false, true, false, false])),
+            (3, (8, 4, [false, false, false, true])),
+            (4, (8, 4, [false, false, true, false])),
+            (5, (4, 8, [true, false, false, false])),
+            (6, (4, 8, [false, true, false, false])),
+            (7, (4, 8, [false, false, false, true])),
+            (8, (4, 8, [false, false, true, false])),
+        ];
+        for (orientation, expected) in cases {
+            let src = jpeg_with_orientation(&quadrant_pattern(), orientation);
+            let out = engine.process(&src, &[]).unwrap();
+            assert_eq!(
+                shape_and_quadrants(&out.bytes),
+                expected,
+                "orientation {orientation}"
+            );
+        }
+    }
+
+    #[test]
+    fn jpeg_without_exif_is_untouched() {
+        let engine = Engine;
+        let img = quadrant_pattern();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+        let out = engine.process(&buf.into_inner(), &[]).unwrap();
+        assert_eq!(
+            shape_and_quadrants(&out.bytes),
+            (8, 4, [true, false, false, false])
+        );
+    }
+
+    #[test]
+    fn invalid_exif_orientation_is_ignored() {
+        let engine = Engine;
+        let src = jpeg_with_orientation(&quadrant_pattern(), 42);
+        let out = engine.process(&src, &[]).unwrap();
+        assert_eq!(
+            shape_and_quadrants(&out.bytes),
+            (8, 4, [true, false, false, false])
+        );
     }
 }
