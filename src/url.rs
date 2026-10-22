@@ -85,6 +85,8 @@ pub enum Align {
     Left,
     /// Keep the right.
     Right,
+    /// Position on the detected focal point.
+    Smart,
 }
 
 /// Output image format requested by a `format(...)` filter.
@@ -287,6 +289,7 @@ fn parse_point(s: &str) -> Option<(u32, u32)> {
 fn parse_align(s: &str) -> Option<Align> {
     match s {
         "center" => Some(Align::Center),
+        "smart" => Some(Align::Smart),
         "top" => Some(Align::Top),
         "bottom" => Some(Align::Bottom),
         "left" => Some(Align::Left),
@@ -884,6 +887,23 @@ mod tests {
     fn parses_no_upscale() {
         let (ops, _) = parse_operations("filters:no_upscale/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::NoUpscale])]);
+    }
+
+    #[test]
+    fn parses_crop_with_smart_alignment() {
+        let (ops, _) = parse_operations("crop:300x200:smart/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Crop {
+                size: ImageSize {
+                    width: Dimension::Pixels(300),
+                    height: Dimension::Pixels(200),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                align: Align::Smart,
+            }]
+        );
     }
 
     #[test]
