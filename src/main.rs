@@ -32,6 +32,7 @@ mod filters;
 mod focus;
 mod loader;
 mod observe;
+mod placeholder;
 mod quality;
 mod server;
 mod url;

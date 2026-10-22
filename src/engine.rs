@@ -41,6 +41,10 @@ pub struct ProcessedImage {
     /// dimensions the pipeline treats as the source).
     pub source_width: u32,
     pub source_height: u32,
+    /// Placeholder data (dominant color + tiny preview) for meta
+    /// responses, computed from the final pixels when the caller
+    /// asked for it. `None` otherwise.
+    pub placeholder: Option<crate::placeholder::Placeholder>,
 }
 
 /// What went wrong while processing an image.
@@ -89,7 +93,7 @@ impl Engine {
     /// form is kept for tests and future library use.
     #[allow(dead_code)]
     pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<ProcessedImage, EngineError> {
-        self.process_preferred(bytes, ops, None, &WatermarkImages::new())
+        self.process_preferred(bytes, ops, None, &WatermarkImages::new(), false)
     }
 
     /// Like [`Engine::process`], with a negotiated format preference.
@@ -98,13 +102,16 @@ impl Engine {
     /// server) applies only when the operations name no format
     /// themselves; an explicit `format(...)` filter always wins.
     /// `watermarks` carries the images the server resolved for any
-    /// `watermark(...)` filters in the operations.
+    /// `watermark(...)` filters in the operations. `placeholders`
+    /// asks for placeholder data (dominant color + tiny preview)
+    /// to be computed from the final pixels, for meta responses.
     pub fn process_preferred(
         &self,
         bytes: &[u8],
         ops: &[Operation],
         preferred: Option<ImageFormat>,
         watermarks: &WatermarkImages,
+        placeholders: bool,
     ) -> Result<ProcessedImage, EngineError> {
         ensure_jxl_decoder();
         // HEIC/HEIF sources are detected explicitly so the failure
@@ -132,7 +139,7 @@ impl Engine {
                     .unwrap_or(detected)
                     == ImageFormat::Gif
             {
-                return self.process_animated_gif(frames, ops, watermarks);
+                return self.process_animated_gif(frames, ops, watermarks, placeholders);
             }
             DynamicImage::ImageRgba8(
                 frames
@@ -164,6 +171,13 @@ impl Engine {
             None
         };
         let (img, directives) = apply_operations(img, ops, cap, watermarks)?;
+        // Placeholders describe the final pixels, so they are
+        // computed here, before encoding.
+        let placeholder = if placeholders {
+            Some(crate::placeholder::compute(&img))
+        } else {
+            None
+        };
         if let Some(f) = directives.format {
             format = f;
         } else if let Some(p) = preferred {
@@ -214,6 +228,7 @@ impl Engine {
             height: img.height(),
             source_width,
             source_height,
+            placeholder,
         })
     }
 
@@ -226,6 +241,7 @@ impl Engine {
         frames: Vec<image::Frame>,
         ops: &[Operation],
         watermarks: &WatermarkImages,
+        placeholders: bool,
     ) -> Result<ProcessedImage, EngineError> {
         let (source_width, source_height) = {
             let b = frames[0].buffer();
@@ -248,6 +264,15 @@ impl Engine {
             .first()
             .map(|f| (f.buffer().width(), f.buffer().height()))
             .unwrap_or((source_width, source_height));
+        // An animated output's placeholder comes from its first
+        // processed frame.
+        let placeholder = if placeholders {
+            out_frames
+                .first()
+                .map(|f| crate::placeholder::compute(&DynamicImage::ImageRgba8(f.buffer().clone())))
+        } else {
+            None
+        };
         let mut out = Vec::new();
         image::codecs::gif::GifEncoder::new(&mut out)
             .encode_frames(out_frames)
@@ -260,6 +285,7 @@ impl Engine {
             height,
             source_width,
             source_height,
+            placeholder,
         })
     }
 }
@@ -1201,6 +1227,7 @@ mod tests {
                 &[],
                 Some(ImageFormat::WebP),
                 &WatermarkImages::new(),
+                false,
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::WebP);
@@ -1210,6 +1237,7 @@ mod tests {
                 &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
                 Some(ImageFormat::WebP),
                 &WatermarkImages::new(),
+                false,
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Png);
@@ -1523,6 +1551,30 @@ mod tests {
     }
 
     #[test]
+    fn placeholders_are_computed_only_on_request() {
+        let engine = Engine;
+        let src = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            100,
+            60,
+            image::Rgb([255, 0, 0]),
+        )));
+        let plain = engine.process(&src, &[]).unwrap();
+        assert!(plain.placeholder.is_none());
+        let out = engine
+            .process_preferred(
+                &src,
+                &[size_op(Dimension::Pixels(50), Dimension::Pixels(30))],
+                None,
+                &WatermarkImages::new(),
+                true,
+            )
+            .unwrap();
+        let ph = out.placeholder.unwrap();
+        assert_eq!(ph.dominant_color, "#ff0000");
+        assert!(ph.data_uri.starts_with("data:image/jpeg;base64,"));
+    }
+
+    #[test]
     fn heic_detection_reads_ftyp_brands() {
         assert!(is_heic(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1"));
         assert!(is_heic(b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00mif1heic"));
@@ -1577,14 +1629,14 @@ mod tests {
         };
         // Full opacity at the top-left corner.
         let out = engine
-            .process_preferred(&src, &[wm_op(0, 0, 100)], None, &map)
+            .process_preferred(&src, &[wm_op(0, 0, 100)], None, &map, false)
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0), &image::Rgb([0, 0, 255]));
         assert_eq!(img.get_pixel(10, 10), &image::Rgb([255, 0, 0]));
         // Half opacity blends evenly.
         let out = engine
-            .process_preferred(&src, &[wm_op(0, 0, 50)], None, &map)
+            .process_preferred(&src, &[wm_op(0, 0, 50)], None, &map, false)
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0), &image::Rgb([128, 0, 128]));
@@ -1606,6 +1658,7 @@ mod tests {
                 }])],
                 None,
                 &map,
+                false,
             )
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
