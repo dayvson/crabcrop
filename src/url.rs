@@ -160,6 +160,16 @@ pub enum Filter {
     /// Crop away the uniform border, keeping pixels that differ
     /// from the corner color by more than this tolerance (0-255).
     Trim(u8),
+    /// Overlay another image at (x, y) with an opacity (0-100).
+    /// The URL is the percent-decoded watermark location; the
+    /// server fetches it before the engine runs. Negative
+    /// coordinates anchor from the right/bottom edges.
+    Watermark {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+    },
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Encoding directive: re-encode at lower quality until the
@@ -445,6 +455,32 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 let tolerance: u8 = p.parse().map_err(|_| invalid())?;
                 Filter::Trim(tolerance)
             }
+            ("watermark", Some(p)) => {
+                // <url>,<x>,<y>,<alpha>. The URL lives inside a
+                // path segment, so it arrives percent-encoded; it
+                // may itself contain commas, so split from the
+                // right where the numeric fields are.
+                let parts: Vec<&str> = p.rsplitn(4, ',').collect();
+                if parts.len() != 4 {
+                    return Err(invalid());
+                }
+                let alpha: u32 = parts[0].parse().map_err(|_| invalid())?;
+                if alpha > 100 {
+                    return Err(invalid());
+                }
+                let y: i32 = parts[1].parse().map_err(|_| invalid())?;
+                let x: i32 = parts[2].parse().map_err(|_| invalid())?;
+                let url = percent_decode(parts[3]).ok_or_else(invalid)?;
+                if url.is_empty() {
+                    return Err(invalid());
+                }
+                Filter::Watermark {
+                    url,
+                    x,
+                    y,
+                    alpha: alpha as u8,
+                }
+            }
             ("rotate", Some(p)) => {
                 let degrees: i32 = p.parse().map_err(|_| invalid())?;
                 if degrees % 90 != 0 {
@@ -522,6 +558,45 @@ pub fn has_no_upscale(ops: &[Operation]) -> bool {
         Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::NoUpscale)),
         _ => false,
     })
+}
+
+/// The distinct watermark URLs a request references, in order of
+/// first appearance. The server fetches each one before the
+/// engine runs.
+pub fn watermark_urls(ops: &[Operation]) -> Vec<&str> {
+    let mut urls: Vec<&str> = Vec::new();
+    for op in ops {
+        if let Operation::Filters(filters) = op {
+            for filter in filters {
+                let Filter::Watermark { url, .. } = filter else {
+                    continue;
+                };
+                if !urls.contains(&url.as_str()) {
+                    urls.push(url.as_str());
+                }
+            }
+        }
+    }
+    urls
+}
+
+/// Decode `%XX` escapes; other characters pass through. A
+/// malformed escape or non-UTF-8 result is an error.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = s.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Parse a full request path into its signature and [`Request`].
@@ -947,6 +1022,45 @@ mod tests {
     fn parses_no_upscale() {
         let (ops, _) = parse_operations("filters:no_upscale/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::NoUpscale])]);
+    }
+
+    #[test]
+    fn parses_watermark() {
+        let (ops, _) = parse_operations(
+            "filters:watermark(https%3A%2F%2Fcdn.example.com%2Fwm.png,10,-5,80)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Watermark {
+                url: "https://cdn.example.com/wm.png".to_string(),
+                x: 10,
+                y: -5,
+                alpha: 80,
+            }])]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_watermarks() {
+        for seg in [
+            "watermark(http%3A%2F%2Fx%2Fwm.png,0,0,101)",
+            "watermark(http%3A%2F%2Fx%2Fwm.png,0,0)",
+            "watermark(%zz,0,0,50)",
+            "watermark(,0,0,50)",
+        ] {
+            let path = format!("filters:{seg}/example.com/img.jpg");
+            assert!(parse_operations(&path).is_err(), "{seg}");
+        }
+    }
+
+    #[test]
+    fn watermark_urls_are_distinct_and_ordered() {
+        let (ops, _) = parse_operations(
+            "filters:watermark(a%2F1.png,0,0,50):watermark(a%2F1.png,5,5,50):watermark(b%2F2.png,0,0,50)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(watermark_urls(&ops), vec!["a/1.png", "b/2.png"]);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -63,15 +63,20 @@ async fn metrics(State(state): State<AppState>) -> Response {
 
 async fn handle(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
+    // The raw path, exactly as sent: the signature covers it
+    // byte-for-byte, so no percent-decoding may happen first
+    // (the `Path` extractor decodes, which would rewrite e.g.
+    // an encoded watermark URL before verification).
+    let path = uri.path().trim_start_matches('/');
     let started = Instant::now();
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (response, mut record) = serve(&state, &path, accept.as_deref()).await;
+    let (response, mut record) = serve(&state, path, accept.as_deref()).await;
     record.status = response.status().as_u16();
     record.total = started.elapsed();
     state.metrics.record(&record);
@@ -151,9 +156,41 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
     record.load = load_start.elapsed();
     record.bytes_in = bytes.len();
 
+    // Watermarks are resolved here, before the engine runs: the
+    // engine only ever sees pixels. Each referenced image goes
+    // through the same loader (and its bounds and source policy)
+    // as sources, and a watermark that fails to load or decode
+    // fails the request rather than being silently skipped.
+    let mut watermark_images = crate::filters::WatermarkImages::new();
+    for wm_url in crate::url::watermark_urls(&ops) {
+        record.load_ran = true;
+        let wm_bytes = match state.loader.load(wm_url).await {
+            Ok(b) => b,
+            Err(e) => {
+                record.fail = FailStage::Load;
+                return (load_error_response(e), record);
+            }
+        };
+        match image::load_from_memory(&wm_bytes) {
+            Ok(img) => {
+                watermark_images.insert(wm_url.to_string(), img);
+            }
+            Err(e) => {
+                record.fail = FailStage::Engine;
+                return (
+                    engine_error_response(EngineError::Decode(e.to_string())),
+                    record,
+                );
+            }
+        }
+    }
+
     record.process_ran = true;
     let process_start = Instant::now();
-    let processed = match state.engine.process_preferred(&bytes, &ops, preferred) {
+    let processed = match state
+        .engine
+        .process_preferred(&bytes, &ops, preferred, &watermark_images)
+    {
         Ok(p) => p,
         Err(e) => {
             record.process = process_start.elapsed();
@@ -365,7 +402,23 @@ mod tests {
 
     /// One-shot source server: serves `test_png()` as image/png once.
     async fn spawn_image_server() -> String {
-        let png = test_png();
+        spawn_bytes_server(test_png()).await
+    }
+
+    /// Serves a solid blue 10x10 PNG on every connection.
+    async fn spawn_watermark_server() -> String {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            10,
+            10,
+            image::Rgb([0, 0, 255]),
+        ));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        spawn_bytes_server(png).await.replace("src.png", "wm.png")
+    }
+
+    async fn spawn_bytes_server(png: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -551,6 +604,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn serves_watermarked_image() {
+        let src = spawn_image_server().await;
+        let wm = spawn_watermark_server().await;
+        let base = spawn_app(false).await;
+        // The watermark URL travels percent-encoded inside the
+        // filters segment.
+        let encoded = wm.replace(':', "%3A").replace('/', "%2F");
+        let remainder = format!("filters:watermark({encoded},0,0,100)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.bytes().await.unwrap();
+        let img = image::load_from_memory(&body).unwrap().to_rgb8();
+        // The blue 10x10 watermark sits at the top-left corner.
+        assert_eq!(img.get_pixel(0, 0), &image::Rgb([0, 0, 255]));
+        assert_eq!(img.get_pixel(9, 9), &image::Rgb([0, 0, 255]));
+        assert_ne!(img.get_pixel(90, 50), &image::Rgb([0, 0, 255]));
+    }
+
+    #[tokio::test]
+    async fn unreachable_watermark_fails_the_request() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let encoded = "http%3A%2F%2F127.0.0.1%3A1%2Fwm.png";
+        let remainder = format!("filters:watermark({encoded},0,0,100)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
