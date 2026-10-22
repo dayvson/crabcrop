@@ -42,6 +42,10 @@ pub struct AppState {
     /// `CRABCROP_REMOVEBG_MODEL` is configured. `None` means the
     /// feature is off; `removebg` requests then fail cleanly.
     pub removebg: Option<Arc<dyn crate::ai::MaskProvider>>,
+    /// Upscale provider, preloaded at boot when
+    /// `CRABCROP_UPSCALE_MODEL` is configured. `None` means the
+    /// feature is off; `upscale` requests then fail cleanly.
+    pub upscale: Option<Arc<dyn crate::ai::UpscaleProvider>>,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
@@ -197,7 +201,7 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
     let process_start = Instant::now();
     // AI inference is gated process-wide: a burst of removebg
     // requests must not starve the transform pipeline.
-    let _ai_permit = if crate::url::has_removebg(&ops) {
+    let _ai_permit = if crate::url::has_removebg(&ops) || crate::url::has_upscale(&ops) {
         Some(
             state
                 .ai_gate
@@ -214,6 +218,7 @@ async fn serve(state: &AppState, path: &str, accept: Option<&str>) -> (Response,
         watermarks: Some(&watermark_images),
         placeholders,
         mask_provider: state.removebg.as_deref(),
+        upscale_provider: state.upscale.as_deref(),
     };
     let processed = match state.engine.process_preferred(&bytes, &ops, ctx) {
         Ok(p) => p,
@@ -543,6 +548,7 @@ mod tests {
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
+            upscale: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -562,6 +568,18 @@ mod tests {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;
         let remainder = format!("filters:removebg:format(png)/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("not configured"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn upscale_without_a_configured_model_is_a_clean_400() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:upscale(2)/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
         let resp = client().get(&url).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

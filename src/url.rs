@@ -174,6 +174,9 @@ pub enum Filter {
     /// model, keeping the subject over transparency. The model
     /// is operator-configured; the engine applies its mask.
     RemoveBg,
+    /// AI super-resolution by the given factor (2 or 4),
+    /// backed by the server's upscale model.
+    Upscale(u32),
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
     /// Encoding directive: re-encode at lower quality until the
@@ -455,6 +458,13 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             }
             ("equalize", None) => Filter::Equalize,
             ("removebg", None) => Filter::RemoveBg,
+            ("upscale", Some(p)) => {
+                let factor: u32 = p.parse().map_err(|_| invalid())?;
+                if !matches!(factor, 2 | 4) {
+                    return Err(invalid());
+                }
+                Filter::Upscale(factor)
+            }
             ("trim", None) => Filter::Trim(10),
             ("trim", Some(p)) => {
                 let tolerance: u8 = p.parse().map_err(|_| invalid())?;
@@ -569,6 +579,14 @@ pub fn has_no_upscale(ops: &[Operation]) -> bool {
 pub fn has_removebg(ops: &[Operation]) -> bool {
     ops.iter().any(|op| match op {
         Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::RemoveBg)),
+        _ => false,
+    })
+}
+
+/// Whether any filters segment in `ops` requests `upscale`.
+pub fn has_upscale(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Upscale(_))),
         _ => false,
     })
 }
@@ -950,6 +968,14 @@ mod tests {
         // `removebg` parses, and takes no parameters.
         let (ops, _) = parse_operations("filters:removebg/example.com/img.png").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::RemoveBg])]);
+        // `upscale` takes a factor of 2 or 4, nothing else.
+        let (ops, _) = parse_operations("filters:upscale(2)/example.com/img.png").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Upscale(2)])]);
+        let (ops, _) = parse_operations("filters:upscale(4)/example.com/img.png").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Upscale(4)])]);
+        assert!(parse_operations("filters:upscale(3)/example.com/img.png").is_err());
+        assert!(parse_operations("filters:upscale(0)/example.com/img.png").is_err());
+        assert!(parse_operations("filters:upscale/example.com/img.png").is_err());
     }
 
     #[test]

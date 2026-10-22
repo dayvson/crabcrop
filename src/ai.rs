@@ -42,6 +42,25 @@ fn environment(dylib: Option<&str>) -> Result<&'static ort::environment::Environ
         .ok_or_else(|| "ONNX environment unavailable".to_string())
 }
 
+/// Build an inference session for a model file and report its
+/// first input's name. Every failure is a plain message: at
+/// boot it becomes the startup diagnostic.
+fn build_session(dylib: Option<&str>, model_path: &str) -> Result<(Session, String), String> {
+    let env = environment(dylib)?;
+    let session = Session::builder(env)
+        .map_err(|e| format!("cannot create a session: {e}"))?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| format!("cannot configure the session: {e}"))?
+        .commit_from_file(model_path)
+        .map_err(|e| format!("cannot load the model {model_path}: {e}"))?;
+    let input_name = session
+        .inputs()
+        .first()
+        .map(|i| i.name().to_string())
+        .ok_or_else(|| format!("the model {model_path} has no inputs"))?;
+    Ok((session, input_name))
+}
+
 /// Background removal backed by a U²-Net-family ONNX model
 /// (single 320x320 input), e.g. the u2netp model the `ai`
 /// container image ships.
@@ -52,21 +71,9 @@ pub struct OnnxMaskProvider {
 
 impl OnnxMaskProvider {
     /// Load a model file against the runtime at `dylib` (or the
-    /// runtime's own search when `None`). Every failure is a
-    /// plain message: at boot it becomes the startup diagnostic.
+    /// runtime's own search when `None`).
     pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, String> {
-        let env = environment(dylib)?;
-        let session = Session::builder(env)
-            .map_err(|e| format!("cannot create a session: {e}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| format!("cannot configure the session: {e}"))?
-            .commit_from_file(model_path)
-            .map_err(|e| format!("cannot load the model {model_path}: {e}"))?;
-        let input_name = session
-            .inputs()
-            .first()
-            .map(|i| i.name().to_string())
-            .ok_or_else(|| format!("the model {model_path} has no inputs"))?;
+        let (session, input_name) = build_session(dylib, model_path)?;
         Ok(Self {
             session: Mutex::new(session),
             input_name,
@@ -161,6 +168,125 @@ pub fn apply_mask(img: &DynamicImage, mask: &GrayImage) -> DynamicImage {
     DynamicImage::ImageRgba8(rgba)
 }
 
+/// Enlarges an image with a super-resolution model. The model
+/// has a native factor; the engine composes runs and trims to
+/// the exact requested size.
+pub trait UpscaleProvider: Send + Sync + std::fmt::Debug {
+    /// The model's native upscale factor (2, 3, 4...).
+    fn factor(&self) -> u32;
+    fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, String>;
+}
+
+/// Super-resolution backed by an ONNX model with the usual
+/// contract: dynamic-size RGB in ([1, 3, H, W], values 0..1),
+/// the same image at an integer factor out. Real-ESRGAN-family
+/// ONNX exports follow it.
+pub struct OnnxUpscaleProvider {
+    session: Mutex<Session>,
+    input_name: String,
+    factor: u32,
+}
+
+impl OnnxUpscaleProvider {
+    /// Load a model file. The native factor is not declared
+    /// anywhere in the format, so it is probed at load with a
+    /// 16x16 image: a model that does not enlarge by an integer
+    /// factor is rejected here, at boot, not per request.
+    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, String> {
+        let (session, input_name) = build_session(dylib, model_path)?;
+        let probe = Self {
+            session: Mutex::new(session),
+            input_name,
+            factor: 0,
+        };
+        let out = probe.upscale(&DynamicImage::new_rgb8(16, 16))?;
+        if out.width() % 16 != 0 || out.width() / 16 < 2 || out.height() != out.width() {
+            return Err(format!(
+                "the model {model_path} is not an integer-factor super-resolution model \
+                 (a 16x16 probe produced {}x{})",
+                out.width(),
+                out.height()
+            ));
+        }
+        Ok(Self {
+            factor: out.width() / 16,
+            ..probe
+        })
+    }
+}
+
+impl std::fmt::Debug for OnnxUpscaleProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxUpscaleProvider")
+            .field("input_name", &self.input_name)
+            .field("factor", &self.factor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpscaleProvider for OnnxUpscaleProvider {
+    fn factor(&self) -> u32 {
+        self.factor
+    }
+
+    fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, String> {
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let rgb = img.to_rgb8();
+        let mut input = vec![0f32; 3 * w * h];
+        for (i, px) in rgb.pixels().enumerate() {
+            for c in 0..3 {
+                input[c * w * h + i] = px[c] as f32 / 255.0;
+            }
+        }
+        let tensor = ort::value::Tensor::from_array(([1, 3, h, w], input.into_boxed_slice()))
+            .map_err(|e| format!("cannot build the input tensor: {e}"))?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| "upscale provider lock poisoned".to_string())?;
+        let outputs = session
+            .run(ort::inputs![self.input_name.as_str() => tensor])
+            .map_err(|e| format!("inference failed: {e}"))?;
+        let (_, first) = outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| "the model produced no outputs".to_string())?;
+        let (shape, data) = first
+            .try_extract_tensor::<f32>()
+            .map_err(|e| format!("cannot read the model output: {e}"))?;
+        if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
+            return Err(format!("unexpected model output shape: {shape:?}"));
+        }
+        let (ow, oh) = (shape[3] as u32, shape[2] as u32);
+        let mut out = image::RgbImage::new(ow, oh);
+        for (i, px) in out.pixels_mut().enumerate() {
+            for c in 0..3 {
+                let v = data[c * (ow * oh) as usize + i];
+                px[c] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+        let out = DynamicImage::ImageRgb8(out);
+        // The model sees RGB only; carry the source alpha over
+        // with a plain resize so transparency survives.
+        if matches!(
+            img,
+            DynamicImage::ImageRgba8(_) | DynamicImage::ImageLumaA8(_)
+        ) {
+            let src = img.to_rgba8();
+            let alpha = GrayImage::from_fn(img.width(), img.height(), |x, y| {
+                image::Luma([src.get_pixel(x, y)[3]])
+            });
+            let alpha = image::imageops::resize(&alpha, ow, oh, FilterType::Triangle);
+            let mut rgba = out.to_rgba8();
+            for (px, a) in rgba.pixels_mut().zip(alpha.pixels()) {
+                px[3] = a[0];
+            }
+            return Ok(DynamicImage::ImageRgba8(rgba));
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +329,22 @@ mod tests {
         // is (0 - 0.485) / 0.229 = -2.1179...
         let input = preprocess(&solid(0, 0, 0, 8, 8));
         assert!((input[0] - -2.1179).abs() < 0.001, "got {}", input[0]);
+    }
+
+    /// Real-model verification, run manually with the deployment
+    /// artifacts in place:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_UPSCALE_MODEL=...
+    /// cargo test -- --ignored upscale_with_the_real_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn upscale_with_the_real_model() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_UPSCALE_MODEL").unwrap();
+        let provider = OnnxUpscaleProvider::load(Some(&dylib), &model).unwrap();
+        assert!(provider.factor() >= 2, "factor {}", provider.factor());
+        let out = provider.upscale(&solid(120, 30, 200, 24, 18)).unwrap();
+        assert_eq!(out.width(), 24 * provider.factor());
+        assert_eq!(out.height(), 18 * provider.factor());
     }
 
     /// Real-model verification, run manually with the deployment

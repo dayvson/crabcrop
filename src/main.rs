@@ -25,6 +25,8 @@
 //!   model for the `removebg` filter. Preloaded at boot; a set
 //!   but unloadable model is a startup error. Unset disables
 //!   the filter (requests fail cleanly).
+//! - `CRABCROP_UPSCALE_MODEL`: path to a super-resolution ONNX
+//!   model for the `upscale` filter. Same preload rule.
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
 //! - `PORT`: listen port, default 3000.
@@ -47,6 +49,7 @@ mod url;
 use std::env;
 use std::sync::Arc;
 
+use crate::ai::UpscaleProvider;
 use crate::cache::Cache;
 use crate::engine::Engine;
 use crate::loader::{Loader, SourcePolicy};
@@ -103,15 +106,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // AI models are configured, never downloaded, and preloaded
     // at boot: a model that is set but broken is a startup
     // error, not a surprise for the first request that uses it.
+    let ort_dylib = env::var("CRABCROP_ORT_DYLIB")
+        .ok()
+        .filter(|v| !v.is_empty());
     let removebg: Option<Arc<dyn crate::ai::MaskProvider>> =
         match env::var("CRABCROP_REMOVEBG_MODEL") {
             Ok(path) if !path.is_empty() => {
-                let dylib = env::var("CRABCROP_ORT_DYLIB")
-                    .ok()
-                    .filter(|v| !v.is_empty());
-                let provider = crate::ai::OnnxMaskProvider::load(dylib.as_deref(), &path)
+                let provider = crate::ai::OnnxMaskProvider::load(ort_dylib.as_deref(), &path)
                     .map_err(|e| format!("cannot load the background-removal model: {e}"))?;
                 println!("background removal model loaded from {path}");
+                Some(Arc::new(provider))
+            }
+            _ => None,
+        };
+    let upscale: Option<Arc<dyn crate::ai::UpscaleProvider>> =
+        match env::var("CRABCROP_UPSCALE_MODEL") {
+            Ok(path) if !path.is_empty() => {
+                let provider = crate::ai::OnnxUpscaleProvider::load(ort_dylib.as_deref(), &path)
+                    .map_err(|e| format!("cannot load the upscale model: {e}"))?;
+                println!(
+                    "upscale model loaded from {path} (native factor {}x)",
+                    provider.factor()
+                );
                 Some(Arc::new(provider))
             }
             _ => None,
@@ -127,6 +143,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metrics: Arc::new(Metrics::default()),
         cache: Arc::new(Cache::new(cache_bytes)),
         removebg,
+        upscale,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;

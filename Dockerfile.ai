@@ -20,5 +20,11 @@ RUN tar -xzf /tmp/ort.tgz -C /tmp \
 ADD https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx /models/u2netp.onnx
 RUN echo "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  /models/u2netp.onnx" | sha256sum -c -
 
+# The upscale model follows the same rule (layered artifact,
+# preloaded at boot). Super-resolution ONNX exports are less
+# standardized than u2netp, so the operator layers their own:
+# COPY my-sr-model.onnx /models/sr.onnx
+# ENV CRABCROP_UPSCALE_MODEL=/models/sr.onnx
+
 ENV CRABCROP_ORT_DYLIB=/opt/onnxruntime/libonnxruntime.so \
     CRABCROP_REMOVEBG_MODEL=/models/u2netp.onnx
