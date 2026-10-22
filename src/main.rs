@@ -21,10 +21,17 @@
 //! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: `1` or `true` to refuse
 //!   sources resolving to loopback, private, or link-local
 //!   addresses. Off by default.
+//! - `CRABCROP_REMOVEBG_MODEL`: path to a U²-Net-family ONNX
+//!   model for the `removebg` filter. Preloaded at boot; a set
+//!   but unloadable model is a startup error. Unset disables
+//!   the filter (requests fail cleanly).
+//! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
+//!   library, when it is not on the loader's search path.
 //! - `PORT`: listen port, default 3000.
 
 #![forbid(unsafe_code)]
 
+mod ai;
 mod cache;
 mod crop;
 mod engine;
@@ -93,6 +100,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     let policy = SourcePolicy::new(allowed_sources, block_private);
 
+    // AI models are configured, never downloaded, and preloaded
+    // at boot: a model that is set but broken is a startup
+    // error, not a surprise for the first request that uses it.
+    let removebg: Option<Arc<dyn crate::ai::MaskProvider>> =
+        match env::var("CRABCROP_REMOVEBG_MODEL") {
+            Ok(path) if !path.is_empty() => {
+                let dylib = env::var("CRABCROP_ORT_DYLIB")
+                    .ok()
+                    .filter(|v| !v.is_empty());
+                let provider = crate::ai::OnnxMaskProvider::load(dylib.as_deref(), &path)
+                    .map_err(|e| format!("cannot load the background-removal model: {e}"))?;
+                println!("background removal model loaded from {path}");
+                Some(Arc::new(provider))
+            }
+            _ => None,
+        };
+
     let state = AppState {
         secret,
         allow_unsafe,
@@ -102,6 +126,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         engine: Engine,
         metrics: Arc::new(Metrics::default()),
         cache: Arc::new(Cache::new(cache_bytes)),
+        removebg,
+        ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     println!("crabcrop listening on port {port}");

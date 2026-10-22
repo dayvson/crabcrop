@@ -56,6 +56,8 @@ pub enum EngineError {
     Encode(String),
     /// The operation is not supported yet. Carries what was asked for.
     Unsupported(String),
+    /// An AI model failed at inference time. Carries the cause.
+    Inference(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -70,11 +72,30 @@ impl std::fmt::Display for EngineError {
             EngineError::Unsupported(what) => {
                 write!(f, "unsupported operation: {what}")
             }
+            EngineError::Inference(cause) => {
+                write!(f, "AI inference failed: {cause}")
+            }
         }
     }
 }
 
 impl std::error::Error for EngineError {}
+
+/// Per-request context the caller hands to the engine: the
+/// things a pipeline run needs that are not in the URL.
+#[derive(Default)]
+pub struct ProcessContext<'a> {
+    /// Negotiated format preference (from `Accept`); applies
+    /// only when the operations name no format themselves.
+    pub preferred: Option<ImageFormat>,
+    /// Watermark images resolved by the server, keyed by URL.
+    pub watermarks: Option<&'a WatermarkImages>,
+    /// Compute placeholder data from the final pixels.
+    pub placeholders: bool,
+    /// Background-removal provider, when the deployment
+    /// configured a model.
+    pub mask_provider: Option<&'a dyn crate::ai::MaskProvider>,
+}
 
 /// Decodes, resizes, and encodes images.
 #[derive(Debug, Clone, Copy, Default)]
@@ -93,25 +114,17 @@ impl Engine {
     /// form is kept for tests and future library use.
     #[allow(dead_code)]
     pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<ProcessedImage, EngineError> {
-        self.process_preferred(bytes, ops, None, &WatermarkImages::new(), false)
+        self.process_preferred(bytes, ops, ProcessContext::default())
     }
 
-    /// Like [`Engine::process`], with a negotiated format preference.
-    ///
-    /// `preferred` (from the client's `Accept` header, chosen by the
-    /// server) applies only when the operations name no format
-    /// themselves; an explicit `format(...)` filter always wins.
-    /// `watermarks` carries the images the server resolved for any
-    /// `watermark(...)` filters in the operations. `placeholders`
-    /// asks for placeholder data (dominant color + tiny preview)
-    /// to be computed from the final pixels, for meta responses.
+    /// Like [`Engine::process`], with the caller's context: a
+    /// negotiated format preference, resolved watermark images,
+    /// the placeholder switch, and the AI providers.
     pub fn process_preferred(
         &self,
         bytes: &[u8],
         ops: &[Operation],
-        preferred: Option<ImageFormat>,
-        watermarks: &WatermarkImages,
-        placeholders: bool,
+        ctx: ProcessContext<'_>,
     ) -> Result<ProcessedImage, EngineError> {
         ensure_jxl_decoder();
         // HEIC/HEIF sources are detected explicitly so the failure
@@ -126,6 +139,25 @@ impl Engine {
             ));
         }
         let detected = detect_format(bytes);
+        // Background removal is validated before any real work:
+        // its output is transparency, so the resolved format
+        // must carry alpha, and a provider must be configured.
+        if crate::url::has_removebg(ops) {
+            let resolved = crate::url::explicit_format(ops)
+                .or(ctx.preferred)
+                .unwrap_or(detected);
+            if matches!(resolved, ImageFormat::Jpeg | ImageFormat::Gif) {
+                return Err(EngineError::Unsupported(
+                    "removebg needs an alpha-capable output format (png, webp, jxl, avif)"
+                        .to_string(),
+                ));
+            }
+            if ctx.mask_provider.is_none() {
+                return Err(EngineError::Unsupported(
+                    "removebg is not configured on this server".to_string(),
+                ));
+            }
+        }
         let img = if detected == ImageFormat::Gif {
             // GIF sources decode frame by frame: an animated source
             // whose output stays GIF keeps its frames (each runs the
@@ -135,11 +167,11 @@ impl Engine {
             let frames = decode_gif_frames(bytes)?;
             if frames.len() > 1
                 && crate::url::explicit_format(ops)
-                    .or(preferred)
+                    .or(ctx.preferred)
                     .unwrap_or(detected)
                     == ImageFormat::Gif
             {
-                return self.process_animated_gif(frames, ops, watermarks, placeholders);
+                return self.process_animated_gif(frames, ops, &ctx);
             }
             DynamicImage::ImageRgba8(
                 frames
@@ -170,17 +202,17 @@ impl Engine {
         } else {
             None
         };
-        let (img, directives) = apply_operations(img, ops, cap, watermarks)?;
+        let (img, directives) = apply_operations(img, ops, cap, &ctx)?;
         // Placeholders describe the final pixels, so they are
         // computed here, before encoding.
-        let placeholder = if placeholders {
+        let placeholder = if ctx.placeholders {
             Some(crate::placeholder::compute(&img))
         } else {
             None
         };
         if let Some(f) = directives.format {
             format = f;
-        } else if let Some(p) = preferred {
+        } else if let Some(p) = ctx.preferred {
             format = p;
         }
         // Resolve the quality directive against the final image.
@@ -240,8 +272,7 @@ impl Engine {
         &self,
         frames: Vec<image::Frame>,
         ops: &[Operation],
-        watermarks: &WatermarkImages,
-        placeholders: bool,
+        ctx: &ProcessContext<'_>,
     ) -> Result<ProcessedImage, EngineError> {
         let (source_width, source_height) = {
             let b = frames[0].buffer();
@@ -257,7 +288,7 @@ impl Engine {
         for frame in frames {
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _) = apply_operations(img, ops, cap, watermarks)?;
+            let (img, _) = apply_operations(img, ops, cap, ctx)?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
         let (width, height) = out_frames
@@ -266,7 +297,7 @@ impl Engine {
             .unwrap_or((source_width, source_height));
         // An animated output's placeholder comes from its first
         // processed frame.
-        let placeholder = if placeholders {
+        let placeholder = if ctx.placeholders {
             out_frames
                 .first()
                 .map(|f| crate::placeholder::compute(&DynamicImage::ImageRgba8(f.buffer().clone())))
@@ -313,7 +344,7 @@ fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
-    watermarks: &WatermarkImages,
+    ctx: &ProcessContext<'_>,
 ) -> Result<(DynamicImage, EncodeOptions), EngineError> {
     let mut directives = EncodeOptions::default();
     for op in ops {
@@ -364,12 +395,21 @@ fn apply_operations(
                 for filter in filters {
                     match filter {
                         Filter::Watermark { url, x, y, alpha } => {
-                            let wm = watermarks.get(url).ok_or_else(|| {
+                            let wm = ctx.watermarks.and_then(|m| m.get(url)).ok_or_else(|| {
                                 EngineError::Unsupported(format!(
                                     "watermark was not resolved: {url}"
                                 ))
                             })?;
                             img = overlay_watermark(&img, wm, *x, *y, *alpha);
+                        }
+                        Filter::RemoveBg => {
+                            let provider = ctx.mask_provider.ok_or_else(|| {
+                                EngineError::Unsupported(
+                                    "removebg is not configured on this server".to_string(),
+                                )
+                            })?;
+                            let mask = provider.mask(&img).map_err(EngineError::Inference)?;
+                            img = crate::ai::apply_mask(&img, &mask);
                         }
                         other => {
                             let (new_img, options) =
@@ -1225,9 +1265,10 @@ mod tests {
             .process_preferred(
                 &gradient_png(),
                 &[],
-                Some(ImageFormat::WebP),
-                &WatermarkImages::new(),
-                false,
+                ProcessContext {
+                    preferred: Some(ImageFormat::WebP),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::WebP);
@@ -1235,9 +1276,10 @@ mod tests {
             .process_preferred(
                 &gradient_png(),
                 &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
-                Some(ImageFormat::WebP),
-                &WatermarkImages::new(),
-                false,
+                ProcessContext {
+                    preferred: Some(ImageFormat::WebP),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Png);
@@ -1564,9 +1606,10 @@ mod tests {
             .process_preferred(
                 &src,
                 &[size_op(Dimension::Pixels(50), Dimension::Pixels(30))],
-                None,
-                &WatermarkImages::new(),
-                true,
+                ProcessContext {
+                    placeholders: true,
+                    ..Default::default()
+                },
             )
             .unwrap();
         let ph = out.placeholder.unwrap();
@@ -1629,14 +1672,28 @@ mod tests {
         };
         // Full opacity at the top-left corner.
         let out = engine
-            .process_preferred(&src, &[wm_op(0, 0, 100)], None, &map, false)
+            .process_preferred(
+                &src,
+                &[wm_op(0, 0, 100)],
+                ProcessContext {
+                    watermarks: Some(&map),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0), &image::Rgb([0, 0, 255]));
         assert_eq!(img.get_pixel(10, 10), &image::Rgb([255, 0, 0]));
         // Half opacity blends evenly.
         let out = engine
-            .process_preferred(&src, &[wm_op(0, 0, 50)], None, &map, false)
+            .process_preferred(
+                &src,
+                &[wm_op(0, 0, 50)],
+                ProcessContext {
+                    watermarks: Some(&map),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0), &image::Rgb([128, 0, 128]));
@@ -1656,9 +1713,10 @@ mod tests {
                     y: -2,
                     alpha: 100,
                 }])],
-                None,
-                &map,
-                false,
+                ProcessContext {
+                    watermarks: Some(&map),
+                    ..Default::default()
+                },
             )
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
@@ -1685,6 +1743,94 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    /// A mask provider with a fixed answer: the left half is
+    /// background, the right half is subject.
+    #[derive(Debug)]
+    struct HalfMask;
+
+    impl crate::ai::MaskProvider for HalfMask {
+        fn mask(&self, img: &DynamicImage) -> Result<image::GrayImage, String> {
+            Ok(image::GrayImage::from_fn(
+                img.width(),
+                img.height(),
+                |x, _| image::Luma([if x < img.width() / 2 { 0 } else { 255 }]),
+            ))
+        }
+    }
+
+    #[test]
+    fn removebg_applies_the_provider_mask() {
+        let engine = Engine;
+        let src = red_source();
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::RemoveBg])],
+                ProcessContext {
+                    mask_provider: Some(&HalfMask),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Png);
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(2, 10)[3], 0);
+        assert_eq!(img.get_pixel(17, 10)[3], 255);
+        // The subject's color survives untouched.
+        assert_eq!(img.get_pixel(17, 10)[0], 255);
+    }
+
+    #[test]
+    fn removebg_rejects_alphaless_output() {
+        let engine = Engine;
+        let ctx = || ProcessContext {
+            mask_provider: Some(&HalfMask),
+            ..Default::default()
+        };
+        // An explicit JPEG format conflicts.
+        let err = engine
+            .process_preferred(
+                &red_source(),
+                &[Operation::Filters(vec![
+                    Filter::RemoveBg,
+                    Filter::Format(ImageFormat::Jpeg),
+                ])],
+                ctx(),
+            )
+            .unwrap_err();
+        match &err {
+            EngineError::Unsupported(msg) => assert!(msg.contains("alpha"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        // So does a JPEG source with no format named: the
+        // resolved output is JPEG.
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(20, 20, image::Rgb([255, 0, 0])))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let err = engine
+            .process_preferred(&jpeg, &[Operation::Filters(vec![Filter::RemoveBg])], ctx())
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn removebg_without_a_provider_is_a_clean_error() {
+        let engine = Engine;
+        // PNG source: the format check passes, the provider
+        // check is the one that fires.
+        let err = engine
+            .process(&red_source(), &[Operation::Filters(vec![Filter::RemoveBg])])
+            .unwrap_err();
+        match &err {
+            EngineError::Unsupported(msg) => assert!(msg.contains("not configured"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]
