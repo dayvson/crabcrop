@@ -95,6 +95,8 @@ pub struct ProcessContext<'a> {
     /// Background-removal provider, when the deployment
     /// configured a model.
     pub mask_provider: Option<&'a dyn crate::ai::MaskProvider>,
+    /// Upscale provider, when the deployment configured a model.
+    pub upscale_provider: Option<&'a dyn crate::ai::UpscaleProvider>,
 }
 
 /// Decodes, resizes, and encodes images.
@@ -157,6 +159,11 @@ impl Engine {
                     "removebg is not configured on this server".to_string(),
                 ));
             }
+        }
+        if crate::url::has_upscale(ops) && ctx.upscale_provider.is_none() {
+            return Err(EngineError::Unsupported(
+                "upscale is not configured on this server".to_string(),
+            ));
         }
         let img = if detected == ImageFormat::Gif {
             // GIF sources decode frame by frame: an animated source
@@ -337,6 +344,49 @@ fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
     Ok(frames)
 }
 
+/// The largest width or height an AI upscale may produce.
+/// Super-resolution multiplies activations by the factor
+/// squared; this keeps the result inside a sane memory envelope.
+const MAX_UPSCALE_DIM: u64 = 4096;
+
+/// AI-upscale `img` to `factor`x its current dimensions. The
+/// provider's model runs at its native factor as many times as
+/// needed; a final Lanczos pass lands the exact requested size
+/// when the native factor does not divide it.
+fn upscale_image(
+    img: DynamicImage,
+    factor: u32,
+    provider: &dyn crate::ai::UpscaleProvider,
+) -> Result<DynamicImage, EngineError> {
+    let (tw, th) = (
+        img.width() as u64 * factor as u64,
+        img.height() as u64 * factor as u64,
+    );
+    if tw > MAX_UPSCALE_DIM || th > MAX_UPSCALE_DIM {
+        return Err(EngineError::Unsupported(format!(
+            "upscale({factor}) would produce {tw}x{th}, over the {MAX_UPSCALE_DIM}px limit; \
+             resize the source first"
+        )));
+    }
+    let (target_w, target_h) = (tw as u32, th as u32);
+    let mut img = img;
+    let mut scale = 1u32;
+    while scale < factor {
+        let before = (img.width(), img.height());
+        img = provider.upscale(&img).map_err(EngineError::Inference)?;
+        if img.width() <= before.0 || img.height() <= before.1 {
+            return Err(EngineError::Inference(
+                "the upscale model did not enlarge the image".to_string(),
+            ));
+        }
+        scale *= provider.factor().max(2);
+    }
+    if img.width() != target_w || img.height() != target_h {
+        img = img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
+    }
+    Ok(img)
+}
+
 /// Apply the operations to one image, collecting the encoding
 /// directives along the way. Shared by the still pipeline and
 /// the animated-GIF path, which runs it once per frame.
@@ -410,6 +460,14 @@ fn apply_operations(
                             })?;
                             let mask = provider.mask(&img).map_err(EngineError::Inference)?;
                             img = crate::ai::apply_mask(&img, &mask);
+                        }
+                        Filter::Upscale(factor) => {
+                            let provider = ctx.upscale_provider.ok_or_else(|| {
+                                EngineError::Unsupported(
+                                    "upscale is not configured on this server".to_string(),
+                                )
+                            })?;
+                            img = upscale_image(img, *factor, provider)?;
                         }
                         other => {
                             let (new_img, options) =
@@ -1826,6 +1884,84 @@ mod tests {
         // check is the one that fires.
         let err = engine
             .process(&red_source(), &[Operation::Filters(vec![Filter::RemoveBg])])
+            .unwrap_err();
+        match &err {
+            EngineError::Unsupported(msg) => assert!(msg.contains("not configured"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// A fake upscale provider: a deterministic 2x
+    /// nearest-neighbor enlargement.
+    #[derive(Debug)]
+    struct DoubleUpscale;
+
+    impl crate::ai::UpscaleProvider for DoubleUpscale {
+        fn factor(&self) -> u32 {
+            2
+        }
+
+        fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, String> {
+            Ok(DynamicImage::ImageRgba8(image::imageops::resize(
+                &img.to_rgba8(),
+                img.width() * 2,
+                img.height() * 2,
+                image::imageops::FilterType::Nearest,
+            )))
+        }
+    }
+
+    #[test]
+    fn upscale_doubles_and_quadruples_dimensions() {
+        let engine = Engine;
+        let src = red_source(); // 20x20
+        let ctx = || ProcessContext {
+            upscale_provider: Some(&DoubleUpscale),
+            ..Default::default()
+        };
+        let out = engine
+            .process_preferred(&src, &[Operation::Filters(vec![Filter::Upscale(2)])], ctx())
+            .unwrap();
+        assert_eq!((out.width, out.height), (40, 40));
+        // 4x from a native-2x model is two runs.
+        let out = engine
+            .process_preferred(&src, &[Operation::Filters(vec![Filter::Upscale(4)])], ctx())
+            .unwrap();
+        assert_eq!((out.width, out.height), (80, 80));
+    }
+
+    #[test]
+    fn upscale_respects_the_output_cap() {
+        let engine = Engine;
+        let src = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2100,
+            10,
+            image::Rgb([9, 9, 9]),
+        )));
+        let err = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::Upscale(2)])],
+                ProcessContext {
+                    upscale_provider: Some(&DoubleUpscale),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        match &err {
+            EngineError::Unsupported(msg) => assert!(msg.contains("4096"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upscale_without_a_provider_is_a_clean_error() {
+        let engine = Engine;
+        let err = engine
+            .process(
+                &red_source(),
+                &[Operation::Filters(vec![Filter::Upscale(2)])],
+            )
             .unwrap_err();
         match &err {
             EngineError::Unsupported(msg) => assert!(msg.contains("not configured"), "{msg}"),
