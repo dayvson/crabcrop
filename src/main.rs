@@ -20,14 +20,17 @@ mod crop;
 mod engine;
 mod filters;
 mod loader;
+mod observe;
 mod quality;
 mod server;
 mod url;
 
 use std::env;
+use std::sync::Arc;
 
 use crate::engine::Engine;
 use crate::loader::Loader;
+use crate::observe::Metrics;
 use crate::server::{AppState, app};
 
 #[tokio::main]
@@ -48,6 +51,7 @@ async fn main() {
         allow_unsafe,
         loader: Loader::with_defaults().expect("loader"),
         engine: Engine,
+        metrics: Arc::new(Metrics::default()),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
