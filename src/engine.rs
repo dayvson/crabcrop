@@ -82,6 +82,8 @@ impl Engine {
         let mut format = detect_format(bytes);
         let mut explicit_format = false;
         let mut quality = None;
+        let mut fill = None;
+        let mut max_bytes = None;
         // `no_upscale` is a request-wide directive, like the encoding
         // directives: wherever it appears, it caps every resize in
         // the request at the (oriented) source dimensions.
@@ -144,6 +146,12 @@ impl Engine {
                     if let Some(q) = options.quality {
                         quality = Some(q);
                     }
+                    if let Some(c) = options.fill {
+                        fill = Some(c);
+                    }
+                    if let Some(n) = options.max_bytes {
+                        max_bytes = Some(n);
+                    }
                 }
             }
         }
@@ -153,9 +161,9 @@ impl Engine {
             }
         }
         // Resolve the quality directive against the final image.
-        // `quality(auto)` is the only directive reported back: it is
-        // the one the caller did not choose themselves.
-        let (encode_quality, chosen_quality) = match quality {
+        // `quality(auto)` is reported back: it is the one the caller
+        // did not choose themselves.
+        let (encode_quality, mut chosen_quality) = match quality {
             Some(Quality::Value(q)) => (Some(q), None),
             Some(Quality::Auto) => {
                 let q = auto_quality(&img);
@@ -163,7 +171,26 @@ impl Engine {
             }
             None => (None, None),
         };
-        let bytes = encode(&img, format, encode_quality)?;
+        let mut bytes = encode(&img, format, encode_quality, fill)?;
+        // `max_bytes` is a budget, pursued by re-encoding at
+        // decreasing quality. Only the quality-bearing formats have
+        // a lever; for the others the directive cannot be honored
+        // and the single encode stands. If quality bottoms out over
+        // budget, the smallest attempt is returned: an image that
+        // misses its budget beats an error.
+        if let Some(budget) = max_bytes {
+            if matches!(
+                format,
+                ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif
+            ) {
+                let mut current = encode_quality.unwrap_or(80);
+                while bytes.len() as u64 > budget && current > 1 {
+                    current = ((current as u32 * 7 / 10) as u8).max(1);
+                    bytes = encode(&img, format, Some(current), fill)?;
+                    chosen_quality = Some(current);
+                }
+            }
+        }
         Ok(ProcessedImage {
             bytes,
             format,
@@ -225,11 +252,13 @@ fn is_jxl(bytes: &[u8]) -> bool {
 }
 
 /// Encode `img` to `format`. `quality` applies to JPEG, JPEG XL,
-/// and AVIF.
+/// and AVIF. `fill` composites transparency for formats without an
+/// alpha channel (only JPEG needs it here).
 fn encode(
     img: &DynamicImage,
     format: ImageFormat,
     quality: Option<u8>,
+    fill: Option<[u8; 3]>,
 ) -> Result<Vec<u8>, EngineError> {
     let (w, h) = (img.width(), img.height());
     if format == ImageFormat::Jxl {
@@ -249,8 +278,13 @@ fn encode(
     let (pixels, color) = (img.as_bytes(), ExtendedColorType::from(img.color()));
     match format {
         ImageFormat::Jpeg => {
-            // JPEG has no alpha channel.
-            let rgb = img.to_rgb8();
+            // JPEG has no alpha channel. A fill color composites
+            // transparency over that background; without one, the
+            // stored RGB values are used as-is.
+            let rgb = match fill {
+                Some(bg) if img.color().has_alpha() => flatten(img, bg),
+                _ => img.to_rgb8(),
+            };
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality.unwrap_or(80))
                 .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
@@ -281,6 +315,18 @@ fn encode(
         ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
     }
     Ok(buf)
+}
+
+/// Composite an image over a solid background color, dropping the
+/// alpha channel.
+fn flatten(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
+    let mut base = image::RgbaImage::from_pixel(
+        img.width(),
+        img.height(),
+        image::Rgba([bg[0], bg[1], bg[2], 255]),
+    );
+    image::imageops::overlay(&mut base, &img.to_rgba8(), 0, 0);
+    DynamicImage::ImageRgba8(base).to_rgb8()
 }
 
 /// Shrink `(w, h)` proportionally to fit inside `cap`, if a cap is
@@ -1056,6 +1102,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dims_of(&out), (1000, 500));
+    }
+
+    #[test]
+    fn max_bytes_fits_the_budget() {
+        let engine = Engine;
+        let src = noise_png();
+        let control = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+            )
+            .unwrap();
+        assert!(
+            control.bytes.len() > 5000,
+            "control {} bytes",
+            control.bytes.len()
+        );
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::MaxBytes(5000),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jpeg);
+        assert!(out.bytes.len() <= 5000, "{} bytes", out.bytes.len());
+        // The reduction is reported as the chosen quality.
+        let q = out.quality.expect("reduced quality is reported");
+        assert!(q < 80, "quality {q}");
+    }
+
+    #[test]
+    fn fill_flattens_transparency_for_jpeg() {
+        let engine = Engine;
+        // Fully transparent green: RGB stored under zero alpha.
+        let rgba = image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 255, 0, 0]));
+        let src = png_bytes(&DynamicImage::ImageRgba8(rgba));
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Fill([0, 0, 255]),
+                ])],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        let p = img.get_pixel(8, 8);
+        assert!(p[2] > 200 && p[1] < 60, "pixel {p:?}");
+        // Without fill, the stored green shows through.
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        let p = img.get_pixel(8, 8);
+        assert!(p[1] > 200, "pixel {p:?}");
     }
 
     /// Timing reference for the issue thread; run explicitly with

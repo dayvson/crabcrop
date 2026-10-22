@@ -1,8 +1,9 @@
 //! Applying filter operations to decoded images.
 //!
 //! [`apply_filters`] runs pixel filters in URL order and collects
-//! encoding directives. `Format` and `Quality` do not touch pixels;
-//! they are recorded for the encoder.
+//! encoding directives. `Format`, `Quality`, `Fill`, and
+//! `MaxBytes` do not touch pixels; they are recorded for the
+//! encoder.
 
 use image::DynamicImage;
 
@@ -17,6 +18,10 @@ pub struct EncodeOptions {
     pub quality: Option<Quality>,
     /// Cap every resize at the source dimensions.
     pub no_upscale: bool,
+    /// Background color for flattening transparency at encode time.
+    pub fill: Option<[u8; 3]>,
+    /// Byte budget for the encoded output, quality permitting.
+    pub max_bytes: Option<u64>,
 }
 
 /// Apply `filters` in order.
@@ -39,12 +44,94 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
                 img = DynamicImage::ImageRgb8(rgb);
             }
             Filter::HueRotate(degrees) => img = img.huerotate(*degrees),
+            Filter::Sharpen(amount) => {
+                // Unsharp mask as a 3x3 convolution: the center is
+                // boosted, the cross neighbors subtracted.
+                let a = *amount;
+                let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
+                let rgb = image::imageops::filter3x3(&img.to_rgb8(), &kernel);
+                img = DynamicImage::ImageRgb8(rgb);
+            }
+            Filter::Saturation(amount) => {
+                img = DynamicImage::ImageRgb8(saturate(&img.to_rgb8(), *amount));
+            }
+            Filter::Rgb(r, g, b) => {
+                let mut rgb = img.to_rgb8();
+                for p in rgb.pixels_mut() {
+                    p[0] = (p[0] as i32 + r).clamp(0, 255) as u8;
+                    p[1] = (p[1] as i32 + g).clamp(0, 255) as u8;
+                    p[2] = (p[2] as i32 + b).clamp(0, 255) as u8;
+                }
+                img = DynamicImage::ImageRgb8(rgb);
+            }
+            Filter::Equalize => {
+                img = DynamicImage::ImageRgb8(equalize(&img.to_rgb8()));
+            }
+            Filter::Rotate(degrees) => {
+                img = match ((degrees % 360) + 360) % 360 {
+                    90 => img.rotate90(),
+                    180 => img.rotate180(),
+                    270 => img.rotate270(),
+                    _ => img,
+                };
+            }
+            Filter::Fill(color) => options.fill = Some(*color),
+            Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::Quality(q) => options.quality = Some(*q),
             Filter::NoUpscale => options.no_upscale = true,
             Filter::Format(f) => options.format = Some(*f),
         }
     }
     (img, options)
+}
+
+/// Scale each pixel's distance from its luma by `amount`:
+/// 0 collapses to gray, 1 is the identity.
+fn saturate(img: &image::RgbImage, amount: f32) -> image::RgbImage {
+    let mut out = img.clone();
+    for p in out.pixels_mut() {
+        let luma = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+        for c in 0..3 {
+            p[c] = (luma + (p[c] as f32 - luma) * amount).clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Histogram equalization, independently per channel.
+fn equalize(img: &image::RgbImage) -> image::RgbImage {
+    let total = (img.width() * img.height()) as u64;
+    let mut maps: [[u8; 256]; 3] = [[0; 256]; 3];
+    for c in 0..3 {
+        let mut hist = [0u64; 256];
+        for p in img.pixels() {
+            hist[p[c] as usize] += 1;
+        }
+        let mut cdf = [0u64; 256];
+        let mut acc = 0u64;
+        for i in 0..256 {
+            acc += hist[i];
+            cdf[i] = acc;
+        }
+        let cdf_min = cdf.iter().copied().find(|&v| v > 0).unwrap_or(0);
+        for i in 0..256 {
+            maps[c][i] = if total == cdf_min {
+                i as u8
+            } else {
+                // Values below the minimum present value have a
+                // CDF of 0 and map to 0.
+                ((cdf[i].saturating_sub(cdf_min) as f64 * 255.0 / (total - cdf_min) as f64).round())
+                    as u8
+            };
+        }
+    }
+    let mut out = img.clone();
+    for p in out.pixels_mut() {
+        for c in 0..3 {
+            p[c] = maps[c][p[c] as usize];
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -93,6 +180,8 @@ mod tests {
                 format: Some(ImageFormat::Jpeg),
                 quality: Some(Quality::Value(90)),
                 no_upscale: false,
+                fill: None,
+                max_bytes: None,
             }
         );
     }
@@ -102,6 +191,76 @@ mod tests {
         let img = DynamicImage::new_rgb8(8, 8);
         let (_, opts) = apply_filters(img, &[Filter::NoUpscale]);
         assert!(opts.no_upscale);
+    }
+
+    #[test]
+    fn sharpen_increases_edge_contrast() {
+        // Vertical step: left half 100, right half 200.
+        let mut img = DynamicImage::new_rgb8(16, 16);
+        for (x, _, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            let v = if x < 8 { 100 } else { 200 };
+            *p = Rgb([v, v, v]);
+        }
+        let (img, _) = apply_filters(img, &[Filter::Sharpen(1.0)]);
+        let rgb = img.to_rgb8();
+        let left = rgb.get_pixel(7, 8)[0] as i32;
+        let right = rgb.get_pixel(8, 8)[0] as i32;
+        assert!(right - left > 100, "left {left} right {right}");
+    }
+
+    #[test]
+    fn saturation_scales_color() {
+        let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::Saturation(0.0)]);
+        let p = first_pixel(&img);
+        assert_eq!(p[0], p[1]);
+        assert_eq!(p[1], p[2]);
+        let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::Saturation(1.0)]);
+        assert_eq!(first_pixel(&img), [200, 100, 50]);
+        let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::Saturation(2.0)]);
+        let p = first_pixel(&img);
+        assert!(p[0] as i32 - p[2] as i32 > 150, "pixel {p:?}");
+    }
+
+    #[test]
+    fn rgb_offsets_channels() {
+        let (img, _) = apply_filters(solid(100, 100, 100), &[Filter::Rgb(50, -30, 0)]);
+        assert_eq!(first_pixel(&img), [150, 70, 100]);
+    }
+
+    #[test]
+    fn equalize_spreads_the_range() {
+        // All pixels in a narrow band, 100..=107.
+        let mut img = DynamicImage::new_rgb8(16, 16);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            let v = 100 + ((x + y) % 8) as u8;
+            *p = Rgb([v, v, v]);
+        }
+        let (img, _) = apply_filters(img, &[Filter::Equalize]);
+        let rgb = img.to_rgb8();
+        let min = rgb.pixels().map(|p| p[0]).min().unwrap();
+        let max = rgb.pixels().map(|p| p[0]).max().unwrap();
+        assert_eq!(min, 0);
+        assert_eq!(max, 255);
+    }
+
+    #[test]
+    fn rotate_swaps_dimensions() {
+        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(90)]);
+        assert_eq!((img.width(), img.height()), (2, 4));
+        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(-90)]);
+        assert_eq!((img.width(), img.height()), (2, 4));
+        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(180)]);
+        assert_eq!((img.width(), img.height()), (4, 2));
+    }
+
+    #[test]
+    fn fill_and_max_bytes_are_collected() {
+        let (_, opts) = apply_filters(
+            solid(1, 2, 3),
+            &[Filter::Fill([255, 136, 0]), Filter::MaxBytes(5000)],
+        );
+        assert_eq!(opts.fill, Some([255, 136, 0]));
+        assert_eq!(opts.max_bytes, Some(5000));
     }
 
     #[test]

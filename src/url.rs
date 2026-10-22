@@ -124,6 +124,21 @@ pub enum Filter {
     Contrast(f32),
     /// Rotate the hue, in degrees.
     HueRotate(i32),
+    /// Sharpen by this amount (unsharp mask strength, > 0).
+    Sharpen(f32),
+    /// Scale color saturation: 0 is grayscale, 1 is identity.
+    Saturation(f32),
+    /// Per-channel level offsets, each -255..=255.
+    Rgb(i32, i32, i32),
+    /// Histogram equalization per channel.
+    Equalize,
+    /// Rotate by a multiple of 90 degrees.
+    Rotate(i32),
+    /// Background color for flattening transparency, as RGB.
+    Fill([u8; 3]),
+    /// Encoding directive: re-encode at lower quality until the
+    /// output fits this many bytes, quality permitting.
+    MaxBytes(u64),
     /// Encoding quality.
     Quality(Quality),
     /// Output container.
@@ -360,6 +375,57 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 }
             }
             ("format", Some(p)) => Filter::Format(parse_format(p).ok_or_else(invalid)?),
+            ("sharpen", Some(p)) => {
+                let amount: f32 = p.parse().map_err(|_| invalid())?;
+                if !amount.is_finite() || amount <= 0.0 {
+                    return Err(invalid());
+                }
+                Filter::Sharpen(amount)
+            }
+            ("saturation", Some(p)) => {
+                let amount: f32 = p.parse().map_err(|_| invalid())?;
+                if !amount.is_finite() || amount < 0.0 {
+                    return Err(invalid());
+                }
+                Filter::Saturation(amount)
+            }
+            ("rgb", Some(p)) => {
+                let parts: Vec<&str> = p.split(',').collect();
+                if parts.len() != 3 {
+                    return Err(invalid());
+                }
+                let mut offsets = [0i32; 3];
+                for (i, part) in parts.iter().enumerate() {
+                    let v: i32 = part.parse().map_err(|_| invalid())?;
+                    if !(-255..=255).contains(&v) {
+                        return Err(invalid());
+                    }
+                    offsets[i] = v;
+                }
+                Filter::Rgb(offsets[0], offsets[1], offsets[2])
+            }
+            ("equalize", None) => Filter::Equalize,
+            ("rotate", Some(p)) => {
+                let degrees: i32 = p.parse().map_err(|_| invalid())?;
+                if degrees % 90 != 0 {
+                    return Err(invalid());
+                }
+                Filter::Rotate(degrees)
+            }
+            ("fill", Some(p)) => {
+                if p.len() != 6 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(invalid());
+                }
+                let byte = |i: usize| u8::from_str_radix(&p[i..i + 2], 16).map_err(|_| invalid());
+                Filter::Fill([byte(0)?, byte(2)?, byte(4)?])
+            }
+            ("max_bytes", Some(p)) => {
+                let n: u64 = p.parse().map_err(|_| invalid())?;
+                if n == 0 {
+                    return Err(invalid());
+                }
+                Filter::MaxBytes(n)
+            }
             _ => return Err(invalid()),
         };
         filters.push(filter);
@@ -818,6 +884,46 @@ mod tests {
     fn parses_no_upscale() {
         let (ops, _) = parse_operations("filters:no_upscale/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::NoUpscale])]);
+    }
+
+    #[test]
+    fn parses_filter_batch_two() {
+        let cases: Vec<(&str, Filter)> = vec![
+            ("sharpen(1.5)", Filter::Sharpen(1.5)),
+            ("saturation(0)", Filter::Saturation(0.0)),
+            ("saturation(2.5)", Filter::Saturation(2.5)),
+            ("rgb(255,-255,0)", Filter::Rgb(255, -255, 0)),
+            ("equalize", Filter::Equalize),
+            ("rotate(90)", Filter::Rotate(90)),
+            ("rotate(-90)", Filter::Rotate(-90)),
+            ("fill(ff8800)", Filter::Fill([255, 136, 0])),
+            ("max_bytes(5000)", Filter::MaxBytes(5000)),
+        ];
+        for (seg, want) in cases {
+            let path = format!("filters:{seg}/example.com/img.jpg");
+            let (ops, _) = parse_operations(&path).unwrap();
+            assert_eq!(ops, vec![Operation::Filters(vec![want])], "{seg}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_filter_batch_two() {
+        for seg in [
+            "sharpen(0)",
+            "sharpen(-1)",
+            "saturation(-0.5)",
+            "rgb(256,0,0)",
+            "rgb(1,2)",
+            "equalize(1)",
+            "rotate(45)",
+            "fill(ff88)",
+            "fill(gggggg)",
+            "max_bytes(0)",
+            "max_bytes(-5)",
+        ] {
+            let path = format!("filters:{seg}/example.com/img.jpg");
+            assert!(parse_operations(&path).is_err(), "{seg}");
+        }
     }
 
     #[test]
