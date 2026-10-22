@@ -90,6 +90,7 @@ pub enum ImageFormat {
     Png,
     WebP,
     Jxl,
+    Avif,
 }
 
 /// Encoding quality from a `quality(...)` filter.
@@ -238,6 +239,7 @@ fn parse_format(s: &str) -> Option<ImageFormat> {
         "png" => Some(ImageFormat::Png),
         "webp" => Some(ImageFormat::WebP),
         "jxl" => Some(ImageFormat::Jxl),
+        "avif" => Some(ImageFormat::Avif),
         _ => None,
     }
 }
@@ -677,6 +679,15 @@ mod tests {
         assert_eq!(
             ops,
             vec![Operation::Filters(vec![Filter::Quality(Quality::Auto)])]
+        );
+    }
+
+    #[test]
+    fn parses_avif_format() {
+        let (ops, _) = parse_operations("filters:format(avif)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Format(ImageFormat::Avif)])]
         );
     }
 

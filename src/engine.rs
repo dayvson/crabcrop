@@ -56,6 +56,20 @@ impl Engine {
     /// cannot be detected and no filter overrides it). A `crop:W×H`
     /// crops to the W:H aspect ratio and then resizes to exactly W×H.
     pub fn process(&self, bytes: &[u8], ops: &[Operation]) -> Result<ProcessedImage, EngineError> {
+        self.process_preferred(bytes, ops, None)
+    }
+
+    /// Like [`Engine::process`], with a negotiated format preference.
+    ///
+    /// `preferred` (from the client's `Accept` header, chosen by the
+    /// server) applies only when the operations name no format
+    /// themselves; an explicit `format(...)` filter always wins.
+    pub fn process_preferred(
+        &self,
+        bytes: &[u8],
+        ops: &[Operation],
+        preferred: Option<ImageFormat>,
+    ) -> Result<ProcessedImage, EngineError> {
         ensure_jxl_decoder();
         let mut img =
             image::load_from_memory(bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
@@ -66,6 +80,7 @@ impl Engine {
             img = apply_orientation(img, orientation);
         }
         let mut format = detect_format(bytes);
+        let mut explicit_format = false;
         let mut quality = None;
         for op in ops {
             match op {
@@ -95,11 +110,17 @@ impl Engine {
                     img = new_img;
                     if let Some(f) = options.format {
                         format = f;
+                        explicit_format = true;
                     }
                     if let Some(q) = options.quality {
                         quality = Some(q);
                     }
                 }
+            }
+        }
+        if !explicit_format {
+            if let Some(p) = preferred {
+                format = p;
             }
         }
         // Resolve the quality directive against the final image.
@@ -160,6 +181,7 @@ fn detect_format(bytes: &[u8]) -> ImageFormat {
         Ok(image::ImageFormat::Jpeg) => ImageFormat::Jpeg,
         Ok(image::ImageFormat::Png) => ImageFormat::Png,
         Ok(image::ImageFormat::WebP) => ImageFormat::WebP,
+        Ok(image::ImageFormat::Avif) => ImageFormat::Avif,
         _ => ImageFormat::Jpeg,
     }
 }
@@ -173,7 +195,8 @@ fn is_jxl(bytes: &[u8]) -> bool {
         ])
 }
 
-/// Encode `img` to `format`. `quality` applies to JPEG and JPEG XL.
+/// Encode `img` to `format`. `quality` applies to JPEG, JPEG XL,
+/// and AVIF.
 fn encode(
     img: &DynamicImage,
     format: ImageFormat,
@@ -213,6 +236,18 @@ fn encode(
             image::codecs::webp::WebPEncoder::new_lossless(&mut buf)
                 .write_image(pixels, w, h, color)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
+        }
+        ImageFormat::Avif => {
+            // Pure-Rust ravif encoder via the image crate. Speed 8
+            // keeps on-demand encoding responsive; AVIF encoding is
+            // the expensive step in the pipeline by a wide margin.
+            image::codecs::avif::AvifEncoder::new_with_speed_quality(
+                &mut buf,
+                8,
+                quality.unwrap_or(80),
+            )
+            .write_image(pixels, w, h, color)
+            .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
     }
@@ -739,6 +774,80 @@ mod tests {
         assert_eq!(
             shape_and_quadrants(&out.bytes),
             (8, 4, [true, false, false, false])
+        );
+    }
+
+    #[test]
+    fn avif_format_encodes() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &gradient_png(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Avif)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Avif);
+        // ISOBMFF layout: box size, then "ftyp", then the brand.
+        assert_eq!(&out.bytes[4..8], b"ftyp");
+        assert_eq!(&out.bytes[8..12], b"avif");
+    }
+
+    #[test]
+    fn avif_quality_changes_size() {
+        let engine = Engine;
+        let mk = |q| {
+            engine
+                .process(
+                    &gradient_png(),
+                    &[Operation::Filters(vec![
+                        Filter::Quality(Quality::Value(q)),
+                        Filter::Format(ImageFormat::Avif),
+                    ])],
+                )
+                .unwrap()
+        };
+        assert!(mk(95).bytes.len() > mk(10).bytes.len());
+    }
+
+    #[test]
+    fn preferred_format_applies_only_without_explicit_format() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(&gradient_png(), &[], Some(ImageFormat::WebP))
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        let out = engine
+            .process_preferred(
+                &gradient_png(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                Some(ImageFormat::WebP),
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Png);
+    }
+
+    /// Timing reference for the issue thread; run explicitly with
+    /// `cargo test avif_encode_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark"]
+    fn avif_encode_bench() {
+        let mut img = DynamicImage::new_rgb8(512, 384);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = image::Rgb([(x / 2) as u8, (y / 2) as u8, ((x + y) / 4) as u8]);
+        }
+        let src = png_bytes(&img);
+        let engine = Engine;
+        let start = std::time::Instant::now();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Avif)])],
+            )
+            .unwrap();
+        eprintln!(
+            "avif 512x384 q80 speed8: {:?}, {} bytes",
+            start.elapsed(),
+            out.bytes.len()
         );
     }
 }
