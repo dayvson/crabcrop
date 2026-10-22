@@ -37,6 +37,11 @@
 //!   the fallback image served (through the same operations,
 //!   marked `X-Crabcrop-Fallback: 1`) when a source cannot be
 //!   loaded or decoded. Unset keeps today's error behavior.
+//! - `CRABCROP_RESULT_STORAGE_DIR`: directory for the
+//!   disk-backed result store (the persistent tier under the
+//!   memory cache). Unset disables it.
+//!   `CRABCROP_RESULT_STORAGE_MAX_MB` bounds it (default 512;
+//!   `0` disables storage even with a directory set).
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
 //! - `PORT`: listen port, default 3000.
@@ -54,6 +59,7 @@ mod observe;
 mod placeholder;
 mod quality;
 mod server;
+mod storage;
 mod text;
 mod url;
 
@@ -184,6 +190,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    // Disk result storage: configured by directory, bounded
+    // by its own budget. Opening indexes whatever a previous
+    // run left behind.
+    let store = match env::var("CRABCROP_RESULT_STORAGE_DIR") {
+        Ok(dir) if !dir.is_empty() => {
+            let max_mb: usize = parse_env("CRABCROP_RESULT_STORAGE_MAX_MB", 512)?;
+            let max_bytes = max_mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| "CRABCROP_RESULT_STORAGE_MAX_MB is too large".to_string())?;
+            let store = crate::storage::DiskStore::open(std::path::Path::new(&dir), max_bytes)?;
+            let (entries, bytes) = store.stats();
+            println!(
+                "result storage at {dir}: {entries} entries, {bytes} bytes, budget {max_mb} MB"
+            );
+            Some(Arc::new(store))
+        }
+        _ => None,
+    };
+
     let state = AppState {
         secret,
         allow_unsafe,
@@ -198,6 +223,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         face,
         font,
         fallback,
+        store,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
