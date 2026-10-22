@@ -14,8 +14,11 @@
 //!
 //! - `CRABCROP_SECRET` (required): the HMAC secret.
 //! - `CRABCROP_ALLOW_UNSAFE`: `1` or `true` to honor `unsafe` URLs.
+//! - `CRABCROP_CACHE_MAX_MB`: result cache budget in megabytes,
+//!   default 256; `0` disables the cache.
 //! - `PORT`: listen port, default 3000.
 
+mod cache;
 mod crop;
 mod engine;
 mod filters;
@@ -28,6 +31,7 @@ mod url;
 use std::env;
 use std::sync::Arc;
 
+use crate::cache::Cache;
 use crate::engine::Engine;
 use crate::loader::Loader;
 use crate::observe::Metrics;
@@ -45,6 +49,10 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
+    let cache_mb: usize = env::var("CRABCROP_CACHE_MAX_MB")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(256);
 
     let state = AppState {
         secret,
@@ -52,6 +60,7 @@ async fn main() {
         loader: Loader::with_defaults().expect("loader"),
         engine: Engine,
         metrics: Arc::new(Metrics::default()),
+        cache: Arc::new(Cache::new(cache_mb * 1024 * 1024)),
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
