@@ -18,6 +18,10 @@ pub struct CachedImage {
     pub bytes: Vec<u8>,
     pub format: ImageFormat,
     pub quality: Option<u8>,
+    /// Cache groups (RFC 9875) the response belongs to: the
+    /// preset names its URL referenced, empty for preset-free
+    /// requests. Group purge matches on these.
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -76,6 +80,28 @@ impl Cache {
         removed
     }
 
+    /// Remove every entry belonging to `group` (RFC 9875
+    /// grouped invalidation). Returns how many entries were
+    /// removed.
+    pub fn purge_group(&self, group: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let keys: Vec<String> = inner
+            .entries
+            .iter()
+            .filter(|(_, image)| image.groups.iter().any(|g| g == group))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut removed = 0;
+        for key in keys {
+            if let Some(old) = inner.entries.remove(&key) {
+                inner.total_bytes -= old.bytes.len();
+                remove_from_order(&mut inner, &key);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Store `image` under `key`, evicting least recently used
     /// entries until it fits. Entries larger than the whole budget
     /// are not stored.
@@ -122,6 +148,14 @@ mod tests {
             bytes: vec![7; n],
             format: ImageFormat::Png,
             quality: None,
+            groups: Vec::new(),
+        }
+    }
+
+    fn grouped(n: usize, groups: &[&str]) -> CachedImage {
+        CachedImage {
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            ..img(n)
         }
     }
 
@@ -167,6 +201,22 @@ mod tests {
         let cache = Cache::new(0);
         cache.put("a".to_string(), img(1));
         assert_eq!(cache.get("a"), None);
+    }
+
+    #[test]
+    fn purge_group_removes_only_members() {
+        let cache = Cache::new(1024);
+        cache.put("a".to_string(), grouped(10, &["thumb"]));
+        cache.put("b".to_string(), grouped(10, &["thumb", "hero"]));
+        cache.put("c".to_string(), grouped(10, &["hero"]));
+        cache.put("d".to_string(), img(10));
+        assert_eq!(cache.purge_group("thumb"), 2);
+        assert_eq!(cache.get("a"), None);
+        assert_eq!(cache.get("b"), None);
+        assert!(cache.get("c").is_some());
+        assert!(cache.get("d").is_some());
+        assert_eq!(cache.purge_group("thumb"), 0);
+        assert_eq!(cache.purge_group("missing"), 0);
     }
 
     #[test]
