@@ -62,6 +62,9 @@ pub struct AppState {
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
+    /// SSIMULACRA2 target for verified `quality(auto)` encodes,
+    /// from `CRABCROP_SSIM_TARGET`.
+    pub ssim_target: f64,
 }
 
 /// Build the router.
@@ -350,6 +353,7 @@ async fn serve(
         face_provider: state.face.as_deref(),
         text_renderer: state.font.as_deref(),
         dpr: dpr_hint,
+        ssim_target: state.ssim_target,
     };
     let processed = match state.engine.process_preferred(&bytes, &ops, ctx.clone()) {
         Ok(p) => p,
@@ -531,6 +535,9 @@ fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
         processed.source_width,
         processed.source_height,
     );
+    if let Some(score) = processed.ssimulacra2 {
+        body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
+    }
     if let Some(ph) = &processed.placeholder {
         body.push_str(&format!(
             ",\"dominant_color\":\"{}\",\"placeholder\":\"{}\"",
@@ -718,6 +725,7 @@ mod tests {
             fallback: None,
             store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -752,6 +760,7 @@ mod tests {
             fallback: Some(Fallback::Bytes(Arc::new(png))),
             store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -940,6 +949,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn meta_reports_the_verified_score_for_auto_quality() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:quality(auto):format(jpeg)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let score = meta["ssimulacra2"].as_f64().expect("score reported");
+        assert!((0.0..=100.0).contains(&score), "score {score}");
+        // An explicit quality is never scored.
+        let remainder = format!("filters:quality(80):format(jpeg)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(meta.get("ssimulacra2").is_none());
+    }
+
+    #[tokio::test]
     async fn serves_watermarked_image() {
         let src = spawn_image_server().await;
         let wm = spawn_watermark_server().await;
@@ -994,6 +1029,7 @@ mod tests {
                 crate::storage::DiskStore::open(dir, 16 * 1024 * 1024).unwrap(),
             )),
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
