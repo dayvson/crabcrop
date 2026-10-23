@@ -72,13 +72,21 @@ The segment is inside the signed remainder, so the HMAC covers it: extending the
 
 ### Source images
 
-The loader fetches the source URL under fixed limits:
+The loader fetches the source under fixed limits, for every source kind:
 
-- HTTP and HTTPS only.
 - 10 seconds total per fetch, including redirects.
-- 10 MiB maximum response body; larger sources fail with `413`.
-- Up to 5 redirects. The [source policy](#configuration) is re-checked on every hop.
-- If the response carries a `Content-Type` header, it must start with `image/`.
+- 10 MiB maximum body; larger sources fail with `413`.
+- If an HTTP response carries a `Content-Type` header, it must start with `image/`.
+
+HTTP and HTTPS sources additionally allow up to 5 redirects, with the [source policy](#configuration) re-checked on every hop.
+
+Three more source kinds cover originals that do not live behind a public URL:
+
+- `s3://bucket/key`: fetched from AWS S3, or from an S3-compatible store (MinIO, R2, Spaces) when `CRABCROP_S3_ENDPOINT` is set. Requests are signed with SigV4 when AWS credentials are in the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`); with none, the fetch is unsigned and public buckets just work.
+- `gs://bucket/key`: the same, against Google Cloud Storage's S3-compatible XML API, signed with the HMAC pair `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY` when set.
+- `file:///path`: a local file under `CRABCROP_FILE_ROOT`. The path is canonicalized per request and must stay under the root, so `..` segments and symlink escapes are refused. Unset root disables file sources.
+
+Bucket sources are gated by `CRABCROP_ALLOWED_BUCKETS` rather than the host policy, since the endpoint is operator configuration, not request input. Store responses are not redirected: a 3xx from a store surfaces as its status code.
 
 JPEG, PNG, WebP, GIF, and JPEG XL sources are decoded. EXIF orientation is applied before any operation runs, so phone photos come out upright. Animated GIFs keep their frames when the output format is GIF; converting an animated GIF to a still format uses the first frame. HEIC/HEIF sources are rejected, and AVIF sources cannot be decoded in this build (AVIF is an output-only format here); both fail with `502`.
 
@@ -377,6 +385,10 @@ All configuration comes from environment variables. Invalid values for the numer
 | `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
 | `CRABCROP_ALLOWED_SOURCES` | unset (all hosts allowed) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
 | `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | `1` or `true` refuses sources whose host is, or resolves to, a loopback, private, link-local, or unspecified address. Checked before connecting and again on every redirect hop. |
+| `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |
+| `CRABCROP_GCS_ENDPOINT` | `https://storage.googleapis.com` | Base URL of the GCS XML API for `gs://` sources. `CRABCROP_GCS_REGION` (default `auto`) is the signing region; the HMAC pair is `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY`. |
+| `CRABCROP_ALLOWED_BUCKETS` | unset (all buckets) | Comma-separated bucket names the `s3://` and `gs://` schemes may read. |
+| `CRABCROP_FILE_ROOT` | unset | Directory that `file://` sources must stay under, canonicalized at boot and per request. Unset disables file sources. |
 | `CRABCROP_REMOVEBG_MODEL` | unset | Path to a U²-Net-family ONNX model for the `removebg` filter. See [AI features](#ai-features). |
 | `CRABCROP_UPSCALE_MODEL` | unset | Path to a super-resolution ONNX model for the `upscale` filter. See [AI features](#ai-features). |
 | `CRABCROP_FACE_MODEL` | unset | Path to a YuNet ONNX model for face-aware `smart` crops, `crop:...:face`, and the face redaction filters. See [AI features](#ai-features). |

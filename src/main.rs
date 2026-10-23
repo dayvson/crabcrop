@@ -24,6 +24,26 @@
 //! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: `1` or `true` to refuse
 //!   sources resolving to loopback, private, or link-local
 //!   addresses. Off by default.
+//! - `CRABCROP_S3_ENDPOINT`: base URL of an S3-compatible
+//!   store for `s3://` sources (path-style addressing).
+//!   Unset means AWS S3 (virtual-hosted, region from
+//!   `CRABCROP_S3_REGION`, default `us-east-1`). Credentials
+//!   come from the ambient `AWS_ACCESS_KEY_ID`,
+//!   `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`
+//!   variables; both key parts must be set together. Unset
+//!   means unsigned fetches (public buckets).
+//! - `CRABCROP_GCS_ENDPOINT` / `CRABCROP_GCS_REGION`: the
+//!   GCS XML API base for `gs://` sources (default
+//!   `https://storage.googleapis.com`) and its signing region
+//!   (default `auto`). Signing uses the HMAC pair
+//!   `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY`;
+//!   both or neither.
+//! - `CRABCROP_ALLOWED_BUCKETS`: comma-separated bucket
+//!   names the `s3://` and `gs://` schemes may read; unset
+//!   allows every bucket.
+//! - `CRABCROP_FILE_ROOT`: directory that `file://` sources
+//!   must stay under, canonicalized at boot. Unset disables
+//!   file sources.
 //! - `CRABCROP_REMOVEBG_MODEL`: path to a U²-Net-family ONNX
 //!   model for the `removebg` filter. Preloaded at boot; a set
 //!   but unloadable model is a startup error. Unset disables
@@ -62,6 +82,7 @@ mod observe;
 mod placeholder;
 mod quality;
 mod server;
+mod sigv4;
 mod storage;
 mod svg;
 mod text;
@@ -73,7 +94,7 @@ use std::sync::Arc;
 use crate::ai::UpscaleProvider;
 use crate::cache::Cache;
 use crate::engine::Engine;
-use crate::loader::{Loader, SourcePolicy};
+use crate::loader::{Loader, SourceConfig, SourcePolicy};
 use crate::observe::Metrics;
 use crate::server::{AppState, app};
 
@@ -83,6 +104,69 @@ async fn main() {
         eprintln!("crabcrop: {e}");
         std::process::exit(1);
     }
+}
+
+/// Build the bucket/file source configuration from the
+/// environment. Half-configured credentials and a file root
+/// that does not exist are startup errors, under the same
+/// strict-config rule as everything else here.
+fn build_source_config() -> Result<SourceConfig, String> {
+    let mut sources = SourceConfig::default();
+    let nonempty = |name: &str| env::var(name).ok().filter(|v| !v.is_empty());
+
+    if let Some(endpoint) = nonempty("CRABCROP_S3_ENDPOINT") {
+        let parsed = reqwest::Url::parse(&endpoint)
+            .map_err(|e| format!("invalid CRABCROP_S3_ENDPOINT: {e}"))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err("CRABCROP_S3_ENDPOINT must be an http(s) URL".to_string());
+        }
+        sources.s3_endpoint = Some(endpoint.trim_end_matches('/').to_string());
+    }
+    if let Some(region) = nonempty("CRABCROP_S3_REGION") {
+        sources.s3_region = region;
+    }
+    let cred_pair =
+        |key_name: &str, secret_name: &str| -> Result<Option<crate::sigv4::Credentials>, String> {
+            match (nonempty(key_name), nonempty(secret_name)) {
+                (Some(access_key), Some(secret_key)) => Ok(Some(crate::sigv4::Credentials {
+                    access_key,
+                    secret_key,
+                    session_token: None,
+                })),
+                (None, None) => Ok(None),
+                _ => Err(format!("{key_name} and {secret_name} must be set together")),
+            }
+        };
+    sources.aws_creds = cred_pair("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")?;
+    if let Some(creds) = &mut sources.aws_creds {
+        creds.session_token = nonempty("AWS_SESSION_TOKEN");
+    }
+    if let Some(endpoint) = nonempty("CRABCROP_GCS_ENDPOINT") {
+        reqwest::Url::parse(&endpoint)
+            .map_err(|e| format!("invalid CRABCROP_GCS_ENDPOINT: {e}"))?;
+        sources.gcs_endpoint = endpoint.trim_end_matches('/').to_string();
+    }
+    if let Some(region) = nonempty("CRABCROP_GCS_REGION") {
+        sources.gcs_region = region;
+    }
+    sources.gcs_creds = cred_pair("CRABCROP_GCS_ACCESS_KEY", "CRABCROP_GCS_SECRET_KEY")?;
+    sources.allowed_buckets = env::var("CRABCROP_ALLOWED_BUCKETS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(root) = nonempty("CRABCROP_FILE_ROOT") {
+        let canonical = std::fs::canonicalize(&root)
+            .map_err(|e| format!("CRABCROP_FILE_ROOT is not usable: {e}"))?;
+        if !canonical.is_dir() {
+            return Err("CRABCROP_FILE_ROOT is not a directory".to_string());
+        }
+        sources.file_root = Some(canonical);
+    }
+    Ok(sources)
 }
 
 /// Read an environment variable as `T`, or fall back to `default`
@@ -129,6 +213,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let policy = SourcePolicy::new(allowed_sources, block_private);
+    let sources = build_source_config()?;
 
     // AI models are configured, never downloaded, and preloaded
     // at boot: a model that is set but broken is a startup
@@ -224,7 +309,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         allow_unsafe,
         loader: Loader::with_defaults()
             .map_err(|e| format!("cannot build the loader: {e}"))?
-            .with_policy(policy),
+            .with_policy(policy)
+            .with_sources(sources),
         engine: Engine,
         metrics: Arc::new(Metrics::default()),
         cache: Arc::new(Cache::new(cache_bytes)),
