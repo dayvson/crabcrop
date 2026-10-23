@@ -21,6 +21,9 @@
 //!   default 75.
 //! - `CRABCROP_AVIF_SPEED`: ravif speed tier for AVIF encodes,
 //!   1 (slowest, smallest) to 10 (fastest), default 8.
+//! - `CRABCROP_METADATA`: `strip` (default) drops embedded
+//!   EXIF/XMP/IPTC on output; `preserve` copies them into
+//!   JPEG and PNG outputs.
 //! - `CRABCROP_WIDTH_STEP`: quantization step in pixels for
 //!   width client hints, 1 to 2000, default 100.
 //! - `CRABCROP_JXL_SPEED`: jixel speed tier for JPEG XL encodes,
@@ -103,6 +106,7 @@
 
 mod ai;
 mod cache;
+mod color;
 mod crop;
 mod engine;
 mod filters;
@@ -380,6 +384,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let policy = SourcePolicy::new(allowed_sources, block_private);
     let sources = build_source_config()?;
     let (presets, only_presets) = build_presets()?;
+    let preserve_metadata = metadata_config(|name| env::var(name).ok())?;
 
     // AI models are configured, never downloaded, and preloaded
     // at boot: a model that is set but broken is a startup
@@ -500,6 +505,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         avif_speed,
         jxl_speed,
         width_step,
+        preserve_metadata,
         presets,
         only_presets,
     };
@@ -579,6 +585,20 @@ fn clip_config(get: impl Fn(&str) -> Option<String>) -> Result<Option<ClipConfig
 /// every other model, broken configuration fatal. The
 /// label file is only a fallback for exports that carry
 /// no class-names metadata.
+/// The metadata policy from `CRABCROP_METADATA`: `strip`
+/// (the default, and the behavior when unset) or `preserve`.
+/// Anything else is a startup error naming the value.
+fn metadata_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, String> {
+    match get("CRABCROP_METADATA") {
+        None => Ok(false),
+        Some(v) if v.eq_ignore_ascii_case("strip") => Ok(false),
+        Some(v) if v.eq_ignore_ascii_case("preserve") => Ok(true),
+        Some(v) => Err(format!(
+            "CRABCROP_METADATA must be \"strip\" or \"preserve\", got {v:?}"
+        )),
+    }
+}
+
 fn build_detector(
     ort_dylib: Option<&str>,
 ) -> Result<Option<Arc<dyn crate::ai::DetectionProvider>>, String> {
@@ -645,6 +665,18 @@ fn build_tagger(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_config_defaults_to_strip() {
+        let none = |_: &str| None;
+        assert_eq!(metadata_config(none), Ok(false));
+        let preserve = |name: &str| (name == "CRABCROP_METADATA").then(|| "preserve".to_string());
+        assert_eq!(metadata_config(preserve), Ok(true));
+        let strip = |name: &str| (name == "CRABCROP_METADATA").then(|| "STRIP".to_string());
+        assert_eq!(metadata_config(strip), Ok(false));
+        let bogus = |name: &str| (name == "CRABCROP_METADATA").then(|| "keep".to_string());
+        assert!(metadata_config(bogus).is_err());
+    }
 
     #[test]
     fn clip_config_needs_all_four_paths_or_none() {

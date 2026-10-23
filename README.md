@@ -311,6 +311,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 | Filter | Parameters | Description | Example |
 | --- | --- | --- | --- |
 | `removebg` | none | Remove the background, keeping the subject over transparency. Output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:removebg:format(png)` |
+| `keep_profile` | none | Keep the source ICC profile instead of converting to sRGB; the profile is embedded in JPEG and PNG outputs. Other output formats convert to sRGB (pixels labeled as nothing would be wrong colors). | `filters:keep_profile` |
 | `blurfaces` | none | Blur every detected face (privacy redaction). Requires a face model. | `filters:blurfaces` |
 | `pixelatefaces` | none | Pixelate every detected face (privacy redaction). Requires a face model. | `filters:pixelatefaces` |
 | `blurclass` | `blurclass(person)` | Blur every detected object of the class (privacy redaction). Repeat for more classes. Requires a detection model. | `filters:blurclass(person)` |
@@ -415,6 +416,19 @@ A successful image response carries:
 
 Signed URLs are content-addressed, so successful responses are cached and served without re-fetching or re-processing. The first tier is an in-memory LRU bounded by bytes: 256 MB by default, configurable with `CRABCROP_CACHE_MAX_MB` (`0` disables it). With `CRABCROP_RESULT_STORAGE_DIR` set, a second, disk-backed tier (bounded by `CRABCROP_RESULT_STORAGE_MAX_MB`, default 512 MB) sits underneath: results survive restarts, and disk hits are promoted into memory. Only `200` responses are cached; errors never are. Because the response can depend on the request headers, negotiated responses are cached per negotiated format class, per effective DPR value, per quantized width-hint class, and per Save-Data class.
 
+### Color management and metadata
+
+Pixels are decoded in the source profile's space. When the source embeds an ICC profile (JPEG, PNG, and WebP sources are read), crabcrop converts to sRGB with an embedded-profile color transform before any operation runs, so sizes, crops, and filters all work in one known space; a source with no profile is assumed to be sRGB already. `filters:keep_profile` opts out per request: no conversion, and the source profile is embedded into JPEG and PNG outputs instead. CMYK JPEGs decode through the JPEG decoder's own CMYK conversion (embedded CMYK profiles are not honored yet); grayscale profiles are not transformed.
+
+Metadata follows an operator policy, `CRABCROP_METADATA`:
+
+| Value | Behavior |
+| --- | --- |
+| `strip` (default) | Outputs carry no source metadata. |
+| `preserve` | JPEG outputs gain the source's EXIF, XMP, and Photoshop (IPTC) segments; PNG outputs gain EXIF and XMP. Other output formats do not carry preserved metadata. |
+
+Preservation copies the source segments rather than re-serializing them, with one patch: the EXIF orientation is rewritten to 1, because the pixels were already rotated at decode and the original value would double-rotate in viewers. EXIF orientation itself is always honored at decode, under either policy.
+
 ### Fallback image
 
 With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at startup), a source that cannot be fetched or decoded degrades to the fallback instead of an error: the fallback runs through the same operations and is served with `200` and the header `X-Crabcrop-Fallback: 1`. Signature and parse failures never fall back — a `403` or `400` stays honest — and neither does a source-policy refusal. Fallback responses are never cached, so a recovered origin is picked up on the next request; they are also served with `Cache-Control: no-store`, so a CDN or browser never pins the placeholder in place of the real image. With no fallback configured, error behavior is unchanged.
@@ -483,6 +497,7 @@ All configuration comes from environment variables. Invalid values for the numer
 | `CRABCROP_ALLOW_UNSAFE` | off | `1` or `true` honors `unsafe` URLs. Anything else, including unset, means off. |
 | `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
 | `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
+| `CRABCROP_METADATA` | `strip` | `preserve` copies source EXIF/XMP (and IPTC for JPEG) into JPEG and PNG outputs; see [Color management and metadata](#color-management-and-metadata). |
 | `CRABCROP_WIDTH_STEP` | `100` | Quantization step in pixels for width client hints: hinted widths round up to a multiple of this. |
 | `CRABCROP_AVIF_SPEED` | `8` | ravif speed tier for AVIF encodes, 1 (slowest, smallest output) to 10 (fastest). At 800w and quality 80, speed 8 encodes in about 1 s cold and produces the smallest files of the fast tiers; speed 10 is roughly 3x quicker for about 47% more bytes. |
 | `CRABCROP_JXL_SPEED` | `fast` | jixel speed tier for JPEG XL encodes: `ultrafast`, `fastest`, `fast`, `medium`, `slow`, or `extraslow`. Slower tiers shrink output with steep latency costs (`slow` is about 8x the latency of `fast` for about 18% fewer bytes at 800w). |

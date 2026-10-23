@@ -87,6 +87,9 @@ pub struct AppState {
     /// Quantization step for width client hints
     /// (`CRABCROP_WIDTH_STEP`).
     pub width_step: u32,
+    /// Metadata policy (`CRABCROP_METADATA=preserve`):
+    /// copy source EXIF/XMP into JPEG and PNG outputs.
+    pub preserve_metadata: bool,
     /// Named operation presets from `CRABCROP_PRESETS_FILE`:
     /// name to operation string, validated at boot.
     pub presets: std::collections::HashMap<String, String>,
@@ -378,6 +381,7 @@ async fn handle(
 #[derive(Clone)]
 struct ProcessJob {
     save_data: bool,
+    preserve_metadata: bool,
     ops: Vec<crate::url::Operation>,
     preferred: Option<ImageFormat>,
     watermarks: crate::filters::WatermarkImages,
@@ -446,6 +450,7 @@ async fn run_process(
             face_provider: job.face_provider.as_deref(),
             detect_provider: job.detect_provider.as_deref(),
             save_data: job.save_data,
+            preserve_metadata: job.preserve_metadata,
             text_renderer: job.text_renderer.as_deref(),
             dpr: job.dpr,
             ssim_target: job.ssim_target,
@@ -731,6 +736,7 @@ async fn serve(
     };
     let job = ProcessJob {
         save_data,
+        preserve_metadata: state.preserve_metadata,
         ops: job_ops,
         preferred,
         watermarks: watermark_images,
@@ -1291,6 +1297,7 @@ mod tests {
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
+            preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1334,6 +1341,7 @@ mod tests {
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
+            preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1485,6 +1493,7 @@ mod tests {
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
+            preserve_metadata: false,
             presets,
             only_presets,
         };
@@ -1769,6 +1778,7 @@ mod tests {
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
+            preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1865,6 +1875,7 @@ mod tests {
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
+            preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1906,6 +1917,7 @@ mod tests {
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
+            preserve_metadata: false,
             presets,
             only_presets: false,
         };
@@ -2343,6 +2355,7 @@ mod tests {
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
+            preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -2506,11 +2519,13 @@ mod tests {
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
+            preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
         let job = ProcessJob {
             save_data: false,
+            preserve_metadata: false,
             ops: Vec::new(),
             preferred: None,
             watermarks: crate::filters::WatermarkImages::new(),

@@ -22,6 +22,9 @@ pub struct EncodeOptions {
     pub fill: Option<[u8; 3]>,
     /// Byte budget for the encoded output, quality permitting.
     pub max_bytes: Option<u64>,
+    /// Keep the source color profile: skip the conversion to
+    /// sRGB and embed the profile in the output instead.
+    pub keep_profile: bool,
 }
 
 impl EncodeOptions {
@@ -42,6 +45,7 @@ impl EncodeOptions {
             self.max_bytes = other.max_bytes;
         }
         self.no_upscale |= other.no_upscale;
+        self.keep_profile |= other.keep_profile;
     }
 }
 
@@ -150,6 +154,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             Filter::Mask(shape) => img = mask_shape(&img, *shape),
             Filter::Fill(color) => options.fill = Some(*color),
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
+            Filter::KeepProfile => options.keep_profile = true,
             Filter::Quality(q) => options.quality = Some(*q),
             Filter::NoUpscale => options.no_upscale = true,
             Filter::Format(f) => options.format = Some(*f),
@@ -973,6 +978,7 @@ mod tests {
                 no_upscale: false,
                 fill: None,
                 max_bytes: None,
+                keep_profile: false,
             }
         );
     }
@@ -1063,6 +1069,7 @@ mod tests {
             no_upscale: true,
             fill: None,
             max_bytes: Some(100),
+            keep_profile: true,
         });
         base.absorb(EncodeOptions {
             format: None,
@@ -1070,10 +1077,12 @@ mod tests {
             no_upscale: false,
             fill: None,
             max_bytes: None,
+            keep_profile: false,
         });
         assert_eq!(
             base,
             EncodeOptions {
+                keep_profile: true,
                 format: Some(ImageFormat::Png),
                 quality: Some(Quality::Value(50)),
                 no_upscale: true,
