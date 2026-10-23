@@ -354,16 +354,13 @@ async fn serve(
                 return (load_error_response(e), record);
             }
         };
-        match image::load_from_memory(&wm_bytes) {
+        match crate::engine::decode_image(&wm_bytes) {
             Ok(img) => {
                 watermark_images.insert(wm_url.to_string(), img);
             }
             Err(e) => {
                 record.fail = FailStage::Engine;
-                return (
-                    engine_error_response(EngineError::Decode(e.to_string())),
-                    record,
-                );
+                return (engine_error_response(e), record);
             }
         }
     }

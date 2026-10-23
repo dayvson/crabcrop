@@ -23,6 +23,96 @@ fn ensure_jxl_decoder() {
     });
 }
 
+/// Shared resource limits for decoding and output sizing
+/// (security audit E-1/E-2/E-3/E-4/E-9): one policy, applied at
+/// every entry point, so a hostile source or an oversized
+/// request fails cheaply instead of allocating gigabytes.
+pub(crate) const MAX_DECODE_DIMENSION: u32 = 16_384;
+const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+const MAX_GIF_FRAMES: usize = 200;
+const MAX_GIF_PIXELS: u64 = 100_000_000;
+pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
+
+pub(crate) fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIMENSION);
+    limits.max_image_height = Some(MAX_DECODE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits
+}
+
+/// Decode an image from memory under the shared decode limits.
+/// Every decode of untrusted bytes routes through here (the
+/// main pipeline, the quality loop's re-decodes, watermark
+/// images in the server), so no entry point can be bombed past
+/// the budget. The declared dimensions are probed first and
+/// checked in our own code, because decoder adherence to
+/// `max_alloc` varies by format; a probe failure is not fatal
+/// (some valid files have headers the probe cannot read), the
+/// limited decode behind it is the second line.
+pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
+    let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
+    if let Ok(probe) = probe {
+        if let Ok((width, height)) = probe.into_dimensions() {
+            check_decoded_dimensions(width as u64, height as u64)?;
+            if width as u64 * height as u64 * 4 > MAX_DECODE_ALLOC {
+                return Err(EngineError::Decode(format!(
+                    "image dimensions {width}x{height} exceed the decode allocation limit"
+                )));
+            }
+        }
+    }
+    let mut reader = image::ImageReader::new(Cursor::new(bytes));
+    reader.limits(decode_limits());
+    let reader = reader
+        .with_guessed_format()
+        .map_err(|e| EngineError::Decode(e.to_string()))?;
+    reader
+        .decode()
+        .map_err(|e| EngineError::Decode(e.to_string()))
+}
+
+fn check_decoded_dimensions(width: u64, height: u64) -> Result<(), EngineError> {
+    if width > MAX_DECODE_DIMENSION as u64 || height > MAX_DECODE_DIMENSION as u64 {
+        return Err(EngineError::Decode(format!(
+            "image dimensions {width}x{height} exceed the {MAX_DECODE_DIMENSION} px decode limit"
+        )));
+    }
+    Ok(())
+}
+
+/// JPEG XL sources decode through the integration hook, whose
+/// decoder ignores image-crate limits, so the declared size is
+/// probed from the header and rejected over budget before any
+/// full decode happens.
+fn check_jxl_dimensions(bytes: &[u8]) -> Result<(), EngineError> {
+    use jxl::api::{Event, JxlDecoder, JxlDecoderOptions};
+    let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+    let mut input = std::io::BufReader::new(Cursor::new(bytes));
+    let event = decoder
+        .process(&mut input, None, None)
+        .map_err(|e| EngineError::Decode(e.to_string()))?;
+    if event != Event::BasicInfo {
+        return Err(EngineError::Decode("truncated JPEG XL image".to_string()));
+    }
+    let info = decoder
+        .basic_info()
+        .ok_or_else(|| EngineError::Decode("JPEG XL header carried no size".to_string()))?;
+    check_decoded_dimensions(info.size.0 as u64, info.size.1 as u64)
+}
+
+/// Reject an output size past the shared pixel budget, before
+/// anything allocates it. u64 math, so DPR-scaled dimensions
+/// cannot wrap past the check.
+fn check_output_pixels(width: u32, height: u32) -> Result<(), EngineError> {
+    if width as u64 * height as u64 > MAX_OUTPUT_PIXELS {
+        return Err(EngineError::Unsupported(format!(
+            "requested output {width}x{height} exceeds the {MAX_OUTPUT_PIXELS} pixel limit"
+        )));
+    }
+    Ok(())
+}
+
 /// The encoded output plus its container format.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessedImage {
@@ -261,8 +351,10 @@ impl Engine {
             let (tw, th) = svg_raster_target(ops, prep.intrinsic(), dpr_factor(ops, &ctx));
             prep.render(tw, th).map_err(EngineError::Decode)?
         } else {
-            let mut img =
-                image::load_from_memory(bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
+            if detected == ImageFormat::Jxl {
+                check_jxl_dimensions(bytes)?;
+            }
+            let mut img = decode_image(bytes)?;
             // Phone photos store rotation in the EXIF orientation
             // tag instead of the pixels. Honor it before any
             // operation, so sizes and crops see the image as the
@@ -318,7 +410,7 @@ impl Engine {
             let first_guess = encode_quality.expect("auto quality resolves a value");
             let scored = crate::quality::encode_to_target(first_guess, ctx.ssim_target, |q| {
                 let candidate = encode(&img, format, Some(q), directives.fill)?;
-                let score = image::load_from_memory(&candidate)
+                let score = decode_image(&candidate)
                     .ok()
                     .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
                 Ok::<_, EngineError>((candidate, score))
@@ -360,7 +452,7 @@ impl Engine {
             // The budget overruled the verified quality, so the
             // reported score must describe the bytes actually
             // served: re-score the final encode once.
-            ssim = image::load_from_memory(&bytes)
+            ssim = decode_image(&bytes)
                 .ok()
                 .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
         }
@@ -436,16 +528,36 @@ impl Engine {
     }
 }
 
-/// Decode all frames of a GIF source. Errors when the GIF is
-/// malformed or carries no frames.
+/// Decode all frames of a GIF source, under the shared limits:
+/// the decoder gets explicit dimension/allocation limits (its
+/// defaults are none), and collection enforces a frame cap and
+/// a total-decoded-pixels budget, so a small file cannot expand
+/// into gigabytes of frames. Errors when the GIF is malformed,
+/// over budget, or carries no frames.
 fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
-    use image::AnimationDecoder;
-    let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+    use image::{AnimationDecoder, ImageDecoder};
+    let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
-    let frames = decoder
-        .into_frames()
-        .collect_frames()
+    decoder
+        .set_limits(decode_limits())
         .map_err(|e| EngineError::Decode(e.to_string()))?;
+    let mut frames = Vec::new();
+    let mut total_pixels: u64 = 0;
+    for frame in decoder.into_frames() {
+        let frame = frame.map_err(|e| EngineError::Decode(e.to_string()))?;
+        if frames.len() >= MAX_GIF_FRAMES {
+            return Err(EngineError::Decode(format!(
+                "GIF has more than {MAX_GIF_FRAMES} frames"
+            )));
+        }
+        total_pixels += frame.buffer().width() as u64 * frame.buffer().height() as u64;
+        if total_pixels > MAX_GIF_PIXELS {
+            return Err(EngineError::Decode(format!(
+                "GIF frames exceed the {MAX_GIF_PIXELS} decoded-pixel limit"
+            )));
+        }
+        frames.push(frame);
+    }
     if frames.is_empty() {
         return Err(EngineError::Decode("GIF has no frames".to_string()));
     }
@@ -547,8 +659,8 @@ fn apply_operations(
     let mut face_memo: FaceMemo = None;
     for op in ops {
         match op {
-            Operation::Size(size) => img = apply_size(img, size, cap, dpr),
-            Operation::FitIn(size) => img = apply_fit_in(img, size, cap, dpr),
+            Operation::Size(size) => img = apply_size(img, size, cap, dpr)?,
+            Operation::FitIn(size) => img = apply_fit_in(img, size, cap, dpr)?,
             Operation::Pad { size, fill } => {
                 let (tw, th) = match (size.width, size.height) {
                     (Dimension::Pixels(w), Dimension::Pixels(h)) => {
@@ -560,7 +672,7 @@ fn apply_operations(
                         ));
                     }
                 };
-                img = apply_pad(img, tw, th, *fill, ops, cap);
+                img = apply_pad(img, tw, th, *fill, ops, cap)?;
             }
             Operation::CropRect {
                 left,
@@ -627,7 +739,7 @@ fn apply_operations(
                     },
                     cap,
                     1.0,
-                );
+                )?;
             }
             Operation::Filters(filters) => {
                 // One filter at a time, in order: watermark
@@ -1110,7 +1222,7 @@ fn apply_size(
     size: &ImageSize,
     cap: Option<(u32, u32)>,
     dpr: f32,
-) -> DynamicImage {
+) -> Result<DynamicImage, EngineError> {
     let size = &ImageSize {
         width: scale_dimension(size.width, dpr),
         height: scale_dimension(size.height, dpr),
@@ -1135,6 +1247,7 @@ fn apply_size(
         },
     };
     let (w, h) = cap_dimensions(w, h, cap);
+    check_output_pixels(w, h)?;
     let mut img = if w == sw && h == sh {
         img
     } else {
@@ -1146,7 +1259,7 @@ fn apply_size(
     if size.flip_vertical {
         img = img.flipv();
     }
-    img
+    Ok(img)
 }
 
 /// Resize to (w, h) with the SIMD backend (fast_image_resize),
@@ -1207,10 +1320,11 @@ fn apply_pad(
     fill: PadFill,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
-) -> DynamicImage {
+) -> Result<DynamicImage, EngineError> {
     if target_w == 0 || target_h == 0 {
-        return img;
+        return Ok(img);
     }
+    check_output_pixels(target_w, target_h)?;
     let fitted = apply_fit_in(
         img.clone(),
         &ImageSize {
@@ -1221,9 +1335,9 @@ fn apply_pad(
         },
         cap,
         1.0,
-    );
+    )?;
     if fitted.width() == target_w && fitted.height() == target_h {
-        return fitted;
+        return Ok(fitted);
     }
     let color = match fill {
         PadFill::Color(c) => Some(c),
@@ -1249,7 +1363,7 @@ fn apply_pad(
     let x = (target_w - fitted.width()) / 2;
     let y = (target_h - fitted.height()) / 2;
     image::imageops::overlay(&mut base, &fitted.to_rgba8(), x as i64, y as i64);
-    DynamicImage::ImageRgba8(base)
+    Ok(DynamicImage::ImageRgba8(base))
 }
 
 fn apply_fit_in(
@@ -1257,7 +1371,7 @@ fn apply_fit_in(
     size: &ImageSize,
     cap: Option<(u32, u32)>,
     dpr: f32,
-) -> DynamicImage {
+) -> Result<DynamicImage, EngineError> {
     let size = &ImageSize {
         width: scale_dimension(size.width, dpr),
         height: scale_dimension(size.height, dpr),
@@ -1277,15 +1391,16 @@ fn apply_fit_in(
         Dimension::Proportional => {}
     }
     if !scale.is_finite() {
-        return img;
+        return Ok(img);
     }
     let w = ((sw as f64 * scale).round() as u32).max(1);
     let h = ((sh as f64 * scale).round() as u32).max(1);
     let (w, h) = cap_dimensions(w, h, cap);
+    check_output_pixels(w, h)?;
     if w == sw && h == sh {
-        img
+        Ok(img)
     } else {
-        resize_lanczos3(&img, w, h)
+        Ok(resize_lanczos3(&img, w, h))
     }
 }
 
@@ -2372,6 +2487,55 @@ mod tests {
             .encode_frames(frames)
             .unwrap();
         out
+    }
+
+    #[test]
+    fn decode_image_rejects_oversized_dimensions() {
+        let big = DynamicImage::ImageRgb8(image::RgbImage::new(17_000, 2));
+        let bytes = png_bytes(&big);
+        let err = decode_image(&bytes).unwrap_err();
+        assert!(matches!(err, EngineError::Decode(_)), "{err:?}");
+    }
+
+    #[test]
+    fn gif_frame_cap_rejects_frame_bombs() {
+        let make = |n: usize| {
+            let delay = image::Delay::from_numer_denom_ms(100, 1);
+            let frames: Vec<image::Frame> = (0..n)
+                .map(|_| image::Frame::from_parts(image::RgbaImage::new(4, 4), 0, 0, delay))
+                .collect();
+            let mut out = Vec::new();
+            image::codecs::gif::GifEncoder::new(&mut out)
+                .encode_frames(frames)
+                .unwrap();
+            out
+        };
+        assert!(decode_gif_frames(&make(201)).is_err());
+        assert_eq!(decode_gif_frames(&make(3)).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn output_pixel_budget_rejects_huge_requests() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::new(64, 64));
+        let size = ImageSize {
+            width: Dimension::Pixels(16_383),
+            height: Dimension::Pixels(16_383),
+            flip_horizontal: false,
+            flip_vertical: false,
+        };
+        let err = apply_size(img.clone(), &size, None, 1.0).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        let err = apply_pad(img, 16_383, 16_383, PadFill::Directive, &[], None).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::new(24, 16));
+        let bytes = encode(&img, ImageFormat::Jxl, Some(80), None).unwrap();
+        assert!(check_jxl_dimensions(&bytes).is_ok());
+        assert!(check_decoded_dimensions(20_000, 10).is_err());
+        assert!(check_decoded_dimensions(16_384, 16_384).is_ok());
     }
 
     fn decoded_gif_frames(bytes: &[u8]) -> Vec<image::Frame> {

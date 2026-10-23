@@ -333,6 +333,13 @@ pub struct Request<'a> {
     pub source_url: &'a str,
 }
 
+/// The largest dimension a request may name, per axis.
+/// Anything larger is a parse error, not an allocation
+/// (security audit E-4): the value sits one below the decode
+/// ceiling and matches the strictest encoder limit in the
+/// pipeline (WebP's 16383).
+pub const MAX_DIMENSION: u32 = 16_383;
+
 fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
     let (flip, digits) = match part.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -341,7 +348,13 @@ fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
     let dimension = match digits {
         "" | "0" => Dimension::Proportional,
         "orig" => Dimension::Original,
-        d => d.parse::<u32>().map(Dimension::Pixels).map_err(|_| ())?,
+        d => {
+            let n = d.parse::<u32>().map_err(|_| ())?;
+            if n > MAX_DIMENSION {
+                return Err(());
+            }
+            Dimension::Pixels(n)
+        }
     };
     Ok((dimension, flip))
 }
@@ -1113,6 +1126,17 @@ mod tests {
             parse_signature("/unsafe/filters:grayscale()/https://example.com/a/b/c.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
         assert_eq!(rest, "filters:grayscale()/https://example.com/a/b/c.jpg");
+    }
+
+    #[test]
+    fn dimensions_are_capped_at_parse_time() {
+        assert!(parse_size("16383x100").is_ok());
+        assert!(parse_size("16384x100").is_err());
+        assert!(parse_size("100x16384").is_err());
+        // The cap applies wherever a size parses.
+        assert!(crate::url::parse_operations("fit-in:16384x10").is_err());
+        assert!(crate::url::parse_operations("pad:20000x20000").is_err());
+        assert!(crate::url::parse_operations("crop:16384x10").is_err());
     }
 
     #[test]
