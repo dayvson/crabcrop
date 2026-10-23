@@ -891,43 +891,57 @@ async fn serve(
     (response, record)
 }
 
-/// Pick a format from the client's `Accept` header, in negotiation
-/// order: AVIF first, then JPEG XL, then WebP. `None` keeps the
-/// detected source format. A format the client explicitly refuses
-/// (q=0) is never picked, and wildcards do not count as an offer:
-/// a bare `*/*` from a generic HTTP client should not trigger the
-/// expensive AVIF encode.
+/// Pick a format from the client's `Accept` header. Among
+/// the negotiable formats (AVIF, JPEG XL, WebP) the client
+/// accepts, the highest q-value wins (Q8); ties break by
+/// the server preference order (AVIF, then JXL, then
+/// WebP). A missing q means 1.0, q=0 is a refusal, and a
+/// format named twice is governed by its first entry.
+/// `None` keeps the detected source format. Wildcards do
+/// not count as an offer: a bare `*/*` from a generic HTTP
+/// client should not trigger the expensive AVIF encode.
 fn negotiate_format(accept: Option<&str>) -> Option<ImageFormat> {
     let accept = accept?;
-    let (mut avif, mut jxl, mut webp) = (false, false, false);
+    let (mut avif, mut jxl, mut webp) = (None, None, None);
     for part in accept.split(',') {
         let mut segments = part.split(';');
         let media = segments.next().unwrap_or("").trim();
-        let refused = segments.any(|p| {
-            p.trim()
-                .strip_prefix("q=")
-                .and_then(|v| v.trim().parse::<f32>().ok())
-                .is_some_and(|q| q == 0.0)
-        });
-        if refused {
+        let slot = match media {
+            "image/avif" => &mut avif,
+            "image/jxl" => &mut jxl,
+            "image/webp" => &mut webp,
+            _ => continue,
+        };
+        if slot.is_some() {
             continue;
         }
-        match media {
-            "image/avif" => avif = true,
-            "image/jxl" => jxl = true,
-            "image/webp" => webp = true,
-            _ => {}
+        let q = segments
+            .filter_map(|p| {
+                p.trim()
+                    .strip_prefix("q=")
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+            })
+            .next()
+            .unwrap_or(1.0);
+        *slot = Some(q);
+    }
+    // Preference order is the array order; a strictly
+    // greater q is required to displace the incumbent, so
+    // ties go to the earlier (more preferred) format.
+    let mut best: Option<(ImageFormat, f32)> = None;
+    for (format, q) in [
+        (ImageFormat::Avif, avif),
+        (ImageFormat::Jxl, jxl),
+        (ImageFormat::WebP, webp),
+    ] {
+        if let Some(q) = q
+            && q > 0.0
+            && best.is_none_or(|(_, best_q)| q > best_q)
+        {
+            best = Some((format, q));
         }
     }
-    if avif {
-        Some(ImageFormat::Avif)
-    } else if jxl {
-        Some(ImageFormat::Jxl)
-    } else if webp {
-        Some(ImageFormat::WebP)
-    } else {
-        None
-    }
+    best.map(|(format, _)| format)
 }
 
 /// Whether the client asked for the meta response: an explicit
@@ -3248,6 +3262,61 @@ mod tests {
         );
         let body = resp.bytes().await.unwrap();
         assert_eq!(&body[4..8], b"ftyp");
+    }
+
+    #[test]
+    fn negotiation_honors_q_values() {
+        use crate::url::ImageFormat::{Avif, Jxl, WebP};
+        // Absent header and bare wildcards keep the source.
+        assert_eq!(negotiate_format(None), None);
+        assert_eq!(negotiate_format(Some("*/*")), None);
+        assert_eq!(negotiate_format(Some("text/html, image/png")), None);
+        // A single offer wins; missing q means 1.0.
+        assert_eq!(negotiate_format(Some("image/webp")), Some(WebP));
+        // Equal q: the server preference order decides.
+        assert_eq!(negotiate_format(Some("image/webp, image/avif")), Some(Avif));
+        assert_eq!(
+            negotiate_format(Some("image/webp;q=0.9, image/jxl;q=0.9")),
+            Some(Jxl)
+        );
+        // Higher q beats server preference.
+        assert_eq!(
+            negotiate_format(Some("image/avif;q=0.5, image/webp")),
+            Some(WebP)
+        );
+        assert_eq!(
+            negotiate_format(Some("image/avif;q=0.5, image/webp;q=0.4")),
+            Some(Avif)
+        );
+        // q=0 refuses, however often the format is listed.
+        assert_eq!(negotiate_format(Some("image/avif;q=0")), None);
+        assert_eq!(
+            negotiate_format(Some("image/avif;q=0, image/avif;q=1")),
+            None
+        );
+        assert_eq!(
+            negotiate_format(Some("image/avif;q=0, image/webp;q=0.5")),
+            Some(WebP)
+        );
+        // An unparseable q is not a refusal.
+        assert_eq!(negotiate_format(Some("image/webp;q=abc")), Some(WebP));
+    }
+
+    #[tokio::test]
+    async fn q_values_can_overrule_server_preference() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("accept", "image/avif;q=0.4, image/webp;q=0.9")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/webp"
+        );
     }
 
     #[tokio::test]
