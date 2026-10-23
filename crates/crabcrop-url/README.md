@@ -5,7 +5,7 @@ Build, sign, and verify [crabcrop](https://github.com/dayvson/crabcrop) URLs fro
 ## Usage
 
 ```rust
-use crabcrop_url::{build_srcset, build_url, sign, verify};
+use crabcrop_url::{build_srcset, build_url, purge_group_signature, purge_signature, sign, verify};
 
 // A signed URL. The operation string is passed verbatim and may
 // contain several segments and preset: references.
@@ -41,6 +41,12 @@ let srcset = build_srcset(
 // The primitives, if you assemble or check URLs yourself.
 let signature = sign(b"your-secret", "300x200/https://example.com/photo.jpg");
 assert!(verify(b"your-secret", &signature, "300x200/https://example.com/photo.jpg"));
+
+// Purge signatures (for the server's /purge and /purge-group endpoints)
+// are domain-separated under a derived subkey; the helpers sign the
+// right strings so callers never assemble them by hand.
+let purge = purge_signature(b"your-secret", "300x200/https://example.com/photo.jpg");
+let group = purge_group_signature(b"your-secret", "thumb");
 ```
 
 A `None` secret produces the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode. Verification compares in constant time. Builders always emit the canonical lowercase hex tag, and the server accepts only that spelling: an uppercase tag is well-formed hex but not a valid signature segment there, so hand-assembled URLs should reuse builder output rather than re-casing a tag.

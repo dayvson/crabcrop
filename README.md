@@ -13,7 +13,7 @@ crabcrop is for sites and apps that serve the same images at many sizes and want
 **1. Start the server.** A secret is required. For local development, also allow unsigned URLs:
 
 ```bash
-CRABCROP_SECRET=dev-secret CRABCROP_ALLOW_UNSAFE=1 cargo run --release
+CRABCROP_SECRET=local-dev-secret CRABCROP_ALLOW_UNSAFE=1 cargo run --release
 # crabcrop listening on port 3000
 ```
 
@@ -79,7 +79,7 @@ The segment is inside the signed remainder, so the HMAC covers it: extending the
 The loader fetches the source under fixed limits, for every source kind:
 
 - 10 seconds total per fetch, including redirects.
-- 10 MiB maximum body; larger sources fail with `413`.
+- 10 MiB maximum body; larger sources fail with `502` (the request was fine; the origin object is too big).
 - If an HTTP response carries a `Content-Type` header, it must start with `image/`.
 
 Decoding is bounded too, so a small file cannot expand into gigabytes: at most 16384 px per axis and 256 MiB of decoder allocations, and animated GIFs at most 200 frames and 100 million decoded pixels in total. Sources past the bounds fail with `502`.
@@ -300,7 +300,7 @@ filters:text(<text>,<size>,<color>,<anchor>)
 | `color` | `rrggbb`, or `rrggbbaa` to include alpha. |
 | `anchor` | One of nine grid points: `top-left`, `top-center`, `top-right`, `center-left`, `center`, `center-right`, `bottom-left`, `bottom-center`, `bottom-right`. The label is padded from the edges by half the font size. |
 
-The text is drawn when the filter runs, at whatever resolution the image has at that point in the path, so put `text` after your resize to keep it sharp. The font comes from `CRABCROP_FONT_PATH` on the server; with no font configured, `text` requests fail with `400`.
+The text is drawn when the filter runs, at whatever resolution the image has at that point in the path, so put `text` after your resize to keep it sharp. The font comes from `CRABCROP_FONT_PATH` on the server; with no font configured, `text` requests fail with `501`.
 
 ```bash
 curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ffffff,bottom-right)/https://example.com/photo.jpg"
@@ -347,9 +347,9 @@ With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: re
 
 The URL grammar and signing scheme are specified in [`spec/url-signing.md`](spec/url-signing.md), with a canonical set of test vectors in [`spec/test-vectors.json`](spec/test-vectors.json) that every implementation runs as its test suite. Builders on top of the spec:
 
-- **Rust**: the `crabcrop-url` crate in this workspace (`crates/crabcrop-url`) with `sign`, `verify`, `build_url`, and `build_srcset`. The server verifies with this same crate, so client and server cannot drift.
-- **TypeScript**: [`sdks/typescript`](sdks/typescript), `@crabcrop/url`, with `sign`, `verifyUrlSignature`, `buildURL`, and `buildSrcSet`. Standard library only; tests run on `node --test`.
-- **Python**: [`sdks/python`](sdks/python), `crabcrop_url`, with `sign`, `verify`, `build_url`, and `build_srcset`. Standard library only; tests run on `python3 -m unittest`.
+- **Rust**: the `crabcrop-url` crate in this workspace (`crates/crabcrop-url`) with `sign`, `verify`, `build_url`, `build_srcset`, and the purge helpers `purge_signature` and `purge_group_signature`. The server verifies with this same crate, so client and server cannot drift.
+- **TypeScript**: [`sdks/typescript`](sdks/typescript), `@crabcrop/url`, with `sign`, `verifyUrlSignature`, `buildURL`, `buildSrcSet`, `purgeSignature`, and `purgeGroupSignature`. Standard library only; tests run on `node --test`.
+- **Python**: [`sdks/python`](sdks/python), `crabcrop_url`, with `sign`, `verify`, `build_url`, `build_srcset`, `purge_signature`, and `purge_group_signature`. Standard library only; tests run on `python3 -m unittest`.
 
 All three take an optional expiry (emitted as a leading `exp:` segment) and a null secret for the `unsafe` form used by unsafe and presets-only deployments.
 
@@ -361,14 +361,13 @@ For coding agents, [`sdks/mcp`](sdks/mcp) is a first-party MCP server (stdio, no
 
 ## Format negotiation
 
-When the URL names no `format(...)`, crabcrop picks the output format from the request's `Accept` header:
+When the URL names no `format(...)`, crabcrop picks the output format from the request's `Accept` header. Among the negotiable formats (AVIF, JPEG XL, WebP), the one with the highest q-value wins; a missing q counts as 1. Ties break by server preference, in this order:
 
 1. `image/avif` → AVIF
 2. `image/jxl` → JPEG XL
 3. `image/webp` → WebP
-4. Otherwise → the source image's format (JPEG if the format cannot be detected)
 
-A format refused with `q=0` is never picked, and wildcards such as `*/*` do not count as an offer. An explicit `format(...)` in the URL always wins over negotiation. Animated GIF sources are the one exception: they never negotiate to JPEG XL, which would drop their frames, and keep GIF instead. Responses include a `Vary` covering `Accept` and the client hints so downstream caches key this correctly (the hints likewise change sizing and quality; see [Client hints](#client-hints)).
+So `Accept: image/avif;q=0.5, image/webp` produces WebP: the client's stronger preference beats the server's. If none of the three is offered, the source image's format is kept (JPEG if the format cannot be detected). A format refused with `q=0` is never picked, and wildcards such as `*/*` do not count as an offer. An explicit `format(...)` in the URL always wins over negotiation. Animated GIF sources are the one exception: they never negotiate to JPEG XL, which would drop their frames, and keep GIF instead. Responses include a `Vary` covering `Accept` and the client hints so downstream caches key this correctly (the hints likewise change sizing and quality; see [Client hints](#client-hints)).
 
 ## Meta responses
 
@@ -398,7 +397,7 @@ Add the `placeholders` parameter to the media type to also get placeholder data,
 curl -H "Accept: application/json; placeholders=1" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
 ```
 
-This adds four fields: `dominant_color`, the image's average color as `#rrggbb`; `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI; `palette`, the five most prominent colors as `#rrggbb`, most prominent first; and `thumbhash`, a ThumbHash string that ThumbHash client libraries decode into an aspect-correct blurred preview. Handy for rendering a preview while the real image loads. When a CLIP model is configured (see [AI features](#ai-features)), meta responses also carry `tags` (labels with zero-shot scores) and `alt_text` composed from the best labels, whether or not placeholders were asked for. With a detection model configured, adding `detections=1` to the same `Accept` entry adds `detections`: the objects found in the processed image as `{label, score, x, y, w, h}` in pixels, best first. Meta requests are never cached, and errors in meta mode keep the usual status codes and plain-text bodies.
+This adds four fields: `dominant_color`, the image's average color as `#rrggbb`; `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI; `palette`, the five most prominent colors as `#rrggbb`, most prominent first; and `thumbhash`, a ThumbHash string that ThumbHash client libraries decode into an aspect-correct blurred preview. Handy for rendering a preview while the real image loads. When a CLIP model is configured (see [AI features](#ai-features)), meta responses also carry `tags` (labels with zero-shot scores) and `alt_text` composed from the best labels, whether or not placeholders were asked for. With a detection model configured, adding `detections=1` to the same `Accept` entry adds `detections`: the objects found in the processed image as `{label, score, x, y, w, h}` in pixels, best first. Meta requests are never cached. Errors in meta mode keep the usual status codes, and grammar failures answer with the JSON error envelope described in [Errors](#errors).
 
 ## Responses
 
@@ -414,7 +413,7 @@ A successful image response carries:
 
 ### Caching
 
-Signed URLs are content-addressed, so successful responses are cached and served without re-fetching or re-processing. The first tier is an in-memory LRU bounded by bytes: 256 MB by default, configurable with `CRABCROP_CACHE_MAX_MB` (`0` disables it). With `CRABCROP_RESULT_STORAGE_DIR` set, a second, disk-backed tier (bounded by `CRABCROP_RESULT_STORAGE_MAX_MB`, default 512 MB) sits underneath: results survive restarts, and disk hits are promoted into memory. Only `200` responses are cached; errors never are. Because the response can depend on the request headers, negotiated responses are cached per negotiated format class, per effective DPR value, per quantized width-hint class, and per Save-Data class.
+Signed URLs are content-addressed, so successful responses are cached and served without re-fetching or re-processing. Entries are keyed by the request's canonical form (the parsed operations in their one spelling), so equivalent spellings of the same request share one entry. The first tier is an in-memory LRU bounded by bytes: 256 MB by default, configurable with `CRABCROP_CACHE_MAX_MB` (`0` disables it). With `CRABCROP_RESULT_STORAGE_DIR` set, a second, disk-backed tier (bounded by `CRABCROP_RESULT_STORAGE_MAX_MB`, default 512 MB) sits underneath: results survive restarts, and disk hits are promoted into memory. Only `200` responses are cached; errors never are. Because the response can depend on the request headers, negotiated responses are cached per negotiated format class, per effective DPR value, per quantized width-hint class, and per Save-Data class.
 
 ### Color management and metadata
 
@@ -441,13 +440,12 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 | --- | --- |
 | `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image. |
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
-| `413` | The source image is larger than the 10 MiB fetch limit. |
 | `500` | Encoding the output failed, or an AI model failed at inference time. |
 | `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font. |
-| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), or the fetched bytes could not be decoded as an image — including HEIC sources and undecodable formats. A watermark that fails to load also lands here. |
+| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image — including HEIC sources and undecodable formats. A watermark that fails to load also lands here. |
 | `504` | The source fetch timed out (10 seconds). |
 
-For example, a `removebg` request to a server with no background-removal model returns `400` with the body `removebg is not configured on this server`.
+For example, a `removebg` request to a server with no background-removal model returns `501` with the body `removebg is not configured on this server`.
 
 ## Endpoints
 
@@ -465,7 +463,7 @@ For example, a `removebg` request to a server with no background-removal model r
 curl -X POST "http://localhost:3000/purge/<signature>/300x200/https://example.com/photo.jpg"
 ```
 
-The `<path>` is the original request path without its signature. Purge targets are raw remainders: percent-encoded spellings verify as different strings and purge nothing. Entries are stored in expiry-free form, so purging a path also evicts its `exp:` variants. Compute the signature with your client library (`purge_signature` in the Rust crate and the Python SDK, `purgeSignature` in TypeScript): the HMAC-SHA256 of the path under a purge subkey derived from the secret, so only the secret holder can invalidate, and an image signature can never be replayed as a purge signature. The response is `200` with a body like `purged 2`: the count covers the entry and all of its variants (per format class and DPR). A bad purge signature is a `403` and removes nothing; purging a path that is not stored answers `purged 0`.
+The `<path>` is the original request path without its signature. The signature covers the target exactly as presented; the target is then canonicalized the same way entries are keyed, so purging any equivalent spelling of a path (the `jpg` alias, leading zeros, a preset reference) evicts the shared entry, `exp:` variants included. Compute the signature with your client library (`purge_signature` in the Rust crate and the Python SDK, `purgeSignature` in TypeScript): the HMAC-SHA256 of the path under a purge subkey derived from the secret, so only the secret holder can invalidate, and an image signature can never be replayed as a purge signature. The response is `200` with a body like `purged 2`: the count covers the entry and all of its variants (per format class and DPR). A bad purge signature is a `403` and removes nothing; purging a path that is not stored answers `purged 0`.
 
 ### Cache headers and groups
 
@@ -560,11 +558,11 @@ Three features run ONNX models in-process: `removebg` (background removal), `ups
 How configuration works:
 
 - Point `CRABCROP_REMOVEBG_MODEL` at a U²-Net-family model file (320×320 input; the U2Netp export is a good fit) and/or `CRABCROP_UPSCALE_MODEL` at a super-resolution model. The upscale contract is dynamic-size RGB in (values 0..1), the same image out at an integer factor; Real-ESRGAN-family ONNX exports follow it.
-- Point `CRABCROP_FACE_MODEL` at a YuNet model to make `crop:...:smart` center on detected faces (the area-weighted center of the faces found). Face detection only ever improves a smart crop: no model, no faces, or a detection failure all fall back to the detail-based focal point, and a smart crop without the model behaves exactly as before. The same model powers the explicit face operations: `crop:...:face` (crop around the largest face; falls back to the smart window when detection fails or finds nothing), and the `blurfaces` / `pixelatefaces` redaction filters. Those require the model — without one they return `400` — and a detection failure fails a redaction request with `500` rather than serve an unredacted image. Chained face operations in one request share a single detection.
+- Point `CRABCROP_FACE_MODEL` at a YuNet model to make `crop:...:smart` center on detected faces (the area-weighted center of the faces found). Face detection only ever improves a smart crop: no model, no faces, or a detection failure all fall back to the detail-based focal point, and a smart crop without the model behaves exactly as before. The same model powers the explicit face operations: `crop:...:face` (crop around the largest face; falls back to the smart window when detection fails or finds nothing), and the `blurfaces` / `pixelatefaces` redaction filters. Those require the model — without one they return `501` — and a detection failure fails a redaction request with `500` rather than serve an unredacted image. Chained face operations in one request share a single detection.
 - Point the `CRABCROP_CLIP_*` set at a CLIP model pair (image and text ONNX exports with the projection head), its `tokenizer.json`, and a label file with one label per line, and meta responses gain `tags` and `alt_text`: zero-shot labels scored against the processed image, plus a short alt text composed from the best three. Labels are embedded once at boot, so a meta request runs only the image encoder, behind the same inference gate; a tagging failure omits the fields instead of failing the response. Labels are embedded exactly as written, so phrase-style labels (`aerial view of a beach`) work as well as single words.
-- Point `CRABCROP_DETECT_MODEL` at a YOLOv8-family detection export and two more surfaces unlock. The class redaction filters `blurclass(<class>)` and `pixelateclass(<class>)` redact every detected object of a class (repeat the filter for more classes; matching is case-insensitive). They inherit the face redaction rules: no model is a `400`, an unknown class is a `400`, and a detection failure is a `500`, never an unredacted response. And meta requests with `detections=1` return the detection boxes for debugging. The class vocabulary comes from the model's own `names` metadata, which Ultralytics exports carry; for exports without it, `CRABCROP_DETECT_LABELS` supplies one class per line in index order. A model whose output is not the YOLOv8 layout is rejected at boot.
+- Point `CRABCROP_DETECT_MODEL` at a YOLOv8-family detection export and two more surfaces unlock. The class redaction filters `blurclass(<class>)` and `pixelateclass(<class>)` redact every detected object of a class (repeat the filter for more classes; matching is case-insensitive). They inherit the face redaction rules: no model is a `501`, an unknown class is a `400`, and a detection failure is a `500`, never an unredacted response. And meta requests with `detections=1` return the detection boxes for debugging. The class vocabulary comes from the model's own `names` metadata, which Ultralytics exports carry; for exports without it, `CRABCROP_DETECT_LABELS` supplies one class per line in index order. A model whose output is not the YOLOv8 layout is rejected at boot.
 - Models load at boot, before the server reports ready. A configured model that cannot be loaded — missing file, wrong shape — is a startup error with a one-line diagnostic, not a surprise for the first request. The upscale model's native factor is probed at load with a 16×16 test image; a model that does not enlarge by an integer factor is rejected at boot.
-- With no model configured, the filter is off: requests that use it fail cleanly with `400` (`removebg is not configured on this server`, `upscale is not configured on this server`). There is no silent fallback — `upscale` never degrades into a plain resize.
+- With no model configured, the filter is off: requests that use it fail cleanly with `501` (`removebg is not configured on this server`, `upscale is not configured on this server`). There is no silent fallback — `upscale` never degrades into a plain resize.
 - Inference runs behind a server-wide gate of 2 concurrent inferences, so a burst of AI requests cannot starve the normal transform pipeline.
 - `upscale(4)` on a server whose model is natively 2× composes two model runs and lands the exact requested size; when the native factor does not divide the request, a final high-quality resize trims the difference. Source transparency is carried across an upscale even though the model only sees RGB.
 - The ONNX Runtime library itself comes from `CRABCROP_ORT_DYLIB`, or the system library search path when that is unset.
@@ -602,7 +600,7 @@ cargo test
 Running the server locally takes only a secret:
 
 ```bash
-CRABCROP_SECRET=dev-secret cargo run
+CRABCROP_SECRET=local-dev-secret cargo run
 ```
 
 ## License

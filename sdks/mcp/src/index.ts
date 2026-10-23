@@ -239,8 +239,8 @@ const TOOLS = [
     name: "purge_result",
     description:
       "Evict a cached result from a crabcrop server. The path is the cached " +
-      "URL's remainder after its signature (operations and source, in expanded " +
-      "form for preset URLs). Requires the signing secret (argument or " +
+      "URL's remainder after its signature (operations and source; a preset " +
+      "URL works as-is, the server expands it). Requires the signing secret (argument or " +
       "CRABCROP_SECRET). Returns how many entries were removed.",
     inputSchema: {
       type: "object",
