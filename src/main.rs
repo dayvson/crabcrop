@@ -317,14 +317,10 @@ fn build_source_config() -> Result<SourceConfig, String> {
     Ok(sources)
 }
 
-/// Read an environment variable as `T`, or fall back to `default`
-/// when it is unset. A set-but-invalid value is a startup error
-/// naming the variable: silently serving on the wrong port or
-/// with the wrong cache budget is worse than refusing to start.
-/// Parse a `CRABCROP_JXL_SPEED` value into a jixel speed tier.
 /// Default quantization step for width client hints.
 const DEFAULT_WIDTH_STEP: u32 = 100;
 
+/// Parse a `CRABCROP_JXL_SPEED` value into a jixel speed tier.
 fn parse_jxl_speed(value: &str) -> Result<jixel::Speed, String> {
     match value.to_ascii_lowercase().as_str() {
         "ultrafast" => Ok(jixel::Speed::UltraFast),
@@ -339,6 +335,10 @@ fn parse_jxl_speed(value: &str) -> Result<jixel::Speed, String> {
     }
 }
 
+/// Read an environment variable as `T`, or fall back to `default`
+/// when it is unset. A set-but-invalid value is a startup error
+/// naming the variable: silently serving on the wrong port or
+/// with the wrong cache budget is worse than refusing to start.
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
     parse_env_value(name, env::var(name).ok(), default)
 }
@@ -610,11 +610,6 @@ fn clip_config(get: impl Fn(&str) -> Option<String>) -> Result<Option<ClipConfig
     }))
 }
 
-/// Build the detection provider from the environment,
-/// when `CRABCROP_DETECT_MODEL` is set: preloaded like
-/// every other model, broken configuration fatal. The
-/// label file is only a fallback for exports that carry
-/// no class-names metadata.
 /// The metadata policy from `CRABCROP_METADATA`: `strip`
 /// (the default, and the behavior when unset) or `preserve`.
 /// Anything else is a startup error naming the value.
@@ -629,6 +624,11 @@ fn metadata_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, String>
     }
 }
 
+/// Build the detection provider from the environment,
+/// when `CRABCROP_DETECT_MODEL` is set: preloaded like
+/// every other model, broken configuration fatal. The
+/// label file is only a fallback for exports that carry
+/// no class-names metadata.
 fn build_detector(
     ort_dylib: Option<&str>,
 ) -> Result<Option<Arc<dyn crate::ai::DetectionProvider>>, String> {
