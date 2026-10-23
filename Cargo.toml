@@ -12,6 +12,7 @@ axum = "0.8"
 hex = "0.4"
 hmac = "0.12"
 jixel = "0.4"
+jpeg-encoder = "0.7"
 ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
 jxl-image-rs-integration = "0.8"
 kamadak-exif = "0.6"
