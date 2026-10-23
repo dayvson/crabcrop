@@ -121,6 +121,11 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
     assert.equal(meta.width, 300);
     assert.equal(meta.height, 200);
 
+    // fetch_meta refuses URLs outside the configured origin
+    // (audit PL-1): the fixture server is a different origin.
+    const refused = await client.call("fetch_meta", { url: source });
+    assert.match(refused, /refusing to fetch/);
+
     const explanation = await client.call("explain_url", { url });
     assert.match(explanation, /signature \(hmac\)/);
     assert.match(explanation, /resize to 300px wide by 200px high/);
