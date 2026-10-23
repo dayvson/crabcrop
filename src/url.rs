@@ -45,6 +45,9 @@ pub enum ParseError {
     /// A `pad:...` segment did not match `pad:<WxH>[:<fill>]`.
     /// Carries the offending segment.
     InvalidPad(String),
+    /// An `exp:...` segment did not carry a valid unix
+    /// timestamp. Carries the offending segment.
+    InvalidExpiry(String),
     /// A `filters:...` segment did not parse. Carries the offending
     /// segment.
     InvalidFilters(String),
@@ -63,6 +66,7 @@ impl std::fmt::Display for ParseError {
                 write!(f, "invalid crop-rect segment: {seg}")
             }
             ParseError::InvalidPad(seg) => write!(f, "invalid pad segment: {seg}"),
+            ParseError::InvalidExpiry(seg) => write!(f, "invalid expiry segment: {seg}"),
             ParseError::InvalidFilters(seg) => {
                 write!(f, "invalid filters segment: {seg}")
             }
@@ -694,13 +698,37 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
 /// slashes intact). The first segment that is not an operation starts
 /// the source URL.
 pub fn parse_operations(input: &str) -> Result<(Vec<Operation>, &str), ParseError> {
+    let (operations, source_url, _) = parse_operations_with_expiry(input)?;
+    Ok((operations, source_url))
+}
+
+/// Parse the operation segments off the front of the remainder,
+/// also extracting the request's expiry: an `exp:<unix-seconds>`
+/// segment may appear anywhere among the operations. It is
+/// metadata, not an operation, and it sits inside the signed
+/// remainder, so the HMAC covers it. The last `exp` wins.
+pub fn parse_operations_with_expiry(
+    input: &str,
+) -> Result<(Vec<Operation>, &str, Option<u64>), ParseError> {
     let mut operations = Vec::new();
+    let mut expiry = None;
     let mut rest = input;
     loop {
         let (seg, remaining) = match rest.split_once('/') {
             Some((s, r)) => (s, r),
             None => (rest, ""),
         };
+        if let Some(ts) = seg.strip_prefix("exp:") {
+            if ts.is_empty() || !ts.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ParseError::InvalidExpiry(seg.to_string()));
+            }
+            expiry = Some(
+                ts.parse::<u64>()
+                    .map_err(|_| ParseError::InvalidExpiry(seg.to_string()))?,
+            );
+            rest = remaining;
+            continue;
+        }
         match parse_operation(seg) {
             Some(Ok(op)) => {
                 operations.push(op);
@@ -711,7 +739,7 @@ pub fn parse_operations(input: &str) -> Result<(Vec<Operation>, &str), ParseErro
                 if seg.is_empty() {
                     return Err(ParseError::MissingSourceUrl);
                 }
-                return Ok((operations, rest));
+                return Ok((operations, rest, expiry));
             }
         }
     }
@@ -1557,6 +1585,36 @@ mod tests {
             "pad:200x100:blur:extra",
         ] {
             assert!(parse_operations(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_expiry_segments() {
+        let (ops, src, exp) =
+            parse_operations_with_expiry("exp:1893456000/300x200/example.com/img.jpg").unwrap();
+        assert_eq!(exp, Some(1893456000));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(src, "example.com/img.jpg");
+        // Position-independent among the operations; last wins.
+        let (_, _, exp) =
+            parse_operations_with_expiry("300x200/exp:100/exp:200/example.com/img.jpg").unwrap();
+        assert_eq!(exp, Some(200));
+        // Once the source URL starts, `exp:` is just URL text.
+        let (ops, src, exp) = parse_operations_with_expiry("example.com/exp:123").unwrap();
+        assert!(ops.is_empty() && exp.is_none());
+        assert_eq!(src, "example.com/exp:123");
+        // Absent means no expiry.
+        let (_, _, exp) = parse_operations_with_expiry("300x200/example.com/img.jpg").unwrap();
+        assert_eq!(exp, None);
+        // Malformed values are parse errors.
+        for bad in [
+            "exp:/example.com/i.jpg",
+            "exp:abc/example.com/i.jpg",
+            "exp:-1/example.com/i.jpg",
+            "exp:12.5/example.com/i.jpg",
+            "exp:99999999999999999999999999/example.com/i.jpg",
+        ] {
+            assert!(parse_operations_with_expiry(bad).is_err(), "{bad}");
         }
     }
 

@@ -60,6 +60,16 @@ Use that hex string as the first path segment. Anyone can verify the scheme agai
 
 A request with a bad signature gets `403` and the body `bad signature`. The literal signature `unsafe` skips verification, but only when the server runs with `CRABCROP_ALLOW_UNSAFE=1` (or `true`). Keep it off in production.
 
+### Expiring URLs
+
+Add an `exp:<unix-seconds>` segment anywhere among the operations to make a signed URL expire:
+
+```text
+/<signature>/exp:1893456000/300x200/https://example.com/photo.jpg
+```
+
+The segment is inside the signed remainder, so the HMAC covers it: extending the expiry without the secret breaks the signature. Past the expiry the request gets `403` with the body `signature expired`, and expired URLs never serve from the cache. The comparison is exact: the URL is valid strictly before its `exp` second, with no built-in allowance for clock skew. Keep the server's clock synchronized (NTP), and mint expiries with whatever margin your own clock situation needs. URLs without `exp` never expire, exactly as before.
+
 ### Source images
 
 The loader fetches the source URL under fixed limits:

@@ -9,7 +9,7 @@
 //! leaves one structured JSON log line and one metrics update.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Router,
@@ -23,7 +23,9 @@ use crate::cache::{Cache, CachedImage};
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
-use crate::url::{ImageFormat, explicit_format, parse_operations, parse_signature, verify};
+use crate::url::{
+    ImageFormat, explicit_format, parse_operations_with_expiry, parse_signature, verify,
+};
 
 /// Shared state for the handlers.
 #[derive(Debug, Clone)]
@@ -197,7 +199,7 @@ async fn serve(
             record,
         );
     }
-    let (ops, source_url) = match parse_operations(rest) {
+    let (ops, source_url, expiry) = match parse_operations_with_expiry(rest) {
         Ok(v) => v,
         Err(_) => return (StatusCode::BAD_REQUEST.into_response(), record),
     };
@@ -205,6 +207,24 @@ async fn serve(
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
         .to_string();
+    // Expiry is enforced after signature verification (the
+    // segment is inside the signed remainder, so a tampered
+    // expiry already failed as a bad signature) and before the
+    // cache: an expired URL never serves, cached or not. The
+    // comparison is exact: the URL is valid strictly before
+    // its `exp` second.
+    if let Some(exp) = expiry {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now >= exp {
+            return (
+                (StatusCode::FORBIDDEN, "signature expired").into_response(),
+                record,
+            );
+        }
+    }
 
     // The DPR client hint settles sizing when the URL has no
     // explicit `dpr` directive; the effective factor is part of
@@ -772,6 +792,73 @@ mod tests {
 
     fn client() -> reqwest::Client {
         reqwest::Client::new()
+    }
+
+    fn now_unix() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[tokio::test]
+    async fn unexpired_signed_urls_serve() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("exp:{}/300x50/{src}", now_unix() + 3600);
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn expired_signed_urls_are_forbidden() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // exp in 1970: properly signed, long past.
+        let remainder = format!("exp:1/300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "signature expired");
+    }
+
+    #[tokio::test]
+    async fn tampered_expiry_is_a_bad_signature() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let signed = format!("exp:{}/300x50/{src}", now_unix() + 3600);
+        let signature = sign(&signed);
+        // Extending the expiry without re-signing breaks the HMAC.
+        let tampered = format!("exp:{}/300x50/{src}", now_unix() + 7200);
+        let resp = client()
+            .get(format!("{base}/{signature}/{tampered}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "bad signature");
+    }
+
+    #[tokio::test]
+    async fn malformed_expiry_is_a_bad_request() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // Signed properly over a malformed expiry: verification
+        // passes, parsing rejects it.
+        let remainder = format!("exp:soon/300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
