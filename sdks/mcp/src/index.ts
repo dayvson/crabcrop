@@ -32,6 +32,31 @@ function textResult(text: string, isError = false) {
   return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
 }
 
+/** Read a response body with a hard byte cap; null when exceeded. */
+async function readCapped(resp: Response, cap: number): Promise<string | null> {
+  if (!resp.body) return "";
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
 const TOOLS = [
   {
     name: "sign_url",
@@ -110,7 +135,9 @@ const TOOLS = [
     description:
       "Fetch the crabcrop meta JSON for a URL (the processed result's width, " +
       "height, format, byte size, quality, and placeholder data on request). " +
-      "The URL must already be signed if the server requires signatures.",
+      "The URL must already be signed if the server requires signatures. " +
+      "For safety the URL's origin must match CRABCROP_BASE: this tool will " +
+      "not fetch arbitrary URLs.",
     inputSchema: {
       type: "object",
       properties: {
@@ -120,11 +147,44 @@ const TOOLS = [
       required: ["url"],
     },
     async run(args: Record<string, unknown>) {
+      if (!envBase) {
+        return textResult(
+          "fetch_meta requires CRABCROP_BASE to be set: it only fetches URLs on the configured server's origin",
+          true,
+        );
+      }
+      let target: URL;
+      try {
+        target = new URL(String(args.url));
+      } catch {
+        return textResult(`fetch_meta: not a valid URL: ${String(args.url)}`, true);
+      }
+      if (target.origin !== new URL(envBase).origin) {
+        return textResult(
+          `fetch_meta: refusing to fetch ${target.origin}; only the configured server origin (${new URL(envBase).origin}) is allowed`,
+          true,
+        );
+      }
       const accept = args.placeholders
         ? "application/json; placeholders=1"
         : "application/json";
-      const resp = await fetch(String(args.url), { headers: { accept } });
-      const body = await resp.text();
+      let resp: Response;
+      try {
+        resp = await fetch(target, {
+          headers: { accept },
+          redirect: "error",
+          signal: AbortSignal.timeout(10_000),
+        });
+      } catch (err) {
+        return textResult(
+          `meta request failed: ${err instanceof Error ? err.message : String(err)}`,
+          true,
+        );
+      }
+      const body = await readCapped(resp, 256 * 1024);
+      if (body === null) {
+        return textResult("meta request failed: response exceeded the 256 KiB cap", true);
+      }
       if (!resp.ok) {
         return textResult(`meta request failed: HTTP ${resp.status}: ${body}`, true);
       }
