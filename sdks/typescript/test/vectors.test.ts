@@ -103,6 +103,7 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:blurclass()/" + SRC, true, SRC],
     ["filters:blurclass(per%24on)/" + SRC, true, SRC],
     ["filters:pixelateclass/" + SRC, true, SRC],
+    ["filters:keep_profile/" + SRC, false, SRC],
   ];
   for (const [remainder, expectError, expectSource] of cases) {
     const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);

@@ -222,6 +222,10 @@ pub struct ProcessContext<'a> {
     /// The client asked to save data (`Save-Data: on`):
     /// step the default encode quality down one notch.
     pub save_data: bool,
+    /// The operator's metadata policy (`CRABCROP_METADATA`):
+    /// copy the source's EXIF/XMP (and IPTC for JPEG) into
+    /// JPEG and PNG outputs.
+    pub preserve_metadata: bool,
     /// ravif speed tier for AVIF encodes (1 slowest to 10
     /// fastest), from `CRABCROP_AVIF_SPEED`.
     pub avif_speed: u8,
@@ -251,6 +255,7 @@ impl Default for ProcessContext<'_> {
             dpr: None,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             save_data: false,
+            preserve_metadata: false,
             avif_speed: DEFAULT_AVIF_SPEED,
             jxl_speed: DEFAULT_JXL_SPEED,
         }
@@ -378,6 +383,11 @@ impl Engine {
                 }
             }
         }
+        // Source metadata, read from the raw bytes once:
+        // the ICC profile drives color conversion below and
+        // (policy permitting) the metadata injection at the
+        // end.
+        let source_meta = crate::color::extract_source_meta(bytes);
         let img = if detected == ImageFormat::Gif {
             // GIF sources decode frame by frame: an animated source
             // whose output stays GIF keeps its frames (each runs the
@@ -427,6 +437,16 @@ impl Engine {
             // viewer would. (GIFs carry no EXIF, hence the split.)
             if let Some(orientation) = exif_orientation(bytes) {
                 img = apply_orientation(img, orientation);
+            }
+            // Color management: pixels arrive in the source
+            // profile's space; convert to sRGB so every later
+            // stage works in one known space, unless the
+            // request asked to keep the profile (then the
+            // profile is embedded at encode time instead).
+            if !crate::url::has_keep_profile(ops)
+                && let Some(icc) = &source_meta.icc
+            {
+                img = crate::color::convert_to_srgb(img, icc);
             }
             img
         };
@@ -565,6 +585,33 @@ impl Engine {
                 .ok()
                 .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
         }
+        // Metadata and profile embedding happen on the final
+        // bytes: the ICC goes in when the request kept the
+        // profile (it was not converted away), preserved
+        // metadata when the operator policy allows it. Only
+        // JPEG and PNG outputs carry either in this pass.
+        let keep_profile = crate::url::has_keep_profile(ops);
+        let bytes = if (keep_profile && source_meta.icc.is_some()) || ctx.preserve_metadata {
+            let embed_icc = if keep_profile {
+                source_meta.icc.as_deref()
+            } else {
+                None
+            };
+            match format {
+                ImageFormat::Jpeg => crate::color::inject_jpeg(
+                    &bytes,
+                    embed_icc,
+                    &source_meta,
+                    ctx.preserve_metadata,
+                ),
+                ImageFormat::Png => {
+                    crate::color::inject_png(&bytes, embed_icc, &source_meta, ctx.preserve_metadata)
+                }
+                _ => bytes,
+            }
+        } else {
+            bytes
+        };
         Ok(ProcessedImage {
             bytes,
             format,
@@ -2197,6 +2244,158 @@ mod tests {
         assert!(q > flat.quality.unwrap());
         // The detailed image ends up larger than the flat one.
         assert!(noisy.bytes.len() > flat.bytes.len());
+    }
+
+    /// A PNG carrying a Display P3 profile and three known
+    /// pixels, built with the production injector.
+    fn p3_png() -> Vec<u8> {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(3, 1, |x, _| {
+            [
+                image::Rgb([200, 80, 40]),
+                image::Rgb([40, 120, 200]),
+                image::Rgb([90, 160, 90]),
+            ][x as usize]
+        }));
+        let icc = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+        crate::color::inject_png(
+            &png_bytes(&img),
+            Some(&icc),
+            &crate::color::SourceMeta::default(),
+            false,
+        )
+    }
+
+    #[test]
+    fn a_wide_gamut_source_converts_to_srgb_by_default() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &p3_png(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        let expected: [[u8; 3]; 3] = [[216, 69, 17], [0, 122, 206], [61, 162, 81]];
+        for (i, want) in expected.iter().enumerate() {
+            let got = img.get_pixel(i as u32, 0).0;
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert!(
+                    (i32::from(*g) - i32::from(*w)).abs() <= 2,
+                    "pixel {i}: {got:?} vs {want:?}"
+                );
+            }
+        }
+        // And the converted output carries no profile: sRGB
+        // is the assumed space now.
+        assert!(crate::color::extract_source_meta(&out.bytes).icc.is_none());
+    }
+
+    #[test]
+    fn keep_profile_keeps_pixels_and_embeds_the_profile() {
+        let engine = Engine;
+        let icc = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+        let out = engine
+            .process(
+                &p3_png(),
+                &[Operation::Filters(vec![
+                    Filter::KeepProfile,
+                    Filter::Format(ImageFormat::Png),
+                ])],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(img.get_pixel(0, 0).0, [200, 80, 40]);
+        assert_eq!(crate::color::extract_source_meta(&out.bytes).icc, Some(icc));
+    }
+
+    #[test]
+    fn a_cmyk_jpeg_converts_sanely() {
+        // Saturated red in CMYK (Adobe storage), encoded
+        // with the same encoder family the engine uses.
+        let mut data = Vec::new();
+        for _ in 0..64 {
+            data.extend_from_slice(&[0u8, 255, 255, 0]);
+        }
+        let mut jpg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpg, 95)
+            .encode(&data, 8, 8, jpeg_encoder::ColorType::Cmyk)
+            .unwrap();
+        let engine = Engine;
+        let out = engine
+            .process(
+                &jpg,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        let px = img.get_pixel(4, 4).0;
+        assert!(
+            px[0] > 150 && px[1] < 100 && px[2] < 100,
+            "CMYK red came out as {px:?}"
+        );
+    }
+
+    /// A JPEG with EXIF (orientation 6) and XMP, built with
+    /// the production injector over an engine-encoded photo.
+    fn meta_jpeg() -> Vec<u8> {
+        let mut base = Vec::new();
+        image::load_from_memory(&gradient_png())
+            .unwrap()
+            .write_to(
+                &mut std::io::Cursor::new(&mut base),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&6u16.to_le_bytes());
+        tiff.extend_from_slice(&0u16.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        let meta = crate::color::SourceMeta {
+            icc: None,
+            exif_tiff: Some(tiff),
+            xmp: Some(b"<x:xmpmeta>fixture</x:xmpmeta>".to_vec()),
+            photoshop: None,
+        };
+        crate::color::inject_jpeg(&base, None, &meta, true)
+    }
+
+    #[test]
+    fn metadata_is_stripped_by_default_and_preserved_on_policy() {
+        let engine = Engine;
+        let src = meta_jpeg();
+        // Default: gone.
+        let out = engine.process(&src, &[]).unwrap();
+        let meta = crate::color::extract_source_meta(&out.bytes);
+        assert!(meta.exif_tiff.is_none() && meta.xmp.is_none());
+        // Preserve: both copied, orientation patched to 1
+        // (the fixture's 6 already rotated the pixels).
+        let out = engine
+            .process_preferred(
+                &src,
+                &[],
+                ProcessContext {
+                    preserve_metadata: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let meta = crate::color::extract_source_meta(&out.bytes);
+        assert_eq!(
+            meta.xmp.as_deref(),
+            Some(b"<x:xmpmeta>fixture</x:xmpmeta>".as_slice())
+        );
+        let tiff = meta.exif_tiff.expect("exif preserved");
+        assert_eq!(
+            u16::from_le_bytes(tiff[8 + 2 + 8..8 + 2 + 10].try_into().unwrap()),
+            1
+        );
     }
 
     #[test]

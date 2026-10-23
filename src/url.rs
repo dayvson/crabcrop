@@ -276,6 +276,9 @@ pub enum Filter {
     /// model, keeping the subject over transparency. The model
     /// is operator-configured; the engine applies its mask.
     RemoveBg,
+    /// Keep the source ICC profile instead of converting
+    /// to sRGB (`filters:keep_profile`).
+    KeepProfile,
     /// Blur every detected face (privacy redaction), backed by
     /// the server's face model.
     BlurFaces,
@@ -727,6 +730,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             }
             ("equalize", None) => Filter::Equalize,
             ("removebg", None) => Filter::RemoveBg,
+            ("keep_profile", None) => Filter::KeepProfile,
             ("blurfaces", None) => Filter::BlurFaces,
             ("pixelatefaces", None) => Filter::PixelateFaces,
             ("blurclass", Some(p)) => Filter::BlurClass(
@@ -1264,6 +1268,14 @@ pub fn has_size_operation(ops: &[Operation]) -> bool {
                 | Operation::Pad { .. }
                 | Operation::CropRect { .. }
         )
+    })
+}
+
+/// Whether `ops` ask to keep the source color profile.
+pub fn has_keep_profile(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::KeepProfile)),
+        _ => false,
     })
 }
 

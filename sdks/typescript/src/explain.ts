@@ -42,6 +42,7 @@ const FILTER_BLURBS = {
   pixelateclass:
     "pixelate every detected object of the named class (needs a detection model on the server)",
   removebg: "remove the background (needs an AI model on the server)",
+  keep_profile: "keep the source color profile instead of converting to sRGB",
   upscale: "AI upscale by the given factor (needs an AI model on the server)",
   equalize: "histogram equalization",
   saturation: "saturation factor (0 is grayscale, 1 is identity)",
@@ -119,6 +120,7 @@ const NO_ARG_FILTERS = new Set([
   "no_upscale",
   "equalize",
   "removebg",
+  "keep_profile",
   "sepia",
   "blurfaces",
   "pixelatefaces",
