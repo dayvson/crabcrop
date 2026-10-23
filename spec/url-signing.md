@@ -55,4 +55,9 @@ For responsive images, a builder emits one URL per width, each with the single o
 
 ## Versioning
 
-Changes to the grammar or the signing scheme that would invalidate existing URLs require a new spec version and a server that accepts both during migration. Additive changes (new operation kinds, new metadata segments) do not: old builders keep working because unknown operation segments are rejected by the server with `400`, never silently misread.
+The grammar is unversioned: there is no version segment, and a URL minted today keeps its meaning. Additive change is tolerated asymmetrically, and the asymmetry matters:
+
+- An unknown filter inside `filters:`, or a malformed payload on a known prefix (`crop:300x0`, `pad:xyz`), is rejected with `400`: the shape is recognized and fails to parse.
+- Anything else unrecognized is read as source text, never rejected: the first segment that does not parse as an operation is where the source URL begins. A new segment kind (a new prefix, a new bare form) and a size-like segment that fails to parse (`300xabc`) all take this path on a server that predates them: the request fails later, as a source error, not a `400`.
+
+A breaking change, if one is ever unavoidable, arrives as a new first segment: the signature is an HMAC over the whole remainder, so a future scheme can introduce its own leading segment and a server can accept both spellings during migration without disturbing URLs already signed.
