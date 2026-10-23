@@ -64,17 +64,34 @@ impl ClipTokenizer {
             let id = id
                 .as_u64()
                 .ok_or_else(|| format!("vocab id for {token:?} is not a number"))?;
-            vocab.insert(token.clone(), id as u32);
+            let id = u32::try_from(id)
+                .map_err(|_| format!("vocab id for {token:?} exceeds the u32 range"))?;
+            vocab.insert(token.clone(), id);
         }
-        let mut ranks: HashMap<(String, String), u32> = HashMap::new();
-        if let Some(merges) = model.get("merges").and_then(|m| m.as_array()) {
-            for (rank, merge) in merges.iter().enumerate() {
-                let text = merge.as_str().ok_or("a merge entry is not a string")?;
-                let (a, b) = text
-                    .split_once(' ')
-                    .ok_or_else(|| format!("malformed merge entry {text:?}"))?;
-                ranks.insert((a.to_string(), b.to_string()), rank as u32);
+        // The merges are not optional: without them BPE
+        // degenerates to single characters and every
+        // embedding is silently wrong, so a file that lacks
+        // them is malformed, not minimal.
+        let merges = model
+            .get("merges")
+            .and_then(|m| m.as_array())
+            .ok_or("the tokenizer file has no merges")?;
+        let mut ranks: HashMap<(String, String), u32> = HashMap::with_capacity(merges.len());
+        for (rank, merge) in merges.iter().enumerate() {
+            let text = merge.as_str().ok_or("a merge entry is not a string")?;
+            let (a, b) = text
+                .split_once(' ')
+                .ok_or_else(|| format!("malformed merge entry {text:?}"))?;
+            // A merge whose product is not itself a vocab
+            // entry can only come from a malformed export;
+            // the product would vanish at encode time.
+            let joined = format!("{a}{b}");
+            if !vocab.contains_key(&joined) {
+                return Err(format!(
+                    "merge {text:?} produces {joined:?}, which is not in the vocab"
+                ));
             }
+            ranks.insert((a.to_string(), b.to_string()), rank as u32);
         }
         let sot = *vocab
             .get("<|startoftext|>")
@@ -93,11 +110,15 @@ impl ClipTokenizer {
     /// Encode a string to exactly [`CONTEXT_LEN`] token ids
     /// plus its attention mask (1 for real tokens including
     /// SOT/EOT, 0 for padding). Padding uses the EOT id,
-    /// the convention for this export family.
-    pub fn encode(&self, text: &str) -> (Vec<i64>, Vec<i64>) {
+    /// the convention for this export family. A symbol the
+    /// BPE produces that is missing from the vocab is an
+    /// error, never a silent skip: dropping it would shift
+    /// every later position and produce plausible, wrong
+    /// embeddings.
+    pub fn encode(&self, text: &str) -> Result<(Vec<i64>, Vec<i64>), String> {
         let mut ids: Vec<i64> = vec![self.sot as i64];
         for piece in pretokenize(&normalize(text)) {
-            ids.extend(self.encode_piece(&piece));
+            ids.extend(self.encode_piece(&piece)?);
         }
         ids.push(self.eot as i64);
         if ids.len() > CONTEXT_LEN {
@@ -111,12 +132,12 @@ impl ClipTokenizer {
             ids.push(self.eot as i64);
             mask.push(0);
         }
-        (ids, mask)
+        Ok((ids, mask))
     }
 
     /// BPE-encode one pre-token: byte-map it, suffix the
     /// final symbol with `</w>`, then merge by rank.
-    fn encode_piece(&self, piece: &str) -> Vec<i64> {
+    fn encode_piece(&self, piece: &str) -> Result<Vec<i64>, String> {
         let mut symbols: Vec<String> = piece.bytes().map(|b| byte_char(b).to_string()).collect();
         if let Some(last) = symbols.last_mut() {
             last.push_str("</w>");
@@ -154,10 +175,18 @@ impl ClipTokenizer {
             }
             symbols = merged;
         }
-        symbols
-            .iter()
-            .filter_map(|s| self.vocab.get(s).map(|&id| id as i64))
-            .collect()
+        let mut out = Vec::with_capacity(symbols.len());
+        for s in &symbols {
+            match self.vocab.get(s) {
+                Some(&id) => out.push(id as i64),
+                None => {
+                    return Err(format!(
+                        "token {s:?} produced by BPE is missing from the tokenizer vocab"
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -274,7 +303,7 @@ mod tests {
     #[test]
     fn encode_wraps_pads_and_masks() {
         let t = toy();
-        let (ids, mask) = t.encode("");
+        let (ids, mask) = t.encode("").unwrap();
         assert_eq!(ids.len(), CONTEXT_LEN);
         assert_eq!(ids[0], 0, "SOT first");
         assert_eq!(ids[1], 1, "EOT second on empty input");
@@ -287,17 +316,58 @@ mod tests {
     #[test]
     fn encode_merges_by_rank_and_suffixes_word_ends() {
         let t = toy();
-        let (ids, _) = t.encode("ab");
+        let (ids, _) = t.encode("ab").unwrap();
         assert_eq!(&ids[..3], &[0, 15, 1], "a + b</w> merge to ab</w>");
         // No merge across pieces: "a b" is a, space, b.
-        let (ids, _) = t.encode("a b");
+        let (ids, _) = t.encode("a b").unwrap();
         assert_eq!(&ids[..5], &[0, 10, 12, 11, 1]);
+    }
+
+    #[test]
+    fn malformed_exports_fail_at_load() {
+        // No merges at all: BPE would degenerate to single
+        // characters instead of erroring.
+        let err = ClipTokenizer::from_json(
+            r#"{"model": {"type": "BPE",
+                "vocab": {"<|startoftext|>": 0, "<|endoftext|>": 1, "a</w>": 2}}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("no merges"), "{err}");
+        // A merge whose product is not a vocab entry: the
+        // product would vanish at encode time.
+        let err = ClipTokenizer::from_json(
+            r#"{"model": {"type": "BPE",
+                "vocab": {"<|startoftext|>": 0, "<|endoftext|>": 1,
+                          "a</w>": 2, "b</w>": 3},
+                "merges": ["a b</w>"]}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("not in the vocab"), "{err}");
+        // An id past the u32 range would truncate on cast.
+        let err = ClipTokenizer::from_json(
+            r#"{"model": {"type": "BPE",
+                "vocab": {"<|startoftext|>": 0, "<|endoftext|>": 1,
+                          "a</w>": 4294967296},
+                "merges": []}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("u32 range"), "{err}");
+    }
+
+    #[test]
+    fn a_symbol_missing_from_the_vocab_is_an_encode_error() {
+        // The toy vocab knows a and b only: encoding "c"
+        // must fail loudly, not drop the symbol and shift
+        // every later position.
+        let t = toy();
+        let err = t.encode("c").unwrap_err();
+        assert!(err.contains("missing from the tokenizer vocab"), "{err}");
     }
 
     #[test]
     fn encode_lowercases_and_collapses_whitespace() {
         let t = toy();
-        let (ids, _) = t.encode("A   B");
+        let (ids, _) = t.encode("A   B").unwrap();
         assert_eq!(&ids[..5], &[0, 10, 12, 11, 1]);
     }
 
