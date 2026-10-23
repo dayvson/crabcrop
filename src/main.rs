@@ -416,6 +416,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (presets, only_presets) = build_presets()?;
     let preserve_metadata = metadata_config(|name| env::var(name).ok())?;
 
+    // Disk result storage: configured by directory, bounded
+    // by its own budget. Opening indexes whatever a previous
+    // run left behind. It opens here, before the AI preload,
+    // together with the listener bind: a taken port or an
+    // unwritable directory is a cheap failure and should
+    // not wait for the model embedding passes to be paid
+    // first (bind early, serve late).
+    let store = match env::var("CRABCROP_RESULT_STORAGE_DIR") {
+        Ok(dir) if !dir.is_empty() => {
+            let max_mb: usize = parse_env("CRABCROP_RESULT_STORAGE_MAX_MB", 512)?;
+            let max_bytes = max_mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| "CRABCROP_RESULT_STORAGE_MAX_MB is too large".to_string())?;
+            let store = crate::storage::DiskStore::open(std::path::Path::new(&dir), max_bytes)?;
+            let (entries, bytes) = store.stats();
+            println!(
+                "result storage at {dir}: {entries} entries, {bytes} bytes, budget {max_mb} MB"
+            );
+            Some(Arc::new(store))
+        }
+        _ => None,
+    };
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+
     // AI models are configured, never downloaded, and preloaded
     // at boot: a model that is set but broken is a startup
     // error, not a surprise for the first request that uses it.
@@ -488,25 +512,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    // Disk result storage: configured by directory, bounded
-    // by its own budget. Opening indexes whatever a previous
-    // run left behind.
-    let store = match env::var("CRABCROP_RESULT_STORAGE_DIR") {
-        Ok(dir) if !dir.is_empty() => {
-            let max_mb: usize = parse_env("CRABCROP_RESULT_STORAGE_MAX_MB", 512)?;
-            let max_bytes = max_mb
-                .checked_mul(1024 * 1024)
-                .ok_or_else(|| "CRABCROP_RESULT_STORAGE_MAX_MB is too large".to_string())?;
-            let store = crate::storage::DiskStore::open(std::path::Path::new(&dir), max_bytes)?;
-            let (entries, bytes) = store.stats();
-            println!(
-                "result storage at {dir}: {entries} entries, {bytes} bytes, budget {max_mb} MB"
-            );
-            Some(Arc::new(store))
-        }
-        _ => None,
-    };
-
     let state = AppState {
         secret,
         allow_unsafe,
@@ -539,7 +544,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         presets,
         only_presets,
     };
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     println!("crabcrop listening on port {port}");
     axum::serve(listener, app(state)).await?;
     Ok(())
