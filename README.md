@@ -486,6 +486,28 @@ The response is `200` with a body like `purged 3`: every entry recorded in the g
 
 Every image request also writes one structured JSON log line to stdout, with the operation summary, status, per-stage timings, and cache result (never the full source URL).
 
+## Command line
+
+The `crabcrop` binary doubles as its own operator CLI: when the first argument is a verb, it runs the verb and exits instead of starting the server. Configuration comes from flags over environment variables, the same convention as the MCP server: `--base` / `--secret` over `CRABCROP_BASE` / `CRABCROP_SECRET`, with the base defaulting to `http://localhost:3000`.
+
+```bash
+export CRABCROP_BASE=http://localhost:3000
+export CRABCROP_SECRET=your-secret
+
+# Sign a URL (validated against the server grammar first)
+crabcrop sign "300x200/filters:grayscale/https://example.com/photo.jpg"
+
+# Explain a URL segment by segment, verifying its signature
+crabcrop explain "http://localhost:3000/<signature>/300x200/filters:grayscale/https://example.com/photo.jpg"
+
+# Fetch the meta JSON for an image (a bare remainder is signed first)
+crabcrop meta "300x200/https://example.com/photo.jpg"
+
+# Purge one URL, or a whole preset group (Cache-Group)
+crabcrop purge "300x200/https://example.com/photo.jpg"
+crabcrop purge-group thumb
+```
+
 ## Configuration
 
 All configuration comes from environment variables. Invalid values for the numeric settings are startup errors — the server refuses to start rather than run with a wrong port or cache budget.

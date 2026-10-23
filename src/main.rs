@@ -106,6 +106,7 @@
 
 mod ai;
 mod cache;
+mod cli;
 mod color;
 mod crop;
 mod engine;
@@ -136,6 +137,31 @@ use crate::server::{AppState, app};
 
 #[tokio::main]
 async fn main() {
+    // CLI verbs run instead of the server when the first
+    // argument names one; anything else starts the server.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|a| {
+        cli::VERBS.contains(&a.as_str()) || a == "--help" || a == "-h" || a == "help"
+    }) {
+        match cli::exec(&argv).await {
+            Ok(out) => {
+                if !out.is_empty() {
+                    println!("{out}");
+                }
+            }
+            Err(e) => {
+                // A bare USAGE error prints to stdout-friendly
+                // stderr without the prefix duplication.
+                if e.starts_with("crabcrop:") {
+                    eprintln!("{e}");
+                } else {
+                    eprintln!("crabcrop: {e}");
+                }
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if let Err(e) = run().await {
         eprintln!("crabcrop: {e}");
         std::process::exit(1);
