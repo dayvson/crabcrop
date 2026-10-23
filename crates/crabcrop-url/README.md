@@ -15,7 +15,8 @@ let url = build_url(
     "crop:1200x630:smart/filters:format(webp)",
     "https://example.com/photo.jpg",
     None,
-);
+)
+.unwrap();
 
 // An expiring URL: Some(unix seconds) emits a leading exp: segment.
 let expiring = build_url(
@@ -24,7 +25,8 @@ let expiring = build_url(
     "300x200",
     "https://example.com/photo.jpg",
     Some(1893456000),
-);
+)
+.unwrap();
 
 // A responsive srcset: one {width}x0 URL per width.
 let srcset = build_srcset(
@@ -33,11 +35,12 @@ let srcset = build_srcset(
     "https://example.com/photo.jpg",
     &[400, 800, 1200],
     None,
-);
+)
+.unwrap();
 
 // The primitives, if you assemble or check URLs yourself.
 let signature = sign(b"your-secret", "300x200/https://example.com/photo.jpg");
 assert!(verify(b"your-secret", &signature, "300x200/https://example.com/photo.jpg"));
 ```
 
-A `None` secret produces the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode. Verification compares in constant time and accepts hex tags case-insensitively; builders always emit lowercase.
+A `None` secret produces the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode. Verification compares in constant time. Builders always emit the canonical lowercase hex tag, and the server accepts only that spelling: an uppercase tag is well-formed hex but not a valid signature segment there, so hand-assembled URLs should reuse builder output rather than re-casing a tag.
