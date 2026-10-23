@@ -128,6 +128,9 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // padding is a directive the face crop reads from
             // the request as a whole. (Same routing.)
             Filter::BlurFaces | Filter::PixelateFaces | Filter::FacePad(_) => {}
+            // Class redaction is engine-routed (it needs the
+            // detection provider), like the face filters above.
+            Filter::BlurClass(_) | Filter::PixelateClass(_) => {}
             // DPR scales size targets in the engine, which
             // resolves it against the request as a whole (with
             // the client-hint fallback). (Same routing.)
@@ -529,6 +532,42 @@ pub fn pixelate_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> Dynam
                 image::imageops::FilterType::Nearest,
             )
     })
+}
+
+/// Blur every detection's box in `img`, through the
+/// region redaction mechanics (strength derived from the
+/// box size). Boxes are clamped to the image; empty or
+/// fully out-of-frame boxes are skipped.
+pub fn blur_detections(img: &DynamicImage, detections: &[crate::ai::Detection]) -> DynamicImage {
+    redact_detections(img, detections, blur_region)
+}
+
+/// Pixelate every detection's box in `img`, through the
+/// region redaction mechanics.
+pub fn pixelate_detections(
+    img: &DynamicImage,
+    detections: &[crate::ai::Detection],
+) -> DynamicImage {
+    redact_detections(img, detections, pixelate_region)
+}
+
+fn redact_detections(
+    img: &DynamicImage,
+    detections: &[crate::ai::Detection],
+    redact: fn(&DynamicImage, u32, u32, u32, u32) -> DynamicImage,
+) -> DynamicImage {
+    let mut out = img.clone();
+    for det in detections {
+        let x = det.x.min(img.width());
+        let y = det.y.min(img.height());
+        let w = det.w.min(img.width() - x);
+        let h = det.h.min(img.height() - y);
+        if w == 0 || h == 0 {
+            continue;
+        }
+        out = redact(&out, x, y, w, h);
+    }
+    out
 }
 
 /// Apply `redact` to each face region of `img` and composite

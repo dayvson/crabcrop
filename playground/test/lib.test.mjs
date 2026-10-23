@@ -160,6 +160,11 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,screen,25)/" + SRC, false, SRC],
     ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,darken)/" + SRC, true, SRC],
     ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,101,normal)/" + SRC, true, SRC],
+    ["filters:blurclass(person)/" + SRC, false, SRC],
+    ["filters:pixelateclass(traffic%20light)/" + SRC, false, SRC],
+    ["filters:blurclass()/" + SRC, true, SRC],
+    ["filters:blurclass(per%24on)/" + SRC, true, SRC],
+    ["filters:pixelateclass/" + SRC, true, SRC],
   ];
   for (const [remainder, expectError, expectSource] of cases) {
     const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);
