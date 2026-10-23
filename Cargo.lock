@@ -423,6 +423,7 @@ dependencies = [
  "image",
  "jixel",
  "jpeg-encoder",
+ "jxl",
  "jxl-image-rs-integration",
  "kamadak-exif",
  "ort",

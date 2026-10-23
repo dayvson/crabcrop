@@ -78,6 +78,8 @@ The loader fetches the source under fixed limits, for every source kind:
 - 10 MiB maximum body; larger sources fail with `413`.
 - If an HTTP response carries a `Content-Type` header, it must start with `image/`.
 
+Decoding is bounded too, so a small file cannot expand into gigabytes: at most 16384 px per axis and 256 MiB of decoder allocations, and animated GIFs at most 200 frames and 100 million decoded pixels in total. Sources past the bounds fail with `502`.
+
 HTTP and HTTPS sources additionally allow up to 5 redirects, with the [source policy](#configuration) re-checked on every hop.
 
 Three more source kinds cover originals that do not live behind a public URL:
@@ -94,7 +96,7 @@ SVG sources are supported and detected by content, not by the declared content t
 
 ## Operations
 
-Operations run in the order they appear in the path.
+Operations run in the order they appear in the path. Requested outputs are capped at 16383 px per axis and 100 megapixels in total; a request past either bound fails with `400` before anything is allocated.
 
 ### Resize
 
