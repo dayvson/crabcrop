@@ -98,6 +98,11 @@ function parseSizeSegment(seg) {
   return { w, h };
 }
 
+function isExactBox(size) {
+  const px = (d) => d.kind === "pixels" && d.value >= 1 && !d.flip;
+  return px(size.w) && px(size.h);
+}
+
 function sizeBlurb(seg) {
   const size = parseSizeSegment(seg);
   if (!size) return `resize per ${seg}`;
@@ -409,11 +414,12 @@ function explainSegment(seg, nowSeconds) {
     const idx = rest.indexOf(":");
     const dims = idx === -1 ? rest : rest.slice(0, idx);
     const align = idx === -1 ? "center" : rest.slice(idx + 1);
-    if (!parseSizeSegment(dims) || !ALIGN_NAMES.has(align)) {
+    const cropSize = parseSizeSegment(dims);
+    if (!cropSize || !isExactBox(cropSize) || !ALIGN_NAMES.has(align)) {
       return {
         kind: "operation",
         title: "Crop",
-        error: `malformed crop segment: ${seg} (want crop:<w>x<h>[:center|smart|face|top|bottom|left|right])`,
+        error: `malformed crop segment: ${seg} (want crop:<w>x<h>[:center|smart|face|top|bottom|left|right], pixels only, no flips)`,
       };
     }
     return { kind: "operation", title: "Crop", detail: `crop to the aspect of ${dims} and resize to it; alignment: ${align === "center" ? "center (or the focal point for smart)" : align}` };
@@ -431,8 +437,9 @@ function explainSegment(seg, nowSeconds) {
     const idx = rest.indexOf(":");
     const dims = idx === -1 ? rest : rest.slice(0, idx);
     const fill = idx === -1 ? null : rest.slice(idx + 1);
-    if (!parseSizeSegment(dims) || (fill !== null && fill !== "blur" && !/^[0-9a-fA-F]{6}$/.test(fill))) {
-      return { kind: "operation", title: "Pad", error: `malformed pad segment: ${seg} (want pad:<w>x<h>[:<hex>|blur])` };
+    const padSize = parseSizeSegment(dims);
+    if (!padSize || !isExactBox(padSize) || (fill !== null && fill !== "blur" && !/^[0-9a-fA-F]{6}$/.test(fill))) {
+      return { kind: "operation", title: "Pad", error: `malformed pad segment: ${seg} (want pad:<w>x<h>[:<hex>|blur], pixels only, no flips)` };
     }
     return { kind: "operation", title: "Pad", detail: `fit inside ${dims} and fill the canvas to exactly that size, fill: ${fill ?? "the fill(...) color or black"}` };
   }

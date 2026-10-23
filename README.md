@@ -140,7 +140,7 @@ curl "http://localhost:3000/unsafe/fit-in:800x600/https://example.com/photo.jpg"
 pad:<width>x<height>[:<fill>]
 ```
 
-Fits the image inside the box (the fit-in rules, including `no_upscale`), centers it, and fills the rest of the canvas so the output is exactly the requested size. The fill is a 6-digit hex color, or `blur` for ambient bars: a cover-scaled, heavily blurred copy of the image itself, the standard treatment for user-generated content in fixed-aspect slots. With no fill named, the request's `fill(...)` filter color is used, or black when there is none.
+Fits the image inside the box (the fit-in rules, including `no_upscale`), centers it, and fills the rest of the canvas so the output is exactly the requested size. Both dimensions are required in pixels: a proportional (`0`) axis, `orig`, and flipped sizes are rejected, the same exact-box contract as `crop:`. The fill is a 6-digit hex color, or `blur` for ambient bars: a cover-scaled, heavily blurred copy of the image itself, the standard treatment for user-generated content in fixed-aspect slots. With no fill named, the request's `fill(...)` filter color is used, or black when there is none.
 
 ```bash
 curl "http://localhost:3000/unsafe/pad:1200x630:blur/https://example.com/photo.jpg"
@@ -152,7 +152,7 @@ curl "http://localhost:3000/unsafe/pad:1200x630:blur/https://example.com/photo.j
 crop:<width>x<height>[:<align>]
 ```
 
-Crops the image to the width:height aspect ratio, then resizes to exactly that width and height. When the aspect ratios differ, `align` chooses which part survives:
+Crops the image to the width:height aspect ratio, then resizes to exactly that width and height. Both dimensions are required in pixels: a proportional (`0`) axis, `orig`, and flipped sizes are rejected when the URL is parsed (`fit-in:` owns proportional boxes, and `filters:flip` flips). When the aspect ratios differ, `align` chooses which part survives:
 
 | Align | Keeps |
 | --- | --- |

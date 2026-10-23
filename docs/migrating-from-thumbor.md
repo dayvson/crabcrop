@@ -43,7 +43,7 @@ crabcrop convert-thumbor "unsafe/filters:brightness(20):focal(10,10,50,50)/https
 | `<W>x<H>`, both set | `crop:<W>x<H>` | Thumbor's fixed size is a crop-to-fill, and so is crabcrop's `crop:` |
 | `<W>x0` or `0x<H>` | `<W>x0` / `0x<H>` | A proportional resize in both grammars |
 | `orig` as a dimension | `orig` | Same meaning |
-| Negative dimension (`-300x200`) | The same, inside the size | A flip on that axis in both |
+| Negative dimension (`-300x200`) | Inside a plain size; a `flip(h)` / `flip(v)` filter where the size takes no flips (`crop:`, `fit-in:`) | A flip on that axis in both |
 | `fit-in` | `fit-in:` | Flips become `flip(h)` / `flip(v)` filters, since crabcrop's fit-in size takes none |
 | `adaptive-fit-in` | `fit-in:` | Converted with a warning; there is no adaptive mode |
 | `full-fit-in` | `fit-in:` | Converted with a warning; the whole image stays inside the box |
@@ -91,5 +91,5 @@ unsafe/10x20:110x220/fit-in/100x100/https://images.example.com/photo.jpg
 -> /<signature>/crop-rect:10x20:110x220/fit-in:100x100/https://images.example.com/photo.jpg
 
 unsafe/-300x200/smart/https://images.example.com/photo.jpg
--> /<signature>/crop:-300x200:smart/https://images.example.com/photo.jpg
+-> /<signature>/filters:flip(h)/crop:300x200:smart/https://images.example.com/photo.jpg
 ```
