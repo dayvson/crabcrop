@@ -269,10 +269,11 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         purge_log("purge", target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
     }
-    // Entries are keyed in expiry-free form (audit P-2), so
-    // the purge target is normalized the same way: purging a
-    // path also evicts its exp: variants.
-    let key_form = crate::url::cache_key_form(target);
+    // Entries are keyed by canonical form (Q1), so the
+    // purge target is canonicalized the same way: purging
+    // any spelling of a path evicts the shared entry, exp:
+    // variants included.
+    let key_form = crate::url::canonical_key_form(target);
     let mut removed = state.cache.purge_matching(&key_form);
     if let Some(store) = &state.store {
         removed += store.purge_matching(&key_form);
@@ -606,11 +607,14 @@ async fn serve(
     // Without an explicit format in the URL, the response depends
     // on the Accept class as well as the path, so the cache key
     // carries the class. Explicit-format URLs key on the path alone.
-    // The key uses the expiry-free form of the remainder (P-2).
+    // The key is the request's canonical form (Q1): the
+    // parsed operations re-serialized in their one
+    // spelling, so equivalent requests share an entry.
+    // Expiry is not an operation, so it never enters it.
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);
     let placeholders = meta && wants_placeholders(accept);
-    let key_base = crate::url::cache_key_form(rest);
+    let key_base = crate::url::canonical_form(&ops, source_url);
     let mut cache_key = if explicit_format(&ops).is_some() {
         key_base.clone()
     } else {
@@ -1454,6 +1458,49 @@ mod tests {
             hits.load(Ordering::SeqCst),
             2,
             "the exp variant was evicted too"
+        );
+    }
+
+    #[tokio::test]
+    async fn equivalent_spellings_share_one_cache_entry() {
+        // Q1: the cache key is the canonical form, so the
+        // jpg alias and the jpeg spelling are one entry,
+        // and a purge in either spelling evicts it.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let alias = format!("filters:format(jpg)/{src}");
+        let canonical = format!("filters:format(jpeg)/{src}");
+        for remainder in [&alias, &canonical] {
+            let resp = client()
+                .get(format!("{base}/{}/{remainder}", sign(remainder)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the second spelling must be a cache hit"
+        );
+        let purge_sig = crate::url::purge_signature(SECRET, &alias);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{alias}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = client()
+            .get(format!("{base}/{}/{canonical}", sign(&canonical)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the purge evicted the shared entry"
         );
     }
 

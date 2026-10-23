@@ -1412,6 +1412,255 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+fn hex3(c: [u8; 3]) -> String {
+    format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+/// Percent-encode a decoded filter argument (a watermark
+/// or overlay URL, a class name, a text label) for the
+/// canonical form: everything outside the unreserved set
+/// is encoded, so the encoding is deterministic and
+/// `percent_decode` restores the exact string.
+fn encode_arg(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for &b in text.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn dim_text(d: Dimension, flip: bool) -> String {
+    let sign = if flip { "-" } else { "" };
+    match d {
+        // "0" itself parses as Proportional; a multi-digit
+        // zero is the only spelling that parses back to
+        // Pixels(0), which the engine treats as an exact
+        // (if degenerate) size, not as proportional.
+        Dimension::Pixels(0) => format!("{sign}00"),
+        Dimension::Pixels(n) => format!("{sign}{n}"),
+        Dimension::Proportional => format!("{sign}0"),
+        Dimension::Original => format!("{sign}orig"),
+    }
+}
+
+fn size_text(size: &ImageSize) -> String {
+    format!(
+        "{}x{}",
+        dim_text(size.width, size.flip_horizontal),
+        dim_text(size.height, size.flip_vertical)
+    )
+}
+
+fn align_text(align: Align) -> Option<&'static str> {
+    match align {
+        Align::Center => None,
+        Align::Smart => Some("smart"),
+        Align::Face => Some("face"),
+        Align::Top => Some("top"),
+        Align::Bottom => Some("bottom"),
+        Align::Left => Some("left"),
+        Align::Right => Some("right"),
+    }
+}
+
+fn anchor_text(anchor: Anchor) -> &'static str {
+    match anchor {
+        Anchor::TopLeft => "top-left",
+        Anchor::TopCenter => "top-center",
+        Anchor::TopRight => "top-right",
+        Anchor::CenterLeft => "center-left",
+        Anchor::Center => "center",
+        Anchor::CenterRight => "center-right",
+        Anchor::BottomLeft => "bottom-left",
+        Anchor::BottomCenter => "bottom-center",
+        Anchor::BottomRight => "bottom-right",
+    }
+}
+
+fn format_text(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Jpeg => "jpeg",
+        ImageFormat::Png => "png",
+        ImageFormat::WebP => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Avif => "avif",
+        ImageFormat::Jxl => "jxl",
+    }
+}
+
+/// The one canonical spelling of a filter: the grammar
+/// text the parser produces this exact value from.
+fn filter_text(filter: &Filter) -> String {
+    match filter {
+        Filter::Grayscale => "grayscale".to_string(),
+        Filter::Invert => "invert".to_string(),
+        Filter::Blur(v) => format!("blur({v})"),
+        Filter::Brighten(v) => format!("brighten({v})"),
+        Filter::Contrast(v) => format!("contrast({v})"),
+        Filter::HueRotate(v) => format!("huerotate({v})"),
+        Filter::Sharpen(v) => format!("sharpen({v})"),
+        Filter::Saturation(v) => format!("saturation({v})"),
+        Filter::Rgb(r, g, b) => format!("rgb({r},{g},{b})"),
+        Filter::Equalize => "equalize".to_string(),
+        Filter::Rotate(v) => format!("rotate({v})"),
+        Filter::Trim(v) => format!("trim({v})"),
+        Filter::Watermark { url, x, y, alpha } => {
+            format!("watermark({},{x},{y},{alpha})", encode_arg(url))
+        }
+        Filter::Overlay {
+            url,
+            x,
+            y,
+            alpha,
+            blend,
+            width,
+        } => {
+            let blend = match blend {
+                BlendMode::Normal => "normal",
+                BlendMode::Multiply => "multiply",
+                BlendMode::Screen => "screen",
+                BlendMode::Overlay => "overlay",
+            };
+            let width = width.map(|w| format!(",{w}")).unwrap_or_default();
+            format!(
+                "overlay({},{x},{y},{alpha},{blend}{width})",
+                encode_arg(url)
+            )
+        }
+        Filter::RemoveBg => "removebg".to_string(),
+        Filter::KeepProfile => "keep_profile".to_string(),
+        Filter::BlurFaces => "blurfaces".to_string(),
+        Filter::PixelateFaces => "pixelatefaces".to_string(),
+        Filter::BlurClass(name) => format!("blurclass({})", encode_arg(name)),
+        Filter::PixelateClass(name) => format!("pixelateclass({})", encode_arg(name)),
+        Filter::FacePad(v) => format!("facepad({v})"),
+        Filter::Upscale(v) => format!("upscale({v})"),
+        Filter::Dpr(v) => format!("dpr({v})"),
+        Filter::Text {
+            text,
+            size,
+            color,
+            anchor,
+        } => format!(
+            "text({},{size},{:02x}{:02x}{:02x}{:02x},{})",
+            encode_arg(text),
+            color[0],
+            color[1],
+            color[2],
+            color[3],
+            anchor_text(*anchor)
+        ),
+        Filter::Fill(c) => format!("fill({})", hex3(*c)),
+        Filter::Radius(r) => format!("radius({},{},{},{})", r[0], r[1], r[2], r[3]),
+        Filter::Border(w, c) => format!("border({w},{})", hex3(*c)),
+        Filter::Mask(shape) => format!(
+            "mask({})",
+            match shape {
+                MaskShape::Circle => "circle",
+                MaskShape::Ellipse => "ellipse",
+            }
+        ),
+        Filter::Sepia => "sepia".to_string(),
+        Filter::Duotone(a, b) => format!("duotone({},{})", hex3(*a), hex3(*b)),
+        Filter::Monochrome(c) => format!("monochrome({})", hex3(*c)),
+        Filter::Pixelate(v) => format!("pixelate({v})"),
+        Filter::Flip(d) => format!(
+            "flip({})",
+            match d {
+                FlipDirection::Horizontal => "h",
+                FlipDirection::Vertical => "v",
+            }
+        ),
+        Filter::BlurRegion { x, y, w, h } => format!("blur_region({x},{y},{w},{h})"),
+        Filter::PixelateRegion { x, y, w, h } => {
+            format!("pixelate_region({x},{y},{w},{h})")
+        }
+        Filter::MaxBytes(v) => format!("max_bytes({v})"),
+        Filter::Quality(q) => match q {
+            Quality::Auto => "quality(auto)".to_string(),
+            Quality::Value(v) => format!("quality({v})"),
+        },
+        Filter::Format(f) => format!("format({})", format_text(*f)),
+        Filter::NoUpscale => "no_upscale".to_string(),
+    }
+}
+
+fn operation_text(op: &Operation) -> String {
+    match op {
+        Operation::Size(size) => size_text(size),
+        Operation::Crop { size, align } => match align_text(*align) {
+            Some(name) => format!("crop:{}:{name}", size_text(size)),
+            None => format!("crop:{}", size_text(size)),
+        },
+        Operation::FitIn(size) => format!("fit-in:{}", size_text(size)),
+        Operation::Pad { size, fill } => match fill {
+            PadFill::Directive => format!("pad:{}", size_text(size)),
+            PadFill::Blur => format!("pad:{}:blur", size_text(size)),
+            PadFill::Color(c) => format!("pad:{}:{}", size_text(size), hex3(*c)),
+        },
+        Operation::CropRect {
+            left,
+            top,
+            right,
+            bottom,
+        } => format!("crop-rect:{left}x{top}:{right}x{bottom}"),
+        Operation::Filters(_) => unreachable!("filters are merged by canonical_form"),
+    }
+}
+
+/// The canonical form of a parsed request: every operation
+/// re-serialized in its one canonical spelling, adjacent
+/// `filters:` segments merged into one, plus the source.
+/// Requests that differ only in spelling (format aliases,
+/// hex case, leading zeros, size forms, split filter
+/// segments) share this form, and therefore a cache entry
+/// (review Q1). Operation and filter order are part of
+/// the form: order changes pixels, so it is meaning, not
+/// spelling.
+pub fn canonical_form(ops: &[Operation], source: &str) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    let mut filters: Vec<String> = Vec::new();
+    for op in ops {
+        match op {
+            Operation::Filters(list) => {
+                filters.extend(list.iter().map(filter_text));
+            }
+            other => {
+                if !filters.is_empty() {
+                    segments.push(format!("filters:{}", filters.join(":")));
+                    filters.clear();
+                }
+                segments.push(operation_text(other));
+            }
+        }
+    }
+    if !filters.is_empty() {
+        segments.push(format!("filters:{}", filters.join(":")));
+    }
+    if segments.is_empty() {
+        source.to_string()
+    } else {
+        format!("{}/{source}", segments.join("/"))
+    }
+}
+
+/// The cache key for a remainder: its canonical form.
+/// Remainders that do not parse (purge targets naming
+/// presets are expanded by the purge handler's own path;
+/// opaque strings) fall back to the expiry-stripped
+/// textual form.
+pub fn canonical_key_form(remainder: &str) -> String {
+    match parse_operations_with_expiry(remainder) {
+        Ok((ops, source, _)) => canonical_form(&ops, source),
+        Err(_) => cache_key_form(remainder),
+    }
+}
+
 /// The cache-key form of an expanded remainder: identical,
 /// except every `exp:` segment is removed (audit P-2).
 /// Expiry is enforced before lookup, so it must not fragment
@@ -1610,6 +1859,102 @@ mod tests {
         // An exp: segment inside the source is URL text, kept.
         let tricky = "https://example.com/exp:123/a.jpg";
         assert_eq!(cache_key_form(tricky), tricky);
+    }
+
+    #[test]
+    fn canonical_key_collapses_spelling_variants() {
+        let src = "https://example.com/a.jpg";
+        let pairs = [
+            // Format alias.
+            ("filters:format(jpg)", "filters:format(jpeg)"),
+            // Leading zeros.
+            ("0300x0200", "300x200"),
+            // Omitted axis vs explicit 0.
+            ("300x", "300x0"),
+            // Hex case in colors.
+            ("filters:fill(FFAA00)", "filters:fill(ffaa00)"),
+            // Split filter segments merge.
+            (
+                "filters:grayscale/filters:blur(2)",
+                "filters:grayscale:blur(2)",
+            ),
+            // The default crop alignment is no alignment.
+            ("crop:300x200:center", "crop:300x200"),
+            // Bare trim is trim(10).
+            ("filters:trim", "filters:trim(10)"),
+            // One radius is four.
+            ("filters:radius(10)", "filters:radius(10,10,10,10)"),
+            // Float spellings.
+            ("filters:contrast(1.50)", "filters:contrast(1.5)"),
+            // Six-digit text colors gain an opaque alpha.
+            (
+                "filters:text(Hi,20,ffaa00,center)",
+                "filters:text(Hi,20,ffaa00ff,center)",
+            ),
+        ];
+        for (a, b) in pairs {
+            assert_eq!(
+                canonical_key_form(&format!("{a}/{src}")),
+                canonical_key_form(&format!("{b}/{src}")),
+                "{a} and {b} must share a key"
+            );
+        }
+        // Expiry never enters the key.
+        assert_eq!(
+            canonical_key_form(&format!("exp:1893456000/300x200/{src}")),
+            canonical_key_form(&format!("300x200/{src}"))
+        );
+        // Order is meaning, not spelling: it stays in the key.
+        assert_ne!(
+            canonical_key_form(&format!("filters:blur(2):grayscale/{src}")),
+            canonical_key_form(&format!("filters:grayscale:blur(2)/{src}"))
+        );
+        // Pixels(0) is an exact size, not proportional.
+        assert_ne!(
+            canonical_key_form(&format!("00x200/{src}")),
+            canonical_key_form(&format!("0x200/{src}"))
+        );
+    }
+
+    #[test]
+    fn canonical_form_is_a_fixed_point_and_round_trips() {
+        let src = "https://example.com/a.jpg";
+        let corpus = [
+            "300x200",
+            "-300xorig",
+            "crop:100x100:smart",
+            "crop-rect:1x2:30x40",
+            "fit-in:300x200",
+            "pad:300x200",
+            "pad:300x200:blur",
+            "pad:300x200:A0B0C0",
+            "filters:grayscale:invert:blur(1.5):brighten(-20):contrast(1.25)",
+            "filters:huerotate(90):sharpen(0.5):saturation(2):rgb(1,-2,3):equalize",
+            "filters:rotate(-90):trim(25):format(avif):quality(auto):quality(80)",
+            "filters:watermark(https%3A%2F%2Fcdn.example.com%2Flogo.png,10,-10,80)",
+            "filters:overlay(https%3A%2F%2Fe.com%2Fo.png,0,0,50,multiply,25)",
+            "filters:removebg:keep_profile:blurfaces:pixelatefaces:no_upscale",
+            "filters:blurclass(person):pixelateclass(license%20plate):facepad(0.5)",
+            "filters:upscale(2):dpr(1.5):max_bytes(50000)",
+            "filters:text(Hello%2C%20world,24,FFAA00CC,bottom-right)",
+            "filters:fill(00ff00):radius(1,2,3,4):border(3,102030):mask(ellipse)",
+            "filters:sepia:duotone(101010,f0e0c0):monochrome(336699):pixelate(8)",
+            "filters:flip(h):blur_region(1,2,30,40):pixelate_region(5,6,70,80)",
+            "300x200/filters:grayscale",
+            "filters:grayscale/300x200/filters:blur(2)",
+        ];
+        for text in corpus {
+            let remainder = format!("{text}/{src}");
+            let canonical = canonical_key_form(&remainder);
+            assert_eq!(
+                canonical_key_form(&canonical),
+                canonical,
+                "canonical form of {text} is not a fixed point"
+            );
+            let (ops_before, _, _) = parse_operations_with_expiry(&remainder).unwrap();
+            let (ops_after, _, _) = parse_operations_with_expiry(&canonical).unwrap();
+            assert_eq!(ops_before, ops_after, "canonical form changed {text}");
+        }
     }
 
     #[test]

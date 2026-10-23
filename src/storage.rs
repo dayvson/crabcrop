@@ -43,10 +43,12 @@ pub struct DiskStore {
 }
 
 /// Entry format version. CRABDISK2 adds the entry's cache
-/// groups to the header; older files do not parse and are
-/// deleted on sight at scan, the store's standing upgrade
-/// behavior for a cache.
-const MAGIC: &str = "CRABDISK2";
+/// groups to the header; CRABDISK3 marks the move to
+/// canonical cache keys (Q1), a one-time invalidation of
+/// entries keyed by spelling. Older files do not parse and
+/// are deleted on sight at scan, the store's standing
+/// upgrade behavior for a cache.
+const MAGIC: &str = "CRABDISK3";
 
 /// The temp file a `put` writes before renaming into place.
 /// The suffix is the process id plus a per-process counter:
