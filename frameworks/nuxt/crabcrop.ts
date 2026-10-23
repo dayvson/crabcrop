@@ -53,9 +53,42 @@ interface Modifiers {
   [key: string]: unknown;
 }
 
-const dim = (v: number | string | undefined): number | undefined => {
+/** The server's per-axis dimension cap (the URL grammar's MAX_DIMENSION). */
+const MAX_DIMENSION = 16383;
+
+const dim = (v: number | string | undefined, name: string): number | undefined => {
   const n = v === undefined ? NaN : Number(v);
-  return Number.isFinite(n) && n > 0 ? Math.round(n) : undefined;
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  const rounded = Math.round(n);
+  // An over-cap dimension is a certain dead URL (the
+  // server rejects the size at parse): throw here, where
+  // the mistake is visible, instead of signing it.
+  if (rounded > MAX_DIMENSION) {
+    throw new Error(
+      `crabcrop provider: ${name} ${rounded} exceeds the maximum dimension ${MAX_DIMENSION}`,
+    );
+  }
+  return rounded;
+};
+
+/** The output formats the server's grammar accepts. */
+const FORMATS = new Set(["jpeg", "png", "webp", "avif", "jxl", "gif"]);
+
+/**
+ * Quality is an integer 0-100 in the grammar (0 is legal:
+ * the smallest file). It is not a dimension, so it gets
+ * its own validation instead of riding dim(): a present
+ * but invalid value throws rather than minting
+ * filters:quality(undefined) or quality(150).
+ */
+const quality = (v: number | string): number => {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 100) {
+    throw new Error(
+      `crabcrop provider: quality must be an integer between 0 and 100, got ${v}`,
+    );
+  }
+  return n;
 };
 
 export const getImage = (
@@ -67,8 +100,8 @@ export const getImage = (
   if (!options?.base) {
     throw new Error("crabcrop provider: the `base` option is required");
   }
-  const width = dim(modifiers.width);
-  const height = dim(modifiers.height);
+  const width = dim(modifiers.width, "width");
+  const height = dim(modifiers.height, "height");
   const operations: string[] = [];
   if (options.preset) {
     operations.push(`preset:${options.preset}`);
@@ -95,10 +128,15 @@ export const getImage = (
   }
   if (modifiers.format) {
     const format = modifiers.format === "jpg" ? "jpeg" : modifiers.format;
+    if (!FORMATS.has(format)) {
+      throw new Error(
+        `crabcrop provider: unsupported format ${modifiers.format} (expected one of ${[...FORMATS].join(", ")}, or jpg)`,
+      );
+    }
     operations.push(`filters:format(${format})`);
   }
   if (modifiers.quality !== undefined) {
-    operations.push(`filters:quality(${dim(modifiers.quality)})`);
+    operations.push(`filters:quality(${quality(modifiers.quality)})`);
   }
   // The provider also runs client-side, where options from
   // nuxt.config are part of the bundle: never sign there
