@@ -279,6 +279,26 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.com/product.jpg"
 ```
 
+## Presets
+
+A preset names an operation string on the server, so URLs stay short and the transformation menu stays operator-controlled. Define presets in a file, one per line:
+
+```text
+# /etc/crabcrop/presets.txt
+og-card = crop:1200x630:smart/filters:format(webp):quality(80)
+thumb = 300x200
+```
+
+Point `CRABCROP_PRESETS_FILE` at it, and requests can use `preset:<name>` anywhere an operation fits:
+
+```bash
+curl "http://localhost:3000/<signature>/preset:og-card/https://example.com/photo.jpg"
+```
+
+The signature covers the preset reference; the server expands it deterministically after verification. Cache entries key on the expanded operations, so editing a preset takes effect on the next request with no purging (and purging names the expanded form). An unknown preset name is a `400`. Preset definitions are validated at startup: malformed entries refuse the boot, and presets cannot contain a source segment, an `exp:`, or another preset.
+
+With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: requests may use preset references, `exp:` metadata, and bare sources only. The mode does not change signature rules. Combined with `CRABCROP_ALLOW_UNSAFE=1` it makes a public deployment where browsers and CMSs can build URLs from preset names alone, with no secret to hold and no way to invent a transform.
+
 ## Format negotiation
 
 When the URL names no `format(...)`, crabcrop picks the output format from the request's `Accept` header:
@@ -383,6 +403,8 @@ All configuration comes from environment variables. Invalid values for the numer
 | `CRABCROP_ALLOW_UNSAFE` | off | `1` or `true` honors `unsafe` URLs. Anything else, including unset, means off. |
 | `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
 | `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
+| `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](#presets). |
+| `CRABCROP_ONLY_PRESETS` | off | `1` or `true` rejects free-form operations in requests; only preset references (and `exp:` metadata) are allowed. Requires at least one preset. |
 | `CRABCROP_ALLOWED_SOURCES` | unset (all hosts allowed) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
 | `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | `1` or `true` refuses sources whose host is, or resolves to, a loopback, private, link-local, or unspecified address. Checked before connecting and again on every redirect hop. |
 | `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |

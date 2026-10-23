@@ -48,6 +48,15 @@ pub enum ParseError {
     /// An `exp:...` segment did not carry a valid unix
     /// timestamp. Carries the offending segment.
     InvalidExpiry(String),
+    /// A `preset:<name>` segment named a preset the server has
+    /// not configured. Carries the name.
+    UnknownPreset(String),
+    /// A preset definition (or a `preset:` segment itself) is
+    /// malformed. Carries the offending text.
+    InvalidPreset(String),
+    /// Free-form operations were used while the server runs in
+    /// presets-only mode. Carries the offending segment.
+    PresetsOnly(String),
     /// A `filters:...` segment did not parse. Carries the offending
     /// segment.
     InvalidFilters(String),
@@ -67,6 +76,11 @@ impl std::fmt::Display for ParseError {
             }
             ParseError::InvalidPad(seg) => write!(f, "invalid pad segment: {seg}"),
             ParseError::InvalidExpiry(seg) => write!(f, "invalid expiry segment: {seg}"),
+            ParseError::UnknownPreset(name) => write!(f, "unknown preset: {name}"),
+            ParseError::InvalidPreset(text) => write!(f, "invalid preset: {text}"),
+            ParseError::PresetsOnly(seg) => {
+                write!(f, "free-form operations are disabled (presets only): {seg}")
+            }
             ParseError::InvalidFilters(seg) => {
                 write!(f, "invalid filters segment: {seg}")
             }
@@ -742,6 +756,87 @@ pub fn parse_operations_with_expiry(
                 return Ok((operations, rest, expiry));
             }
         }
+    }
+}
+
+/// Parse an operations-only string, the shape of a preset
+/// definition: every segment must be an operation, and neither
+/// `exp:` metadata nor nested `preset:` references are allowed.
+/// Used to validate preset definitions at server boot; request
+/// expansion itself is textual (see [`expand_presets`]).
+pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError> {
+    if input.is_empty() {
+        return Err(ParseError::InvalidPreset(input.to_string()));
+    }
+    let mut operations = Vec::new();
+    for seg in input.split('/') {
+        if seg.starts_with("preset:") || seg.starts_with("exp:") {
+            return Err(ParseError::InvalidPreset(input.to_string()));
+        }
+        match parse_operation(seg) {
+            Some(Ok(op)) => operations.push(op),
+            Some(Err(e)) => return Err(e),
+            None => return Err(ParseError::InvalidPreset(input.to_string())),
+        }
+    }
+    Ok(operations)
+}
+
+/// Expand `preset:<name>` segments in a request remainder,
+/// splicing each preset's operation string in its place.
+///
+/// The signature covers the unexpanded remainder (the preset
+/// reference is what gets signed); expansion is deterministic
+/// and server-side, and everything downstream of it (parsing,
+/// cache keys) sees the expanded string, so editing a preset
+/// definition produces fresh cache entries naturally.
+///
+/// The walk stops expanding at the first segment that starts
+/// the source URL, using the same dispatch as
+/// [`parse_operations_with_expiry`]: a `preset:` segment inside
+/// the source path is URL text, not a reference. Expansion is
+/// single-pass: spliced text is not rescanned (and configured
+/// presets cannot contain `preset:` segments anyway; see
+/// [`parse_preset_operations`]).
+///
+/// With `only_presets`, any real operation segment in the
+/// request is an error: the operations must all arrive via
+/// presets. `exp:` metadata stays allowed; it is not an
+/// operation.
+pub fn expand_presets(
+    rest: &str,
+    presets: &std::collections::HashMap<String, String>,
+    only_presets: bool,
+) -> Result<String, ParseError> {
+    let mut out = String::with_capacity(rest.len());
+    let mut tail = rest;
+    loop {
+        let (seg, remaining) = match tail.split_once('/') {
+            Some((s, r)) => (s, r),
+            None => (tail, ""),
+        };
+        if let Some(name) = seg.strip_prefix("preset:") {
+            let definition = presets
+                .get(name)
+                .ok_or_else(|| ParseError::UnknownPreset(name.to_string()))?;
+            out.push_str(definition);
+        } else if seg.starts_with("exp:") || parse_operation(seg).is_some_and(|r| r.is_ok()) {
+            if only_presets && !seg.starts_with("exp:") {
+                return Err(ParseError::PresetsOnly(seg.to_string()));
+            }
+            out.push_str(seg);
+        } else {
+            // Source URL (or a malformed operation, whose error
+            // the real parse will produce): copy the rest of
+            // the path verbatim and stop.
+            out.push_str(tail);
+            return Ok(out);
+        }
+        if remaining.is_empty() {
+            return Ok(out);
+        }
+        out.push('/');
+        tail = remaining;
     }
 }
 
@@ -1616,6 +1711,92 @@ mod tests {
         ] {
             assert!(parse_operations_with_expiry(bad).is_err(), "{bad}");
         }
+    }
+
+    fn preset_map() -> std::collections::HashMap<String, String> {
+        [
+            ("thumb".to_string(), "300x200".to_string()),
+            (
+                "og".to_string(),
+                "crop:1200x630:smart/filters:format(webp)".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn preset_definitions_validate() {
+        assert_eq!(
+            parse_preset_operations("crop:1200x630:smart/filters:format(webp):quality(80)")
+                .unwrap()
+                .len(),
+            2
+        );
+        // Source-like segments, expiry, nested presets, and the
+        // empty string are all invalid definitions.
+        for bad in [
+            "",
+            "example.com/img.jpg",
+            "exp:123/300x200",
+            "preset:other/300x200",
+            "300x200/",
+        ] {
+            assert!(parse_preset_operations(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn presets_expand_in_the_operations_region() {
+        let map = preset_map();
+        assert_eq!(
+            expand_presets("preset:thumb/example.com/img.jpg", &map, false).unwrap(),
+            "300x200/example.com/img.jpg"
+        );
+        assert_eq!(
+            expand_presets("preset:og/exp:999/example.com/img.jpg", &map, false).unwrap(),
+            "crop:1200x630:smart/filters:format(webp)/exp:999/example.com/img.jpg"
+        );
+        // Mixed with free-form operations.
+        assert_eq!(
+            expand_presets(
+                "preset:thumb/filters:grayscale/example.com/i.jpg",
+                &map,
+                false
+            )
+            .unwrap(),
+            "300x200/filters:grayscale/example.com/i.jpg"
+        );
+        // A preset: segment inside the source path is URL text.
+        assert_eq!(
+            expand_presets("example.com/preset:thumb/img.jpg", &map, false).unwrap(),
+            "example.com/preset:thumb/img.jpg"
+        );
+        // Unknown names are errors.
+        assert_eq!(
+            expand_presets("preset:nope/example.com/img.jpg", &map, false),
+            Err(ParseError::UnknownPreset("nope".to_string()))
+        );
+    }
+
+    #[test]
+    fn presets_only_mode_rejects_free_form_operations() {
+        let map = preset_map();
+        assert!(expand_presets("preset:thumb/example.com/img.jpg", &map, true).is_ok());
+        assert!(expand_presets("exp:999/preset:thumb/example.com/img.jpg", &map, true).is_ok());
+        assert!(expand_presets("example.com/img.jpg", &map, true).is_ok());
+        assert_eq!(
+            expand_presets("300x200/example.com/img.jpg", &map, true),
+            Err(ParseError::PresetsOnly("300x200".to_string()))
+        );
+        assert_eq!(
+            expand_presets(
+                "preset:thumb/filters:grayscale/example.com/i.jpg",
+                &map,
+                true
+            ),
+            Err(ParseError::PresetsOnly("filters:grayscale".to_string()))
+        );
     }
 
     #[test]

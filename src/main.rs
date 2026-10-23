@@ -44,6 +44,14 @@
 //! - `CRABCROP_FILE_ROOT`: directory that `file://` sources
 //!   must stay under, canonicalized at boot. Unset disables
 //!   file sources.
+//! - `CRABCROP_PRESETS_FILE`: path to a presets file, one
+//!   `name = operations` entry per line (`#` comments and
+//!   blank lines skipped), validated at boot. Requests may
+//!   then use `preset:<name>` as an operation.
+//! - `CRABCROP_ONLY_PRESETS`: `1` or `true` rejects
+//!   free-form operations in requests; only preset references
+//!   (and `exp:` metadata) are allowed. Requires a presets
+//!   file with at least one entry.
 //! - `CRABCROP_REMOVEBG_MODEL`: path to a U²-Net-family ONNX
 //!   model for the `removebg` filter. Preloaded at boot; a set
 //!   but unloadable model is a startup error. Unset disables
@@ -104,6 +112,65 @@ async fn main() {
         eprintln!("crabcrop: {e}");
         std::process::exit(1);
     }
+}
+
+/// Load the preset configuration: the presets file (one
+/// `name = operations` entry per line) and the presets-only
+/// flag, both validated strictly. Presets-only with no
+/// presets configured would reject every transformed
+/// request, so it is a startup error rather than a policy.
+fn build_presets() -> Result<(std::collections::HashMap<String, String>, bool), String> {
+    let only_presets = env::var("CRABCROP_ONLY_PRESETS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let presets = match env::var("CRABCROP_PRESETS_FILE") {
+        Ok(path) if !path.is_empty() => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read CRABCROP_PRESETS_FILE ({path}): {e}"))?;
+            parse_presets(&text)?
+        }
+        _ => std::collections::HashMap::new(),
+    };
+    if only_presets && presets.is_empty() {
+        return Err(
+            "CRABCROP_ONLY_PRESETS is set but CRABCROP_PRESETS_FILE defines no presets".to_string(),
+        );
+    }
+    Ok((presets, only_presets))
+}
+
+/// Parse preset definitions: one `name = operations` entry
+/// per line, blank lines and `#` comments skipped. Names are
+/// letters, digits, `_`, and `-`; every operation string must
+/// validate as a preset body (operations only: no source, no
+/// `exp:`, no nested `preset:`).
+fn parse_presets(text: &str) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut map = std::collections::HashMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, ops) = line
+            .split_once('=')
+            .ok_or_else(|| format!("preset line {} is not `name = operations`", i + 1))?;
+        let name = name.trim();
+        let ops = ops.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(format!("invalid preset name on line {}: {name:?}", i + 1));
+        }
+        if map.contains_key(name) {
+            return Err(format!("duplicate preset name: {name}"));
+        }
+        crate::url::parse_preset_operations(ops)
+            .map_err(|e| format!("invalid operations for preset {name}: {e}"))?;
+        map.insert(name.to_string(), ops.to_string());
+    }
+    Ok(map)
 }
 
 /// Build the bucket/file source configuration from the
@@ -214,6 +281,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     let policy = SourcePolicy::new(allowed_sources, block_private);
     let sources = build_source_config()?;
+    let (presets, only_presets) = build_presets()?;
 
     // AI models are configured, never downloaded, and preloaded
     // at boot: a model that is set but broken is a startup
@@ -322,6 +390,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         store,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         ssim_target,
+        presets,
+        only_presets,
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     println!("crabcrop listening on port {port}");
@@ -342,5 +412,25 @@ mod tests {
         );
         let err = parse_env_value::<u16>("PORT", Some("abc".to_string()), 3000).unwrap_err();
         assert!(err.contains("PORT"), "{err}");
+    }
+
+    #[test]
+    fn parses_preset_files() {
+        let map = parse_presets(
+            "# cards\nog-card = crop:1200x630:smart/filters:format(webp):quality(80)\n\nthumb = 300x200\n",
+        )
+        .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["thumb"], "300x200");
+        for bad in [
+            "no-equals-here",
+            "bad name = 300x200",
+            "thumb = 300x200\nthumb = 100x100",
+            "thumb = preset:other",
+            "thumb = example.com/img.jpg",
+            "thumb = ",
+        ] {
+            assert!(parse_presets(bad).is_err(), "{bad}");
+        }
     }
 }
