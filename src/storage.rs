@@ -48,6 +48,18 @@ pub struct DiskStore {
 /// behavior for a cache.
 const MAGIC: &str = "CRABDISK2";
 
+/// The temp file a `put` writes before renaming into place.
+/// The suffix is the process id plus a per-process counter:
+/// the pid alone made every concurrent put of one key share
+/// a single temp file, so two writers could interleave and
+/// rename a torn write into place.
+fn tmp_name(stem: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{stem}.tmp-{}-{n}", std::process::id())
+}
+
 impl DiskStore {
     /// Open (creating if needed) the store rooted at `dir`,
     /// indexing whatever entries a previous run left behind.
@@ -145,7 +157,7 @@ impl DiskStore {
             return;
         }
         let stem = key_stem(key);
-        let tmp = self.dir.join(format!("{stem}.tmp-{}", std::process::id()));
+        let tmp = self.dir.join(tmp_name(&stem));
         if std::fs::write(&tmp, &data).is_err() {
             return;
         }
@@ -409,6 +421,14 @@ fn read_header(path: &Path) -> Option<(String, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_names_are_unique_per_put() {
+        // Concurrent puts of one key must never share a
+        // temp file (review P-6).
+        assert_ne!(tmp_name("abc"), tmp_name("abc"));
+        assert!(tmp_name("abc").starts_with("abc.tmp-"));
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("crabcrop-store-{tag}-{}", std::process::id()));
