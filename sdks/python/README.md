@@ -5,7 +5,7 @@ Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from Python.
 ## Usage
 
 ```python
-from crabcrop_url import build_url, build_srcset, sign
+from crabcrop_url import build_url, build_srcset, purge_group_signature, purge_signature, sign, verify
 
 # A signed URL. The operation string is passed verbatim and may
 # contain several segments and preset: references.
@@ -35,6 +35,15 @@ srcset = build_srcset(
 
 # The raw signature for a remainder, if you assemble URLs yourself.
 signature = sign("your-secret", "300x200/https://example.com/photo.jpg")
+
+# Verify a signature in constant time (malformed tags return False).
+ok = verify("your-secret", signature, "300x200/https://example.com/photo.jpg")
+
+# Purge signatures for the server's /purge and /purge-group endpoints
+# are domain-separated under a derived subkey; the helpers sign the
+# right strings so callers never assemble them by hand.
+purge = purge_signature("your-secret", "300x200/https://example.com/photo.jpg")
+group = purge_group_signature("your-secret", "thumb")
 ```
 
 Pass `None` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode. The secret may be `str` or `bytes`.

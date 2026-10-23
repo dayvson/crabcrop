@@ -9,7 +9,7 @@ A first-party MCP (Model Context Protocol) server for crabcrop, so coding agents
 | `sign_url` | Build and sign a URL from an operation string and a source (optional expiry). |
 | `explain_url` | Parse a URL back into its signature kind, explained segments, and source; malformed segments are flagged. |
 | `fetch_meta` | Fetch the server's meta JSON for a URL (dimensions, format, bytes, quality, placeholders on request). Only fetches URLs on the configured `CRABCROP_BASE` origin, never follows redirects, and caps the response at 256 KiB. |
-| `purge_result` | Evict a cached result by its URL remainder (the expanded form for preset URLs). |
+| `purge_result` | Evict a cached result by its URL remainder; a preset URL works as-is (the server expands it before matching). |
 
 ## Setup
 

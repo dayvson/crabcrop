@@ -33,6 +33,18 @@ remainder = everything after the signature segment, exactly as it appears
 - The signature covers the path only. A query string is not signed, is ignored by the server, and must not be relied on for anything.
 - Verification failure is `403` with the body `bad signature`. An expired URL is `403` with the body `signature expired`. An unknown preset, a malformed segment, or free-form operations in presets-only mode is a `400`.
 
+## Purge signatures
+
+The purge endpoints are signed under a derived subkey, never the secret itself:
+
+```text
+subkey = HMAC_SHA256( key = secret, message = "crabcrop/purge-key" )   (raw bytes)
+signature for POST /purge/<signature>/<path>        = lowercase_hex( HMAC_SHA256( subkey, path ) )
+signature for POST /purge-group/<signature>/<group> = lowercase_hex( HMAC_SHA256( subkey, "purge-group/" + group ) )
+```
+
+`path` is the request remainder exactly as presented. The server canonicalizes it before matching entries, so any equivalent spelling signed this way evicts the shared entry. Domain separation is the point: an image signature can never be replayed as a purge signature, and vice versa. Purges never honor `unsafe`: without a secret there is no purge, in every mode. Client libraries expose these as `purge_signature` / `purge_group_signature` helpers so the signed strings are never assembled by hand.
+
 ## Building URLs
 
 A builder assembles, in order:

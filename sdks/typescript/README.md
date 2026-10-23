@@ -5,7 +5,7 @@ Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScr
 ## Usage
 
 ```ts
-import { buildURL, buildSrcSet, sign } from "@crabcrop/url";
+import { buildURL, buildSrcSet, purgeGroupSignature, purgeSignature, sign, verifyUrlSignature } from "@crabcrop/url";
 
 // A signed URL. The operation string is passed verbatim and may
 // contain several segments and preset: references.
@@ -35,6 +35,15 @@ const srcset = buildSrcSet(
 
 // The raw signature for a remainder, if you assemble URLs yourself.
 const signature = sign("your-secret", "300x200/https://example.com/photo.jpg");
+
+// Verify a signature in constant time (malformed tags return false).
+const ok = verifyUrlSignature("your-secret", signature, "300x200/https://example.com/photo.jpg");
+
+// Purge signatures for the server's /purge and /purge-group endpoints
+// are domain-separated under a derived subkey; the helpers sign the
+// right strings so callers never assemble them by hand.
+const purge = purgeSignature("your-secret", "300x200/https://example.com/photo.jpg");
+const group = purgeGroupSignature("your-secret", "thumb");
 ```
 
 Pass `null` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode.
