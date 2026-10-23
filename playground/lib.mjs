@@ -111,6 +111,8 @@ const FILTER_BLURBS = {
   monochrome: "single-hue rendering in the given color (RRGGBB)",
   pixelate: "mosaic into blocks of the given pixel size, each block averaged",
   flip: "mirror the image: `h` horizontal, `v` vertical",
+  blur_region: "gaussian-blur the rectangle (x,y,w,h) in pixels at this point in the chain (redaction)",
+  pixelate_region: "pixelate the rectangle (x,y,w,h) in pixels at this point in the chain (redaction)",
 };
 
 const MAX_DIMENSION = 16383;
@@ -286,6 +288,17 @@ function validateFilter(name, args) {
         : bad;
     case "flip":
       return args === "h" || args === "v" ? null : bad;
+    case "blur_region":
+    case "pixelate_region": {
+      if (args === null) return bad;
+      const parts = args.split(",");
+      return parts.length === 4 &&
+        parts.every((p) => /^\d+$/.test(p) && BigInt(p) <= 16383n) &&
+        BigInt(parts[2]) >= 1n &&
+        BigInt(parts[3]) >= 1n
+        ? null
+        : bad;
+    }
     case "max_bytes":
       return args !== null &&
         /^\d+$/.test(args) &&

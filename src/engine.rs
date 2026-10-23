@@ -713,6 +713,28 @@ fn detect_faces(
     found.map_err(EngineError::Inference)
 }
 
+/// The crop-rect stance for explicit regions: a rectangle
+/// that overflows the image in effect at this point in the
+/// chain fails the request, rather than redacting less than
+/// the caller specified.
+fn check_region(
+    name: &str,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    img: &DynamicImage,
+) -> Result<(), EngineError> {
+    if x + w > img.width() || y + h > img.height() {
+        return Err(EngineError::Unsupported(format!(
+            "{name}({x},{y},{w},{h}) exceeds image bounds {}x{}",
+            img.width(),
+            img.height()
+        )));
+    }
+    Ok(())
+}
+
 fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
@@ -852,6 +874,14 @@ fn apply_operations(
                                 )
                             })?;
                             img = upscale_image(img, *factor, provider)?;
+                        }
+                        Filter::BlurRegion { x, y, w, h } => {
+                            check_region("blur_region", *x, *y, *w, *h, &img)?;
+                            img = crate::filters::blur_region(&img, *x, *y, *w, *h);
+                        }
+                        Filter::PixelateRegion { x, y, w, h } => {
+                            check_region("pixelate_region", *x, *y, *w, *h, &img)?;
+                            img = crate::filters::pixelate_region(&img, *x, *y, *w, *h);
                         }
                         Filter::Text {
                             text,
@@ -1698,6 +1728,71 @@ mod tests {
         assert_eq!(hi.format, ImageFormat::Jpeg);
         assert!(hi.bytes.len() > lo.bytes.len());
         assert_eq!(&hi.bytes[..2], b"\xff\xd8");
+    }
+
+    #[test]
+    fn region_filters_apply_and_check_bounds() {
+        let engine = Engine;
+        let src = solid_png(100, 80, [200, 30, 30]);
+        // Multiple regions in one chain apply.
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::BlurRegion {
+                        x: 0,
+                        y: 0,
+                        w: 10,
+                        h: 10,
+                    },
+                    Filter::PixelateRegion {
+                        x: 90,
+                        y: 70,
+                        w: 10,
+                        h: 10,
+                    },
+                ])],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (100, 80));
+        // Overflow is an error naming the region and the bounds.
+        let err = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::BlurRegion {
+                    x: 90,
+                    y: 70,
+                    w: 20,
+                    h: 20,
+                }])],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("blur_region(90,70,20,20) exceeds image bounds 100x80"),
+            "got: {err}"
+        );
+        // Bounds are the size at the point the filter runs:
+        // after a resize to 50x40, a 60-wide region no longer fits.
+        let err = engine
+            .process(
+                &src,
+                &[
+                    size_op(Dimension::Pixels(50), Dimension::Pixels(40)),
+                    Operation::Filters(vec![Filter::PixelateRegion {
+                        x: 0,
+                        y: 0,
+                        w: 60,
+                        h: 10,
+                    }]),
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pixelate_region(0,0,60,10) exceeds image bounds 50x40"),
+            "got: {err}"
+        );
     }
 
     #[test]

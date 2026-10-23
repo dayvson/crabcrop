@@ -106,6 +106,10 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // the resolved images; one reaching this function is
             // unresolved by construction and leaves pixels alone.
             // (The engine never routes them here.)
+            // Region redaction runs in the engine, which
+            // validates the rectangle against the image size
+            // in effect at that point. (Same routing.)
+            Filter::BlurRegion { .. } | Filter::PixelateRegion { .. } => {}
             Filter::Watermark { .. } => {}
             // Background removal is applied by the engine, which
             // owns the mask provider. (Same routing as above.)
@@ -305,6 +309,42 @@ fn average_blocks<P: image::Pixel>(
             }
         }
     }
+}
+
+/// Apply `f` to the rectangle (x, y, w, h) of `img` and
+/// composite the result back over an RGBA copy; pixels
+/// outside the rectangle are untouched, and alpha survives.
+/// The caller guarantees the rectangle is in bounds.
+fn apply_to_region(
+    img: &DynamicImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    f: impl Fn(&DynamicImage) -> DynamicImage,
+) -> DynamicImage {
+    let mut base = img.to_rgba8();
+    let region = img.crop_imm(x, y, w, h);
+    let done = f(&region).to_rgba8();
+    image::imageops::overlay(&mut base, &done, x as i64, y as i64);
+    DynamicImage::ImageRgba8(base)
+}
+
+/// Gaussian-blur one rectangle of `img` (explicit region
+/// redaction: plates, screens, documents). The sigma scales
+/// with the region, min(w, h) / 8 clamped to [1, 30], so a
+/// tall thin region blurs to its own scale.
+pub fn blur_region(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> DynamicImage {
+    let sigma = (w.min(h) as f32 / 8.0).clamp(1.0, 30.0);
+    apply_to_region(img, x, y, w, h, |region| region.blur(sigma))
+}
+
+/// Pixelate one rectangle of `img`, with the block size
+/// derived from the region: min(w, h) / 10, at least 2 px,
+/// using the same block averaging as the `pixelate` filter.
+pub fn pixelate_region(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> DynamicImage {
+    let block = (w.min(h) / 10).max(2);
+    apply_to_region(img, x, y, w, h, |region| pixelate(region, block))
 }
 
 /// Round the corners of `img` by the given radii (CSS order:
@@ -798,6 +838,54 @@ mod tests {
         let (out, _) = apply_filters(img, &[Filter::Flip(crate::url::FlipDirection::Vertical)]);
         assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [0, 0, 255]);
         assert_eq!(out.to_rgb8().get_pixel(0, 1).0, [255, 0, 0]);
+    }
+
+    #[test]
+    fn blur_region_smooths_only_the_region() {
+        // 1px checkerboard: maximal local contrast.
+        let mut img = DynamicImage::new_rgb8(40, 40);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+            *p = Rgb([v, v, v]);
+        }
+        let out = blur_region(&img, 10, 10, 20, 20);
+        let rgb = out.to_rgb8();
+        // Outside the region: pixel-exact.
+        assert_eq!(rgb.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(rgb.get_pixel(39, 39).0, [0, 0, 0]);
+        assert_eq!(rgb.get_pixel(8, 15).0, [255, 255, 255]);
+        // Inside: the checkerboard is smoothed toward mid gray,
+        // so neighbors differ by far less than the original 255.
+        let a = rgb.get_pixel(20, 20)[0] as i32;
+        let b = rgb.get_pixel(21, 20)[0] as i32;
+        assert!((a - b).abs() < 60, "neighbors {a} vs {b}");
+        assert!(a > 60 && a < 195, "smoothed toward gray, got {a}");
+    }
+
+    #[test]
+    fn pixelate_region_averages_inside_only() {
+        // Left half red, right half blue, edge at x = 20.
+        let mut img = DynamicImage::new_rgb8(40, 40);
+        for (x, _y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if x < 20 {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([0, 0, 255])
+            };
+        }
+        // Region starts at x = 11, so its 2px blocks straddle
+        // the color edge at block [19, 20].
+        let out = pixelate_region(&img, 11, 10, 20, 20);
+        let rgb = out.to_rgb8();
+        assert_eq!(rgb.get_pixel(19, 15).0, [128, 0, 128]);
+        assert_eq!(rgb.get_pixel(20, 15).0, [128, 0, 128]);
+        // Pure blocks inside stay pure.
+        assert_eq!(rgb.get_pixel(12, 15).0, [255, 0, 0]);
+        assert_eq!(rgb.get_pixel(29, 15).0, [0, 0, 255]);
+        // Outside the region nothing changes.
+        assert_eq!(rgb.get_pixel(5, 15).0, [255, 0, 0]);
+        assert_eq!(rgb.get_pixel(35, 15).0, [0, 0, 255]);
+        assert_eq!(rgb.get_pixel(19, 5).0, [255, 0, 0]);
     }
 
     fn striped() -> DynamicImage {
