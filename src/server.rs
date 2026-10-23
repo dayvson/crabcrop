@@ -98,6 +98,10 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/purge/{*path}", axum::routing::post(purge_handle))
+        .route(
+            "/purge-group/{*path}",
+            axum::routing::post(purge_group_handle),
+        )
         .route("/{*path}", get(handle))
         .with_state(state)
         .layer(axum::middleware::from_fn(security_headers))
@@ -181,13 +185,15 @@ async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
 /// One structured line per purge request (audit PL-8): the
 /// destructive, secret-gated endpoint must be auditable. The
 /// target is hashed; a raw target can carry signed URLs.
-fn purge_log(target: &str, removed: Option<usize>) {
+fn purge_log(event: &str, target: &str, removed: Option<usize>) {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(target.as_bytes());
     let hash: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     match removed {
-        Some(n) => println!("{{\"event\":\"purge\",\"target\":\"{hash}\",\"removed\":{n}}}"),
-        None => println!("{{\"event\":\"purge\",\"target\":\"{hash}\",\"rejected\":true}}"),
+        Some(n) => {
+            println!("{{\"event\":\"{event}\",\"target\":\"{hash}\",\"removed\":{n}}}")
+        }
+        None => println!("{{\"event\":\"{event}\",\"target\":\"{hash}\",\"rejected\":true}}"),
     }
 }
 
@@ -202,7 +208,7 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
     };
     if !verify_purge(&state.secret, &signature, target, state.allow_unsafe) {
         state.metrics.record_purge();
-        purge_log(target, None);
+        purge_log("purge", target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
     }
     // Entries are keyed in expiry-free form (audit P-2), so
@@ -214,8 +220,77 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         removed += store.purge_matching(&key_form);
     }
     state.metrics.record_purge();
-    purge_log(target, Some(removed));
+    purge_log("purge", target, Some(removed));
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
+}
+
+/// `POST /purge-group/<signature>/<group>`: invalidate every
+/// stored entry in one cache group (RFC 9875), across both
+/// tiers. The signature is verified with the same purge
+/// subkey as `/purge`, over the literal `purge-group/<group>`,
+/// so an image or per-URL purge signature cannot be replayed
+/// here. A bad signature is a 403 and removes nothing; an
+/// unknown group answers 200 with a count of 0.
+async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+    let Some(tail) = uri.path().strip_prefix("/purge-group/") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let full = format!("/{tail}");
+    let (signature, group) = match parse_signature(&full) {
+        Ok(v) => v,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if group.is_empty() || group.contains('/') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let target = format!("purge-group/{group}");
+    if !verify_purge(&state.secret, &signature, &target, state.allow_unsafe) {
+        state.metrics.record_purge();
+        purge_log("purge-group", &target, None);
+        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+    }
+    let mut removed = state.cache.purge_group(group);
+    if let Some(store) = &state.store {
+        removed += store.purge_group(group);
+    }
+    state.metrics.record_purge();
+    purge_log("purge-group", &target, Some(removed));
+    (StatusCode::OK, format!("purged {removed}\n")).into_response()
+}
+
+/// Quote one string for a structured-fields string list
+/// (RFC 8941): backslash and quote are escaped.
+fn sf_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        if ch == '\\' || ch == '"' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// Attach the cache observability headers (RFC 9211
+/// Cache-Status, RFC 9875 Cache-Group) to an image response.
+fn attach_cache_headers(response: &mut Response, cache_status: &str, groups: &[String]) {
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("cache-status"),
+        axum::http::HeaderValue::from_str(cache_status).unwrap(),
+    );
+    if !groups.is_empty() {
+        let list = groups
+            .iter()
+            .map(|g| sf_quote(g))
+            .collect::<Vec<_>>()
+            .join(", ");
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("cache-group"),
+            axum::http::HeaderValue::from_str(&list).unwrap(),
+        );
+    }
 }
 
 async fn handle(
@@ -362,9 +437,12 @@ async fn serve(
     // Defense in depth for the purge domain separation (audit
     // P-1): an image remainder may not begin with the `purge`
     // segment, so the two URL shapes can never be confused.
-    if rest.split('/').next() == Some("purge") {
+    if matches!(rest.split('/').next(), Some("purge" | "purge-group")) {
         return (StatusCode::BAD_REQUEST.into_response(), record);
     }
+    // The cache groups (RFC 9875) are the presets the signed
+    // remainder references, read before expansion rewrites it.
+    let groups = crate::url::preset_names(rest);
     // Preset expansion happens after verification (the
     // signature covers the preset reference, not its expansion)
     // and before everything else: parsing, the cache key, and
@@ -443,6 +521,7 @@ async fn serve(
     // requests bypass the cache in both directions: they must
     // never be answered with image bytes, and their JSON is never
     // stored as an image entry.
+    let mut cache_status = "crabcrop; fwd=uri-miss";
     let hit = if meta {
         None
     } else {
@@ -451,12 +530,16 @@ async fn serve(
     // Memory first, disk second: a disk hit is promoted into
     // memory so the next repeat skips the file read.
     let hit = match hit {
-        Some(h) => Some(h),
+        Some(h) => {
+            cache_status = "crabcrop; hit";
+            Some(h)
+        }
         None if meta => None,
         None => match &state.store {
             Some(store) => {
                 let found = store.get(&cache_key);
                 if let Some(image) = &found {
+                    cache_status = "crabcrop; hit; detail=\"disk\"";
                     state.cache.put(cache_key.clone(), image.clone());
                 }
                 found
@@ -467,7 +550,9 @@ async fn serve(
     if let Some(hit) = hit {
         record.cache_hit = true;
         record.bytes_out = hit.bytes.len();
-        return (respond(hit.format, hit.quality, hit.bytes), record);
+        let mut response = respond(hit.format, hit.quality, hit.bytes);
+        attach_cache_headers(&mut response, cache_status, &groups);
+        return (response, record);
     }
 
     record.load_ran = true;
@@ -628,6 +713,7 @@ async fn serve(
             bytes: processed.bytes.clone(),
             format: processed.format,
             quality: processed.quality,
+            groups: groups.clone(),
         };
         state.cache.put(cache_key.clone(), entry.clone());
         if let Some(store) = &state.store {
@@ -650,6 +736,9 @@ async fn serve(
     } else {
         respond(processed.format, processed.quality, processed.bytes)
     };
+    if !meta {
+        attach_cache_headers(&mut response, cache_status, &groups);
+    }
     if used_fallback {
         record.fallback = true;
         response
@@ -1690,6 +1779,161 @@ mod tests {
             axum::serve(listener, app(state)).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// An app combining presets and disk storage, with a
+    /// caller-chosen memory cache size (0 disables the
+    /// memory tier so disk behavior is observable).
+    async fn spawn_app_full(
+        presets: std::collections::HashMap<String, String>,
+        dir: Option<&std::path::Path>,
+        cache_bytes: usize,
+    ) -> String {
+        let state = AppState {
+            secret: SECRET.to_vec(),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(cache_bytes)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            detect: None,
+            font: None,
+            fallback: None,
+            store: dir
+                .map(|d| Arc::new(crate::storage::DiskStore::open(d, 16 * 1024 * 1024).unwrap())),
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            presets,
+            only_presets: false,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn header(resp: &reqwest::Response, name: &str) -> String {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn cache_status_reports_miss_then_memory_hit() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("40x24/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(header(&resp, "cache-group"), "");
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_status_reports_a_disk_hit_with_its_tier() {
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-tier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        // Memory tier disabled: the repeat must come from disk.
+        let base = spawn_app_full(preset_test_map(), Some(&dir), 0).await;
+        let remainder = format!("40x24/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; hit; detail=\"disk\""
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn preset_responses_carry_the_group_and_group_purge_evicts() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        let remainder = format!("preset:small/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(header(&resp, "cache-group"), "\"small\"");
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-group"), "\"small\"");
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        // A bad signature refuses and removes nothing.
+        let resp = client()
+            .post(format!("{base}/purge-group/deadbeef/small"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        // The real purge: signed over the literal target.
+        let sig = crate::url::purge_signature(SECRET, "purge-group/small");
+        let resp = client()
+            .post(format!("{base}/purge-group/{sig}/small"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        // And the group is a miss again.
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // Unknown group: 200, nothing removed.
+        let sig = crate::url::purge_signature(SECRET, "purge-group/nope");
+        let resp = client()
+            .post(format!("{base}/purge-group/{sig}/nope"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.text().await.unwrap().contains("purged 0"));
+    }
+
+    #[tokio::test]
+    async fn group_purge_reaches_the_disk_tier() {
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-gdisk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_full(preset_test_map(), Some(&dir), 0).await;
+        let remainder = format!("preset:small/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-group"), "\"small\"");
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; hit; detail=\"disk\""
+        );
+        let sig = crate::url::purge_signature(SECRET, "purge-group/small");
+        let resp = client()
+            .post(format!("{base}/purge-group/{sig}/small"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -1078,6 +1078,34 @@ pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError
 /// request is an error: the operations must all arrive via
 /// presets. `exp:` metadata stays allowed; it is not an
 /// operation.
+/// The preset names a remainder references, in order,
+/// deduplicated: the cache groups (RFC 9875) the response
+/// belongs to. Scans the same leading segment run
+/// [`expand_presets`] expands and stops where it stops (the
+/// source, or a segment that is not an operation).
+pub fn preset_names(rest: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut tail = rest;
+    loop {
+        let (seg, remaining) = match tail.split_once('/') {
+            Some((s, r)) => (s, r),
+            None => (tail, ""),
+        };
+        if let Some(name) = seg.strip_prefix("preset:") {
+            if !name.is_empty() && !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
+            }
+        } else if !(seg.starts_with("exp:") || parse_operation(seg).is_some_and(|r| r.is_ok())) {
+            break;
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        tail = remaining;
+    }
+    out
+}
+
 pub fn expand_presets(
     rest: &str,
     presets: &std::collections::HashMap<String, String>,

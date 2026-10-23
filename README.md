@@ -435,6 +435,7 @@ For example, a `removebg` request to a server with no background-removal model r
 | `GET /health` | Health check. Returns `200` with the body `ok`. |
 | `GET /metrics` | Prometheus metrics in text format: request counts by status class (`crabcrop_requests_total`), request/load/process durations, cache hit and miss counters, loader and engine error counters, and byte totals. |
 | `POST /purge/<signature>/<path>` | Invalidate every stored variant of one result, in both cache tiers. See below. |
+| `POST /purge-group/<signature>/<group>` | Invalidate every stored result in a cache group, in both cache tiers. See below. |
 | `GET /<signature>/...` | Image requests, as documented above. |
 
 ### Purge a cached result
@@ -444,6 +445,24 @@ curl -X POST "http://localhost:3000/purge/<signature>/300x200/https://example.co
 ```
 
 The `<path>` is the original request path without its signature. Purge targets are raw remainders: percent-encoded spellings verify as different strings and purge nothing. Entries are stored in expiry-free form, so purging a path also evicts its `exp:` variants. The purge signature is the HMAC-SHA256 of the path under a purge subkey derived from the secret (the subkey is the raw HMAC-SHA256 of the secret over the string `crabcrop/purge-key`), so only the secret holder can invalidate, and an image signature can never be replayed as a purge signature. The response is `200` with a body like `purged 2`: the count covers the entry and all of its variants (per format class and DPR). A bad purge signature is a `403` and removes nothing; purging a path that is not stored answers `purged 0`.
+
+### Cache headers and groups
+
+Image responses carry two standard headers. `Cache-Status` (RFC 9211) reports what the server's own caches did: `crabcrop; hit` for a memory hit, `crabcrop; hit; detail="disk"` for a disk hit, and `crabcrop; fwd=uri-miss` when the response was produced from the origin.
+
+A response also belongs to a cache group (RFC 9875) for each preset its URL referenced, listed in the `Cache-Group` header:
+
+```http
+Cache-Group: "small"
+```
+
+Groups make preset-wide invalidation one call instead of a script over every URL. The purge-group signature is computed exactly like a purge signature, over the literal string `purge-group/<group>`:
+
+```bash
+curl -X POST "http://localhost:3000/purge-group/<signature>/small"
+```
+
+The response is `200` with a body like `purged 3`: every entry recorded in the group, across both tiers. A bad signature is a `403` and removes nothing; an unknown group answers `purged 0`.
 
 Every image request also writes one structured JSON log line to stdout, with the operation summary, status, per-stage timings, and cache result (never the full source URL).
 

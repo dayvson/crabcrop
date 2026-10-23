@@ -24,8 +24,8 @@ use crate::url::ImageFormat;
 
 #[derive(Debug, Default)]
 struct Inner {
-    /// Cache key -> (file stem, total file size).
-    entries: HashMap<String, (String, usize)>,
+    /// Cache key -> (file stem, total file size, cache groups).
+    entries: HashMap<String, (String, usize, Vec<String>)>,
     /// Keys from least to most recently used.
     order: VecDeque<String>,
     total_bytes: usize,
@@ -42,7 +42,11 @@ pub struct DiskStore {
     inner: Mutex<Inner>,
 }
 
-const MAGIC: &str = "CRABDISK1";
+/// Entry format version. CRABDISK2 adds the entry's cache
+/// groups to the header; older files do not parse and are
+/// deleted on sight at scan, the store's standing upgrade
+/// behavior for a cache.
+const MAGIC: &str = "CRABDISK2";
 
 impl DiskStore {
     /// Open (creating if needed) the store rooted at `dir`,
@@ -63,7 +67,8 @@ impl DiskStore {
     /// order approximates the previous run's. Files that do
     /// not parse are deleted on sight.
     fn scan(&self) -> Result<(), String> {
-        let mut found: Vec<(std::time::SystemTime, String, String, usize)> = Vec::new();
+        let mut found: Vec<(std::time::SystemTime, String, String, usize, Vec<String>)> =
+            Vec::new();
         let read = std::fs::read_dir(&self.dir)
             .map_err(|e| format!("cannot read the result storage directory: {e}"))?;
         for entry in read.flatten() {
@@ -81,21 +86,21 @@ impl DiskStore {
             }
             let Ok(meta) = entry.metadata() else { continue };
             match read_header(&path) {
-                Some((key, _, _)) => {
+                Some((key, groups)) => {
                     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    found.push((mtime, key, stem, meta.len() as usize));
+                    found.push((mtime, key, stem, meta.len() as usize, groups));
                 }
                 None => {
                     let _ = std::fs::remove_file(&path);
                 }
             }
         }
-        found.sort_by_key(|(mtime, _, _, _)| *mtime);
+        found.sort_by_key(|(mtime, _, _, _, _)| *mtime);
         let mut inner = self.inner.lock().unwrap();
-        for (_, key, stem, size) in found {
+        for (_, key, stem, size, groups) in found {
             inner.total_bytes += size;
             inner.order.push_back(key.clone());
-            inner.entries.insert(key, (stem, size));
+            inner.entries.insert(key, (stem, size, groups));
         }
         Ok(())
     }
@@ -111,7 +116,7 @@ impl DiskStore {
             return None;
         }
         let mut inner = self.inner.lock().unwrap();
-        let (stem, _) = inner.entries.get(key)?.clone();
+        let (stem, _, _) = inner.entries.get(key)?.clone();
         let path = self.file_for(&stem);
         let parsed = std::fs::read(&path)
             .ok()
@@ -149,7 +154,7 @@ impl DiskStore {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
-        if let Some((_, old_size)) = inner.entries.remove(key) {
+        if let Some((_, old_size, _)) = inner.entries.remove(key) {
             inner.total_bytes -= old_size;
             remove_from_order(&mut inner, key);
         }
@@ -157,14 +162,16 @@ impl DiskStore {
             let Some(oldest) = inner.order.pop_front() else {
                 break;
             };
-            if let Some((old_stem, size)) = inner.entries.remove(&oldest) {
+            if let Some((old_stem, size, _)) = inner.entries.remove(&oldest) {
                 inner.total_bytes -= size;
                 let _ = std::fs::remove_file(self.file_for(&old_stem));
             }
         }
         inner.total_bytes += data.len();
         inner.order.push_back(key.to_string());
-        inner.entries.insert(key.to_string(), (stem, data.len()));
+        inner
+            .entries
+            .insert(key.to_string(), (stem, data.len(), image.groups.clone()));
     }
 
     /// Remove every entry for `base`: the bare key plus its
@@ -177,6 +184,28 @@ impl DiskStore {
             .keys()
             .filter(|k| k.as_str() == base || k.starts_with(&format!("{base}#")))
             .cloned()
+            .collect();
+        let mut removed = 0;
+        for key in keys {
+            if let Some((stem, _)) = evict_entry(&mut inner, &key) {
+                let _ = std::fs::remove_file(self.file_for(&stem));
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Remove every entry belonging to `group` (RFC 9875
+    /// grouped invalidation), using the groups indexed at
+    /// scan and at store time. Returns how many entries
+    /// were removed.
+    pub fn purge_group(&self, group: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let keys: Vec<String> = inner
+            .entries
+            .iter()
+            .filter(|(_, (_, _, groups))| groups.iter().any(|g| g == group))
+            .map(|(key, _)| key.clone())
             .collect();
         let mut removed = 0;
         for key in keys {
@@ -213,10 +242,10 @@ fn remove_from_order(inner: &mut Inner, key: &str) {
 }
 
 fn evict_entry(inner: &mut Inner, key: &str) -> Option<(String, usize)> {
-    let removed = inner.entries.remove(key)?;
-    inner.total_bytes -= removed.1;
+    let (stem, size, _) = inner.entries.remove(key)?;
+    inner.total_bytes -= size;
     remove_from_order(inner, key);
-    Some(removed)
+    Some((stem, size))
 }
 
 fn format_name(format: ImageFormat) -> &'static str {
@@ -247,16 +276,29 @@ fn serialize_entry(key: &str, image: &CachedImage) -> Vec<u8> {
         .quality
         .map(|q| q.to_string())
         .unwrap_or_else(|| "-".to_string());
+    // The groups block: per group, a decimal byte length, a
+    // newline, the raw bytes, a newline. Length-prefixed like
+    // the key, so any group name survives.
+    let mut groups_block = Vec::new();
+    for group in &image.groups {
+        groups_block.extend_from_slice(group.len().to_string().as_bytes());
+        groups_block.push(b'\n');
+        groups_block.extend_from_slice(group.as_bytes());
+        groups_block.push(b'\n');
+    }
     let head = format!(
-        "{MAGIC}\n{}\n{quality}\n{}\n{}\n",
+        "{MAGIC}\n{}\n{quality}\n{}\n{}\n{}\n",
         format_name(image.format),
+        image.groups.len(),
         key.len(),
         image.bytes.len()
     );
-    let mut out = Vec::with_capacity(head.len() + key.len() + 1 + image.bytes.len());
+    let mut out =
+        Vec::with_capacity(head.len() + key.len() + 1 + groups_block.len() + image.bytes.len());
     out.extend_from_slice(head.as_bytes());
     out.extend_from_slice(key.as_bytes());
     out.push(b'\n');
+    out.extend_from_slice(&groups_block);
     out.extend_from_slice(&image.bytes);
     out
 }
@@ -272,11 +314,20 @@ fn take_line<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
     Some(line)
 }
 
-/// Split a stored file into (key, format, quality, payload
-/// offset). `None` on any inconsistency, including a payload
-/// whose length disagrees with the header: the header is the
-/// integrity check.
-fn parse_header_bytes(data: &[u8]) -> Option<(String, ImageFormat, Option<u8>, usize)> {
+/// Split a stored file into (key, format, quality, groups,
+/// payload offset). `None` on any inconsistency, including a
+/// payload whose length disagrees with the header: the header
+/// is the integrity check.
+/// A stored file's parsed header.
+struct EntryHeader {
+    key: String,
+    format: ImageFormat,
+    quality: Option<u8>,
+    groups: Vec<String>,
+    payload_offset: usize,
+}
+
+fn parse_header_bytes(data: &[u8]) -> Option<EntryHeader> {
     let mut pos = 0;
     if take_line(data, &mut pos)? != MAGIC.as_bytes() {
         return None;
@@ -289,6 +340,10 @@ fn parse_header_bytes(data: &[u8]) -> Option<(String, ImageFormat, Option<u8>, u
     } else {
         Some(quality_line.parse().ok()?)
     };
+    let group_count: usize = std::str::from_utf8(take_line(data, &mut pos)?)
+        .ok()?
+        .parse()
+        .ok()?;
     let key_len: usize = std::str::from_utf8(take_line(data, &mut pos)?)
         .ok()?
         .parse()
@@ -302,34 +357,53 @@ fn parse_header_bytes(data: &[u8]) -> Option<(String, ImageFormat, Option<u8>, u
         return None;
     }
     let key = String::from_utf8(key_bytes.to_vec()).ok()?;
-    let payload_offset = pos + key_len + 1;
+    let mut cursor = pos + key_len + 1;
+    let mut groups = Vec::with_capacity(group_count);
+    for _ in 0..group_count {
+        let len_line = std::str::from_utf8(take_line(data, &mut cursor)?).ok()?;
+        let glen: usize = len_line.parse().ok()?;
+        let gbytes = data.get(cursor..cursor + glen)?;
+        if data.get(cursor + glen) != Some(&b'\n') {
+            return None;
+        }
+        groups.push(String::from_utf8(gbytes.to_vec()).ok()?);
+        cursor += glen + 1;
+    }
+    let payload_offset = cursor;
     if data.len() != payload_offset + payload_len {
         return None;
     }
-    Some((key, format, quality, payload_offset))
+    Some(EntryHeader {
+        key,
+        format,
+        quality,
+        groups,
+        payload_offset,
+    })
 }
 
 fn parse_entry(data: &[u8]) -> Option<(String, CachedImage)> {
-    let (key, format, quality, offset) = parse_header_bytes(data)?;
-    let bytes = data.get(offset..)?.to_vec();
+    let header = parse_header_bytes(data)?;
+    let bytes = data.get(header.payload_offset..)?.to_vec();
     if bytes.is_empty() {
         return None;
     }
     Some((
-        key,
+        header.key,
         CachedImage {
             bytes,
-            format,
-            quality,
+            format: header.format,
+            quality: header.quality,
+            groups: header.groups,
         },
     ))
 }
 
 /// Just the header of a stored file, for the boot scan.
-fn read_header(path: &Path) -> Option<(String, ImageFormat, Option<u8>)> {
+fn read_header(path: &Path) -> Option<(String, Vec<String>)> {
     let data = std::fs::read(path).ok()?;
-    let (key, format, quality, _) = parse_header_bytes(&data)?;
-    Some((key, format, quality))
+    let header = parse_header_bytes(&data)?;
+    Some((header.key, header.groups))
 }
 
 #[cfg(test)]
@@ -347,6 +421,14 @@ mod tests {
             bytes: bytes.to_vec(),
             format: ImageFormat::Png,
             quality: Some(80),
+            groups: Vec::new(),
+        }
+    }
+
+    fn grouped_image(bytes: &[u8], groups: &[&str]) -> CachedImage {
+        CachedImage {
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            ..image(bytes)
         }
     }
 
@@ -409,7 +491,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // appended temporarily to storage tests
+    #[test]
+    fn groups_round_trip_and_group_purge_survives_reopen() {
+        let dir = temp_dir("groups");
+        {
+            let store = DiskStore::open(&dir, 1_000_000).unwrap();
+            store.put("a", &grouped_image(b"1", &["thumb"]));
+            store.put("b", &grouped_image(b"2", &["thumb", "hero"]));
+            store.put("c", &grouped_image(b"3", &["hero"]));
+            assert_eq!(store.get("b").unwrap().groups, ["thumb", "hero"]);
+        }
+        // Reopen: the scan re-indexes groups from the file
+        // headers, so group purge works across restarts.
+        let store = DiskStore::open(&dir, 1_000_000).unwrap();
+        assert_eq!(store.purge_group("thumb"), 2);
+        assert!(store.get("a").is_none());
+        assert!(store.get("b").is_none());
+        assert!(store.get("c").is_some());
+        assert_eq!(store.purge_group("thumb"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn purge_removes_the_base_and_its_variants_only() {
         let dir = temp_dir("purge");
