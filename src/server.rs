@@ -269,10 +269,25 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         purge_log("purge", target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
     }
-    // Entries are keyed by canonical form (Q1), so the
-    // purge target is canonicalized the same way: purging
-    // any spelling of a path evicts the shared entry, exp:
-    // variants included.
+    // The signature covers the target as presented; the
+    // entries, though, are keyed by the canonical form of
+    // the EXPANDED remainder (Q1, Q5). Expand presets the
+    // way serve does, or a purge of the preset URL an
+    // operator actually holds silently removes 0 entries.
+    // A target that does not expand (a directly expanded
+    // path, an unknown preset) falls back to itself.
+    let expanded;
+    let target = if state.presets.is_empty() && !state.only_presets {
+        target
+    } else {
+        match crate::url::expand_presets(target, &state.presets, state.only_presets) {
+            Ok(text) => {
+                expanded = text;
+                &expanded
+            }
+            Err(_) => target,
+        }
+    };
     let key_form = crate::url::canonical_key_form(target);
     let mut removed = state.cache.purge_matching(&key_form);
     if let Some(store) = &state.store {
@@ -1510,6 +1525,36 @@ mod tests {
             2,
             "the purge evicted the shared entry"
         );
+    }
+
+    #[tokio::test]
+    async fn purging_a_preset_url_evicts_its_entry() {
+        // Q5's trap: entries are keyed by the expanded
+        // form, so purging the preset URL itself used to
+        // remove 0. The handler expands before matching.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        let remainder = format!("preset:small/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "second fetch is a hit");
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.text().await.unwrap().contains("purged 1"),
+            "the preset URL must purge its own entry"
+        );
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "the entry was evicted");
     }
 
     #[tokio::test]
