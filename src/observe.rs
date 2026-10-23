@@ -34,6 +34,12 @@ pub struct RequestRecord {
     pub load_ran: bool,
     /// Whether the engine stage ran (attempted).
     pub process_ran: bool,
+    /// Whether the result cache was consulted at all.
+    /// Requests rejected before the lookup (bad signature,
+    /// parse errors) and meta requests (which bypass the
+    /// cache by design) never set it, and the hit/miss
+    /// counters only move for requests that did.
+    pub cache_looked_up: bool,
     pub cache_hit: bool,
     /// Whether the configured fallback image was served
     /// instead of the source.
@@ -54,6 +60,7 @@ impl Default for RequestRecord {
             total: Duration::ZERO,
             load_ran: false,
             process_ran: false,
+            cache_looked_up: false,
             cache_hit: false,
             fallback: false,
             bytes_in: 0,
@@ -159,10 +166,12 @@ impl Metrics {
         }
         m.bytes_in += r.bytes_in as u64;
         m.bytes_served += r.bytes_out as u64;
-        if r.cache_hit {
-            m.cache_hits += 1;
-        } else {
-            m.cache_misses += 1;
+        if r.cache_looked_up {
+            if r.cache_hit {
+                m.cache_hits += 1;
+            } else {
+                m.cache_misses += 1;
+            }
         }
         if r.load_ran {
             m.load_ms_sum += ms(r.load);
@@ -287,6 +296,7 @@ mod tests {
             total: Duration::from_millis(4),
             load_ran: true,
             process_ran: true,
+            cache_looked_up: true,
             bytes_in: 1200,
             bytes_out: 300,
             ..Default::default()
@@ -344,5 +354,34 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("crabcrop_cache_misses_total 3"), "{out}");
+    }
+
+    #[test]
+    fn requests_that_never_reached_the_cache_count_neither_way() {
+        let metrics = Metrics::default();
+        // An early rejection (bad signature, parse error)
+        // and a meta request both return records that never
+        // consulted the cache: neither counter may move.
+        metrics.record(&RequestRecord {
+            status: 403,
+            ..Default::default()
+        });
+        metrics.record(&RequestRecord {
+            status: 200,
+            ..Default::default()
+        });
+        let out = metrics.render();
+        assert!(out.contains("crabcrop_cache_hits_total 0"), "{out}");
+        assert!(out.contains("crabcrop_cache_misses_total 0"), "{out}");
+        // A looked-up miss and hit still count.
+        let mut miss = record(200);
+        miss.cache_hit = false;
+        metrics.record(&miss);
+        let mut hit = record(200);
+        hit.cache_hit = true;
+        metrics.record(&hit);
+        let out = metrics.render();
+        assert!(out.contains("crabcrop_cache_hits_total 1"), "{out}");
+        assert!(out.contains("crabcrop_cache_misses_total 1"), "{out}");
     }
 }
