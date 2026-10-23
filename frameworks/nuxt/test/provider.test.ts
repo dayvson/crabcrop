@@ -57,3 +57,18 @@ test("a configured preset leads the operations", () => {
 test("a missing base is a configuration error", () => {
   assert.throws(() => getImage(SRC, { modifiers: {} }, { options: {} as never }), /base/);
 });
+
+test("in a browser context the secret is never used (audit PL-11)", () => {
+  const ctx = {
+    options: { base: "https://images.example.com", secret: "browser-secret-0123" },
+  };
+  (globalThis as { window?: unknown }).window = {};
+  try {
+    assert.equal(
+      getImage(SRC, { modifiers: { width: 800 } }, ctx).url,
+      `https://images.example.com/unsafe/800x0/${SRC}`,
+    );
+  } finally {
+    delete (globalThis as { window?: unknown }).window;
+  }
+});

@@ -37,3 +37,19 @@ test("no dimensions produces the bare source URL", () => {
   const loader = createCrabcropLoader({ base: "https://images.example.com" });
   assert.equal(loader({ src: SRC }), `https://images.example.com/unsafe/${SRC}`);
 });
+
+test("in a browser context the secret is never used (audit PL-11)", () => {
+  const loader = createCrabcropLoader({
+    base: "https://images.example.com",
+    secret: "browser-secret-0123",
+  });
+  (globalThis as { window?: unknown }).window = {};
+  try {
+    assert.equal(
+      loader({ src: SRC, width: 300 }),
+      `https://images.example.com/unsafe/300x0/${SRC}`,
+    );
+  } finally {
+    delete (globalThis as { window?: unknown }).window;
+  }
+});
