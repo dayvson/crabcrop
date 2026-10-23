@@ -500,10 +500,7 @@ async fn serve(
     let (signature, rest) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => {
-            return (
-                (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-                record,
-            );
+            return (parse_failure(&e, accept), record);
         }
     };
     let verify_start = Instant::now();
@@ -546,20 +543,14 @@ async fn serve(
                 &expanded
             }
             Err(e) => {
-                return (
-                    (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-                    record,
-                );
+                return (parse_failure(&e, accept), record);
             }
         }
     };
     let (ops, source_url, expiry) = match parse_operations_with_expiry(rest) {
         Ok(v) => v,
         Err(e) => {
-            return (
-                (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-                record,
-            );
+            return (parse_failure(&e, accept), record);
         }
     };
     // The operation summary is everything before the source URL.
@@ -1218,6 +1209,22 @@ fn load_error_response(e: LoadError) -> Response {
     (status, message).into_response()
 }
 
+/// A grammar failure's response: the parser's message as
+/// plain text, or the v2 JSON envelope
+/// (`{"error":{"code","message"}}`, the code being the
+/// error's stable name) when the client asked for JSON,
+/// the same test the meta surface uses.
+fn parse_failure(e: &crate::url::ParseError, accept: Option<&str>) -> Response {
+    if wants_meta(accept) {
+        let body = serde_json::json!({
+            "error": { "code": e.code(), "message": e.to_string() }
+        });
+        (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+    } else {
+        (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+    }
+}
+
 fn engine_error_response(e: EngineError) -> Response {
     eprintln!("engine error: {e}");
     let (status, message) = match e {
@@ -1230,6 +1237,7 @@ fn engine_error_response(e: EngineError) -> Response {
             "image encoding failed".to_string(),
         ),
         EngineError::Unsupported(what) => (StatusCode::BAD_REQUEST, what),
+        EngineError::NotConfigured(what) => (StatusCode::NOT_IMPLEMENTED, what),
         EngineError::Inference(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "image inference failed".to_string(),
@@ -1605,6 +1613,58 @@ mod tests {
         assert_eq!(resp.text().await.unwrap(), "unknown preset: nope");
     }
 
+    #[tokio::test]
+    async fn parse_failures_speak_json_when_asked() {
+        // The v2 contract: a client asking for JSON gets
+        // {"error":{"code","message"}} with the frozen code;
+        // everyone else keeps the plain-text body.
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:bogus(1)/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_filters");
+        assert_eq!(
+            body["error"]["message"],
+            "invalid filters segment: filters:bogus(1)"
+        );
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "invalid filters segment: filters:bogus(1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_features_answer_501_not_400() {
+        // The URL is fine; this deployment has no face
+        // model. 501 says the server cannot do it, where
+        // 400 would blame the request.
+        let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:blurfaces/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            resp.text()
+                .await
+                .unwrap()
+                .contains("face operations are not configured on this server")
+        );
+    }
+
     fn preset_test_map() -> std::collections::HashMap<String, String> {
         [
             ("small".to_string(), "30x20".to_string()),
@@ -1749,25 +1809,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removebg_without_a_configured_model_is_a_clean_400() {
+    async fn removebg_without_a_configured_model_is_a_clean_501() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;
         let remainder = format!("filters:removebg:format(png)/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
         let resp = client().get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let body = resp.text().await.unwrap();
         assert!(body.contains("not configured"), "body: {body}");
     }
 
     #[tokio::test]
-    async fn upscale_without_a_configured_model_is_a_clean_400() {
+    async fn upscale_without_a_configured_model_is_a_clean_501() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;
         let remainder = format!("filters:upscale(2)/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
         let resp = client().get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let body = resp.text().await.unwrap();
         assert!(body.contains("not configured"), "body: {body}");
     }
@@ -2921,7 +2981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_without_a_font_is_400() {
+    async fn text_without_a_font_is_501() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;
         let remainder = format!("filters:text(HI,20,ffffff,bottom-right)/{src}");
@@ -2931,7 +2991,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 400);
+        assert_eq!(resp.status(), 501);
         let body = resp.text().await.unwrap();
         assert!(body.contains("text is not configured"), "{body}");
     }

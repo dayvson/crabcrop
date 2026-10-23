@@ -160,6 +160,11 @@ pub enum EngineError {
     Encode(String),
     /// The operation is not supported yet. Carries what was asked for.
     Unsupported(String),
+    /// The operation needs a model or resource this server
+    /// was not configured with. Distinct from Unsupported:
+    /// the URL is fine, the deployment cannot do it, so the
+    /// server answers 501 rather than blaming the request.
+    NotConfigured(String),
     /// An AI model failed at inference time. Carries the cause.
     Inference(String),
     /// A text overlay could not be rendered. Carries the cause.
@@ -177,6 +182,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::Unsupported(what) => {
                 write!(f, "unsupported operation: {what}")
+            }
+            EngineError::NotConfigured(what) => {
+                write!(f, "not configured: {what}")
             }
             EngineError::Inference(cause) => {
                 write!(f, "AI inference failed: {cause}")
@@ -331,7 +339,7 @@ impl Engine {
                 ));
             }
             if ctx.mask_provider.is_none() {
-                return Err(EngineError::Unsupported(
+                return Err(EngineError::NotConfigured(
                     "removebg is not configured on this server".to_string(),
                 ));
             }
@@ -350,23 +358,23 @@ impl Engine {
             }
         }
         if crate::url::has_upscale(ops) && ctx.upscale_provider.is_none() {
-            return Err(EngineError::Unsupported(
+            return Err(EngineError::NotConfigured(
                 "upscale is not configured on this server".to_string(),
             ));
         }
         if crate::url::has_text(ops) && ctx.text_renderer.is_none() {
-            return Err(EngineError::Unsupported(
+            return Err(EngineError::NotConfigured(
                 "text is not configured on this server (no font)".to_string(),
             ));
         }
         if crate::url::needs_face_model(ops) && ctx.face_provider.is_none() {
-            return Err(EngineError::Unsupported(
+            return Err(EngineError::NotConfigured(
                 "face operations are not configured on this server (no face model)".to_string(),
             ));
         }
         if crate::url::has_class_redaction(ops) {
             let provider = ctx.detect_provider.ok_or_else(|| {
-                EngineError::Unsupported(
+                EngineError::NotConfigured(
                     "class redaction is not configured on this server (no detection model)"
                         .to_string(),
                 )
@@ -789,7 +797,7 @@ fn detect_faces(
     ctx: &ProcessContext<'_>,
 ) -> Result<Vec<crate::ai::FaceBox>, EngineError> {
     let provider = ctx.face_provider.ok_or_else(|| {
-        EngineError::Unsupported(
+        EngineError::NotConfigured(
             "face operations are not configured on this server (no face model)".to_string(),
         )
     })?;
@@ -819,7 +827,7 @@ fn detect_objects(
     ctx: &ProcessContext<'_>,
 ) -> Result<Vec<crate::ai::Detection>, EngineError> {
     let provider = ctx.detect_provider.ok_or_else(|| {
-        EngineError::Unsupported(
+        EngineError::NotConfigured(
             "class redaction is not configured on this server (no detection model)".to_string(),
         )
     })?;
@@ -1000,7 +1008,7 @@ fn apply_operations(
                         }
                         Filter::RemoveBg => {
                             let provider = ctx.mask_provider.ok_or_else(|| {
-                                EngineError::Unsupported(
+                                EngineError::NotConfigured(
                                     "removebg is not configured on this server".to_string(),
                                 )
                             })?;
@@ -1038,7 +1046,7 @@ fn apply_operations(
                         Filter::FacePad(_) => {}
                         Filter::Upscale(factor) => {
                             let provider = ctx.upscale_provider.ok_or_else(|| {
-                                EngineError::Unsupported(
+                                EngineError::NotConfigured(
                                     "upscale is not configured on this server".to_string(),
                                 )
                             })?;
@@ -1059,7 +1067,7 @@ fn apply_operations(
                             anchor,
                         } => {
                             let renderer = ctx.text_renderer.ok_or_else(|| {
-                                EngineError::Unsupported(
+                                EngineError::NotConfigured(
                                     "text is not configured on this server (no font)".to_string(),
                                 )
                             })?;
@@ -3740,8 +3748,10 @@ mod tests {
             .process(&red_source(), &[Operation::Filters(vec![Filter::RemoveBg])])
             .unwrap_err();
         match &err {
-            EngineError::Unsupported(msg) => assert!(msg.contains("not configured"), "{msg}"),
-            other => panic!("expected Unsupported, got {other:?}"),
+            EngineError::NotConfigured(msg) => {
+                assert!(msg.contains("not configured"), "{msg}")
+            }
+            other => panic!("expected NotConfigured, got {other:?}"),
         }
     }
 
@@ -3818,8 +3828,10 @@ mod tests {
             )
             .unwrap_err();
         match &err {
-            EngineError::Unsupported(msg) => assert!(msg.contains("not configured"), "{msg}"),
-            other => panic!("expected Unsupported, got {other:?}"),
+            EngineError::NotConfigured(msg) => {
+                assert!(msg.contains("not configured"), "{msg}")
+            }
+            other => panic!("expected NotConfigured, got {other:?}"),
         }
     }
 
@@ -4043,7 +4055,7 @@ mod tests {
     }
 
     #[test]
-    fn blurclass_unknown_class_and_missing_model_fail_unsupported() {
+    fn blurclass_unknown_class_and_missing_model_fail_cleanly() {
         let engine = Engine;
         let err = engine
             .process_preferred(
@@ -4064,7 +4076,7 @@ mod tests {
                 ProcessContext::default(),
             )
             .unwrap_err();
-        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
     }
 
     #[test]
@@ -4144,8 +4156,8 @@ mod tests {
             .process(&face_scene(), &[face_crop_op()])
             .unwrap_err();
         match &err {
-            EngineError::Unsupported(msg) => assert!(msg.contains("face"), "{msg}"),
-            other => panic!("expected Unsupported, got {other:?}"),
+            EngineError::NotConfigured(msg) => assert!(msg.contains("face"), "{msg}"),
+            other => panic!("expected NotConfigured, got {other:?}"),
         }
     }
 
@@ -4254,8 +4266,8 @@ mod tests {
             )
             .unwrap_err();
         match &err {
-            EngineError::Unsupported(msg) => assert!(msg.contains("face"), "{msg}"),
-            other => panic!("expected Unsupported, got {other:?}"),
+            EngineError::NotConfigured(msg) => assert!(msg.contains("face"), "{msg}"),
+            other => panic!("expected NotConfigured, got {other:?}"),
         }
     }
 
@@ -4595,7 +4607,7 @@ mod tests {
         let engine = Engine;
         assert!(matches!(
             engine.process(&solid_png(10, 10, [0, 0, 0]), &[text_op()]),
-            Err(EngineError::Unsupported(msg)) if msg.contains("text is not configured")
+            Err(EngineError::NotConfigured(msg)) if msg.contains("text is not configured")
         ));
     }
 
