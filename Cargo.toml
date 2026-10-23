@@ -18,7 +18,7 @@ fast_image_resize = { version = "6.1", features = ["image"] }
 hex = "0.4"
 hmac = "0.13"
 jixel = "0.4"
-jpeg-encoder = "0.7"
+jpeg-encoder = { version = "0.7", features = ["simd"] }
 ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
 jxl-image-rs-integration = "0.8"
 jxl = "0.8"
