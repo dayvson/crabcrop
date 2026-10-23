@@ -111,6 +111,9 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // in effect at that point. (Same routing.)
             Filter::BlurRegion { .. } | Filter::PixelateRegion { .. } => {}
             Filter::Watermark { .. } => {}
+            // Overlays are applied by the engine, which owns
+            // the resolved images. (Same routing as above.)
+            Filter::Overlay { .. } => {}
             // Background removal is applied by the engine, which
             // owns the mask provider. (Same routing as above.)
             Filter::RemoveBg => {}
