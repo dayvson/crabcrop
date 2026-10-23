@@ -348,6 +348,8 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 | `source_width`, `source_height` | Source dimensions in pixels, after EXIF orientation. |
 | `ssimulacra2` | The verified perceptual score of the output, present when `quality(auto)` verified a JPEG or JPEG XL encode. 100 is identical. |
 
+Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other.
+
 Add the `placeholders` parameter to the media type to also get placeholder data, computed from the final processed pixels:
 
 ```bash
@@ -374,7 +376,7 @@ Signed URLs are content-addressed, so successful responses are cached and served
 
 ### Fallback image
 
-With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at startup), a source that cannot be fetched or decoded degrades to the fallback instead of an error: the fallback runs through the same operations and is served with `200` and the header `X-Crabcrop-Fallback: 1`. Signature and parse failures never fall back — a `403` or `400` stays honest — and neither does a source-policy refusal. Fallback responses are never cached, so a recovered origin is picked up on the next request. With no fallback configured, error behavior is unchanged.
+With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at startup), a source that cannot be fetched or decoded degrades to the fallback instead of an error: the fallback runs through the same operations and is served with `200` and the header `X-Crabcrop-Fallback: 1`. Signature and parse failures never fall back — a `403` or `400` stays honest — and neither does a source-policy refusal. Fallback responses are never cached, so a recovered origin is picked up on the next request; they are also served with `Cache-Control: no-store`, so a CDN or browser never pins the placeholder in place of the real image. With no fallback configured, error behavior is unchanged.
 
 ## Errors
 
