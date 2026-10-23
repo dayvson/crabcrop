@@ -313,6 +313,8 @@ Framework integrations in [`frameworks/`](frameworks) sit on the TypeScript buil
 
 The [playground](playground) is a static page (no build step, no server state) for building, signing, previewing, and debugging URLs in the browser: the secret never leaves the page, signatures verify locally, and pasted URLs are explained segment by segment with errors highlighted.
 
+For coding agents, [`sdks/mcp`](sdks/mcp) is a first-party MCP server (stdio, no dependencies) exposing `sign_url`, `explain_url`, `fetch_meta`, and `purge_result` over the same SDK and HTTP surface, configured with `CRABCROP_BASE` / `CRABCROP_SECRET`. Client setup snippets are in its README.
+
 ## Format negotiation
 
 When the URL names no `format(...)`, crabcrop picks the output format from the request's `Accept` header:

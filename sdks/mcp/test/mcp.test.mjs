@@ -1,0 +1,136 @@
+/**
+ * End-to-end test: spawns the MCP server and a real crabcrop
+ * binary and runs the full loop (sign, fetch, meta, purge).
+ *
+ * Precondition: the debug server binary is built
+ * (`cargo build` in the repository root). The image source is
+ * the repository's bench fixture, served locally.
+ */
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
+import { existsSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+
+const root = fileURLToPath(new URL("../../..", import.meta.url));
+const binary = `${root}target/debug/crabcrop`;
+
+function waitForHealth(port, path = "/health", tries = 50) {
+  return new Promise((resolve, reject) => {
+    const attempt = async (n) => {
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}${path}`);
+        if (resp.status < 500) return resolve();
+        throw new Error("not ok");
+      } catch {
+        if (n <= 0) return reject(new Error(`server on ${port} never became healthy`));
+        setTimeout(() => void attempt(n - 1), 200);
+      }
+    };
+    void attempt(tries);
+  });
+}
+
+class McpClient {
+  constructor(child) {
+    this.child = child;
+    this.nextId = 1;
+    this.pending = new Map();
+    const rl = createInterface({ input: child.stdout });
+    rl.on("line", (line) => {
+      const msg = JSON.parse(line);
+      const resolve = this.pending.get(msg.id);
+      if (resolve) {
+        this.pending.delete(msg.id);
+        resolve(msg.result);
+      }
+    });
+  }
+  request(method, params) {
+    const id = this.nextId++;
+    return new Promise((resolve) => {
+      this.pending.set(id, resolve);
+      this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    });
+  }
+  notify(method, params) {
+    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+  }
+  async call(name, args) {
+    const result = await this.request("tools/call", { name, arguments: args });
+    return result.content.map((c) => c.text).join("\n");
+  }
+}
+
+test("the MCP tools work end to end against a live server", { timeout: 90000 }, async () => {
+  assert.ok(existsSync(binary), "precondition: cargo build must have produced target/debug/crabcrop");
+
+  const server = spawn(binary, [], {
+    env: { ...process.env, CRABCROP_SECRET: "mcp-secret", PORT: "3323" },
+    stdio: "ignore",
+  });
+  const fixtureServer = spawn("python3", ["-m", "http.server", "8912"], {
+    cwd: `${root}../spikes/bench/fixtures`,
+    stdio: "ignore",
+  });
+  const mcp = spawn(
+    process.execPath,
+    ["--import", `${root}sdks/mcp/test/register.mjs`, `${root}sdks/mcp/src/index.ts`],
+    {
+      env: {
+        ...process.env,
+        CRABCROP_BASE: "http://127.0.0.1:3323",
+        CRABCROP_SECRET: "mcp-secret",
+      },
+      stdio: ["pipe", "pipe", "inherit"],
+    },
+  );
+  try {
+    await waitForHealth(3323);
+    await waitForHealth(8912, "/src00.jpg");
+    const client = new McpClient(mcp);
+
+    const init = await client.request("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "mcp-test", version: "0" },
+    });
+    assert.equal(init.serverInfo.name, "crabcrop");
+    client.notify("notifications/initialized", {});
+
+    const list = await client.request("tools/list", {});
+    assert.deepEqual(
+      list.tools.map((t) => t.name).sort(),
+      ["explain_url", "fetch_meta", "purge_result", "sign_url"],
+    );
+
+    const source = "http://127.0.0.1:8912/src00.jpg";
+    const url = await client.call("sign_url", { operations: "300x200", source });
+    const remainder = `300x200/${source}`;
+    const expectedSig = createHmac("sha256", "mcp-secret").update(remainder).digest("hex");
+    assert.equal(url, `http://127.0.0.1:3323/${expectedSig}/${remainder}`);
+
+    // The signed URL really serves, populating the cache.
+    const img = await fetch(url);
+    assert.equal(img.status, 200);
+    await img.arrayBuffer();
+
+    const meta = JSON.parse(await client.call("fetch_meta", { url }));
+    assert.equal(meta.width, 300);
+    assert.equal(meta.height, 200);
+
+    const explanation = await client.call("explain_url", { url });
+    assert.match(explanation, /signature \(hmac\)/);
+    assert.match(explanation, /resize to 300px wide by 200px high/);
+    assert.match(explanation, new RegExp(`source: ${source.replaceAll("/", "\\/")}`));
+
+    assert.equal(await client.call("purge_result", { path: remainder }), "purged 1");
+    assert.equal(await client.call("purge_result", { path: remainder }), "purged 0");
+  } finally {
+    mcp.kill();
+    fixtureServer.kill();
+    server.kill();
+  }
+});
