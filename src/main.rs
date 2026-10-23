@@ -429,6 +429,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         fallback,
         store,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        process_gate: Arc::new(tokio::sync::Semaphore::new(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        )),
         ssim_target,
         presets,
         only_presets,

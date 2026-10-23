@@ -65,6 +65,10 @@ pub struct AppState {
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent engine runs (audit E-5): cache misses
+    /// process on blocking threads under this gate, sized to
+    /// the core count at boot.
+    pub process_gate: Arc<tokio::sync::Semaphore>,
     /// SSIMULACRA2 target for verified `quality(auto)` encodes,
     /// from `CRABCROP_SSIM_TARGET`.
     pub ssim_target: f64,
@@ -184,6 +188,86 @@ async fn handle(
 }
 
 /// Run one image request, timing each stage into the returned record.
+/// An owned bundle for one engine run: everything
+/// [`crate::engine::ProcessContext`] borrows, owned so the work
+/// can move to a blocking thread (audit E-5).
+#[derive(Clone)]
+struct ProcessJob {
+    ops: Vec<crate::url::Operation>,
+    preferred: Option<ImageFormat>,
+    watermarks: crate::filters::WatermarkImages,
+    placeholders: bool,
+    mask_provider: Option<Arc<dyn crate::ai::MaskProvider>>,
+    upscale_provider: Option<Arc<dyn crate::ai::UpscaleProvider>>,
+    face_provider: Option<Arc<dyn crate::ai::FaceProvider>>,
+    text_renderer: Option<Arc<dyn crate::text::TextRenderer>>,
+    dpr: Option<f32>,
+    ssim_target: f64,
+}
+
+/// Why a gated engine run produced no image.
+#[derive(Debug)]
+enum ProcessFailure {
+    /// The engine's own error; fallback logic applies.
+    Engine(EngineError),
+    /// The process gate stayed saturated past its wait:
+    /// the request is shed with a 503.
+    Busy,
+    /// The engine panicked. The panic is contained at this
+    /// seam (audit E-8) and surfaces as a 500.
+    Panicked,
+}
+
+/// How long a cache miss may wait for a processing slot
+/// before the server sheds it with a 503.
+const PROCESS_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run the engine under the process gate on a blocking
+/// thread, so CPU-bound work neither stalls the async
+/// workers nor multiplies unboundedly under a burst of
+/// cache misses. Cache hits never reach this function.
+async fn run_process(
+    state: &AppState,
+    job: &ProcessJob,
+    bytes: &[u8],
+) -> Result<crate::engine::ProcessedImage, ProcessFailure> {
+    let permit = match tokio::time::timeout(
+        PROCESS_GATE_WAIT,
+        state.process_gate.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return Err(ProcessFailure::Busy),
+    };
+    let job = job.clone();
+    let bytes = bytes.to_vec();
+    let engine = state.engine;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let ctx = crate::engine::ProcessContext {
+            preferred: job.preferred,
+            watermarks: Some(&job.watermarks),
+            placeholders: job.placeholders,
+            mask_provider: job.mask_provider.as_deref(),
+            upscale_provider: job.upscale_provider.as_deref(),
+            face_provider: job.face_provider.as_deref(),
+            text_renderer: job.text_renderer.as_deref(),
+            dpr: job.dpr,
+            ssim_target: job.ssim_target,
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.process_preferred(&bytes, &job.ops, ctx)
+        })) {
+            Ok(Ok(processed)) => Ok(processed),
+            Ok(Err(e)) => Err(ProcessFailure::Engine(e)),
+            Err(_) => Err(ProcessFailure::Panicked),
+        }
+    })
+    .await
+    .unwrap_or(Err(ProcessFailure::Panicked))
+}
+
 async fn serve(
     state: &AppState,
     path: &str,
@@ -391,29 +475,48 @@ async fn serve(
     } else {
         None
     };
-    let ctx = crate::engine::ProcessContext {
+    let job = ProcessJob {
+        ops: ops.clone(),
         preferred,
-        watermarks: Some(&watermark_images),
+        watermarks: watermark_images,
         placeholders,
-        mask_provider: state.removebg.as_deref(),
-        upscale_provider: state.upscale.as_deref(),
-        face_provider: state.face.as_deref(),
-        text_renderer: state.font.as_deref(),
+        mask_provider: state.removebg.clone(),
+        upscale_provider: state.upscale.clone(),
+        face_provider: state.face.clone(),
+        text_renderer: state.font.clone(),
         dpr: dpr_hint,
         ssim_target: state.ssim_target,
     };
-    let processed = match state.engine.process_preferred(&bytes, &ops, ctx.clone()) {
+    let processed = match run_process(state, &job, &bytes).await {
         Ok(p) => p,
-        Err(e) => {
+        Err(ProcessFailure::Busy) => {
+            return (
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server busy: too many images processing at once",
+                )
+                    .into_response(),
+                record,
+            );
+        }
+        Err(ProcessFailure::Panicked) => {
+            record.fail = FailStage::Engine;
+            return (
+                (StatusCode::INTERNAL_SERVER_ERROR, "image processing failed").into_response(),
+                record,
+            );
+        }
+        Err(ProcessFailure::Engine(e)) => {
             record.process = process_start.elapsed();
             // A source that loads but does not decode is the
             // other fallback case. Other engine errors are
             // properties of the request or the configuration,
             // not of the source, and stay honest.
             let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
-                fallback_source_bytes(state)
-                    .await
-                    .and_then(|fb| state.engine.process_preferred(&fb, &ops, ctx).ok())
+                match fallback_source_bytes(state).await {
+                    Some(fb) => run_process(state, &job, &fb).await.ok(),
+                    None => None,
+                }
             } else {
                 None
             };
@@ -778,6 +881,7 @@ mod tests {
             fallback: None,
             store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             presets: std::collections::HashMap::new(),
             only_presets: false,
@@ -815,6 +919,7 @@ mod tests {
             fallback: Some(Fallback::Bytes(Arc::new(png))),
             store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             presets: std::collections::HashMap::new(),
             only_presets: false,
@@ -925,6 +1030,7 @@ mod tests {
             fallback: None,
             store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             presets,
             only_presets,
@@ -1294,6 +1400,7 @@ mod tests {
                 crate::storage::DiskStore::open(dir, 16 * 1024 * 1024).unwrap(),
             )),
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             presets: std::collections::HashMap::new(),
             only_presets: false,
@@ -1367,6 +1474,57 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "purged: origin refetched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn processing_gate_bounds_concurrency() {
+        // A state whose single process permit the test holds:
+        // a gated run must wait, then proceed once released
+        // (audit E-5).
+        let state = AppState {
+            secret: SECRET.to_vec(),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            font: None,
+            fallback: None,
+            store: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+        };
+        let job = ProcessJob {
+            ops: Vec::new(),
+            preferred: None,
+            watermarks: crate::filters::WatermarkImages::new(),
+            placeholders: false,
+            mask_provider: None,
+            upscale_provider: None,
+            face_provider: None,
+            text_renderer: None,
+            dpr: None,
+            ssim_target: state.ssim_target,
+        };
+        let held = state.process_gate.clone().acquire_owned().await.unwrap();
+        let png = test_png();
+        let waiting = run_process(&state, &job, &png);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "the gated run must wait while the only permit is held"
+        );
+        drop(held);
+        let processed = waiting.await.unwrap();
+        assert_eq!((processed.width, processed.height), (40, 30));
     }
 
     #[tokio::test]
