@@ -41,6 +41,9 @@ class StubElement {
   get src() {
     return this._src;
   }
+  removeAttribute(name) {
+    if (name === "src") this._src = undefined;
+  }
 }
 
 const ids = [
@@ -105,4 +108,20 @@ test("the explainer verifies the built URL, then catches a tamper", async () => 
   elements["explain-input"].value = elements.built.value.replace("300x200", "400x200");
   await elements["explain-input"].dispatch("input");
   assert.match(await verdict(), /does NOT verify/);
+});
+
+test("a builder error is surfaced and clears the stale build", async () => {
+  // A source carrying a query string is routine to paste
+  // and the builder throws on it by design: the page must
+  // say so and drop the previous URL and preview, not
+  // silently keep showing them.
+  assert.ok(elements.built.value, "a valid build exists before the error");
+  elements.source.value = "http://127.0.0.1:8909/src00.jpg?w=300";
+  await elements.source.dispatch("input");
+  for (let i = 0; i < 50 && elements.built.value; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(elements.built.value, "");
+  assert.equal(elements.preview.src, undefined);
+  assert.match(elements.sizes.textContent, /Cannot build a URL from these inputs/);
 });
