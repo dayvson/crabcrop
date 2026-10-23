@@ -6,7 +6,9 @@
 //! The verbs use the server's own URL grammar, so what the
 //! CLI validates is what the server will do.
 
-use crate::url::{Dimension, Filter, ImageFormat, Operation, Signature};
+use crate::url::{
+    Dimension, Filter, FlipDirection, ImageFormat, MaskShape, Operation, Quality, Signature,
+};
 
 const USAGE: &str = "\
 crabcrop: on-demand image optimization service
@@ -301,7 +303,7 @@ fn describe_filter(filter: &Filter) -> String {
         Filter::Blur(v) => format!("blur({v}): gaussian blur"),
         Filter::Brighten(v) => format!("brighten({v}): adjust brightness"),
         Filter::Contrast(v) => format!("contrast({v}): adjust contrast"),
-        Filter::HueRotate(v) => format!("hue_rotate({v}): rotate the hue"),
+        Filter::HueRotate(v) => format!("huerotate({v}): rotate the hue"),
         Filter::Sharpen(v) => format!("sharpen({v}): sharpen"),
         Filter::Saturation(v) => format!("saturation({v}): adjust saturation"),
         Filter::Rgb(r, g, b) => format!("rgb({r},{g},{b}): shift the channels"),
@@ -340,14 +342,26 @@ fn describe_filter(filter: &Filter) -> String {
             corners[0], corners[1], corners[2], corners[3]
         ),
         Filter::Border(w, c) => format!("border({w}, {}): paint an inside border", hex3(*c)),
-        Filter::Mask(shape) => format!("mask({shape:?}): clip to a shape, keeping alpha"),
+        Filter::Mask(shape) => format!(
+            "mask({}): clip to a shape, keeping alpha",
+            match shape {
+                MaskShape::Circle => "circle",
+                MaskShape::Ellipse => "ellipse",
+            }
+        ),
         Filter::Sepia => "sepia: sepia tone".into(),
         Filter::Duotone(a, b) => {
             format!("duotone({}, {}): two-tone gradient map", hex3(*a), hex3(*b))
         }
         Filter::Monochrome(c) => format!("monochrome({}): single-hue tint", hex3(*c)),
         Filter::Pixelate(v) => format!("pixelate({v}): mosaic into blocks"),
-        Filter::Flip(d) => format!("flip({d:?}): mirror the image"),
+        Filter::Flip(d) => format!(
+            "flip({}): mirror the image",
+            match d {
+                FlipDirection::Horizontal => "h",
+                FlipDirection::Vertical => "v",
+            }
+        ),
         Filter::BlurRegion { x, y, w, h } => {
             format!("blur_region({x},{y},{w},{h}): blur one rectangle")
         }
@@ -355,7 +369,10 @@ fn describe_filter(filter: &Filter) -> String {
             format!("pixelate_region({x},{y},{w},{h}): pixelate one rectangle")
         }
         Filter::MaxBytes(v) => format!("max_bytes({v}): cap the output size in bytes"),
-        Filter::Quality(q) => format!("quality({q:?}): encode quality"),
+        Filter::Quality(q) => match q {
+            Quality::Auto => "quality(auto): encode quality".into(),
+            Quality::Value(v) => format!("quality({v}): encode quality"),
+        },
         Filter::Format(f) => format!("format({}): output as {}", format_name(*f), format_name(*f)),
         Filter::NoUpscale => "no_upscale: never enlarge past the source".into(),
     }
@@ -1066,6 +1083,30 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn described_filters_round_trip_through_the_parser() {
+        // explain's spellings must be grammar: the text
+        // before the colon is a filter segment the parser
+        // itself accepts (review CL-5).
+        for filter in [
+            Filter::HueRotate(90),
+            Filter::Flip(FlipDirection::Horizontal),
+            Filter::Flip(FlipDirection::Vertical),
+            Filter::Quality(Quality::Value(80)),
+            Filter::Quality(Quality::Auto),
+            Filter::Mask(MaskShape::Circle),
+            Filter::Mask(MaskShape::Ellipse),
+        ] {
+            let described = describe_filter(&filter);
+            let spelling = described.split(':').next().unwrap();
+            let rest = format!("filters:{spelling}/https://e.com/a.jpg");
+            assert!(
+                crate::url::parse_operations(&rest).is_ok(),
+                "{spelling} did not re-parse"
+            );
+        }
     }
 
     #[tokio::test]
