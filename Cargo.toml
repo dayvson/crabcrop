@@ -24,7 +24,7 @@ jxl-image-rs-integration = "0.8"
 jxl = "0.8"
 kamadak-exif = "0.6"
 oxideav-webp = { version = "0.3.1", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 resvg = "0.45"
 roxmltree = "0.20"
 sha2 = "0.11"
