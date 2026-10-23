@@ -177,6 +177,25 @@ fn parse_presets(text: &str) -> Result<std::collections::HashMap<String, String>
 /// environment. Half-configured credentials and a file root
 /// that does not exist are startup errors, under the same
 /// strict-config rule as everything else here.
+/// Fail closed on bucket access (security audit L-1): when
+/// signing credentials are configured, bucket fetches sign as
+/// the server, so an unset allowlist would make the server a
+/// signing oracle for every bucket its identity can read.
+/// With credentials present the allowlist must be explicit;
+/// `*` is the deliberate any-bucket opt-in.
+fn check_bucket_policy(has_credentials: bool, allowed_buckets: &[String]) -> Result<(), String> {
+    if has_credentials && allowed_buckets.is_empty() {
+        return Err(
+            "bucket credentials are configured but CRABCROP_ALLOWED_BUCKETS is unset: \
+             refusing to boot, because signed bucket fetches would reach every bucket \
+             the credentials can read. Set CRABCROP_ALLOWED_BUCKETS to a comma-separated \
+             list, or to * to deliberately allow all buckets."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn build_source_config() -> Result<SourceConfig, String> {
     let mut sources = SourceConfig::default();
     let nonempty = |name: &str| env::var(name).ok().filter(|v| !v.is_empty());
@@ -225,6 +244,10 @@ fn build_source_config() -> Result<SourceConfig, String> {
                 .collect()
         })
         .unwrap_or_default();
+    check_bucket_policy(
+        sources.aws_creds.is_some() || sources.gcs_creds.is_some(),
+        &sources.allowed_buckets,
+    )?;
     if let Some(root) = nonempty("CRABCROP_FILE_ROOT") {
         let canonical = std::fs::canonicalize(&root)
             .map_err(|e| format!("CRABCROP_FILE_ROOT is not usable: {e}"))?;
@@ -419,6 +442,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_policy_fails_closed_with_credentials() {
+        assert!(check_bucket_policy(false, &[]).is_ok());
+        assert!(check_bucket_policy(false, &["photos".to_string()]).is_ok());
+        assert!(check_bucket_policy(true, &["photos".to_string()]).is_ok());
+        assert!(check_bucket_policy(true, &["*".to_string()]).is_ok());
+        let err = check_bucket_policy(true, &[]).unwrap_err();
+        assert!(err.contains("CRABCROP_ALLOWED_BUCKETS"), "{err}");
+    }
 
     #[test]
     fn secrets_below_the_minimum_are_rejected() {

@@ -88,7 +88,7 @@ Three more source kinds cover originals that do not live behind a public URL:
 - `gs://bucket/key`: the same, against Google Cloud Storage's S3-compatible XML API, signed with the HMAC pair `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY` when set.
 - `file:///path`: a local file under `CRABCROP_FILE_ROOT`. The path is canonicalized per request and must stay under the root, so `..` segments and symlink escapes are refused. Unset root disables file sources.
 
-Bucket sources are gated by `CRABCROP_ALLOWED_BUCKETS` rather than the host policy, since the endpoint is operator configuration, not request input. Store responses are not redirected: a 3xx from a store surfaces as its status code.
+Bucket sources are gated by `CRABCROP_ALLOWED_BUCKETS` rather than the host policy, since the endpoint is operator configuration, not request input. When signing credentials are configured, the allowlist is required: the server refuses to boot without it, because signed fetches would otherwise reach every bucket the credentials can read. List `*` to deliberately allow all buckets. Store responses are not redirected: a 3xx from a store surfaces as its status code.
 
 JPEG, PNG, WebP, GIF, and JPEG XL sources are decoded. EXIF orientation is applied before any operation runs, so phone photos come out upright. Animated GIFs keep their frames when the output format is GIF; converting an animated GIF to a still format uses the first frame. HEIC/HEIF sources are rejected, and AVIF sources cannot be decoded in this build (AVIF is an output-only format here); both fail with `502`.
 
@@ -429,7 +429,7 @@ All configuration comes from environment variables. Invalid values for the numer
 | `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | `1` or `true` refuses sources whose host is, or resolves to, a loopback, private, link-local, or unspecified address. Checked before connecting and again on every redirect hop. |
 | `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |
 | `CRABCROP_GCS_ENDPOINT` | `https://storage.googleapis.com` | Base URL of the GCS XML API for `gs://` sources. `CRABCROP_GCS_REGION` (default `auto`) is the signing region; the HMAC pair is `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY`. |
-| `CRABCROP_ALLOWED_BUCKETS` | unset (all buckets) | Comma-separated bucket names the `s3://` and `gs://` schemes may read. |
+| `CRABCROP_ALLOWED_BUCKETS` | unset | Comma-separated bucket names the `s3://` and `gs://` schemes may read; `*` allows all. Required when bucket credentials are configured (the server refuses to boot without it); without credentials, unset means all buckets, fetched unsigned. |
 | `CRABCROP_FILE_ROOT` | unset | Directory that `file://` sources must stay under, canonicalized at boot and per request. Unset disables file sources. |
 | `CRABCROP_REMOVEBG_MODEL` | unset | Path to a U²-Net-family ONNX model for the `removebg` filter. See [AI features](#ai-features). |
 | `CRABCROP_UPSCALE_MODEL` | unset | Path to a super-resolution ONNX model for the `upscale` filter. See [AI features](#ai-features). |
