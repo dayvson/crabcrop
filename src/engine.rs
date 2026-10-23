@@ -859,7 +859,14 @@ fn check_region(
     h: u32,
     img: &DynamicImage,
 ) -> Result<(), EngineError> {
-    if x + w > img.width() || y + h > img.height() {
+    // The coordinates are parser-supplied u32s: plain
+    // addition can wrap (release) or panic (debug) before
+    // the comparison ever runs, so compare the far edge
+    // with checked arithmetic.
+    let in_bounds = x.checked_add(w).is_some_and(|right| right <= img.width())
+        && y.checked_add(h)
+            .is_some_and(|bottom| bottom <= img.height());
+    if !in_bounds {
         return Err(EngineError::Unsupported(format!(
             "{name}({x},{y},{w},{h}) exceeds image bounds {}x{}",
             img.width(),
@@ -2011,6 +2018,23 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("blur_region(90,70,20,20) exceeds image bounds 100x80"),
+            "got: {err}"
+        );
+        // Near-MAX coordinates must error, not wrap the
+        // bounds check (or panic on it in debug builds).
+        let err = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::BlurRegion {
+                    x: u32::MAX - 10,
+                    y: 0,
+                    w: 20,
+                    h: 10,
+                }])],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds image bounds 100x80"),
             "got: {err}"
         );
         // Bounds are the size at the point the filter runs:
