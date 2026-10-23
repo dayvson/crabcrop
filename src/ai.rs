@@ -634,7 +634,7 @@ impl OnnxClipProvider {
         let mut label_embeddings: Vec<f32> = Vec::new();
         let mut dim = 0usize;
         for label in &labels {
-            let (ids, mask) = tokenizer.encode(label);
+            let (ids, mask) = tokenizer.encode(label)?;
             let emb = run_text(&mut text, &text_inputs, &ids, &mask)?;
             if dim == 0 {
                 dim = emb.len();
