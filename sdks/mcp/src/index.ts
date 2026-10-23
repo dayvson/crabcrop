@@ -16,6 +16,7 @@
  *
  * Run: node src/index.ts   (Node >= 22, for type stripping)
  */
+import { createHmac } from "node:crypto";
 import { createInterface } from "node:readline";
 import { buildURL, sign } from "@crabcrop/url";
 // The explainer is the playground's module: one implementation
@@ -213,7 +214,11 @@ const TOOLS = [
       if (!base) throw new Error("no base: pass the base argument or set CRABCROP_BASE");
       if (!secret) throw new Error("purge requires a secret: pass the secret argument or set CRABCROP_SECRET");
       const target = String(args.path).replace(/^\//, "");
-      const signature = sign(secret, `purge/${target}`);
+      // Purge signatures are domain-separated (audit P-1): the
+      // key is the raw HMAC of the secret over a fixed label,
+      // and the signature is the HMAC of the target under it.
+      const subkey = Buffer.from(sign(secret, "crabcrop/purge-key"), "hex");
+      const signature = createHmac("sha256", subkey).update(target, "utf8").digest("hex");
       const resp = await fetch(`${base}/purge/${signature}/${target}`, { method: "POST" });
       const body = (await resp.text()).trim();
       if (!resp.ok) {

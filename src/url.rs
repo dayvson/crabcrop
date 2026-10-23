@@ -1057,6 +1057,44 @@ pub fn verify(secret: &[u8], signature: &Signature, remainder: &str, allow_unsaf
     }
 }
 
+/// Derive the purge signing key from the server secret.
+///
+/// Purge signatures live in their own domain (security audit
+/// P-1): they are HMACs under this derived key, never under the
+/// secret itself, so a signature minted for an image URL can
+/// never be replayed against the purge endpoint, even when the
+/// image remainder begins with `purge/`. Before this change the
+/// purge scheme signed the literal `purge/<target>` with the
+/// secret, which is exactly an image signature over a remainder
+/// of that shape.
+pub fn purge_key(secret: &[u8]) -> Vec<u8> {
+    // `sign` returns the hex tag; the key is its raw bytes.
+    hex::decode(crabcrop_url::sign(secret, "crabcrop/purge-key"))
+        .expect("sign returns lowercase hex")
+}
+
+/// The purge signature for a target path: HMAC-SHA256 of the
+/// path alone, under the derived purge key. The server only
+/// verifies; this mints, for operators and tests.
+#[allow(dead_code)]
+pub fn purge_signature(secret: &[u8], target: &str) -> String {
+    crabcrop_url::sign(&purge_key(secret), target)
+}
+
+/// Verify a purge signature, with the same unsafe semantics
+/// as [`verify`].
+pub fn verify_purge(
+    secret: &[u8],
+    signature: &Signature,
+    target: &str,
+    allow_unsafe: bool,
+) -> bool {
+    match signature {
+        Signature::Unsafe => allow_unsafe,
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(&purge_key(secret), hex_digest, target),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,6 +1164,29 @@ mod tests {
             parse_signature("/unsafe/filters:grayscale()/https://example.com/a/b/c.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
         assert_eq!(rest, "filters:grayscale()/https://example.com/a/b/c.jpg");
+    }
+
+    #[test]
+    fn purge_signatures_are_domain_separated() {
+        let secret = b"test-secret";
+        let target = "300x200/https://example.com/a.jpg";
+        let purge_sig = purge_signature(secret, target);
+        // The replay from audit P-1: an image signature over
+        // "purge/<target>" must not verify as a purge signature.
+        let image_sig = crabcrop_url::sign(secret, &format!("purge/{target}"));
+        assert_ne!(purge_sig, image_sig);
+        assert!(verify_purge(
+            secret,
+            &Signature::Hmac(purge_sig),
+            target,
+            false
+        ));
+        assert!(!verify_purge(
+            secret,
+            &Signature::Hmac(image_sig),
+            target,
+            false
+        ));
     }
 
     #[test]
