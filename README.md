@@ -339,7 +339,7 @@ Point `CRABCROP_PRESETS_FILE` at it, and requests can use `preset:<name>` anywhe
 curl "http://localhost:3000/<signature>/preset:og-card/https://example.com/photo.jpg"
 ```
 
-The signature covers the preset reference; the server expands it deterministically after verification. Cache entries key on the expanded operations, so editing a preset takes effect on the next request with no purging (and purging names the expanded form). An unknown preset name is a `400`. Preset definitions are validated at startup: malformed entries refuse the boot, and presets cannot contain a source segment, an `exp:`, or another preset.
+The signature covers the preset reference; the server expands it deterministically after verification, and cache entries key on the expanded operations. Treat a preset as a stable template: **never edit a definition in place**. Roll a change out under a new name (`thumb2`) and update your templates to reference it. Editing in place changes the bytes behind URLs already signed and shared, and image responses travel with `Cache-Control: immutable` for a year, so browsers and CDNs holding the old response keep serving it, beyond the reach of any purge. (This server's own caches are not the problem: they key on the expanded form, so they would pick the edit up. Downstream copies are the ones stranded.) Purging accepts the preset URL itself, exactly as an operator holds it; the server expands it before matching entries, and `/purge-group` clears a preset's whole output set at once. An unknown preset name is a `400`. Preset definitions are validated at startup: malformed entries refuse the boot, and presets cannot contain a source segment, an `exp:`, or another preset.
 
 With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: requests may use preset references, `exp:` metadata, and bare sources only. The mode does not change signature rules. Combined with `CRABCROP_ALLOW_UNSAFE=1` it makes a public deployment where browsers and CMSs can build URLs from preset names alone, with no secret to hold and no way to invent a transform.
 
@@ -348,8 +348,8 @@ With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: re
 The URL grammar and signing scheme are specified in [`spec/url-signing.md`](spec/url-signing.md), with a canonical set of test vectors in [`spec/test-vectors.json`](spec/test-vectors.json) that every implementation runs as its test suite. Builders on top of the spec:
 
 - **Rust**: the `crabcrop-url` crate in this workspace (`crates/crabcrop-url`) with `sign`, `verify`, `build_url`, and `build_srcset`. The server verifies with this same crate, so client and server cannot drift.
-- **TypeScript**: [`sdks/typescript`](sdks/typescript), `@crabcrop/url`, with `sign`, `buildURL`, and `buildSrcSet`. Standard library only; tests run on `node --test`.
-- **Python**: [`sdks/python`](sdks/python), `crabcrop_url`, with `sign`, `build_url`, and `build_srcset`. Standard library only; tests run on `python3 -m unittest`.
+- **TypeScript**: [`sdks/typescript`](sdks/typescript), `@crabcrop/url`, with `sign`, `verifyUrlSignature`, `buildURL`, and `buildSrcSet`. Standard library only; tests run on `node --test`.
+- **Python**: [`sdks/python`](sdks/python), `crabcrop_url`, with `sign`, `verify`, `build_url`, and `build_srcset`. Standard library only; tests run on `python3 -m unittest`.
 
 All three take an optional expiry (emitted as a leading `exp:` segment) and a null secret for the `unsafe` form used by unsafe and presets-only deployments.
 

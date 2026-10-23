@@ -55,6 +55,8 @@ onlyPresets: false
 
 The map renders a ConfigMap the chart mounts as the presets file and wires through `CRABCROP_PRESETS_FILE`. Preset names also become cache groups (the `Cache-Group` header), so `crabcrop purge-group thumb` invalidates a preset's whole output set at once.
 
+Treat a preset as a stable template: never edit a definition in place. Roll a change out under a new name and update templates to reference it. Image responses are served `immutable` for a year, so an in-place edit strands the old bytes in every browser and CDN that already holds them, where no purge can reach.
+
 ## AI variant
 
 ```yaml
