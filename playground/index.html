@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crabcrop playground</title>
+<style>
+  :root { color-scheme: light dark; --bad: #c0392b; --ok: #1e8449; --mut: #777; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 880px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: .25rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; }
+  .note { color: var(--mut); font-size: .92rem; }
+  .card { border: 1px solid #8884; border-radius: 10px; padding: 1rem 1.25rem; margin-top: 1rem; }
+  label { display: block; font-weight: 600; margin-top: .8rem; font-size: .92rem; }
+  input[type=text], input[type=password], select, textarea {
+    width: 100%; box-sizing: border-box; padding: .45rem .55rem; margin-top: .25rem;
+    border: 1px solid #8886; border-radius: 6px; font: inherit; font-size: .95rem;
+  }
+  textarea { min-height: 3.2rem; word-break: break-all; }
+  .chips { margin-top: .4rem; display: flex; flex-wrap: wrap; gap: .35rem; }
+  .chips button { font: inherit; font-size: .82rem; padding: .18rem .55rem; border-radius: 999px; border: 1px solid #8886; background: transparent; cursor: pointer; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+  img.preview { max-width: 100%; border-radius: 8px; margin-top: .8rem; background: repeating-conic-gradient(#8882 0% 25%, transparent 0% 50%) 0 0/16px 16px; }
+  .seg { border-left: 3px solid #8886; padding: .35rem .6rem; margin: .45rem 0; }
+  .seg.error { border-left-color: var(--bad); }
+  .seg code { font-weight: 600; }
+  .seg .kind { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; color: var(--mut); }
+  .seg .detail { font-size: .92rem; }
+  .err { color: var(--bad); font-weight: 600; }
+  .ok { color: var(--ok); font-weight: 600; }
+  button.action { font: inherit; padding: .45rem .9rem; border-radius: 6px; border: 1px solid #8886; background: transparent; cursor: pointer; margin-top: .6rem; }
+</style>
+</head>
+<body>
+<h1>crabcrop playground</h1>
+<p class="note">
+  Build, sign, preview, and debug crabcrop URLs entirely in your browser.
+  <strong>Your secret never leaves this page:</strong> signing happens locally with
+  WebCrypto, the secret is never stored and never sent to any server, and the only
+  network requests this page makes are to the crabcrop endpoint and image sources
+  you enter. The scheme is the one in <code>spec/url-signing.md</code>.
+</p>
+
+<div class="card">
+  <h2 style="margin-top:0">Build a URL</h2>
+  <div class="row">
+    <div>
+      <label for="base">crabcrop endpoint</label>
+      <input type="text" id="base" value="http://localhost:3000">
+    </div>
+    <div>
+      <label for="secret">secret (blank = unsafe)</label>
+      <input type="password" id="secret" autocomplete="off" placeholder="your CRABCROP_SECRET">
+    </div>
+  </div>
+  <label for="source">source image</label>
+  <input type="text" id="source" value="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Fronalpstock_big.jpg/640px-Fronalpstock_big.jpg">
+  <label for="operations">operations</label>
+  <input type="text" id="operations" value="crop:1200x630:smart/filters:format(webp):quality(80)">
+  <div class="chips" id="chips"></div>
+  <div class="row">
+    <div>
+      <label for="preset">preset name (optional)</label>
+      <input type="text" id="preset" placeholder="og-card">
+    </div>
+    <div>
+      <label for="expiry">expiry</label>
+      <select id="expiry">
+        <option value="">never</option>
+        <option value="3600">in 1 hour</option>
+        <option value="86400">in 24 hours</option>
+        <option value="604800">in 7 days</option>
+      </select>
+    </div>
+  </div>
+  <label for="built">your URL</label>
+  <textarea id="built" readonly></textarea>
+  <button class="action" id="copy">Copy URL</button>
+  <div>
+    <img class="preview" id="preview" alt="Processed preview">
+  </div>
+  <p class="note" id="sizes"></p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Explain a URL</h2>
+  <label for="explain-input">paste any crabcrop URL</label>
+  <textarea id="explain-input" placeholder="http://localhost:3000/<signature>/300x200/https://example.com/photo.jpg"></textarea>
+  <button class="action" id="explain-built">Explain the URL built above</button>
+  <div id="explanation"></div>
+  <p id="verify-line"></p>
+</div>
+
+<p class="note">
+  Docs: the repository README and <code>spec/url-signing.md</code>. Presets expand
+  server-side, so the debugger shows the reference, not the expansion.
+</p>
+
+<script type="module" src="./app.mjs"></script>
+</body>
+</html>
