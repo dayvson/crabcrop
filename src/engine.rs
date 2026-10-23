@@ -10,7 +10,7 @@ use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use crate::filters::{EncodeOptions, WatermarkImages, apply_filters};
 use crate::quality::auto_quality;
-use crate::url::{Align, Dimension, Filter, ImageFormat, ImageSize, Operation, Quality};
+use crate::url::{Align, Dimension, Filter, ImageFormat, ImageSize, Operation, PadFill, Quality};
 
 /// Register the JPEG XL decoder with the image crate, once.
 ///
@@ -549,6 +549,19 @@ fn apply_operations(
         match op {
             Operation::Size(size) => img = apply_size(img, size, cap, dpr),
             Operation::FitIn(size) => img = apply_fit_in(img, size, cap, dpr),
+            Operation::Pad { size, fill } => {
+                let (tw, th) = match (size.width, size.height) {
+                    (Dimension::Pixels(w), Dimension::Pixels(h)) => {
+                        (scale_px(w, dpr), scale_px(h, dpr))
+                    }
+                    _ => {
+                        return Err(EngineError::Unsupported(
+                            "pad with non-pixel dimensions".to_string(),
+                        ));
+                    }
+                };
+                img = apply_pad(img, tw, th, *fill, ops, cap);
+            }
             Operation::CropRect {
                 left,
                 top,
@@ -1181,6 +1194,64 @@ pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImag
 /// Scale proportionally to fit inside the `fit-in` box, preserving
 /// aspect and never distorting. A 0 dimension bounds nothing;
 /// `orig` bounds at the source dimension (a scale of 1).
+/// Pad `img` to exactly `target_w` x `target_h`: fit the image
+/// inside the box (the fit-in rules, `no_upscale` cap included),
+/// center it, and fill the rest of the canvas: a solid color
+/// (the pad segment's own, or the request's `fill(...)`
+/// directive, or black), or a blurred cover-scaled copy of the
+/// image itself.
+fn apply_pad(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    fill: PadFill,
+    ops: &[Operation],
+    cap: Option<(u32, u32)>,
+) -> DynamicImage {
+    if target_w == 0 || target_h == 0 {
+        return img;
+    }
+    let fitted = apply_fit_in(
+        img.clone(),
+        &ImageSize {
+            width: Dimension::Pixels(target_w),
+            height: Dimension::Pixels(target_h),
+            flip_horizontal: false,
+            flip_vertical: false,
+        },
+        cap,
+        1.0,
+    );
+    if fitted.width() == target_w && fitted.height() == target_h {
+        return fitted;
+    }
+    let color = match fill {
+        PadFill::Color(c) => Some(c),
+        PadFill::Directive => Some(crate::url::explicit_fill(ops).unwrap_or([0, 0, 0])),
+        PadFill::Blur => None,
+    };
+    let canvas = match color {
+        Some(c) => DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            target_w,
+            target_h,
+            image::Rgba([c[0], c[1], c[2], 255]),
+        )),
+        None => {
+            // Ambient bars: the image scaled to cover the whole
+            // canvas, then blurred hard enough that only its
+            // broad colors survive.
+            let sigma = ((target_w.max(target_h) as f32) / 16.0).clamp(2.0, 80.0);
+            img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle)
+                .blur(sigma)
+        }
+    };
+    let mut base = canvas.to_rgba8();
+    let x = (target_w - fitted.width()) / 2;
+    let y = (target_h - fitted.height()) / 2;
+    image::imageops::overlay(&mut base, &fitted.to_rgba8(), x as i64, y as i64);
+    DynamicImage::ImageRgba8(base)
+}
+
 fn apply_fit_in(
     img: DynamicImage,
     size: &ImageSize,
@@ -3008,6 +3079,133 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn pad_op(w: u32, h: u32, fill: PadFill) -> Operation {
+        Operation::Pad {
+            size: ImageSize {
+                width: Dimension::Pixels(w),
+                height: Dimension::Pixels(h),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            fill,
+        }
+    }
+
+    fn decoded(out: &ProcessedImage) -> image::RgbImage {
+        image::load_from_memory(&out.bytes).unwrap().to_rgb8()
+    }
+
+    #[test]
+    fn pad_portrait_into_landscape_defaults_to_black() {
+        let engine = Engine;
+        // 100x200 red into 200x100: fits at 50x100, centered,
+        // so x 75..125 is red and the rest is black.
+        let out = engine
+            .process(
+                &solid_png(100, 200, [255, 0, 0]),
+                &[pad_op(200, 100, PadFill::Directive)],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (200, 100));
+        let img = decoded(&out);
+        assert_eq!(img.get_pixel(100, 50), &image::Rgb([255, 0, 0]));
+        assert_eq!(img.get_pixel(124, 50), &image::Rgb([255, 0, 0]));
+        assert_eq!(img.get_pixel(74, 50), &image::Rgb([0, 0, 0]));
+        assert_eq!(img.get_pixel(125, 50), &image::Rgb([0, 0, 0]));
+        assert_eq!(img.get_pixel(0, 0), &image::Rgb([0, 0, 0]));
+    }
+
+    #[test]
+    fn pad_landscape_into_portrait_with_a_color() {
+        let engine = Engine;
+        // 200x100 blue into 100x200 with orange bars: fits at
+        // 100x50, centered vertically at y 75..125.
+        let out = engine
+            .process(
+                &solid_png(200, 100, [0, 0, 255]),
+                &[pad_op(100, 200, PadFill::Color([255, 136, 0]))],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (100, 200));
+        let img = decoded(&out);
+        assert_eq!(img.get_pixel(50, 100), &image::Rgb([0, 0, 255]));
+        assert_eq!(img.get_pixel(50, 74), &image::Rgb([255, 136, 0]));
+        assert_eq!(img.get_pixel(50, 125), &image::Rgb([255, 136, 0]));
+    }
+
+    #[test]
+    fn pad_uses_the_fill_directive_in_either_order() {
+        let engine = Engine;
+        for ops in [
+            vec![
+                Operation::Filters(vec![Filter::Fill([0, 0, 255])]),
+                pad_op(200, 100, PadFill::Directive),
+            ],
+            vec![
+                pad_op(200, 100, PadFill::Directive),
+                Operation::Filters(vec![Filter::Fill([0, 0, 255])]),
+            ],
+        ] {
+            let out = engine
+                .process(&solid_png(100, 200, [0, 200, 0]), &ops)
+                .unwrap();
+            let img = decoded(&out);
+            assert_eq!(img.get_pixel(0, 0), &image::Rgb([0, 0, 255]));
+            assert_eq!(img.get_pixel(100, 50), &image::Rgb([0, 200, 0]));
+        }
+    }
+
+    #[test]
+    fn pad_blur_bars_are_ambient() {
+        let engine = Engine;
+        // Left half red, right half blue, 100x100 into 200x100:
+        // the image sits at x 50..150 unscaled; the bars are the
+        // blurred cover copy, red-dominant on the left.
+        let mut src = image::RgbImage::new(100, 100);
+        for (x, _y, p) in src.enumerate_pixels_mut() {
+            *p = if x < 50 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        let out = engine
+            .process(
+                &png_bytes(&DynamicImage::ImageRgb8(src)),
+                &[pad_op(200, 100, PadFill::Blur)],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (200, 100));
+        let img = decoded(&out);
+        // The fitted image itself is exact in the middle.
+        assert_eq!(img.get_pixel(60, 50), &image::Rgb([255, 0, 0]));
+        assert_eq!(img.get_pixel(140, 50), &image::Rgb([0, 0, 255]));
+        // The left bar is a blurred wash: red leads, but the
+        // pure source red is softened by the blur.
+        let bar = img.get_pixel(10, 50);
+        assert!(bar[0] > 140 && bar[2] < 110, "bar {bar:?}");
+        let right_bar = img.get_pixel(190, 50);
+        assert!(
+            right_bar[2] > 140 && right_bar[0] < 110,
+            "bar {right_bar:?}"
+        );
+    }
+
+    #[test]
+    fn pad_with_a_matching_aspect_changes_nothing() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &solid_png(200, 100, [10, 20, 30]),
+                &[pad_op(200, 100, PadFill::Color([255, 255, 255]))],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (200, 100));
+        let img = decoded(&out);
+        assert_eq!(img.get_pixel(0, 0), &image::Rgb([10, 20, 30]));
+        assert_eq!(img.get_pixel(199, 99), &image::Rgb([10, 20, 30]));
     }
 
     /// A renderer that stamps one white pixel at the origin:

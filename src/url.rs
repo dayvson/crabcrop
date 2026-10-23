@@ -42,6 +42,9 @@ pub enum ParseError {
     /// `crop-rect:<left>x<top>:<right>x<bottom>` with right > left
     /// and bottom > top. Carries the offending segment.
     InvalidCropRect(String),
+    /// A `pad:...` segment did not match `pad:<WxH>[:<fill>]`.
+    /// Carries the offending segment.
+    InvalidPad(String),
     /// A `filters:...` segment did not parse. Carries the offending
     /// segment.
     InvalidFilters(String),
@@ -59,6 +62,7 @@ impl std::fmt::Display for ParseError {
             ParseError::InvalidCropRect(seg) => {
                 write!(f, "invalid crop-rect segment: {seg}")
             }
+            ParseError::InvalidPad(seg) => write!(f, "invalid pad segment: {seg}"),
             ParseError::InvalidFilters(seg) => {
                 write!(f, "invalid filters segment: {seg}")
             }
@@ -90,6 +94,19 @@ pub struct ImageSize {
     pub height: Dimension,
     pub flip_horizontal: bool,
     pub flip_vertical: bool,
+}
+
+/// How `pad` fills the canvas around the fitted image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadFill {
+    /// A solid RGB color.
+    Color([u8; 3]),
+    /// A blurred, cover-scaled copy of the image itself
+    /// (ambient bars).
+    Blur,
+    /// The request's `fill(...)` directive color, or black
+    /// when the request names none.
+    Directive,
 }
 
 /// Where the crop keeps the image when aspect ratios differ.
@@ -272,6 +289,9 @@ pub enum Operation {
     Crop { size: ImageSize, align: Align },
     /// Scale proportionally to fit inside a box (`fit-in:300x200`).
     FitIn(ImageSize),
+    /// Fit inside a box, then extend the canvas to exactly the
+    /// box, filling the remainder (`pad:300x200[:<fill>]`).
+    Pad { size: ImageSize, fill: PadFill },
     /// Cut an exact pixel rectangle
     /// (`crop-rect:<left>x<top>:<right>x<bottom>`).
     CropRect {
@@ -359,6 +379,9 @@ fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
     if let Some(rest) = seg.strip_prefix("crop:") {
         return Some(parse_crop(rest, seg));
     }
+    if let Some(rest) = seg.strip_prefix("pad:") {
+        return Some(parse_pad(rest, seg));
+    }
     if let Some(rest) = seg.strip_prefix("fit-in:") {
         return Some(parse_fit_in(rest, seg));
     }
@@ -429,6 +452,31 @@ fn parse_crop(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     };
     let size = parse_size(dims).map_err(|_| invalid())?;
     Ok(Operation::Crop { size, align })
+}
+
+/// Parse the dimensions (and optional fill) after `pad:`.
+/// The fill is `blur`, or a 6-digit hex color with the same
+/// semantics as the `fill` filter; absent means the request's
+/// `fill(...)` directive (or black).
+fn parse_pad(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let invalid = || ParseError::InvalidPad(seg.to_string());
+    let (dims, fill) = match rest.split_once(':') {
+        Some((d, f)) => (d, Some(f)),
+        None => (rest, None),
+    };
+    let fill = match fill {
+        None => PadFill::Directive,
+        Some("blur") => PadFill::Blur,
+        Some(p) => {
+            if p.len() != 6 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(invalid());
+            }
+            let byte = |i: usize| u8::from_str_radix(&p[i..i + 2], 16).map_err(|_| invalid());
+            PadFill::Color([byte(0)?, byte(2)?, byte(4)?])
+        }
+    };
+    let size = parse_size(dims).map_err(|_| invalid())?;
+    Ok(Operation::Pad { size, fill })
 }
 
 fn parse_format(s: &str) -> Option<ImageFormat> {
@@ -688,6 +736,18 @@ pub fn has_no_upscale(ops: &[Operation]) -> bool {
     ops.iter().any(|op| match op {
         Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::NoUpscale)),
         _ => false,
+    })
+}
+
+/// The request's `fill(...)` directive color: the last one in
+/// the request wins.
+pub fn explicit_fill(ops: &[Operation]) -> Option<[u8; 3]> {
+    ops.iter().rev().find_map(|op| match op {
+        Operation::Filters(filters) => filters.iter().rev().find_map(|f| match f {
+            Filter::Fill(color) => Some(*color),
+            _ => None,
+        }),
+        _ => None,
     })
 }
 
@@ -1452,6 +1512,49 @@ mod tests {
             "filters:facepad(-1)/example.com/img.jpg",
             "filters:facepad(x)/example.com/img.jpg",
             "filters:blurfaces(1)/example.com/img.jpg",
+        ] {
+            assert!(parse_operations(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_pad() {
+        let size = ImageSize {
+            width: Dimension::Pixels(200),
+            height: Dimension::Pixels(100),
+            flip_horizontal: false,
+            flip_vertical: false,
+        };
+        let (ops, _) = parse_operations("pad:200x100/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Pad {
+                size,
+                fill: PadFill::Directive
+            }]
+        );
+        let (ops, _) = parse_operations("pad:200x100:blur/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Pad {
+                size,
+                fill: PadFill::Blur
+            }]
+        );
+        let (ops, _) = parse_operations("pad:200x100:ff8800/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Pad {
+                size,
+                fill: PadFill::Color([255, 136, 0])
+            }]
+        );
+        for bad in [
+            "pad:",
+            "pad:200",
+            "pad:200x100:red",
+            "pad:200x100:ff88",
+            "pad:200x100:blur:extra",
         ] {
             assert!(parse_operations(bad).is_err(), "{bad}");
         }
