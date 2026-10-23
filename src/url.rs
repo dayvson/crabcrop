@@ -288,6 +288,16 @@ pub enum Filter {
     },
     /// Background color for flattening transparency, as RGB.
     Fill([u8; 3]),
+    /// Rounded corners: radii in pixels, CSS order (top-left,
+    /// top-right, bottom-right, bottom-left), applied to the
+    /// alpha channel with antialiased edges.
+    Radius([u32; 4]),
+    /// An opaque band of this width and color (RGB) painted
+    /// inside the frame; dimensions do not change.
+    Border(u32, [u8; 3]),
+    /// Keep only the inscribed shape; the rest of the frame
+    /// becomes transparent.
+    Mask(MaskShape),
     /// Encoding directive: re-encode at lower quality until the
     /// output fits this many bytes, quality permitting.
     MaxBytes(u64),
@@ -297,6 +307,16 @@ pub enum Filter {
     Format(ImageFormat),
     /// Cap every resize at the source dimensions.
     NoUpscale,
+}
+
+/// A shape for the `mask` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskShape {
+    /// The inscribed circle: diameter is the smaller
+    /// dimension, centered.
+    Circle,
+    /// The inscribed ellipse, touching all four edges.
+    Ellipse,
 }
 
 /// One operation from the request path, in path order.
@@ -709,6 +729,46 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 }
                 Filter::Rotate(degrees)
             }
+            ("radius", Some(p)) => {
+                let parts: Vec<&str> = p.split(',').collect();
+                if parts.len() != 1 && parts.len() != 4 {
+                    return Err(invalid());
+                }
+                let mut radii = [0u32; 4];
+                for (i, part) in parts.iter().enumerate() {
+                    let v: u32 = part.parse().map_err(|_| invalid())?;
+                    if v > MAX_DIMENSION {
+                        return Err(invalid());
+                    }
+                    radii[i] = v;
+                }
+                if parts.len() == 1 {
+                    radii = [radii[0]; 4];
+                }
+                Filter::Radius(radii)
+            }
+            ("border", Some(p)) => {
+                // <width>,<color>, the color spelled like fill's.
+                let parts: Vec<&str> = p.split(',').collect();
+                if parts.len() != 2 {
+                    return Err(invalid());
+                }
+                let width: u32 = parts[0].parse().map_err(|_| invalid())?;
+                if width == 0 || width > MAX_DIMENSION {
+                    return Err(invalid());
+                }
+                let hex = parts[1];
+                if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(invalid());
+                }
+                let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| invalid());
+                Filter::Border(width, [byte(0)?, byte(2)?, byte(4)?])
+            }
+            ("mask", Some(p)) => match p {
+                "circle" => Filter::Mask(MaskShape::Circle),
+                "ellipse" => Filter::Mask(MaskShape::Ellipse),
+                _ => return Err(invalid()),
+            },
             ("fill", Some(p)) => {
                 if p.len() != 6 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Err(invalid());
@@ -903,6 +963,19 @@ pub fn has_removebg(ops: &[Operation]) -> bool {
     ops.iter().any(|op| match op {
         Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::RemoveBg)),
         _ => false,
+    })
+}
+
+/// The first shape filter in `ops` that produces transparency
+/// (`radius` or `mask`), named for error messages.
+pub fn shape_filter(ops: &[Operation]) -> Option<&'static str> {
+    ops.iter().find_map(|op| match op {
+        Operation::Filters(filters) => filters.iter().find_map(|f| match f {
+            Filter::Radius(_) => Some("radius"),
+            Filter::Mask(_) => Some("mask"),
+            _ => None,
+        }),
+        _ => None,
     })
 }
 
@@ -1467,6 +1540,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_shape_filters() {
+        let (ops, _) = parse_operations(
+            "filters:radius(12):border(2,00ff00):mask(ellipse)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::Radius([12, 12, 12, 12]),
+                Filter::Border(2, [0, 255, 0]),
+                Filter::Mask(MaskShape::Ellipse),
+            ])]
+        );
+        let (ops, _) =
+            parse_operations("filters:radius(1,2,3,4):mask(circle)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::Radius([1, 2, 3, 4]),
+                Filter::Mask(MaskShape::Circle),
+            ])]
+        );
+    }
+
+    #[test]
     fn rejects_bad_filters() {
         for seg in [
             "filters:",
@@ -1477,6 +1575,17 @@ mod tests {
             "filters:grayscale(1)",
             "filters:format(bmp)",
             "filters:quality(80",
+            "filters:radius()",
+            "filters:radius(1,2)",
+            "filters:radius(1,2,3)",
+            "filters:radius(16384)",
+            "filters:radius(-1)",
+            "filters:border(0,FF0000)",
+            "filters:border(2,FFF)",
+            "filters:border(2)",
+            "filters:border(2,FF0000,1)",
+            "filters:mask(square)",
+            "filters:mask()",
         ] {
             assert_eq!(
                 parse_operations(&format!("{seg}/example.com/img.jpg")),
