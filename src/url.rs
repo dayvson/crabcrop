@@ -311,6 +311,13 @@ pub enum Filter {
     Pixelate(u32),
     /// Mirror the image, horizontally or vertically.
     Flip(FlipDirection),
+    /// Gaussian-blur the rectangle (x, y, w, h), in the
+    /// pixels of the image at the point the filter runs.
+    /// Redaction of plates, screens, documents.
+    BlurRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Pixelate the rectangle (x, y, w, h), same coordinate
+    /// convention as `BlurRegion`.
+    PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
     /// Encoding directive: re-encode at lower quality until the
     /// output fits this many bytes, quality permitting.
     MaxBytes(u64),
@@ -820,6 +827,28 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     return Err(invalid());
                 }
                 Filter::Pixelate(block)
+            }
+            ("blur_region", Some(p)) | ("pixelate_region", Some(p)) => {
+                let parts: Vec<&str> = p.split(',').collect();
+                if parts.len() != 4 {
+                    return Err(invalid());
+                }
+                let mut v = [0u32; 4];
+                for (i, part) in parts.iter().enumerate() {
+                    v[i] = part.parse().map_err(|_| invalid())?;
+                    if v[i] > MAX_DIMENSION {
+                        return Err(invalid());
+                    }
+                }
+                if v[2] == 0 || v[3] == 0 {
+                    return Err(invalid());
+                }
+                let (x, y, w, h) = (v[0], v[1], v[2], v[3]);
+                if name == "blur_region" {
+                    Filter::BlurRegion { x, y, w, h }
+                } else {
+                    Filter::PixelateRegion { x, y, w, h }
+                }
             }
             ("flip", Some(p)) => match p {
                 "h" => Filter::Flip(FlipDirection::Horizontal),
@@ -1640,6 +1669,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_region_filters() {
+        let (ops, _) = parse_operations(
+            "filters:blur_region(1,2,30,40):pixelate_region(0,0,5,5)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::BlurRegion {
+                    x: 1,
+                    y: 2,
+                    w: 30,
+                    h: 40
+                },
+                Filter::PixelateRegion {
+                    x: 0,
+                    y: 0,
+                    w: 5,
+                    h: 5
+                },
+            ])]
+        );
+    }
+
+    #[test]
     fn rejects_bad_filters() {
         for seg in [
             "filters:",
@@ -1669,6 +1723,11 @@ mod tests {
             "filters:pixelate(16384)",
             "filters:flip(x)",
             "filters:flip()",
+            "filters:blur_region(1,2,0,40)",
+            "filters:blur_region(1,2,3)",
+            "filters:blur_region(1,2,3,4,5)",
+            "filters:blur_region(-1,0,10,10)",
+            "filters:pixelate_region(0,0,10,16384)",
         ] {
             assert_eq!(
                 parse_operations(&format!("{seg}/example.com/img.jpg")),
