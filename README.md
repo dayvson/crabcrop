@@ -110,6 +110,18 @@ Scales the image proportionally so it fits inside the box. A `0` axis is unbound
 curl "http://localhost:3000/unsafe/fit-in:800x600/https://example.com/photo.jpg"
 ```
 
+### Pad to an exact size
+
+```text
+pad:<width>x<height>[:<fill>]
+```
+
+Fits the image inside the box (the fit-in rules, including `no_upscale`), centers it, and fills the rest of the canvas so the output is exactly the requested size. The fill is a 6-digit hex color, or `blur` for ambient bars: a cover-scaled, heavily blurred copy of the image itself, the standard treatment for user-generated content in fixed-aspect slots. With no fill named, the request's `fill(...)` filter color is used, or black when there is none.
+
+```bash
+curl "http://localhost:3000/unsafe/pad:1200x630:blur/https://example.com/photo.jpg"
+```
+
 ### Crop to an aspect ratio
 
 ```text
