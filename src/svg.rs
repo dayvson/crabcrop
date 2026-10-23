@@ -289,12 +289,12 @@ fn check_document_bounds<'a, 'input>(root: roxmltree::Node<'a, 'input>) -> Resul
     walk(root, &mut (0, 0), &mut ids)?;
     let mut memo = std::collections::HashMap::new();
     for desc in root.descendants() {
-        if desc.tag_name().name().eq_ignore_ascii_case("use") {
-            if let Some(target) = use_target(&desc) {
-                let depth = 1 + depth_of(target, &ids, &mut Vec::new(), &mut memo)?;
-                if depth > MAX_USE_DEPTH {
-                    return Err(format!("SVG use elements nest deeper than {MAX_USE_DEPTH}"));
-                }
+        if desc.tag_name().name().eq_ignore_ascii_case("use")
+            && let Some(target) = use_target(&desc)
+        {
+            let depth = 1 + depth_of(target, &ids, &mut Vec::new(), &mut memo)?;
+            if depth > MAX_USE_DEPTH {
+                return Err(format!("SVG use elements nest deeper than {MAX_USE_DEPTH}"));
             }
         }
     }
