@@ -9,6 +9,7 @@ repository = "https://github.com/dayvson/crabcrop"
 [dependencies]
 ab_glyph = "0.2"
 axum = "0.8"
+fast_image_resize = { version = "6.1", features = ["image"] }
 hex = "0.4"
 hmac = "0.12"
 jixel = "0.4"
