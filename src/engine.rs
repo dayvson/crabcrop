@@ -33,6 +33,12 @@ const MAX_GIF_FRAMES: usize = 200;
 const MAX_GIF_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 
+/// The per-request encode budget (audit E-6): the
+/// quality(auto) verification loop and the max_bytes ladder
+/// draw from one pool, so their multipliers cannot stack
+/// into a dozen-plus full-size encodes per cache miss.
+const MAX_REQUEST_ENCODES: usize = 6;
+
 pub(crate) fn decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DECODE_DIMENSION);
@@ -406,20 +412,28 @@ impl Engine {
         let perceptual = matches!(directives.quality, Some(Quality::Auto))
             && matches!(format, ImageFormat::Jpeg | ImageFormat::Jxl);
         let mut ssim: Option<f64> = None;
+        let mut encode_budget = MAX_REQUEST_ENCODES;
         let mut bytes = if perceptual {
             let first_guess = encode_quality.expect("auto quality resolves a value");
-            let scored = crate::quality::encode_to_target(first_guess, ctx.ssim_target, |q| {
-                let candidate = encode(&img, format, Some(q), directives.fill)?;
-                let score = decode_image(&candidate)
-                    .ok()
-                    .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
-                Ok::<_, EngineError>((candidate, score))
-            })?;
+            let scored = crate::quality::encode_to_target(
+                first_guess,
+                ctx.ssim_target,
+                &mut encode_budget,
+                |q| {
+                    let candidate = encode(&img, format, Some(q), directives.fill)?;
+                    let score = decode_image(&candidate)
+                        .ok()
+                        .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
+                    Ok::<_, EngineError>((candidate, score))
+                },
+            )?;
             chosen_quality = Some(scored.quality);
             ssim = scored.score;
             scored.bytes
         } else {
-            encode(&img, format, encode_quality, directives.fill)?
+            let bytes = encode(&img, format, encode_quality, directives.fill)?;
+            encode_budget -= 1;
+            bytes
         };
         // `max_bytes` is a budget, pursued by re-encoding at
         // decreasing quality. Only the quality-bearing formats have
@@ -440,15 +454,17 @@ impl Engine {
             while bytes.len() as u64 > budget
                 && current > 1
                 && attempts < max_quality_attempts(format)
+                && encode_budget > 0
             {
                 current = next_quality(format, current);
                 bytes = encode(&img, format, Some(current), directives.fill)?;
+                encode_budget -= 1;
                 chosen_quality = Some(current);
                 attempts += 1;
                 ladder_ran = true;
             }
         }
-        if ladder_ran && ssim.is_some() {
+        if ladder_ran && ssim.is_some() && encode_budget > 0 {
             // The budget overruled the verified quality, so the
             // reported score must describe the bytes actually
             // served: re-score the final encode once.

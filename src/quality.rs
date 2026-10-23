@@ -95,6 +95,7 @@ pub fn ssimulacra2(reference: &DynamicImage, distorted: &DynamicImage) -> Option
 pub fn encode_to_target<E, F>(
     first_guess: u8,
     target: f64,
+    budget: &mut usize,
     mut attempt: F,
 ) -> Result<ScoredEncode, E>
 where
@@ -106,7 +107,14 @@ where
     // sentinels sit one step outside the searchable range.
     let (mut lo, mut hi) = (MIN_AUTO_QUALITY as u16 - 1, MAX_AUTO_QUALITY as u16 + 1);
     let mut q = first_guess.clamp(MIN_AUTO_QUALITY, MAX_AUTO_QUALITY);
-    for _ in 0..MAX_PERCEPTUAL_ATTEMPTS {
+    for attempts_made in 0..MAX_PERCEPTUAL_ATTEMPTS {
+        // The shared per-request encode budget (audit E-6):
+        // the first attempt always runs; later attempts spend
+        // from the budget the max_bytes ladder also draws on.
+        if attempts_made > 0 && *budget == 0 {
+            break;
+        }
+        *budget = budget.saturating_sub(1);
         let (bytes, score) = attempt(q)?;
         let Some(score) = score else {
             return Ok(ScoredEncode {
@@ -290,7 +298,8 @@ mod tests {
         target: f64,
     ) -> (Vec<u8>, ScoredEncode) {
         let tried = std::cell::RefCell::new(Vec::new());
-        let out = encode_to_target(first_guess, target, |q| {
+        let mut budget = usize::MAX;
+        let out = encode_to_target(first_guess, target, &mut budget, |q| {
             tried.borrow_mut().push(q);
             // Bytes shrink as quality drops, so size stands in for
             // the quality that produced them.
@@ -347,10 +356,29 @@ mod tests {
 
     #[test]
     fn loop_serves_an_unscored_candidate_unverified() {
-        let out =
-            encode_to_target(70, 75.0, |_q| Ok::<_, ()>((vec![0u8; 7], None::<f64>))).unwrap();
+        let mut budget = usize::MAX;
+        let out = encode_to_target(70, 75.0, &mut budget, |_q| {
+            Ok::<_, ()>((vec![0u8; 7], None::<f64>))
+        })
+        .unwrap();
         assert_eq!(out.quality, 70);
         assert_eq!(out.score, None);
         assert_eq!(out.bytes.len(), 7);
+    }
+
+    #[test]
+    fn encode_loop_honors_the_shared_budget() {
+        // A scorer that never lands in band would bisect to
+        // the attempt cap; a budget of 2 stops it at 2 (E-6).
+        let tried = std::cell::RefCell::new(Vec::new());
+        let mut budget = 2;
+        let out = encode_to_target(70, 75.0, &mut budget, |q| {
+            tried.borrow_mut().push(q);
+            Ok::<_, ()>((vec![0u8; 10], Some(10.0)))
+        })
+        .unwrap();
+        assert_eq!(tried.borrow().len(), 2);
+        assert_eq!(budget, 0);
+        assert_eq!(out.score, Some(10.0));
     }
 }
