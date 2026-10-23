@@ -128,6 +128,7 @@ struct Inner {
     cache_misses: u64,
     load_ms_sum: f64,
     load_count: u64,
+    purges: u64,
     process_ms_sum: f64,
     process_count: u64,
     duration_buckets: [u64; BUCKETS_MS.len() + 1],
@@ -180,6 +181,12 @@ impl Metrics {
         m.duration_buckets[BUCKETS_MS.len()] += 1;
         m.duration_sum += total;
         m.duration_count += 1;
+    }
+
+    /// Count one purge request, accepted or rejected (audit
+    /// PL-8: the destructive endpoint must leave a trace).
+    pub fn record_purge(&self) {
+        self.inner.lock().unwrap().purges += 1;
     }
 
     /// Render the counters in Prometheus text format.
@@ -259,6 +266,9 @@ impl Metrics {
         out.push_str(&format!("crabcrop_cache_hits_total {}\n", m.cache_hits));
         out.push_str("# TYPE crabcrop_cache_misses_total counter\n");
         out.push_str(&format!("crabcrop_cache_misses_total {}\n", m.cache_misses));
+        out.push_str("# HELP crabcrop_purges_total Purge requests, accepted or rejected.\n");
+        out.push_str("# TYPE crabcrop_purges_total counter\n");
+        out.push_str(&format!("crabcrop_purges_total {}\n", m.purges));
         out
     }
 }

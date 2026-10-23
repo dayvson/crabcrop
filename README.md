@@ -469,6 +469,8 @@ docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret crabcrop:latest
 
 For the AI features, build `Dockerfile.ai` on top of that image; see [AI features](#ai-features).
 
+Run crabcrop behind a reverse proxy or CDN in production. The application bounds its own work (the processing and AI gates shed overload with `503`), but connection-level protections belong at the edge: request and header timeouts, connection limits, rate limiting, and TLS termination. Restrict `/health` and `/metrics` to your internal network at the proxy: both are unauthenticated (they are served with `Cache-Control: no-store`), and the metrics expose traffic and error counters.
+
 ## Development
 
 ```bash

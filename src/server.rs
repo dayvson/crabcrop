@@ -88,6 +88,28 @@ pub fn app(state: AppState) -> Router {
         .route("/purge/{*path}", axum::routing::post(purge_handle))
         .route("/{*path}", get(handle))
         .with_state(state)
+        .layer(axum::middleware::from_fn(security_headers))
+}
+
+/// Headers applied to every response (audit PL-5, PL-6):
+/// `nosniff` everywhere, and `no-store` on the system
+/// endpoints, whose contents are operational data, not
+/// cacheable content.
+async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let system = matches!(req.uri().path(), "/health" | "/metrics");
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    if system {
+        headers.insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 async fn health() -> &'static str {
@@ -144,6 +166,19 @@ async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
 /// purge and an image signature can never be replayed here; a
 /// bad signature is a 403 and purges nothing. Idempotent:
 /// purging an absent entry answers 200 with a count of 0.
+/// One structured line per purge request (audit PL-8): the
+/// destructive, secret-gated endpoint must be auditable. The
+/// target is hashed; a raw target can carry signed URLs.
+fn purge_log(target: &str, removed: Option<usize>) {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(target.as_bytes());
+    let hash: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    match removed {
+        Some(n) => println!("{{\"event\":\"purge\",\"target\":\"{hash}\",\"removed\":{n}}}"),
+        None => println!("{{\"event\":\"purge\",\"target\":\"{hash}\",\"rejected\":true}}"),
+    }
+}
+
 async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let Some(tail) = uri.path().strip_prefix("/purge/") else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -154,6 +189,8 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     if !verify_purge(&state.secret, &signature, target, state.allow_unsafe) {
+        state.metrics.record_purge();
+        purge_log(target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
     }
     // Entries are keyed in expiry-free form (audit P-2), so
@@ -164,6 +201,8 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
     if let Some(store) = &state.store {
         removed += store.purge_matching(&key_form);
     }
+    state.metrics.record_purge();
+    purge_log(target, Some(removed));
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
 }
 
@@ -229,6 +268,10 @@ enum ProcessFailure {
 /// How long a cache miss may wait for a processing slot
 /// before the server sheds it with a 503.
 const PROCESS_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long an AI-backed request may wait for an inference
+/// slot before the server sheds it with a 503 (audit PL-14).
+const AI_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run the engine under the process gate on a blocking
 /// thread, so CPU-bound work neither stalls the async
@@ -474,14 +517,22 @@ async fn serve(
         || crate::url::has_upscale(&ops)
         || crate::url::has_smart_crop(&ops)
     {
-        Some(
-            state
-                .ai_gate
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("the AI gate is never closed"),
-        )
+        // The wait is bounded (audit PL-14): a burst of AI
+        // requests sheds with a 503 instead of parking
+        // unbounded tasks on the gate.
+        match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            _ => {
+                return (
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "server busy: AI processing queue is full",
+                    )
+                        .into_response(),
+                    record,
+                );
+            }
+        }
     } else {
         None
     };
@@ -750,16 +801,20 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
 }
 
 fn load_error_response(e: LoadError) -> Response {
+    // The detailed cause (which can embed origin-controlled
+    // strings and server-constructed store URLs) goes to the
+    // server log; clients get a short generic message (PL-6).
+    eprintln!("load error: {e}");
     let (status, message) = match e {
         LoadError::Forbidden(reason) => (StatusCode::FORBIDDEN, reason),
         LoadError::BadStatus(code) => (
             StatusCode::BAD_GATEWAY,
             format!("source returned status {code}"),
         ),
-        LoadError::Network(cause) => (StatusCode::BAD_GATEWAY, cause),
-        LoadError::WrongContentType(ct) => (
+        LoadError::Network(_) => (StatusCode::BAD_GATEWAY, "source fetch failed".to_string()),
+        LoadError::WrongContentType(_) => (
             StatusCode::BAD_GATEWAY,
-            format!("source is not an image: {ct:?}"),
+            "source did not return an image".to_string(),
         ),
         LoadError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "source timed out".to_string()),
         LoadError::TooLarge { limit } => (
@@ -771,12 +826,25 @@ fn load_error_response(e: LoadError) -> Response {
 }
 
 fn engine_error_response(e: EngineError) -> Response {
+    eprintln!("engine error: {e}");
     let (status, message) = match e {
-        EngineError::Decode(cause) => (StatusCode::BAD_GATEWAY, cause),
-        EngineError::Encode(cause) => (StatusCode::INTERNAL_SERVER_ERROR, cause),
+        EngineError::Decode(_) => (
+            StatusCode::BAD_GATEWAY,
+            "source image could not be decoded".to_string(),
+        ),
+        EngineError::Encode(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "image encoding failed".to_string(),
+        ),
         EngineError::Unsupported(what) => (StatusCode::BAD_REQUEST, what),
-        EngineError::Inference(cause) => (StatusCode::INTERNAL_SERVER_ERROR, cause),
-        EngineError::Render(cause) => (StatusCode::INTERNAL_SERVER_ERROR, cause),
+        EngineError::Inference(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "image inference failed".to_string(),
+        ),
+        EngineError::Render(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "image rendering failed".to_string(),
+        ),
     };
     (status, message).into_response()
 }
@@ -1519,6 +1587,69 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "purged: origin refetched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn system_endpoints_carry_security_headers() {
+        let base = spawn_app(false).await;
+        for path in ["/health", "/metrics"] {
+            let resp = client().get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        }
+        // Image responses get nosniff too, and keep their
+        // immutable caching (audits PL-5, PL-6).
+        let src = spawn_image_server().await;
+        let remainder = format!("100x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert!(
+            resp.headers()
+                .get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("immutable")
+        );
+    }
+
+    #[tokio::test]
+    async fn purges_leave_a_metric_trace() {
+        // Audit PL-8: accepted and rejected purges both count.
+        let base = spawn_app(false).await;
+        let target = "100x50/http://example.com/x.jpg";
+        let bad = client()
+            .post(format!("{base}/purge/deadbeef/{target}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::FORBIDDEN);
+        let sig = crate::url::purge_signature(SECRET, target);
+        let ok = client()
+            .post(format!("{base}/purge/{sig}/{target}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        let metrics = client()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(metrics.contains("crabcrop_purges_total 2"), "{metrics}");
     }
 
     #[tokio::test]
