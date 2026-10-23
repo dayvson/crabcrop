@@ -20,7 +20,10 @@
  * read configuration from the request context, not from
  * build-time env: pass `secret` only from server-side code
  * (a loader function in a route), or prefer a preset, which
- * needs no secret anywhere.
+ * needs no secret anywhere. The returned loader enforces the
+ * boundary: in a browser context the secret is forced to
+ * null, so a factory created with one still cannot sign (or
+ * leak it) client-side.
  */
 import { buildURL } from "@crabcrop/url";
 
@@ -56,7 +59,11 @@ export function createCrabcropLoader(config: CrabcropLoaderConfig) {
     } else if (h) {
       operations.push(`0x${h}`);
     }
-    return buildURL(config.base, config.secret ?? null, operations.join("/"), src, {
+    // In a browser context the secret is forced to null, so
+    // it can never be used (or extracted) client-side
+    // (audit PL-11, the Next.js loader's guard).
+    const secret = typeof window === "undefined" ? (config.secret ?? null) : null;
+    return buildURL(config.base, secret, operations.join("/"), src, {
       expires: config.expires,
     });
   };

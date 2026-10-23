@@ -21,8 +21,11 @@
  *
  * Provider options: `base` (required), `preset` (recommended:
  * the transform policy stays server-side and the browser
- * never needs the secret), `secret` (optional; only for
- * providers configured in server-only contexts).
+ * never needs the secret), `secret` (optional; honored only
+ * when this code runs server-side. Nuxt compiles provider
+ * options into the app, so in the browser the secret is
+ * forced to null and can never ship in the client bundle;
+ * prefer a preset for client-side use).
  *
  * Modifier mapping:
  *   width + height, fit cover (default) -> crop:WxH:smart
@@ -97,5 +100,9 @@ export const getImage = (
   if (modifiers.quality !== undefined) {
     operations.push(`filters:quality(${dim(modifiers.quality)})`);
   }
-  return { url: buildURL(options.base, options.secret ?? null, operations.join("/"), src) };
+  // The provider also runs client-side, where options from
+  // nuxt.config are part of the bundle: never sign there
+  // (audit PL-11, the Next.js loader's guard).
+  const secret = typeof window === "undefined" ? (options.secret ?? null) : null;
+  return { url: buildURL(options.base, secret, operations.join("/"), src) };
 };
