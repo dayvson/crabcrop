@@ -575,6 +575,19 @@ fn parse_align(s: &str) -> Option<Align> {
     }
 }
 
+/// The size contract for `crop:` and `pad:`: an exact box,
+/// pixels on both axes and no flips. The general size
+/// grammar also spells proportional and original sizes,
+/// which mean something for resizes and fit-in but not for
+/// an operation whose whole job is one exact box, and a
+/// flip belongs to a resize or `filters:flip`. Rejecting
+/// the spellings at parse keeps them out of URLs the
+/// engine could only refuse after fetching the source.
+fn exact_box(size: &ImageSize) -> bool {
+    let pixels = |d: &Dimension| matches!(d, Dimension::Pixels(n) if *n >= 1);
+    pixels(&size.width) && pixels(&size.height) && !size.flip_horizontal && !size.flip_vertical
+}
+
 /// Parse the dimensions (and optional alignment) after `crop:`.
 fn parse_crop(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidCrop(seg.to_string());
@@ -583,6 +596,9 @@ fn parse_crop(rest: &str, seg: &str) -> Result<Operation, ParseError> {
         None => (rest, Align::Center),
     };
     let size = parse_size(dims).map_err(|_| invalid())?;
+    if !exact_box(&size) {
+        return Err(invalid());
+    }
     Ok(Operation::Crop { size, align })
 }
 
@@ -608,6 +624,9 @@ fn parse_pad(rest: &str, seg: &str) -> Result<Operation, ParseError> {
         }
     };
     let size = parse_size(dims).map_err(|_| invalid())?;
+    if !exact_box(&size) {
+        return Err(invalid());
+    }
     Ok(Operation::Pad { size, fill })
 }
 
@@ -1799,6 +1818,16 @@ mod tests {
             "crop:300",
             "crop:300x200:sideways",
             "crop:300x200:center:extra",
+            // The exact-box contract: pixels on both axes,
+            // no flips (fit-in owns proportional boxes, and
+            // a flip is filters:flip).
+            "crop:300x0",
+            "crop:0x200",
+            "crop:origx100",
+            "crop:300xorig",
+            "crop:-300x200",
+            "crop:300x-200",
+            "crop:00x200",
         ] {
             assert_eq!(
                 parse_operations(&format!("{seg}/example.com/img.jpg")),
@@ -2344,6 +2373,10 @@ mod tests {
             "pad:200x100:red",
             "pad:200x100:ff88",
             "pad:200x100:blur:extra",
+            // The exact-box contract, same as crop:.
+            "pad:200x0",
+            "pad:origx100",
+            "pad:-200x100",
         ] {
             assert!(parse_operations(bad).is_err(), "{bad}");
         }

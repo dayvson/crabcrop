@@ -901,10 +901,14 @@ pub fn convert_thumbor(
         }
     };
 
-    // Flips ride inside crabcrop sizes, except on fit-in,
-    // whose size takes none: there they become flip filters,
-    // applied before the converted filter chain.
+    // Flips ride inside a plain crabcrop size. On fit-in
+    // and on crop (both exact-box operations, whose sizes
+    // take no flips) they become flip filters instead: for
+    // fit-in, in the converted filter chain; for crop, in
+    // their own segment ahead of the crop, so an alignment
+    // anchors the same region it anchored in Thumbor.
     let mut lead_filters: Vec<String> = Vec::new();
+    let mut crop_flips: Vec<String> = Vec::new();
     let size_op = size.map(|(w, h)| {
         let axis = |d: ThumborDim| -> (String, bool, bool) {
             match d {
@@ -937,10 +941,20 @@ pub fn convert_thumbor(
             };
             format!("fit-in:{plain}")
         } else if w_live && h_live {
+            if w_flip {
+                crop_flips.push("flip(h)".to_string());
+            }
+            if h_flip {
+                crop_flips.push("flip(v)".to_string());
+            }
+            let plain = {
+                let strip = |t: &str| t.strip_prefix('-').unwrap_or(t).to_string();
+                format!("{}x{}", strip(&wt), strip(&ht))
+            };
             if align == "center" {
-                format!("crop:{dims}")
+                format!("crop:{plain}")
             } else {
-                format!("crop:{dims}:{align}")
+                format!("crop:{plain}:{align}")
             }
         } else {
             dims
@@ -958,6 +972,9 @@ pub fn convert_thumbor(
     }
     if let Some((l, t, r, b)) = crop_rect {
         ops.push(format!("crop-rect:{l}x{t}:{r}x{b}"));
+    }
+    if !crop_flips.is_empty() {
+        ops.push(format!("filters:{}", crop_flips.join(":")));
     }
     if let Some(op) = size_op {
         ops.push(op);
@@ -1117,10 +1134,15 @@ mod tests {
             url.contains("/crop-rect:10x20:110x220/crop:100x100/"),
             "{url}"
         );
-        // Negative dimensions are flips, and ride in the size.
+        // Negative dimensions are flips. On a crop they
+        // become a flip segment ahead of it (crop sizes
+        // take no flips); on a plain size they ride inside.
         let (url, _) =
             convert_thumbor("unsafe/-300x200/https://e.com/a.jpg", base, Some(b"s")).unwrap();
-        assert!(url.contains("/crop:-300x200/"), "{url}");
+        assert!(url.contains("/filters:flip(h)/crop:300x200/"), "{url}");
+        let (url, _) =
+            convert_thumbor("unsafe/-300x0/https://e.com/a.jpg", base, Some(b"s")).unwrap();
+        assert!(url.contains("/-300x0/"), "{url}");
         // ...except on fit-in, where they become flip filters.
         let (url, _) = convert_thumbor(
             "unsafe/fit-in/-300x200/https://e.com/a.jpg",
