@@ -36,7 +36,7 @@ async function rebuild() {
   const expirySeconds = $("expiry").value;
   builtUrl = await buildPlaygroundUrl({
     base: $("base").value.trim(),
-    secret: $("secret").value,
+    secret: $("secret").value || null,
     operations,
     source: $("source").value.trim(),
     expires: expirySeconds ? Math.floor(Date.now() / 1000) + Number(expirySeconds) : undefined,

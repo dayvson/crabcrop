@@ -43,6 +43,8 @@ A builder assembles, in order:
 
 then signs the joined remainder and prefixes `{base}/{signature}/`. With a null secret the signature segment is the literal `unsafe` and no HMAC is computed.
 
+Builders reject inputs that can never verify, at build time: an expiry that is not a non-negative integer, and operations or sources containing `?`, `#`, whitespace, control, or non-ASCII characters. The remainder travels as a raw path and those characters cannot be represented in it (percent-encoding them produces a different remainder, which fails verification just the same). Only a null secret means `unsafe`: an empty-string secret is a real key and signs.
+
 ## Srcset building
 
 For responsive images, a builder emits one URL per width, each with the single operation `{width}x0` (proportional resize to that width), formatted as an `srcset` attribute value: entries `{url} {width}w` joined by `, `. An expiry, when requested, applies to every entry.

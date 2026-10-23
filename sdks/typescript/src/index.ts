@@ -26,6 +26,32 @@ export interface BuildOptions {
  * produces the literal `unsafe` signature segment, for servers
  * running with unsafe or presets-only configurations.
  */
+/**
+ * Fail loudly on inputs that can never produce a verifiable URL
+ * (audit P-4, P-5): the remainder travels as a raw URL path, so
+ * `?`/`#` would truncate it and whitespace, control, and
+ * non-ASCII characters cannot be sent as-is; an expiry must be
+ * a non-negative integer the server's u64 parser accepts.
+ */
+function assertUrlText(text: string, what: string): void {
+  for (const c of text) {
+    const code = c.codePointAt(0) as number;
+    if (c === "?" || c === "#" || code <= 0x20 || code === 0x7f || code > 0x7e) {
+      throw new Error(
+        `${what} contains a character that cannot appear in a crabcrop URL: ${JSON.stringify(c)}`,
+      );
+    }
+  }
+}
+
+function assertExpires(expires: number): void {
+  if (!Number.isSafeInteger(expires) || expires < 0) {
+    throw new Error(
+      `expires must be a non-negative integer number of unix seconds, got ${expires}`,
+    );
+  }
+}
+
 export function buildURL(
   base: string,
   secret: string | null,
@@ -33,6 +59,11 @@ export function buildURL(
   source: string,
   options: BuildOptions = {},
 ): string {
+  if (options.expires !== undefined) {
+    assertExpires(options.expires);
+  }
+  assertUrlText(operations, "operations");
+  assertUrlText(source, "source");
   const trimmedBase = base.replace(/\/+$/, "");
   let remainder = "";
   if (options.expires !== undefined) {

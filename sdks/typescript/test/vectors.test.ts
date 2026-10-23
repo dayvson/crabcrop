@@ -43,3 +43,13 @@ test("buildSrcSet formats entries", () => {
       "https://img.example.com/unsafe/640x0/https://example.com/a.jpg 640w",
   );
 });
+
+test("buildURL rejects inputs that can never verify (audit P-4, P-5)", () => {
+  const base = "https://img.example.com";
+  assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/a.jpg?w=1"));
+  assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/a.jpg#f"));
+  assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/my photo.jpg"));
+  assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/café.jpg"));
+  assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/a.jpg", { expires: 1.5 }));
+  assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/a.jpg", { expires: -1 }));
+});

@@ -20,12 +20,12 @@ for (const v of vectors) {
 test("URL assembly matches the SDK byte for byte", async () => {
   const cases = [
     { base: "https://images.example.com/", secret: "your-secret", operations: "300x200", source: "https://example.com/photo.jpg" },
-    { base: "https://img.example.com", secret: "", operations: "preset:thumb", source: "s3://media/a.jpg", expires: 1893456000 },
+    { base: "https://img.example.com", secret: null, operations: "preset:thumb", source: "s3://media/a.jpg", expires: 1893456000 },
     { base: "https://img.example.com", secret: "k", operations: "", source: "https://example.com/a.jpg" },
     { base: "https://img.example.com", secret: "k", operations: "crop:10x10:smart/filters:grayscale", source: "gs://b/k.png", expires: 42 },
   ];
   for (const c of cases) {
-    const expected = sdk.buildURL(c.base, c.secret === "" ? null : c.secret, c.operations, c.source, {
+    const expected = sdk.buildURL(c.base, c.secret, c.operations, c.source, {
       expires: c.expires,
     });
     const actual = await buildPlaygroundUrl(c);
@@ -84,9 +84,36 @@ test("signature verification round-trips locally", async () => {
   assert.equal(await verifyUrlSignature("s3cr3t", url.replace("300x200", "400x200")), false);
   const unsigned = await buildPlaygroundUrl({
     base: "https://images.example.com",
-    secret: "",
+    secret: null,
     operations: "300x200",
     source: "https://example.com/photo.jpg",
   });
   assert.equal(await verifyUrlSignature("s3cr3t", unsigned), null);
+});
+
+test("buildPlaygroundUrl rejects inputs that can never verify (audit P-4, P-5)", async () => {
+  const base = { base: "https://img.example.com", secret: "k", operations: "300x200" };
+  await assert.rejects(() => buildPlaygroundUrl({ ...base, source: "https://example.com/a.jpg?w=1" }));
+  await assert.rejects(() => buildPlaygroundUrl({ ...base, source: "https://example.com/my photo.jpg" }));
+  await assert.rejects(() =>
+    buildPlaygroundUrl({ ...base, source: "https://example.com/a.jpg", expires: 1893456000.5 }),
+  );
+});
+
+test("empty-string secret signs; only null means unsafe (audit P-6)", async () => {
+  const signed = await buildPlaygroundUrl({
+    base: "https://img.example.com",
+    secret: "",
+    operations: "300x200",
+    source: "https://example.com/a.jpg",
+  });
+  const segment = signed.split("/")[3];
+  assert.match(segment, /^[0-9a-f]{64}$/);
+  const unsigned = await buildPlaygroundUrl({
+    base: "https://img.example.com",
+    secret: null,
+    operations: "300x200",
+    source: "https://example.com/a.jpg",
+  });
+  assert.ok(unsigned.includes("/unsafe/"));
 });

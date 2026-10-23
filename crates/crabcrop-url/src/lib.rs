@@ -9,7 +9,8 @@
 //!     "300x200",
 //!     "https://example.com/photo.jpg",
 //!     None,
-//! );
+//! )
+//! .unwrap();
 //! assert_eq!(
 //!     url,
 //!     "https://images.example.com/3c1f6c180116661877bd4c85fd201a178087d74c1cc188cc584e819d901308c6/300x200/https://example.com/photo.jpg"
@@ -53,13 +54,33 @@ pub fn verify(secret: &[u8], signature_hex: &str, remainder: &str) -> bool {
 /// leading `exp:` segment. A `None` secret produces the
 /// literal `unsafe` signature segment, for servers running
 /// with unsafe or presets-only configurations.
+/// Why a builder input can never produce a verifiable URL:
+/// the remainder travels as a raw URL path, so `?` and `#`
+/// would truncate it at the HTTP layer, and whitespace,
+/// control, and non-ASCII characters cannot be sent as-is
+/// (audit P-4). Builders fail loudly at build time instead of
+/// minting a URL that 403s at fetch time.
+pub fn validate_url_text(text: &str, what: &str) -> Result<(), String> {
+    if let Some(c) = text
+        .chars()
+        .find(|c| matches!(c, '?' | '#') || !c.is_ascii() || c.is_ascii_control() || *c == ' ')
+    {
+        return Err(format!(
+            "{what} contains a character that cannot appear in a crabcrop URL: {c:?}"
+        ));
+    }
+    Ok(())
+}
+
 pub fn build_url(
     base: &str,
     secret: Option<&[u8]>,
     operations: &str,
     source: &str,
     expires: Option<u64>,
-) -> String {
+) -> Result<String, String> {
+    validate_url_text(operations, "operations")?;
+    validate_url_text(source, "source")?;
     let base = base.trim_end_matches('/');
     let mut remainder = String::new();
     if let Some(exp) = expires {
@@ -74,7 +95,7 @@ pub fn build_url(
         Some(secret) => sign(secret, &remainder),
         None => "unsafe".to_string(),
     };
-    format!("{base}/{signature}/{remainder}")
+    Ok(format!("{base}/{signature}/{remainder}"))
 }
 
 /// Build an `srcset` attribute value: one `{width}x0` URL per
@@ -86,15 +107,15 @@ pub fn build_srcset(
     source: &str,
     widths: &[u32],
     expires: Option<u64>,
-) -> String {
-    widths
+) -> Result<String, String> {
+    let entries = widths
         .iter()
         .map(|w| {
-            let url = build_url(base, secret, &format!("{w}x0"), source, expires);
-            format!("{url} {w}w")
+            let url = build_url(base, secret, &format!("{w}x0"), source, expires)?;
+            Ok(format!("{url} {w}w"))
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(entries.join(", "))
 }
 
 #[cfg(test)]
@@ -130,7 +151,8 @@ mod tests {
                 "300x200",
                 "https://example.com/photo.jpg",
                 None,
-            ),
+            )
+            .unwrap(),
             "https://images.example.com/3c1f6c180116661877bd4c85fd201a178087d74c1cc188cc584e819d901308c6/300x200/https://example.com/photo.jpg"
         );
         // Expiry leads the remainder; a null secret is unsafe.
@@ -140,7 +162,8 @@ mod tests {
             "preset:thumb",
             "s3://media/a.jpg",
             Some(1_893_456_000),
-        );
+        )
+        .unwrap();
         assert_eq!(
             url,
             "https://img.example.com/unsafe/exp:1893456000/preset:thumb/s3://media/a.jpg"
@@ -152,8 +175,42 @@ mod tests {
             "",
             "https://example.com/a.jpg",
             None,
-        );
+        )
+        .unwrap();
         assert!(url.ends_with("/https://example.com/a.jpg"));
+    }
+
+    #[test]
+    fn builders_reject_unbuildable_urls() {
+        // Audit P-4: these can never verify, so building fails.
+        for source in [
+            "https://example.com/a.jpg?w=1",
+            "https://example.com/a.jpg#frag",
+            "https://example.com/my photo.jpg",
+            "https://example.com/caf\u{e9}.jpg",
+        ] {
+            assert!(
+                build_url(
+                    "https://img.example.com",
+                    Some(b"k"),
+                    "300x200",
+                    source,
+                    None
+                )
+                .is_err(),
+                "{source}"
+            );
+        }
+        assert!(
+            build_url(
+                "https://img.example.com",
+                Some(b"k"),
+                "300x200?x",
+                "https://example.com/a.jpg",
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -164,7 +221,8 @@ mod tests {
             "https://example.com/a.jpg",
             &[320, 640],
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(
             srcset,
             "https://img.example.com/unsafe/320x0/https://example.com/a.jpg 320w, \

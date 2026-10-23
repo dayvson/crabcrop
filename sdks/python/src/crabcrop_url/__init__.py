@@ -23,6 +23,32 @@ def sign(secret: Union[str, bytes], remainder: str) -> str:
     return hmac.new(_key(secret), remainder.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _validate_url_text(text: str, what: str) -> None:
+    """Fail loudly on inputs that can never verify (audit
+    P-4): the remainder travels as a raw URL path, so ``?`` /
+    ``#`` would truncate it and whitespace, control, and
+    non-ASCII characters cannot be sent as-is."""
+    for c in text:
+        if c in "?#" or not c.isascii() or ord(c) <= 0x20 or ord(c) == 0x7F:
+            raise ValueError(
+                f"{what} contains a character that cannot appear in a crabcrop URL: {c!r}"
+            )
+
+
+def _validate_expires(expires: int) -> None:
+    """The server accepts only an unsigned 64-bit integer
+    (audit P-5)."""
+    if (
+        isinstance(expires, bool)
+        or not isinstance(expires, int)
+        or expires < 0
+        or expires > 2**64 - 1
+    ):
+        raise ValueError(
+            f"expires must be a non-negative integer of unix seconds, got {expires!r}"
+        )
+
+
 def build_url(
     base: str,
     secret: Secret,
@@ -39,7 +65,10 @@ def build_url(
     with unsafe or presets-only configurations."""
     remainder = ""
     if expires is not None:
+        _validate_expires(expires)
         remainder += f"exp:{expires}/"
+    _validate_url_text(operations, "operations")
+    _validate_url_text(source, "source")
     if operations:
         remainder += f"{operations}/"
     remainder += source
