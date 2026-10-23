@@ -1,0 +1,38 @@
+# crabcrop evaluation run: one command, no registry needed.
+#
+#   CRABCROP_SECRET=$(openssl rand -hex 32) docker compose up --build
+#
+# Then sign a URL with the CLI in the image:
+#   docker compose exec crabcrop \
+#     env CRABCROP_BASE=http://localhost:3000 crabcrop sign \
+#     "300x200/https://example.com/photo.jpg"
+#
+# Without CRABCROP_SECRET set, a clearly marked development
+# secret is used so the trial boots; never serve traffic
+# with it.
+services:
+  crabcrop:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: crabcrop:latest
+    ports:
+      - "3000:3000"
+    environment:
+      CRABCROP_SECRET: "${CRABCROP_SECRET:-crabcrop-dev-secret-do-not-use-in-production}"
+      CRABCROP_CACHE_MAX_MB: "256"
+    # Presets: drop a presets file next to this compose file
+    # and wire it in:
+    #   volumes:
+    #     - ./presets.txt:/etc/crabcrop/presets.txt:ro
+    #   environment:
+    #     CRABCROP_PRESETS_FILE: /etc/crabcrop/presets.txt
+    #
+    # AI variant: build Dockerfile.ai instead (it layers on
+    # this image and bakes in the removebg model):
+    #   build:
+    #     context: ../..
+    #     dockerfile: Dockerfile.ai
+    #     args:
+    #       BASE_IMAGE: crabcrop:latest
+    restart: unless-stopped

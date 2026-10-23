@@ -1,0 +1,28 @@
+# Example overlay: three replicas behind the Service.
+#
+# Read the cache note in the chart README first. The result
+# cache is per-replica (memory) and per-pod (disk tier), so
+# replicas trade cache efficiency, never correctness: expect
+# a lower hit rate than a single replica with the same total
+# memory, and do not share one disk-tier volume between pods
+# unless it is a genuinely shared (RWX) filesystem.
+replicaCount: 3
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# Spread replicas across nodes when the cluster allows it.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: crabcrop
+          topologyKey: kubernetes.io/hostname

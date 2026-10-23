@@ -1,0 +1,114 @@
+# Default values for crabcrop. Anything the server reads from
+# the environment can be set through the free-form `env` map;
+# the structured values below cover the common wiring.
+
+replicaCount: 1
+
+image:
+  # Nothing is published to a public registry yet: build the
+  # image from the repo Dockerfile and push it somewhere your
+  # cluster can pull from, then point this at it.
+  repository: crabcrop
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- The signing secret (CRABCROP_SECRET, 16+ bytes).
+# Preferred: reference a Secret you manage yourself.
+existingSecret: ""
+secretKey: CRABCROP_SECRET
+# Trial shortcut: let the chart create the Secret from this
+# value instead. Do not use for anything real.
+secret: ""
+
+# Port the server listens on (the PORT environment variable).
+containerPort: 3000
+
+# Presets, name = operations, delivered as a ConfigMap and
+# wired through CRABCROP_PRESETS_FILE automatically.
+# Example:
+#   presets:
+#     thumb: "300x200"
+#     gray: "filters:grayscale"
+presets: {}
+onlyPresets: false
+
+# Free-form environment: any CRABCROP_* setting, as strings.
+# Example:
+#   env:
+#     CRABCROP_CACHE_MAX_MB: "512"
+#     CRABCROP_METADATA: "preserve"
+env: {}
+
+# The disk-backed result cache tier. Off by default: the
+# in-memory tier alone serves a single replica well. See the
+# chart README before enabling this on multiple replicas.
+resultStorage:
+  enabled: false
+  mountPath: /var/cache/crabcrop
+  # Set sizeLimit MB for CRABCROP_RESULT_STORAGE_MAX_MB.
+  sizeLimitMb: 512
+  pvc:
+    existingClaim: ""
+    size: 1Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+# AI variant (Dockerfile.ai): switch the image, mount the
+# models volume, and point the model env vars at it through
+# ai.env. Models are deployment artifacts, never chart
+# content.
+ai:
+  enabled: false
+  image:
+    repository: crabcrop-ai
+    tag: latest
+  models:
+    existingClaim: ""
+    mountPath: /models
+  # Example:
+  #   env:
+  #     CRABCROP_ORT_DYLIB: /models/libonnxruntime.so
+  #     CRABCROP_REMOVEBG_MODEL: /models/removebg.onnx
+  env: {}
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: crabcrop.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+resources: {}
+  # requests:
+  #   cpu: 250m
+  #   memory: 256Mi
+  # limits:
+  #   cpu: "2"
+  #   memory: 1Gi
+
+podAnnotations: {}
+podSecurityContext: {}
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "crabcrop.fullname" . }}
+  labels:
+    {{- include "crabcrop.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "crabcrop.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "crabcrop.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if .Values.ai.enabled }}
+          image: "{{ .Values.ai.image.repository }}:{{ .Values.ai.image.tag }}"
+          {{- else }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          {{- end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          env:
+            - name: PORT
+              value: {{ .Values.containerPort | quote }}
+            {{- if or .Values.existingSecret .Values.secret }}
+            - name: CRABCROP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "crabcrop.secretName" . }}
+                  key: {{ .Values.secretKey }}
+            {{- end }}
+            {{- if .Values.presets }}
+            - name: CRABCROP_PRESETS_FILE
+              value: /etc/crabcrop/presets.txt
+            {{- if .Values.onlyPresets }}
+            - name: CRABCROP_ONLY_PRESETS
+              value: "1"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.resultStorage.enabled }}
+            - name: CRABCROP_RESULT_STORAGE_DIR
+              value: {{ .Values.resultStorage.mountPath }}
+            - name: CRABCROP_RESULT_STORAGE_MAX_MB
+              value: {{ .Values.resultStorage.sizeLimitMb | quote }}
+            {{- end }}
+            {{- $allEnv := dict }}
+            {{- range $k, $v := .Values.env }}
+            {{- $_ := set $allEnv $k $v }}
+            {{- end }}
+            {{- if .Values.ai.enabled }}
+            {{- range $k, $v := .Values.ai.env }}
+            {{- $_ := set $allEnv $k $v }}
+            {{- end }}
+            {{- end }}
+            {{- range $k := keys $allEnv | sortAlpha }}
+            - name: {{ $k }}
+              value: {{ index $allEnv $k | quote }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if or .Values.presets .Values.resultStorage.enabled (and .Values.ai.enabled .Values.ai.models.existingClaim) }}
+          volumeMounts:
+            {{- if .Values.presets }}
+            - name: presets
+              mountPath: /etc/crabcrop/presets.txt
+              subPath: presets.txt
+              readOnly: true
+            {{- end }}
+            {{- if .Values.resultStorage.enabled }}
+            - name: results
+              mountPath: {{ .Values.resultStorage.mountPath }}
+            {{- end }}
+            {{- if and .Values.ai.enabled .Values.ai.models.existingClaim }}
+            - name: models
+              mountPath: {{ .Values.ai.models.mountPath }}
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.presets .Values.resultStorage.enabled (and .Values.ai.enabled .Values.ai.models.existingClaim) }}
+      volumes:
+        {{- if .Values.presets }}
+        - name: presets
+          configMap:
+            name: {{ include "crabcrop.fullname" . }}-presets
+        {{- end }}
+        {{- if .Values.resultStorage.enabled }}
+        - name: results
+          persistentVolumeClaim:
+            claimName: {{ .Values.resultStorage.pvc.existingClaim | default (printf "%s-results" (include "crabcrop.fullname" .)) }}
+        {{- end }}
+        {{- if and .Values.ai.enabled .Values.ai.models.existingClaim }}
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ .Values.ai.models.existingClaim }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

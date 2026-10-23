@@ -1,0 +1,23 @@
+crabcrop is deployed as {{ include "crabcrop.fullname" . }}.
+
+{{- if and (not .Values.existingSecret) (not .Values.secret) }}
+
+WARNING: no signing secret is configured. The server refuses
+to start without CRABCROP_SECRET (16+ bytes). Create one and
+point existingSecret at it:
+
+  kubectl create secret generic crabcrop-secret \
+    --from-literal=CRABCROP_SECRET="$(openssl rand -hex 32)"
+  helm upgrade {{ .Release.Name }} {{ .Chart.Name }} --set existingSecret=crabcrop-secret
+{{- end }}
+{{- if and .Values.ai.enabled (not .Values.ai.models.existingClaim) }}
+
+NOTE: ai.enabled is set but ai.models.existingClaim is empty,
+so no models volume is mounted. The AI features stay off
+until the model env vars point at real files.
+{{- end }}
+
+Sign a URL with the CLI built into the image:
+
+  kubectl exec deploy/{{ include "crabcrop.fullname" . }} -- \
+    env CRABCROP_BASE=http://localhost:{{ .Values.containerPort }} crabcrop sign "300x200/https://example.com/photo.jpg"

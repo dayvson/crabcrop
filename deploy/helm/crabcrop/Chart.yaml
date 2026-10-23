@@ -1,0 +1,9 @@
+apiVersion: v2
+name: crabcrop
+description: On-demand image optimization service
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/dayvson/crabcrop
+maintainers:
+  - name: dayvson
