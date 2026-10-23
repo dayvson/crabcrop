@@ -2493,7 +2493,7 @@ mod tests {
         let resp = client().get(&url).send().await.unwrap();
         assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
         // The real purge: signed over the literal target.
-        let sig = crate::url::purge_signature(SECRET, "purge-group/small");
+        let sig = crate::url::purge_group_signature(SECRET, "small");
         let resp = client()
             .post(format!("{base}/purge-group/{sig}/small"))
             .send()
@@ -2506,7 +2506,7 @@ mod tests {
         assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         // Unknown group: 200, nothing removed.
-        let sig = crate::url::purge_signature(SECRET, "purge-group/nope");
+        let sig = crate::url::purge_group_signature(SECRET, "nope");
         let resp = client()
             .post(format!("{base}/purge-group/{sig}/nope"))
             .send()
@@ -2530,7 +2530,7 @@ mod tests {
             header(&resp, "cache-status"),
             "crabcrop; hit; detail=\"disk\""
         );
-        let sig = crate::url::purge_signature(SECRET, "purge-group/small");
+        let sig = crate::url::purge_group_signature(SECRET, "small");
         let resp = client()
             .post(format!("{base}/purge-group/{sig}/small"))
             .send()

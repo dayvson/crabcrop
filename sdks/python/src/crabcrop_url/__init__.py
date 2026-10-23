@@ -23,6 +23,31 @@ def sign(secret: Union[str, bytes], remainder: str) -> str:
     return hmac.new(_key(secret), remainder.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def purge_key(secret: Union[str, bytes]) -> bytes:
+    """The purge subkey: the raw bytes of the HMAC-SHA256
+    of the domain label ``crabcrop/purge-key`` under the
+    secret. Purge signatures live under this derived key,
+    so an image signature can never be replayed as one."""
+    return bytes.fromhex(sign(secret, "crabcrop/purge-key"))
+
+
+def purge_signature(secret: Union[str, bytes], target: str) -> str:
+    """The signature segment for
+    ``POST /purge/<signature>/<path>``: HMAC-SHA256 of the
+    target path under the purge subkey."""
+    key = purge_key(secret)
+    return hmac.new(key, target.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def purge_group_signature(secret: Union[str, bytes], group: str) -> str:
+    """The signature segment for
+    ``POST /purge-group/<signature>/<group>``: a purge
+    signature over the literal string ``purge-group/<group>``,
+    which appears nowhere in the request URL. The helper
+    exists so nobody has to know the signed string."""
+    return purge_signature(secret, f"purge-group/{group}")
+
+
 def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
     """Check a signature segment against a remainder, with
     the Rust implementation's semantics: the expected tag

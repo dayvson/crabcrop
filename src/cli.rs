@@ -439,7 +439,7 @@ async fn purge(config: &Config, positional: &[String]) -> Result<String, String>
 async fn purge_group(config: &Config, positional: &[String]) -> Result<String, String> {
     let name = one_target(positional, "purge-group")?;
     let secret = require_secret(config)?;
-    let sig = crate::url::purge_signature(secret, &format!("purge-group/{name}"));
+    let sig = crate::url::purge_group_signature(secret, &name);
     post_purge(config, &format!("{}/purge-group/{sig}/{name}", config.base)).await
 }
 

@@ -18,8 +18,7 @@
  *
  * Run: node src/index.ts   (Node >= 22, for type stripping)
  */
-import { createHmac } from "node:crypto";
-import { buildURL, explainUrl, sign } from "@crabcrop/url";
+import { buildURL, explainUrl, purgeSignature, sign } from "@crabcrop/url";
 
 const SERVER = { name: "crabcrop", version: "0.1.0" };
 const PROTOCOL = "2024-11-05";
@@ -259,11 +258,10 @@ const TOOLS = [
       if (!base) throw new Error("no base: pass the base argument or set CRABCROP_BASE");
       if (!secret) throw new Error("purge requires a secret: pass the secret argument or set CRABCROP_SECRET");
       const target = stringArg(args, "path").replace(/^\//, "");
-      // Purge signatures are domain-separated (audit P-1): the
-      // key is the raw HMAC of the secret over a fixed label,
-      // and the signature is the HMAC of the target under it.
-      const subkey = Buffer.from(sign(secret, "crabcrop/purge-key"), "hex");
-      const signature = createHmac("sha256", subkey).update(target, "utf8").digest("hex");
+      // The SDK's helper: purge signatures are
+      // domain-separated from image signatures (audit P-1),
+      // and the derivation lives in exactly one place.
+      const signature = purgeSignature(secret, target);
       // The same network hygiene as fetch_meta: no
       // redirects, a bounded wait, and a capped body, so a
       // hung or hostile endpoint cannot hang the tool call

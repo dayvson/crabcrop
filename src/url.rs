@@ -1754,21 +1754,27 @@ pub fn verify(secret: &[u8], signature: &Signature, remainder: &str, allow_unsaf
 /// secret, which is exactly an image signature over a remainder
 /// of that shape.
 pub fn purge_key(secret: &[u8]) -> Vec<u8> {
-    // `sign` returns the hex tag; the key is its raw bytes.
-    hex::decode(crabcrop_url::sign(secret, "crabcrop/purge-key"))
-        .expect("sign returns lowercase hex")
+    crabcrop_url::purge_key(secret)
 }
 
-/// The purge signature for a target path: HMAC-SHA256 of the
-/// path alone, under the derived purge key. The server only
+/// The purge signature for a target path: HMAC-SHA256 of
+/// the path alone, under the derived purge key. Delegates
+/// to the `crabcrop-url` crate, the one implementation
+/// clients and server share (Q6). The server only
 /// verifies; this mints, for operators and tests.
 #[allow(dead_code)]
 pub fn purge_signature(secret: &[u8], target: &str) -> String {
-    crabcrop_url::sign(&purge_key(secret), target)
+    crabcrop_url::purge_signature(secret, target)
 }
 
-/// Verify a purge signature, with the same unsafe semantics
-/// as [`verify`].
+/// The purge-group signature for a cache group, over the
+/// literal `purge-group/<group>` string. Delegates to the
+/// crate helper so nobody hand-constructs the message.
+#[allow(dead_code)]
+pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
+    crabcrop_url::purge_group_signature(secret, group)
+}
+
 /// Verify a purge signature. Purges are the server's only
 /// destructive operation, so they never honor `unsafe`
 /// (review Q3): an HMAC under the purge subkey is always
