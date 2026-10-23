@@ -18,10 +18,9 @@
  */
 import { createHmac } from "node:crypto";
 import { createInterface } from "node:readline";
-import { buildURL, sign } from "@crabcrop/url";
+import { buildURL, explainUrl, sign } from "@crabcrop/url";
 // The explainer is the playground's module: one implementation
 // of URL explanation, shared by the debugger and this server.
-import { explainUrl } from "../../../playground/lib.mjs";
 
 const SERVER = { name: "crabcrop", version: "0.1.0" };
 const PROTOCOL = "2024-11-05";

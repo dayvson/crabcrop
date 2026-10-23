@@ -93,3 +93,20 @@ export function buildSrcSet(
     .map((w) => `${buildURL(base, secret, `${w}x0`, source, options)} ${w}w`)
     .join(", ");
 }
+
+export { explainUrl } from "./explain.ts";
+export type { ExplainedSegment, Explanation } from "./explain.ts";
+
+import { explainUrl } from "./explain.ts";
+
+/**
+ * Verify a URL's signature against a secret, locally. Returns
+ * true or false, or null when the URL is unsigned or malformed.
+ */
+export function verifyUrlSignature(secret: string, input: string): boolean | null {
+  const { signature, remainder } = explainUrl(input);
+  if (!signature || signature.kind !== "hmac") {
+    return null;
+  }
+  return sign(secret, remainder) === signature.value;
+}
