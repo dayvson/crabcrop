@@ -860,7 +860,7 @@ mod tests {
     const SECRET: &[u8] = b"test-secret";
 
     fn sign(remainder: &str) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(SECRET).unwrap();
         mac.update(remainder.as_bytes());
