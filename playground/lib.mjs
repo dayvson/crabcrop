@@ -106,6 +106,11 @@ const FILTER_BLURBS = {
   radius: "round the corners by the given radius in pixels (one value, or four in CSS corner order); needs an alpha-capable format",
   border: "paint a border of the given width and color (RRGGBB) inside the frame",
   mask: "keep only the inscribed `circle` or `ellipse`; the rest becomes transparent",
+  sepia: "the classic warm sepia tone",
+  duotone: "map shadows to the first color and highlights to the second, by luminance",
+  monochrome: "single-hue rendering in the given color (RRGGBB)",
+  pixelate: "mosaic into blocks of the given pixel size, each block averaged",
+  flip: "mirror the image: `h` horizontal, `v` vertical",
 };
 
 const MAX_DIMENSION = 16383;
@@ -162,6 +167,7 @@ const NO_ARG_FILTERS = new Set([
   "no_upscale",
   "equalize",
   "removebg",
+  "sepia",
   "blurfaces",
   "pixelatefaces",
 ]);
@@ -267,6 +273,19 @@ function validateFilter(name, args) {
     }
     case "mask":
       return args === "circle" || args === "ellipse" ? null : bad;
+    case "duotone": {
+      if (args === null) return bad;
+      const parts = args.split(",");
+      return parts.length === 2 && parts.every((p) => /^[0-9a-fA-F]{6}$/.test(p)) ? null : bad;
+    }
+    case "monochrome":
+      return args !== null && /^[0-9a-fA-F]{6}$/.test(args) ? null : bad;
+    case "pixelate":
+      return args !== null && /^\d+$/.test(args) && BigInt(args) >= 1n && BigInt(args) <= 16383n
+        ? null
+        : bad;
+    case "flip":
+      return args === "h" || args === "v" ? null : bad;
     case "max_bytes":
       return args !== null &&
         /^\d+$/.test(args) &&
