@@ -29,6 +29,9 @@ pub enum ParseError {
     /// There was no `/` after the first segment, so no operations or
     /// image URL could follow.
     MissingSignature,
+    /// The signature segment was neither `unsafe` nor lowercase
+    /// hex (audit PL-7: one canonical spelling).
+    MalformedSignature,
     /// A size segment did not match `<width>x<height>`. Carries the
     /// offending segment.
     InvalidSize(String),
@@ -66,6 +69,7 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::EmptyPath => write!(f, "empty path"),
             ParseError::MissingSignature => write!(f, "missing signature segment"),
+            ParseError::MalformedSignature => write!(f, "malformed signature segment"),
             ParseError::InvalidSize(seg) => write!(f, "invalid size segment: {seg}"),
             ParseError::InvalidCrop(seg) => write!(f, "invalid crop segment: {seg}"),
             ParseError::InvalidCropRect(seg) => {
@@ -389,8 +393,18 @@ pub fn parse_signature(path: &str) -> Result<(Signature, &str), ParseError> {
     }
     let signature = if first == "unsafe" {
         Signature::Unsafe
-    } else {
+    } else if !first.is_empty()
+        && first
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        // One canonical spelling (audit PL-7): builders emit
+        // lowercase hex, and other spellings (uppercase, non-hex
+        // tags) are parse errors rather than alternate forms of
+        // the same URL.
         Signature::Hmac(first.to_string())
+    } else {
+        return Err(ParseError::MalformedSignature);
     };
     Ok((signature, rest))
 }
@@ -1137,10 +1151,22 @@ mod tests {
     }
 
     #[test]
+    fn signatures_have_one_canonical_spelling() {
+        // Uppercase and non-hex spellings are parse errors
+        // (audit PL-7); builders only ever emit lowercase hex.
+        assert!(parse_signature("/A1B2C3D4/300x200/example.com/img.jpg").is_err());
+        assert!(parse_signature("/not-a-sig/300x200/example.com/img.jpg").is_err());
+        assert!(parse_signature("/a1b2c3d4/300x200/example.com/img.jpg").is_ok());
+    }
+
+    #[test]
     fn signature_is_case_sensitive_but_unsafe_is_lowercase_only() {
-        // "Unsafe" is not the magic word; it becomes an HMAC-looking signature.
-        let (sig, _) = parse_signature("/Unsafe/300x200/example.com/img.jpg").unwrap();
-        assert_eq!(sig, Signature::Hmac("Unsafe".to_string()));
+        // "Unsafe" is not the magic word, and under the
+        // canonical-spelling rule (PL-7) it is not lowercase
+        // hex either: a parse error, not an HMAC signature.
+        assert!(parse_signature("/Unsafe/300x200/example.com/img.jpg").is_err());
+        let (sig, _) = parse_signature("/unsafe/300x200/example.com/img.jpg").unwrap();
+        assert_eq!(sig, Signature::Unsafe);
     }
 
     #[test]

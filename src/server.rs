@@ -175,8 +175,12 @@ async fn handle(
     // The raw path, exactly as sent: the signature covers it
     // byte-for-byte, so no percent-decoding may happen first
     // (the `Path` extractor decodes, which would rewrite e.g.
-    // an encoded watermark URL before verification).
-    let path = uri.path().trim_start_matches('/');
+    // an encoded watermark URL before verification). At most
+    // one leading slash is stripped (audit PL-7): a doubled
+    // slash leaves an empty signature segment, which the
+    // parser rejects, instead of silently serving the same
+    // content under a second spelling.
+    let path = uri.path().strip_prefix('/').unwrap_or(uri.path());
     let started = Instant::now();
     let accept = headers
         .get(header::ACCEPT)
