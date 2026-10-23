@@ -19,6 +19,11 @@
 //! - `CRABCROP_SSIM_TARGET`: SSIMULACRA2 target (0-100) that
 //!   `quality(auto)` verifies against for JPEG and JXL output,
 //!   default 75.
+//! - `CRABCROP_AVIF_SPEED`: ravif speed tier for AVIF encodes,
+//!   1 (slowest, smallest) to 10 (fastest), default 8.
+//! - `CRABCROP_JXL_SPEED`: jixel speed tier for JPEG XL encodes,
+//!   one of ultrafast, fastest, fast, medium, slow, extraslow,
+//!   default fast.
 //! - `CRABCROP_ALLOWED_SOURCES`: comma-separated host suffixes the
 //!   loader may fetch from; unset allows every host.
 //! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: `1` or `true` to refuse
@@ -263,6 +268,21 @@ fn build_source_config() -> Result<SourceConfig, String> {
 /// when it is unset. A set-but-invalid value is a startup error
 /// naming the variable: silently serving on the wrong port or
 /// with the wrong cache budget is worse than refusing to start.
+/// Parse a `CRABCROP_JXL_SPEED` value into a jixel speed tier.
+fn parse_jxl_speed(value: &str) -> Result<jixel::Speed, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "ultrafast" => Ok(jixel::Speed::UltraFast),
+        "fastest" => Ok(jixel::Speed::Fastest),
+        "fast" => Ok(jixel::Speed::Fast),
+        "medium" => Ok(jixel::Speed::Medium),
+        "slow" => Ok(jixel::Speed::Slow),
+        "extraslow" => Ok(jixel::Speed::ExtraSlow),
+        _ => Err(format!(
+            "invalid CRABCROP_JXL_SPEED: {value:?} (expected ultrafast, fastest, fast, medium, slow, or extraslow)"
+        )),
+    }
+}
+
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
     parse_env_value(name, env::var(name).ok(), default)
 }
@@ -309,6 +329,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             format!("CRABCROP_SSIM_TARGET must be between 0 and 100, got {ssim_target}").into(),
         );
     }
+    let avif_speed: u8 = parse_env("CRABCROP_AVIF_SPEED", crate::engine::DEFAULT_AVIF_SPEED)?;
+    if !(1..=10).contains(&avif_speed) {
+        return Err(
+            format!("CRABCROP_AVIF_SPEED must be between 1 and 10, got {avif_speed}").into(),
+        );
+    }
+    let jxl_speed = match env::var("CRABCROP_JXL_SPEED") {
+        Ok(v) => parse_jxl_speed(&v)?,
+        Err(_) => crate::engine::DEFAULT_JXL_SPEED,
+    };
     let cache_mb: usize = parse_env("CRABCROP_CACHE_MAX_MB", 256)?;
     let cache_bytes = cache_mb
         .checked_mul(1024 * 1024)
@@ -435,6 +465,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(4),
         )),
         ssim_target,
+        avif_speed,
+        jxl_speed,
         presets,
         only_presets,
     };

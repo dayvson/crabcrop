@@ -72,6 +72,8 @@ pub struct AppState {
     /// SSIMULACRA2 target for verified `quality(auto)` encodes,
     /// from `CRABCROP_SSIM_TARGET`.
     pub ssim_target: f64,
+    pub avif_speed: u8,
+    pub jxl_speed: jixel::Speed,
     /// Named operation presets from `CRABCROP_PRESETS_FILE`:
     /// name to operation string, validated at boot.
     pub presets: std::collections::HashMap<String, String>,
@@ -250,6 +252,8 @@ struct ProcessJob {
     text_renderer: Option<Arc<dyn crate::text::TextRenderer>>,
     dpr: Option<f32>,
     ssim_target: f64,
+    avif_speed: u8,
+    jxl_speed: jixel::Speed,
 }
 
 /// Why a gated engine run produced no image.
@@ -306,6 +310,8 @@ async fn run_process(
             text_renderer: job.text_renderer.as_deref(),
             dpr: job.dpr,
             ssim_target: job.ssim_target,
+            avif_speed: job.avif_speed,
+            jxl_speed: job.jxl_speed,
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             engine.process_preferred(&bytes, &job.ops, ctx)
@@ -547,6 +553,8 @@ async fn serve(
         text_renderer: state.font.clone(),
         dpr: dpr_hint,
         ssim_target: state.ssim_target,
+        avif_speed: state.avif_speed,
+        jxl_speed: state.jxl_speed,
     };
     let processed = match run_process(state, &job, &bytes).await {
         Ok(p) => p,
@@ -961,6 +969,8 @@ mod tests {
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -999,6 +1009,8 @@ mod tests {
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1145,6 +1157,8 @@ mod tests {
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             presets,
             only_presets,
         };
@@ -1515,6 +1529,8 @@ mod tests {
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1673,6 +1689,8 @@ mod tests {
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1687,6 +1705,8 @@ mod tests {
             text_renderer: None,
             dpr: None,
             ssim_target: state.ssim_target,
+            avif_speed: state.avif_speed,
+            jxl_speed: state.jxl_speed,
         };
         let held = state.process_gate.clone().acquire_owned().await.unwrap();
         let png = test_png();

@@ -211,7 +211,20 @@ pub struct ProcessContext<'a> {
     /// SSIMULACRA2 target for verified `quality(auto)` encodes,
     /// from `CRABCROP_SSIM_TARGET`.
     pub ssim_target: f64,
+    /// ravif speed tier for AVIF encodes (1 slowest to 10
+    /// fastest), from `CRABCROP_AVIF_SPEED`.
+    pub avif_speed: u8,
+    /// jixel speed tier for JPEG XL encodes, from
+    /// `CRABCROP_JXL_SPEED`.
+    pub jxl_speed: jixel::Speed,
 }
+
+/// Default AVIF speed tier: the value the encoder ran at
+/// before it became configurable.
+pub const DEFAULT_AVIF_SPEED: u8 = 8;
+
+/// Default JPEG XL speed tier: jixel's own default.
+pub const DEFAULT_JXL_SPEED: jixel::Speed = jixel::Speed::Fast;
 
 impl Default for ProcessContext<'_> {
     fn default() -> Self {
@@ -225,6 +238,8 @@ impl Default for ProcessContext<'_> {
             text_renderer: None,
             dpr: None,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: DEFAULT_AVIF_SPEED,
+            jxl_speed: DEFAULT_JXL_SPEED,
         }
     }
 }
@@ -420,7 +435,14 @@ impl Engine {
                 ctx.ssim_target,
                 &mut encode_budget,
                 |q| {
-                    let candidate = encode(&img, format, Some(q), directives.fill)?;
+                    let candidate = encode(
+                        &img,
+                        format,
+                        Some(q),
+                        directives.fill,
+                        ctx.avif_speed,
+                        ctx.jxl_speed,
+                    )?;
                     let score = decode_image(&candidate)
                         .ok()
                         .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
@@ -431,7 +453,14 @@ impl Engine {
             ssim = scored.score;
             scored.bytes
         } else {
-            let bytes = encode(&img, format, encode_quality, directives.fill)?;
+            let bytes = encode(
+                &img,
+                format,
+                encode_quality,
+                directives.fill,
+                ctx.avif_speed,
+                ctx.jxl_speed,
+            )?;
             encode_budget -= 1;
             bytes
         };
@@ -457,7 +486,14 @@ impl Engine {
                 && encode_budget > 0
             {
                 current = next_quality(format, current);
-                bytes = encode(&img, format, Some(current), directives.fill)?;
+                bytes = encode(
+                    &img,
+                    format,
+                    Some(current),
+                    directives.fill,
+                    ctx.avif_speed,
+                    ctx.jxl_speed,
+                )?;
                 encode_budget -= 1;
                 chosen_quality = Some(current);
                 attempts += 1;
@@ -1020,12 +1056,16 @@ fn encode(
     format: ImageFormat,
     quality: Option<u8>,
     fill: Option<[u8; 3]>,
+    avif_speed: u8,
+    jxl_speed: jixel::Speed,
 ) -> Result<Vec<u8>, EngineError> {
     let (w, h) = (img.width(), img.height());
     if format == ImageFormat::Jxl {
         // Pure-Rust encoder (jixel). Its quality is a libjpeg-like
         // 0-100 scale, matching the quality filter's semantics.
-        let config = jixel::EncodeConfig::default().with_quality(quality.unwrap_or(80) as f32);
+        let config = jixel::EncodeConfig::default()
+            .with_quality(quality.unwrap_or(80) as f32)
+            .with_speed(jxl_speed);
         let encoded = if img.color().has_alpha() {
             let rgba = img.to_rgba8();
             jixel::encode_image_with_alpha(rgba.as_raw(), w as usize, h as usize, &config)
@@ -1078,12 +1118,13 @@ fn encode(
         }
         ImageFormat::WebP => unreachable!("WebP returns early in encode"),
         ImageFormat::Avif => {
-            // Pure-Rust ravif encoder via the image crate. Speed 8
-            // keeps on-demand encoding responsive; AVIF encoding is
-            // the expensive step in the pipeline by a wide margin.
+            // Pure-Rust ravif encoder via the image crate. The
+            // speed tier is operator configuration; AVIF encoding
+            // is the expensive step in the pipeline by a wide
+            // margin, so the tier trades real latency for bytes.
             image::codecs::avif::AvifEncoder::new_with_speed_quality(
                 &mut buf,
-                8,
+                avif_speed,
                 quality.unwrap_or(80),
             )
             .write_image(pixels, w, h, color)
@@ -2548,7 +2589,15 @@ mod tests {
     #[test]
     fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(24, 16));
-        let bytes = encode(&img, ImageFormat::Jxl, Some(80), None).unwrap();
+        let bytes = encode(
+            &img,
+            ImageFormat::Jxl,
+            Some(80),
+            None,
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
         assert!(check_jxl_dimensions(&bytes).is_ok());
         assert!(check_decoded_dimensions(20_000, 10).is_err());
         assert!(check_decoded_dimensions(16_384, 16_384).is_ok());
