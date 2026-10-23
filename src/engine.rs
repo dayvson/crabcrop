@@ -318,6 +318,19 @@ impl Engine {
                 ));
             }
         }
+        // Shape filters are validated the same way: their
+        // output is transparency, so the resolved format must
+        // carry alpha.
+        if let Some(name) = crate::url::shape_filter(ops) {
+            let resolved = crate::url::explicit_format(ops)
+                .or(ctx.preferred)
+                .unwrap_or(detected);
+            if matches!(resolved, ImageFormat::Jpeg | ImageFormat::Gif) {
+                return Err(EngineError::Unsupported(format!(
+                    "{name} needs an alpha-capable output format (png, webp, jxl, avif)"
+                )));
+            }
+        }
         if crate::url::has_upscale(ops) && ctx.upscale_provider.is_none() {
             return Err(EngineError::Unsupported(
                 "upscale is not configured on this server".to_string(),
@@ -1685,6 +1698,64 @@ mod tests {
         assert_eq!(hi.format, ImageFormat::Jpeg);
         assert!(hi.bytes.len() > lo.bytes.len());
         assert_eq!(&hi.bytes[..2], b"\xff\xd8");
+    }
+
+    #[test]
+    fn shape_filters_need_an_alpha_capable_format() {
+        let engine = Engine;
+        let src = solid_png(40, 40, [200, 30, 30]);
+        let err = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Radius([10, 10, 10, 10]),
+                    Filter::Format(ImageFormat::Jpeg),
+                ])],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("radius needs an alpha-capable output format"),
+            "got: {err}"
+        );
+        let err = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Mask(crate::url::MaskShape::Circle),
+                    Filter::Format(ImageFormat::Gif),
+                ])],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mask needs an alpha-capable output format"),
+            "got: {err}"
+        );
+        // PNG output carries the transparency through.
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Radius([10, 10, 10, 10]),
+                    Filter::Format(ImageFormat::Png),
+                ])],
+            )
+            .unwrap();
+        let decoded = image::load_from_memory(&out.bytes).unwrap();
+        assert_eq!(decoded.to_rgba8().get_pixel(0, 0)[3], 0);
+        assert_eq!(decoded.to_rgba8().get_pixel(20, 20)[3], 255);
+        // Border is opaque paint: JPEG is fine.
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Border(3, [0, 255, 0]),
+                    Filter::Format(ImageFormat::Jpeg),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jpeg);
     }
 
     #[test]

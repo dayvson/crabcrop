@@ -125,6 +125,9 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // resolves it against the request as a whole (with
             // the client-hint fallback). (Same routing.)
             Filter::Dpr(_) => {}
+            Filter::Radius(radii) => img = rounded_corners(&img, *radii),
+            Filter::Border(width, color) => img = draw_border(&img, *width, *color),
+            Filter::Mask(shape) => img = mask_shape(&img, *shape),
             Filter::Fill(color) => options.fill = Some(*color),
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::Quality(q) => options.quality = Some(*q),
@@ -133,6 +136,153 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
         }
     }
     (img, options)
+}
+
+/// Round the corners of `img` by the given radii (CSS order:
+/// top-left, top-right, bottom-right, bottom-left). Radii
+/// larger than the frame shrink proportionally so adjacent
+/// corners never overlap (the CSS rule). Only the alpha
+/// channel changes; coverage is antialiased over one pixel
+/// from the signed distance to the corner arc, multiplying
+/// the pixel's existing alpha.
+pub fn rounded_corners(img: &DynamicImage, radii: [u32; 4]) -> DynamicImage {
+    if radii.iter().all(|&r| r == 0) {
+        return img.clone();
+    }
+    let (w, h) = (img.width(), img.height());
+    let (wf, hf) = (w as f32, h as f32);
+    let mut rs = [
+        radii[0] as f32,
+        radii[1] as f32,
+        radii[2] as f32,
+        radii[3] as f32,
+    ];
+    let mut f = 1.0f32;
+    for (edge, sum) in [
+        (wf, rs[0] + rs[1]),
+        (hf, rs[1] + rs[2]),
+        (wf, rs[2] + rs[3]),
+        (hf, rs[3] + rs[0]),
+    ] {
+        if sum > edge {
+            f = f.min(edge / sum);
+        }
+    }
+    for r in &mut rs {
+        *r *= f;
+    }
+    // (radius, arc center x, arc center y, square x range, square y range)
+    let corners = [
+        (
+            rs[0],
+            rs[0],
+            rs[0],
+            0..(rs[0].ceil() as u32).min(w),
+            0..(rs[0].ceil() as u32).min(h),
+        ),
+        (
+            rs[1],
+            wf - rs[1],
+            rs[1],
+            w - (rs[1].ceil() as u32).min(w)..w,
+            0..(rs[1].ceil() as u32).min(h),
+        ),
+        (
+            rs[2],
+            wf - rs[2],
+            hf - rs[2],
+            w - (rs[2].ceil() as u32).min(w)..w,
+            h - (rs[2].ceil() as u32).min(h)..h,
+        ),
+        (
+            rs[3],
+            rs[3],
+            hf - rs[3],
+            0..(rs[3].ceil() as u32).min(w),
+            h - (rs[3].ceil() as u32).min(h)..h,
+        ),
+    ];
+    let mut rgba = img.to_rgba8();
+    for (r, ax, ay, xs, ys) in corners {
+        if r <= 0.0 {
+            continue;
+        }
+        for y in ys {
+            for x in xs.clone() {
+                let d = ((x as f32 + 0.5 - ax).powi(2) + (y as f32 + 0.5 - ay).powi(2)).sqrt() - r;
+                let coverage = (0.5 - d).clamp(0.0, 1.0);
+                if coverage < 1.0 {
+                    let px = rgba.get_pixel_mut(x, y);
+                    px[3] = (px[3] as f32 * coverage).round() as u8;
+                }
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(rgba)
+}
+
+/// Keep only the inscribed shape of `img`; everything outside
+/// becomes transparent. The edge is antialiased over one pixel
+/// from the signed distance to the boundary (exact for
+/// circles, a close approximation for ellipses), multiplying
+/// the pixel's existing alpha.
+pub fn mask_shape(img: &DynamicImage, shape: crate::url::MaskShape) -> DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+    let (rx, ry) = match shape {
+        crate::url::MaskShape::Circle => {
+            let r = cx.min(cy);
+            (r, r)
+        }
+        crate::url::MaskShape::Ellipse => (cx, cy),
+    };
+    let feather_scale = rx.min(ry);
+    let mut rgba = img.to_rgba8();
+    for y in 0..h {
+        for x in 0..w {
+            let nx = (x as f32 + 0.5 - cx) / rx;
+            let ny = (y as f32 + 0.5 - cy) / ry;
+            let d = ((nx * nx + ny * ny).sqrt() - 1.0) * feather_scale;
+            let coverage = (0.5 - d).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                rgba.get_pixel_mut(x, y)[3] = 0;
+            } else if coverage < 1.0 {
+                let px = rgba.get_pixel_mut(x, y);
+                px[3] = (px[3] as f32 * coverage).round() as u8;
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(rgba)
+}
+
+/// Paint an opaque band of `color`, `width` pixels wide,
+/// inside the frame. Dimensions do not change; a width of
+/// half the smaller dimension or more paints the whole image.
+pub fn draw_border(img: &DynamicImage, width: u32, color: [u8; 3]) -> DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    let mut rgba = img.to_rgba8();
+    let band = image::Rgba([color[0], color[1], color[2], 255]);
+    let bh = width.min(h);
+    let bw = width.min(w);
+    for y in 0..bh {
+        for x in 0..w {
+            rgba.put_pixel(x, y, band);
+        }
+    }
+    for y in h - bh..h {
+        for x in 0..w {
+            rgba.put_pixel(x, y, band);
+        }
+    }
+    for y in bh..h - bh {
+        for x in 0..bw {
+            rgba.put_pixel(x, y, band);
+        }
+        for x in w - bw..w {
+            rgba.put_pixel(x, y, band);
+        }
+    }
+    DynamicImage::ImageRgba8(rgba)
 }
 
 /// Crop away the uniform border: keep the bounding box of
@@ -276,6 +426,111 @@ fn equalize(img: &image::RgbImage) -> image::RgbImage {
 mod tests {
     use super::*;
     use image::Rgb;
+
+    fn alpha_at(img: &DynamicImage, x: u32, y: u32) -> u8 {
+        img.to_rgba8().get_pixel(x, y)[3]
+    }
+
+    fn opaque(w: u32, h: u32, color: [u8; 3]) -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(w, h);
+        for p in img.as_mut_rgb8().unwrap().pixels_mut() {
+            *p = Rgb(color);
+        }
+        img
+    }
+
+    #[test]
+    fn radius_cuts_corners_and_antialiases() {
+        let img = rounded_corners(&opaque(100, 100, [255, 0, 0]), [20, 20, 20, 20]);
+        assert_eq!(alpha_at(&img, 0, 0), 0);
+        assert_eq!(alpha_at(&img, 50, 50), 255);
+        let edge = alpha_at(&img, 5, 6);
+        assert!(edge > 0 && edge < 255, "antialiased edge, got {edge}");
+        // Color channels are untouched.
+        assert_eq!(img.to_rgba8().get_pixel(50, 50).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn radius_multiplies_existing_alpha() {
+        let mut img = DynamicImage::new_rgba8(40, 40);
+        for p in img.as_mut_rgba8().unwrap().pixels_mut() {
+            *p = image::Rgba([10, 20, 30, 100]);
+        }
+        let img = rounded_corners(&img, [10, 10, 10, 10]);
+        assert_eq!(alpha_at(&img, 20, 20), 100);
+        assert_eq!(alpha_at(&img, 0, 0), 0);
+    }
+
+    #[test]
+    fn radius_is_per_corner() {
+        let img = rounded_corners(&opaque(100, 100, [0, 0, 255]), [20, 0, 0, 0]);
+        assert_eq!(alpha_at(&img, 0, 0), 0);
+        assert_eq!(alpha_at(&img, 99, 0), 255);
+        assert_eq!(alpha_at(&img, 99, 99), 255);
+        assert_eq!(alpha_at(&img, 0, 99), 255);
+    }
+
+    #[test]
+    fn radius_scales_to_the_frame() {
+        // 80px radii on a 100px frame shrink to 50 (CSS rule).
+        let img = rounded_corners(&opaque(100, 100, [9, 9, 9]), [80, 80, 80, 80]);
+        assert_eq!(alpha_at(&img, 0, 0), 0);
+        // (0, 50) sits on the scaled arc itself: antialiased
+        // to nearly full, not exactly full.
+        assert!(alpha_at(&img, 0, 50) >= 250);
+        assert_eq!(alpha_at(&img, 50, 50), 255);
+    }
+
+    #[test]
+    fn mask_circle_and_ellipse_geometry() {
+        let circle = mask_shape(&opaque(100, 60, [255, 0, 0]), crate::url::MaskShape::Circle);
+        assert_eq!(alpha_at(&circle, 50, 30), 255);
+        assert_eq!(alpha_at(&circle, 0, 0), 0);
+        assert_eq!(alpha_at(&circle, 99, 30), 0);
+        // The circle's diameter is the height, so it touches
+        // the top and bottom edges at the horizontal center.
+        assert!(alpha_at(&circle, 50, 59) >= 250);
+        assert!(alpha_at(&circle, 50, 0) >= 250);
+        let ellipse = mask_shape(
+            &opaque(100, 60, [255, 0, 0]),
+            crate::url::MaskShape::Ellipse,
+        );
+        assert_eq!(alpha_at(&ellipse, 50, 30), 255);
+        assert!(alpha_at(&ellipse, 50, 0) >= 250);
+        // The ellipse touches the left edge at the vertical
+        // center: inside the feather there, fully outside
+        // higher up.
+        assert!(alpha_at(&ellipse, 0, 30) >= 150);
+        assert_eq!(alpha_at(&ellipse, 0, 15), 0);
+        assert_eq!(alpha_at(&ellipse, 0, 0), 0);
+    }
+
+    #[test]
+    fn border_paints_inside_the_frame() {
+        let img = draw_border(&opaque(10, 10, [255, 0, 0]), 2, [0, 255, 0]);
+        assert_eq!((img.width(), img.height()), (10, 10));
+        let rgba = img.to_rgba8();
+        for (x, y) in [(0, 0), (1, 5), (9, 9), (5, 0), (8, 8)] {
+            assert_eq!(
+                rgba.get_pixel(x, y).0,
+                [0, 255, 0, 255],
+                "band pixel {x},{y}"
+            );
+        }
+        for (x, y) in [(2, 2), (5, 5), (7, 7)] {
+            assert_eq!(
+                rgba.get_pixel(x, y).0,
+                [255, 0, 0, 255],
+                "interior pixel {x},{y}"
+            );
+        }
+    }
+
+    #[test]
+    fn border_wider_than_half_paints_everything() {
+        let img = draw_border(&opaque(10, 10, [255, 0, 0]), 5, [0, 0, 255]);
+        assert_eq!(img.to_rgba8().get_pixel(5, 5).0, [0, 0, 255, 255]);
+    }
 
     fn striped() -> DynamicImage {
         let mut img = DynamicImage::new_rgb8(64, 64);

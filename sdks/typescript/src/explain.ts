@@ -49,6 +49,9 @@ const FILTER_BLURBS = {
   dpr: "device pixel ratio the sizes are multiplied by",
   watermark: "overlay a watermark image",
   max_bytes: "cap the output size, lowering quality to fit",
+  radius: "round the corners by the given radius in pixels (one value, or four in CSS corner order); needs an alpha-capable format",
+  border: "paint a border of the given width and color (RRGGBB) inside the frame",
+  mask: "keep only the inscribed `circle` or `ellipse`; the rest becomes transparent",
 };
 
 const MAX_DIMENSION = 16383;
@@ -189,6 +192,27 @@ function validateFilter(name, args) {
         : bad;
     case "fill":
       return args !== null && /^[0-9a-fA-F]{6}$/.test(args) ? null : bad;
+    case "radius": {
+      if (args === null) return bad;
+      const parts = args.split(",");
+      return (parts.length === 1 || parts.length === 4) &&
+        parts.every((p) => /^\d+$/.test(p) && BigInt(p) <= 16383n)
+        ? null
+        : bad;
+    }
+    case "border": {
+      if (args === null) return bad;
+      const parts = args.split(",");
+      return parts.length === 2 &&
+        /^\d+$/.test(parts[0]) &&
+        BigInt(parts[0]) >= 1n &&
+        BigInt(parts[0]) <= 16383n &&
+        /^[0-9a-fA-F]{6}$/.test(parts[1])
+        ? null
+        : bad;
+    }
+    case "mask":
+      return args === "circle" || args === "ellipse" ? null : bad;
     case "max_bytes":
       return args !== null &&
         /^\d+$/.test(args) &&

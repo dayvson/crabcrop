@@ -142,6 +142,12 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["crop-rect:0x0:50/" + SRC, true, SRC],
     ["16384x10/" + SRC, false, "16384x10/" + SRC], // oversize bare size is not an op: the source starts there
     ["exp:1893456000/300x200/" + SRC, false, SRC],
+    ["filters:radius(12)/" + SRC, false, SRC],
+    ["filters:radius(1,2,3,4):mask(circle)/" + SRC, false, SRC],
+    ["filters:radius(1,2)/" + SRC, true, SRC],
+    ["filters:border(2,00ff00)/" + SRC, false, SRC],
+    ["filters:border(0,00ff00)/" + SRC, true, SRC],
+    ["filters:mask(square)/" + SRC, true, SRC],
   ];
   for (const [remainder, expectError, expectSource] of cases) {
     const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);

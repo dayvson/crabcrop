@@ -200,6 +200,9 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | `equalize` | none | Histogram equalization, per channel. | `filters:equalize` |
 | `rotate` | `rotate(90)` — a multiple of 90; negatives allowed | Rotate the image. | `filters:rotate(-90)` |
 | `trim` | `trim` or `trim(20)` — tolerance 0–255, default 10 | Crop away the border that matches the top-left corner color within the tolerance. | `filters:trim(20)` |
+| `radius` | `radius(24)` — pixels; or four values `radius(24,24,0,0)` in CSS corner order (top-left, top-right, bottom-right, bottom-left) | Round the corners, antialiased. Radii larger than the frame shrink proportionally so corners never overlap. The output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:radius(24):format(png)` |
+| `border` | `border(4,000000)` — width in pixels, color as six hex digits | Paint an opaque band of the color inside the frame. Dimensions do not change. Works on any format. | `filters:border(4,000000)` |
+| `mask` | `mask(circle)` or `mask(ellipse)` | Keep only the inscribed shape (the circle's diameter is the smaller dimension); the rest becomes transparent. The output format must carry alpha. | `filters:mask(circle):format(png)` |
 
 ```bash
 curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/https://example.com/photo.jpg"
