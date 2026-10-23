@@ -386,6 +386,7 @@ dependencies = [
  "jxl-image-rs-integration",
  "kamadak-exif",
  "ort",
+ "oxideav-webp",
  "reqwest",
  "resvg",
  "roxmltree",
@@ -1540,6 +1541,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
+]
+
+[[package]]
+name = "oxideav-vp8"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "506f2495a728488c2fee1ee54bc7f819ca934dc3246369b4100c83848f057852"
+
+[[package]]
+name = "oxideav-webp"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f165f68743f086d7349770ed9e9ae5a9acc622a87fc44fe5af5f892f74abf556"
+dependencies = [
+ "oxideav-vp8",
 ]
 
 [[package]]
