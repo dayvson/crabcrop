@@ -12,6 +12,13 @@ pub struct Placeholder {
     pub dominant_color: String,
     /// `data:image/jpeg;base64,...`: a 16px-wide blurred preview.
     pub data_uri: String,
+    /// The five most prominent colors as `#rrggbb`, most
+    /// prominent first.
+    pub palette: Vec<String>,
+    /// A ThumbHash of the image, base64: decodable by
+    /// ThumbHash client libraries into an aspect-correct
+    /// blurred preview.
+    pub thumbhash: String,
 }
 
 /// Compute the placeholder for a processed image.
@@ -19,6 +26,58 @@ pub fn compute(img: &DynamicImage) -> Placeholder {
     Placeholder {
         dominant_color: dominant_color(img),
         data_uri: data_uri(img),
+        palette: palette(img),
+        thumbhash: crate::thumbhash::thumbhash_base64(img),
+    }
+}
+
+/// The top colors of the image: a 4-bit-per-channel
+/// histogram over a <=100x100 resample, pixels weighted by
+/// alpha, each reported color its bin's weighted average.
+/// At most five entries, most prominent first; ties break
+/// by bin so the result is deterministic. A fully
+/// transparent image has no prominent colors and reports
+/// just its (RGB) dominant color.
+fn palette(img: &DynamicImage) -> Vec<String> {
+    let small = img.resize(100, 100, FilterType::Triangle).to_rgba8();
+    let mut sums = vec![[0.0f64; 3]; 4096];
+    let mut weights = vec![0.0f64; 4096];
+    for px in small.pixels() {
+        let a = px[3] as f64 / 255.0;
+        if a == 0.0 {
+            continue;
+        }
+        let bin =
+            ((px[0] as usize >> 4) << 8) | ((px[1] as usize >> 4) << 4) | (px[2] as usize >> 4);
+        for c in 0..3 {
+            sums[bin][c] += a * px[c] as f64;
+        }
+        weights[bin] += a;
+    }
+    let mut bins: Vec<usize> = (0..4096).filter(|&b| weights[b] > 0.0).collect();
+    bins.sort_by(|&x, &y| {
+        weights[y]
+            .partial_cmp(&weights[x])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(x.cmp(&y))
+    });
+    let out: Vec<String> = bins
+        .iter()
+        .take(5)
+        .map(|&b| {
+            let w = weights[b];
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (sums[b][0] / w).round() as u8,
+                (sums[b][1] / w).round() as u8,
+                (sums[b][2] / w).round() as u8
+            )
+        })
+        .collect();
+    if out.is_empty() {
+        vec![dominant_color(img)]
+    } else {
+        out
     }
 }
 
@@ -128,6 +187,34 @@ mod tests {
     fn dominant_color_of_a_solid_image_is_exact() {
         assert_eq!(compute(&solid(255, 0, 0, 40, 30)).dominant_color, "#ff0000");
         assert_eq!(compute(&solid(18, 52, 86, 7, 3)).dominant_color, "#123456");
+    }
+
+    #[test]
+    fn palette_of_a_solid_image_is_that_color() {
+        let p = compute(&solid(18, 52, 86, 40, 30));
+        assert_eq!(p.palette, vec!["#123456".to_string()]);
+        assert!(!p.thumbhash.is_empty());
+    }
+
+    #[test]
+    fn palette_ranks_colors_by_prominence() {
+        // Three quarters red (left 30 of 40 columns), one
+        // quarter blue.
+        let mut img = image::RgbImage::new(40, 40);
+        for (x, _y, px) in img.enumerate_pixels_mut() {
+            *px = if x < 30 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        let p = compute(&DynamicImage::ImageRgb8(img));
+        assert_eq!(p.palette[0], "#ff0000");
+        assert!(
+            p.palette.contains(&"#0000ff".to_string()),
+            "{:?}",
+            p.palette
+        );
     }
 
     #[test]
