@@ -16,6 +16,9 @@
 //! - `CRABCROP_ALLOW_UNSAFE`: `1` or `true` to honor `unsafe` URLs.
 //! - `CRABCROP_CACHE_MAX_MB`: result cache budget in megabytes,
 //!   default 256; `0` disables the cache.
+//! - `CRABCROP_SSIM_TARGET`: SSIMULACRA2 target (0-100) that
+//!   `quality(auto)` verifies against for JPEG and JXL output,
+//!   default 75.
 //! - `CRABCROP_ALLOWED_SOURCES`: comma-separated host suffixes the
 //!   loader may fetch from; unset allows every host.
 //! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: `1` or `true` to refuse
@@ -109,6 +112,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let port: u16 = parse_env("PORT", 3000)?;
+    let ssim_target: f64 = parse_env("CRABCROP_SSIM_TARGET", crate::quality::DEFAULT_SSIM_TARGET)?;
+    if !ssim_target.is_finite() || !(0.0..=100.0).contains(&ssim_target) {
+        return Err(
+            format!("CRABCROP_SSIM_TARGET must be between 0 and 100, got {ssim_target}").into(),
+        );
+    }
     let cache_mb: usize = parse_env("CRABCROP_CACHE_MAX_MB", 256)?;
     let cache_bytes = cache_mb
         .checked_mul(1024 * 1024)
@@ -226,6 +235,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         fallback,
         store,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        ssim_target,
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     println!("crabcrop listening on port {port}");

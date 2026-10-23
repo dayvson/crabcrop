@@ -24,7 +24,7 @@ fn ensure_jxl_decoder() {
 }
 
 /// The encoded output plus its container format.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProcessedImage {
     pub bytes: Vec<u8>,
     pub format: ImageFormat,
@@ -44,6 +44,10 @@ pub struct ProcessedImage {
     /// responses, computed from the final pixels when the caller
     /// asked for it. `None` otherwise.
     pub placeholder: Option<crate::placeholder::Placeholder>,
+    /// The SSIMULACRA2 score of the returned bytes against the
+    /// processed source, set when `quality(auto)` verified its
+    /// encode (JPEG and JXL). `None` when nothing was scored.
+    pub ssimulacra2: Option<f64>,
 }
 
 /// What went wrong while processing an image.
@@ -87,7 +91,7 @@ impl std::error::Error for EngineError {}
 
 /// Per-request context the caller hands to the engine: the
 /// things a pipeline run needs that are not in the URL.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ProcessContext<'a> {
     /// Negotiated format preference (from `Accept`); applies
     /// only when the operations name no format themselves.
@@ -108,6 +112,25 @@ pub struct ProcessContext<'a> {
     /// DPR fallback from the request's client hint, used when
     /// the URL carries no explicit `dpr` directive.
     pub dpr: Option<f32>,
+    /// SSIMULACRA2 target for verified `quality(auto)` encodes,
+    /// from `CRABCROP_SSIM_TARGET`.
+    pub ssim_target: f64,
+}
+
+impl Default for ProcessContext<'_> {
+    fn default() -> Self {
+        ProcessContext {
+            preferred: None,
+            watermarks: None,
+            placeholders: false,
+            mask_provider: None,
+            upscale_provider: None,
+            face_provider: None,
+            text_renderer: None,
+            dpr: None,
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+        }
+    }
 }
 
 /// Decodes, resizes, and encodes images.
@@ -278,7 +301,29 @@ impl Engine {
             }
             None => (None, None),
         };
-        let mut bytes = encode(&img, format, encode_quality, directives.fill)?;
+        // `quality(auto)` on a format with a decoder to verify
+        // against (JPEG, JXL) closes the loop: encode, decode,
+        // score with SSIMULACRA2, and bisect on quality until the
+        // score lands in the target band. The heuristic pick is
+        // the first guess. Other formats keep the one-shot pick.
+        let perceptual = matches!(directives.quality, Some(Quality::Auto))
+            && matches!(format, ImageFormat::Jpeg | ImageFormat::Jxl);
+        let mut ssim: Option<f64> = None;
+        let mut bytes = if perceptual {
+            let first_guess = encode_quality.expect("auto quality resolves a value");
+            let scored = crate::quality::encode_to_target(first_guess, ctx.ssim_target, |q| {
+                let candidate = encode(&img, format, Some(q), directives.fill)?;
+                let score = image::load_from_memory(&candidate)
+                    .ok()
+                    .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
+                Ok::<_, EngineError>((candidate, score))
+            })?;
+            chosen_quality = Some(scored.quality);
+            ssim = scored.score;
+            scored.bytes
+        } else {
+            encode(&img, format, encode_quality, directives.fill)?
+        };
         // `max_bytes` is a budget, pursued by re-encoding at
         // decreasing quality. Only the quality-bearing formats have
         // a lever; for the others the directive cannot be honored
@@ -291,8 +336,9 @@ impl Engine {
             format,
             ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
         );
+        let mut ladder_ran = false;
         if let Some(budget) = directives.max_bytes.filter(|_| quality_bearing) {
-            let mut current = encode_quality.unwrap_or(80);
+            let mut current = chosen_quality.or(encode_quality).unwrap_or(80);
             let mut attempts = 0;
             while bytes.len() as u64 > budget
                 && current > 1
@@ -302,7 +348,16 @@ impl Engine {
                 bytes = encode(&img, format, Some(current), directives.fill)?;
                 chosen_quality = Some(current);
                 attempts += 1;
+                ladder_ran = true;
             }
+        }
+        if ladder_ran && ssim.is_some() {
+            // The budget overruled the verified quality, so the
+            // reported score must describe the bytes actually
+            // served: re-score the final encode once.
+            ssim = image::load_from_memory(&bytes)
+                .ok()
+                .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
         }
         Ok(ProcessedImage {
             bytes,
@@ -313,6 +368,7 @@ impl Engine {
             source_width,
             source_height,
             placeholder,
+            ssimulacra2: ssim,
         })
     }
 
@@ -370,6 +426,7 @@ impl Engine {
             source_width,
             source_height,
             placeholder,
+            ssimulacra2: None,
         })
     }
 }
@@ -1251,6 +1308,28 @@ mod tests {
         png_bytes(&img)
     }
 
+    /// A photo surrogate for perceptual tests: smooth
+    /// multi-frequency content (sums of sinusoids) at a size the
+    /// metric's scales can work with. Unlike the sawtooth
+    /// gradient, lossy codecs can encode it well.
+    fn photo_like_png() -> Vec<u8> {
+        let mut img = DynamicImage::new_rgb8(240, 180);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            let (fx, fy) = (x as f64, y as f64);
+            let wave = |phase: f64, a: f64, b: f64| {
+                128.0
+                    + 62.0 * (fx * a + phase).sin() * (fy * b + phase * 0.7).cos()
+                    + 24.0 * ((fx + fy) * 0.021 + phase).sin()
+            };
+            *p = image::Rgb([
+                wave(0.0, 0.11, 0.07).clamp(0.0, 255.0) as u8,
+                wave(2.1, 0.09, 0.13).clamp(0.0, 255.0) as u8,
+                wave(4.2, 0.05, 0.05).clamp(0.0, 255.0) as u8,
+            ]);
+        }
+        png_bytes(&img)
+    }
+
     #[test]
     fn grayscale_filter_desaturates() {
         let engine = Engine;
@@ -1448,6 +1527,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.quality, None);
+        assert_eq!(out.ssimulacra2, None);
+    }
+
+    #[test]
+    fn auto_quality_jpeg_is_verified_against_the_target() {
+        let engine = Engine;
+        let ops = &[Operation::Filters(vec![
+            Filter::Quality(Quality::Auto),
+            Filter::Format(ImageFormat::Jpeg),
+        ])];
+        // The photo surrogate is ordinary content for the metric:
+        // the loop must land it at or above the target.
+        let out = engine.process(&photo_like_png(), ops).unwrap();
+        let score = out.ssimulacra2.expect("auto JPEG is scored");
+        assert!(
+            (crate::quality::DEFAULT_SSIM_TARGET..=100.0).contains(&score),
+            "score {score}"
+        );
+        assert!(out.quality.is_some_and(|q| (50..=95).contains(&q)));
+        // The noisy fixture cannot reach the target at any allowed
+        // quality; the loop still scores it and serves its best.
+        let noisy = engine.process(&noise_png(), ops).unwrap();
+        assert!(noisy.ssimulacra2.is_some());
+    }
+
+    #[test]
+    fn auto_quality_jxl_is_verified_too() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &photo_like_png(),
+                &[Operation::Filters(vec![
+                    Filter::Quality(Quality::Auto),
+                    Filter::Format(ImageFormat::Jxl),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jxl);
+        let score = out.ssimulacra2.expect("auto JXL is scored");
+        assert!(
+            (crate::quality::DEFAULT_SSIM_TARGET..=100.0).contains(&score),
+            "score {score}"
+        );
+    }
+
+    #[test]
+    fn auto_quality_webp_keeps_the_one_shot_pick() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &gradient_png(),
+                &[Operation::Filters(vec![
+                    Filter::Quality(Quality::Auto),
+                    Filter::Format(ImageFormat::WebP),
+                ])],
+            )
+            .unwrap();
+        // WebP is out of the verified scope for now: the heuristic
+        // quality is reported, and nothing was scored.
+        assert!(out.quality.is_some());
+        assert_eq!(out.ssimulacra2, None);
     }
 
     /// 8x4 pattern with only the top-left quadrant white.

@@ -185,7 +185,7 @@ curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/
 
 Notes on the directives:
 
-- `quality(auto)` picks a quality per image, from 50 for flat images to 95 for detailed ones, based on content analysis. When crabcrop picks the quality — for `quality(auto)`, or when `max_bytes` steps quality down — the response carries an `X-Crabcrop-Quality` header with the value used.
+- `quality(auto)` picks a quality per image, from 50 for flat images to 95 for detailed ones, based on content analysis. For JPEG and JPEG XL the pick is then verified: crabcrop encodes, decodes the result, and scores it against the processed source with SSIMULACRA2, adjusting quality (at most 4 encodes) until the score lands at the target, 75 by default and configurable with `CRABCROP_SSIM_TARGET`. The achieved score is reported in meta responses as `ssimulacra2`. Verification happens on cache misses only, but it is real work: scoring a full-size image takes about a second. When crabcrop picks the quality — for `quality(auto)`, or when `max_bytes` steps quality down — the response carries an `X-Crabcrop-Quality` header with the value used.
 - `max_bytes` can only steer formats with a quality setting: JPEG, JPEG XL, AVIF, and WebP. If quality reaches its floor and the output is still over budget, you get the smallest encode rather than an error. PNG and GIF ignore the budget.
 - WebP encodes lossy at the requested quality (default 80); `quality(100)` selects the lossless encode. `quality` has no effect on PNG or GIF output.
 - JPEG has no alpha channel. With `fill`, transparent pixels are composited over the fill color; without it, the stored RGB values are used as-is.
@@ -274,6 +274,7 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 | `format` | Output format: `jpeg`, `png`, `webp`, `jxl`, `avif`, or `gif`. |
 | `bytes` | Size of the processed image in bytes. |
 | `source_width`, `source_height` | Source dimensions in pixels, after EXIF orientation. |
+| `ssimulacra2` | The verified perceptual score of the output, present when `quality(auto)` verified a JPEG or JPEG XL encode. 100 is identical. |
 
 Add the `placeholders` parameter to the media type to also get placeholder data, computed from the final processed pixels:
 
@@ -347,6 +348,7 @@ All configuration comes from environment variables. Invalid values for the numer
 | `PORT` | `3000` | Listen port. |
 | `CRABCROP_ALLOW_UNSAFE` | off | `1` or `true` honors `unsafe` URLs. Anything else, including unset, means off. |
 | `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
+| `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
 | `CRABCROP_ALLOWED_SOURCES` | unset (all hosts allowed) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
 | `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | `1` or `true` refuses sources whose host is, or resolves to, a loopback, private, link-local, or unspecified address. Checked before connecting and again on every redirect hop. |
 | `CRABCROP_REMOVEBG_MODEL` | unset | Path to a U²-Net-family ONNX model for the `removebg` filter. See [AI features](#ai-features). |
