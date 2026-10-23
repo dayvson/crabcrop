@@ -280,7 +280,7 @@ impl Engine {
         // encode without limit.
         let quality_bearing = matches!(
             format,
-            ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif
+            ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
         );
         if let Some(budget) = directives.max_bytes.filter(|_| quality_bearing) {
             let mut current = encode_quality.unwrap_or(80);
@@ -724,7 +724,8 @@ fn max_quality_attempts(format: ImageFormat) -> u32 {
 }
 
 /// Encode `img` to `format`. `quality` applies to JPEG, JPEG XL,
-/// and AVIF. `fill` composites transparency for formats without an
+/// AVIF, and WebP (where 100 selects the lossless encode).
+/// `fill` composites transparency for formats without an
 /// alpha channel (only JPEG needs it here).
 fn encode(
     img: &DynamicImage,
@@ -746,6 +747,9 @@ fn encode(
         };
         return encoded.map_err(|e| EngineError::Encode(e.to_string()));
     }
+    if format == ImageFormat::WebP {
+        return encode_webp(img, quality);
+    }
     let mut buf = Vec::new();
     let (pixels, color) = (img.as_bytes(), ExtendedColorType::from(img.color()));
     match format {
@@ -766,12 +770,7 @@ fn encode(
                 .write_image(pixels, w, h, color)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
-        ImageFormat::WebP => {
-            // The image crate's WebP encoder is lossless-only.
-            image::codecs::webp::WebPEncoder::new_lossless(&mut buf)
-                .write_image(pixels, w, h, color)
-                .map_err(|e| EngineError::Encode(e.to_string()))?;
-        }
+        ImageFormat::WebP => unreachable!("WebP returns early in encode"),
         ImageFormat::Avif => {
             // Pure-Rust ravif encoder via the image crate. Speed 8
             // keeps on-demand encoding responsive; AVIF encoding is
@@ -792,6 +791,41 @@ fn encode(
         ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
     }
     Ok(buf)
+}
+
+/// Encode WebP. Quality below 100 is a lossy VP8 encode via
+/// oxideav-webp (pure Rust); quality 100 (or an encode the ladder
+/// starts there) keeps the image crate's lossless VP8L encode.
+/// The default quality is 80, like the other lossy formats.
+fn encode_webp(img: &DynamicImage, quality: Option<u8>) -> Result<Vec<u8>, EngineError> {
+    let q = quality.unwrap_or(80);
+    if q >= 100 {
+        let mut buf = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut buf)
+            .write_image(
+                img.as_bytes(),
+                img.width(),
+                img.height(),
+                ExtendedColorType::from(img.color()),
+            )
+            .map_err(|e| EngineError::Encode(e.to_string()))?;
+        return Ok(buf);
+    }
+    // VP8 frames carry 14-bit dimensions.
+    if img.width() > 16383 || img.height() > 16383 {
+        return Err(EngineError::Encode(
+            "webp: dimension exceeds the 16383 format limit".into(),
+        ));
+    }
+    let opts = oxideav_webp::EncodeOptions::default().with_quality(q as f32);
+    let encoded = if img.color().has_alpha() {
+        let rgba = img.to_rgba8();
+        oxideav_webp::encode_rgba8(img.width(), img.height(), rgba.as_raw(), &opts)
+    } else {
+        let rgb = img.to_rgb8();
+        oxideav_webp::encode_rgb8(img.width(), img.height(), rgb.as_raw(), &opts)
+    };
+    encoded.map_err(|e| EngineError::Encode(e.to_string()))
 }
 
 /// Overlay `wm` onto `base` at (x, y) with `alpha` percent
@@ -1712,6 +1746,126 @@ mod tests {
         // The reduction is reported as the chosen quality.
         let q = out.quality.expect("reduced quality is reported");
         assert!(q < 80, "quality {q}");
+    }
+
+    fn webp_chunk(bytes: &[u8]) -> &'static str {
+        if bytes.windows(4).any(|c| c == b"VP8L") {
+            "VP8L"
+        } else if bytes.windows(4).any(|c| c == b"VP8 ") {
+            "VP8 "
+        } else {
+            "?"
+        }
+    }
+
+    #[test]
+    fn webp_encodes_lossy_by_default() {
+        let engine = Engine;
+        let src = noise_png();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::WebP)])],
+            )
+            .unwrap();
+        assert_eq!(webp_chunk(&out.bytes), "VP8 ");
+        assert_eq!(decode_dims(&out.bytes), (120, 120));
+        // Lossy on noise is far smaller than the lossless encode.
+        let lossless = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::WebP),
+                    Filter::Quality(Quality::Value(100)),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(webp_chunk(&lossless.bytes), "VP8L");
+        assert!(
+            out.bytes.len() * 2 < lossless.bytes.len(),
+            "lossy {} vs lossless {}",
+            out.bytes.len(),
+            lossless.bytes.len()
+        );
+    }
+
+    #[test]
+    fn webp_quality_100_is_lossless_and_exact() {
+        let engine = Engine;
+        let src = noise_png();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::WebP),
+                    Filter::Quality(Quality::Value(100)),
+                ])],
+            )
+            .unwrap();
+        let decoded = image::load_from_memory(&out.bytes).unwrap();
+        let original = image::load_from_memory(&src).unwrap();
+        assert_eq!(decoded.to_rgb8(), original.to_rgb8());
+    }
+
+    #[test]
+    fn webp_lossy_size_tracks_quality() {
+        let engine = Engine;
+        let src = noise_png();
+        let len = |q: u8| {
+            engine
+                .process(
+                    &src,
+                    &[Operation::Filters(vec![
+                        Filter::Format(ImageFormat::WebP),
+                        Filter::Quality(Quality::Value(q)),
+                    ])],
+                )
+                .unwrap()
+                .bytes
+                .len()
+        };
+        assert!(len(50) < len(95), "q50 {} vs q95 {}", len(50), len(95));
+    }
+
+    #[test]
+    fn webp_lossy_preserves_alpha() {
+        let engine = Engine;
+        let mut rgba = image::RgbaImage::from_pixel(16, 16, image::Rgba([200, 30, 30, 255]));
+        for x in 0..8 {
+            for y in 0..16 {
+                rgba.put_pixel(x, y, image::Rgba([30, 30, 200, 0]));
+            }
+        }
+        let src = png_bytes(&DynamicImage::ImageRgba8(rgba));
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::WebP),
+                    Filter::Quality(Quality::Value(80)),
+                ])],
+            )
+            .unwrap();
+        let decoded = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert_eq!(decoded.get_pixel(12, 8)[3], 255);
+        assert_eq!(decoded.get_pixel(4, 8)[3], 0);
+    }
+
+    #[test]
+    fn webp_max_bytes_uses_the_quality_ladder() {
+        let engine = Engine;
+        let src = noise_png();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::WebP),
+                    Filter::MaxBytes(4000),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        assert!(out.bytes.len() <= 4000, "{} bytes", out.bytes.len());
     }
 
     #[test]

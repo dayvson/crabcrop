@@ -186,8 +186,8 @@ curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/
 Notes on the directives:
 
 - `quality(auto)` picks a quality per image, from 50 for flat images to 95 for detailed ones, based on content analysis. When crabcrop picks the quality — for `quality(auto)`, or when `max_bytes` steps quality down — the response carries an `X-Crabcrop-Quality` header with the value used.
-- `max_bytes` can only steer formats with a quality setting: JPEG, JPEG XL, and AVIF. If quality reaches its floor and the output is still over budget, you get the smallest encode rather than an error. PNG, WebP, and GIF ignore the budget.
-- WebP output is lossless only, so `quality` has no effect on WebP, PNG, or GIF output.
+- `max_bytes` can only steer formats with a quality setting: JPEG, JPEG XL, AVIF, and WebP. If quality reaches its floor and the output is still over budget, you get the smallest encode rather than an error. PNG and GIF ignore the budget.
+- WebP encodes lossy at the requested quality (default 80); `quality(100)` selects the lossless encode. `quality` has no effect on PNG or GIF output.
 - JPEG has no alpha channel. With `fill`, transparent pixels are composited over the fill color; without it, the stored RGB values are used as-is.
 - `no_upscale` applies to the whole request wherever it appears: a `300x200` resize of a 200×150 source returns 200×150, scaled proportionally.
 - `dpr` also applies request-wide, and it scales targets *before* the `no_upscale` cap sees them, so `dpr` never invents pixels past the source when both are set. Targets round to whole pixels. `crop-rect` coordinates address source pixels and are not scaled. When the URL carries no `dpr`, the server honors the `DPR` client hint header (same set of values; an invalid hint is ignored). An explicit `dpr` in the URL always beats the header.
