@@ -117,3 +117,35 @@ test("empty-string secret signs; only null means unsafe (audit P-6)", async () =
   });
   assert.ok(unsigned.includes("/unsafe/"));
 });
+
+test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
+  const SRC = "https://example.com/a.jpg";
+  // [remainder, expectError, expectSource]
+  const cases = [
+    ["exp:99999999999999999999999999/300x200/" + SRC, true, SRC], // u64 overflow: a clean error, not a crash
+    ["300x200/https://example.com/%2e%2e/a.jpg", false, "https://example.com/%2e%2e/a.jpg"], // dot segments stay literal
+    ["300x/" + SRC, false, SRC], // empty height is proportional
+    ["x200/" + SRC, false, SRC], // empty width is proportional
+    ["fit-in:300x/" + SRC, false, SRC],
+    ["fit-in:-300x200/" + SRC, true, SRC], // flips are invalid in fit-in
+    ["crop:100x100:sideways/" + SRC, true, SRC], // align is an enumerated set
+    ["crop:100x100:smart/" + SRC, false, SRC],
+    ["filters:quality(999)/" + SRC, true, SRC], // quality caps at 100
+    ["filters:quality(80):blur(2)/" + SRC, false, SRC],
+    ["filters:blur(-1)/" + SRC, true, SRC], // sigma must be positive
+    ["filters:dpr(7)/" + SRC, true, SRC], // dpr is an enumerated set
+    ["filters:dpr(1.5)/" + SRC, false, SRC],
+    ["pad:100x100:blur/" + SRC, false, SRC],
+    ["pad:100x100:ff00aa/" + SRC, false, SRC],
+    ["pad:100x100:red/" + SRC, true, SRC],
+    ["crop-rect:0x0:50x50/" + SRC, false, SRC],
+    ["crop-rect:0x0:50/" + SRC, true, SRC],
+    ["16384x10/" + SRC, false, "16384x10/" + SRC], // oversize bare size is not an op: the source starts there
+    ["exp:1893456000/300x200/" + SRC, false, SRC],
+  ];
+  for (const [remainder, expectError, expectSource] of cases) {
+    const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);
+    assert.equal(out.source, expectSource, remainder);
+    assert.equal(out.errors.length > 0, expectError, `${remainder}: ${JSON.stringify(out.errors)}`);
+  }
+});

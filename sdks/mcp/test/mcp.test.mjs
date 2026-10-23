@@ -128,7 +128,7 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
 
     const explanation = await client.call("explain_url", { url });
     assert.match(explanation, /signature \(hmac\)/);
-    assert.match(explanation, /resize to 300px wide by 200px high/);
+    assert.match(explanation, /resize to 300px width by 200px height/);
     assert.match(explanation, new RegExp(`source: ${source.replaceAll("/", "\\/")}`));
 
     assert.equal(await client.call("purge_result", { path: remainder }), "purged 1");
