@@ -1022,6 +1022,29 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// The cache-key form of an expanded remainder: identical,
+/// except every `exp:` segment is removed (audit P-2).
+/// Expiry is enforced before lookup, so it must not fragment
+/// the cache or shield entries from purges. Unparseable
+/// remainders pass through unchanged.
+pub fn cache_key_form(remainder: &str) -> String {
+    let Ok((_, source)) = parse_operations(remainder) else {
+        return remainder.to_string();
+    };
+    let Some(ops_part) = remainder.strip_suffix(source) else {
+        return remainder.to_string();
+    };
+    let kept: Vec<&str> = ops_part
+        .split('/')
+        .filter(|seg| !seg.is_empty() && !seg.starts_with("exp:"))
+        .collect();
+    if kept.is_empty() {
+        source.to_string()
+    } else {
+        format!("{}/{source}", kept.join("/"))
+    }
+}
+
 /// Parse a full request path into its signature and [`Request`].
 #[allow(dead_code)]
 pub fn parse_request(path: &str) -> Result<(Signature, Request<'_>), ParseError> {
@@ -1164,6 +1187,27 @@ mod tests {
             parse_signature("/unsafe/filters:grayscale()/https://example.com/a/b/c.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
         assert_eq!(rest, "filters:grayscale()/https://example.com/a/b/c.jpg");
+    }
+
+    #[test]
+    fn cache_key_form_strips_expiry_segments() {
+        let src = "https://example.com/a.jpg";
+        assert_eq!(
+            cache_key_form(&format!("exp:1893456000/300x200/{src}")),
+            format!("300x200/{src}")
+        );
+        assert_eq!(
+            cache_key_form(&format!("300x200/exp:1893456000/{src}")),
+            format!("300x200/{src}")
+        );
+        assert_eq!(cache_key_form(&format!("exp:1893456000/{src}")), src);
+        assert_eq!(
+            cache_key_form(&format!("300x200/{src}")),
+            format!("300x200/{src}")
+        );
+        // An exp: segment inside the source is URL text, kept.
+        let tricky = "https://example.com/exp:123/a.jpg";
+        assert_eq!(cache_key_form(tricky), tricky);
     }
 
     #[test]

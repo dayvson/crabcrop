@@ -408,7 +408,7 @@ For example, a `removebg` request to a server with no background-removal model r
 curl -X POST "http://localhost:3000/purge/<signature>/300x200/https://example.com/photo.jpg"
 ```
 
-The `<path>` is the original request path without its signature. The purge signature is the HMAC-SHA256 of the path under a purge subkey derived from the secret (the subkey is the raw HMAC-SHA256 of the secret over the string `crabcrop/purge-key`), so only the secret holder can invalidate, and an image signature can never be replayed as a purge signature. The response is `200` with a body like `purged 2`: the count covers the entry and all of its variants (per format class and DPR). A bad purge signature is a `403` and removes nothing; purging a path that is not stored answers `purged 0`.
+The `<path>` is the original request path without its signature. Purge targets are raw remainders: percent-encoded spellings verify as different strings and purge nothing. Entries are stored in expiry-free form, so purging a path also evicts its `exp:` variants. The purge signature is the HMAC-SHA256 of the path under a purge subkey derived from the secret (the subkey is the raw HMAC-SHA256 of the secret over the string `crabcrop/purge-key`), so only the secret holder can invalidate, and an image signature can never be replayed as a purge signature. The response is `200` with a body like `purged 2`: the count covers the entry and all of its variants (per format class and DPR). A bad purge signature is a `403` and removes nothing; purging a path that is not stored answers `purged 0`.
 
 Every image request also writes one structured JSON log line to stdout, with the operation summary, status, per-stage timings, and cache result (never the full source URL).
 

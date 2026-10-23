@@ -156,9 +156,13 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
     if !verify_purge(&state.secret, &signature, target, state.allow_unsafe) {
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
     }
-    let mut removed = state.cache.purge_matching(target);
+    // Entries are keyed in expiry-free form (audit P-2), so
+    // the purge target is normalized the same way: purging a
+    // path also evicts its exp: variants.
+    let key_form = crate::url::cache_key_form(target);
+    let mut removed = state.cache.purge_matching(&key_form);
     if let Some(store) = &state.store {
-        removed += store.purge_matching(target);
+        removed += store.purge_matching(&key_form);
     }
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
 }
@@ -349,11 +353,13 @@ async fn serve(
     // Without an explicit format in the URL, the response depends
     // on the Accept class as well as the path, so the cache key
     // carries the class. Explicit-format URLs key on the path alone.
+    // The key uses the expiry-free form of the remainder (P-2).
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);
     let placeholders = meta && wants_placeholders(accept);
+    let key_base = crate::url::cache_key_form(rest);
     let mut cache_key = if explicit_format(&ops).is_some() {
-        rest.to_string()
+        key_base.clone()
     } else {
         let class = match preferred {
             Some(ImageFormat::Avif) => "avif",
@@ -361,7 +367,7 @@ async fn serve(
             Some(ImageFormat::WebP) => "webp",
             _ => "source",
         };
-        format!("{rest}#{class}")
+        format!("{key_base}#{class}")
     };
     if effective_dpr != 1.0 {
         cache_key = format!("{cache_key}#dpr{effective_dpr}");
@@ -941,6 +947,41 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    #[tokio::test]
+    async fn purge_evicts_expiry_variants() {
+        // Audit P-2: entries are keyed without their exp:
+        // segment, so one purge evicts every expiry spelling.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let plain = format!("100x50/{src}");
+        let expiring = format!("exp:{}/{plain}", now_unix() + 3600);
+        let url = format!("{base}/{}/{expiring}", sign(&expiring));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second fetch is a cache hit"
+        );
+        let purge_sig = crate::url::purge_signature(SECRET, &plain);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{plain}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the exp variant was evicted too"
+        );
     }
 
     #[tokio::test]
