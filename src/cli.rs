@@ -8,15 +8,6 @@
 
 use crate::url::{Dimension, Filter, ImageFormat, Operation, Signature};
 
-pub const VERBS: [&str; 6] = [
-    "sign",
-    "explain",
-    "meta",
-    "purge",
-    "purge-group",
-    "convert-thumbor",
-];
-
 const USAGE: &str = "\
 crabcrop: on-demand image optimization service
 
@@ -64,7 +55,6 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
                     secret = Some(value);
                 }
             }
-            "--help" | "-h" => return Err(USAGE.to_string()),
             _ if arg.starts_with("--") => return Err(format!("unknown flag {arg:?}\n\n{USAGE}")),
             _ => positional.push(arg.clone()),
         }
@@ -154,6 +144,12 @@ fn parse_with_presets(rest: &str) -> Result<(usize, Vec<Operation>, String, Opti
 pub async fn exec(args: &[String]) -> Result<String, String> {
     let verb = args.first().map(String::as_str).unwrap_or("");
     if verb == "--help" || verb == "-h" || verb == "help" {
+        return Ok(USAGE.to_string());
+    }
+    // Help in any position is help: `crabcrop sign --help`
+    // prints usage and exits 0, like the top-level spelling,
+    // instead of travelling as an error to stderr.
+    if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
         return Ok(USAGE.to_string());
     }
     let (config, positional) = parse_flags(&args[1..])?;
@@ -1015,6 +1011,25 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn help_after_a_verb_is_usage_not_an_error() {
+        // `crabcrop sign --help` answers Ok(USAGE) like the
+        // top-level spelling, not an Err to stderr.
+        let out = exec(&args(&["sign", "--help"])).await.unwrap();
+        assert!(out.contains("crabcrop sign"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_verb_is_an_error() {
+        // The dispatch contract behind main's guard: a
+        // misspelled verb errors here instead of the
+        // process ever reaching the server.
+        let err = exec(&args(&["sgin", "300x200/https://e.com/a.jpg"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown verb \"sgin\""), "{err}");
     }
 
     #[tokio::test]
