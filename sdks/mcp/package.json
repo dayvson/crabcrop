@@ -1,1 +1,24 @@
-{"bin":{"crabcrop-mcp":"src/index.ts"},"dependencies":{"@crabcrop/url":"file:../typescript"},"description":"First-party MCP server for crabcrop: sign, explain, fetch meta, purge","license":"MIT","name":"@crabcrop/mcp","scripts":{"start":"node src/index.ts","test":"node --test test/*.test.mjs"},"type":"module","version":"0.1.0"}
+{
+  "bin": {
+    "crabcrop-mcp": "dist/index.js"
+  },
+  "dependencies": {
+    "@crabcrop/url": "file:../typescript"
+  },
+  "description": "First-party MCP server for crabcrop: sign, explain, fetch meta, purge",
+  "license": "MIT",
+  "name": "@crabcrop/mcp",
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
+    "start": "node src/index.ts",
+    "test": "node --test test/*.test.mjs"
+  },
+  "type": "module",
+  "version": "0.1.0",
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^5.9.3"
+  },
+  "main": "./dist/index.js"
+}

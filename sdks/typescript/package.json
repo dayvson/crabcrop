@@ -4,14 +4,25 @@
     "node": ">=22"
   },
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "license": "MIT",
   "name": "@crabcrop/url",
   "repository": "https://github.com/dayvson/crabcrop",
   "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
     "test": "node --test"
   },
   "type": "module",
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^5.9.3"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts"
 }

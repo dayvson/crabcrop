@@ -53,3 +53,37 @@ test("buildURL rejects inputs that can never verify (audit P-4, P-5)", () => {
   assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/a.jpg", { expires: 1.5 }));
   assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/a.jpg", { expires: -1 }));
 });
+
+import { explainUrl } from "../src/index.ts";
+
+test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
+  const SIG = "a".repeat(64);
+  const SRC = "https://example.com/a.jpg";
+  const cases: Array<[string, boolean, string]> = [
+    ["exp:99999999999999999999999999/300x200/" + SRC, true, SRC],
+    ["300x200/https://example.com/%2e%2e/a.jpg", false, "https://example.com/%2e%2e/a.jpg"],
+    ["300x/" + SRC, false, SRC],
+    ["x200/" + SRC, false, SRC],
+    ["fit-in:300x/" + SRC, false, SRC],
+    ["fit-in:-300x200/" + SRC, true, SRC],
+    ["crop:100x100:sideways/" + SRC, true, SRC],
+    ["crop:100x100:smart/" + SRC, false, SRC],
+    ["filters:quality(999)/" + SRC, true, SRC],
+    ["filters:quality(80):blur(2)/" + SRC, false, SRC],
+    ["filters:blur(-1)/" + SRC, true, SRC],
+    ["filters:dpr(7)/" + SRC, true, SRC],
+    ["filters:dpr(1.5)/" + SRC, false, SRC],
+    ["pad:100x100:blur/" + SRC, false, SRC],
+    ["pad:100x100:ff00aa/" + SRC, false, SRC],
+    ["pad:100x100:red/" + SRC, true, SRC],
+    ["crop-rect:0x0:50x50/" + SRC, false, SRC],
+    ["crop-rect:0x0:50/" + SRC, true, SRC],
+    ["16384x10/" + SRC, false, "16384x10/" + SRC],
+    ["exp:1893456000/300x200/" + SRC, false, SRC],
+  ];
+  for (const [remainder, expectError, expectSource] of cases) {
+    const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);
+    assert.equal(out.source, expectSource, remainder);
+    assert.equal(out.errors.length > 0, expectError, `${remainder}: ${JSON.stringify(out.errors)}`);
+  }
+});
