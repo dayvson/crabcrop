@@ -22,6 +22,11 @@ use std::sync::{Arc, OnceLock};
 /// expansion usvg performs while building its tree, and the
 /// declared dimensions, before any rendering happens.
 const MAX_SVG_NODES: usize = 10_000;
+/// The deepest element nesting the bounds walk (and, after
+/// it, the writer) will recurse into. The node cap alone
+/// permits a 10,000-deep nest; real drawings nest a few
+/// dozen levels at most.
+const MAX_SVG_DEPTH: usize = 64;
 const MAX_USE_ELEMENTS: usize = 256;
 const MAX_USE_DEPTH: usize = 16;
 const MAX_EXPANDED_NODES: usize = 100_000;
@@ -81,18 +86,35 @@ const BANNED_ELEMENTS: &[&str] = &[
 ];
 
 fn is_banned(name: &str) -> bool {
-    BANNED_ELEMENTS.contains(&name.to_lowercase().as_str())
+    BANNED_ELEMENTS.iter().any(|b| b.eq_ignore_ascii_case(name))
+}
+
+/// The first position of `needle` in `haystack`, comparing
+/// ASCII case-insensitively, so the case checks below do
+/// not allocate a lowercased copy of untrusted text.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Whether `value` begins with `prefix`, comparing ASCII
+/// case-insensitively.
+fn starts_with_ci(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// Whether a CSS fragment references anything besides an
 /// in-document fragment or an embedded `data:` payload.
 fn has_external_url_ref(value: &str) -> bool {
-    let lower = value.to_lowercase();
-    let mut rest = lower.as_str();
-    while let Some(i) = rest.find("url(") {
+    let mut rest = value;
+    while let Some(i) = find_ascii_ci(rest, "url(") {
         let after = &rest[i + 4..];
         let target = after.trim_start_matches([' ', '\t', '"', '\'']);
-        if !(target.starts_with('#') || target.starts_with("data:")) {
+        if !(target.starts_with('#') || starts_with_ci(target, "data:")) {
             return true;
         }
         rest = after;
@@ -101,15 +123,15 @@ fn has_external_url_ref(value: &str) -> bool {
 }
 
 fn keep_attribute(attr: roxmltree::Attribute) -> bool {
-    let name = attr.name().to_lowercase();
+    let name = attr.name();
     // Event handlers (onclick, onload, ...) are behavior, not
     // drawing.
-    if name.starts_with("on") {
+    if starts_with_ci(name, "on") {
         return false;
     }
-    if name == "href" {
+    if name.eq_ignore_ascii_case("href") {
         let value = attr.value().trim();
-        return value.starts_with('#') || value.to_lowercase().starts_with("data:");
+        return value.starts_with('#') || starts_with_ci(value, "data:");
     }
     if has_external_url_ref(attr.value()) {
         return false;
@@ -140,7 +162,7 @@ fn style_is_safe(node: roxmltree::Node) -> bool {
         .filter(|c| c.is_text())
         .filter_map(|c| c.text())
         .collect();
-    !text.to_lowercase().contains("@import") && !has_external_url_ref(&text)
+    find_ascii_ci(&text, "@import").is_none() && !has_external_url_ref(&text)
 }
 
 fn write_node(node: roxmltree::Node, out: &mut String, is_root: bool) {
@@ -230,10 +252,14 @@ fn check_document_bounds<'a, 'input>(root: roxmltree::Node<'a, 'input>) -> Resul
         node: roxmltree::Node<'a, 'input>,
         counts: &mut (usize, usize),
         ids: &mut std::collections::HashMap<String, roxmltree::Node<'a, 'input>>,
+        depth: usize,
     ) -> Result<(), String> {
         counts.0 += 1;
         if counts.0 > MAX_SVG_NODES {
             return Err(format!("SVG has more than {MAX_SVG_NODES} nodes"));
+        }
+        if depth > MAX_SVG_DEPTH {
+            return Err(format!("SVG nests deeper than {MAX_SVG_DEPTH} elements"));
         }
         if node.tag_name().name().eq_ignore_ascii_case("use") {
             counts.1 += 1;
@@ -245,7 +271,7 @@ fn check_document_bounds<'a, 'input>(root: roxmltree::Node<'a, 'input>) -> Resul
             ids.insert(id.to_string(), node);
         }
         for child in node.children() {
-            walk(child, counts, ids)?;
+            walk(child, counts, ids, depth + 1)?;
         }
         Ok(())
     }
@@ -263,6 +289,12 @@ fn check_document_bounds<'a, 'input>(root: roxmltree::Node<'a, 'input>) -> Resul
         }
         if visiting.iter().any(|v| v == id) {
             return Err("SVG use elements reference each other cyclically".to_string());
+        }
+        // The chain being walked is already longer than any
+        // depth the caller would accept: fail here instead
+        // of recursing to the end of it first.
+        if visiting.len() > MAX_USE_DEPTH {
+            return Err(format!("SVG use elements nest deeper than {MAX_USE_DEPTH}"));
         }
         let Some(node) = ids.get(id) else {
             return Ok(0);
@@ -286,7 +318,7 @@ fn check_document_bounds<'a, 'input>(root: roxmltree::Node<'a, 'input>) -> Resul
             .and_then(|h| h.strip_prefix('#'))
     }
     let mut ids = std::collections::HashMap::new();
-    walk(root, &mut (0, 0), &mut ids)?;
+    walk(root, &mut (0, 0), &mut ids, 0)?;
     let mut memo = std::collections::HashMap::new();
     for desc in root.descendants() {
         if desc.tag_name().name().eq_ignore_ascii_case("use")
@@ -450,6 +482,34 @@ mod tests {
         // reference and the data-free fills.
         assert!(clean.contains("#local"));
         assert!(clean.contains("#0000ff"));
+    }
+
+    #[test]
+    fn sanitizer_rejects_deep_nesting() {
+        // The node cap alone would allow this nest; the
+        // depth cap is what bounds the recursive passes.
+        let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\">");
+        for _ in 0..100 {
+            svg.push_str("<g>");
+        }
+        svg.push_str("<rect width=\"1\" height=\"1\"/>");
+        for _ in 0..100 {
+            svg.push_str("</g>");
+        }
+        svg.push_str("</svg>");
+        let err = sanitize(&svg).unwrap_err();
+        assert!(err.contains("nests deeper"), "{err}");
+    }
+
+    #[test]
+    fn case_variants_of_active_content_are_still_stripped() {
+        // The case-insensitive checks allocate nothing, but
+        // they must keep catching the uppercase spellings.
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" OnLoad=\"alert(1)\"><rect width=\"1\" height=\"1\" fill=\"URL(https://example.com/x)\"/><image href=\"DATA:image/png;base64,AA==\" width=\"1\" height=\"1\"/></svg>";
+        let clean = sanitize(svg).unwrap();
+        assert!(!clean.contains("OnLoad"), "{clean}");
+        assert!(!clean.contains("example.com"), "{clean}");
+        assert!(clean.contains("DATA:image/png"), "{clean}");
     }
 
     #[test]
