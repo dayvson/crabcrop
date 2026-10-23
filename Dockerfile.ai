@@ -6,22 +6,28 @@
 # is preloaded at boot, so a broken payload fails the
 # container at startup, not at first use.
 #
-# Both downloads are pinned and hash-checked. The model is a
-# deployment artifact: it is never committed to this repo.
-FROM crabcrop:latest
+# All downloads are checksum-pinned at the ADD (audit
+# PL-13), and the extracted runtime library is hash-checked
+# again after extraction. The model is a deployment
+# artifact: it is never committed to this repo.
+#
+# The base is an explicit build argument so a build cannot
+# silently layer onto a stale local image: pass a digest for
+# anything beyond local use, e.g.
+#   --build-arg BASE_IMAGE=crabcrop@sha256:<digest>
+ARG BASE_IMAGE=crabcrop:latest
+FROM ${BASE_IMAGE}
 
-ADD https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz /tmp/ort.tgz
+ADD --checksum=sha256:cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57 https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz /tmp/ort.tgz
 RUN tar -xzf /tmp/ort.tgz -C /tmp \
     && mkdir -p /opt/onnxruntime \
     && cp /tmp/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0 /opt/onnxruntime/libonnxruntime.so \
     && echo "469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e  /opt/onnxruntime/libonnxruntime.so" | sha256sum -c - \
     && rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-x64-1.31.0
 
-ADD https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx /models/u2netp.onnx
-RUN echo "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  /models/u2netp.onnx" | sha256sum -c -
+ADD --checksum=sha256:309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8 https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx /models/u2netp.onnx
 
-ADD https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx /models/yunet.onnx
-RUN echo "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  /models/yunet.onnx" | sha256sum -c -
+ADD --checksum=sha256:8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4 https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx /models/yunet.onnx
 
 # The upscale model follows the same rule (layered artifact,
 # preloaded at boot). Super-resolution ONNX exports are less
@@ -29,6 +35,8 @@ RUN echo "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  /mod
 # COPY my-sr-model.onnx /models/sr.onnx
 # ENV CRABCROP_UPSCALE_MODEL=/models/sr.onnx
 
-ENV CRABCROP_ORT_DYLIB=/opt/onnxruntime/libonnxruntime.so \
+# ONNX Runtime telemetry off unless an operator opts in.
+ENV ORT_DISABLE_TELEMETRY=1 \
+    CRABCROP_ORT_DYLIB=/opt/onnxruntime/libonnxruntime.so \
     CRABCROP_REMOVEBG_MODEL=/models/u2netp.onnx \
     CRABCROP_FACE_MODEL=/models/yunet.onnx
