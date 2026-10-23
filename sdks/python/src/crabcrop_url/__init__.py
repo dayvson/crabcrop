@@ -23,6 +23,18 @@ def sign(secret: Union[str, bytes], remainder: str) -> str:
     return hmac.new(_key(secret), remainder.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
+    """Check a signature segment against a remainder, with
+    the Rust implementation's semantics: the expected tag
+    is recomputed and compared in constant time
+    (``hmac.compare_digest``), so a non-canonical tag (an
+    uppercase one, say) fails like any other mismatch, and
+    a malformed one returns False instead of raising."""
+    if not isinstance(signature, str) or not signature.isascii():
+        return False
+    return hmac.compare_digest(sign(secret, remainder), signature)
+
+
 def _validate_url_text(text: str, what: str) -> None:
     """Fail loudly on inputs that can never verify (audit
     P-4): the remainder travels as a raw URL path, so ``?`` /

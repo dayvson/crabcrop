@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from crabcrop_url import build_srcset, build_url, sign  # noqa: E402
+from crabcrop_url import build_srcset, build_url, sign, verify  # noqa: E402
 
 VECTORS = json.loads(
     (Path(__file__).resolve().parents[3] / "spec" / "test-vectors.json").read_text()
@@ -21,6 +21,19 @@ class TestVectors(unittest.TestCase):
         for v in VECTORS:
             with self.subTest(description=v["description"]):
                 self.assertEqual(sign(v["secret"], v["remainder"]), v["signature"])
+
+    def test_verify_accepts_the_vectors_and_rejects_tampering(self):
+        for v in VECTORS:
+            with self.subTest(description=v["description"]):
+                self.assertTrue(verify(v["secret"], v["signature"], v["remainder"]))
+                self.assertFalse(verify(v["secret"], v["signature"], v["remainder"] + "x"))
+                self.assertFalse(verify("wrong-secret", v["signature"], v["remainder"]))
+                # A non-canonical tag fails: the server
+                # accepts only the lowercase spelling.
+                self.assertFalse(
+                    verify(v["secret"], v["signature"].upper(), v["remainder"])
+                )
+        self.assertFalse(verify("s", "not-a-signature", "300x200/https://e.com/a.jpg"))
 
 
 class TestBuilders(unittest.TestCase):

@@ -597,5 +597,8 @@ export async function verifyUrlSignature(secret, input) {
     return null;
   }
   const expected = await sign(secret, remainder);
-  return expected === signature.value.toLowerCase();
+  // No case-folding: the explainer already classifies a
+  // non-lowercase tag as invalid, and the SDK verifiers
+  // compare the canonical spelling as-is.
+  return expected === signature.value;
 }

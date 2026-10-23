@@ -2,7 +2,7 @@
  * Build and sign crabcrop URLs, per `spec/url-signing.md` in
  * the crabcrop repository. Standard library only.
  */
-import { createHmac } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 /**
  * Compute the signature segment for a remainder: the lowercase
@@ -19,13 +19,6 @@ export interface BuildOptions {
   expires?: number;
 }
 
-/**
- * Assemble a signed (or `unsafe`) crabcrop URL. `operations`
- * is the operation string verbatim (several `/`-separated
- * segments and `preset:` references included). A null secret
- * produces the literal `unsafe` signature segment, for servers
- * running with unsafe or presets-only configurations.
- */
 /**
  * Fail loudly on inputs that can never produce a verifiable URL
  * (audit P-4, P-5): the remainder travels as a raw URL path, so
@@ -67,6 +60,13 @@ function assertWidth(width: number): void {
   }
 }
 
+/**
+ * Assemble a signed (or `unsafe`) crabcrop URL. `operations`
+ * is the operation string verbatim (several `/`-separated
+ * segments and `preset:` references included). A null secret
+ * produces the literal `unsafe` signature segment, for servers
+ * running with unsafe or presets-only configurations.
+ */
 export function buildURL(
   base: string,
   secret: string | null,
@@ -126,5 +126,9 @@ export function verifyUrlSignature(secret: string, input: string): boolean | nul
   if (!signature || signature.kind !== "hmac") {
     return null;
   }
-  return sign(secret, remainder) === signature.value;
+  // Constant-time, like the Rust and Python verifiers: a
+  // plain === leaks how much of the tag was right.
+  const expected = Buffer.from(sign(secret, remainder), "utf8");
+  const given = Buffer.from(signature.value, "utf8");
+  return expected.length === given.length && timingSafeEqual(expected, given);
 }
