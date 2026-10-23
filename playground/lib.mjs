@@ -13,9 +13,15 @@ const encoder = new TextEncoder();
 
 /** Lowercase hex HMAC-SHA256 of `remainder` under `secret`. */
 export async function sign(secret, remainder) {
+  // WebCrypto refuses a zero-length HMAC key. By the HMAC
+  // definition, a key shorter than the 64-byte block size is
+  // padded with zeros to the block size, so an empty key is
+  // exactly a 64-byte all-zero key: importing the padded form
+  // is the same key, not an approximation (audit P-6).
+  const keyBytes = encoder.encode(secret);
   const key = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(secret),
+    keyBytes.length === 0 ? new Uint8Array(64) : keyBytes,
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
@@ -30,9 +36,19 @@ export async function sign(secret, remainder) {
  * Assemble a crabcrop URL exactly as the SDK's buildURL does:
  * an optional leading `exp:` segment, the operations verbatim,
  * the source, and either the HMAC of the remainder or the
- * literal `unsafe` when the secret is empty.
+ * literal `unsafe`. Only a null/undefined secret means unsafe:
+ * an empty string is a real (if weak) key and signs, matching
+ * every other implementation (audit P-6). Inputs that can
+ * never verify throw instead of minting a dead URL (P-4, P-5).
  */
 export async function buildPlaygroundUrl({ base, secret, operations, source, expires }) {
+  if (expires !== undefined && expires !== null) {
+    if (!Number.isSafeInteger(expires) || expires < 0) {
+      throw new Error(`expires must be a non-negative integer of unix seconds, got ${expires}`);
+    }
+  }
+  assertUrlText(operations, "operations");
+  assertUrlText(source, "source");
   const trimmedBase = base.replace(/\/+$/, "");
   let remainder = "";
   if (expires !== undefined && expires !== null) {
@@ -42,8 +58,20 @@ export async function buildPlaygroundUrl({ base, secret, operations, source, exp
     remainder += `${operations}/`;
   }
   remainder += source;
-  const signature = secret ? await sign(secret, remainder) : "unsafe";
+  const signature =
+    secret === null || secret === undefined ? "unsafe" : await sign(secret, remainder);
   return `${trimmedBase}/${signature}/${remainder}`;
+}
+
+function assertUrlText(text, what) {
+  for (const c of text) {
+    const code = c.codePointAt(0);
+    if (c === "?" || c === "#" || code <= 0x20 || code === 0x7f || code > 0x7e) {
+      throw new Error(
+        `${what} contains a character that cannot appear in a crabcrop URL: ${JSON.stringify(c)}`,
+      );
+    }
+  }
 }
 
 // ----------------------------------------------------------------

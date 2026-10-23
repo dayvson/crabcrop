@@ -59,5 +59,27 @@ class TestBuilders(unittest.TestCase):
         )
 
 
+    def test_builders_reject_unbuildable_urls(self):
+        # Audit P-4 and P-5: these can never verify, so the
+        # builders raise instead of minting dead URLs.
+        for source in (
+            "https://example.com/a.jpg?w=1",
+            "https://example.com/a.jpg#frag",
+            "https://example.com/my photo.jpg",
+            "https://example.com/café.jpg",
+        ):
+            with self.assertRaises(ValueError, msg=source):
+                build_url("https://img.example.com", b"k", "300x200", source)
+        for bad_expires in (-1, 1.5, True, 2**64):
+            with self.assertRaises(ValueError, msg=repr(bad_expires)):
+                build_url(
+                    "https://img.example.com",
+                    b"k",
+                    "300x200",
+                    "https://example.com/a.jpg",
+                    expires=bad_expires,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
