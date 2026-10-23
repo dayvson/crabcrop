@@ -6,7 +6,11 @@ description = "On-demand image optimization service in Rust"
 license = "MIT"
 repository = "https://github.com/dayvson/crabcrop"
 
+[workspace]
+members = ["crates/crabcrop-url"]
+
 [dependencies]
+crabcrop-url = { path = "crates/crabcrop-url" }
 ab_glyph = "0.2"
 axum = "0.8"
 fast-ssim2 = "0.9"

@@ -1,0 +1,32 @@
+[
+  {
+    "description": "RFC 4231-style known answer (the server test vector)",
+    "secret": "Jefe",
+    "remainder": "what do ye want for nothing?",
+    "signature": "ba5396e10039ec002bf1fde117eee48df8c2f06bc47b5f2d3272ea77f6862da9"
+  },
+  {
+    "description": "The README worked example",
+    "secret": "your-secret",
+    "remainder": "300x200/https://example.com/photo.jpg",
+    "signature": "3c1f6c180116661877bd4c85fd201a178087d74c1cc188cc584e819d901308c6"
+  },
+  {
+    "description": "Expiring URL",
+    "secret": "s3cr3t",
+    "remainder": "exp:1893456000/300x200/https://example.com/photo.jpg",
+    "signature": "878f5cb69f5ac5770161176099fcdd64dcce17d6e6f846a3108ffacfa4644386"
+  },
+  {
+    "description": "Preset reference and filter chain",
+    "secret": "s3cr3t",
+    "remainder": "preset:og-card/filters:grayscale/https://example.com/photo.jpg",
+    "signature": "4ccaf0251e8899792852954b375a4a0e004a6e3f79de81eb598fe4ec818fabad"
+  },
+  {
+    "description": "Bucket source with crop and quality",
+    "secret": "correct horse battery staple",
+    "remainder": "crop:1200x630:smart/filters:quality(80)/s3://media/photo.jpg",
+    "signature": "368f2826d950429c19e89b431af940d3ae4d301e1a7a03e13abb8af58941fa91"
+  }
+]

@@ -1,0 +1,17 @@
+{
+  "description": "Build and sign crabcrop image URLs",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "license": "MIT",
+  "name": "@crabcrop/url",
+  "repository": "https://github.com/dayvson/crabcrop",
+  "scripts": {
+    "test": "node --test"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}

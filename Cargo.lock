@@ -415,6 +415,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "axum",
+ "crabcrop-url",
  "fast-ssim2",
  "fast_image_resize",
  "hex",
@@ -432,6 +433,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+]
+
+[[package]]
+name = "crabcrop-url"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

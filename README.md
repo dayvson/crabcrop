@@ -299,6 +299,16 @@ The signature covers the preset reference; the server expands it deterministical
 
 With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: requests may use preset references, `exp:` metadata, and bare sources only. The mode does not change signature rules. Combined with `CRABCROP_ALLOW_UNSAFE=1` it makes a public deployment where browsers and CMSs can build URLs from preset names alone, with no secret to hold and no way to invent a transform.
 
+## Client libraries
+
+The URL grammar and signing scheme are specified in [`spec/url-signing.md`](spec/url-signing.md), with a canonical set of test vectors in [`spec/test-vectors.json`](spec/test-vectors.json) that every implementation runs as its test suite. Builders on top of the spec:
+
+- **Rust**: the `crabcrop-url` crate in this workspace (`crates/crabcrop-url`) with `sign`, `verify`, `build_url`, and `build_srcset`. The server verifies with this same crate, so client and server cannot drift.
+- **TypeScript**: [`sdks/typescript`](sdks/typescript), `@crabcrop/url`, with `sign`, `buildURL`, and `buildSrcSet`. Standard library only; tests run on `node --test`.
+- **Python**: [`sdks/python`](sdks/python), `crabcrop_url`, with `sign`, `build_url`, and `build_srcset`. Standard library only; tests run on `python3 -m unittest`.
+
+All three take an optional expiry (emitted as a leading `exp:` segment) and a null secret for the `unsafe` form used by unsafe and presets-only deployments.
+
 ## Format negotiation
 
 When the URL names no `format(...)`, crabcrop picks the output format from the request's `Accept` header:
