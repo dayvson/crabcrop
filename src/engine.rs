@@ -419,7 +419,7 @@ fn upscale_image(
         scale *= provider.factor().max(2);
     }
     if img.width() != target_w || img.height() != target_h {
-        img = img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
+        img = resize_lanczos3(&img, target_w, target_h);
     }
     Ok(img)
 }
@@ -978,8 +978,7 @@ fn apply_size(
     let mut img = if w == sw && h == sh {
         img
     } else {
-        let resized = image::imageops::resize(&img, w, h, image::imageops::FilterType::Lanczos3);
-        DynamicImage::ImageRgba8(resized)
+        resize_lanczos3(&img, w, h)
     };
     if size.flip_horizontal {
         img = img.fliph();
@@ -988,6 +987,48 @@ fn apply_size(
         img = img.flipv();
     }
     img
+}
+
+/// Resize to (w, h) with the SIMD backend (fast_image_resize),
+/// Lanczos3. Same filter as the image crate's Lanczos3 up to
+/// rounding (max diff 1 per channel on photo content), except
+/// alpha: the backend resamples premultiplied alpha, so colors
+/// stored under transparent pixels no longer bleed into visible
+/// ones. Pixel types the backend does not cover fall back to
+/// the image crate.
+pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
+    let mut dst = match img {
+        DynamicImage::ImageLuma8(_) => DynamicImage::new_luma8(w, h),
+        DynamicImage::ImageLumaA8(_) => DynamicImage::new_luma_a8(w, h),
+        DynamicImage::ImageRgb8(_) => DynamicImage::new_rgb8(w, h),
+        DynamicImage::ImageRgba8(_) => DynamicImage::new_rgba8(w, h),
+        DynamicImage::ImageLuma16(_) => DynamicImage::new_luma16(w, h),
+        DynamicImage::ImageLumaA16(_) => DynamicImage::new_luma_a16(w, h),
+        DynamicImage::ImageRgb16(_) => DynamicImage::new_rgb16(w, h),
+        DynamicImage::ImageRgba16(_) => DynamicImage::new_rgba16(w, h),
+        DynamicImage::ImageRgb32F(_) => DynamicImage::new_rgb32f(w, h),
+        DynamicImage::ImageRgba32F(_) => DynamicImage::new_rgba32f(w, h),
+        _ => {
+            return DynamicImage::ImageRgba8(image::imageops::resize(
+                img,
+                w,
+                h,
+                image::imageops::FilterType::Lanczos3,
+            ));
+        }
+    };
+    let opts = fast_image_resize::ResizeOptions::new().resize_alg(
+        fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Lanczos3),
+    );
+    match fast_image_resize::Resizer::new().resize(img, &mut dst, &opts) {
+        Ok(()) => dst,
+        Err(_) => DynamicImage::ImageRgba8(image::imageops::resize(
+            img,
+            w,
+            h,
+            image::imageops::FilterType::Lanczos3,
+        )),
+    }
 }
 
 /// Scale proportionally to fit inside the `fit-in` box, preserving
@@ -1026,12 +1067,7 @@ fn apply_fit_in(
     if w == sw && h == sh {
         img
     } else {
-        DynamicImage::ImageRgba8(image::imageops::resize(
-            &img,
-            w,
-            h,
-            image::imageops::FilterType::Lanczos3,
-        ))
+        resize_lanczos3(&img, w, h)
     }
 }
 
@@ -1931,6 +1967,57 @@ mod tests {
         // and 12,069 B with jpeg-encoder at 4:2:0.
         assert!(out.bytes.len() < 14000, "{} bytes", out.bytes.len());
         assert_eq!(decode_dims(&out.bytes), (120, 120));
+    }
+
+    #[test]
+    fn resize_backend_matches_lanczos3_within_rounding() {
+        // Same filter (Lanczos3) in both backends, so outputs
+        // track closely: on photo content the spike measured a
+        // max per-channel diff of 1 (RMS 0.14). This pure-noise
+        // fixture is the adversarial case for kernel precision:
+        // measured RMS 0.48 with a tail to 9 (0.3% of channels
+        // over 2). The bounds below sit well above that and far
+        // below any real breakage (a wrong filter or stride
+        // pushes RMS into the tens).
+        let src = image::load_from_memory(&noise_png()).unwrap();
+        let ours = resize_lanczos3(&src, 60, 60).to_rgb8();
+        let reference =
+            image::imageops::resize(&src, 60, 60, image::imageops::FilterType::Lanczos3);
+        let (mut maxd, mut sq) = (0u8, 0f64);
+        for (a, b) in ours.pixels().zip(reference.pixels()) {
+            for c in 0..3 {
+                let d = a[c].abs_diff(b[c]);
+                maxd = maxd.max(d);
+                sq += (d as f64) * (d as f64);
+            }
+        }
+        let rms = (sq / (60.0 * 60.0 * 3.0)).sqrt();
+        assert!(rms < 1.0, "rms diff {rms}");
+        assert!(maxd <= 10, "max diff {maxd}");
+        // The source pixel type is preserved, not forced to RGBA.
+        assert!(matches!(
+            resize_lanczos3(&src, 30, 30),
+            DynamicImage::ImageRgb8(_)
+        ));
+    }
+
+    #[test]
+    fn resize_backend_does_not_bleed_transparent_colors() {
+        // Left half transparent red, right half opaque blue. With
+        // premultiplied-alpha resampling, the nearly transparent
+        // boundary pixel takes its color from the opaque side;
+        // straight-alpha resampling would tint it red.
+        let mut img = image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 0, 0, 0]));
+        for x in 32..64 {
+            for y in 0..64 {
+                img.put_pixel(x, y, image::Rgba([0, 0, 255, 255]));
+            }
+        }
+        let out = resize_lanczos3(&DynamicImage::ImageRgba8(img), 16, 16).to_rgba8();
+        let edge = out.get_pixel(7, 8);
+        assert_eq!(edge[0], 0, "red bled into the boundary pixel: {edge:?}");
+        assert!(edge[2] > 200, "blue contribution lost: {edge:?}");
+        assert!(edge[3] < 64, "edge alpha should be small: {edge:?}");
     }
 
     #[test]
