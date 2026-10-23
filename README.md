@@ -506,6 +506,9 @@ crabcrop meta "300x200/https://example.com/photo.jpg"
 # Purge one URL, or a whole preset group (Cache-Group)
 crabcrop purge "300x200/https://example.com/photo.jpg"
 crabcrop purge-group thumb
+
+# Convert a Thumbor URL (re-signed; losses are reported on stderr)
+crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
 ```
 
 ## Configuration
@@ -566,6 +569,14 @@ How configuration works:
 - The ONNX Runtime library itself comes from `CRABCROP_ORT_DYLIB`, or the system library search path when that is unset.
 
 The `Dockerfile.ai` variant in this repo shows the intended shape: the base image stays free of AI payload, and a second layer adds the pinned ONNX Runtime 1.31.0, the U2Netp model, and the YuNet model, each hash-checked at image build time, and enables the features by setting the variables above. Layer your own super-resolution model the same way and set `CRABCROP_UPSCALE_MODEL` to enable `upscale`.
+
+## Migrating
+
+Guides for moving existing URL templates over:
+
+- [From Thumbor](docs/migrating-from-thumbor.md): concept and operation mapping, plus the `convert-thumbor` verb, which converts and re-signs URLs mechanically.
+- [From imgproxy](docs/migrating-from-imgproxy.md): option-by-option mapping tables.
+- [From Cloudinary](docs/migrating-from-cloudinary.md): transformation mapping, and what changes when assets become origin URLs.
 
 ## Deployment
 
