@@ -191,10 +191,12 @@ impl DiskStore {
     /// many entries were removed.
     pub fn purge_matching(&self, base: &str) -> usize {
         let mut inner = self.inner.lock().unwrap();
+        // Built once, not per key examined.
+        let prefix = format!("{base}#");
         let keys: Vec<String> = inner
             .entries
             .keys()
-            .filter(|k| k.as_str() == base || k.starts_with(&format!("{base}#")))
+            .filter(|k| k.as_str() == base || k.starts_with(&prefix))
             .cloned()
             .collect();
         let mut removed = 0;
