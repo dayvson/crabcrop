@@ -62,7 +62,7 @@ printf '%s' '300x200/https://example.com/photo.jpg' | openssl dgst -sha256 -hmac
 
 Use that hex string as the first path segment. Anyone can verify the scheme against this test vector: with secret `Jefe`, the HMAC-SHA256 of `what do ye want for nothing?` is `ba5396e10039ec002bf1fde117eee48df8c2f06bc47b5f2d3272ea77f6862da9`.
 
-A request with a bad signature gets `403` and the body `bad signature`. The literal signature `unsafe` skips verification, but only when the server runs with `CRABCROP_ALLOW_UNSAFE=1` (or `true`). Keep it off in production. Purges are the exception that never bends: `/purge` and `/purge-group` always require an HMAC signature made with the secret, even in unsafe mode.
+A request with a bad signature gets `403` and the body `bad signature`. The literal signature `unsafe` skips verification, but only when the server runs with `CRABCROP_ALLOW_UNSAFE=1` (or `true`, `yes`, `on`). Keep it off in production. Purges are the exception that never bends: `/purge` and `/purge-group` always require an HMAC signature made with the secret, even in unsafe mode.
 
 ### Expiring URLs
 
@@ -514,13 +514,13 @@ crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
 
 ## Configuration
 
-All configuration comes from environment variables. Invalid values for the numeric settings are startup errors — the server refuses to start rather than run with a wrong port or cache budget.
+All configuration comes from environment variables. Invalid values are startup errors, booleans included — the server refuses to start rather than run with a wrong port, cache budget, or safety flag. Boolean variables accept `1`, `true`, `yes`, `on` (any case) for on and `0`, `false`, `no`, `off` for off; anything else fails the boot with the variable named. Names follow one pattern: `*_MODEL` is an AI model artifact, `*_FILE` is a file read at boot, `*_DIR` is a directory, and `*_MAX_MB` is a size budget in megabytes.
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `CRABCROP_SECRET` | — (required) | The HMAC secret used to verify signed URLs. The server will not start without it. |
-| `PORT` | `3000` | Listen port. |
-| `CRABCROP_ALLOW_UNSAFE` | off | `1` or `true` honors `unsafe` URLs. Anything else, including unset, means off. |
+| `PORT` | `3000` | Listen port. `CRABCROP_PORT` is the namespaced alias and wins when both are set. |
+| `CRABCROP_ALLOW_UNSAFE` | off | Honors `unsafe` URLs (for the boolean spellings, see above). |
 | `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
 | `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
 | `CRABCROP_METADATA` | `strip` | `preserve` copies source EXIF/XMP (and IPTC for JPEG) into JPEG and PNG outputs; see [Color management and metadata](#color-management-and-metadata). |
@@ -528,9 +528,9 @@ All configuration comes from environment variables. Invalid values for the numer
 | `CRABCROP_AVIF_SPEED` | `8` | ravif speed tier for AVIF encodes, 1 (slowest, smallest output) to 10 (fastest). At 800w and quality 80, speed 8 encodes in about 1 s cold and produces the smallest files of the fast tiers; speed 10 is roughly 3x quicker for about 47% more bytes. |
 | `CRABCROP_JXL_SPEED` | `fast` | jixel speed tier for JPEG XL encodes: `ultrafast`, `fastest`, `fast`, `medium`, `slow`, or `extraslow`. Slower tiers shrink output with steep latency costs (`slow` is about 8x the latency of `fast` for about 18% fewer bytes at 800w). |
 | `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](#presets). |
-| `CRABCROP_ONLY_PRESETS` | off | `1` or `true` rejects free-form operations in requests; only preset references (and `exp:` metadata) are allowed. Requires at least one preset. |
+| `CRABCROP_ONLY_PRESETS` | off | Rejects free-form operations in requests; only preset references (and `exp:` metadata) are allowed. Requires at least one preset. |
 | `CRABCROP_ALLOWED_SOURCES` | unset (all hosts allowed) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
-| `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | `1` or `true` refuses sources whose host is, or resolves to, a loopback, private, link-local, or unspecified address. Checked before connecting and again on every redirect hop. |
+| `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | Refuses sources whose host is, or resolves to, a loopback, private, link-local, or unspecified address. Checked before connecting and again on every redirect hop. |
 | `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |
 | `CRABCROP_GCS_ENDPOINT` | `https://storage.googleapis.com` | Base URL of the GCS XML API for `gs://` sources. `CRABCROP_GCS_REGION` (default `auto`) is the signing region; the HMAC pair is `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY`. |
 | `CRABCROP_ALLOWED_BUCKETS` | unset | Comma-separated bucket names the `s3://` and `gs://` schemes may read; `*` allows all. Required when bucket credentials are configured (the server refuses to boot without it); without credentials, unset means all buckets, fetched unsigned. |

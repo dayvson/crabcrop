@@ -178,9 +178,7 @@ async fn main() {
 /// presets configured would reject every transformed
 /// request, so it is a startup error rather than a policy.
 fn build_presets() -> Result<(std::collections::HashMap<String, String>, bool), String> {
-    let only_presets = env::var("CRABCROP_ONLY_PRESETS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let only_presets = parse_bool("CRABCROP_ONLY_PRESETS", false)?;
     let presets = match env::var("CRABCROP_PRESETS_FILE") {
         Ok(path) if !path.is_empty() => {
             let text = std::fs::read_to_string(&path)
@@ -354,6 +352,30 @@ fn parse_env_value<T: std::str::FromStr>(
     }
 }
 
+/// Read a boolean environment variable, strictly: `1`,
+/// `true`, `yes`, `on` (any case) are true; `0`, `false`,
+/// `no`, `off` are false; anything else is a startup error
+/// naming the variable. The lenient reading this replaces
+/// (only `1` or `true` count) made a typo like `ture`
+/// silently false, which for a safety flag such as
+/// CRABCROP_BLOCK_PRIVATE_SOURCES is the unsafe direction.
+fn parse_bool(name: &str, default: bool) -> Result<bool, String> {
+    parse_bool_value(name, env::var(name).ok(), default)
+}
+
+fn parse_bool_value(name: &str, value: Option<String>, default: bool) -> Result<bool, String> {
+    match value.as_deref() {
+        None => Ok(default),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(format!(
+                "invalid {name}: {v:?} (expected one of 1, true, yes, on, 0, false, no, off)"
+            )),
+        },
+    }
+}
+
 /// The minimum `CRABCROP_SECRET` length, in bytes. Shorter
 /// secrets are brute-forceable, and an empty one is worse:
 /// empty-key HMAC is publicly computable, so every signed URL
@@ -375,10 +397,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "CRABCROP_SECRET must be set")?
         .into_bytes();
     validate_secret(&secret)?;
-    let allow_unsafe = env::var("CRABCROP_ALLOW_UNSAFE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let port: u16 = parse_env("PORT", 3000)?;
+    let allow_unsafe = parse_bool("CRABCROP_ALLOW_UNSAFE", false)?;
+    // CRABCROP_PORT is the namespaced alias for PORT and
+    // wins when both are set; PORT alone keeps working for
+    // the deployments and charts that already use it.
+    let (port_name, port_value) = match env::var("CRABCROP_PORT") {
+        Ok(v) => ("CRABCROP_PORT", Some(v)),
+        Err(_) => ("PORT", env::var("PORT").ok()),
+    };
+    let port: u16 = parse_env_value(port_name, port_value, 3000)?;
     let ssim_target: f64 = parse_env("CRABCROP_SSIM_TARGET", crate::quality::DEFAULT_SSIM_TARGET)?;
     if !ssim_target.is_finite() || !(0.0..=100.0).contains(&ssim_target) {
         return Err(
@@ -408,9 +435,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let allowed_sources: Vec<String> = env::var("CRABCROP_ALLOWED_SOURCES")
         .map(|v| v.split(',').map(str::to_string).collect())
         .unwrap_or_default();
-    let block_private = env::var("CRABCROP_BLOCK_PRIVATE_SOURCES")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let block_private = parse_bool("CRABCROP_BLOCK_PRIVATE_SOURCES", false)?;
     let policy = SourcePolicy::new(allowed_sources, block_private);
     let sources = build_source_config()?;
     let (presets, only_presets) = build_presets()?;
@@ -774,6 +799,30 @@ mod tests {
         );
         let err = parse_env_value::<u16>("PORT", Some("abc".to_string()), 3000).unwrap_err();
         assert!(err.contains("PORT"), "{err}");
+    }
+
+    #[test]
+    fn parse_bool_value_accepts_the_spellings_and_rejects_typos() {
+        for v in ["1", "true", "TRUE", "yes", "Yes", "on", "ON"] {
+            assert!(
+                parse_bool_value("CRABCROP_ALLOW_UNSAFE", Some(v.to_string()), false).unwrap(),
+                "{v}"
+            );
+        }
+        for v in ["0", "false", "False", "no", "off", "OFF"] {
+            assert!(
+                !parse_bool_value("CRABCROP_ALLOW_UNSAFE", Some(v.to_string()), true).unwrap(),
+                "{v}"
+            );
+        }
+        assert!(!parse_bool_value("X", None, false).unwrap());
+        assert!(parse_bool_value("X", None, true).unwrap());
+        // A typo is a boot error naming the variable, not a
+        // silent false.
+        let err =
+            parse_bool_value("CRABCROP_ALLOW_UNSAFE", Some("ture".to_string()), false).unwrap_err();
+        assert!(err.contains("CRABCROP_ALLOW_UNSAFE"), "{err}");
+        assert!(err.contains("ture"), "{err}");
     }
 
     #[test]
