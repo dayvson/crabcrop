@@ -311,6 +311,8 @@ All three take an optional expiry (emitted as a leading `exp:` segment) and a nu
 
 Framework integrations in [`frameworks/`](frameworks) sit on the TypeScript builder: a [Next.js](frameworks/nextjs) custom loader for `next/image`, a [Nuxt](frameworks/nuxt) provider for `@nuxt/image`, and a [Hydrogen](frameworks/hydrogen) loader for external (non-Shopify-CDN) images. All three recommend presets as the configuration, so client-side URL building never needs the secret.
 
+The [playground](playground) is a static page (no build step, no server state) for building, signing, previewing, and debugging URLs in the browser: the secret never leaves the page, signatures verify locally, and pasted URLs are explained segment by segment with errors highlighted.
+
 ## Format negotiation
 
 When the URL names no `format(...)`, crabcrop picks the output format from the request's `Accept` header:

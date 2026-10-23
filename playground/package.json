@@ -1,0 +1,10 @@
+{
+  "name": "@crabcrop/playground",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/lib.test.mjs",
+    "test:integration": "node --test test/app.integration.test.mjs"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
