@@ -16,6 +16,17 @@
 
 use std::sync::{Arc, OnceLock};
 
+/// Bounds on SVG document complexity (audit E-7). The raster
+/// target was already capped, but parse and `<use>` expansion
+/// work was not: these caps bound the source document, the
+/// expansion usvg performs while building its tree, and the
+/// declared dimensions, before any rendering happens.
+const MAX_SVG_NODES: usize = 10_000;
+const MAX_USE_ELEMENTS: usize = 256;
+const MAX_USE_DEPTH: usize = 16;
+const MAX_EXPANDED_NODES: usize = 100_000;
+const MAX_SVG_DIMENSION: f64 = 100_000.0;
+
 use image::DynamicImage;
 use resvg::usvg;
 
@@ -190,14 +201,142 @@ fn write_node(node: roxmltree::Node, out: &mut String, is_root: bool) {
 /// docs). Errors when the document is malformed or its root
 /// is not `<svg>`.
 pub fn sanitize(text: &str) -> Result<String, String> {
+    // A DOCTYPE with an internal subset can declare entities;
+    // expansion behavior differs across parsers, so the subset
+    // form is rejected outright (audit E-7). A bare DOCTYPE is
+    // fine: the writer below does not re-emit it.
+    if let Some(start) = text.find("<!DOCTYPE") {
+        let decl = &text[start..text[start..].find('>').map_or(text.len(), |i| start + i)];
+        if decl.contains('[') {
+            return Err("SVG with a DOCTYPE internal subset is not supported".to_string());
+        }
+    }
     let doc = roxmltree::Document::parse(text).map_err(|e| format!("invalid SVG: {e}"))?;
     let root = doc.root_element();
     if !root.tag_name().name().eq_ignore_ascii_case("svg") {
         return Err("not an SVG document".to_string());
     }
+    check_document_bounds(root)?;
     let mut out = String::with_capacity(text.len());
     write_node(root, &mut out, true);
     Ok(out)
+}
+
+/// Enforce the source-side bounds: total node count, `<use>`
+/// count and nesting depth, and the declared root dimensions
+/// (width/height/viewBox), all before tree construction.
+fn check_document_bounds<'a, 'input>(root: roxmltree::Node<'a, 'input>) -> Result<(), String> {
+    fn walk<'a, 'input>(
+        node: roxmltree::Node<'a, 'input>,
+        counts: &mut (usize, usize),
+        ids: &mut std::collections::HashMap<String, roxmltree::Node<'a, 'input>>,
+    ) -> Result<(), String> {
+        counts.0 += 1;
+        if counts.0 > MAX_SVG_NODES {
+            return Err(format!("SVG has more than {MAX_SVG_NODES} nodes"));
+        }
+        if node.tag_name().name().eq_ignore_ascii_case("use") {
+            counts.1 += 1;
+            if counts.1 > MAX_USE_ELEMENTS {
+                return Err(format!("SVG has more than {MAX_USE_ELEMENTS} use elements"));
+            }
+        }
+        if let Some(id) = node.attribute("id") {
+            ids.insert(id.to_string(), node);
+        }
+        for child in node.children() {
+            walk(child, counts, ids)?;
+        }
+        Ok(())
+    }
+    // The expansion depth of the content an id names: the
+    // longest chain of uses reachable from it. Cycles are
+    // errors (usvg rejects them too, later).
+    fn depth_of<'a, 'input>(
+        id: &str,
+        ids: &std::collections::HashMap<String, roxmltree::Node<'a, 'input>>,
+        visiting: &mut Vec<String>,
+        memo: &mut std::collections::HashMap<String, usize>,
+    ) -> Result<usize, String> {
+        if let Some(depth) = memo.get(id) {
+            return Ok(*depth);
+        }
+        if visiting.iter().any(|v| v == id) {
+            return Err("SVG use elements reference each other cyclically".to_string());
+        }
+        let Some(node) = ids.get(id) else {
+            return Ok(0);
+        };
+        visiting.push(id.to_string());
+        let mut deepest = 0;
+        for desc in node.descendants() {
+            if desc.tag_name().name().eq_ignore_ascii_case("use")
+                && let Some(target) = use_target(&desc)
+            {
+                deepest = deepest.max(1 + depth_of(target, ids, visiting, memo)?);
+            }
+        }
+        visiting.pop();
+        memo.insert(id.to_string(), deepest);
+        Ok(deepest)
+    }
+    fn use_target<'x>(node: &roxmltree::Node<'x, '_>) -> Option<&'x str> {
+        node.attribute("href")
+            .or_else(|| node.attribute(("http://www.w3.org/1999/xlink", "href")))
+            .and_then(|h| h.strip_prefix('#'))
+    }
+    let mut ids = std::collections::HashMap::new();
+    walk(root, &mut (0, 0), &mut ids)?;
+    let mut memo = std::collections::HashMap::new();
+    for desc in root.descendants() {
+        if desc.tag_name().name().eq_ignore_ascii_case("use") {
+            if let Some(target) = use_target(&desc) {
+                let depth = 1 + depth_of(target, &ids, &mut Vec::new(), &mut memo)?;
+                if depth > MAX_USE_DEPTH {
+                    return Err(format!("SVG use elements nest deeper than {MAX_USE_DEPTH}"));
+                }
+            }
+        }
+    }
+    for attr in ["width", "height"] {
+        if let Some(value) = root.attribute(attr) {
+            let number: String = value
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(n) = number.parse::<f64>()
+                && n > MAX_SVG_DIMENSION
+            {
+                return Err(format!(
+                    "SVG {attr} exceeds the {MAX_SVG_DIMENSION} unit limit"
+                ));
+            }
+        }
+    }
+    if let Some(view_box) = root.attribute("viewBox") {
+        for part in view_box.split(|c: char| c.is_whitespace() || c == ',') {
+            if let Ok(n) = part.parse::<f64>()
+                && n.abs() > MAX_SVG_DIMENSION
+            {
+                return Err(format!(
+                    "SVG viewBox exceeds the {MAX_SVG_DIMENSION} unit limit"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Count nodes in a constructed usvg tree, `<use>` clones
+/// included: the expansion bound, checked before rendering.
+fn count_expanded(nodes: &[usvg::Node]) -> usize {
+    nodes
+        .iter()
+        .map(|node| match node {
+            usvg::Node::Group(group) => 1 + count_expanded(group.children()),
+            _ => 1,
+        })
+        .sum()
 }
 
 /// A sanitized, parsed SVG ready to rasterize.
@@ -216,6 +355,11 @@ pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
         ..Default::default()
     };
     let tree = usvg::Tree::from_str(&clean, &opt).map_err(|e| format!("cannot parse SVG: {e}"))?;
+    if count_expanded(tree.root().children()) > MAX_EXPANDED_NODES {
+        return Err(format!(
+            "SVG expands past the {MAX_EXPANDED_NODES} node limit"
+        ));
+    }
     Ok(Prepared { tree })
 }
 
@@ -338,5 +482,53 @@ mod tests {
     fn non_svg_xml_is_rejected() {
         assert!(prepare(b"<note><to>x</to></note>").is_err());
         assert!(sanitize("<html><body>x</body></html>").is_err());
+    }
+
+    #[test]
+    fn doctype_with_an_internal_subset_is_rejected() {
+        let subset = r#"<!DOCTYPE svg [ <!ENTITY x "boom"> ]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>"#;
+        assert!(sanitize(subset).is_err());
+        // A bare DOCTYPE is rejected too: the XML parser
+        // refuses DTDs outright, which the sanitizer surfaces.
+        let bare = r#"<!DOCTYPE svg><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>"#;
+        assert!(sanitize(bare).is_err());
+    }
+
+    #[test]
+    fn document_complexity_is_capped() {
+        // Node cap: 10_001 elements is past it.
+        let many = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">{}</svg>",
+            "<rect width=\"1\" height=\"1\"/>".repeat(10_001)
+        );
+        assert!(sanitize(&many).is_err());
+        // Declared-dimension cap.
+        let huge = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200000" height="10"></svg>"##;
+        assert!(sanitize(huge).is_err());
+        // Use nesting depth: a chain of groups, each using the
+        // previous one, 20 deep.
+        let mut doc = String::from(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><defs><g id=\"g0\"><rect width=\"1\" height=\"1\"/></g>",
+        );
+        for i in 1..20 {
+            doc.push_str(&format!("<g id=\"g{i}\"><use href=\"#g{}\"/></g>", i - 1));
+        }
+        doc.push_str("</defs></svg>");
+        assert!(sanitize(&doc).is_err());
+    }
+
+    #[test]
+    fn use_expansion_is_capped_after_parse() {
+        // A 1_000-rect group referenced by 150 uses is a small
+        // source document but expands to ~150k tree nodes.
+        let mut doc = String::from(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><defs><g id=\"big\">",
+        );
+        doc.push_str(&"<rect width=\"1\" height=\"1\"/>".repeat(1_000));
+        doc.push_str("</g></defs>");
+        doc.push_str(&"<use href=\"#big\"/>".repeat(150));
+        doc.push_str("</svg>");
+        assert!(sanitize(&doc).is_ok());
+        assert!(prepare(doc.as_bytes()).is_err());
     }
 }
