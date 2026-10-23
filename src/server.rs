@@ -84,6 +84,9 @@ pub struct AppState {
     pub ssim_target: f64,
     pub avif_speed: u8,
     pub jxl_speed: jixel::Speed,
+    /// Quantization step for width client hints
+    /// (`CRABCROP_WIDTH_STEP`).
+    pub width_step: u32,
     /// Named operation presets from `CRABCROP_PRESETS_FILE`:
     /// name to operation string, validated at boot.
     pub presets: std::collections::HashMap<String, String>,
@@ -144,11 +147,55 @@ async fn metrics(State(state): State<AppState>) -> Response {
 /// factors. Anything else (absent, unparsable, out of set) is
 /// no hint: hints are advisory, never an error.
 fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
-    headers
-        .get("DPR")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<f32>().ok())
+    let raw = headers
+        .get("Sec-CH-DPR")
+        .or_else(|| headers.get("DPR"))
+        .and_then(|v| v.to_str().ok())?;
+    raw.trim()
+        .parse::<f32>()
+        .ok()
         .filter(|f| [1.0, 1.5, 2.0, 3.0].contains(f))
+}
+
+/// The width client hint: the display width the client
+/// wants, from the most specific header present
+/// (`Sec-CH-Width`, then the legacy `Width`, then the
+/// viewport widths). Advisory like every hint: an absent,
+/// unparsable, or out-of-range value is no hint, never an
+/// error.
+fn width_hint(headers: &HeaderMap) -> Option<u32> {
+    for name in [
+        "Sec-CH-Width",
+        "Width",
+        "Sec-CH-Viewport-Width",
+        "Viewport-Width",
+    ] {
+        let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) else {
+            continue;
+        };
+        if let Ok(w) = raw.trim().parse::<u32>()
+            && (1..=16383).contains(&w)
+        {
+            return Some(w);
+        }
+    }
+    None
+}
+
+/// Round a hinted width UP to the next multiple of the
+/// quantization step, so a client never gets less than it
+/// asked for and the cache sees bounded cardinality.
+fn quantize_width(width: u32, step: u32) -> u32 {
+    let step = step.max(1);
+    width.div_ceil(step) * step
+}
+
+/// Whether the client sent `Save-Data: on`.
+fn save_data_hint(headers: &HeaderMap) -> bool {
+    headers
+        .get("Save-Data")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("on"))
 }
 
 /// The operator-configured fallback image: processed and
@@ -313,7 +360,10 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let dpr = dpr_hint(&headers);
-    let (response, mut record) = serve(&state, path, accept.as_deref(), dpr).await;
+    let width = width_hint(&headers);
+    let save_data = save_data_hint(&headers);
+    let (response, mut record) =
+        serve(&state, path, accept.as_deref(), dpr, width, save_data).await;
     record.status = response.status().as_u16();
     record.total = started.elapsed();
     state.metrics.record(&record);
@@ -327,6 +377,7 @@ async fn handle(
 /// can move to a blocking thread (audit E-5).
 #[derive(Clone)]
 struct ProcessJob {
+    save_data: bool,
     ops: Vec<crate::url::Operation>,
     preferred: Option<ImageFormat>,
     watermarks: crate::filters::WatermarkImages,
@@ -394,6 +445,7 @@ async fn run_process(
             upscale_provider: job.upscale_provider.as_deref(),
             face_provider: job.face_provider.as_deref(),
             detect_provider: job.detect_provider.as_deref(),
+            save_data: job.save_data,
             text_renderer: job.text_renderer.as_deref(),
             dpr: job.dpr,
             ssim_target: job.ssim_target,
@@ -417,6 +469,8 @@ async fn serve(
     path: &str,
     accept: Option<&str>,
     dpr_hint: Option<f32>,
+    width_hint: Option<u32>,
+    save_data: bool,
 ) -> (Response, RequestRecord) {
     let mut record = RequestRecord::default();
     let full = format!("/{path}");
@@ -493,6 +547,19 @@ async fn serve(
     // it changes the output.
     let effective_dpr = crate::url::explicit_dpr(&ops).or(dpr_hint).unwrap_or(1.0);
 
+    // The quantized width a width hint resolves to, when the
+    // ops size nothing themselves. It is part of what the
+    // response is, so it joins the cache key below.
+    let hinted_width = if crate::url::has_size_operation(&ops) {
+        None
+    } else {
+        width_hint.map(|w| quantize_width(w, state.width_step))
+    };
+    // Save-Data changes the bytes exactly when the engine
+    // steps (hint present, no quality directive in the URL);
+    // the key separates those entries under the same rule.
+    let save_data_applies = save_data && !crate::url::has_quality_directive(&ops);
+
     // Without an explicit format in the URL, the response depends
     // on the Accept class as well as the path, so the cache key
     // carries the class. Explicit-format URLs key on the path alone.
@@ -512,6 +579,12 @@ async fn serve(
         };
         format!("{key_base}#{class}")
     };
+    if let Some(w) = hinted_width {
+        cache_key = format!("{cache_key}#w{w}");
+    }
+    if save_data_applies {
+        cache_key = format!("{cache_key}#sd");
+    }
     if effective_dpr != 1.0 {
         cache_key = format!("{cache_key}#dpr{effective_dpr}");
     }
@@ -640,8 +713,25 @@ async fn serve(
     } else {
         None
     };
+    // A width hint applies only when the URL sizes nothing
+    // itself: it synthesizes the width-only size op a client
+    // URL would have carried, ahead of the URL's own ops.
+    let job_ops = match hinted_width {
+        Some(w) => {
+            let mut combined = vec![crate::url::Operation::Size(crate::url::ImageSize {
+                width: crate::url::Dimension::Pixels(w),
+                height: crate::url::Dimension::Proportional,
+                flip_horizontal: false,
+                flip_vertical: false,
+            })];
+            combined.extend(ops.iter().cloned());
+            combined
+        }
+        None => ops.clone(),
+    };
     let job = ProcessJob {
-        ops: ops.clone(),
+        save_data,
+        ops: job_ops,
         preferred,
         watermarks: watermark_images,
         placeholders,
@@ -1003,7 +1093,7 @@ fn meta_response(
     // PL-12): never publicly cacheable, so an intermediary can
     // never pin it in place of the image, or the reverse.
     headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
-    headers.insert(header::VARY, "Accept, DPR".parse().unwrap());
+    headers.insert(header::VARY, "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data".parse().unwrap());
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -1025,7 +1115,7 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
         "public, max-age=31536000, immutable".parse().unwrap(),
     );
     // The format may have been negotiated from the request's Accept.
-    headers.insert(header::VARY, "Accept, DPR".parse().unwrap());
+    headers.insert(header::VARY, "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data".parse().unwrap());
     if let Some(q) = quality {
         headers.insert(
             axum::http::HeaderName::from_static("x-crabcrop-quality"),
@@ -1200,6 +1290,7 @@ mod tests {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1242,6 +1333,7 @@ mod tests {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1392,6 +1484,7 @@ mod tests {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
             presets,
             only_presets,
         };
@@ -1675,6 +1768,7 @@ mod tests {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1770,6 +1864,7 @@ mod tests {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -1810,6 +1905,7 @@ mod tests {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
             presets,
             only_presets: false,
         };
@@ -1826,6 +1922,141 @@ mod tests {
             .get(name)
             .map(|v| v.to_str().unwrap().to_string())
             .unwrap_or_default()
+    }
+
+    fn headers_of(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn width_hint_prefers_the_specific_sec_spelling() {
+        // The per-image Sec- width beats everything.
+        let map = headers_of(&[
+            ("Sec-CH-Width", "800"),
+            ("Width", "400"),
+            ("Sec-CH-Viewport-Width", "1200"),
+        ]);
+        assert_eq!(width_hint(&map), Some(800));
+        // Legacy spelling next.
+        let map = headers_of(&[("Width", "400"), ("Viewport-Width", "1200")]);
+        assert_eq!(width_hint(&map), Some(400));
+        // Viewport widths are the fallback, Sec- first.
+        let map = headers_of(&[("Sec-CH-Viewport-Width", "1200"), ("Viewport-Width", "900")]);
+        assert_eq!(width_hint(&map), Some(1200));
+        // Junk and out-of-range values are no hint, and a
+        // junk specific header falls through to the next.
+        let map = headers_of(&[("Sec-CH-Width", "wide"), ("Width", "300")]);
+        assert_eq!(width_hint(&map), Some(300));
+        let map = headers_of(&[("Sec-CH-Width", "0")]);
+        assert_eq!(width_hint(&map), None);
+        let map = headers_of(&[("Sec-CH-Width", "20000")]);
+        assert_eq!(width_hint(&map), None);
+        assert_eq!(width_hint(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn quantize_width_rounds_up_to_the_step() {
+        assert_eq!(quantize_width(1, 100), 100);
+        assert_eq!(quantize_width(100, 100), 100);
+        assert_eq!(quantize_width(101, 100), 200);
+        assert_eq!(quantize_width(250, 100), 300);
+        assert_eq!(quantize_width(250, 1), 250);
+        assert_eq!(quantize_width(250, 0), 250);
+    }
+
+    #[test]
+    fn save_data_hint_reads_on_only() {
+        assert!(save_data_hint(&headers_of(&[("Save-Data", "on")])));
+        assert!(save_data_hint(&headers_of(&[("Save-Data", " On ")])));
+        assert!(!save_data_hint(&headers_of(&[("Save-Data", "off")])));
+        assert!(!save_data_hint(&HeaderMap::new()));
+    }
+
+    async fn get_with_headers(
+        base: &str,
+        remainder: &str,
+        pairs: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let mut req = client().get(format!("{base}/{}/{remainder}", sign(remainder)));
+        for (name, value) in pairs {
+            req = req.header(*name, *value);
+        }
+        req.send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn width_hint_sizes_an_unsized_url_and_separates_the_cache() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        // The source is 100x60 and the URL sizes nothing.
+        let remainder = format!("filters:format(png)/{src}");
+        let width_of = |resp: reqwest::Response| async {
+            let bytes = resp.bytes().await.unwrap();
+            image::load_from_memory(&bytes).unwrap().width()
+        };
+        // 250 quantizes to 300 (upscale is the engine's
+        // default posture): proof the synthesized op ran.
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "250")]).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(width_of(resp).await, 300);
+        // 210 is the same quantized class: a hit, no refetch.
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "210")]).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // 90 quantizes to 100: a different entry.
+        let resp = get_with_headers(&base, &remainder, &[("Width", "90")]).await;
+        assert_eq!(width_of(resp).await, 100);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // No hint at all: its own entry again.
+        let resp = get_with_headers(&base, &remainder, &[]).await;
+        assert_eq!(width_of(resp).await, 100);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_size_ignores_the_width_hint() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("30x20/{src}");
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "250")]).await;
+        let bytes = resp.bytes().await.unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (30, 20));
+    }
+
+    #[tokio::test]
+    async fn save_data_steps_quality_and_separates_the_cache() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(jpeg)/{src}");
+        // Plain: no quality is reported on the default path.
+        let resp = get_with_headers(&base, &remainder, &[]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "");
+        let plain = resp.bytes().await.unwrap();
+        // Save-Data: the step to 70 is reported and the bytes
+        // are a different encode.
+        let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "70");
+        let stepped = resp.bytes().await.unwrap();
+        assert_ne!(plain, stepped);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // A repeat is the stepped entry, not the plain one.
+        let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(resp.bytes().await.unwrap(), stepped);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // An explicit quality stands under Save-Data and
+        // reports nothing, exactly as without the hint.
+        let remainder = format!("filters:format(jpeg):quality(90)/{src}");
+        let resp = get_with_headers(&base, &remainder, &[("Save-Data", "on")]).await;
+        assert_eq!(header(&resp, "x-crabcrop-quality"), "");
     }
 
     #[tokio::test]
@@ -2111,6 +2342,7 @@ mod tests {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
@@ -2273,10 +2505,12 @@ mod tests {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
             presets: std::collections::HashMap::new(),
             only_presets: false,
         };
         let job = ProcessJob {
+            save_data: false,
             ops: Vec::new(),
             preferred: None,
             watermarks: crate::filters::WatermarkImages::new(),
@@ -2581,7 +2815,10 @@ mod tests {
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/avif"
         );
-        assert_eq!(resp.headers().get(header::VARY).unwrap(), "Accept, DPR");
+        assert_eq!(
+            resp.headers().get(header::VARY).unwrap(),
+            "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data"
+        );
         let body = resp.bytes().await.unwrap();
         assert_eq!(&body[4..8], b"ftyp");
     }

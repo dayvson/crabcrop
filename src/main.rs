@@ -21,6 +21,8 @@
 //!   default 75.
 //! - `CRABCROP_AVIF_SPEED`: ravif speed tier for AVIF encodes,
 //!   1 (slowest, smallest) to 10 (fastest), default 8.
+//! - `CRABCROP_WIDTH_STEP`: quantization step in pixels for
+//!   width client hints, 1 to 2000, default 100.
 //! - `CRABCROP_JXL_SPEED`: jixel speed tier for JPEG XL encodes,
 //!   one of ultrafast, fastest, fast, medium, slow, extraslow,
 //!   default fast.
@@ -286,6 +288,9 @@ fn build_source_config() -> Result<SourceConfig, String> {
 /// naming the variable: silently serving on the wrong port or
 /// with the wrong cache budget is worse than refusing to start.
 /// Parse a `CRABCROP_JXL_SPEED` value into a jixel speed tier.
+/// Default quantization step for width client hints.
+const DEFAULT_WIDTH_STEP: u32 = 100;
+
 fn parse_jxl_speed(value: &str) -> Result<jixel::Speed, String> {
     match value.to_ascii_lowercase().as_str() {
         "ultrafast" => Ok(jixel::Speed::UltraFast),
@@ -356,6 +361,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(v) => parse_jxl_speed(&v)?,
         Err(_) => crate::engine::DEFAULT_JXL_SPEED,
     };
+    let width_step: u32 = parse_env("CRABCROP_WIDTH_STEP", DEFAULT_WIDTH_STEP)?;
+    if !(1..=2000).contains(&width_step) {
+        return Err(
+            format!("CRABCROP_WIDTH_STEP must be between 1 and 2000, got {width_step}").into(),
+        );
+    }
     let cache_mb: usize = parse_env("CRABCROP_CACHE_MAX_MB", 256)?;
     let cache_bytes = cache_mb
         .checked_mul(1024 * 1024)
@@ -488,6 +499,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ssim_target,
         avif_speed,
         jxl_speed,
+        width_step,
         presets,
         only_presets,
     };

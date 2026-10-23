@@ -1251,6 +1251,31 @@ pub fn explicit_dpr(ops: &[Operation]) -> Option<f32> {
     found
 }
 
+/// Whether `ops` fix the output dimensions themselves (a
+/// size, crop, fit-in, pad, or crop-rect operation). A
+/// width client hint only applies when this is false.
+pub fn has_size_operation(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            Operation::Size(_)
+                | Operation::Crop { .. }
+                | Operation::FitIn(_)
+                | Operation::Pad { .. }
+                | Operation::CropRect { .. }
+        )
+    })
+}
+
+/// Whether `ops` carry any `quality(...)` directive, fixed
+/// or auto. Save-Data only steps quality when this is false.
+pub fn has_quality_directive(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Quality(_))),
+        _ => false,
+    })
+}
+
 /// Whether any filters segment in `ops` requests `text`.
 pub fn has_text(ops: &[Operation]) -> bool {
     ops.iter().any(|op| match op {
