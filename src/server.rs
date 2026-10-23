@@ -25,6 +25,7 @@ use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
 use crate::url::{
     ImageFormat, explicit_format, parse_operations_with_expiry, parse_signature, verify,
+    verify_purge,
 };
 
 /// Shared state for the handlers.
@@ -133,11 +134,12 @@ async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
 }
 
 /// `POST /purge/<signature>/<path>`: invalidate every stored
-/// variant of one result. The signature is the HMAC scheme over
-/// the literal remainder `purge/<path>`, so only the secret
-/// holder can purge; a bad signature is a 403 and purges
-/// nothing. Idempotent: purging an absent entry answers 200
-/// with a count of 0.
+/// variant of one result. The signature is an HMAC over the
+/// path under a purge subkey derived from the secret (see
+/// [`crate::url::purge_key`]), so only the secret holder can
+/// purge and an image signature can never be replayed here; a
+/// bad signature is a 403 and purges nothing. Idempotent:
+/// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let Some(tail) = uri.path().strip_prefix("/purge/") else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -147,8 +149,7 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         Ok(v) => v,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let remainder = format!("purge/{target}");
-    if !verify(&state.secret, &signature, &remainder, state.allow_unsafe) {
+    if !verify_purge(&state.secret, &signature, target, state.allow_unsafe) {
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
     }
     let mut removed = state.cache.purge_matching(target);
@@ -204,6 +205,12 @@ async fn serve(
             (StatusCode::FORBIDDEN, "bad signature").into_response(),
             record,
         );
+    }
+    // Defense in depth for the purge domain separation (audit
+    // P-1): an image remainder may not begin with the `purge`
+    // segment, so the two URL shapes can never be confused.
+    if rest.split('/').next() == Some("purge") {
+        return (StatusCode::BAD_REQUEST.into_response(), record);
     }
     // Preset expansion happens after verification (the
     // signature covers the preset reference, not its expansion)
@@ -1331,8 +1338,9 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // A correctly signed purge removes it from both tiers,
-        // so the next request refetches the origin.
-        let purge_sig = sign(&format!("purge/{remainder}"));
+        // so the next request refetches the origin. Purge
+        // signatures use the derived purge key (audit P-1).
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
         let ok = client()
             .post(format!("{base2}/purge/{purge_sig}/{remainder}"))
             .send()

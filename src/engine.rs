@@ -52,14 +52,14 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// limited decode behind it is the second line.
 pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
-    if let Ok(probe) = probe {
-        if let Ok((width, height)) = probe.into_dimensions() {
-            check_decoded_dimensions(width as u64, height as u64)?;
-            if width as u64 * height as u64 * 4 > MAX_DECODE_ALLOC {
-                return Err(EngineError::Decode(format!(
-                    "image dimensions {width}x{height} exceed the decode allocation limit"
-                )));
-            }
+    if let Ok(probe) = probe
+        && let Ok((width, height)) = probe.into_dimensions()
+    {
+        check_decoded_dimensions(width as u64, height as u64)?;
+        if width as u64 * height as u64 * 4 > MAX_DECODE_ALLOC {
+            return Err(EngineError::Decode(format!(
+                "image dimensions {width}x{height} exceed the decode allocation limit"
+            )));
         }
     }
     let mut reader = image::ImageReader::new(Cursor::new(bytes));
