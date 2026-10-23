@@ -2072,6 +2072,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_verbs_work_against_a_live_server() {
+        let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x50/{src}");
+        // sign: the printed URL serves.
+        let signed = crate::cli::exec(&cli(&[
+            "sign",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        assert!(signed.starts_with(&format!("{base}/")), "{signed}");
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // explain: verified, with the operation described.
+        let out = crate::cli::exec(&cli(&["explain", "--secret", "test-secret", &signed]))
+            .await
+            .unwrap();
+        assert!(out.contains("valid for this remainder"), "{out}");
+        assert!(out.contains("resize to 50x50"), "{out}");
+        // meta: a remainder is signed, fetched, and printed.
+        let meta = crate::cli::exec(&cli(&[
+            "meta",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        assert!(meta.contains("\"width\": 50"), "{meta}");
+        // purge: the entry the first fetch cached goes away.
+        let out = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &signed,
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 1");
+        // purge-group: a preset fetch lands in the group,
+        // and the group purge removes it.
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        let remainder = format!("preset:small/{src}");
+        let signed = crate::cli::exec(&cli(&[
+            "sign",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = crate::cli::exec(&cli(&[
+            "purge-group",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            "small",
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 1");
+    }
+
+    #[tokio::test]
     async fn cache_status_reports_miss_then_memory_hit() {
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
         let base = spawn_app(false).await;
