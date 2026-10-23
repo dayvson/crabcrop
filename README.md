@@ -177,7 +177,7 @@ curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/
 | Directive | Parameters | Description | Example |
 | --- | --- | --- | --- |
 | `format` | `format(webp)` — `jpeg` (or `jpg`), `png`, `webp`, `jxl`, `avif`, `gif` | Output format. Overrides `Accept` negotiation. | `filters:format(avif)` |
-| `quality` | `quality(80)` — 0 to 100, or `quality(auto)` | Encoding quality for JPEG, JPEG XL, and AVIF. Default 80. | `filters:quality(auto)` |
+| `quality` | `quality(80)` — 0 to 100, or `quality(auto)` | Encoding quality for JPEG, JPEG XL, AVIF, and WebP. Default 80. | `filters:quality(auto)` |
 | `max_bytes` | `max_bytes(50000)` — byte budget, at least 1 | Re-encode at decreasing quality until the output fits the budget. | `filters:max_bytes(50000)` |
 | `fill` | `fill(ff0000)` — six hex digits, RGB | Background color used to flatten transparency when encoding to JPEG. | `filters:fill(ffffff)` |
 | `no_upscale` | none | Cap every resize in the request at the source dimensions. | `filters:no_upscale` |

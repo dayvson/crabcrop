@@ -756,14 +756,32 @@ fn encode(
         ImageFormat::Jpeg => {
             // JPEG has no alpha channel. A fill color composites
             // transparency over that background; without one, the
-            // stored RGB values are used as-is.
+            // stored RGB values are used as-is. Encoding uses the
+            // jpeg-encoder crate with 4:2:0 chroma subsampling
+            // (the image crate's vendored encoder is fixed at
+            // 4:2:2, and its quality scale runs hot compared to
+            // libjpeg). Optimized Huffman tables stay OFF:
+            // jpeg-encoder's optimized tables for degenerate
+            // (tiny, flat) inputs produce files zune-jpeg decodes
+            // incorrectly, an interop hazard measured in #38.
             let rgb = match fill {
                 Some(bg) if img.color().has_alpha() => flatten(img, bg),
                 _ => img.to_rgb8(),
             };
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality.unwrap_or(80))
-                .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
-                .map_err(|e| EngineError::Encode(e.to_string()))?;
+            if w > u16::MAX as u32 || h > u16::MAX as u32 {
+                return Err(EngineError::Encode(
+                    "jpeg: dimension exceeds the 65535 format limit".into(),
+                ));
+            }
+            let mut enc = jpeg_encoder::Encoder::new(&mut buf, quality.unwrap_or(80));
+            enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+            enc.encode(
+                rgb.as_raw(),
+                w as u16,
+                h as u16,
+                jpeg_encoder::ColorType::Rgb,
+            )
+            .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Png => {
             image::codecs::png::PngEncoder::new(&mut buf)
@@ -1866,6 +1884,53 @@ mod tests {
             .unwrap();
         assert_eq!(out.format, ImageFormat::WebP);
         assert!(out.bytes.len() <= 4000, "{} bytes", out.bytes.len());
+    }
+
+    /// The sampling factors from a JPEG's SOF0 segment, per
+    /// component: (id, sampling byte). 4:2:0 shows Y as 0x22.
+    fn jpeg_sof_sampling(bytes: &[u8]) -> Vec<(u8, u8)> {
+        let mut i = 2;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            if marker == 0xC0 {
+                let n = bytes[i + 9] as usize;
+                return (0..n)
+                    .map(|c| (bytes[i + 10 + c * 3], bytes[i + 11 + c * 3]))
+                    .collect();
+            }
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            i += 2 + len;
+        }
+        panic!("no SOF0 segment");
+    }
+
+    #[test]
+    fn jpeg_uses_420_subsampling_and_stays_compact() {
+        let engine = Engine;
+        let src = noise_png();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+            )
+            .unwrap();
+        let sampling = jpeg_sof_sampling(&out.bytes);
+        assert_eq!(sampling.len(), 3);
+        assert_eq!(sampling[0].1, 0x22, "Y sampling (4:2:0)");
+        assert_eq!(sampling[1].1, 0x11, "Cb sampling");
+        // Regression bound from the #38 encoder swap: this
+        // fixture encoded to 20,746 B with the previous encoder
+        // and 12,069 B with jpeg-encoder at 4:2:0.
+        assert!(out.bytes.len() < 14000, "{} bytes", out.bytes.len());
+        assert_eq!(decode_dims(&out.bytes), (120, 120));
     }
 
     #[test]
