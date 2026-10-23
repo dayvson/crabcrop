@@ -536,7 +536,13 @@ impl Loader {
 /// boundary is what keeps `evil-example.com` from matching
 /// `example.com`.
 fn suffix_matches(host: &str, suffix: &str) -> bool {
-    host == suffix || host.ends_with(&format!(".{suffix}"))
+    // Allocation-free form of `host == suffix ||
+    // host.ends_with(".{suffix}")`: the part before the
+    // suffix must end at a dot boundary.
+    host == suffix
+        || host
+            .strip_suffix(suffix)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
 
 /// Loopback, private, link-local, and unspecified addresses are
