@@ -10,7 +10,7 @@ use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use crate::filters::{EncodeOptions, WatermarkImages, apply_filters};
 use crate::quality::auto_quality;
-use crate::url::{Dimension, Filter, ImageFormat, ImageSize, Operation, Quality};
+use crate::url::{Align, Dimension, Filter, ImageFormat, ImageSize, Operation, Quality};
 
 /// Register the JPEG XL decoder with the image crate, once.
 ///
@@ -215,6 +215,11 @@ impl Engine {
         if crate::url::has_text(ops) && ctx.text_renderer.is_none() {
             return Err(EngineError::Unsupported(
                 "text is not configured on this server (no font)".to_string(),
+            ));
+        }
+        if crate::url::needs_face_model(ops) && ctx.face_provider.is_none() {
+            return Err(EngineError::Unsupported(
+                "face operations are not configured on this server (no face model)".to_string(),
             ));
         }
         let img = if detected == ImageFormat::Gif {
@@ -499,6 +504,38 @@ fn dpr_factor(ops: &[Operation], ctx: &ProcessContext<'_>) -> f32 {
     crate::url::explicit_dpr(ops).or(ctx.dpr).unwrap_or(1.0)
 }
 
+/// Memoized face detection for one pipeline run: the image
+/// dimensions the detections belong to, and the provider's
+/// result. Several face operations on the same image state
+/// share one inference; an operation that changes the size
+/// re-detects against the new state.
+type FaceMemo = Option<(u32, u32, Result<Vec<crate::ai::FaceBox>, String>)>;
+
+/// Detect faces in `img` through the context's provider,
+/// serving the memoized result when the image state matches.
+/// The provider's failure surfaces as an inference error;
+/// callers with a fallback (the face crop) may downgrade it.
+fn detect_faces(
+    memo: &mut FaceMemo,
+    img: &DynamicImage,
+    ctx: &ProcessContext<'_>,
+) -> Result<Vec<crate::ai::FaceBox>, EngineError> {
+    let provider = ctx.face_provider.ok_or_else(|| {
+        EngineError::Unsupported(
+            "face operations are not configured on this server (no face model)".to_string(),
+        )
+    })?;
+    if let Some((w, h, cached)) = &memo
+        && *w == img.width()
+        && *h == img.height()
+    {
+        return cached.clone().map_err(EngineError::Inference);
+    }
+    let found = provider.detect(img);
+    *memo = Some((img.width(), img.height(), found.clone()));
+    found.map_err(EngineError::Inference)
+}
+
 fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
@@ -507,6 +544,7 @@ fn apply_operations(
     ctx: &ProcessContext<'_>,
 ) -> Result<(DynamicImage, EncodeOptions), EngineError> {
     let mut directives = EncodeOptions::default();
+    let mut face_memo: FaceMemo = None;
     for op in ops {
         match op {
             Operation::Size(size) => img = apply_size(img, size, cap, dpr),
@@ -537,7 +575,35 @@ fn apply_operations(
                         ));
                     }
                 };
-                img = crate::crop::crop_to_aspect_with(img, tw, th, *align, ctx.face_provider);
+                img = if *align == Align::Face {
+                    // Crop around the largest detected face. A
+                    // detection failure or an empty result falls
+                    // back to the saliency smart crop: a crop
+                    // always exists, so it never fails the
+                    // request.
+                    match detect_faces(&mut face_memo, &img, ctx) {
+                        Ok(faces) if !faces.is_empty() => {
+                            let face = faces
+                                .iter()
+                                .max_by_key(|f| f.w as u64 * f.h as u64)
+                                .expect("faces is non-empty");
+                            crate::crop::crop_around_face(
+                                img,
+                                tw,
+                                th,
+                                face,
+                                crate::url::face_padding(ops),
+                            )
+                        }
+                        Ok(_) => crate::crop::crop_to_aspect_with(img, tw, th, Align::Smart, None),
+                        Err(EngineError::Inference(_)) => {
+                            crate::crop::crop_to_aspect_with(img, tw, th, Align::Smart, None)
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    crate::crop::crop_to_aspect_with(img, tw, th, *align, ctx.face_provider)
+                };
                 img = apply_size(
                     img,
                     &ImageSize {
@@ -574,6 +640,21 @@ fn apply_operations(
                             let mask = provider.mask(&img).map_err(EngineError::Inference)?;
                             img = crate::ai::apply_mask(&img, &mask);
                         }
+                        Filter::BlurFaces => {
+                            // A detection failure fails the
+                            // request: serving the image
+                            // unredacted would be the real
+                            // failure.
+                            let faces = detect_faces(&mut face_memo, &img, ctx)?;
+                            img = crate::filters::blur_faces(&img, &faces);
+                        }
+                        Filter::PixelateFaces => {
+                            let faces = detect_faces(&mut face_memo, &img, ctx)?;
+                            img = crate::filters::pixelate_faces(&img, &faces);
+                        }
+                        // Padding is read from the request as a
+                        // whole by the face crop; no pixels here.
+                        Filter::FacePad(_) => {}
                         Filter::Upscale(factor) => {
                             let provider = ctx.upscale_provider.ok_or_else(|| {
                                 EngineError::Unsupported(
@@ -2696,6 +2777,237 @@ mod tests {
         assert_eq!((out.width, out.height), (50, 100));
         let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(result.get_pixel(25, 50), &image::Rgb([0, 0, 255]));
+    }
+
+    /// The known face of `face_scene`: box (140, 30, 40, 40).
+    fn known_face() -> crate::ai::FaceBox {
+        crate::ai::FaceBox {
+            x: 140,
+            y: 30,
+            w: 40,
+            h: 40,
+            score: 0.95,
+        }
+    }
+
+    #[derive(Debug)]
+    struct KnownFace;
+
+    impl crate::ai::FaceProvider for KnownFace {
+        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+            Ok(vec![known_face()])
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingFace {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::ai::FaceProvider for CountingFace {
+        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![known_face()])
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingFace;
+
+    impl crate::ai::FaceProvider for FailingFace {
+        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+            Err("detector exploded".to_string())
+        }
+    }
+
+    /// 200x160 flat gray, except the known face box, which is a
+    /// black/white checkerboard.
+    fn face_scene() -> Vec<u8> {
+        let mut img = image::RgbImage::from_pixel(200, 160, image::Rgb([90, 90, 90]));
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            if (140..180).contains(&x) && (30..70).contains(&y) {
+                *p = if (x + y) % 2 == 0 {
+                    image::Rgb([0, 0, 0])
+                } else {
+                    image::Rgb([255, 255, 255])
+                };
+            }
+        }
+        png_bytes(&DynamicImage::ImageRgb8(img))
+    }
+
+    fn face_crop_op() -> Operation {
+        Operation::Crop {
+            size: ImageSize {
+                width: Dimension::Pixels(100),
+                height: Dimension::Pixels(100),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            align: Align::Face,
+        }
+    }
+
+    #[test]
+    fn face_crop_targets_the_detected_face() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &face_scene(),
+                &[face_crop_op()],
+                ProcessContext {
+                    face_provider: Some(&KnownFace),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (100, 100));
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // Default padding 0.5: the crop is the 80x80 region at
+        // (120, 10), so the output center is the face center:
+        // checkerboard blended by the resize (dark or light,
+        // never the flat background gray), corner is background.
+        let center = result.get_pixel(50, 50);
+        assert!(center[0] < 40 || center[0] > 200, "center {center:?}");
+        assert_eq!(result.get_pixel(2, 2), &image::Rgb([90, 90, 90]));
+    }
+
+    #[test]
+    fn face_crop_without_a_model_is_a_clean_error() {
+        let engine = Engine;
+        let err = engine
+            .process(&face_scene(), &[face_crop_op()])
+            .unwrap_err();
+        match &err {
+            EngineError::Unsupported(msg) => assert!(msg.contains("face"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn face_crop_falls_back_when_detection_fails() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &face_scene(),
+                &[face_crop_op()],
+                ProcessContext {
+                    face_provider: Some(&FailingFace),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (100, 100));
+    }
+
+    #[test]
+    fn blurfaces_redacts_only_the_face_region() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &face_scene(),
+                &[Operation::Filters(vec![Filter::BlurFaces])],
+                ProcessContext {
+                    face_provider: Some(&KnownFace),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // Outside the box: untouched.
+        assert_eq!(result.get_pixel(10, 10), &image::Rgb([90, 90, 90]));
+        assert_eq!(result.get_pixel(139, 50), &image::Rgb([90, 90, 90]));
+        // Inside: the checkerboard extremes are blurred away.
+        let mut extremes = 0;
+        for y in 30..70 {
+            for x in 140..180 {
+                let v = result.get_pixel(x, y)[0];
+                if v == 0 || v == 255 {
+                    extremes += 1;
+                }
+            }
+        }
+        assert!(extremes < 80, "{extremes} of 1600 pixels still extreme");
+    }
+
+    #[test]
+    fn pixelatefaces_blocks_the_face_region() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &face_scene(),
+                &[Operation::Filters(vec![Filter::PixelateFaces])],
+                ProcessContext {
+                    face_provider: Some(&KnownFace),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(result.get_pixel(10, 10), &image::Rgb([90, 90, 90]));
+        // Neighboring pixels inside one 4px block agree.
+        assert_eq!(result.get_pixel(141, 31), result.get_pixel(142, 32));
+        // The checkerboard is gone: blocks are mid-gray averages
+        // or single extremes, but adjacent blocks differ from a
+        // per-pixel checker pattern.
+        let mut distinct = std::collections::HashSet::new();
+        for y in 30..70 {
+            for x in 140..180 {
+                distinct.insert(result.get_pixel(x, y).0);
+            }
+        }
+        assert!(distinct.len() <= 100, "{} distinct colors", distinct.len());
+    }
+
+    #[test]
+    fn blurfaces_fails_when_detection_fails() {
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                &face_scene(),
+                &[Operation::Filters(vec![Filter::BlurFaces])],
+                ProcessContext {
+                    face_provider: Some(&FailingFace),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Inference(_)), "{err:?}");
+    }
+
+    #[test]
+    fn blurfaces_without_a_model_is_a_clean_error() {
+        let engine = Engine;
+        let err = engine
+            .process(
+                &face_scene(),
+                &[Operation::Filters(vec![Filter::BlurFaces])],
+            )
+            .unwrap_err();
+        match &err {
+            EngineError::Unsupported(msg) => assert!(msg.contains("face"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chained_face_ops_detect_once() {
+        let engine = Engine;
+        let provider = CountingFace::default();
+        engine
+            .process_preferred(
+                &face_scene(),
+                &[Operation::Filters(vec![
+                    Filter::BlurFaces,
+                    Filter::PixelateFaces,
+                ])],
+                ProcessContext {
+                    face_provider: Some(&provider),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// A renderer that stamps one white pixel at the origin:

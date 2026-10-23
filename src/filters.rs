@@ -116,6 +116,11 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // Text is drawn by the engine, which owns the
             // configured font renderer. (Same routing.)
             Filter::Text { .. } => {}
+            // Face operations run in the engine, which owns the
+            // face provider and the shared detection memo. Face
+            // padding is a directive the face crop reads from
+            // the request as a whole. (Same routing.)
+            Filter::BlurFaces | Filter::PixelateFaces | Filter::FacePad(_) => {}
             // DPR scales size targets in the engine, which
             // resolves it against the request as a whole (with
             // the client-hint fallback). (Same routing.)
@@ -134,6 +139,63 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
 /// pixels that differ from the top-left corner color by more
 /// than `tolerance` in any channel (alpha included). A fully
 /// uniform image is returned unchanged, never emptied.
+/// Blur every detected face region in `img`. The blur sigma
+/// scales with each face's size, so the redaction holds up at
+/// any resolution. Pixels outside the face boxes are untouched.
+pub fn blur_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicImage {
+    redact_faces(img, faces, |region, face| {
+        let sigma = (face.w.min(face.h) as f32 / 6.0).max(1.0);
+        region.blur(sigma)
+    })
+}
+
+/// Pixelate every detected face region in `img`: each face is
+/// resampled down to a handful of blocks and back with nearest
+/// neighbor. Pixels outside the face boxes are untouched.
+pub fn pixelate_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicImage {
+    redact_faces(img, faces, |region, face| {
+        let block = (face.w / 10).max(1);
+        let (sw, sh) = (
+            (region.width() / block).max(1),
+            (region.height() / block).max(1),
+        );
+        region
+            .resize_exact(sw, sh, image::imageops::FilterType::Nearest)
+            .resize_exact(
+                region.width(),
+                region.height(),
+                image::imageops::FilterType::Nearest,
+            )
+    })
+}
+
+/// Apply `redact` to each face region of `img` and composite
+/// the results back. Face boxes are clamped to the image;
+/// empty or fully out-of-frame boxes are skipped.
+fn redact_faces(
+    img: &DynamicImage,
+    faces: &[crate::ai::FaceBox],
+    redact: impl Fn(&DynamicImage, &crate::ai::FaceBox) -> DynamicImage,
+) -> DynamicImage {
+    if faces.is_empty() {
+        return img.clone();
+    }
+    let mut base = img.to_rgba8();
+    for face in faces {
+        let x = face.x.min(img.width());
+        let y = face.y.min(img.height());
+        let w = face.w.min(img.width() - x);
+        let h = face.h.min(img.height() - y);
+        if w == 0 || h == 0 {
+            continue;
+        }
+        let region = img.crop_imm(x, y, w, h);
+        let done = redact(&region, face).to_rgba8();
+        image::imageops::overlay(&mut base, &done, x as i64, y as i64);
+    }
+    DynamicImage::ImageRgba8(base)
+}
+
 fn trim(img: DynamicImage, tolerance: u8) -> DynamicImage {
     let rgba = img.to_rgba8();
     let corner = *rgba.get_pixel(0, 0);

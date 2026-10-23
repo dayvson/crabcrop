@@ -72,6 +72,53 @@ pub fn crop_to_aspect_with(
     DynamicImage::ImageRgba8(cropped)
 }
 
+/// Crop `img` to the `target_w:target_h` aspect around `face`:
+/// the smallest region with that aspect which contains the face
+/// expanded by `padding` (a fraction of the face's size, added
+/// on every side), centered on the face's center and clamped
+/// into the image. When the padded region cannot fit (the
+/// image is too small on one axis) it shrinks to fit and the
+/// face fills more of the frame. The engine resizes the result
+/// to the exact target, like every other crop.
+pub fn crop_around_face(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    face: &crate::ai::FaceBox,
+    padding: f32,
+) -> DynamicImage {
+    if target_w == 0 || target_h == 0 || img.width() == 0 || img.height() == 0 {
+        return img;
+    }
+    let (w, h) = (img.width() as f64, img.height() as f64);
+    let (tw, th) = (target_w as f64, target_h as f64);
+    let pad = padding.max(0.0) as f64;
+    let pw = face.w as f64 * (1.0 + 2.0 * pad);
+    let ph = face.h as f64 * (1.0 + 2.0 * pad);
+    // The smallest target-aspect region holding the padded face.
+    let scale = (pw / tw).max(ph / th);
+    let (mut rw, mut rh) = (tw * scale, th * scale);
+    // Shrink to fit the image, keeping the aspect.
+    if rw > w {
+        rw = w;
+        rh = rw * th / tw;
+    }
+    if rh > h {
+        rh = h;
+        rw = rh * tw / th;
+    }
+    let cx = face.x as f64 + face.w as f64 / 2.0;
+    let cy = face.y as f64 + face.h as f64 / 2.0;
+    let ox = (cx - rw / 2.0).clamp(0.0, (w - rw).max(0.0));
+    let oy = (cy - rh / 2.0).clamp(0.0, (h - rh).max(0.0));
+    let cw = (rw.round() as u32).clamp(1, img.width());
+    let ch = (rh.round() as u32).clamp(1, img.height());
+    let x = (ox.round() as u32).min(img.width() - cw);
+    let y = (oy.round() as u32).min(img.height() - ch);
+    let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
+    DynamicImage::ImageRgba8(cropped)
+}
+
 /// Window start along one axis for smart alignment: center the
 /// `window` span on the focal point's coordinate along that
 /// axis, clamped so the window stays inside the image.
@@ -224,5 +271,70 @@ mod tests {
         let smart = crop_to_aspect(img.clone(), 1, 1, Align::Smart);
         let centered = crop_to_aspect(img, 1, 1, Align::Center);
         assert_eq!(smart.to_rgb8(), centered.to_rgb8());
+    }
+
+    fn face(x: u32, y: u32, w: u32, h: u32) -> crate::ai::FaceBox {
+        crate::ai::FaceBox {
+            x,
+            y,
+            w,
+            h,
+            score: 0.95,
+        }
+    }
+
+    /// 400x300 gray, with a pure-red block exactly over the
+    /// face box used below: x 300..360, y 20..80.
+    fn face_canvas() -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(400, 300);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if (300..360).contains(&x) && (20..80).contains(&y) {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([128, 128, 128])
+            };
+        }
+        img
+    }
+
+    #[test]
+    fn face_crop_centers_the_padded_face() {
+        // Face 60x60 at center (330, 50); padding 0.5 makes the
+        // region 120x120, clamped to y=0: origin (270, 0).
+        let out = crop_around_face(face_canvas(), 1, 1, &face(300, 20, 60, 60), 0.5);
+        assert_eq!((out.width(), out.height()), (120, 120));
+        // The face lands at (30..90, 20..80) of the crop.
+        assert_eq!(rgb(&out, 60, 50), [255, 0, 0]);
+        assert_eq!(rgb(&out, 0, 0), [128, 128, 128]);
+        assert_eq!(rgb(&out, 29, 50), [128, 128, 128]);
+    }
+
+    #[test]
+    fn face_crop_without_padding_fits_the_target_aspect() {
+        // Face 60x60, target 2:1, no padding: the region must
+        // contain the face at aspect 2, so 120x60.
+        let out = crop_around_face(face_canvas(), 2, 1, &face(300, 20, 60, 60), 0.0);
+        assert_eq!((out.width(), out.height()), (120, 60));
+        // Face center still centered: face at (30..90, 0..60).
+        assert_eq!(rgb(&out, 60, 30), [255, 0, 0]);
+        assert_eq!(rgb(&out, 0, 30), [128, 128, 128]);
+    }
+
+    #[test]
+    fn face_crop_clamps_into_the_corner() {
+        // Face at the very corner; heavy padding would push the
+        // region outside on both axes.
+        let mut img = DynamicImage::new_rgb8(200, 200);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if x < 40 && y < 40 {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([128, 128, 128])
+            };
+        }
+        let out = crop_around_face(img, 1, 1, &face(0, 0, 40, 40), 1.0);
+        assert_eq!((out.width(), out.height()), (120, 120));
+        assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
+        assert_eq!(rgb(&out, 119, 119), [128, 128, 128]);
     }
 }

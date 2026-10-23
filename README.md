@@ -126,6 +126,7 @@ Crops the image to the width:height aspect ratio, then resizes to exactly that w
 | `left` | The left edge. |
 | `right` | The right edge. |
 | `smart` | A window centered on the focal point: a detected face when a face model is configured (see [AI features](#ai-features)), otherwise the point of greatest local detail in the image. |
+| `face` | A window around the largest detected face, expanded by the `facepad` padding (below). Requires a face model; with no faces (or a detection failure) it falls back to the `smart` window. |
 
 ```bash
 curl "http://localhost:3000/unsafe/crop:1200x630:top/https://example.com/photo.jpg"
@@ -239,6 +240,9 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 | Filter | Parameters | Description | Example |
 | --- | --- | --- | --- |
 | `removebg` | none | Remove the background, keeping the subject over transparency. Output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:removebg:format(png)` |
+| `blurfaces` | none | Blur every detected face (privacy redaction). Requires a face model. | `filters:blurfaces` |
+| `pixelatefaces` | none | Pixelate every detected face (privacy redaction). Requires a face model. | `filters:pixelatefaces` |
+| `facepad` | `facepad(0.5)` — 0 to 3 | Padding for `crop:...:face`: that fraction of the face's size added on every side of the crop window. Default 0.5. | `crop:200x200:face/filters:facepad(1)` |
 | `upscale` | `upscale(2)` or `upscale(4)` | AI super-resolution by that factor. Output is capped at 4096 px per dimension. | `filters:upscale(2)` |
 
 ```bash
@@ -353,7 +357,7 @@ All configuration comes from environment variables. Invalid values for the numer
 | `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | `1` or `true` refuses sources whose host is, or resolves to, a loopback, private, link-local, or unspecified address. Checked before connecting and again on every redirect hop. |
 | `CRABCROP_REMOVEBG_MODEL` | unset | Path to a U²-Net-family ONNX model for the `removebg` filter. See [AI features](#ai-features). |
 | `CRABCROP_UPSCALE_MODEL` | unset | Path to a super-resolution ONNX model for the `upscale` filter. See [AI features](#ai-features). |
-| `CRABCROP_FACE_MODEL` | unset | Path to a YuNet ONNX model for face-aware `smart` crops. See [AI features](#ai-features). |
+| `CRABCROP_FACE_MODEL` | unset | Path to a YuNet ONNX model for face-aware `smart` crops, `crop:...:face`, and the face redaction filters. See [AI features](#ai-features). |
 | `CRABCROP_ORT_DYLIB` | unset | Path to the ONNX Runtime shared library, when it is not on the library search path. |
 | `CRABCROP_FONT_PATH` | unset | Path to a TTF/OTF font for the `text(...)` overlay filter, loaded at startup. Unset disables the filter. |
 | `CRABCROP_FALLBACK_IMAGE` | unset | URL or local file path of the fallback image served when a source cannot be fetched or decoded. See [Fallback image](#fallback-image). |
@@ -364,12 +368,12 @@ One known limit: with `CRABCROP_BLOCK_PRIVATE_SOURCES`, the loader resolves the 
 
 ## AI features
 
-Three features run ONNX models in-process: `removebg` (background removal), `upscale` (super-resolution), and face detection for `smart` crops. The models are files you supply — deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
+Three features run ONNX models in-process: `removebg` (background removal), `upscale` (super-resolution), and face detection for crops and redaction. The models are files you supply — deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
 
 How configuration works:
 
 - Point `CRABCROP_REMOVEBG_MODEL` at a U²-Net-family model file (320×320 input; the U2Netp export is a good fit) and/or `CRABCROP_UPSCALE_MODEL` at a super-resolution model. The upscale contract is dynamic-size RGB in (values 0..1), the same image out at an integer factor; Real-ESRGAN-family ONNX exports follow it.
-- Point `CRABCROP_FACE_MODEL` at a YuNet model to make `crop:...:smart` center on detected faces (the area-weighted center of the faces found). Face detection only ever improves a crop: no model, no faces, or a detection failure all fall back to the detail-based focal point, and a smart crop without the model behaves exactly as before.
+- Point `CRABCROP_FACE_MODEL` at a YuNet model to make `crop:...:smart` center on detected faces (the area-weighted center of the faces found). Face detection only ever improves a smart crop: no model, no faces, or a detection failure all fall back to the detail-based focal point, and a smart crop without the model behaves exactly as before. The same model powers the explicit face operations: `crop:...:face` (crop around the largest face; falls back to the smart window when detection fails or finds nothing), and the `blurfaces` / `pixelatefaces` redaction filters. Those require the model — without one they return `400` — and a detection failure fails a redaction request with `500` rather than serve an unredacted image. Chained face operations in one request share a single detection.
 - Models load at boot, before the server reports ready. A configured model that cannot be loaded — missing file, wrong shape — is a startup error with a one-line diagnostic, not a surprise for the first request. The upscale model's native factor is probed at load with a 16×16 test image; a model that does not enlarge by an integer factor is rejected at boot.
 - With no model configured, the filter is off: requests that use it fail cleanly with `400` (`removebg is not configured on this server`, `upscale is not configured on this server`). There is no silent fallback — `upscale` never degrades into a plain resize.
 - Inference runs behind a server-wide gate of 2 concurrent inferences, so a burst of AI requests cannot starve the normal transform pipeline.
