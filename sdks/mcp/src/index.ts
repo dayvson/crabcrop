@@ -31,6 +31,52 @@ function textResult(text: string, isError = false) {
   return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
 }
 
+/**
+ * Tool arguments arrive as untyped JSON. Validate each one
+ * instead of coercing with String(...): a missing argument
+ * would otherwise be signed into a URL as the literal
+ * segment "undefined", and numbers and objects would
+ * stringify silently.
+ */
+function stringArg(args: Record<string, unknown>, name: string): string {
+  const value = args[name];
+  if (typeof value !== "string") {
+    throw new Error(
+      value === undefined
+        ? `missing required argument: ${name}`
+        : `argument ${name} must be a string, got ${typeof value}`,
+    );
+  }
+  return value;
+}
+
+function optionalStringArg(args: Record<string, unknown>, name: string): string | undefined {
+  const value = args[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw new Error(`argument ${name} must be a string, got ${typeof value}`);
+  }
+  return value;
+}
+
+function numberArg(args: Record<string, unknown>, name: string): number | undefined {
+  const value = args[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number") {
+    throw new Error(`argument ${name} must be a number, got ${typeof value}`);
+  }
+  return value;
+}
+
+function boolArg(args: Record<string, unknown>, name: string): boolean | undefined {
+  const value = args[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error(`argument ${name} must be a boolean, got ${typeof value}`);
+  }
+  return value;
+}
+
 /** Read a response body with a hard byte cap; null when exceeded. */
 async function readCapped(resp: Response, cap: number): Promise<string | null> {
   if (!resp.body) return "";
@@ -80,18 +126,15 @@ const TOOLS = [
         expires: { type: "number", description: "Optional unix-seconds expiry, emitted as an exp: segment." },
       },
       required: ["operations", "source"],
+      additionalProperties: false,
     },
     async run(args: Record<string, unknown>) {
-      const base = String(args.base ?? envBase);
+      const base = optionalStringArg(args, "base") ?? envBase;
       if (!base) throw new Error("no base: pass the base argument or set CRABCROP_BASE");
-      const secret = (args.secret as string | undefined) ?? envSecret;
-      const url = buildURL(
-        base,
-        secret,
-        String(args.operations),
-        String(args.source),
-        { expires: args.expires as number | undefined },
-      );
+      const secret = optionalStringArg(args, "secret") ?? envSecret;
+      const url = buildURL(base, secret, stringArg(args, "operations"), stringArg(args, "source"), {
+        expires: numberArg(args, "expires"),
+      });
       return textResult(url);
     },
   },
@@ -108,9 +151,10 @@ const TOOLS = [
         url: { type: "string", description: "The full crabcrop URL or bare path." },
       },
       required: ["url"],
+      additionalProperties: false,
     },
     async run(args: Record<string, unknown>) {
-      const out = explainUrl(String(args.url));
+      const out = explainUrl(stringArg(args, "url"));
       const lines: string[] = [];
       if (out.signature) {
         lines.push(`signature (${out.signature.kind}): ${out.signature.value}`);
@@ -144,6 +188,7 @@ const TOOLS = [
         placeholders: { type: "boolean", description: "Also request placeholder data (default false)." },
       },
       required: ["url"],
+      additionalProperties: false,
     },
     async run(args: Record<string, unknown>) {
       if (!envBase) {
@@ -152,11 +197,12 @@ const TOOLS = [
           true,
         );
       }
+      const urlArg = stringArg(args, "url");
       let target: URL;
       try {
-        target = new URL(String(args.url));
+        target = new URL(urlArg);
       } catch {
-        return textResult(`fetch_meta: not a valid URL: ${String(args.url)}`, true);
+        return textResult(`fetch_meta: not a valid URL: ${urlArg}`, true);
       }
       if (target.origin !== new URL(envBase).origin) {
         return textResult(
@@ -164,7 +210,7 @@ const TOOLS = [
           true,
         );
       }
-      const accept = args.placeholders
+      const accept = boolArg(args, "placeholders")
         ? "application/json; placeholders=1"
         : "application/json";
       let resp: Response;
@@ -205,24 +251,44 @@ const TOOLS = [
         secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET. Sensitive, deprecated: prefer the CRABCROP_SECRET environment variable; a per-call secret is kept in client transcripts." },
       },
       required: ["path"],
+      additionalProperties: false,
     },
     async run(args: Record<string, unknown>) {
-      const base = String(args.base ?? envBase).replace(/\/+$/, "");
-      const secret = (args.secret as string | undefined) ?? envSecret;
+      const base = (optionalStringArg(args, "base") ?? envBase).replace(/\/+$/, "");
+      const secret = optionalStringArg(args, "secret") ?? envSecret;
       if (!base) throw new Error("no base: pass the base argument or set CRABCROP_BASE");
       if (!secret) throw new Error("purge requires a secret: pass the secret argument or set CRABCROP_SECRET");
-      const target = String(args.path).replace(/^\//, "");
+      const target = stringArg(args, "path").replace(/^\//, "");
       // Purge signatures are domain-separated (audit P-1): the
       // key is the raw HMAC of the secret over a fixed label,
       // and the signature is the HMAC of the target under it.
       const subkey = Buffer.from(sign(secret, "crabcrop/purge-key"), "hex");
       const signature = createHmac("sha256", subkey).update(target, "utf8").digest("hex");
-      const resp = await fetch(`${base}/purge/${signature}/${target}`, { method: "POST" });
-      const body = (await resp.text()).trim();
-      if (!resp.ok) {
-        return textResult(`purge failed: HTTP ${resp.status}: ${body}`, true);
+      // The same network hygiene as fetch_meta: no
+      // redirects, a bounded wait, and a capped body, so a
+      // hung or hostile endpoint cannot hang the tool call
+      // or stream an unbounded response.
+      let resp: Response;
+      try {
+        resp = await fetch(`${base}/purge/${signature}/${target}`, {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.timeout(10_000),
+        });
+      } catch (err) {
+        return textResult(
+          `purge request failed: ${err instanceof Error ? err.message : String(err)}`,
+          true,
+        );
       }
-      return textResult(body);
+      const body = await readCapped(resp, 256 * 1024);
+      if (body === null) {
+        return textResult("purge failed: response exceeded the 256 KiB cap", true);
+      }
+      if (!resp.ok) {
+        return textResult(`purge failed: HTTP ${resp.status}: ${body.trim()}`, true);
+      }
+      return textResult(body.trim());
     },
   },
 ];

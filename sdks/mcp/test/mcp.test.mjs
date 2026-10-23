@@ -105,8 +105,22 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
       list.tools.map((t) => t.name).sort(),
       ["explain_url", "fetch_meta", "purge_result", "sign_url"],
     );
+    // Every schema is closed: misspelled argument names are
+    // rejected by clients instead of silently ignored.
+    for (const tool of list.tools) {
+      assert.equal(tool.inputSchema.additionalProperties, false, tool.name);
+    }
 
     const source = "http://127.0.0.1:8912/src00.jpg";
+    // Arguments are validated, not String(...)-coerced: a
+    // missing operations argument errors instead of signing
+    // a URL over the literal segment "undefined", and a
+    // numeric one errors instead of stringifying.
+    const missing = await client.call("sign_url", { source });
+    assert.match(missing, /missing required argument: operations/);
+    const wrongType = await client.call("sign_url", { operations: 42, source });
+    assert.match(wrongType, /argument operations must be a string/);
+
     const url = await client.call("sign_url", { operations: "300x200", source });
     const remainder = `300x200/${source}`;
     const expectedSig = createHmac("sha256", "mcp-test-secret-0123456").update(remainder).digest("hex");
@@ -137,5 +151,40 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
     mcp.kill();
     fixtureServer.kill();
     server.kill();
+  }
+});
+
+test("purge_result gives up on a hung endpoint", { timeout: 60000 }, async () => {
+  // An endpoint that accepts the connection and never
+  // answers: the purge fetch must time out (10 s) and
+  // report, not hang the tool call forever.
+  const { createServer } = await import("node:http");
+  const hung = createServer(() => {});
+  await new Promise((resolve) => hung.listen(0, "127.0.0.1", resolve));
+  const mcp = spawn(
+    process.execPath,
+    ["--import", `${root}sdks/mcp/test/register.mjs`, `${root}sdks/mcp/src/index.ts`],
+    {
+      env: {
+        ...process.env,
+        CRABCROP_BASE: `http://127.0.0.1:${hung.address().port}`,
+        CRABCROP_SECRET: "mcp-test-secret-0123456",
+      },
+      stdio: ["pipe", "pipe", "inherit"],
+    },
+  );
+  try {
+    const client = new McpClient(mcp);
+    await client.request("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "mcp-test", version: "0" },
+    });
+    client.notify("notifications/initialized", {});
+    const out = await client.call("purge_result", { path: "300x200/https://example.com/a.jpg" });
+    assert.match(out, /purge request failed/);
+  } finally {
+    mcp.kill();
+    hung.close();
   }
 });
