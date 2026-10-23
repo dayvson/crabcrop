@@ -440,7 +440,7 @@ All configuration comes from environment variables. Invalid values for the numer
 | `CRABCROP_RESULT_STORAGE_DIR` | unset | Directory for the disk-backed result store. Unset disables the second cache tier. |
 | `CRABCROP_RESULT_STORAGE_MAX_MB` | `512` | Disk result store budget in megabytes. `0` disables storage even with a directory set. |
 
-One known limit: with `CRABCROP_BLOCK_PRIVATE_SOURCES`, the loader resolves the host to check its addresses, and the HTTP client resolves again when it connects. A hostile DNS server could answer differently the second time (DNS rebinding). The check still stops direct internal URLs, which is the common exposure.
+With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves the host to check its addresses and pins the connection to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
 
 ## AI features
 

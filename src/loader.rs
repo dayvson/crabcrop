@@ -27,15 +27,12 @@
 //! loopback, private, link-local, or unspecified addresses. Both
 //! checks run before any connection is made, and again on every
 //! redirect hop (redirects are followed manually for exactly that
-//! reason).
-//!
-//! Known limit: the private-address check resolves the host and
-//! inspects the answers, but the HTTP client resolves again when it
-//! connects. A hostile authoritative DNS server could answer
-//! differently the second time (DNS rebinding). Closing that gap
-//! needs a resolver that pins the checked addresses, which the
-//! client does not expose; the check still stops direct internal
-//! URLs, which is the common exposure.
+//! reason). When the private-address check resolves a hostname,
+//! the connection is pinned to the validated addresses, so a
+//! hostile DNS server cannot answer differently the second time
+//! (DNS rebinding, audit L-3). Source URLs carrying userinfo are
+//! refused: the loader never presents Basic credentials to an
+//! origin (audit L-2).
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -125,9 +122,18 @@ impl SourcePolicy {
 #[derive(Debug, Clone)]
 pub struct Loader {
     client: Client,
+    timeout: Duration,
     max_bytes: u64,
     policy: SourcePolicy,
     sources: SourceConfig,
+}
+
+/// A hostname resolution the policy has already validated:
+/// the connection must go to one of these addresses (L-3).
+#[derive(Debug, Clone)]
+struct PinnedResolution {
+    host: String,
+    addr: std::net::SocketAddr,
 }
 
 /// Configuration for the non-HTTP source kinds: object stores
@@ -192,6 +198,7 @@ impl Loader {
             .map_err(|e| LoadError::Network(e.to_string()))?;
         Ok(Self {
             client,
+            timeout,
             max_bytes,
             policy: SourcePolicy::default(),
             sources: SourceConfig::default(),
@@ -244,9 +251,12 @@ impl Loader {
                     parsed.scheme()
                 )));
             }
-            self.check_policy(&parsed).await?;
-            let resp = self
-                .client
+            let pin = self.check_policy(&parsed).await?;
+            let client = match &pin {
+                Some(pin) => self.pinned_client(pin)?,
+                None => self.client.clone(),
+            };
+            let resp = client
                 .get(parsed.clone())
                 .send()
                 .await
@@ -446,9 +456,31 @@ impl Loader {
         Ok(body)
     }
 
+    /// Build a client whose DNS for the pinned host is forced
+    /// to the address the policy validated (audit L-3). TLS
+    /// still authenticates the original hostname.
+    fn pinned_client(&self, pin: &PinnedResolution) -> Result<Client, LoadError> {
+        Client::builder()
+            .timeout(self.timeout)
+            .redirect(redirect::Policy::none())
+            .resolve(&pin.host, pin.addr)
+            .build()
+            .map_err(|e| LoadError::Network(e.to_string()))
+    }
+
     /// Run the source policy against `url`. No connection has been
-    /// made yet when this runs.
-    async fn check_policy(&self, url: &Url) -> Result<(), LoadError> {
+    /// made yet when this runs. When the private-address check
+    /// resolves a hostname, the validated address comes back so
+    /// the caller can pin the connection to it.
+    async fn check_policy(&self, url: &Url) -> Result<Option<PinnedResolution>, LoadError> {
+        // The loader never presents credentials to an origin
+        // (audit L-2): a signed URL must not make the server
+        // authenticate anywhere with author-chosen userinfo.
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(LoadError::Forbidden(
+                "source URL must not contain credentials".to_string(),
+            ));
+        }
         let host = url
             .host_str()
             .ok_or_else(|| LoadError::Forbidden("source URL has no host".to_string()))?;
@@ -479,8 +511,21 @@ impl Loader {
                     "host {host} resolves to a non-public address ({ip})"
                 )));
             }
+            // Hostnames (not IP literals) get pinned to the
+            // first validated address for this connection.
+            if bare.parse::<IpAddr>().is_err() {
+                let port = url
+                    .port()
+                    .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+                if let Some(ip) = ips.first() {
+                    return Ok(Some(PinnedResolution {
+                        host: host.to_string(),
+                        addr: std::net::SocketAddr::new(*ip, port),
+                    }));
+                }
+            }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -614,6 +659,39 @@ mod tests {
         let base = spawn_server(Respond::Bytes(ok_image_response())).await;
         let loader = Loader::with_defaults().unwrap();
         assert_eq!(fetch(&loader, &base).await.unwrap(), b"\xff\xd8\xff\xd9");
+    }
+
+    #[tokio::test]
+    async fn userinfo_sources_are_refused() {
+        // Audit L-2: refused by policy before any connection,
+        // so the unroutable port never matters.
+        let loader = Loader::with_defaults().unwrap();
+        let err = loader
+            .load("http://user:pass@127.0.0.1:1/img.jpg")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn pinned_client_forces_the_validated_address() {
+        // Audit L-3: a client pinned for an unresolvable name
+        // connects to the validated address anyway (and would
+        // authenticate TLS for the original name).
+        let base = spawn_server(Respond::Bytes(ok_image_response())).await;
+        let port = base.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        let loader = Loader::with_defaults().unwrap();
+        let pin = PinnedResolution {
+            host: "pinned.invalid".to_string(),
+            addr: std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
+        };
+        let client = loader.pinned_client(&pin).unwrap();
+        let resp = client
+            .get(format!("http://pinned.invalid:{port}/img.jpg"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
     }
 
     #[test]
