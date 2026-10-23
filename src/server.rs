@@ -1524,7 +1524,7 @@ mod tests {
         );
         drop(held);
         let processed = waiting.await.unwrap();
-        assert_eq!((processed.width, processed.height), (40, 30));
+        assert_eq!((processed.width, processed.height), (100, 60));
     }
 
     #[tokio::test]
