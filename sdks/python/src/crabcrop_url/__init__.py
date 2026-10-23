@@ -76,6 +76,23 @@ def build_url(
     return f"{base.rstrip('/')}/{signature}/{remainder}"
 
 
+def _validate_width(width: int) -> None:
+    """A srcset width becomes a ``{width}x0`` size segment,
+    so it must satisfy the grammar's dimension rules: a
+    positive integer within the server cap. Anything else
+    mints a URL the server rejects (or worse, ``-300``
+    reads as a flip), so it raises here, at build time."""
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width < 1
+        or width > 16383
+    ):
+        raise ValueError(
+            f"srcset width must be a positive integer no larger than 16383, got {width!r}"
+        )
+
+
 def build_srcset(
     base: str,
     secret: Secret,
@@ -87,6 +104,8 @@ def build_srcset(
     URL per width, entries formatted ``{url} {width}w`` and
     joined by ``, ``. An expiry, when given, applies to every
     entry."""
+    for w in widths:
+        _validate_width(w)
     return ", ".join(
         f"{build_url(base, secret, f'{w}x0', source, expires)} {w}w" for w in widths
     )

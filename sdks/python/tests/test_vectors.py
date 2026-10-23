@@ -58,6 +58,19 @@ class TestBuilders(unittest.TestCase):
             "https://img.example.com/unsafe/640x0/https://example.com/a.jpg 640w",
         )
 
+    def test_srcset_rejects_widths_the_grammar_cannot_express(self):
+        # 320.5 is not an integer, -300 is the flip spelling,
+        # 0 is not a size, and 16384 is past the server cap:
+        # each would mint a URL the server rejects.
+        for bad in (320.5, -300, 0, 16384, True):
+            with self.assertRaises(ValueError):
+                build_srcset(
+                    "https://img.example.com", None, "https://example.com/a.jpg", [bad]
+                )
+        build_srcset(
+            "https://img.example.com", None, "https://example.com/a.jpg", [1, 16383]
+        )
+
 
     def test_builders_reject_unbuildable_urls(self):
         # Audit P-4 and P-5: these can never verify, so the

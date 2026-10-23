@@ -44,6 +44,18 @@ test("buildSrcSet formats entries", () => {
   );
 });
 
+test("buildSrcSet rejects widths the grammar cannot express", () => {
+  const base = "https://img.example.com";
+  const src = "https://example.com/a.jpg";
+  // 320.5 is not an integer, -300 is the flip spelling,
+  // 0 is not a size, and 16384 is past the server cap:
+  // each would mint a URL the server rejects.
+  for (const bad of [320.5, -300, 0, 16384, NaN]) {
+    assert.throws(() => buildSrcSet(base, null, src, [bad]), /srcset width/);
+  }
+  assert.doesNotThrow(() => buildSrcSet(base, null, src, [1, 16383]));
+});
+
 test("buildURL rejects inputs that can never verify (audit P-4, P-5)", () => {
   const base = "https://img.example.com";
   assert.throws(() => buildURL(base, "k", "300x200", "https://example.com/a.jpg?w=1"));

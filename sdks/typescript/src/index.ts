@@ -52,6 +52,21 @@ function assertExpires(expires: number): void {
   }
 }
 
+/**
+ * A srcset width becomes a `{width}x0` size segment, so it
+ * must satisfy the grammar's dimension rules: a positive
+ * integer within the server cap. Anything else mints a
+ * URL the server rejects (or worse, `-300` reads as a
+ * flip), so it throws here, at build time.
+ */
+function assertWidth(width: number): void {
+  if (!Number.isSafeInteger(width) || width < 1 || width > 16383) {
+    throw new Error(
+      `srcset width must be a positive integer no larger than 16383, got ${width}`,
+    );
+  }
+}
+
 export function buildURL(
   base: string,
   secret: string | null,
@@ -89,6 +104,9 @@ export function buildSrcSet(
   widths: number[],
   options: BuildOptions = {},
 ): string {
+  for (const w of widths) {
+    assertWidth(w);
+  }
   return widths
     .map((w) => `${buildURL(base, secret, `${w}x0`, source, options)} ${w}w`)
     .join(", ");
