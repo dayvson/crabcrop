@@ -39,6 +39,6 @@ claude mcp add crabcrop \
   -- node /path/to/crabcrop/sdks/mcp/src/index.ts
 ```
 
-`CRABCROP_BASE` and `CRABCROP_SECRET` are defaults: `sign_url` and `purge_result` accept per-call `base`/`secret` overrides, and with no secret configured `sign_url` produces `unsafe` URLs for servers that allow them. `purge_result` always requires a secret.
+`CRABCROP_BASE` and `CRABCROP_SECRET` are the defaults, and the environment is the recommended home for the secret: `sign_url` and `purge_result` still accept per-call `base`/`secret` overrides, but the per-call secret is deprecated because agentic clients persist tool arguments in their transcripts. With no secret configured, `sign_url` produces `unsafe` URLs for servers that allow them. `purge_result` always requires a secret.
 
-In this repository (no install step), `@crabcrop/url` resolves through the SDK sources; in a standalone install, `npm install @crabcrop/url` provides it. The end-to-end test (`npm test`) spawns this server plus a real crabcrop binary and runs sign -> fetch -> meta -> purge against it; it needs `cargo build` to have produced `target/debug/crabcrop` and uses the bench fixture photo as its source.
+Both this package and `@crabcrop/url` ship compiled `dist/` builds (their `prepack` runs `tsc`). In this repository's tests (no install step), a register hook maps `@crabcrop/url` to the SDK sources; a packed-install smoke test covers the real layout. The end-to-end test (`npm test`) spawns this server plus a real crabcrop binary and runs sign -> fetch -> meta -> purge against it; it needs `cargo build` to have produced `target/debug/crabcrop` and uses the bench fixture photo as its source.
