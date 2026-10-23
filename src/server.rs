@@ -1122,6 +1122,16 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
     );
     // The format may have been negotiated from the request's Accept.
     headers.insert(header::VARY, "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data".parse().unwrap());
+    // Advertise the client hints the server reads, so
+    // browsers send them on later requests; without the
+    // advertisement only proxies and clients that set the
+    // hints manually ever benefit from them.
+    headers.insert(
+        axum::http::HeaderName::from_static("accept-ch"),
+        "Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width"
+            .parse()
+            .unwrap(),
+    );
     if let Some(q) = quality {
         headers.insert(
             axum::http::HeaderName::from_static("x-crabcrop-quality"),
@@ -2017,6 +2027,12 @@ mod tests {
         // default posture): proof the synthesized op ran.
         let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "250")]).await;
         assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        // The response advertises the hints it reads, so a
+        // browser sends them next time.
+        assert_eq!(
+            header(&resp, "accept-ch"),
+            "Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width"
+        );
         assert_eq!(width_of(resp).await, 300);
         // 210 is the same quantized class: a hit, no refetch.
         let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "210")]).await;
