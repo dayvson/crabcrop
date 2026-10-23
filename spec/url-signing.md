@@ -29,7 +29,8 @@ remainder = everything after the signature segment, exactly as it appears
 
 - The secret is the server's `CRABCROP_SECRET`, encoded as UTF-8 when it is text.
 - The message is the remainder encoded as UTF-8. Sign the bytes you send: any percent-encoding, case change, or added/removed character is a different message and fails verification.
-- A signature segment that does not hex-decode to a 32-byte tag fails verification. (Hex decoding is case-insensitive; builders always emit lowercase.) Servers compare in constant time.
+- Signatures have one canonical spelling: lowercase hex. Servers reject a signature segment that is not lowercase hex at parse time (`400`); builders always emit lowercase.
+- The signature covers the path only. A query string is not signed, is ignored by the server, and must not be relied on for anything.
 - Verification failure is `403` with the body `bad signature`. An expired URL is `403` with the body `signature expired`. An unknown preset, a malformed segment, or free-form operations in presets-only mode is a `400`.
 
 ## Building URLs
