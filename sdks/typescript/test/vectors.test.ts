@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { buildSrcSet, buildURL, sign } from "../src/index.ts";
+import {
+  buildSrcSet,
+  buildURL,
+  purgeGroupSignature,
+  purgeSignature,
+  sign,
+} from "../src/index.ts";
 
 // The canonical cross-language vectors: this package's whole
 // signing suite is the shared file from the spec directory.
@@ -127,4 +133,21 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     assert.equal(out.source, expectSource, remainder);
     assert.equal(out.errors.length > 0, expectError, `${remainder}: ${JSON.stringify(out.errors)}`);
   }
+});
+
+test("purge signatures match the published vectors", () => {
+  // The same pinned literals the Rust crate asserts: one
+  // wire scheme across every implementation.
+  assert.equal(
+    purgeSignature("test-secret", "300x200/https://example.com/a.jpg"),
+    "9b58a43a984e47cbde3ec08333290acad06c48a5e9b85b99124ae725218e90e8",
+  );
+  assert.equal(
+    purgeGroupSignature("test-secret", "thumb"),
+    "2f779d54c25154a7528fb334973dd2c92e08b2575ee1359a7d426421b083b5d6",
+  );
+  assert.equal(
+    purgeGroupSignature("test-secret", "thumb"),
+    purgeSignature("test-secret", "purge-group/thumb"),
+  );
 });

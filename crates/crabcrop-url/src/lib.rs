@@ -46,6 +46,68 @@ pub fn verify(secret: &[u8], signature_hex: &str, remainder: &str) -> bool {
     mac.verify_slice(&expected).is_ok()
 }
 
+/// The largest size dimension the server's grammar accepts,
+/// per `spec/url-signing.md`.
+pub const MAX_DIMENSION: u32 = 16383;
+
+/// Why a builder refused to produce a URL. Typed, with the
+/// offending value attached, so callers can react to the
+/// failure instead of parsing a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildError {
+    /// The named input ("operations" or "source") contains
+    /// a character that cannot travel in a URL path.
+    InvalidCharacter { what: &'static str, character: char },
+    /// A srcset width is not a positive dimension within
+    /// the grammar's cap. Carries the width.
+    InvalidWidth(u32),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::InvalidCharacter { what, character } => write!(
+                f,
+                "{what} contains a character that cannot appear in a crabcrop URL: {character:?}"
+            ),
+            BuildError::InvalidWidth(w) => write!(
+                f,
+                "srcset width must be a positive integer no larger than {MAX_DIMENSION}, got {w}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
+
+/// The purge subkey: the raw bytes of the HMAC-SHA256 of
+/// the domain label `crabcrop/purge-key` under the secret.
+/// Purge signatures live under this derived key, so a
+/// signature minted for an image URL can never be replayed
+/// against a purge endpoint.
+pub fn purge_key(secret: &[u8]) -> Vec<u8> {
+    // `sign` returns the hex tag; the key is its raw bytes.
+    hex::decode(sign(secret, "crabcrop/purge-key")).expect("sign returns lowercase hex")
+}
+
+/// The purge signature for a target path (the request
+/// remainder without its signature): HMAC-SHA256 of the
+/// path under the purge subkey. This is the signature
+/// segment for `POST /purge/<signature>/<path>`.
+pub fn purge_signature(secret: &[u8], target: &str) -> String {
+    sign(&purge_key(secret), target)
+}
+
+/// The purge-group signature for a cache group: a purge
+/// signature over the literal string `purge-group/<group>`,
+/// which appears nowhere in the request URL. This is the
+/// signature segment for
+/// `POST /purge-group/<signature>/<group>`; the helper
+/// exists so nobody has to know the signed string.
+pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
+    purge_signature(secret, &format!("purge-group/{group}"))
+}
+
 /// Assemble a signed (or `unsafe`) crabcrop URL.
 ///
 /// `operations` is the operation string verbatim (it may hold
@@ -60,14 +122,12 @@ pub fn verify(secret: &[u8], signature_hex: &str, remainder: &str) -> bool {
 /// control, and non-ASCII characters cannot be sent as-is
 /// (audit P-4). Builders fail loudly at build time instead of
 /// minting a URL that 403s at fetch time.
-pub fn validate_url_text(text: &str, what: &str) -> Result<(), String> {
+pub fn validate_url_text(text: &str, what: &'static str) -> Result<(), BuildError> {
     if let Some(c) = text
         .chars()
         .find(|c| matches!(c, '?' | '#') || !c.is_ascii() || c.is_ascii_control() || *c == ' ')
     {
-        return Err(format!(
-            "{what} contains a character that cannot appear in a crabcrop URL: {c:?}"
-        ));
+        return Err(BuildError::InvalidCharacter { what, character: c });
     }
     Ok(())
 }
@@ -78,7 +138,7 @@ pub fn build_url(
     operations: &str,
     source: &str,
     expires: Option<u64>,
-) -> Result<String, String> {
+) -> Result<String, BuildError> {
     validate_url_text(operations, "operations")?;
     validate_url_text(source, "source")?;
     let base = base.trim_end_matches('/');
@@ -107,14 +167,17 @@ pub fn build_srcset(
     source: &str,
     widths: &[u32],
     expires: Option<u64>,
-) -> Result<String, String> {
+) -> Result<String, BuildError> {
     let entries = widths
         .iter()
         .map(|w| {
+            if *w == 0 || *w > MAX_DIMENSION {
+                return Err(BuildError::InvalidWidth(*w));
+            }
             let url = build_url(base, secret, &format!("{w}x0"), source, expires)?;
             Ok(format!("{url} {w}w"))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, BuildError>>()?;
     Ok(entries.join(", "))
 }
 
@@ -138,6 +201,66 @@ mod tests {
             assert_eq!(sign(secret.as_bytes(), remainder), signature, "{remainder}");
             assert!(verify(secret.as_bytes(), signature, remainder));
             assert!(!verify(secret.as_bytes(), signature, "tampered"));
+        }
+    }
+
+    #[test]
+    fn purge_signatures_match_the_published_vectors() {
+        // Pinned literals: the wire scheme every deployed
+        // server verifies, computed from the scheme itself.
+        assert_eq!(
+            purge_signature(b"test-secret", "300x200/https://example.com/a.jpg"),
+            "9b58a43a984e47cbde3ec08333290acad06c48a5e9b85b99124ae725218e90e8"
+        );
+        assert_eq!(
+            purge_group_signature(b"test-secret", "thumb"),
+            "2f779d54c25154a7528fb334973dd2c92e08b2575ee1359a7d426421b083b5d6"
+        );
+        // Domain separation: neither purge signature is an
+        // image signature over a related string.
+        assert_ne!(
+            purge_signature(b"test-secret", "300x200/https://example.com/a.jpg"),
+            sign(b"test-secret", "300x200/https://example.com/a.jpg")
+        );
+        assert_eq!(
+            purge_group_signature(b"test-secret", "thumb"),
+            purge_signature(b"test-secret", "purge-group/thumb")
+        );
+    }
+
+    #[test]
+    fn builders_fail_with_typed_errors() {
+        let err = build_url(
+            "https://img.example.com",
+            Some(b"k"),
+            "300x200",
+            "https://example.com/a.jpg?w=1",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BuildError::InvalidCharacter {
+                what: "source",
+                character: '?'
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "source contains a character that cannot appear in a crabcrop URL: '?'"
+        );
+        for w in [0, 16384] {
+            assert_eq!(
+                build_srcset(
+                    "https://img.example.com",
+                    Some(b"k"),
+                    "https://example.com/a.jpg",
+                    &[w],
+                    None,
+                )
+                .unwrap_err(),
+                BuildError::InvalidWidth(w)
+            );
         }
     }
 

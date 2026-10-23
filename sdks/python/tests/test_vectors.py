@@ -8,7 +8,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from crabcrop_url import build_srcset, build_url, sign, verify  # noqa: E402
+from crabcrop_url import (  # noqa: E402
+    build_srcset,
+    build_url,
+    purge_group_signature,
+    purge_signature,
+    sign,
+    verify,
+)
 
 VECTORS = json.loads(
     (Path(__file__).resolve().parents[3] / "spec" / "test-vectors.json").read_text()
@@ -34,6 +41,24 @@ class TestVectors(unittest.TestCase):
                     verify(v["secret"], v["signature"].upper(), v["remainder"])
                 )
         self.assertFalse(verify("s", "not-a-signature", "300x200/https://e.com/a.jpg"))
+
+
+class TestPurgeSignatures(unittest.TestCase):
+    def test_published_vectors(self):
+        # The same pinned literals the Rust crate and the
+        # TypeScript SDK assert.
+        self.assertEqual(
+            purge_signature("test-secret", "300x200/https://example.com/a.jpg"),
+            "9b58a43a984e47cbde3ec08333290acad06c48a5e9b85b99124ae725218e90e8",
+        )
+        self.assertEqual(
+            purge_group_signature("test-secret", "thumb"),
+            "2f779d54c25154a7528fb334973dd2c92e08b2575ee1359a7d426421b083b5d6",
+        )
+        self.assertEqual(
+            purge_group_signature("test-secret", "thumb"),
+            purge_signature("test-secret", "purge-group/thumb"),
+        )
 
 
 class TestBuilders(unittest.TestCase):

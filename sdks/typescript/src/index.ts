@@ -14,6 +14,32 @@ export function sign(secret: string, remainder: string): string {
   return createHmac("sha256", secret).update(remainder, "utf8").digest("hex");
 }
 
+/**
+ * The purge signature for a target path (the request
+ * remainder without its signature): HMAC-SHA256 of the
+ * path under a subkey derived from the secret (the raw
+ * HMAC of the secret over the label `crabcrop/purge-key`),
+ * so an image signature can never be replayed as a purge
+ * signature. This is the signature segment for
+ * `POST /purge/<signature>/<path>`.
+ */
+export function purgeSignature(secret: string, target: string): string {
+  const subkey = Buffer.from(sign(secret, "crabcrop/purge-key"), "hex");
+  return createHmac("sha256", subkey).update(target, "utf8").digest("hex");
+}
+
+/**
+ * The purge-group signature for a cache group: a purge
+ * signature over the literal string `purge-group/<group>`,
+ * which appears nowhere in the request URL. The helper
+ * exists so nobody has to know the signed string. This is
+ * the signature segment for
+ * `POST /purge-group/<signature>/<group>`.
+ */
+export function purgeGroupSignature(secret: string, group: string): string {
+  return purgeSignature(secret, `purge-group/${group}`);
+}
+
 export interface BuildOptions {
   /** Unix-seconds expiry, emitted as a leading `exp:` segment. */
   expires?: number;
