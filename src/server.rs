@@ -459,6 +459,12 @@ async fn serve(
         response
             .headers_mut()
             .insert("x-crabcrop-fallback", "1".parse().unwrap());
+        // A fallback is a placeholder for a transient failure:
+        // it must never be pinned downstream for the immutable
+        // year (audit PL-2).
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     }
     (response, record)
 }
@@ -594,10 +600,10 @@ fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
     body.push('}');
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-    headers.insert(
-        header::CACHE_CONTROL,
-        "public, max-age=31536000, immutable".parse().unwrap(),
-    );
+    // Meta is a second representation of the same URL (audit
+    // PL-12): never publicly cacheable, so an intermediary can
+    // never pin it in place of the image, or the reverse.
+    headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
     headers.insert(header::VARY, "Accept, DPR".parse().unwrap());
     (StatusCode::OK, headers, body).into_response()
 }
@@ -1180,6 +1186,11 @@ mod tests {
             .send()
             .await
             .unwrap();
+        // Meta is never publicly cacheable (audit PL-12).
+        assert_eq!(
+            resp.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
         let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         let color = meta["dominant_color"].as_str().unwrap();
         assert!(color.starts_with('#') && color.len() == 7, "{color}");
@@ -1368,6 +1379,8 @@ mod tests {
         let resp = client().get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-crabcrop-fallback").unwrap(), "1");
+        // The fallback is never pinned downstream (audit PL-2).
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
         let bytes = resp.bytes().await.unwrap();
         let img = image::load_from_memory(&bytes).unwrap();
         // The operations ran on the fallback (red 40x30), not on
