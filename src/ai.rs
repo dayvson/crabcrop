@@ -575,3 +575,432 @@ mod tests {
         );
     }
 }
+
+/// One label and its zero-shot probability.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagScore {
+    pub label: String,
+    pub score: f32,
+}
+
+/// The result of annotating an image: the labels that
+/// cleared the threshold, and a readable alt text composed
+/// from the best labels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub tags: Vec<TagScore>,
+    pub alt_text: String,
+}
+
+/// Annotates images with content tags and alt text.
+pub trait TagProvider: Send + Sync + std::fmt::Debug {
+    fn annotate(&self, img: &DynamicImage) -> Result<Annotation, String>;
+}
+
+/// Zero-shot tagging backed by a CLIP image/text ONNX model
+/// pair. The label set is operator configuration: labels
+/// are embedded once at load, so a request runs only the
+/// image encoder and a cosine comparison. The exports are
+/// expected to include the projection head (outputs named
+/// `image_embeds`/`text_embeds` or `pooled_output`), which
+/// is validated at load: mismatched pairs fail startup.
+pub struct OnnxClipProvider {
+    vision: Mutex<Session>,
+    vision_input: String,
+    labels: Vec<String>,
+    /// Label embeddings, flattened `labels.len()` x `dim`,
+    /// each row L2-normalized.
+    label_embeddings: Vec<f32>,
+    dim: usize,
+    threshold: f32,
+}
+
+impl OnnxClipProvider {
+    /// Load the model pair, the tokenizer file, and the
+    /// label file, embedding every label before returning.
+    pub fn load(
+        dylib: Option<&str>,
+        image_model: &str,
+        text_model: &str,
+        tokenizer_path: &str,
+        labels_path: &str,
+        threshold: f32,
+    ) -> Result<Self, String> {
+        let labels = read_labels(labels_path)?;
+        let tokenizer = crate::tokenizer::ClipTokenizer::load(tokenizer_path)?;
+        let (text, _) = build_session(dylib, text_model)?;
+        let text_inputs: Vec<String> = text.inputs().iter().map(|i| i.name().to_string()).collect();
+        let mut text = text;
+        let mut label_embeddings: Vec<f32> = Vec::new();
+        let mut dim = 0usize;
+        for label in &labels {
+            let (ids, mask) = tokenizer.encode(label);
+            let emb = run_text(&mut text, &text_inputs, &ids, &mask)?;
+            if dim == 0 {
+                dim = emb.len();
+            } else if emb.len() != dim {
+                return Err("the text model returned inconsistent embedding sizes".to_string());
+            }
+            label_embeddings.extend_from_slice(&normalize(&emb));
+        }
+        let (vision, vision_input) = build_session(dylib, image_model)?;
+        let provider = Self {
+            vision: Mutex::new(vision),
+            vision_input,
+            labels,
+            label_embeddings,
+            dim,
+            threshold,
+        };
+        // Fail fast on a mismatched pair: embed a black
+        // image once and check the projection size agrees
+        // with the text side.
+        let probe = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        let emb = provider.embed_image(&probe)?;
+        if emb.len() != provider.dim {
+            return Err(format!(
+                "the image model produced a {}-dimensional embedding but the text model produced {}: the pair does not share a projection space",
+                emb.len(),
+                provider.dim
+            ));
+        }
+        Ok(provider)
+    }
+
+    /// The number of configured labels.
+    pub fn label_count(&self) -> usize {
+        self.labels.len()
+    }
+
+    fn embed_image(&self, img: &DynamicImage) -> Result<Vec<f32>, String> {
+        let input = preprocess_clip(img);
+        let tensor = ort::value::Tensor::from_array(([1, 3, 224, 224], input.into_boxed_slice()))
+            .map_err(|e| format!("cannot build the input tensor: {e}"))?;
+        let mut session = self
+            .vision
+            .lock()
+            .map_err(|_| "clip provider lock poisoned".to_string())?;
+        let outputs = session
+            .run(ort::inputs![self.vision_input.as_str() => tensor])
+            .map_err(|e| format!("inference failed: {e}"))?;
+        let outputs = collect_outputs(outputs)?;
+        pick_embedding(&outputs, None)
+    }
+}
+
+impl std::fmt::Debug for OnnxClipProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxClipProvider")
+            .field("labels", &self.labels.len())
+            .field("dim", &self.dim)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TagProvider for OnnxClipProvider {
+    fn annotate(&self, img: &DynamicImage) -> Result<Annotation, String> {
+        let emb = normalize(&self.embed_image(img)?);
+        let dots: Vec<f32> = (0..self.labels.len())
+            .map(|i| {
+                emb.iter()
+                    .zip(&self.label_embeddings[i * self.dim..(i + 1) * self.dim])
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
+            .collect();
+        Ok(annotation_from_dots(&self.labels, &dots, self.threshold))
+    }
+}
+
+/// Read the label file: one label per line, blank lines
+/// and `#` comments skipped. No labels is an error.
+fn read_labels(path: &str) -> Result<Vec<String>, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the label file {path}: {e}"))?;
+    let labels: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    if labels.is_empty() {
+        return Err(format!("the label file {path} contains no labels"));
+    }
+    Ok(labels)
+}
+
+/// Run the text model for one tokenized label and pick its
+/// embedding. Inputs are fed by name, so exports with or
+/// without an attention mask (or token type ids) all work.
+fn run_text(
+    session: &mut Session,
+    input_names: &[String],
+    ids: &[i64],
+    mask: &[i64],
+) -> Result<Vec<f32>, String> {
+    let n = ids.len();
+    let ids_tensor = ort::value::Tensor::from_array(([1, n], ids.to_vec().into_boxed_slice()))
+        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
+    let mask_tensor = ort::value::Tensor::from_array(([1, n], mask.to_vec().into_boxed_slice()))
+        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
+    let zeros_tensor = ort::value::Tensor::from_array(([1, n], vec![0i64; n].into_boxed_slice()))
+        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
+    let ids_name = input_names
+        .iter()
+        .find(|name| name.contains("input_ids"))
+        .or_else(|| input_names.first())
+        .ok_or("the text model has no inputs")?;
+    let mask_name = input_names.iter().find(|name| name.contains("attention"));
+    let types_name = input_names.iter().find(|name| name.contains("token_type"));
+    let outputs = match (mask_name, types_name) {
+        (Some(m), Some(t)) => session.run(ort::inputs![
+            ids_name.as_str() => ids_tensor,
+            m.as_str() => mask_tensor,
+            t.as_str() => zeros_tensor,
+        ]),
+        (Some(m), None) => session.run(ort::inputs![
+            ids_name.as_str() => ids_tensor,
+            m.as_str() => mask_tensor,
+        ]),
+        (None, Some(t)) => session.run(ort::inputs![
+            ids_name.as_str() => ids_tensor,
+            t.as_str() => zeros_tensor,
+        ]),
+        (None, None) => session.run(ort::inputs![ids_name.as_str() => ids_tensor]),
+    }
+    .map_err(|e| format!("inference failed: {e}"))?;
+    let outputs = collect_outputs(outputs)?;
+    // The text embedding is the pooled row at the EOT
+    // position: the last non-padding token.
+    let eot_row = mask.iter().filter(|&&m| m == 1).count().saturating_sub(1);
+    pick_embedding(&outputs, Some(eot_row))
+}
+
+/// One model output: name, dims, data.
+type ModelOutput = (String, Vec<i64>, Vec<f32>);
+
+/// Collect a session's outputs as (name, dims, data).
+fn collect_outputs(outputs: ort::session::SessionOutputs<'_>) -> Result<Vec<ModelOutput>, String> {
+    let mut out = Vec::new();
+    for (name, value) in outputs.into_iter() {
+        let (shape, data) = value
+            .try_extract_tensor::<f32>()
+            .map_err(|e| format!("cannot read the model output: {e}"))?;
+        let dims: Vec<i64> = shape.iter().copied().collect();
+        out.push((name.to_string(), dims, data.to_vec()));
+    }
+    Ok(out)
+}
+
+/// Choose the embedding from a model's outputs:
+/// `image_embeds` / `text_embeds` first, then
+/// `pooled_output`, then the first output (row 0, or the
+/// EOT row for text hidden states).
+fn pick_embedding(outputs: &[ModelOutput], eot_row: Option<usize>) -> Result<Vec<f32>, String> {
+    for wanted in ["image_embeds", "text_embeds", "pooled_output"] {
+        if let Some((_, dims, data)) = outputs.iter().find(|(name, _, _)| name == wanted) {
+            return Ok(first_row(dims, data));
+        }
+    }
+    let (_, dims, data) = outputs.first().ok_or("the model produced no outputs")?;
+    if dims.len() == 3 {
+        let dim = dims[2] as usize;
+        let row = eot_row.unwrap_or(0);
+        let start = row * dim;
+        if start + dim > data.len() {
+            return Err("the model output is smaller than its declared shape".to_string());
+        }
+        return Ok(data[start..start + dim].to_vec());
+    }
+    Ok(first_row(dims, data))
+}
+
+fn first_row(dims: &[i64], data: &[f32]) -> Vec<f32> {
+    if dims.len() >= 2 {
+        let dim = dims[dims.len() - 1] as usize;
+        if dim > 0 && data.len() >= dim {
+            return data[..dim].to_vec();
+        }
+    }
+    data.to_vec()
+}
+
+fn normalize(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return v.to_vec();
+    }
+    v.iter().map(|x| x / norm).collect()
+}
+
+/// CLIP image preprocessing, matching the export's
+/// declared pipeline: resize the short side to 224
+/// (bicubic), center crop 224x224, normalize with the
+/// CLIP mean/std. Output is planar CHW.
+#[allow(clippy::excessive_precision)] // the model's published constants
+fn preprocess_clip(img: &DynamicImage) -> Vec<f32> {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let scale = 224.0 / w.min(h) as f32;
+    let nw = ((w as f32 * scale).round() as u32).max(224);
+    let nh = ((h as f32 * scale).round() as u32).max(224);
+    let resized = img.resize_exact(nw, nh, FilterType::CatmullRom);
+    let cropped = resized
+        .crop_imm((nw - 224) / 2, (nh - 224) / 2, 224, 224)
+        .to_rgb8();
+    const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+    const STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+    let plane = 224 * 224;
+    let mut out = vec![0f32; 3 * plane];
+    for (i, px) in cropped.pixels().enumerate() {
+        for (c, (mean, std)) in MEAN.iter().zip(STD.iter()).enumerate() {
+            out[c * plane + i] = ((px[c] as f32 / 255.0) - mean) / std;
+        }
+    }
+    out
+}
+
+/// The model's zero-shot logit scale.
+const LOGIT_SCALE: f32 = 100.0;
+
+/// Turn cosine similarities into the annotation:
+/// probabilities are the softmax of `LOGIT_SCALE * dot`;
+/// tags are the labels at or above the threshold, best
+/// first, at most 10; alt text is the top 3 labels joined
+/// with commas, first letter capitalized.
+pub fn annotation_from_dots(labels: &[String], dots: &[f32], threshold: f32) -> Annotation {
+    debug_assert_eq!(labels.len(), dots.len());
+    let max_logit = dots
+        .iter()
+        .map(|d| d * LOGIT_SCALE)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = dots
+        .iter()
+        .map(|d| (d * LOGIT_SCALE - max_logit).exp())
+        .collect();
+    let total: f32 = exps.iter().sum();
+    let probs: Vec<f32> = exps.iter().map(|e| e / total).collect();
+    let mut order: Vec<usize> = (0..labels.len()).collect();
+    order.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let tags: Vec<TagScore> = order
+        .iter()
+        .filter(|&&i| probs[i] >= threshold)
+        .take(10)
+        .map(|&i| TagScore {
+            label: labels[i].clone(),
+            score: (probs[i] * 1000.0).round() / 1000.0,
+        })
+        .collect();
+    let mut alt = order
+        .iter()
+        .take(3)
+        .map(|&i| labels[i].as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(first) = alt.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    Annotation {
+        tags,
+        alt_text: alt,
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    fn labels(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn annotation_picks_the_clear_winner() {
+        let a = annotation_from_dots(
+            &labels(&["ocean", "desert", "forest"]),
+            &[0.30, 0.05, 0.02],
+            0.05,
+        );
+        assert_eq!(a.tags.len(), 1);
+        assert_eq!(a.tags[0].label, "ocean");
+        assert!(a.tags[0].score > 0.99, "score {}", a.tags[0].score);
+        assert_eq!(a.alt_text, "Ocean, desert, forest");
+    }
+
+    #[test]
+    fn annotation_threshold_and_order() {
+        // Logit gaps of 0.01 in cosine are 1.0 after the
+        // scale: probs are roughly 0.66 / 0.24 / 0.09.
+        let a = annotation_from_dots(&labels(&["a", "b", "c"]), &[0.10, 0.09, 0.08], 0.10);
+        let names: Vec<&str> = a.tags.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        // A flat distribution clears nothing but alt text
+        // still names the best labels.
+        let flat = annotation_from_dots(&labels(&["a", "b", "c"]), &[0.0, 0.0, 0.0], 0.9);
+        assert!(flat.tags.is_empty());
+        assert_eq!(flat.alt_text, "A, b, c");
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // the model's published constants
+    fn preprocess_clip_normalizes_a_solid_image() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            100,
+            50,
+            image::Rgb([255, 0, 0]),
+        ));
+        let input = preprocess_clip(&img);
+        assert_eq!(input.len(), 3 * 224 * 224);
+        let r = (1.0f32 - 0.48145466) / 0.26862954;
+        let g = (0.0f32 - 0.4578275) / 0.26130258;
+        assert!((input[0] - r).abs() < 1e-4, "red plane {}", input[0]);
+        assert!((input[224 * 224] - g).abs() < 1e-4, "green plane");
+        assert!(input.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn read_labels_skips_comments_and_blanks() {
+        let path = std::env::temp_dir().join(format!("crabcrop-labels-{}.txt", std::process::id()));
+        std::fs::write(&path, "# heading\n\nocean\n  sky  \n#kite\n").unwrap();
+        let got = read_labels(path.to_str().unwrap()).unwrap();
+        assert_eq!(got, ["ocean", "sky"]);
+        std::fs::remove_file(&path).ok();
+        let empty =
+            std::env::temp_dir().join(format!("crabcrop-labels-empty-{}.txt", std::process::id()));
+        std::fs::write(&empty, "# only comments\n\n").unwrap();
+        assert!(read_labels(empty.to_str().unwrap()).is_err());
+        std::fs::remove_file(&empty).ok();
+    }
+
+    /// Live check with a real CLIP export: tags a fixture
+    /// photo and asserts the annotation is sane. Ignored:
+    /// needs the runtime, both models, the tokenizer, a
+    /// label file, and a photo:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_CLIP_IMAGE_MODEL=...
+    /// CRABCROP_TEST_CLIP_TEXT_MODEL=... CRABCROP_TEST_CLIP_TOKENIZER=...
+    /// CRABCROP_TEST_CLIP_LABELS=... CRABCROP_TEST_IMAGE=...
+    #[test]
+    #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
+    fn clip_live_tags_a_photo() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let provider = OnnxClipProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
+            &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
+            &var("CRABCROP_TEST_CLIP_TOKENIZER"),
+            &var("CRABCROP_TEST_CLIP_LABELS"),
+            0.01,
+        )
+        .unwrap();
+        let img = image::open(var("CRABCROP_TEST_IMAGE")).unwrap();
+        let annotation = provider.annotate(&img).unwrap();
+        println!("tags: {:?}", annotation.tags);
+        println!("alt: {}", annotation.alt_text);
+        assert!(!annotation.tags.is_empty());
+        assert!(!annotation.alt_text.is_empty());
+    }
+}

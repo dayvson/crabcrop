@@ -53,6 +53,10 @@ pub struct AppState {
     /// `CRABCROP_FACE_MODEL` is configured. `None` means smart
     /// crops use the saliency estimate.
     pub face: Option<Arc<dyn crate::ai::FaceProvider>>,
+    /// CLIP tag provider for meta annotations, preloaded at
+    /// boot when the `CRABCROP_CLIP_*` set is configured.
+    /// `None` means meta responses carry no tags or alt text.
+    pub tagger: Option<Arc<dyn crate::ai::TagProvider>>,
     /// Text renderer, loaded at boot when `CRABCROP_FONT_PATH`
     /// is configured. `None` means `text(...)` requests fail
     /// cleanly.
@@ -621,8 +625,13 @@ async fn serve(
         }
     }
     record.bytes_out = processed.bytes.len();
+    let annotation = if meta {
+        annotate_meta(state, &processed).await
+    } else {
+        None
+    };
     let mut response = if meta {
-        meta_response(&processed)
+        meta_response(&processed, annotation.as_ref())
     } else {
         respond(processed.format, processed.quality, processed.bytes)
     };
@@ -750,7 +759,39 @@ fn format_name(format: ImageFormat) -> &'static str {
 
 /// The meta response: what the pipeline produced, as JSON,
 /// without the image bytes.
-fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
+/// Annotate a processed image for a meta response, when a
+/// tag provider is configured. Bounded by the AI gate like
+/// every other inference; any failure (gate busy, decode,
+/// inference) omits the annotation rather than failing a
+/// response whose image processed fine.
+async fn annotate_meta(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+) -> Option<crate::ai::Annotation> {
+    let tagger = state.tagger.as_ref()?;
+    let _permit = tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()?;
+    let img = crate::engine::decode_image(&processed.bytes).ok()?;
+    let tagger = tagger.clone();
+    match tokio::task::spawn_blocking(move || tagger.annotate(&img)).await {
+        Ok(Ok(annotation)) => Some(annotation),
+        Ok(Err(e)) => {
+            eprintln!("annotation error: {e}");
+            None
+        }
+        Err(e) => {
+            eprintln!("annotation task failed: {e}");
+            None
+        }
+    }
+}
+
+fn meta_response(
+    processed: &crate::engine::ProcessedImage,
+    annotation: Option<&crate::ai::Annotation>,
+) -> Response {
     let mut body = format!(
         "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}",
         processed.width,
@@ -760,6 +801,24 @@ fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
         processed.source_width,
         processed.source_height,
     );
+    if let Some(a) = annotation {
+        let tags: Vec<String> = a
+            .tags
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"label\":{},\"score\":{}}}",
+                    serde_json::to_string(&t.label).unwrap_or_default(),
+                    t.score
+                )
+            })
+            .collect();
+        body.push_str(&format!(
+            ",\"tags\":[{}],\"alt_text\":{}",
+            tags.join(","),
+            serde_json::to_string(&a.alt_text).unwrap_or_default()
+        ));
+    }
     if let Some(score) = processed.ssimulacra2 {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
     }
@@ -967,6 +1026,7 @@ mod tests {
             removebg: None,
             upscale: None,
             face: None,
+            tagger: None,
             font: None,
             fallback: None,
             store: None,
@@ -1007,6 +1067,7 @@ mod tests {
             removebg: None,
             upscale: None,
             face: None,
+            tagger: None,
             font: None,
             fallback: Some(Fallback::Bytes(Arc::new(png))),
             store: None,
@@ -1155,6 +1216,7 @@ mod tests {
             removebg: None,
             upscale: None,
             face: None,
+            tagger: None,
             font: None,
             fallback: None,
             store: None,
@@ -1410,6 +1472,82 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    #[derive(Debug)]
+    struct FakeTagger;
+
+    impl crate::ai::TagProvider for FakeTagger {
+        fn annotate(&self, _img: &image::DynamicImage) -> Result<crate::ai::Annotation, String> {
+            Ok(crate::ai::Annotation {
+                tags: vec![crate::ai::TagScore {
+                    label: "ocean".to_string(),
+                    score: 0.42,
+                }],
+                alt_text: "Ocean, sky".to_string(),
+            })
+        }
+    }
+
+    async fn spawn_app_with_tagger() -> String {
+        let state = AppState {
+            secret: SECRET.to_vec(),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: Some(Arc::new(FakeTagger)),
+            font: None,
+            fallback: None,
+            store: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn meta_includes_tags_only_with_a_tagger() {
+        let src = spawn_image_server().await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        // With a tagger: tags and alt text are present.
+        let base = spawn_app_with_tagger().await;
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["tags"][0]["label"], "ocean");
+        assert_eq!(meta["tags"][0]["score"], 0.42);
+        assert_eq!(meta["alt_text"], "Ocean, sky");
+        // Without one: both fields absent.
+        let base = spawn_app(false).await;
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(meta.get("tags").is_none());
+        assert!(meta.get("alt_text").is_none());
+    }
+
     #[tokio::test]
     async fn meta_includes_placeholders_only_when_asked() {
         let src = spawn_image_server().await;
@@ -1535,6 +1673,7 @@ mod tests {
             removebg: None,
             upscale: None,
             face: None,
+            tagger: None,
             font: None,
             fallback: None,
             store: Some(Arc::new(
@@ -1697,6 +1836,7 @@ mod tests {
             removebg: None,
             upscale: None,
             face: None,
+            tagger: None,
             font: None,
             fallback: None,
             store: None,
