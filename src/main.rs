@@ -99,6 +99,7 @@ mod sigv4;
 mod storage;
 mod svg;
 mod text;
+mod thumbhash;
 mod url;
 
 use std::env;

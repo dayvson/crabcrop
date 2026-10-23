@@ -389,7 +389,7 @@ Add the `placeholders` parameter to the media type to also get placeholder data,
 curl -H "Accept: application/json; placeholders=1" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
 ```
 
-This adds two fields: `dominant_color`, the image's average color as `#rrggbb`, and `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI — handy for rendering a preview while the real image loads. Meta requests are never cached, and errors in meta mode keep the usual status codes and plain-text bodies.
+This adds four fields: `dominant_color`, the image's average color as `#rrggbb`; `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI; `palette`, the five most prominent colors as `#rrggbb`, most prominent first; and `thumbhash`, a ThumbHash string that ThumbHash client libraries decode into an aspect-correct blurred preview. Handy for rendering a preview while the real image loads. Meta requests are never cached, and errors in meta mode keep the usual status codes and plain-text bodies.
 
 ## Responses
 

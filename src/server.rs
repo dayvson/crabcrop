@@ -764,9 +764,13 @@ fn meta_response(processed: &crate::engine::ProcessedImage) -> Response {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
     }
     if let Some(ph) = &processed.placeholder {
+        let palette: Vec<String> = ph.palette.iter().map(|c| format!("\"{c}\"")).collect();
         body.push_str(&format!(
-            ",\"dominant_color\":\"{}\",\"placeholder\":\"{}\"",
-            ph.dominant_color, ph.data_uri
+            ",\"dominant_color\":\"{}\",\"placeholder\":\"{}\",\"palette\":[{}],\"thumbhash\":\"{}\"",
+            ph.dominant_color,
+            ph.data_uri,
+            palette.join(","),
+            ph.thumbhash
         ));
     }
     body.push('}');
@@ -1433,6 +1437,14 @@ mod tests {
                 .unwrap()
                 .starts_with("data:image/jpeg;base64,")
         );
+        let palette = meta["palette"].as_array().unwrap();
+        assert!(!palette.is_empty() && palette.len() <= 5);
+        for entry in palette {
+            let c = entry.as_str().unwrap();
+            assert!(c.starts_with('#') && c.len() == 7, "{c}");
+        }
+        let thumbhash = meta["thumbhash"].as_str().unwrap();
+        assert!(thumbhash.len() >= 20, "{thumbhash}");
         // Not asked: both fields absent, plain fields unchanged.
         let resp = client()
             .get(&url)
@@ -1443,6 +1455,8 @@ mod tests {
         let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert!(meta.get("dominant_color").is_none());
         assert!(meta.get("placeholder").is_none());
+        assert!(meta.get("palette").is_none());
+        assert!(meta.get("thumbhash").is_none());
         assert_eq!(meta["width"].as_u64(), Some(40));
     }
 
