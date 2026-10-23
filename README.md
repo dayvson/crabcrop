@@ -239,6 +239,12 @@ Notes on the directives:
 - `no_upscale` applies to the whole request wherever it appears: a `300x200` resize of a 200×150 source returns 200×150, scaled proportionally.
 - `dpr` also applies request-wide, and it scales targets *before* the `no_upscale` cap sees them, so `dpr` never invents pixels past the source when both are set. Targets round to whole pixels. `crop-rect` coordinates address source pixels and are not scaled. When the URL carries no `dpr`, the server honors the `DPR` client hint header (same set of values; an invalid hint is ignored). An explicit `dpr` in the URL always beats the header.
 
+#### Client hints
+
+When a URL sizes nothing itself (no size, crop, fit-in, pad, or crop-rect operation), the server honors the width client hints so responsive pages do not have to mint a URL per width. It reads, in order, `Sec-CH-Width`, `Width`, `Sec-CH-Viewport-Width`, and `Viewport-Width`, and resizes to that width as if the URL had carried the width-only size op (the `DPR` hint still multiplies on top). Hinted widths are quantized up to a multiple of `CRABCROP_WIDTH_STEP` (default 100), so nearby viewports share one cache entry, and the quantized width joins the cache key. Image responses advertise `Accept-CH` for these hints and vary on them.
+
+A request with `Save-Data: on` gets the default encode quality stepped down one notch, from 80 to 70, on the formats that carry a quality (JPEG, JPEG XL, AVIF, WebP); the stepped value is reported in `X-Crabcrop-Quality`. URLs that set `quality(...)` themselves are unaffected, and stepped responses are cached separately.
+
 ```bash
 curl "http://localhost:3000/unsafe/1200x0/filters:format(webp):quality(auto)/https://example.com/photo.jpg"
 ```
@@ -361,7 +367,7 @@ When the URL names no `format(...)`, crabcrop picks the output format from the r
 3. `image/webp` → WebP
 4. Otherwise → the source image's format (JPEG if the format cannot be detected)
 
-A format refused with `q=0` is never picked, and wildcards such as `*/*` do not count as an offer. An explicit `format(...)` in the URL always wins over negotiation. Animated GIF sources are the one exception: they never negotiate to JPEG XL, which would drop their frames, and keep GIF instead. Responses include `Vary: Accept, DPR` so downstream caches key this correctly (the `DPR` hint likewise changes sizing; see `dpr` above).
+A format refused with `q=0` is never picked, and wildcards such as `*/*` do not count as an offer. An explicit `format(...)` in the URL always wins over negotiation. Animated GIF sources are the one exception: they never negotiate to JPEG XL, which would drop their frames, and keep GIF instead. Responses include a `Vary` covering `Accept` and the client hints so downstream caches key this correctly (the hints likewise change sizing and quality; see [Client hints](#client-hints)).
 
 ## Meta responses
 
@@ -401,13 +407,13 @@ A successful image response carries:
 | --- | --- |
 | `Content-Type` | The output format's media type, e.g. `image/webp`. |
 | `Cache-Control` | `public, max-age=31536000, immutable` |
-| `Vary` | `Accept, DPR` |
-| `X-Crabcrop-Quality` | Present only when crabcrop chose the quality (`quality(auto)` or a `max_bytes` reduction); the value used. |
+| `Vary` | `Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data` |
+| `X-Crabcrop-Quality` | Present only when crabcrop chose the quality (`quality(auto)`, a `max_bytes` reduction, or a `Save-Data` step); the value used. |
 | `X-Crabcrop-Fallback` | `1` when the response is the configured fallback image rather than the source (see [Fallback image](#fallback-image)). |
 
 ### Caching
 
-Signed URLs are content-addressed, so successful responses are cached and served without re-fetching or re-processing. The first tier is an in-memory LRU bounded by bytes: 256 MB by default, configurable with `CRABCROP_CACHE_MAX_MB` (`0` disables it). With `CRABCROP_RESULT_STORAGE_DIR` set, a second, disk-backed tier (bounded by `CRABCROP_RESULT_STORAGE_MAX_MB`, default 512 MB) sits underneath: results survive restarts, and disk hits are promoted into memory. Only `200` responses are cached; errors never are. Because the response can depend on the request headers, negotiated responses are cached per negotiated format class and per effective DPR value.
+Signed URLs are content-addressed, so successful responses are cached and served without re-fetching or re-processing. The first tier is an in-memory LRU bounded by bytes: 256 MB by default, configurable with `CRABCROP_CACHE_MAX_MB` (`0` disables it). With `CRABCROP_RESULT_STORAGE_DIR` set, a second, disk-backed tier (bounded by `CRABCROP_RESULT_STORAGE_MAX_MB`, default 512 MB) sits underneath: results survive restarts, and disk hits are promoted into memory. Only `200` responses are cached; errors never are. Because the response can depend on the request headers, negotiated responses are cached per negotiated format class, per effective DPR value, per quantized width-hint class, and per Save-Data class.
 
 ### Fallback image
 
@@ -477,6 +483,7 @@ All configuration comes from environment variables. Invalid values for the numer
 | `CRABCROP_ALLOW_UNSAFE` | off | `1` or `true` honors `unsafe` URLs. Anything else, including unset, means off. |
 | `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
 | `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
+| `CRABCROP_WIDTH_STEP` | `100` | Quantization step in pixels for width client hints: hinted widths round up to a multiple of this. |
 | `CRABCROP_AVIF_SPEED` | `8` | ravif speed tier for AVIF encodes, 1 (slowest, smallest output) to 10 (fastest). At 800w and quality 80, speed 8 encodes in about 1 s cold and produces the smallest files of the fast tiers; speed 10 is roughly 3x quicker for about 47% more bytes. |
 | `CRABCROP_JXL_SPEED` | `fast` | jixel speed tier for JPEG XL encodes: `ultrafast`, `fastest`, `fast`, `medium`, `slow`, or `extraslow`. Slower tiers shrink output with steep latency costs (`slow` is about 8x the latency of `fast` for about 18% fewer bytes at 800w). |
 | `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](#presets). |

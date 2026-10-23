@@ -39,6 +39,11 @@ pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 /// into a dozen-plus full-size encodes per cache miss.
 const MAX_REQUEST_ENCODES: usize = 6;
 
+/// The quality a `Save-Data` request steps down to: one
+/// notch (10 points) below the default 80 the encoders and
+/// the `max_bytes` ladder assume.
+pub const SAVE_DATA_QUALITY: u8 = 70;
+
 pub(crate) fn decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DECODE_DIMENSION);
@@ -214,6 +219,9 @@ pub struct ProcessContext<'a> {
     /// SSIMULACRA2 target for verified `quality(auto)` encodes,
     /// from `CRABCROP_SSIM_TARGET`.
     pub ssim_target: f64,
+    /// The client asked to save data (`Save-Data: on`):
+    /// step the default encode quality down one notch.
+    pub save_data: bool,
     /// ravif speed tier for AVIF encodes (1 slowest to 10
     /// fastest), from `CRABCROP_AVIF_SPEED`.
     pub avif_speed: u8,
@@ -242,6 +250,7 @@ impl Default for ProcessContext<'_> {
             text_renderer: None,
             dpr: None,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            save_data: false,
             avif_speed: DEFAULT_AVIF_SPEED,
             jxl_speed: DEFAULT_JXL_SPEED,
         }
@@ -452,6 +461,18 @@ impl Engine {
             Some(Quality::Auto) => {
                 let q = auto_quality(&img);
                 (Some(q), Some(q))
+            }
+            // Save-Data steps the default quality down one
+            // notch (80 to 70) on the formats that carry a
+            // quality, and reports the step like an auto pick.
+            // An explicit quality(...) of either kind stands.
+            None if ctx.save_data
+                && matches!(
+                    format,
+                    ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
+                ) =>
+            {
+                (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY))
             }
             None => (None, None),
         };
@@ -2176,6 +2197,53 @@ mod tests {
         assert!(q > flat.quality.unwrap());
         // The detailed image ends up larger than the flat one.
         assert!(noisy.bytes.len() > flat.bytes.len());
+    }
+
+    #[test]
+    fn save_data_steps_the_default_quality_and_reports_it() {
+        let engine = Engine;
+        let ctx = ProcessContext {
+            save_data: true,
+            ..Default::default()
+        };
+        // A JPEG with no quality directive encodes at the
+        // stepped quality and reports it.
+        let out = engine
+            .process_preferred(
+                &gradient_png(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+                ctx,
+            )
+            .unwrap();
+        assert_eq!(out.quality, Some(SAVE_DATA_QUALITY));
+        // An explicit quality stands: nothing is reported,
+        // exactly as without the hint.
+        let out = engine
+            .process_preferred(
+                &gradient_png(),
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Quality(Quality::Value(90)),
+                ])],
+                ProcessContext {
+                    save_data: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.quality, None);
+        // PNG has no quality to step.
+        let out = engine
+            .process_preferred(
+                &gradient_png(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                ProcessContext {
+                    save_data: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.quality, None);
     }
 
     #[test]
