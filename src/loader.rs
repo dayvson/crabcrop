@@ -149,8 +149,9 @@ pub struct SourceConfig {
     pub gcs_region: String,
     /// GCS HMAC credentials, when configured.
     pub gcs_creds: Option<Credentials>,
-    /// Bucket names the bucket schemes may read. Empty means
-    /// every bucket.
+    /// Bucket names the bucket schemes may read. An entry of
+    /// `*` allows every bucket. Boot refuses the combination of
+    /// configured credentials and an empty list (audit L-1).
     pub allowed_buckets: Vec<String>,
     /// Canonicalized root that `file://` sources must stay
     /// under. `None` disables file sources.
@@ -311,7 +312,11 @@ impl Loader {
         key: &str,
     ) -> Result<Vec<u8>, LoadError> {
         if !self.sources.allowed_buckets.is_empty()
-            && !self.sources.allowed_buckets.iter().any(|b| b == bucket)
+            && !self
+                .sources
+                .allowed_buckets
+                .iter()
+                .any(|b| b == bucket || b == "*")
         {
             return Err(LoadError::Forbidden(format!(
                 "bucket {bucket} is not an allowed source"
