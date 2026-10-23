@@ -16,7 +16,7 @@ axum = "0.8"
 fast-ssim2 = "0.9"
 fast_image_resize = { version = "6.1", features = ["image"] }
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 jixel = "0.4"
 jpeg-encoder = "0.7"
 ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
@@ -27,7 +27,7 @@ oxideav-webp = { version = "0.3.1", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 resvg = "0.45"
 roxmltree = "0.20"
-sha2 = "0.10"
+sha2 = "0.11"
 image = { version = "0.25", features = ["avif"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "fs", "io-util"] }
 
