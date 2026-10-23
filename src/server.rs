@@ -1198,8 +1198,11 @@ fn load_error_response(e: LoadError) -> Response {
             "source did not return an image".to_string(),
         ),
         LoadError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "source timed out".to_string()),
+        // 502, not 413: the client's request was a valid
+        // signed URL; it is the origin object that is too
+        // big, like the other origin faults above.
         LoadError::TooLarge { limit } => (
-            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::BAD_GATEWAY,
             format!("source exceeds {limit} bytes"),
         ),
     };
@@ -2092,6 +2095,14 @@ mod tests {
             req = req.header(*name, *value);
         }
         req.send().await.unwrap()
+    }
+
+    #[test]
+    fn oversized_source_is_a_bad_gateway() {
+        // The request was a valid signed URL; the origin
+        // object is what is too big (review AP-11).
+        let resp = load_error_response(LoadError::TooLarge { limit: 10 });
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
