@@ -458,11 +458,14 @@ impl Loader {
 
     /// Build a client whose DNS for the pinned host is forced
     /// to the address the policy validated (audit L-3). TLS
-    /// still authenticates the original hostname.
+    /// still authenticates the original hostname. Proxies are
+    /// disabled: a proxied request resolves at the proxy, so
+    /// pinning through one would be meaningless.
     fn pinned_client(&self, pin: &PinnedResolution) -> Result<Client, LoadError> {
         Client::builder()
             .timeout(self.timeout)
             .redirect(redirect::Policy::none())
+            .no_proxy()
             .resolve(&pin.host, pin.addr)
             .build()
             .map_err(|e| LoadError::Network(e.to_string()))
@@ -677,9 +680,19 @@ mod tests {
     async fn pinned_client_forces_the_validated_address() {
         // Audit L-3: a client pinned for an unresolvable name
         // connects to the validated address anyway (and would
-        // authenticate TLS for the original name).
-        let base = spawn_server(Respond::Bytes(ok_image_response())).await;
-        let port = base.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        // authenticate TLS for the original name). This test's
+        // server reads the request before answering (the
+        // shared fixture answers on accept, which races a
+        // client whose request lands after the response).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket.write_all(&ok_image_response()).await;
+        });
         let loader = Loader::with_defaults().unwrap();
         let pin = PinnedResolution {
             host: "pinned.invalid".to_string(),
