@@ -1,0 +1,17 @@
+{{- if and .Values.resultStorage.enabled (not .Values.resultStorage.pvc.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "crabcrop.fullname" . }}-results
+  labels:
+    {{- include "crabcrop.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.resultStorage.pvc.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.resultStorage.pvc.size }}
+  {{- if .Values.resultStorage.pvc.storageClass }}
+  storageClassName: {{ .Values.resultStorage.pvc.storageClass }}
+  {{- end }}
+{{- end }}

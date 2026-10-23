@@ -1,0 +1,13 @@
+{{- if .Values.presets }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "crabcrop.fullname" . }}-presets
+  labels:
+    {{- include "crabcrop.labels" . | nindent 4 }}
+data:
+  presets.txt: |
+    {{- range $name, $ops := .Values.presets }}
+    {{ $name }} = {{ $ops }}
+    {{- end }}
+{{- end }}
