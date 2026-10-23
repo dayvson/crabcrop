@@ -12,15 +12,14 @@
  * Configuration: CRABCROP_BASE and CRABCROP_SECRET in the
  * environment are the defaults for sign_url and purge_result,
  * so agents do not pass the secret on every call. Per-call
- * arguments override them.
+ * secret arguments exist as an override but are deprecated:
+ * agentic clients persist tool arguments in transcripts, so
+ * the environment is the right home for the secret.
  *
  * Run: node src/index.ts   (Node >= 22, for type stripping)
  */
 import { createHmac } from "node:crypto";
-import { createInterface } from "node:readline";
 import { buildURL, explainUrl, sign } from "@crabcrop/url";
-// The explainer is the playground's module: one implementation
-// of URL explanation, shared by the debugger and this server.
 
 const SERVER = { name: "crabcrop", version: "0.1.0" };
 const PROTOCOL = "2024-11-05";
@@ -64,7 +63,7 @@ const TOOLS = [
       "Build and sign a crabcrop URL from an operation string and a source. " +
       "Returns the full URL. Uses CRABCROP_BASE / CRABCROP_SECRET from the " +
       "environment unless base/secret arguments override them; with no secret " +
-      "the URL carries the literal `unsafe` signature segment.",
+      "the URL carries the literal `unsafe` signature segment. Prefer the environment for the secret: per-call secret arguments are deprecated.",
     inputSchema: {
       type: "object",
       properties: {
@@ -77,7 +76,7 @@ const TOOLS = [
           description: "Source locator: an http(s) URL, s3://bucket/key, gs://bucket/key, or file:// path.",
         },
         base: { type: "string", description: "crabcrop endpoint origin. Defaults to CRABCROP_BASE." },
-        secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET; omit for unsafe URLs." },
+        secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET; omit for unsafe URLs. Sensitive, deprecated: prefer the CRABCROP_SECRET environment variable; a per-call secret is kept in client transcripts." },
         expires: { type: "number", description: "Optional unix-seconds expiry, emitted as an exp: segment." },
       },
       required: ["operations", "source"],
@@ -203,7 +202,7 @@ const TOOLS = [
       properties: {
         path: { type: "string", description: "Remainder of the cached URL, e.g. \"300x200/https://example.com/a.jpg\"." },
         base: { type: "string", description: "crabcrop endpoint origin. Defaults to CRABCROP_BASE." },
-        secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET." },
+        secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET. Sensitive, deprecated: prefer the CRABCROP_SECRET environment variable; a per-call secret is kept in client transcripts." },
       },
       required: ["path"],
     },
@@ -270,22 +269,65 @@ async function handle(req: JsonRpcRequest): Promise<unknown> {
   }
 }
 
-const rl = createInterface({ input: process.stdin, terminal: false });
-rl.on("line", async (line) => {
-  const trimmed = line.trim();
-  if (!trimmed) return;
-  let req: JsonRpcRequest;
-  try {
-    req = JSON.parse(trimmed) as JsonRpcRequest;
-  } catch {
-    return;
+// Transport: newline-delimited JSON-RPC over stdio. Lines
+// are capped (readline would buffer an unbounded line in
+// memory) and requests are handled one at a time through a
+// promise chain, so side-effecting calls cannot race
+// (audit PL-9).
+const MAX_LINE_BYTES = 1024 * 1024;
+let chain: Promise<void> = Promise.resolve();
+let buffered = "";
+let discarding = false;
+
+function enqueue(line: string): void {
+  chain = chain.then(async () => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let req: JsonRpcRequest;
+    try {
+      req = JSON.parse(trimmed) as JsonRpcRequest;
+    } catch {
+      return;
+    }
+    if (req.id === undefined || req.id === null) {
+      await handle(req); // A notification: handle silently.
+      return;
+    }
+    const result = await handle(req);
+    process.stdout.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: req.id, result: result ?? {} })}\n`,
+    );
+  });
+}
+
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk: string) => {
+  buffered += chunk;
+  for (;;) {
+    const nl = buffered.indexOf("\n");
+    if (discarding) {
+      if (nl === -1) {
+        buffered = "";
+        return;
+      }
+      buffered = buffered.slice(nl + 1);
+      discarding = false;
+      continue;
+    }
+    if (nl === -1) {
+      if (buffered.length > MAX_LINE_BYTES) {
+        // An over-long line: drop it and everything up to
+        // its newline, and answer with a protocol error.
+        buffered = "";
+        discarding = true;
+        process.stdout.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "request line too large" } })}\n`,
+        );
+      }
+      return;
+    }
+    const line = buffered.slice(0, nl);
+    buffered = buffered.slice(nl + 1);
+    enqueue(line);
   }
-  if (req.id === undefined || req.id === null) {
-    void handle(req); // A notification: handle silently.
-    return;
-  }
-  const result = await handle(req);
-  process.stdout.write(
-    `${JSON.stringify({ jsonrpc: "2.0", id: req.id, result: result ?? {} })}\n`,
-  );
 });
