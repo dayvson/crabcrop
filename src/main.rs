@@ -69,6 +69,14 @@
 //! - `CRABCROP_FONT_PATH`: path to a TTF/OTF font for the
 //!   `text(...)` overlay filter, loaded at boot. Unset
 //!   disables the filter (requests fail cleanly).
+//! - `CRABCROP_CLIP_IMAGE_MODEL` / `CRABCROP_CLIP_TEXT_MODEL`:
+//!   a CLIP ONNX model pair for meta `tags` and `alt_text`,
+//!   with `CRABCROP_CLIP_TOKENIZER` (the export's
+//!   `tokenizer.json`) and `CRABCROP_CLIP_LABELS` (one label
+//!   per line). All four are required together; a partial set
+//!   is a startup error. `CRABCROP_CLIP_THRESHOLD` optionally
+//!   sets the tag score floor (default 0.05). Unset disables
+//!   annotation; meta responses then carry no tags.
 //! - `CRABCROP_FALLBACK_IMAGE`: a URL or local file path for
 //!   the fallback image served (through the same operations,
 //!   marked `X-Crabcrop-Fallback: 1`) when a source cannot be
@@ -100,6 +108,7 @@ mod storage;
 mod svg;
 mod text;
 mod thumbhash;
+mod tokenizer;
 mod url;
 
 use std::env;
@@ -383,6 +392,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => None,
         };
+    let tagger = build_tagger(ort_dylib.as_deref())?;
     let face: Option<Arc<dyn crate::ai::FaceProvider>> = match env::var("CRABCROP_FACE_MODEL") {
         Ok(path) if !path.is_empty() => {
             let provider = crate::ai::OnnxFaceProvider::load(ort_dylib.as_deref(), &path)
@@ -456,6 +466,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         removebg,
         upscale,
         face,
+        tagger,
         font,
         fallback,
         store,
@@ -477,9 +488,138 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The CLIP annotation configuration from the environment:
+/// all four paths together, or none of them.
+#[derive(Debug)]
+struct ClipConfig {
+    image_model: String,
+    text_model: String,
+    tokenizer: String,
+    labels: String,
+    threshold: f32,
+}
+
+/// Resolve the `CRABCROP_CLIP_*` set through `get` (a name
+/// to value lookup, so tests can drive it without the
+/// process environment). A partial set, or an out-of-range
+/// threshold, is an error.
+fn clip_config(get: impl Fn(&str) -> Option<String>) -> Result<Option<ClipConfig>, String> {
+    const NAMES: [&str; 4] = [
+        "CRABCROP_CLIP_IMAGE_MODEL",
+        "CRABCROP_CLIP_TEXT_MODEL",
+        "CRABCROP_CLIP_TOKENIZER",
+        "CRABCROP_CLIP_LABELS",
+    ];
+    let values: Vec<Option<String>> = NAMES
+        .iter()
+        .map(|name| get(name).filter(|v| !v.is_empty()))
+        .collect();
+    if values.iter().all(|v| v.is_none()) {
+        return Ok(None);
+    }
+    let missing: Vec<&str> = NAMES
+        .iter()
+        .zip(&values)
+        .filter(|(_, v)| v.is_none())
+        .map(|(name, _)| *name)
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "CLIP annotation is partially configured: missing {}",
+            missing.join(", ")
+        ));
+    }
+    let threshold = match get("CRABCROP_CLIP_THRESHOLD").filter(|v| !v.is_empty()) {
+        Some(raw) => {
+            let parsed: f32 = raw
+                .parse()
+                .map_err(|_| format!("CRABCROP_CLIP_THRESHOLD is not a number: {raw:?}"))?;
+            if !(0.0..=1.0).contains(&parsed) {
+                return Err(format!(
+                    "CRABCROP_CLIP_THRESHOLD must be within 0..=1, got {parsed}"
+                ));
+            }
+            parsed
+        }
+        None => 0.05,
+    };
+    let mut values = values.into_iter();
+    Ok(Some(ClipConfig {
+        image_model: values.next().unwrap().unwrap(),
+        text_model: values.next().unwrap().unwrap(),
+        tokenizer: values.next().unwrap().unwrap(),
+        labels: values.next().unwrap().unwrap(),
+        threshold,
+    }))
+}
+
+/// Build the CLIP tag provider from the environment, when
+/// configured: preloaded like every other model, with a
+/// broken configuration failing startup.
+fn build_tagger(
+    ort_dylib: Option<&str>,
+) -> Result<Option<Arc<dyn crate::ai::TagProvider>>, String> {
+    let config = clip_config(|name| env::var(name).ok())?;
+    match config {
+        None => Ok(None),
+        Some(config) => {
+            let provider = crate::ai::OnnxClipProvider::load(
+                ort_dylib,
+                &config.image_model,
+                &config.text_model,
+                &config.tokenizer,
+                &config.labels,
+                config.threshold,
+            )
+            .map_err(|e| format!("cannot load the CLIP tagging models: {e}"))?;
+            println!(
+                "CLIP tagging loaded ({} labels, threshold {})",
+                provider.label_count(),
+                config.threshold
+            );
+            Ok(Some(Arc::new(provider)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_config_needs_all_four_paths_or_none() {
+        let get = |pairs: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |name: &str| map.get(name).cloned()
+        };
+        // None configured: off.
+        assert!(clip_config(get(&[])).unwrap().is_none());
+        // Partial: an error naming what is missing.
+        let err = clip_config(get(&[("CRABCROP_CLIP_IMAGE_MODEL", "a.onnx")])).unwrap_err();
+        assert!(err.contains("CRABCROP_CLIP_TEXT_MODEL"), "{err}");
+        assert!(err.contains("CRABCROP_CLIP_LABELS"), "{err}");
+        // Full set: defaults and explicit threshold.
+        let full = clip_config(get(&[
+            ("CRABCROP_CLIP_IMAGE_MODEL", "a.onnx"),
+            ("CRABCROP_CLIP_TEXT_MODEL", "b.onnx"),
+            ("CRABCROP_CLIP_TOKENIZER", "t.json"),
+            ("CRABCROP_CLIP_LABELS", "labels.txt"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(full.threshold, 0.05);
+        let bad = clip_config(get(&[
+            ("CRABCROP_CLIP_IMAGE_MODEL", "a.onnx"),
+            ("CRABCROP_CLIP_TEXT_MODEL", "b.onnx"),
+            ("CRABCROP_CLIP_TOKENIZER", "t.json"),
+            ("CRABCROP_CLIP_LABELS", "labels.txt"),
+            ("CRABCROP_CLIP_THRESHOLD", "2.5"),
+        ]));
+        assert!(bad.is_err());
+    }
 
     #[test]
     fn bucket_policy_fails_closed_with_credentials() {
