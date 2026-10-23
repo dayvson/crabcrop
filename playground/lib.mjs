@@ -58,6 +58,7 @@ const FILTER_BLURBS = {
   brighten: "brighten by the given amount (-255..255)",
   contrast: "contrast multiplier (1 is identity)",
   huerotate: "rotate the hue by the given degrees",
+  rotate: "rotate by a multiple of 90 degrees",
   quality: "output quality 0..100, or `auto` for perceptual targeting",
   format: "force the output format",
   fill: "the background color other operations pad with",

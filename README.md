@@ -381,7 +381,7 @@ Error bodies are plain text with a short message. The statuses you can get:
 | Status | Meaning |
 | --- | --- |
 | `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image — or an AI filter used on a server with no model configured. |
-| `403` | Bad signature, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
+| `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
 | `413` | The source image is larger than the 10 MiB fetch limit. |
 | `500` | Encoding the output failed, or an AI model failed at inference time. |
 | `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), or the fetched bytes could not be decoded as an image — including HEIC sources and undecodable formats. A watermark that fails to load also lands here. |
@@ -453,6 +453,17 @@ How configuration works:
 - The ONNX Runtime library itself comes from `CRABCROP_ORT_DYLIB`, or the system library search path when that is unset.
 
 The `Dockerfile.ai` variant in this repo shows the intended shape: the base image stays free of AI payload, and a second layer adds the pinned ONNX Runtime 1.31.0, the U2Netp model, and the YuNet model, each hash-checked at image build time, and enables the features by setting the variables above. Layer your own super-resolution model the same way and set `CRABCROP_UPSCALE_MODEL` to enable `upscale`.
+
+## Deployment
+
+The repo ships a multi-stage `Dockerfile` (the runtime image carries only the binary and CA certificates):
+
+```bash
+docker build -t crabcrop:latest .
+docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret crabcrop:latest
+```
+
+For the AI features, build `Dockerfile.ai` on top of that image; see [AI features](#ai-features).
 
 ## Development
 
