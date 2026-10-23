@@ -257,6 +257,21 @@ pub enum Filter {
         y: i32,
         alpha: u8,
     },
+    /// Composite another image over the result with a blend
+    /// mode, at (x, y) with an opacity (0-100), optionally
+    /// scaled to `width` percent of the base image's width.
+    /// The URL is the percent-decoded overlay location; the
+    /// server fetches it before the engine runs, through the
+    /// same prefetch as watermarks. Negative coordinates
+    /// anchor from the right/bottom edges.
+    Overlay {
+        url: String,
+        x: i32,
+        y: i32,
+        alpha: u8,
+        blend: BlendMode,
+        width: Option<u32>,
+    },
     /// Remove the background with the server's segmentation
     /// model, keeping the subject over transparency. The model
     /// is operator-configured; the engine applies its mask.
@@ -327,6 +342,21 @@ pub enum Filter {
     Format(ImageFormat),
     /// Cap every resize at the source dimensions.
     NoUpscale,
+}
+
+/// A blend mode for the `overlay` filter: the CSS formulas,
+/// applied per RGB channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    /// The overlay color, composited by alpha (watermark's
+    /// behavior).
+    Normal,
+    /// base x overlay: darkens.
+    Multiply,
+    /// Inverted multiply: lightens.
+    Screen,
+    /// Multiply below mid-gray, screen above it.
+    Overlay,
 }
 
 /// A direction for the `flip` filter.
@@ -758,6 +788,49 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 }
                 Filter::Rotate(degrees)
             }
+            ("overlay", Some(p)) => {
+                // <url>,<x>,<y>,<alpha>,<blend>[,<width>]. Like
+                // watermark, split from the right: the URL may
+                // contain commas, the trailing fields may not.
+                let parts: Vec<&str> = p.rsplitn(6, ',').collect();
+                if parts.len() != 5 && parts.len() != 6 {
+                    return Err(invalid());
+                }
+                let (width, rest) = if parts.len() == 6 {
+                    let w: u32 = parts[0].parse().map_err(|_| invalid())?;
+                    if w == 0 || w > 400 {
+                        return Err(invalid());
+                    }
+                    (Some(w), &parts[1..])
+                } else {
+                    (None, &parts[..])
+                };
+                let blend = match rest[0] {
+                    "normal" => BlendMode::Normal,
+                    "multiply" => BlendMode::Multiply,
+                    "screen" => BlendMode::Screen,
+                    "overlay" => BlendMode::Overlay,
+                    _ => return Err(invalid()),
+                };
+                let alpha: u32 = rest[1].parse().map_err(|_| invalid())?;
+                if alpha > 100 {
+                    return Err(invalid());
+                }
+                let y: i32 = rest[2].parse().map_err(|_| invalid())?;
+                let x: i32 = rest[3].parse().map_err(|_| invalid())?;
+                let url = percent_decode(rest[4]).ok_or_else(invalid)?;
+                if url.is_empty() {
+                    return Err(invalid());
+                }
+                Filter::Overlay {
+                    url,
+                    x,
+                    y,
+                    alpha: alpha as u8,
+                    blend,
+                    width,
+                }
+            }
             ("radius", Some(p)) => {
                 let parts: Vec<&str> = p.split(',').collect();
                 if parts.len() != 1 && parts.len() != 4 {
@@ -1156,16 +1229,18 @@ pub fn face_padding(ops: &[Operation]) -> f32 {
         .unwrap_or(0.5)
 }
 
-/// The distinct watermark URLs a request references, in order of
-/// first appearance. The server fetches each one before the
-/// engine runs.
+/// The distinct watermark and overlay URLs a request
+/// references, in order of first appearance. The server
+/// fetches each one before the engine runs.
 pub fn watermark_urls(ops: &[Operation]) -> Vec<&str> {
     let mut urls: Vec<&str> = Vec::new();
     for op in ops {
         if let Operation::Filters(filters) = op {
             for filter in filters {
-                let Filter::Watermark { url, .. } = filter else {
-                    continue;
+                let url = match filter {
+                    Filter::Watermark { url, .. } => url,
+                    Filter::Overlay { url, .. } => url,
+                    _ => continue,
                 };
                 if !urls.contains(&url.as_str()) {
                     urls.push(url.as_str());
@@ -1694,6 +1769,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_overlay() {
+        let (ops, _) = parse_operations(
+            "filters:overlay(https%3A%2F%2Fcdn.example.com%2Fov.png,10,-5,80,multiply)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Overlay {
+                url: "https://cdn.example.com/ov.png".to_string(),
+                x: 10,
+                y: -5,
+                alpha: 80,
+                blend: BlendMode::Multiply,
+                width: None,
+            }])]
+        );
+        // Width form, and a comma inside the URL itself.
+        let (ops, _) = parse_operations(
+            "filters:overlay(https%3A%2F%2Fx%2Fa,b.png,0,0,100,screen,25)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Overlay {
+                url: "https://x/a,b.png".to_string(),
+                x: 0,
+                y: 0,
+                alpha: 100,
+                blend: BlendMode::Screen,
+                width: Some(25),
+            }])]
+        );
+        // Overlay URLs join the prefetch set.
+        let (ops, _) = parse_operations(
+            "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,normal)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(watermark_urls(&ops), vec!["https://x/ov.png"]);
+    }
+
+    #[test]
     fn rejects_bad_filters() {
         for seg in [
             "filters:",
@@ -1728,6 +1844,12 @@ mod tests {
             "filters:blur_region(1,2,3,4,5)",
             "filters:blur_region(-1,0,10,10)",
             "filters:pixelate_region(0,0,10,16384)",
+            "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,101,normal)",
+            "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,darken)",
+            "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,normal,0)",
+            "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,normal,401)",
+            "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100)",
+            "filters:overlay(,0,0,100,normal)",
         ] {
             assert_eq!(
                 parse_operations(&format!("{seg}/example.com/img.jpg")),

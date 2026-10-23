@@ -843,6 +843,19 @@ fn apply_operations(
                             })?;
                             img = overlay_watermark(&img, wm, *x, *y, *alpha);
                         }
+                        Filter::Overlay {
+                            url,
+                            x,
+                            y,
+                            alpha,
+                            blend,
+                            width,
+                        } => {
+                            let ov = ctx.watermarks.and_then(|m| m.get(url)).ok_or_else(|| {
+                                EngineError::Unsupported(format!("overlay was not resolved: {url}"))
+                            })?;
+                            img = blend_overlay(&img, ov, *x, *y, *alpha, *blend, *width);
+                        }
                         Filter::RemoveBg => {
                             let provider = ctx.mask_provider.ok_or_else(|| {
                                 EngineError::Unsupported(
@@ -1224,6 +1237,85 @@ fn encode_webp(img: &DynamicImage, quality: Option<u8>) -> Result<Vec<u8>, Engin
 /// (x = -1 puts the watermark's right edge one pixel from the
 /// base's right edge). Parts falling outside the base are
 /// clipped, never a panic.
+/// One channel of a blend mode: the CSS formulas on the
+/// 0-255 scale (`b` is the base channel, `o` the overlay's).
+fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
+    use crate::url::BlendMode;
+    match mode {
+        BlendMode::Normal => o,
+        BlendMode::Multiply => b * o / 255.0,
+        BlendMode::Screen => 255.0 - (255.0 - b) * (255.0 - o) / 255.0,
+        BlendMode::Overlay => {
+            if b < 127.5 {
+                2.0 * b * o / 255.0
+            } else {
+                255.0 - 2.0 * (255.0 - b) * (255.0 - o) / 255.0
+            }
+        }
+    }
+}
+
+/// Composite `ov` over `base` with a blend mode, at (x, y)
+/// with an opacity (0-100), optionally after scaling `ov`
+/// to `width_pct` percent of the base width (aspect
+/// preserved). Anchoring and clipping follow
+/// `overlay_watermark`, as does the alpha convention: the
+/// effective alpha is the overlay pixel's alpha times the
+/// opacity, and the base alpha channel is preserved, so
+/// `Normal` reproduces a watermark exactly.
+fn blend_overlay(
+    base: &DynamicImage,
+    ov: &DynamicImage,
+    x: i32,
+    y: i32,
+    alpha: u8,
+    mode: crate::url::BlendMode,
+    width_pct: Option<u32>,
+) -> DynamicImage {
+    let scaled;
+    let ov = match width_pct {
+        Some(pct) => {
+            let target = ((base.width() as u64 * pct as u64) / 100).max(1) as u32;
+            scaled = ov.resize(target, u32::MAX, image::imageops::FilterType::Lanczos3);
+            &scaled
+        }
+        None => ov,
+    };
+    let mut out = base.to_rgba8();
+    let ov = ov.to_rgba8();
+    let left = if x >= 0 {
+        x as i64
+    } else {
+        out.width() as i64 - ov.width() as i64 + x as i64
+    };
+    let top = if y >= 0 {
+        y as i64
+    } else {
+        out.height() as i64 - ov.height() as i64 + y as i64
+    };
+    let opacity = alpha as f32 / 100.0;
+    let (bw, bh) = (out.width() as i64, out.height() as i64);
+    for oy in 0..ov.height() as i64 {
+        for ox in 0..ov.width() as i64 {
+            let (bx, by) = (left + ox, top + oy);
+            if bx < 0 || by < 0 || bx >= bw || by >= bh {
+                continue;
+            }
+            let top_px = ov.get_pixel(ox as u32, oy as u32);
+            let a = opacity * (top_px[3] as f32 / 255.0);
+            if a <= 0.0 {
+                continue;
+            }
+            let bot = out.get_pixel_mut(bx as u32, by as u32);
+            for c in 0..3 {
+                let blended = blend_channel(mode, bot[c] as f32, top_px[c] as f32);
+                bot[c] = (bot[c] as f32 * (1.0 - a) + blended * a).round() as u8;
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(out)
+}
+
 fn overlay_watermark(
     base: &DynamicImage,
     wm: &DynamicImage,
@@ -3005,6 +3097,174 @@ mod tests {
         assert_eq!(img.get_pixel(17, 17), &image::Rgb([0, 0, 255]));
         assert_eq!(img.get_pixel(19, 19), &image::Rgb([255, 0, 0]));
         assert_eq!(img.get_pixel(13, 13), &image::Rgb([255, 0, 0]));
+    }
+
+    fn overlay_map() -> WatermarkImages {
+        let mut map = WatermarkImages::new();
+        map.insert(
+            "ov".to_string(),
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                2,
+                2,
+                image::Rgb([200, 100, 50]),
+            )),
+        );
+        map
+    }
+
+    fn overlay_base() -> Vec<u8> {
+        png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            4,
+            4,
+            image::Rgb([100, 150, 200]),
+        )))
+    }
+
+    #[test]
+    fn overlay_blend_modes_match_hand_computed_values() {
+        let engine = Engine;
+        let map = overlay_map();
+        // Base (100,150,200), overlay (200,100,50), full alpha.
+        let cases = [
+            (crate::url::BlendMode::Multiply, [78, 59, 39]),
+            (crate::url::BlendMode::Screen, [222, 191, 211]),
+            (crate::url::BlendMode::Overlay, [157, 127, 167]),
+            (crate::url::BlendMode::Normal, [200, 100, 50]),
+        ];
+        for (mode, want) in cases {
+            let out = engine
+                .process_preferred(
+                    &overlay_base(),
+                    &[Operation::Filters(vec![Filter::Overlay {
+                        url: "ov".to_string(),
+                        x: 0,
+                        y: 0,
+                        alpha: 100,
+                        blend: mode,
+                        width: None,
+                    }])],
+                    ProcessContext {
+                        watermarks: Some(&map),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+            assert_eq!(img.get_pixel(0, 0), &image::Rgb(want), "mode {mode:?}");
+            assert_eq!(img.get_pixel(3, 3), &image::Rgb([100, 150, 200]));
+        }
+        // Half opacity, normal mode: the plain average.
+        let out = engine
+            .process_preferred(
+                &overlay_base(),
+                &[Operation::Filters(vec![Filter::Overlay {
+                    url: "ov".to_string(),
+                    x: 0,
+                    y: 0,
+                    alpha: 50,
+                    blend: crate::url::BlendMode::Normal,
+                    width: None,
+                }])],
+                ProcessContext {
+                    watermarks: Some(&map),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(img.get_pixel(0, 0), &image::Rgb([150, 125, 125]));
+    }
+
+    #[test]
+    fn overlay_normal_mode_reproduces_watermark() {
+        let engine = Engine;
+        let map = overlay_map();
+        let make_ctx = || ProcessContext {
+            watermarks: Some(&map),
+            ..Default::default()
+        };
+        let via_watermark = engine
+            .process_preferred(
+                &overlay_base(),
+                &[Operation::Filters(vec![Filter::Watermark {
+                    url: "ov".to_string(),
+                    x: 1,
+                    y: 1,
+                    alpha: 80,
+                }])],
+                make_ctx(),
+            )
+            .unwrap();
+        let via_overlay = engine
+            .process_preferred(
+                &overlay_base(),
+                &[Operation::Filters(vec![Filter::Overlay {
+                    url: "ov".to_string(),
+                    x: 1,
+                    y: 1,
+                    alpha: 80,
+                    blend: crate::url::BlendMode::Normal,
+                    width: None,
+                }])],
+                make_ctx(),
+            )
+            .unwrap();
+        assert_eq!(via_watermark.bytes, via_overlay.bytes);
+    }
+
+    #[test]
+    fn overlay_width_scales_relative_to_the_base() {
+        let engine = Engine;
+        let mut map = WatermarkImages::new();
+        map.insert(
+            "blue".to_string(),
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255]))),
+        );
+        let out = engine
+            .process_preferred(
+                &red_source(),
+                &[Operation::Filters(vec![Filter::Overlay {
+                    url: "blue".to_string(),
+                    x: -2,
+                    y: -2,
+                    alpha: 100,
+                    blend: crate::url::BlendMode::Normal,
+                    width: Some(50),
+                }])],
+                ProcessContext {
+                    watermarks: Some(&map),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // Scaled to 50% of 20 = 10 px, anchored at (8, 8).
+        assert_eq!(img.get_pixel(8, 8), &image::Rgb([0, 0, 255]));
+        assert_eq!(img.get_pixel(17, 17), &image::Rgb([0, 0, 255]));
+        assert_eq!(img.get_pixel(18, 18), &image::Rgb([255, 0, 0]));
+        assert_eq!(img.get_pixel(7, 7), &image::Rgb([255, 0, 0]));
+    }
+
+    #[test]
+    fn unresolved_overlay_is_an_error() {
+        let engine = Engine;
+        let err = engine
+            .process(
+                &overlay_base(),
+                &[Operation::Filters(vec![Filter::Overlay {
+                    url: "missing".to_string(),
+                    x: 0,
+                    y: 0,
+                    alpha: 100,
+                    blend: crate::url::BlendMode::Normal,
+                    width: None,
+                }])],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("overlay was not resolved"),
+            "got: {err}"
+        );
     }
 
     #[test]

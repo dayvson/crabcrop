@@ -112,6 +112,7 @@ const FILTER_BLURBS = {
   pixelate: "mosaic into blocks of the given pixel size, each block averaged",
   flip: "mirror the image: `h` horizontal, `v` vertical",
   blur_region: "gaussian-blur the rectangle (x,y,w,h) in pixels at this point in the chain (redaction)",
+  overlay: "composite another image over the result: (url,x,y,alpha,blend[,width %]) with blend normal, multiply, screen, or overlay",
   pixelate_region: "pixelate the rectangle (x,y,w,h) in pixels at this point in the chain (redaction)",
 };
 
@@ -288,6 +289,22 @@ function validateFilter(name, args) {
         : bad;
     case "flip":
       return args === "h" || args === "v" ? null : bad;
+    case "overlay": {
+      if (args === null) return bad;
+      const rest = args.split(",");
+      if (rest.length < 5) return bad;
+      let width = null;
+      if (rest.length >= 6 && /^\d+$/.test(rest[rest.length - 1])) width = rest.pop();
+      const blend = rest.pop();
+      if (!["normal", "multiply", "screen", "overlay"].includes(blend)) return bad;
+      if (width !== null && (BigInt(width) < 1n || BigInt(width) > 400n)) return bad;
+      const alpha = rest.pop();
+      if (!/^\d+$/.test(alpha) || BigInt(alpha) > 100n) return bad;
+      const y = rest.pop();
+      const x = rest.pop();
+      if (!/^-?\d+$/.test(x) || !/^-?\d+$/.test(y)) return bad;
+      return rest.join(",").length > 0 ? null : bad;
+    }
     case "blur_region":
     case "pixelate_region": {
       if (args === null) return bad;

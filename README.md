@@ -262,6 +262,25 @@ The server fetches each watermark through the same loader, limits, and source po
 curl "http://localhost:3000/unsafe/filters:watermark(https%3A%2F%2Fcdn.example.com%2Flogo.png,-10,-10,80)/https://example.com/photo.jpg"
 ```
 
+**Overlay** generalizes the watermark with blend modes and relative sizing:
+
+```text
+filters:overlay(<url>,<x>,<y>,<alpha>,<blend>)
+filters:overlay(<url>,<x>,<y>,<alpha>,<blend>,<width>)
+```
+
+| Parameter | Description |
+| --- | --- |
+| `url`, `x`, `y`, `alpha` | Same as `watermark`: percent-encoded URL (may contain commas), position with negative values anchoring from the right and bottom edges, opacity 0 to 100. |
+| `blend` | How the overlay's colors mix with the image below: `normal` (the watermark behavior), `multiply`, `screen`, or `overlay`, the CSS formulas per channel. The mix is composited at the effective alpha (the overlay's own alpha times `alpha`), and the base image's alpha channel is preserved. |
+| `width` | Optional. Scale the overlay to this percentage of the base image's width (1 to 400), preserving its aspect ratio, before compositing. |
+
+Overlay images are fetched through the same prefetch, loader, and failure semantics as watermarks: a failed overlay fails the request.
+
+```bash
+curl "http://localhost:3000/unsafe/filters:overlay(https%3A%2F%2Fcdn.example.com%2Ftexture.png,0,0,60,multiply,100)/https://example.com/photo.jpg"
+```
+
 **Text overlay** draws a label with a font configured on the server:
 
 ```text

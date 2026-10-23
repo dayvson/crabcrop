@@ -94,6 +94,10 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:blur_region(1,2,30,40):pixelate_region(0,0,5,5)/" + SRC, false, SRC],
     ["filters:blur_region(1,2,0,40)/" + SRC, true, SRC],
     ["filters:pixelate_region(0,0,10,16384)/" + SRC, true, SRC],
+    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,80,multiply)/" + SRC, false, SRC],
+    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,screen,25)/" + SRC, false, SRC],
+    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,darken)/" + SRC, true, SRC],
+    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,101,normal)/" + SRC, true, SRC],
   ];
   for (const [remainder, expectError, expectSource] of cases) {
     const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);
