@@ -177,7 +177,7 @@ fn width_hint(headers: &HeaderMap) -> Option<u32> {
             continue;
         };
         if let Ok(w) = raw.trim().parse::<u32>()
-            && (1..=16383).contains(&w)
+            && (1..=crate::url::MAX_DIMENSION).contains(&w)
         {
             return Some(w);
         }
@@ -187,10 +187,14 @@ fn width_hint(headers: &HeaderMap) -> Option<u32> {
 
 /// Round a hinted width UP to the next multiple of the
 /// quantization step, so a client never gets less than it
-/// asked for and the cache sees bounded cardinality.
+/// asked for and the cache sees bounded cardinality. The
+/// result is clamped to the parser's dimension cap: the
+/// synthesized op bypasses parsing, so without the clamp
+/// a near-cap hint at a coarse step would mint a size the
+/// URL grammar itself would reject.
 fn quantize_width(width: u32, step: u32) -> u32 {
     let step = step.max(1);
-    width.div_ceil(step) * step
+    (width.div_ceil(step) * step).min(crate::url::MAX_DIMENSION)
 }
 
 /// Whether the client sent `Save-Data: on`.
@@ -2075,6 +2079,9 @@ mod tests {
         assert_eq!(quantize_width(250, 100), 300);
         assert_eq!(quantize_width(250, 1), 250);
         assert_eq!(quantize_width(250, 0), 250);
+        // Rounding up never crosses the parser's cap.
+        assert_eq!(quantize_width(16383, 2000), 16383);
+        assert_eq!(quantize_width(16383, 100), 16383);
     }
 
     #[test]
