@@ -64,6 +64,30 @@ pub enum ParseError {
     MissingSourceUrl,
 }
 
+impl ParseError {
+    /// The variant's stable machine-readable code, for the
+    /// v2 error contract (`{"error":{"code":...}}`). These
+    /// strings are frozen once published: a variant may be
+    /// renamed in code, but its code never changes.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ParseError::EmptyPath => "empty_path",
+            ParseError::MissingSignature => "missing_signature",
+            ParseError::MalformedSignature => "malformed_signature",
+            ParseError::InvalidSize(_) => "invalid_size",
+            ParseError::InvalidCrop(_) => "invalid_crop",
+            ParseError::InvalidCropRect(_) => "invalid_crop_rect",
+            ParseError::InvalidPad(_) => "invalid_pad",
+            ParseError::InvalidExpiry(_) => "invalid_expiry",
+            ParseError::UnknownPreset(_) => "unknown_preset",
+            ParseError::InvalidPreset(_) => "invalid_preset",
+            ParseError::PresetsOnly(_) => "presets_only",
+            ParseError::InvalidFilters(_) => "invalid_filters",
+            ParseError::MissingSourceUrl => "missing_source_url",
+        }
+    }
+}
+
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1859,6 +1883,31 @@ mod tests {
         // An exp: segment inside the source is URL text, kept.
         let tricky = "https://example.com/exp:123/a.jpg";
         assert_eq!(cache_key_form(tricky), tricky);
+    }
+
+    #[test]
+    fn parse_error_codes_are_the_frozen_v2_set() {
+        let cases: Vec<(ParseError, &str)> = vec![
+            (ParseError::EmptyPath, "empty_path"),
+            (ParseError::MissingSignature, "missing_signature"),
+            (ParseError::MalformedSignature, "malformed_signature"),
+            (ParseError::InvalidSize("x".into()), "invalid_size"),
+            (ParseError::InvalidCrop("x".into()), "invalid_crop"),
+            (ParseError::InvalidCropRect("x".into()), "invalid_crop_rect"),
+            (ParseError::InvalidPad("x".into()), "invalid_pad"),
+            (ParseError::InvalidExpiry("x".into()), "invalid_expiry"),
+            (ParseError::UnknownPreset("x".into()), "unknown_preset"),
+            (ParseError::InvalidPreset("x".into()), "invalid_preset"),
+            (ParseError::PresetsOnly("x".into()), "presets_only"),
+            (ParseError::InvalidFilters("x".into()), "invalid_filters"),
+            (ParseError::MissingSourceUrl, "missing_source_url"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (err, expected) in &cases {
+            assert_eq!(err.code(), *expected);
+            assert!(seen.insert(err.code()), "codes must be unique");
+        }
+        assert_eq!(seen.len(), cases.len());
     }
 
     #[test]

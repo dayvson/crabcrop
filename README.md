@@ -435,14 +435,15 @@ With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at sta
 
 ## Errors
 
-Error bodies are plain text with a short message. The statuses you can get:
+Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `presets_only`, `invalid_filters`, `missing_source_url`. The statuses you can get:
 
 | Status | Meaning |
 | --- | --- |
-| `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image — or an AI filter used on a server with no model configured. |
+| `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image. |
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
 | `413` | The source image is larger than the 10 MiB fetch limit. |
 | `500` | Encoding the output failed, or an AI model failed at inference time. |
+| `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font. |
 | `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), or the fetched bytes could not be decoded as an image — including HEIC sources and undecodable formats. A watermark that fails to load also lands here. |
 | `504` | The source fetch timed out (10 seconds). |
 
