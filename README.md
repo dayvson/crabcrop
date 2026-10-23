@@ -1,7 +1,7 @@
 # crabcrop
 
 <p align="center">
-  <img src="assets/crabcrop-mascot.gif" alt="The crabcrop mascot: a crochet crab waving hello and holding a photo" width="260">
+  <img src="assets/crabcrop-mascot.webp" alt="The crabcrop mascot: a crochet crab waving hello and holding a photo" width="260">
 </p>
 
 crabcrop is an on-demand image optimization service written in Rust. You request an image with the operations encoded in the URL — resize, crop, convert, filter — and crabcrop fetches the source image, applies the operations in order, and returns the result. There are no pre-generated thumbnails and no build step: the URL is the API.
