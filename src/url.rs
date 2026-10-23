@@ -1769,14 +1769,14 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
 
 /// Verify a purge signature, with the same unsafe semantics
 /// as [`verify`].
-pub fn verify_purge(
-    secret: &[u8],
-    signature: &Signature,
-    target: &str,
-    allow_unsafe: bool,
-) -> bool {
+/// Verify a purge signature. Purges are the server's only
+/// destructive operation, so they never honor `unsafe`
+/// (review Q3): an HMAC under the purge subkey is always
+/// required, whatever the image-read mode. A read-mode
+/// flag must not silently grant them.
+pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool {
     match signature {
-        Signature::Unsafe => allow_unsafe,
+        Signature::Unsafe => false,
         Signature::Hmac(hex_digest) => crabcrop_url::verify(&purge_key(secret), hex_digest, target),
     }
 }
@@ -2015,18 +2015,10 @@ mod tests {
         // "purge/<target>" must not verify as a purge signature.
         let image_sig = crabcrop_url::sign(secret, &format!("purge/{target}"));
         assert_ne!(purge_sig, image_sig);
-        assert!(verify_purge(
-            secret,
-            &Signature::Hmac(purge_sig),
-            target,
-            false
-        ));
-        assert!(!verify_purge(
-            secret,
-            &Signature::Hmac(image_sig),
-            target,
-            false
-        ));
+        assert!(verify_purge(secret, &Signature::Hmac(purge_sig), target));
+        assert!(!verify_purge(secret, &Signature::Hmac(image_sig), target));
+        // Purges never honor unsafe (Q3), in any mode.
+        assert!(!verify_purge(secret, &Signature::Unsafe, target));
     }
 
     #[test]
