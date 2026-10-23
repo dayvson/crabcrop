@@ -740,11 +740,7 @@ async fn serve(
             Ok(Ok(permit)) => Some(permit),
             _ => {
                 return (
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "server busy: AI processing queue is full",
-                    )
-                        .into_response(),
+                    busy_response("server busy: AI processing queue is full", 5),
                     record,
                 );
             }
@@ -789,11 +785,7 @@ async fn serve(
         Ok(p) => p,
         Err(ProcessFailure::Busy) => {
             return (
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server busy: too many images processing at once",
-                )
-                    .into_response(),
+                busy_response("server busy: too many images processing at once", 1),
                 record,
             );
         }
@@ -1173,6 +1165,20 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
         );
     }
     (headers, bytes).into_response()
+}
+
+/// A 503 for a saturated gate. Retry-After tells clients
+/// and CDNs when a retry has a chance, instead of letting
+/// them retry straight into the same full queue; the value
+/// is sized to the gate (the AI gate's jobs run seconds,
+/// the process gate's run in well under one).
+fn busy_response(message: &'static str, retry_after_secs: u64) -> Response {
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        retry_after_secs.to_string().parse().unwrap(),
+    );
+    response
 }
 
 fn load_error_response(e: LoadError) -> Response {
@@ -2086,6 +2092,23 @@ mod tests {
             req = req.header(*name, *value);
         }
         req.send().await.unwrap()
+    }
+
+    #[test]
+    fn busy_responses_carry_retry_after() {
+        // Both gate 503s are built by busy_response; the
+        // header is what lets a client back off instead of
+        // retrying into the same full queue (review AP-9).
+        let resp = busy_response("server busy", 5);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "5"
+        );
     }
 
     #[tokio::test]
