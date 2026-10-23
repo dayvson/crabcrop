@@ -34,13 +34,28 @@ async function rebuild() {
     .filter(Boolean)
     .join("/");
   const expirySeconds = $("expiry").value;
-  builtUrl = await buildPlaygroundUrl({
-    base: $("base").value.trim(),
-    secret: $("secret").value || null,
-    operations,
-    source: $("source").value.trim(),
-    expires: expirySeconds ? Math.floor(Date.now() / 1000) + Number(expirySeconds) : undefined,
-  });
+  try {
+    builtUrl = await buildPlaygroundUrl({
+      base: $("base").value.trim(),
+      secret: $("secret").value || null,
+      operations,
+      source: $("source").value.trim(),
+      expires: expirySeconds ? Math.floor(Date.now() / 1000) + Number(expirySeconds) : undefined,
+    });
+  } catch (err) {
+    // The builder throws by design on inputs that are
+    // routine while typing or pasting (a source carrying
+    // a "?", a space, a non-ASCII character): surface the
+    // reason in the status line and clear the stale build,
+    // instead of leaving the previous URL and preview on
+    // screen with no indication anything is wrong.
+    builtUrl = "";
+    $("built").value = "";
+    $("preview").removeAttribute("src");
+    $("sizes").textContent =
+      `Cannot build a URL from these inputs: ${err instanceof Error ? err.message : String(err)}`;
+    return;
+  }
   $("built").value = builtUrl;
   $("preview").src = builtUrl;
   void measureSizes(builtUrl);
