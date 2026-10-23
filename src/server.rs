@@ -249,12 +249,16 @@ fn purge_log(event: &str, target: &str, removed: Option<usize>) {
 
 async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let Some(tail) = uri.path().strip_prefix("/purge/") else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected /purge/<signature>/<target>",
+        )
+            .into_response();
     };
     let full = format!("/{tail}");
     let (signature, target) = match parse_signature(&full) {
         Ok(v) => v,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     if !verify_purge(&state.secret, &signature, target, state.allow_unsafe) {
         state.metrics.record_purge();
@@ -283,15 +287,19 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
 /// unknown group answers 200 with a count of 0.
 async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let Some(tail) = uri.path().strip_prefix("/purge-group/") else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected /purge-group/<signature>/<group>",
+        )
+            .into_response();
     };
     let full = format!("/{tail}");
     let (signature, group) = match parse_signature(&full) {
         Ok(v) => v,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     if group.is_empty() || group.contains('/') {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, "invalid purge group name").into_response();
     }
     let target = format!("purge-group/{group}");
     if !verify_purge(&state.secret, &signature, &target, state.allow_unsafe) {
@@ -480,9 +488,18 @@ async fn serve(
     let mut record = RequestRecord::default();
     let full = format!("/{path}");
 
+    // Grammar failures answer 400 with the parser's own
+    // message as the body: it names only what the caller
+    // sent, and it is the difference between a debuggable
+    // rejection and an empty one.
     let (signature, rest) = match parse_signature(&full) {
         Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_REQUEST.into_response(), record),
+        Err(e) => {
+            return (
+                (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+                record,
+            );
+        }
     };
     let verify_start = Instant::now();
     let verified = verify(&state.secret, &signature, rest, state.allow_unsafe);
@@ -497,7 +514,14 @@ async fn serve(
     // P-1): an image remainder may not begin with the `purge`
     // segment, so the two URL shapes can never be confused.
     if matches!(rest.split('/').next(), Some("purge" | "purge-group")) {
-        return (StatusCode::BAD_REQUEST.into_response(), record);
+        return (
+            (
+                StatusCode::BAD_REQUEST,
+                "an image URL may not begin with a purge segment",
+            )
+                .into_response(),
+            record,
+        );
     }
     // The cache groups (RFC 9875) are the presets the signed
     // remainder references, read before expansion rewrites it.
@@ -516,12 +540,22 @@ async fn serve(
                 expanded = text;
                 &expanded
             }
-            Err(_) => return (StatusCode::BAD_REQUEST.into_response(), record),
+            Err(e) => {
+                return (
+                    (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+                    record,
+                );
+            }
         }
     };
     let (ops, source_url, expiry) = match parse_operations_with_expiry(rest) {
         Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_REQUEST.into_response(), record),
+        Err(e) => {
+            return (
+                (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+                record,
+            );
+        }
     };
     // The operation summary is everything before the source URL.
     record.ops = rest[..rest.len() - source_url.len()]
@@ -1467,6 +1501,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn grammar_rejections_carry_the_parser_message() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // The 400 body is the parser's own message, so a
+        // signed-URL bug is debuggable from the response
+        // alone (review AP-2).
+        for (remainder, want) in [
+            (
+                format!("crop:300x0/{src}"),
+                "invalid crop segment: crop:300x0".to_string(),
+            ),
+            (
+                format!("filters:bogus(1)/{src}"),
+                "invalid filters segment: filters:bogus(1)".to_string(),
+            ),
+            (
+                format!("exp:soon/300x50/{src}"),
+                "invalid expiry segment: exp:soon".to_string(),
+            ),
+        ] {
+            let resp = client()
+                .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{remainder}");
+            assert_eq!(resp.text().await.unwrap(), want, "{remainder}");
+        }
+        // Preset expansion failures name the preset.
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        let remainder = format!("preset:nope/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.text().await.unwrap(), "unknown preset: nope");
     }
 
     fn preset_test_map() -> std::collections::HashMap<String, String> {
