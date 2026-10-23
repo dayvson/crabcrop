@@ -38,6 +38,9 @@ const FILTER_BLURBS = {
   fill: "the background color other operations pad with",
   facepad: "how much a face crop expands around the face",
   pixelatefaces: "pixelate detected faces (needs a face model on the server)",
+  blurclass: "blur every detected object of the named class (needs a detection model on the server)",
+  pixelateclass:
+    "pixelate every detected object of the named class (needs a detection model on the server)",
   removebg: "remove the background (needs an AI model on the server)",
   upscale: "AI upscale by the given factor (needs an AI model on the server)",
   equalize: "histogram equalization",
@@ -250,6 +253,18 @@ function validateFilter(name, args) {
       const x = rest.pop()!;
       if (!/^-?\d+$/.test(x) || !/^-?\d+$/.test(y)) return bad;
       return rest.join(",").length > 0 ? null : bad;
+    }
+    case "blurclass":
+    case "pixelateclass": {
+      if (args === null) return bad;
+      const decoded = percentDecodable(args);
+      if (decoded === null) return bad;
+      const name = decoded.trim();
+      return name.length >= 1 &&
+        name.length <= 64 &&
+        /^[\p{L}\p{N} _.\-/]+$/u.test(name)
+        ? null
+        : bad;
     }
     case "blur_region":
     case "pixelate_region": {

@@ -57,6 +57,12 @@ pub struct AppState {
     /// boot when the `CRABCROP_CLIP_*` set is configured.
     /// `None` means meta responses carry no tags or alt text.
     pub tagger: Option<Arc<dyn crate::ai::TagProvider>>,
+    /// Detection provider for class redaction and meta
+    /// detections, preloaded at boot when
+    /// `CRABCROP_DETECT_MODEL` is configured. `None` means
+    /// class redaction fails cleanly and meta carries no
+    /// detections.
+    pub detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
     /// Text renderer, loaded at boot when `CRABCROP_FONT_PATH`
     /// is configured. `None` means `text(...)` requests fail
     /// cleanly.
@@ -253,6 +259,7 @@ struct ProcessJob {
     mask_provider: Option<Arc<dyn crate::ai::MaskProvider>>,
     upscale_provider: Option<Arc<dyn crate::ai::UpscaleProvider>>,
     face_provider: Option<Arc<dyn crate::ai::FaceProvider>>,
+    detect_provider: Option<Arc<dyn crate::ai::DetectionProvider>>,
     text_renderer: Option<Arc<dyn crate::text::TextRenderer>>,
     dpr: Option<f32>,
     ssim_target: f64,
@@ -311,6 +318,7 @@ async fn run_process(
             mask_provider: job.mask_provider.as_deref(),
             upscale_provider: job.upscale_provider.as_deref(),
             face_provider: job.face_provider.as_deref(),
+            detect_provider: job.detect_provider.as_deref(),
             text_renderer: job.text_renderer.as_deref(),
             dpr: job.dpr,
             ssim_target: job.ssim_target,
@@ -526,6 +534,7 @@ async fn serve(
     let _ai_permit = if crate::url::has_removebg(&ops)
         || crate::url::has_upscale(&ops)
         || crate::url::has_smart_crop(&ops)
+        || crate::url::has_class_redaction(&ops)
     {
         // The wait is bounded (audit PL-14): a burst of AI
         // requests sheds with a 503 instead of parking
@@ -554,6 +563,7 @@ async fn serve(
         mask_provider: state.removebg.clone(),
         upscale_provider: state.upscale.clone(),
         face_provider: state.face.clone(),
+        detect_provider: state.detect.clone(),
         text_renderer: state.font.clone(),
         dpr: dpr_hint,
         ssim_target: state.ssim_target,
@@ -630,8 +640,13 @@ async fn serve(
     } else {
         None
     };
+    let detections = if meta && wants_detections(accept) {
+        detect_meta(state, &processed).await
+    } else {
+        None
+    };
     let mut response = if meta {
-        meta_response(&processed, annotation.as_ref())
+        meta_response(&processed, annotation.as_ref(), detections.as_deref())
     } else {
         respond(processed.format, processed.quality, processed.bytes)
     };
@@ -718,6 +733,19 @@ fn wants_meta(accept: Option<&str>) -> bool {
 /// placeholder fields: a `placeholders` parameter on that entry,
 /// bare or set to a truthy value (`0`/`false` decline).
 fn wants_placeholders(accept: Option<&str>) -> bool {
+    wants_meta_param(accept, "placeholders")
+}
+
+/// Whether the accepted `application/json` entry asks for
+/// detection boxes: a `detections` parameter, same rule as
+/// `placeholders`.
+fn wants_detections(accept: Option<&str>) -> bool {
+    wants_meta_param(accept, "detections")
+}
+
+/// Whether the accepted `application/json` entry carries
+/// the named parameter, bare or set to a truthy value.
+fn wants_meta_param(accept: Option<&str>, name: &str) -> bool {
     let Some(accept) = accept else {
         return false;
     };
@@ -738,7 +766,7 @@ fn wants_placeholders(accept: Option<&str>) -> bool {
         }
         return params.iter().any(|p| {
             let mut kv = p.trim().splitn(2, '=');
-            kv.next() == Some("placeholders")
+            kv.next() == Some(name)
                 && !matches!(kv.next().map(str::trim), Some("0") | Some("false"))
         });
     }
@@ -788,9 +816,39 @@ async fn annotate_meta(
     }
 }
 
+/// Run object detection for a meta response, when a
+/// detection provider is configured and the request asked
+/// (`detections=1`). Same failure stance as annotation:
+/// detection is a debugging surface here, so a failure
+/// omits the field rather than failing the response.
+async fn detect_meta(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+) -> Option<Vec<crate::ai::Detection>> {
+    let detector = state.detect.as_ref()?;
+    let _permit = tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()?;
+    let img = crate::engine::decode_image(&processed.bytes).ok()?;
+    let detector = detector.clone();
+    match tokio::task::spawn_blocking(move || detector.detect(&img)).await {
+        Ok(Ok(detections)) => Some(detections),
+        Ok(Err(e)) => {
+            eprintln!("detection error: {e}");
+            None
+        }
+        Err(e) => {
+            eprintln!("detection task failed: {e}");
+            None
+        }
+    }
+}
+
 fn meta_response(
     processed: &crate::engine::ProcessedImage,
     annotation: Option<&crate::ai::Annotation>,
+    detections: Option<&[crate::ai::Detection]>,
 ) -> Response {
     let mut body = format!(
         "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}",
@@ -818,6 +876,23 @@ fn meta_response(
             tags.join(","),
             serde_json::to_string(&a.alt_text).unwrap_or_default()
         ));
+    }
+    if let Some(detections) = detections {
+        let boxes: Vec<String> = detections
+            .iter()
+            .map(|d| {
+                format!(
+                    "{{\"label\":{},\"score\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                    serde_json::to_string(&d.label).unwrap_or_default(),
+                    d.score,
+                    d.x,
+                    d.y,
+                    d.w,
+                    d.h
+                )
+            })
+            .collect();
+        body.push_str(&format!(",\"detections\":[{}]", boxes.join(",")));
     }
     if let Some(score) = processed.ssimulacra2 {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
@@ -1027,6 +1102,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            detect: None,
             font: None,
             fallback: None,
             store: None,
@@ -1068,6 +1144,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            detect: None,
             font: None,
             fallback: Some(Fallback::Bytes(Arc::new(png))),
             store: None,
@@ -1217,6 +1294,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            detect: None,
             font: None,
             fallback: None,
             store: None,
@@ -1499,6 +1577,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: Some(Arc::new(FakeTagger)),
+            detect: None,
             font: None,
             fallback: None,
             store: None,
@@ -1546,6 +1625,109 @@ mod tests {
         let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert!(meta.get("tags").is_none());
         assert!(meta.get("alt_text").is_none());
+    }
+
+    #[derive(Debug)]
+    struct FakeDetector;
+
+    impl crate::ai::DetectionProvider for FakeDetector {
+        fn classes(&self) -> &[String] {
+            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            CLASSES.get_or_init(|| vec!["person".to_string()])
+        }
+        fn detect(&self, _img: &image::DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
+            Ok(vec![crate::ai::Detection {
+                label: "person".to_string(),
+                score: 0.87,
+                x: 1,
+                y: 2,
+                w: 30,
+                h: 20,
+            }])
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingDetector;
+
+    impl crate::ai::DetectionProvider for FailingDetector {
+        fn classes(&self) -> &[String] {
+            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            CLASSES.get_or_init(|| vec!["person".to_string()])
+        }
+        fn detect(&self, _img: &image::DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
+            Err("detector exploded".to_string())
+        }
+    }
+
+    async fn spawn_app_with_detector(detector: Arc<dyn crate::ai::DetectionProvider>) -> String {
+        let state = AppState {
+            secret: SECRET.to_vec(),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            detect: Some(detector),
+            font: None,
+            fallback: None,
+            store: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn meta_includes_detections_only_when_asked_and_configured() {
+        let src = spawn_image_server().await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let get_meta = |base: String, accept: &'static str| {
+            let url_path = url_path.clone();
+            async move {
+                let resp = client()
+                    .get(format!("{base}{url_path}"))
+                    .header("Accept", accept)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                serde_json::from_str::<serde_json::Value>(&resp.text().await.unwrap()).unwrap()
+            }
+        };
+        // Asked + configured: boxes present and shaped right.
+        let base = spawn_app_with_detector(Arc::new(FakeDetector)).await;
+        let meta = get_meta(base, "application/json; detections=1").await;
+        let boxes = meta["detections"].as_array().unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0]["label"], "person");
+        assert_eq!(boxes[0]["score"], 0.87);
+        assert_eq!(boxes[0]["w"], 30);
+        // Configured but not asked: absent.
+        let base = spawn_app_with_detector(Arc::new(FakeDetector)).await;
+        let meta = get_meta(base, "application/json").await;
+        assert!(meta.get("detections").is_none());
+        // Asked and configured but the detector fails: the
+        // field is omitted, the response still succeeds.
+        let base = spawn_app_with_detector(Arc::new(FailingDetector)).await;
+        let meta = get_meta(base, "application/json; detections=1").await;
+        assert!(meta.get("detections").is_none());
+        assert_eq!(meta["width"], 40);
     }
 
     #[tokio::test]
@@ -1674,6 +1856,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            detect: None,
             font: None,
             fallback: None,
             store: Some(Arc::new(
@@ -1837,6 +2020,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            detect: None,
             font: None,
             fallback: None,
             store: None,
@@ -1856,6 +2040,7 @@ mod tests {
             mask_provider: None,
             upscale_provider: None,
             face_provider: None,
+            detect_provider: None,
             text_renderer: None,
             dpr: None,
             ssim_target: state.ssim_target,

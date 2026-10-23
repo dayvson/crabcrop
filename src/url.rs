@@ -282,6 +282,14 @@ pub enum Filter {
     /// Pixelate every detected face (privacy redaction),
     /// backed by the server's face model.
     PixelateFaces,
+    /// Blur every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    BlurClass(String),
+    /// Pixelate every detected object of the named class
+    /// (privacy redaction), backed by the server's
+    /// detection model.
+    PixelateClass(String),
     /// Padding for `crop:*:face`, as a fraction of the face
     /// size added on every side. A request-wide directive,
     /// like `no_upscale`.
@@ -613,6 +621,24 @@ fn parse_format(s: &str) -> Option<ImageFormat> {
 }
 
 /// Parse the filter list after `filters:`.
+/// A detection class name for `blurclass` / `pixelateclass`:
+/// the vocabulary's own spellings (COCO names like `traffic
+/// light` and `cell phone` included), so letters, digits,
+/// spaces, and a few joiners, trimmed, non-empty, bounded.
+fn parse_class_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.is_empty() || name.len() > 64 {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '/'))
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidFilters(seg.to_string());
     if rest.is_empty() {
@@ -703,6 +729,12 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             ("removebg", None) => Filter::RemoveBg,
             ("blurfaces", None) => Filter::BlurFaces,
             ("pixelatefaces", None) => Filter::PixelateFaces,
+            ("blurclass", Some(p)) => Filter::BlurClass(
+                parse_class_name(&percent_decode(p).ok_or_else(invalid)?).ok_or_else(invalid)?,
+            ),
+            ("pixelateclass", Some(p)) => Filter::PixelateClass(
+                parse_class_name(&percent_decode(p).ok_or_else(invalid)?).ok_or_else(invalid)?,
+            ),
             ("facepad", Some(p)) => {
                 let pad: f32 = p.parse().map_err(|_| invalid())?;
                 if !pad.is_finite() || !(0.0..=3.0).contains(&pad) {
@@ -1211,6 +1243,32 @@ pub fn needs_face_model(ops: &[Operation]) -> bool {
             .any(|f| matches!(f, Filter::BlurFaces | Filter::PixelateFaces)),
         _ => false,
     })
+}
+
+/// Whether any filters segment in `ops` requests a
+/// class redaction (`blurclass` / `pixelateclass`), which
+/// needs the detection model and the AI gate.
+pub fn has_class_redaction(ops: &[Operation]) -> bool {
+    !class_filters(ops).is_empty()
+}
+
+/// The class names requested by `ops`' class redaction
+/// filters, in request order.
+pub fn class_filters(ops: &[Operation]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for op in ops {
+        if let Operation::Filters(filters) = op {
+            for f in filters {
+                match f {
+                    Filter::BlurClass(name) | Filter::PixelateClass(name) => {
+                        out.push(name.as_str())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Padding for a face-aligned crop: the last `facepad(...)`
@@ -2148,6 +2206,30 @@ mod tests {
         // Smart crops and plain requests do not require a model.
         let (ops, _) = parse_operations("crop:300x300:smart/example.com/img.jpg").unwrap();
         assert!(!needs_face_model(&ops));
+
+        // Class redaction (#62): names parse as written,
+        // spaces included; the class list is in order.
+        let (ops, _) = parse_operations(
+            "filters:blurclass(person):pixelateclass(traffic%20light)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::BlurClass("person".to_string()),
+                Filter::PixelateClass("traffic light".to_string()),
+            ])]
+        );
+        assert!(has_class_redaction(&ops));
+        assert_eq!(class_filters(&ops), ["person", "traffic light"]);
+        for bad in [
+            "filters:blurclass()/example.com/img.jpg",
+            "filters:blurclass( )/example.com/img.jpg",
+            "filters:blurclass(per%24on)/example.com/img.jpg",
+            "filters:pixelateclass/example.com/img.jpg",
+        ] {
+            assert!(parse_operations(bad).is_err(), "{bad}");
+        }
 
         for bad in [
             "filters:facepad(9)/example.com/img.jpg",

@@ -86,6 +86,13 @@
 //!   memory cache). Unset disables it.
 //!   `CRABCROP_RESULT_STORAGE_MAX_MB` bounds it (default 512;
 //!   `0` disables storage even with a directory set).
+//! - `CRABCROP_DETECT_MODEL`: path to a YOLOv8-family ONNX
+//!   model for `blurclass` / `pixelateclass` redaction and
+//!   meta detections. Same preload rule. The class
+//!   vocabulary comes from the model's `names` metadata;
+//!   `CRABCROP_DETECT_LABELS` (one class per line) covers
+//!   exports without it. `CRABCROP_DETECT_THRESHOLD` sets
+//!   the score floor (default 0.5).
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
 //! - `PORT`: listen port, default 3000.
@@ -393,6 +400,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         };
     let tagger = build_tagger(ort_dylib.as_deref())?;
+    let detect = build_detector(ort_dylib.as_deref())?;
     let face: Option<Arc<dyn crate::ai::FaceProvider>> = match env::var("CRABCROP_FACE_MODEL") {
         Ok(path) if !path.is_empty() => {
             let provider = crate::ai::OnnxFaceProvider::load(ort_dylib.as_deref(), &path)
@@ -467,6 +475,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         upscale,
         face,
         tagger,
+        detect,
         font,
         fallback,
         store,
@@ -551,6 +560,45 @@ fn clip_config(get: impl Fn(&str) -> Option<String>) -> Result<Option<ClipConfig
         labels: values.next().unwrap().unwrap(),
         threshold,
     }))
+}
+
+/// Build the detection provider from the environment,
+/// when `CRABCROP_DETECT_MODEL` is set: preloaded like
+/// every other model, broken configuration fatal. The
+/// label file is only a fallback for exports that carry
+/// no class-names metadata.
+fn build_detector(
+    ort_dylib: Option<&str>,
+) -> Result<Option<Arc<dyn crate::ai::DetectionProvider>>, String> {
+    let path = match env::var("CRABCROP_DETECT_MODEL") {
+        Ok(path) if !path.is_empty() => path,
+        _ => return Ok(None),
+    };
+    let labels = env::var("CRABCROP_DETECT_LABELS")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let threshold = match env::var("CRABCROP_DETECT_THRESHOLD") {
+        Ok(raw) if !raw.is_empty() => {
+            let parsed: f32 = raw
+                .parse()
+                .map_err(|_| format!("CRABCROP_DETECT_THRESHOLD is not a number: {raw:?}"))?;
+            if !(0.0..=1.0).contains(&parsed) {
+                return Err(format!(
+                    "CRABCROP_DETECT_THRESHOLD must be within 0..=1, got {parsed}"
+                ));
+            }
+            parsed
+        }
+        _ => 0.5,
+    };
+    let provider =
+        crate::ai::OnnxDetectionProvider::load(ort_dylib, &path, labels.as_deref(), threshold)
+            .map_err(|e| format!("cannot load the detection model: {e}"))?;
+    println!(
+        "detection model loaded from {path} ({} classes, threshold {threshold})",
+        crate::ai::DetectionProvider::classes(&provider).len()
+    );
+    Ok(Some(Arc::new(provider)))
 }
 
 /// Build the CLIP tag provider from the environment, when

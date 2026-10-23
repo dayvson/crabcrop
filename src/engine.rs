@@ -203,6 +203,9 @@ pub struct ProcessContext<'a> {
     pub upscale_provider: Option<&'a dyn crate::ai::UpscaleProvider>,
     /// Face provider for smart crops, when configured.
     pub face_provider: Option<&'a dyn crate::ai::FaceProvider>,
+    /// Detection provider for class redaction, when
+    /// configured.
+    pub detect_provider: Option<&'a dyn crate::ai::DetectionProvider>,
     /// Text renderer, when a font is configured.
     pub text_renderer: Option<&'a dyn crate::text::TextRenderer>,
     /// DPR fallback from the request's client hint, used when
@@ -235,6 +238,7 @@ impl Default for ProcessContext<'_> {
             mask_provider: None,
             upscale_provider: None,
             face_provider: None,
+            detect_provider: None,
             text_renderer: None,
             dpr: None,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -345,6 +349,25 @@ impl Engine {
             return Err(EngineError::Unsupported(
                 "face operations are not configured on this server (no face model)".to_string(),
             ));
+        }
+        if crate::url::has_class_redaction(ops) {
+            let provider = ctx.detect_provider.ok_or_else(|| {
+                EngineError::Unsupported(
+                    "class redaction is not configured on this server (no detection model)"
+                        .to_string(),
+                )
+            })?;
+            for class in crate::url::class_filters(ops) {
+                if !provider
+                    .classes()
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(class))
+                {
+                    return Err(EngineError::Unsupported(format!(
+                        "unknown detection class {class:?}: not in the detection model's vocabulary"
+                    )));
+                }
+            }
         }
         let img = if detected == ImageFormat::Gif {
             // GIF sources decode frame by frame: an animated source
@@ -713,6 +736,49 @@ fn detect_faces(
     found.map_err(EngineError::Inference)
 }
 
+/// Memoized object detection for one pipeline run, the
+/// face memo's twin: chained class filters on the same
+/// image state share one inference.
+type DetectionMemo = Option<(u32, u32, Result<Vec<crate::ai::Detection>, String>)>;
+
+/// Detect objects in `img` through the context's provider,
+/// memoized like face detection. A provider failure is an
+/// inference error: on a redaction request that fails the
+/// request (never an unredacted response).
+fn detect_objects(
+    memo: &mut DetectionMemo,
+    img: &DynamicImage,
+    ctx: &ProcessContext<'_>,
+) -> Result<Vec<crate::ai::Detection>, EngineError> {
+    let provider = ctx.detect_provider.ok_or_else(|| {
+        EngineError::Unsupported(
+            "class redaction is not configured on this server (no detection model)".to_string(),
+        )
+    })?;
+    if let Some((w, h, cached)) = &memo
+        && *w == img.width()
+        && *h == img.height()
+    {
+        return cached.clone().map_err(EngineError::Inference);
+    }
+    let found = provider.detect(img);
+    *memo = Some((img.width(), img.height(), found.clone()));
+    found.map_err(EngineError::Inference)
+}
+
+/// The detections of one class (case-insensitive, the
+/// vocabulary's spelling is the model's own).
+fn detections_of_class(
+    detections: &[crate::ai::Detection],
+    class: &str,
+) -> Vec<crate::ai::Detection> {
+    detections
+        .iter()
+        .filter(|d| d.label.eq_ignore_ascii_case(class))
+        .cloned()
+        .collect()
+}
+
 /// The crop-rect stance for explicit regions: a rectangle
 /// that overflows the image in effect at this point in the
 /// chain fails the request, rather than redacting less than
@@ -744,6 +810,7 @@ fn apply_operations(
 ) -> Result<(DynamicImage, EncodeOptions), EngineError> {
     let mut directives = EncodeOptions::default();
     let mut face_memo: FaceMemo = None;
+    let mut detection_memo: DetectionMemo = None;
     for op in ops {
         match op {
             Operation::Size(size) => img = apply_size(img, size, cap, dpr)?,
@@ -876,6 +943,20 @@ fn apply_operations(
                         Filter::PixelateFaces => {
                             let faces = detect_faces(&mut face_memo, &img, ctx)?;
                             img = crate::filters::pixelate_faces(&img, &faces);
+                        }
+                        Filter::BlurClass(class) => {
+                            // The #42 rule, inherited: a
+                            // detection failure fails the
+                            // request rather than serve the
+                            // image unredacted.
+                            let detections = detect_objects(&mut detection_memo, &img, ctx)?;
+                            let boxes = detections_of_class(&detections, class);
+                            img = crate::filters::blur_detections(&img, &boxes);
+                        }
+                        Filter::PixelateClass(class) => {
+                            let detections = detect_objects(&mut detection_memo, &img, ctx)?;
+                            let boxes = detections_of_class(&detections, class);
+                            img = crate::filters::pixelate_detections(&img, &boxes);
                         }
                         // Padding is read from the request as a
                         // whole by the face crop; no pixels here.
@@ -3496,6 +3577,7 @@ mod tests {
                 }],
                 ProcessContext {
                     face_provider: Some(&RightFace),
+                    detect_provider: None,
                     ..Default::default()
                 },
             )
@@ -3546,6 +3628,171 @@ mod tests {
         }
     }
 
+    /// The class-redaction scene's vocabulary: person on
+    /// the left, car on the right.
+    #[derive(Debug)]
+    struct KnownObjects;
+
+    fn known_detections() -> Vec<crate::ai::Detection> {
+        vec![
+            crate::ai::Detection {
+                label: "person".to_string(),
+                score: 0.9,
+                x: 10,
+                y: 10,
+                w: 60,
+                h: 80,
+            },
+            crate::ai::Detection {
+                label: "car".to_string(),
+                score: 0.8,
+                x: 120,
+                y: 10,
+                w: 60,
+                h: 80,
+            },
+        ]
+    }
+
+    impl crate::ai::DetectionProvider for KnownObjects {
+        fn classes(&self) -> &[String] {
+            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            CLASSES.get_or_init(|| vec!["person".to_string(), "car".to_string()])
+        }
+        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
+            Ok(known_detections())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingObjects;
+
+    impl crate::ai::DetectionProvider for FailingObjects {
+        fn classes(&self) -> &[String] {
+            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            CLASSES.get_or_init(|| vec!["person".to_string()])
+        }
+        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
+            Err("detector exploded".to_string())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingObjects {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::ai::DetectionProvider for CountingObjects {
+        fn classes(&self) -> &[String] {
+            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            CLASSES.get_or_init(|| vec!["person".to_string(), "car".to_string()])
+        }
+        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(known_detections())
+        }
+    }
+
+    /// 200x100, a black/white checkerboard everywhere: any
+    /// redaction (blur or pixelate) visibly changes its box.
+    fn class_scene() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(200, 100, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgb([0, 0, 0])
+            } else {
+                image::Rgb([255, 255, 255])
+            }
+        });
+        png_bytes(&DynamicImage::ImageRgb8(img))
+    }
+
+    fn detect_ctx(provider: &dyn crate::ai::DetectionProvider) -> ProcessContext<'_> {
+        ProcessContext {
+            detect_provider: Some(provider),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pixelateclass_redacts_only_the_named_class() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::PixelateClass(
+                    "Person".to_string(),
+                )])],
+                detect_ctx(&KnownObjects),
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // Inside the person box the checkerboard is gone
+        // (pixelate averages blocks: neighbors now agree).
+        assert_eq!(result.get_pixel(11, 11), result.get_pixel(12, 11));
+        assert_eq!(result.get_pixel(11, 11), result.get_pixel(11, 12));
+        // Inside the car box the checkerboard survives.
+        assert_ne!(result.get_pixel(121, 11), result.get_pixel(122, 11));
+    }
+
+    #[test]
+    fn chained_class_filters_share_one_detection() {
+        let engine = Engine;
+        let counter = CountingObjects::default();
+        engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![
+                    Filter::BlurClass("person".to_string()),
+                    Filter::PixelateClass("car".to_string()),
+                ])],
+                detect_ctx(&counter),
+            )
+            .unwrap();
+        assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn blurclass_unknown_class_and_missing_model_fail_unsupported() {
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::BlurClass(
+                    "zebra".to_string(),
+                )])],
+                detect_ctx(&KnownObjects),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        let err = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::BlurClass(
+                    "person".to_string(),
+                )])],
+                ProcessContext::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn blurclass_detection_failure_is_an_inference_error() {
+        // The #42 rule: never serve an unredacted image
+        // because detection failed.
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::BlurClass(
+                    "person".to_string(),
+                )])],
+                detect_ctx(&FailingObjects),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Inference(_)), "{err:?}");
+    }
+
     /// 200x160 flat gray, except the known face box, which is a
     /// black/white checkerboard.
     fn face_scene() -> Vec<u8> {
@@ -3583,6 +3830,7 @@ mod tests {
                 &[face_crop_op()],
                 ProcessContext {
                     face_provider: Some(&KnownFace),
+                    detect_provider: None,
                     ..Default::default()
                 },
             )
@@ -3619,6 +3867,7 @@ mod tests {
                 &[face_crop_op()],
                 ProcessContext {
                     face_provider: Some(&FailingFace),
+                    detect_provider: None,
                     ..Default::default()
                 },
             )
@@ -3635,6 +3884,7 @@ mod tests {
                 &[Operation::Filters(vec![Filter::BlurFaces])],
                 ProcessContext {
                     face_provider: Some(&KnownFace),
+                    detect_provider: None,
                     ..Default::default()
                 },
             )
@@ -3665,6 +3915,7 @@ mod tests {
                 &[Operation::Filters(vec![Filter::PixelateFaces])],
                 ProcessContext {
                     face_provider: Some(&KnownFace),
+                    detect_provider: None,
                     ..Default::default()
                 },
             )
@@ -3694,6 +3945,7 @@ mod tests {
                 &[Operation::Filters(vec![Filter::BlurFaces])],
                 ProcessContext {
                     face_provider: Some(&FailingFace),
+                    detect_provider: None,
                     ..Default::default()
                 },
             )
@@ -3729,6 +3981,7 @@ mod tests {
                 ])],
                 ProcessContext {
                     face_provider: Some(&provider),
+                    detect_provider: None,
                     ..Default::default()
                 },
             )
