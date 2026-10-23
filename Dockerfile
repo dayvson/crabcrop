@@ -4,7 +4,10 @@
 # runtime stage carries only the binary and CA certificates
 # (source fetching is HTTPS). The AI variant layers on top of
 # this image: see Dockerfile.ai.
-FROM rust:1-bookworm AS builder
+#
+# Base images are digest-pinned (audit PL-13); refresh the
+# digests deliberately when moving to a newer base.
+FROM rust:1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
@@ -12,7 +15,7 @@ COPY src src
 RUN cargo build --release --locked \
     && cp target/release/crabcrop /usr/local/bin/crabcrop
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
@@ -21,5 +24,5 @@ ENV PORT=3000
 EXPOSE 3000
 USER nobody
 HEALTHCHECK --interval=30s --timeout=3s \
-    CMD curl -f http://127.0.0.1:3000/health || exit 1
+    CMD curl -f "http://127.0.0.1:${PORT:-3000}/health" || exit 1
 ENTRYPOINT ["crabcrop"]
