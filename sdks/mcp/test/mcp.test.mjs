@@ -68,7 +68,7 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
   assert.ok(existsSync(binary), "precondition: cargo build must have produced target/debug/crabcrop");
 
   const server = spawn(binary, [], {
-    env: { ...process.env, CRABCROP_SECRET: "mcp-secret", PORT: "3323" },
+    env: { ...process.env, CRABCROP_SECRET: "mcp-test-secret-0123456", PORT: "3323" },
     stdio: "ignore",
   });
   const fixtureServer = spawn("python3", ["-m", "http.server", "8912"], {
@@ -82,7 +82,7 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
       env: {
         ...process.env,
         CRABCROP_BASE: "http://127.0.0.1:3323",
-        CRABCROP_SECRET: "mcp-secret",
+        CRABCROP_SECRET: "mcp-test-secret-0123456",
       },
       stdio: ["pipe", "pipe", "inherit"],
     },
@@ -109,7 +109,7 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
     const source = "http://127.0.0.1:8912/src00.jpg";
     const url = await client.call("sign_url", { operations: "300x200", source });
     const remainder = `300x200/${source}`;
-    const expectedSig = createHmac("sha256", "mcp-secret").update(remainder).digest("hex");
+    const expectedSig = createHmac("sha256", "mcp-test-secret-0123456").update(remainder).digest("hex");
     assert.equal(url, `http://127.0.0.1:3323/${expectedSig}/${remainder}`);
 
     // The signed URL really serves, populating the cache.

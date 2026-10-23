@@ -12,7 +12,7 @@
 //!
 //! Configuration comes from the environment:
 //!
-//! - `CRABCROP_SECRET` (required): the HMAC secret.
+//! - `CRABCROP_SECRET` (required, at least 16 bytes): the HMAC secret.
 //! - `CRABCROP_ALLOW_UNSAFE`: `1` or `true` to honor `unsafe` URLs.
 //! - `CRABCROP_CACHE_MAX_MB`: result cache budget in megabytes,
 //!   default 256; `0` disables the cache.
@@ -255,10 +255,27 @@ fn parse_env_value<T: std::str::FromStr>(
     }
 }
 
+/// The minimum `CRABCROP_SECRET` length, in bytes. Shorter
+/// secrets are brute-forceable, and an empty one is worse:
+/// empty-key HMAC is publicly computable, so every signed URL
+/// (and purge) is forgeable (security audit PL-3, P-6).
+const MIN_SECRET_BYTES: usize = 16;
+
+fn validate_secret(secret: &[u8]) -> Result<(), String> {
+    if secret.len() < MIN_SECRET_BYTES {
+        return Err(format!(
+            "CRABCROP_SECRET must be at least {MIN_SECRET_BYTES} bytes, got {}",
+            secret.len()
+        ));
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let secret = env::var("CRABCROP_SECRET")
         .map_err(|_| "CRABCROP_SECRET must be set")?
         .into_bytes();
+    validate_secret(&secret)?;
     let allow_unsafe = env::var("CRABCROP_ALLOW_UNSAFE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -402,6 +419,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_below_the_minimum_are_rejected() {
+        assert!(validate_secret(b"").is_err());
+        assert!(validate_secret(b"fifteen-bytes!!").is_err());
+        assert!(validate_secret(b"sixteen-bytes!!!").is_ok());
+        assert!(validate_secret(b"a much longer production secret").is_ok());
+    }
 
     #[test]
     fn parse_env_value_defaults_parses_and_rejects() {
