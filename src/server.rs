@@ -641,6 +641,7 @@ async fn serve(
     let hit = if meta {
         None
     } else {
+        record.cache_looked_up = true;
         state.cache.get(&cache_key)
     };
     // Memory first, disk second: a disk hit is promoted into
