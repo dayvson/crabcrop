@@ -220,6 +220,7 @@ async fn serve(
     } else {
         let class = match preferred {
             Some(ImageFormat::Avif) => "avif",
+            Some(ImageFormat::Jxl) => "jxl",
             Some(ImageFormat::WebP) => "webp",
             _ => "source",
         };
@@ -412,14 +413,14 @@ async fn serve(
 }
 
 /// Pick a format from the client's `Accept` header, in negotiation
-/// order: AVIF first, then WebP. `None` keeps the detected source
-/// format. A format the client explicitly refuses (q=0) is never
-/// picked, and wildcards do not count as an offer: a bare `*/*` from
-/// a generic HTTP client should not trigger the expensive AVIF
-/// encode.
+/// order: AVIF first, then JPEG XL, then WebP. `None` keeps the
+/// detected source format. A format the client explicitly refuses
+/// (q=0) is never picked, and wildcards do not count as an offer:
+/// a bare `*/*` from a generic HTTP client should not trigger the
+/// expensive AVIF encode.
 fn negotiate_format(accept: Option<&str>) -> Option<ImageFormat> {
     let accept = accept?;
-    let (mut avif, mut webp) = (false, false);
+    let (mut avif, mut jxl, mut webp) = (false, false, false);
     for part in accept.split(',') {
         let mut segments = part.split(';');
         let media = segments.next().unwrap_or("").trim();
@@ -434,12 +435,15 @@ fn negotiate_format(accept: Option<&str>) -> Option<ImageFormat> {
         }
         match media {
             "image/avif" => avif = true,
+            "image/jxl" => jxl = true,
             "image/webp" => webp = true,
             _ => {}
         }
     }
     if avif {
         Some(ImageFormat::Avif)
+    } else if jxl {
+        Some(ImageFormat::Jxl)
     } else if webp {
         Some(ImageFormat::WebP)
     } else {
@@ -1357,6 +1361,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiates_jxl_from_accept() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("accept", "image/jxl")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jxl"
+        );
+        let body = resp.bytes().await.unwrap();
+        // Bare codestream signature, or the container signature.
+        assert!(
+            body.starts_with(&[0xFF, 0x0A])
+                || body.starts_with(&[
+                    0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A
+                ]),
+            "not a JXL stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn jxl_sits_between_avif_and_webp_in_negotiation() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        // JXL beats WebP when AVIF is absent.
+        let resp = client()
+            .get(&url)
+            .header("accept", "image/webp, image/jxl")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jxl"
+        );
+        // AVIF still wins over JXL.
+        let resp = client()
+            .get(&url)
+            .header("accept", "image/jxl, image/avif")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/avif"
+        );
+        // A refused JXL falls through to WebP.
+        let resp = client()
+            .get(&url)
+            .header("accept", "image/jxl;q=0, image/webp")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/webp"
+        );
+    }
+
+    #[tokio::test]
     async fn no_accept_keeps_source_format() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;
@@ -1412,8 +1484,8 @@ mod tests {
         let base = spawn_app(false).await;
         let remainder = format!("300x50/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
-        let types = ["image/avif", "image/webp", "image/avif"];
-        let expected = ["image/avif", "image/webp", "image/avif"];
+        let types = ["image/avif", "image/webp", "image/jxl", "image/avif"];
+        let expected = ["image/avif", "image/webp", "image/jxl", "image/avif"];
         for (accept, want) in types.iter().zip(expected) {
             let resp = client()
                 .get(&url)
@@ -1423,8 +1495,8 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), want);
         }
-        // Two fetches: one per Accept class; the repeat was cached.
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // Three fetches: one per Accept class; the repeat was cached.
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

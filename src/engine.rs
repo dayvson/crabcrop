@@ -201,12 +201,21 @@ impl Engine {
             // with the first frame, which is also what converting an
             // animated GIF to a still format means.
             let frames = decode_gif_frames(bytes)?;
+            let mut resolved = crate::url::explicit_format(ops)
+                .or(ctx.preferred)
+                .unwrap_or(detected);
             if frames.len() > 1
-                && crate::url::explicit_format(ops)
-                    .or(ctx.preferred)
-                    .unwrap_or(detected)
-                    == ImageFormat::Gif
+                && resolved == ImageFormat::Jxl
+                && crate::url::explicit_format(ops).is_none()
             {
+                // Animated sources stay out of JXL negotiation:
+                // a negotiated JXL would silently drop the frames,
+                // so the preference falls back to GIF. An explicit
+                // format(jxl) still converts (first frame), as
+                // documented for still conversions.
+                resolved = ImageFormat::Gif;
+            }
+            if frames.len() > 1 && resolved == ImageFormat::Gif {
                 return self.process_animated_gif(frames, ops, &ctx);
             }
             DynamicImage::ImageRgba8(
@@ -2142,6 +2151,38 @@ mod tests {
         // The first frame is solid red.
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0), &image::Rgb([255, 0, 0]));
+    }
+
+    #[test]
+    fn animated_gif_stays_out_of_jxl_negotiation() {
+        let engine = Engine;
+        let src = animated_gif_bytes();
+        // A negotiated (preferred) JXL falls back to GIF so the
+        // frames survive.
+        let out = engine
+            .process_preferred(
+                &src,
+                &[],
+                ProcessContext {
+                    preferred: Some(ImageFormat::Jxl),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        assert_eq!(decoded_gif_frames(&out.bytes).len(), 2);
+        // An explicit format(jxl) still converts, first frame only.
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])],
+                ProcessContext {
+                    preferred: Some(ImageFormat::Jxl),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jxl);
     }
 
     #[test]
