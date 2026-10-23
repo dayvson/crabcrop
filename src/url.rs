@@ -107,6 +107,8 @@ pub enum Align {
     Right,
     /// Position on the detected focal point.
     Smart,
+    /// Crop around the largest detected face.
+    Face,
 }
 
 /// Where a text overlay anchors: one of the nine grid points
@@ -223,6 +225,16 @@ pub enum Filter {
     /// model, keeping the subject over transparency. The model
     /// is operator-configured; the engine applies its mask.
     RemoveBg,
+    /// Blur every detected face (privacy redaction), backed by
+    /// the server's face model.
+    BlurFaces,
+    /// Pixelate every detected face (privacy redaction),
+    /// backed by the server's face model.
+    PixelateFaces,
+    /// Padding for `crop:*:face`, as a fraction of the face
+    /// size added on every side. A request-wide directive,
+    /// like `no_upscale`.
+    FacePad(f32),
     /// AI super-resolution by the given factor (2 or 4),
     /// backed by the server's upscale model.
     Upscale(u32),
@@ -399,6 +411,7 @@ fn parse_align(s: &str) -> Option<Align> {
     match s {
         "center" => Some(Align::Center),
         "smart" => Some(Align::Smart),
+        "face" => Some(Align::Face),
         "top" => Some(Align::Top),
         "bottom" => Some(Align::Bottom),
         "left" => Some(Align::Left),
@@ -519,6 +532,15 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             }
             ("equalize", None) => Filter::Equalize,
             ("removebg", None) => Filter::RemoveBg,
+            ("blurfaces", None) => Filter::BlurFaces,
+            ("pixelatefaces", None) => Filter::PixelateFaces,
+            ("facepad", Some(p)) => {
+                let pad: f32 = p.parse().map_err(|_| invalid())?;
+                if !pad.is_finite() || !(0.0..=3.0).contains(&pad) {
+                    return Err(invalid());
+                }
+                Filter::FacePad(pad)
+            }
             ("upscale", Some(p)) => {
                 let factor: u32 = p.parse().map_err(|_| invalid())?;
                 if !matches!(factor, 2 | 4) {
@@ -736,6 +758,36 @@ pub fn has_text(ops: &[Operation]) -> bool {
         Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Text { .. })),
         _ => false,
     })
+}
+
+/// Whether the request uses an operation that requires the
+/// face model: a face-aligned crop, or a face redaction
+/// filter. (Smart alignment does not count: it falls back to
+/// saliency without a model.)
+pub fn needs_face_model(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Crop { align, .. } => *align == Align::Face,
+        Operation::Filters(filters) => filters
+            .iter()
+            .any(|f| matches!(f, Filter::BlurFaces | Filter::PixelateFaces)),
+        _ => false,
+    })
+}
+
+/// Padding for a face-aligned crop: the last `facepad(...)`
+/// directive in the request, as a fraction of the face size
+/// added on every side. Defaults to 0.5.
+pub fn face_padding(ops: &[Operation]) -> f32 {
+    ops.iter()
+        .rev()
+        .find_map(|op| match op {
+            Operation::Filters(filters) => filters.iter().rev().find_map(|f| match f {
+                Filter::FacePad(p) => Some(*p),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .unwrap_or(0.5)
 }
 
 /// The distinct watermark URLs a request references, in order of
@@ -1357,6 +1409,52 @@ mod tests {
                 align: Align::Smart,
             }]
         );
+    }
+
+    #[test]
+    fn parses_face_operations() {
+        let (ops, _) = parse_operations("crop:300x300:face/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Crop {
+                size: ImageSize {
+                    width: Dimension::Pixels(300),
+                    height: Dimension::Pixels(300),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                align: Align::Face,
+            }]
+        );
+        assert!(needs_face_model(&ops));
+        assert_eq!(face_padding(&ops), 0.5);
+
+        let (ops, _) =
+            parse_operations("filters:blurfaces:pixelatefaces:facepad(1.5)/example.com/img.jpg")
+                .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::BlurFaces,
+                Filter::PixelateFaces,
+                Filter::FacePad(1.5),
+            ])]
+        );
+        assert!(needs_face_model(&ops));
+        assert_eq!(face_padding(&ops), 1.5);
+
+        // Smart crops and plain requests do not require a model.
+        let (ops, _) = parse_operations("crop:300x300:smart/example.com/img.jpg").unwrap();
+        assert!(!needs_face_model(&ops));
+
+        for bad in [
+            "filters:facepad(9)/example.com/img.jpg",
+            "filters:facepad(-1)/example.com/img.jpg",
+            "filters:facepad(x)/example.com/img.jpg",
+            "filters:blurfaces(1)/example.com/img.jpg",
+        ] {
+            assert!(parse_operations(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
