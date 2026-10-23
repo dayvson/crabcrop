@@ -264,7 +264,7 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    if !verify_purge(&state.secret, &signature, target, state.allow_unsafe) {
+    if !verify_purge(&state.secret, &signature, target) {
         state.metrics.record_purge();
         purge_log("purge", target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
@@ -307,7 +307,7 @@ async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri)
         return (StatusCode::BAD_REQUEST, "invalid purge group name").into_response();
     }
     let target = format!("purge-group/{group}");
-    if !verify_purge(&state.secret, &signature, &target, state.allow_unsafe) {
+    if !verify_purge(&state.secret, &signature, &target) {
         state.metrics.record_purge();
         purge_log("purge-group", &target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
@@ -3066,6 +3066,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn purges_never_honor_unsafe() {
+        // Q3: unsafe mode opens image reads, never the
+        // destructive endpoints. An unsafe purge is a 403
+        // and evicts nothing; the signed purge still works
+        // on the same server.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(true).await;
+        let remainder = format!("300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/unsafe/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client()
+            .post(format!("{base}/purge/unsafe/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = client()
+            .post(format!("{base}/purge-group/unsafe/anygroup"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = client()
+            .get(format!("{base}/unsafe/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the rejected purge evicted nothing"
+        );
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("purged 1"));
     }
 
     #[tokio::test]

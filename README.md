@@ -62,7 +62,7 @@ printf '%s' '300x200/https://example.com/photo.jpg' | openssl dgst -sha256 -hmac
 
 Use that hex string as the first path segment. Anyone can verify the scheme against this test vector: with secret `Jefe`, the HMAC-SHA256 of `what do ye want for nothing?` is `ba5396e10039ec002bf1fde117eee48df8c2f06bc47b5f2d3272ea77f6862da9`.
 
-A request with a bad signature gets `403` and the body `bad signature`. The literal signature `unsafe` skips verification, but only when the server runs with `CRABCROP_ALLOW_UNSAFE=1` (or `true`). Keep it off in production.
+A request with a bad signature gets `403` and the body `bad signature`. The literal signature `unsafe` skips verification, but only when the server runs with `CRABCROP_ALLOW_UNSAFE=1` (or `true`). Keep it off in production. Purges are the exception that never bends: `/purge` and `/purge-group` always require an HMAC signature made with the secret, even in unsafe mode.
 
 ### Expiring URLs
 
