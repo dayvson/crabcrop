@@ -298,6 +298,19 @@ pub enum Filter {
     /// Keep only the inscribed shape; the rest of the frame
     /// becomes transparent.
     Mask(MaskShape),
+    /// The classic warm sepia tone.
+    Sepia,
+    /// Map shadows to the first color and highlights to the
+    /// second, by luminance.
+    Duotone([u8; 3], [u8; 3]),
+    /// Single-hue rendering in the given color: full
+    /// luminance renders exactly that color.
+    Monochrome([u8; 3]),
+    /// Mosaic the image into blocks of this many pixels,
+    /// each block the average of its pixels.
+    Pixelate(u32),
+    /// Mirror the image, horizontally or vertically.
+    Flip(FlipDirection),
     /// Encoding directive: re-encode at lower quality until the
     /// output fits this many bytes, quality permitting.
     MaxBytes(u64),
@@ -307,6 +320,15 @@ pub enum Filter {
     Format(ImageFormat),
     /// Cap every resize at the source dimensions.
     NoUpscale,
+}
+
+/// A direction for the `flip` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlipDirection {
+    /// Mirror left-to-right.
+    Horizontal,
+    /// Mirror top-to-bottom.
+    Vertical,
 }
 
 /// A shape for the `mask` filter.
@@ -767,6 +789,41 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             ("mask", Some(p)) => match p {
                 "circle" => Filter::Mask(MaskShape::Circle),
                 "ellipse" => Filter::Mask(MaskShape::Ellipse),
+                _ => return Err(invalid()),
+            },
+            ("sepia", None) => Filter::Sepia,
+            ("duotone", Some(p)) => {
+                let parts: Vec<&str> = p.split(',').collect();
+                if parts.len() != 2 {
+                    return Err(invalid());
+                }
+                let color = |hex: &str| -> Result<[u8; 3], ParseError> {
+                    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(invalid());
+                    }
+                    let byte =
+                        |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| invalid());
+                    Ok([byte(0)?, byte(2)?, byte(4)?])
+                };
+                Filter::Duotone(color(parts[0])?, color(parts[1])?)
+            }
+            ("monochrome", Some(p)) => {
+                if p.len() != 6 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(invalid());
+                }
+                let byte = |i: usize| u8::from_str_radix(&p[i..i + 2], 16).map_err(|_| invalid());
+                Filter::Monochrome([byte(0)?, byte(2)?, byte(4)?])
+            }
+            ("pixelate", Some(p)) => {
+                let block: u32 = p.parse().map_err(|_| invalid())?;
+                if block == 0 || block > MAX_DIMENSION {
+                    return Err(invalid());
+                }
+                Filter::Pixelate(block)
+            }
+            ("flip", Some(p)) => match p {
+                "h" => Filter::Flip(FlipDirection::Horizontal),
+                "v" => Filter::Flip(FlipDirection::Vertical),
                 _ => return Err(invalid()),
             },
             ("fill", Some(p)) => {
@@ -1565,6 +1622,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_finishing_filters() {
+        let (ops, _) = parse_operations(
+            "filters:sepia:duotone(000000,ffffff):monochrome(ff8000):pixelate(8):flip(h)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::Sepia,
+                Filter::Duotone([0, 0, 0], [255, 255, 255]),
+                Filter::Monochrome([255, 128, 0]),
+                Filter::Pixelate(8),
+                Filter::Flip(FlipDirection::Horizontal),
+            ])]
+        );
+    }
+
+    #[test]
     fn rejects_bad_filters() {
         for seg in [
             "filters:",
@@ -1586,6 +1661,14 @@ mod tests {
             "filters:border(2,FF0000,1)",
             "filters:mask(square)",
             "filters:mask()",
+            "filters:sepia(1)",
+            "filters:duotone(FF0000)",
+            "filters:duotone(FF0000,FFF)",
+            "filters:monochrome(FFF)",
+            "filters:pixelate(0)",
+            "filters:pixelate(16384)",
+            "filters:flip(x)",
+            "filters:flip()",
         ] {
             assert_eq!(
                 parse_operations(&format!("{seg}/example.com/img.jpg")),

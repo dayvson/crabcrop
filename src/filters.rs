@@ -125,6 +125,16 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             // resolves it against the request as a whole (with
             // the client-hint fallback). (Same routing.)
             Filter::Dpr(_) => {}
+            Filter::Sepia => img = sepia(&img),
+            Filter::Duotone(shadow, highlight) => img = duotone(&img, *shadow, *highlight),
+            Filter::Monochrome(color) => img = monochrome(&img, *color),
+            Filter::Pixelate(block) => img = pixelate(&img, *block),
+            Filter::Flip(direction) => {
+                img = match direction {
+                    crate::url::FlipDirection::Horizontal => img.fliph(),
+                    crate::url::FlipDirection::Vertical => img.flipv(),
+                }
+            }
             Filter::Radius(radii) => img = rounded_corners(&img, *radii),
             Filter::Border(width, color) => img = draw_border(&img, *width, *color),
             Filter::Mask(shape) => img = mask_shape(&img, *shape),
@@ -136,6 +146,165 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
         }
     }
     (img, options)
+}
+
+/// Rec. 601 luma, the same weights the saturation filter
+/// and the image crate's grayscale use.
+fn luma(r: u8, g: u8, b: u8) -> f32 {
+    0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+}
+
+/// Map the RGB channels of every pixel through `f`, which
+/// returns the new channels. Alpha survives untouched when
+/// the image carries it; other channel layouts normalize to
+/// RGB first, like the sibling color filters.
+fn map_rgb(img: &DynamicImage, f: impl Fn(u8, u8, u8) -> [u8; 3]) -> DynamicImage {
+    if img.color().has_alpha() {
+        let mut rgba = img.to_rgba8();
+        for p in rgba.pixels_mut() {
+            let [r, g, b] = f(p[0], p[1], p[2]);
+            p[0] = r;
+            p[1] = g;
+            p[2] = b;
+        }
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        let mut rgb = img.to_rgb8();
+        for p in rgb.pixels_mut() {
+            let [r, g, b] = f(p[0], p[1], p[2]);
+            p[0] = r;
+            p[1] = g;
+            p[2] = b;
+        }
+        DynamicImage::ImageRgb8(rgb)
+    }
+}
+
+/// The classic warm sepia tone (the standard sepia matrix).
+pub fn sepia(img: &DynamicImage) -> DynamicImage {
+    map_rgb(img, |r, g, b| {
+        let (r, g, b) = (r as f32, g as f32, b as f32);
+        [
+            (0.393 * r + 0.769 * g + 0.189 * b)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+            (0.349 * r + 0.686 * g + 0.168 * b)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+            (0.272 * r + 0.534 * g + 0.131 * b)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+        ]
+    })
+}
+
+/// Map shadows to `shadow` and highlights to `highlight` by
+/// luminance: black renders exactly `shadow`, white exactly
+/// `highlight`, and everything between is the straight
+/// interpolation at the pixel's luminance.
+pub fn duotone(img: &DynamicImage, shadow: [u8; 3], highlight: [u8; 3]) -> DynamicImage {
+    map_rgb(img, |r, g, b| {
+        let t = luma(r, g, b) / 255.0;
+        let mut out = [0u8; 3];
+        for (c, o) in out.iter_mut().enumerate() {
+            *o = (shadow[c] as f32 + (highlight[c] as f32 - shadow[c] as f32) * t)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+        out
+    })
+}
+
+/// Single-hue rendering in `color`: each pixel's luminance
+/// scaled by the color, so full luminance renders exactly
+/// `color` and black stays black.
+pub fn monochrome(img: &DynamicImage, color: [u8; 3]) -> DynamicImage {
+    map_rgb(img, |r, g, b| {
+        let l = luma(r, g, b);
+        let mut out = [0u8; 3];
+        for (c, o) in out.iter_mut().enumerate() {
+            *o = (l * color[c] as f32 / 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        out
+    })
+}
+
+/// Mosaic the image into `block`-pixel squares anchored at
+/// the top-left, each painted with the average of its pixels
+/// (alpha included when the image carries it). A block of 1
+/// is the identity; blocks at the right and bottom edges are
+/// as large as the frame allows.
+pub fn pixelate(img: &DynamicImage, block: u32) -> DynamicImage {
+    if block <= 1 {
+        return img.clone();
+    }
+    if img.color().has_alpha() {
+        let mut rgba = img.to_rgba8();
+        average_blocks(
+            &mut rgba,
+            block,
+            |p| [p[0], p[1], p[2], p[3]],
+            |p, v| {
+                p[0] = v[0];
+                p[1] = v[1];
+                p[2] = v[2];
+                p[3] = v[3];
+            },
+        );
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        let mut rgb = img.to_rgb8();
+        average_blocks(
+            &mut rgb,
+            block,
+            |p| [p[0], p[1], p[2], 0],
+            |p, v| {
+                p[0] = v[0];
+                p[1] = v[1];
+                p[2] = v[2];
+            },
+        );
+        DynamicImage::ImageRgb8(rgb)
+    }
+}
+
+/// Shared block averaging for `pixelate`, over either pixel
+/// buffer: `get` reads the channels that take part (the
+/// fourth is an alpha slot, 0 for RGB), `set` writes the
+/// averaged pixel back.
+fn average_blocks<P: image::Pixel>(
+    img: &mut image::ImageBuffer<P, Vec<P::Subpixel>>,
+    block: u32,
+    get: impl Fn(&P) -> [u8; 4],
+    set: impl Fn(&mut P, [u8; 4]),
+) {
+    let (w, h) = (img.width(), img.height());
+    for by in (0..h).step_by(block as usize) {
+        for bx in (0..w).step_by(block as usize) {
+            let (bw, bh) = (block.min(w - bx), block.min(h - by));
+            let mut sums = [0u64; 4];
+            for y in by..by + bh {
+                for x in bx..bx + bw {
+                    let v = get(&img.get_pixel(x, y).clone());
+                    for c in 0..4 {
+                        sums[c] += v[c] as u64;
+                    }
+                }
+            }
+            let n = (bw * bh) as f32;
+            let avg = [
+                (sums[0] as f32 / n).round() as u8,
+                (sums[1] as f32 / n).round() as u8,
+                (sums[2] as f32 / n).round() as u8,
+                (sums[3] as f32 / n).round() as u8,
+            ];
+            for y in by..by + bh {
+                for x in bx..bx + bw {
+                    set(img.get_pixel_mut(x, y), avg);
+                }
+            }
+        }
+    }
 }
 
 /// Round the corners of `img` by the given radii (CSS order:
@@ -530,6 +699,105 @@ mod tests {
     fn border_wider_than_half_paints_everything() {
         let img = draw_border(&opaque(10, 10, [255, 0, 0]), 5, [0, 0, 255]);
         assert_eq!(img.to_rgba8().get_pixel(5, 5).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn sepia_tones_with_the_standard_matrix() {
+        let (img, _) = apply_filters(solid(128, 128, 128), &[Filter::Sepia]);
+        assert_eq!(first_pixel(&img), [173, 154, 120]);
+        let (img, _) = apply_filters(solid(0, 0, 0), &[Filter::Sepia]);
+        assert_eq!(first_pixel(&img), [0, 0, 0]);
+    }
+
+    #[test]
+    fn sepia_keeps_alpha() {
+        let mut img = DynamicImage::new_rgba8(2, 2);
+        for p in img.as_mut_rgba8().unwrap().pixels_mut() {
+            *p = image::Rgba([100, 150, 200, 77]);
+        }
+        let out = sepia(&img);
+        assert_eq!(out.to_rgba8().get_pixel(0, 0)[3], 77);
+    }
+
+    #[test]
+    fn duotone_maps_shadows_and_highlights() {
+        let bw = |px: [u8; 3]| {
+            let mut img = DynamicImage::new_rgb8(1, 1);
+            img.as_mut_rgb8().unwrap().get_pixel_mut(0, 0).0 = px;
+            duotone(&img, [255, 0, 0], [0, 0, 255])
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0
+        };
+        assert_eq!(bw([0, 0, 0]), [255, 0, 0]);
+        assert_eq!(bw([255, 255, 255]), [0, 0, 255]);
+        // Pure red's luminance is 0.299 of the way from red to blue.
+        assert_eq!(bw([255, 0, 0]), [179, 0, 76]);
+    }
+
+    #[test]
+    fn monochrome_scales_luminance_by_the_color() {
+        let one = |px: [u8; 3]| {
+            let mut img = DynamicImage::new_rgb8(1, 1);
+            img.as_mut_rgb8().unwrap().get_pixel_mut(0, 0).0 = px;
+            monochrome(&img, [255, 128, 0]).to_rgb8().get_pixel(0, 0).0
+        };
+        assert_eq!(one([255, 255, 255]), [255, 128, 0]);
+        assert_eq!(one([0, 0, 0]), [0, 0, 0]);
+        assert_eq!(one([128, 128, 128]), [128, 64, 0]);
+    }
+
+    #[test]
+    fn pixelate_averages_blocks() {
+        // 4x4, four solid quadrants: 2px blocks stay pure.
+        let mut img = DynamicImage::new_rgb8(4, 4);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = match (x < 2, y < 2) {
+                (true, true) => Rgb([255, 0, 0]),
+                (false, true) => Rgb([0, 0, 255]),
+                (true, false) => Rgb([0, 255, 0]),
+                (false, false) => Rgb([255, 255, 255]),
+            };
+        }
+        let out = pixelate(&img, 2);
+        let rgb = out.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(rgb.get_pixel(3, 0).0, [0, 0, 255]);
+        assert_eq!(rgb.get_pixel(0, 3).0, [0, 255, 0]);
+        assert_eq!(rgb.get_pixel(3, 3).0, [255, 255, 255]);
+        // One 4x4 block over a half-red half-blue image averages.
+        let mut img = DynamicImage::new_rgb8(4, 2);
+        for (x, _y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if x < 2 {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([0, 0, 255])
+            };
+        }
+        let out = pixelate(&img, 4);
+        assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [128, 0, 128]);
+        assert_eq!(out.to_rgb8().get_pixel(3, 1).0, [128, 0, 128]);
+        // Block 1 is the identity.
+        assert_eq!(pixelate(&img, 1).to_rgb8(), img.to_rgb8());
+    }
+
+    #[test]
+    fn flip_mirrors_both_ways() {
+        let mut img = DynamicImage::new_rgb8(2, 1);
+        img.as_mut_rgb8().unwrap().get_pixel_mut(0, 0).0 = [255, 0, 0];
+        img.as_mut_rgb8().unwrap().get_pixel_mut(1, 0).0 = [0, 0, 255];
+        let (out, _) = apply_filters(
+            img.clone(),
+            &[Filter::Flip(crate::url::FlipDirection::Horizontal)],
+        );
+        assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [0, 0, 255]);
+        assert_eq!(out.to_rgb8().get_pixel(1, 0).0, [255, 0, 0]);
+        let mut img = DynamicImage::new_rgb8(1, 2);
+        img.as_mut_rgb8().unwrap().get_pixel_mut(0, 0).0 = [255, 0, 0];
+        img.as_mut_rgb8().unwrap().get_pixel_mut(0, 1).0 = [0, 0, 255];
+        let (out, _) = apply_filters(img, &[Filter::Flip(crate::url::FlipDirection::Vertical)]);
+        assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [0, 0, 255]);
+        assert_eq!(out.to_rgb8().get_pixel(0, 1).0, [255, 0, 0]);
     }
 
     fn striped() -> DynamicImage {

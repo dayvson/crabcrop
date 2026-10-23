@@ -86,6 +86,11 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:border(2,00ff00)/" + SRC, false, SRC],
     ["filters:border(0,00ff00)/" + SRC, true, SRC],
     ["filters:mask(square)/" + SRC, true, SRC],
+    ["filters:sepia:duotone(000000,ffffff):flip(h)/" + SRC, false, SRC],
+    ["filters:duotone(000000)/" + SRC, true, SRC],
+    ["filters:monochrome(ff8000):pixelate(8)/" + SRC, false, SRC],
+    ["filters:pixelate(0)/" + SRC, true, SRC],
+    ["filters:flip(x)/" + SRC, true, SRC],
   ];
   for (const [remainder, expectError, expectSource] of cases) {
     const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);
