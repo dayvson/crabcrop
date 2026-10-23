@@ -1,0 +1,15 @@
+[package]
+name = "crabcrop-url"
+version = "0.1.0"
+edition = "2024"
+description = "URL building and signing for crabcrop image service URLs"
+license = "MIT"
+repository = "https://github.com/dayvson/crabcrop"
+
+[dependencies]
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

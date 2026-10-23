@@ -9,9 +9,6 @@
 //! plus the source image URL with its slashes intact. [`parse_signature`]
 //! and [`parse_operations`] are the two halves, usable on their own.
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
 /// How the request proves it was minted by someone holding the server secret.
 ///
 /// Either an HMAC-SHA256 (hex) of the rest of the URL, or the literal `unsafe`
@@ -1040,16 +1037,10 @@ pub fn parse_request(path: &str) -> Result<(Signature, Request<'_>), ParseError>
 pub fn verify(secret: &[u8], signature: &Signature, remainder: &str, allow_unsafe: bool) -> bool {
     match signature {
         Signature::Unsafe => allow_unsafe,
-        Signature::Hmac(hex_digest) => {
-            let Ok(expected) = hex::decode(hex_digest) else {
-                return false;
-            };
-            let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret) else {
-                return false;
-            };
-            mac.update(remainder.as_bytes());
-            mac.verify_slice(&expected).is_ok()
-        }
+        // The HMAC check itself lives in the `crabcrop-url`
+        // builder crate, so the server verifies with exactly
+        // the code clients sign with.
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(secret, hex_digest, remainder),
     }
 }
 
