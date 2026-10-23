@@ -67,6 +67,12 @@ pub struct AppState {
     /// SSIMULACRA2 target for verified `quality(auto)` encodes,
     /// from `CRABCROP_SSIM_TARGET`.
     pub ssim_target: f64,
+    /// Named operation presets from `CRABCROP_PRESETS_FILE`:
+    /// name to operation string, validated at boot.
+    pub presets: std::collections::HashMap<String, String>,
+    /// Presets-only mode, from `CRABCROP_ONLY_PRESETS`: reject
+    /// free-form operations in requests.
+    pub only_presets: bool,
 }
 
 /// Build the router.
@@ -199,6 +205,23 @@ async fn serve(
             record,
         );
     }
+    // Preset expansion happens after verification (the
+    // signature covers the preset reference, not its expansion)
+    // and before everything else: parsing, the cache key, and
+    // the ops summary all see the expanded remainder, so
+    // editing a preset produces fresh cache entries naturally.
+    let expanded;
+    let rest = if state.presets.is_empty() && !state.only_presets {
+        rest
+    } else {
+        match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
+            Ok(text) => {
+                expanded = text;
+                &expanded
+            }
+            Err(_) => return (StatusCode::BAD_REQUEST.into_response(), record),
+        }
+    };
     let (ops, source_url, expiry) = match parse_operations_with_expiry(rest) {
         Ok(v) => v,
         Err(_) => return (StatusCode::BAD_REQUEST.into_response(), record),
@@ -746,6 +769,8 @@ mod tests {
             store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -781,6 +806,8 @@ mod tests {
             store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -858,6 +885,142 @@ mod tests {
             .send()
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn preset_test_map() -> std::collections::HashMap<String, String> {
+        [
+            ("small".to_string(), "30x20".to_string()),
+            ("gray".to_string(), "filters:grayscale".to_string()),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    async fn spawn_app_with_presets(
+        presets: std::collections::HashMap<String, String>,
+        only_presets: bool,
+    ) -> String {
+        let state = AppState {
+            secret: SECRET.to_vec(),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            font: None,
+            fallback: None,
+            store: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            presets,
+            only_presets,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn get_signed(base: &str, remainder: &str) -> reqwest::Response {
+        client()
+            .get(format!("{base}/{}/{remainder}", sign(remainder)))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preset_urls_serve_the_expanded_transform() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        // The source is 100x60; the preset resizes to 30x20.
+        let resp = get_signed(&base, &format!("preset:small/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.bytes().await.unwrap();
+        let img = image::load_from_memory(&body).unwrap();
+        assert_eq!((img.width(), img.height()), (30, 20));
+    }
+
+    #[tokio::test]
+    async fn unknown_presets_are_a_bad_request() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        let resp = get_signed(&base, &format!("preset:nope/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An image server that counts how many times it was hit:
+    /// how cache behavior becomes observable from outside.
+    async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let png = test_png();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let body = png.clone();
+                tokio::spawn(async move {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}/src.png"), hits)
+    }
+
+    #[tokio::test]
+    async fn presets_and_free_form_share_a_cache_entry() {
+        use std::sync::atomic::Ordering;
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        // The preset request populates the cache under its
+        // expanded form...
+        let resp = get_signed(&base, &format!("preset:small/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // ...so the equivalent free-form request is a cache hit
+        // and the source is not fetched again.
+        let resp = get_signed(&base, &format!("30x20/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn presets_only_mode_gates_free_form_operations() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_presets(preset_test_map(), true).await;
+        // Preset references and bare sources are fine.
+        let resp = get_signed(&base, &format!("preset:small/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get_signed(&base, &src).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Expiry metadata alongside a preset is fine too.
+        let resp = get_signed(
+            &base,
+            &format!("exp:{}/preset:gray/{src}", now_unix() + 3600),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Free-form operations are refused.
+        let resp = get_signed(&base, &format!("30x20/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = get_signed(&base, &format!("preset:small/filters:grayscale/{src}")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1117,6 +1280,8 @@ mod tests {
             )),
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
