@@ -250,10 +250,11 @@ curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.
 When the URL names no `format(...)`, crabcrop picks the output format from the request's `Accept` header:
 
 1. `image/avif` → AVIF
-2. `image/webp` → WebP
-3. Otherwise → the source image's format (JPEG if the format cannot be detected)
+2. `image/jxl` → JPEG XL
+3. `image/webp` → WebP
+4. Otherwise → the source image's format (JPEG if the format cannot be detected)
 
-A format refused with `q=0` is never picked, and wildcards such as `*/*` do not count as an offer. An explicit `format(...)` in the URL always wins over negotiation. Responses include `Vary: Accept, DPR` so downstream caches key this correctly (the `DPR` hint likewise changes sizing; see `dpr` above).
+A format refused with `q=0` is never picked, and wildcards such as `*/*` do not count as an offer. An explicit `format(...)` in the URL always wins over negotiation. Animated GIF sources are the one exception: they never negotiate to JPEG XL, which would drop their frames, and keep GIF instead. Responses include `Vary: Accept, DPR` so downstream caches key this correctly (the `DPR` hint likewise changes sizing; see `dpr` above).
 
 ## Meta responses
 
