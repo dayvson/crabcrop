@@ -24,8 +24,7 @@ use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
 use crate::url::{
-    ImageFormat, explicit_format, parse_operations_with_expiry, parse_signature, verify,
-    verify_purge,
+    ImageFormat, parse_operations_with_expiry, parse_signature, verify, verify_purge,
 };
 
 /// Shared state for the handlers.
@@ -591,16 +590,20 @@ async fn serve(
         }
     }
 
+    // One pass over the ops list settles every directive
+    // the handler reads (issue #136).
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+
     // The DPR client hint settles sizing when the URL has no
     // explicit `dpr` directive; the effective factor is part of
     // what the response is, so it joins the cache key whenever
     // it changes the output.
-    let effective_dpr = crate::url::explicit_dpr(&ops).or(dpr_hint).unwrap_or(1.0);
+    let effective_dpr = directives.dpr.or(dpr_hint).unwrap_or(1.0);
 
     // The quantized width a width hint resolves to, when the
     // ops size nothing themselves. It is part of what the
     // response is, so it joins the cache key below.
-    let hinted_width = if crate::url::has_size_operation(&ops) {
+    let hinted_width = if directives.has_size_operation {
         None
     } else {
         width_hint.map(|w| quantize_width(w, state.width_step))
@@ -608,7 +611,7 @@ async fn serve(
     // Save-Data changes the bytes exactly when the engine
     // steps (hint present, no quality directive in the URL);
     // the key separates those entries under the same rule.
-    let save_data_applies = save_data && !crate::url::has_quality_directive(&ops);
+    let save_data_applies = save_data && !directives.quality_directive;
 
     // Without an explicit format in the URL, the response depends
     // on the Accept class as well as the path, so the cache key
@@ -621,7 +624,7 @@ async fn serve(
     let meta = wants_meta(accept);
     let placeholders = meta && wants_placeholders(accept);
     let key_base = crate::url::canonical_form(&ops, source_url);
-    let mut cache_key = if explicit_format(&ops).is_some() {
+    let mut cache_key = if directives.explicit_format.is_some() {
         key_base.clone()
     } else {
         let class = match preferred {
@@ -719,7 +722,7 @@ async fn serve(
     // as sources, and a watermark that fails to load or decode
     // fails the request rather than being silently skipped.
     let mut watermark_images = crate::filters::WatermarkImages::new();
-    for wm_url in crate::url::watermark_urls(&ops) {
+    for wm_url in &directives.watermark_urls {
         record.load_ran = true;
         let wm_bytes = match state.loader.load(wm_url).await {
             Ok(b) => b,
@@ -743,11 +746,7 @@ async fn serve(
     let process_start = Instant::now();
     // AI inference is gated process-wide: a burst of removebg
     // requests must not starve the transform pipeline.
-    let _ai_permit = if crate::url::has_removebg(&ops)
-        || crate::url::has_upscale(&ops)
-        || crate::url::has_smart_crop(&ops)
-        || crate::url::has_class_redaction(&ops)
-    {
+    let _ai_permit = if directives.uses_ai() {
         // The wait is bounded (audit PL-14): a burst of AI
         // requests sheds with a 503 instead of parking
         // unbounded tasks on the gate.

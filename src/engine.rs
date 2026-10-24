@@ -300,6 +300,10 @@ impl Engine {
         ctx: ProcessContext<'_>,
     ) -> Result<ProcessedImage, EngineError> {
         ensure_jxl_decoder();
+        // One pass over the ops list settles every directive
+        // the pipeline reads (issue #136); nothing below
+        // re-walks the list looking for them.
+        let directives = crate::url::RequestDirectives::analyze(ops);
         // HEIC/HEIF sources are detected explicitly so the failure
         // names the real problem instead of a generic decode error.
         // The decoder evaluation (issue #24) found no option that
@@ -328,8 +332,9 @@ impl Engine {
         // Background removal is validated before any real work:
         // its output is transparency, so the resolved format
         // must carry alpha, and a provider must be configured.
-        if crate::url::has_removebg(ops) {
-            let resolved = crate::url::explicit_format(ops)
+        if directives.removebg {
+            let resolved = directives
+                .explicit_format
                 .or(ctx.preferred)
                 .unwrap_or(detected);
             if matches!(resolved, ImageFormat::Jpeg | ImageFormat::Gif) {
@@ -347,8 +352,9 @@ impl Engine {
         // Shape filters are validated the same way: their
         // output is transparency, so the resolved format must
         // carry alpha.
-        if let Some(name) = crate::url::shape_filter(ops) {
-            let resolved = crate::url::explicit_format(ops)
+        if let Some(name) = directives.shape_filter {
+            let resolved = directives
+                .explicit_format
                 .or(ctx.preferred)
                 .unwrap_or(detected);
             if matches!(resolved, ImageFormat::Jpeg | ImageFormat::Gif) {
@@ -357,29 +363,29 @@ impl Engine {
                 )));
             }
         }
-        if crate::url::has_upscale(ops) && ctx.upscale_provider.is_none() {
+        if directives.upscale && ctx.upscale_provider.is_none() {
             return Err(EngineError::NotConfigured(
                 "upscale is not configured on this server".to_string(),
             ));
         }
-        if crate::url::has_text(ops) && ctx.text_renderer.is_none() {
+        if directives.text && ctx.text_renderer.is_none() {
             return Err(EngineError::NotConfigured(
                 "text is not configured on this server (no font)".to_string(),
             ));
         }
-        if crate::url::needs_face_model(ops) && ctx.face_provider.is_none() {
+        if directives.needs_face_model && ctx.face_provider.is_none() {
             return Err(EngineError::NotConfigured(
                 "face operations are not configured on this server (no face model)".to_string(),
             ));
         }
-        if crate::url::has_class_redaction(ops) {
+        if directives.has_class_redaction() {
             let provider = ctx.detect_provider.ok_or_else(|| {
                 EngineError::NotConfigured(
                     "class redaction is not configured on this server (no detection model)"
                         .to_string(),
                 )
             })?;
-            for class in crate::url::class_filters(ops) {
+            for class in &directives.classes {
                 if !provider
                     .classes()
                     .iter()
@@ -403,12 +409,13 @@ impl Engine {
             // with the first frame, which is also what converting an
             // animated GIF to a still format means.
             let frames = decode_gif_frames(bytes)?;
-            let mut resolved = crate::url::explicit_format(ops)
+            let mut resolved = directives
+                .explicit_format
                 .or(ctx.preferred)
                 .unwrap_or(detected);
             if frames.len() > 1
                 && resolved == ImageFormat::Jxl
-                && crate::url::explicit_format(ops).is_none()
+                && directives.explicit_format.is_none()
             {
                 // Animated sources stay out of JXL negotiation:
                 // a negotiated JXL would silently drop the frames,
@@ -432,7 +439,8 @@ impl Engine {
             // (or the intrinsic size when it asks for none), so
             // vectors stay crisp; the normal pipeline runs on
             // the raster from here.
-            let (tw, th) = svg_raster_target(ops, prep.intrinsic(), dpr_factor(ops, &ctx));
+            let (tw, th) =
+                svg_raster_target(ops, prep.intrinsic(), dpr_factor(directives.dpr, &ctx));
             prep.render(tw, th).map_err(EngineError::Decode)?
         } else {
             if detected == ImageFormat::Jxl {
@@ -451,7 +459,7 @@ impl Engine {
             // stage works in one known space, unless the
             // request asked to keep the profile (then the
             // profile is embedded at encode time instead).
-            if !crate::url::has_keep_profile(ops)
+            if !directives.keep_profile
                 && let Some(icc) = &source_meta.icc
             {
                 img = crate::color::convert_to_srgb(img, icc);
@@ -463,12 +471,19 @@ impl Engine {
         // `no_upscale` is a request-wide directive, like the encoding
         // directives: wherever it appears, it caps every resize in
         // the request at the (oriented) source dimensions.
-        let cap = if crate::url::has_no_upscale(ops) {
+        let cap = if directives.no_upscale {
             Some((img.width(), img.height()))
         } else {
             None
         };
-        let (img, directives) = apply_operations(img, ops, cap, dpr_factor(ops, &ctx), &ctx)?;
+        let (img, directives) = apply_operations(
+            img,
+            ops,
+            cap,
+            dpr_factor(directives.dpr, &ctx),
+            &ctx,
+            &directives,
+        )?;
         // Placeholders describe the final pixels, so they are
         // computed here, before encoding.
         let placeholder = if ctx.placeholders {
@@ -598,7 +613,7 @@ impl Engine {
         // profile (it was not converted away), preserved
         // metadata when the operator policy allows it. Only
         // JPEG and PNG outputs carry either in this pass.
-        let keep_profile = crate::url::has_keep_profile(ops);
+        let keep_profile = directives.keep_profile;
         let bytes = if (keep_profile && source_meta.icc.is_some()) || ctx.preserve_metadata {
             let embed_icc = if keep_profile {
                 source_meta.icc.as_deref()
@@ -643,22 +658,23 @@ impl Engine {
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
     ) -> Result<ProcessedImage, EngineError> {
+        let directives = crate::url::RequestDirectives::analyze(ops);
         let (source_width, source_height) = {
             let b = frames[0].buffer();
             (b.width(), b.height())
         };
         let first = frames[0].buffer();
-        let cap = if crate::url::has_no_upscale(ops) {
+        let cap = if directives.no_upscale {
             Some((first.width(), first.height()))
         } else {
             None
         };
-        let dpr = dpr_factor(ops, ctx);
+        let dpr = dpr_factor(directives.dpr, ctx);
         let mut out_frames = Vec::with_capacity(frames.len());
         for frame in frames {
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _) = apply_operations(img, ops, cap, dpr, ctx)?;
+            let (img, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
         let (width, height) = out_frames
@@ -776,8 +792,8 @@ fn upscale_image(
 /// the animated-GIF path, which runs it once per frame.
 /// The effective DPR factor: an explicit `dpr(...)` directive
 /// wins, then the client hint carried on the context, else 1.
-fn dpr_factor(ops: &[Operation], ctx: &ProcessContext<'_>) -> f32 {
-    crate::url::explicit_dpr(ops).or(ctx.dpr).unwrap_or(1.0)
+fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
+    explicit.or(ctx.dpr).unwrap_or(1.0)
 }
 
 /// Memoized face detection for one pipeline run: the image
@@ -890,8 +906,9 @@ fn apply_operations(
     cap: Option<(u32, u32)>,
     dpr: f32,
     ctx: &ProcessContext<'_>,
+    directives: &crate::url::RequestDirectives,
 ) -> Result<(DynamicImage, EncodeOptions), EngineError> {
-    let mut directives = EncodeOptions::default();
+    let mut encode_opts = EncodeOptions::default();
     let mut face_memo: FaceMemo = None;
     let mut detection_memo: DetectionMemo = None;
     for op in ops {
@@ -909,7 +926,7 @@ fn apply_operations(
                         ));
                     }
                 };
-                img = apply_pad(img, tw, th, *fill, ops, cap)?;
+                img = apply_pad(img, tw, th, *fill, directives.fill, cap)?;
             }
             Operation::CropRect {
                 left,
@@ -954,7 +971,7 @@ fn apply_operations(
                                 tw,
                                 th,
                                 face,
-                                crate::url::face_padding(ops),
+                                directives.face_padding,
                             )
                         }
                         Ok(_) => crate::crop::crop_to_aspect_with(img, tw, th, Align::Smart, None),
@@ -1079,14 +1096,14 @@ fn apply_operations(
                             let (new_img, options) =
                                 apply_filters(img, std::slice::from_ref(other));
                             img = new_img;
-                            directives.absorb(options);
+                            encode_opts.absorb(options);
                         }
                     }
                 }
             }
         }
     }
-    Ok((img, directives))
+    Ok((img, encode_opts))
 }
 
 /// The EXIF orientation stored in the source bytes (1-8), if the
@@ -1674,7 +1691,7 @@ fn apply_pad(
     target_w: u32,
     target_h: u32,
     fill: PadFill,
-    ops: &[Operation],
+    directive_fill: Option<[u8; 3]>,
     cap: Option<(u32, u32)>,
 ) -> Result<DynamicImage, EngineError> {
     if target_w == 0 || target_h == 0 {
@@ -1697,7 +1714,7 @@ fn apply_pad(
     }
     let color = match fill {
         PadFill::Color(c) => Some(c),
-        PadFill::Directive => Some(crate::url::explicit_fill(ops).unwrap_or([0, 0, 0])),
+        PadFill::Directive => Some(directive_fill.unwrap_or([0, 0, 0])),
         PadFill::Blur => None,
     };
     let canvas = match color {
@@ -3220,7 +3237,7 @@ mod tests {
         };
         let err = apply_size(img.clone(), &size, None, 1.0).unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
-        let err = apply_pad(img, 16_383, 16_383, PadFill::Directive, &[], None).unwrap_err();
+        let err = apply_pad(img, 16_383, 16_383, PadFill::Directive, None, None).unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
     }
 

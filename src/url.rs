@@ -1190,83 +1190,6 @@ pub fn expand_presets(
     }
 }
 
-/// The output format a request names explicitly, if any: the
-/// last `format(...)` filter wins, matching how the engine reads
-/// directives. Shared by the engine and the server (whose cache
-/// key must know whether negotiation can change the answer).
-pub fn explicit_format(ops: &[Operation]) -> Option<ImageFormat> {
-    ops.iter().rev().find_map(|op| match op {
-        Operation::Filters(filters) => filters.iter().rev().find_map(|f| match f {
-            Filter::Format(fmt) => Some(*fmt),
-            _ => None,
-        }),
-        _ => None,
-    })
-}
-
-/// Whether any filters segment in `ops` requests `no_upscale`.
-pub fn has_no_upscale(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| match op {
-        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::NoUpscale)),
-        _ => false,
-    })
-}
-
-/// The request's `fill(...)` directive color: the last one in
-/// the request wins.
-pub fn explicit_fill(ops: &[Operation]) -> Option<[u8; 3]> {
-    ops.iter().rev().find_map(|op| match op {
-        Operation::Filters(filters) => filters.iter().rev().find_map(|f| match f {
-            Filter::Fill(color) => Some(*color),
-            _ => None,
-        }),
-        _ => None,
-    })
-}
-
-/// Whether any filters segment in `ops` requests `removebg`.
-pub fn has_removebg(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| match op {
-        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::RemoveBg)),
-        _ => false,
-    })
-}
-
-/// The first shape filter in `ops` that produces transparency
-/// (`radius` or `mask`), named for error messages.
-pub fn shape_filter(ops: &[Operation]) -> Option<&'static str> {
-    ops.iter().find_map(|op| match op {
-        Operation::Filters(filters) => filters.iter().find_map(|f| match f {
-            Filter::Radius(_) => Some("radius"),
-            Filter::Mask(_) => Some("mask"),
-            _ => None,
-        }),
-        _ => None,
-    })
-}
-
-/// Whether any filters segment in `ops` requests `upscale`.
-pub fn has_upscale(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| match op {
-        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Upscale(_))),
-        _ => false,
-    })
-}
-
-/// Whether any operation in `ops` is a smart-aligned crop
-/// (which may run face detection when one is configured).
-pub fn has_smart_crop(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| {
-        matches!(
-            op,
-            Operation::Crop {
-                align: Align::Smart,
-                ..
-            }
-        )
-    })
-}
-
 /// The `text(...)` color field: `rrggbb` (opaque) or
 /// `rrggbbaa`, as RGBA bytes.
 fn parse_text_color(s: &str) -> Option<[u8; 4]> {
@@ -1281,140 +1204,156 @@ fn parse_text_color(s: &str) -> Option<[u8; 4]> {
     }
 }
 
-/// The request's explicit DPR factor, if a `dpr` directive is
-/// present. Like format and quality it is request-wide: the
-/// last segment that sets it wins.
-pub fn explicit_dpr(ops: &[Operation]) -> Option<f32> {
-    let mut found = None;
-    for op in ops {
-        if let Operation::Filters(filters) = op {
-            for f in filters {
-                if let Filter::Dpr(factor) = f {
-                    found = Some(*factor);
-                }
-            }
-        }
-    }
-    found
+/// Everything the server and the engine need to know about a
+/// parsed request's directives, computed in ONE pass over the
+/// operations. This replaces the former family of per-question
+/// walks (each helper re-scanned the whole list, and the
+/// server's AI-gate predicate had drifted from the engine's
+/// preflight): there is now exactly one place that reads the
+/// ops list for directives, and both sides consume it.
+///
+/// Field semantics match the historical helpers: `format`,
+/// `fill`, `dpr`, and `facepad` are request-wide with the LAST
+/// segment winning; the shape filter is the FIRST one (it names
+/// error messages); class names keep request order; watermark
+/// URLs are distinct, in order of first appearance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestDirectives {
+    /// The explicitly named output format, if any.
+    pub explicit_format: Option<ImageFormat>,
+    /// Any `no_upscale` directive.
+    pub no_upscale: bool,
+    /// The `fill(...)` directive color, if any.
+    pub fill: Option<[u8; 3]>,
+    /// Any `removebg` filter.
+    pub removebg: bool,
+    /// The first shape filter (`radius` or `mask`), named for
+    /// error messages.
+    pub shape_filter: Option<&'static str>,
+    /// Any `upscale` filter.
+    pub upscale: bool,
+    /// Any smart-aligned crop.
+    pub smart_crop: bool,
+    /// The explicit DPR factor, if a `dpr` directive is present.
+    pub dpr: Option<f32>,
+    /// The ops fix the output dimensions themselves (a size,
+    /// crop, fit-in, pad, or crop-rect operation), so a width
+    /// client hint does not apply.
+    pub has_size_operation: bool,
+    /// Any `keep_profile` directive.
+    pub keep_profile: bool,
+    /// Any `quality(...)` directive, fixed or auto.
+    pub quality_directive: bool,
+    /// Any `text` filter.
+    pub text: bool,
+    /// The request requires the face model: a face-aligned
+    /// crop, or a face redaction filter. (Smart alignment does
+    /// not count here: it falls back to saliency.)
+    pub needs_face_model: bool,
+    /// Class names requested by class redaction filters, in
+    /// request order.
+    pub classes: Vec<String>,
+    /// Padding for a face-aligned crop, as a fraction of the
+    /// face size added on every side. Defaults to 0.5.
+    pub face_padding: f32,
+    /// The distinct watermark and overlay URLs referenced, in
+    /// order of first appearance. The server fetches each one
+    /// before the engine runs.
+    pub watermark_urls: Vec<String>,
 }
 
-/// Whether `ops` fix the output dimensions themselves (a
-/// size, crop, fit-in, pad, or crop-rect operation). A
-/// width client hint only applies when this is false.
-pub fn has_size_operation(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| {
-        matches!(
-            op,
-            Operation::Size(_)
+impl RequestDirectives {
+    /// Analyze a parsed request's operations in a single walk.
+    pub fn analyze(ops: &[Operation]) -> Self {
+        let mut d = RequestDirectives {
+            explicit_format: None,
+            no_upscale: false,
+            fill: None,
+            removebg: false,
+            shape_filter: None,
+            upscale: false,
+            smart_crop: false,
+            dpr: None,
+            has_size_operation: false,
+            keep_profile: false,
+            quality_directive: false,
+            text: false,
+            needs_face_model: false,
+            classes: Vec::new(),
+            face_padding: 0.5,
+            watermark_urls: Vec::new(),
+        };
+        for op in ops {
+            match op {
+                Operation::Size(_)
                 | Operation::Crop { .. }
                 | Operation::FitIn(_)
                 | Operation::Pad { .. }
-                | Operation::CropRect { .. }
-        )
-    })
-}
-
-/// Whether `ops` ask to keep the source color profile.
-pub fn has_keep_profile(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| match op {
-        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::KeepProfile)),
-        _ => false,
-    })
-}
-
-/// Whether `ops` carry any `quality(...)` directive, fixed
-/// or auto. Save-Data only steps quality when this is false.
-pub fn has_quality_directive(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| match op {
-        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Quality(_))),
-        _ => false,
-    })
-}
-
-/// Whether any filters segment in `ops` requests `text`.
-pub fn has_text(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| match op {
-        Operation::Filters(filters) => filters.iter().any(|f| matches!(f, Filter::Text { .. })),
-        _ => false,
-    })
-}
-
-/// Whether the request uses an operation that requires the
-/// face model: a face-aligned crop, or a face redaction
-/// filter. (Smart alignment does not count: it falls back to
-/// saliency without a model.)
-pub fn needs_face_model(ops: &[Operation]) -> bool {
-    ops.iter().any(|op| match op {
-        Operation::Crop { align, .. } => *align == Align::Face,
-        Operation::Filters(filters) => filters
-            .iter()
-            .any(|f| matches!(f, Filter::BlurFaces | Filter::PixelateFaces)),
-        _ => false,
-    })
-}
-
-/// Whether any filters segment in `ops` requests a
-/// class redaction (`blurclass` / `pixelateclass`), which
-/// needs the detection model and the AI gate.
-pub fn has_class_redaction(ops: &[Operation]) -> bool {
-    !class_filters(ops).is_empty()
-}
-
-/// The class names requested by `ops`' class redaction
-/// filters, in request order.
-pub fn class_filters(ops: &[Operation]) -> Vec<&str> {
-    let mut out = Vec::new();
-    for op in ops {
-        if let Operation::Filters(filters) = op {
-            for f in filters {
-                match f {
-                    Filter::BlurClass(name) | Filter::PixelateClass(name) => {
-                        out.push(name.as_str())
-                    }
+                | Operation::CropRect { .. } => d.has_size_operation = true,
+                _ => {}
+            }
+            if let Operation::Crop { align, .. } = op {
+                match align {
+                    Align::Smart => d.smart_crop = true,
+                    Align::Face => d.needs_face_model = true,
                     _ => {}
                 }
             }
-        }
-    }
-    out
-}
-
-/// Padding for a face-aligned crop: the last `facepad(...)`
-/// directive in the request, as a fraction of the face size
-/// added on every side. Defaults to 0.5.
-pub fn face_padding(ops: &[Operation]) -> f32 {
-    ops.iter()
-        .rev()
-        .find_map(|op| match op {
-            Operation::Filters(filters) => filters.iter().rev().find_map(|f| match f {
-                Filter::FacePad(p) => Some(*p),
-                _ => None,
-            }),
-            _ => None,
-        })
-        .unwrap_or(0.5)
-}
-
-/// The distinct watermark and overlay URLs a request
-/// references, in order of first appearance. The server
-/// fetches each one before the engine runs.
-pub fn watermark_urls(ops: &[Operation]) -> Vec<&str> {
-    let mut urls: Vec<&str> = Vec::new();
-    for op in ops {
-        if let Operation::Filters(filters) = op {
-            for filter in filters {
-                let url = match filter {
-                    Filter::Watermark { url, .. } => url,
-                    Filter::Overlay { url, .. } => url,
-                    _ => continue,
-                };
-                if !urls.contains(&url.as_str()) {
-                    urls.push(url.as_str());
+            if let Operation::Filters(filters) = op {
+                for f in filters {
+                    match f {
+                        Filter::Format(fmt) => d.explicit_format = Some(*fmt),
+                        Filter::NoUpscale => d.no_upscale = true,
+                        Filter::Fill(color) => d.fill = Some(*color),
+                        Filter::RemoveBg => d.removebg = true,
+                        Filter::Radius(_) if d.shape_filter.is_none() => {
+                            d.shape_filter = Some("radius")
+                        }
+                        Filter::Mask(_) if d.shape_filter.is_none() => {
+                            d.shape_filter = Some("mask")
+                        }
+                        Filter::Upscale(_) => d.upscale = true,
+                        Filter::Dpr(factor) => d.dpr = Some(*factor),
+                        Filter::KeepProfile => d.keep_profile = true,
+                        Filter::Quality(_) => d.quality_directive = true,
+                        Filter::Text { .. } => d.text = true,
+                        Filter::BlurFaces | Filter::PixelateFaces => d.needs_face_model = true,
+                        Filter::BlurClass(name) | Filter::PixelateClass(name) => {
+                            d.classes.push(name.clone())
+                        }
+                        Filter::FacePad(p) => d.face_padding = *p,
+                        Filter::Watermark { url, .. } | Filter::Overlay { url, .. }
+                            if !d.watermark_urls.contains(url) =>
+                        {
+                            d.watermark_urls.push(url.clone());
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
+        d
     }
-    urls
+
+    /// Whether any class redaction filter is present (which
+    /// needs the detection model and the AI gate).
+    pub fn has_class_redaction(&self) -> bool {
+        !self.classes.is_empty()
+    }
+
+    /// Whether the request can run AI inference in the engine.
+    /// This is the ONE predicate behind both the server's AI
+    /// gate and the engine's expectations: background removal,
+    /// upscale, face operations, and class redaction always
+    /// infer; smart crops infer when a face provider is
+    /// configured, so they are gated too.
+    pub fn uses_ai(&self) -> bool {
+        self.removebg
+            || self.upscale
+            || self.needs_face_model
+            || self.smart_crop
+            || self.has_class_redaction()
+    }
 }
 
 /// Decode `%XX` escapes; other characters pass through. A
@@ -2350,7 +2289,10 @@ mod tests {
             "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,normal)/example.com/img.jpg",
         )
         .unwrap();
-        assert_eq!(watermark_urls(&ops), vec!["https://x/ov.png"]);
+        assert_eq!(
+            RequestDirectives::analyze(&ops).watermark_urls,
+            ["https://x/ov.png"]
+        );
     }
 
     #[test]
@@ -2407,7 +2349,7 @@ mod tests {
     fn parses_dpr_directive() {
         let (ops, _) = parse_operations("filters:dpr(2)/example.com/i.png").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::Dpr(2.0)])]);
-        assert_eq!(explicit_dpr(&ops), Some(2.0));
+        assert_eq!(RequestDirectives::analyze(&ops).dpr, Some(2.0));
         for bad in [
             "filters:dpr(1.25)", // not one of the settled factors
             "filters:dpr(0)",
@@ -2618,7 +2560,10 @@ mod tests {
             "filters:watermark(a%2F1.png,0,0,50):watermark(a%2F1.png,5,5,50):watermark(b%2F2.png,0,0,50)/example.com/img.jpg",
         )
         .unwrap();
-        assert_eq!(watermark_urls(&ops), vec!["a/1.png", "b/2.png"]);
+        assert_eq!(
+            RequestDirectives::analyze(&ops).watermark_urls,
+            ["a/1.png", "b/2.png"]
+        );
     }
 
     #[test]
@@ -2672,8 +2617,8 @@ mod tests {
                 align: Align::Face,
             }]
         );
-        assert!(needs_face_model(&ops));
-        assert_eq!(face_padding(&ops), 0.5);
+        assert!(RequestDirectives::analyze(&ops).needs_face_model);
+        assert_eq!(RequestDirectives::analyze(&ops).face_padding, 0.5);
 
         let (ops, _) =
             parse_operations("filters:blurfaces:pixelatefaces:facepad(1.5)/example.com/img.jpg")
@@ -2686,12 +2631,12 @@ mod tests {
                 Filter::FacePad(1.5),
             ])]
         );
-        assert!(needs_face_model(&ops));
-        assert_eq!(face_padding(&ops), 1.5);
+        assert!(RequestDirectives::analyze(&ops).needs_face_model);
+        assert_eq!(RequestDirectives::analyze(&ops).face_padding, 1.5);
 
         // Smart crops and plain requests do not require a model.
         let (ops, _) = parse_operations("crop:300x300:smart/example.com/img.jpg").unwrap();
-        assert!(!needs_face_model(&ops));
+        assert!(!RequestDirectives::analyze(&ops).needs_face_model);
 
         // Class redaction (#62): names parse as written,
         // spaces included; the class list is in order.
@@ -2706,8 +2651,11 @@ mod tests {
                 Filter::PixelateClass("traffic light".to_string()),
             ])]
         );
-        assert!(has_class_redaction(&ops));
-        assert_eq!(class_filters(&ops), ["person", "traffic light"]);
+        assert!(RequestDirectives::analyze(&ops).has_class_redaction());
+        assert_eq!(
+            RequestDirectives::analyze(&ops).classes,
+            ["person", "traffic light"]
+        );
         for bad in [
             "filters:blurclass()/example.com/img.jpg",
             "filters:blurclass( )/example.com/img.jpg",
@@ -3036,14 +2984,20 @@ mod tests {
     fn operation_queries_find_directives() {
         let (ops, _) =
             parse_operations("100x100/filters:format(png):no_upscale/example.com/i.jpg").unwrap();
-        assert_eq!(explicit_format(&ops), Some(ImageFormat::Png));
-        assert!(has_no_upscale(&ops));
+        assert_eq!(
+            RequestDirectives::analyze(&ops).explicit_format,
+            Some(ImageFormat::Png)
+        );
+        assert!(RequestDirectives::analyze(&ops).no_upscale);
         let (ops, _) = parse_operations("100x100/example.com/i.jpg").unwrap();
-        assert_eq!(explicit_format(&ops), None);
-        assert!(!has_no_upscale(&ops));
+        assert_eq!(RequestDirectives::analyze(&ops).explicit_format, None);
+        assert!(!RequestDirectives::analyze(&ops).no_upscale);
         // A later format filter wins over an earlier one.
         let (ops, _) =
             parse_operations("filters:format(jpeg):format(webp)/example.com/i.jpg").unwrap();
-        assert_eq!(explicit_format(&ops), Some(ImageFormat::WebP));
+        assert_eq!(
+            RequestDirectives::analyze(&ops).explicit_format,
+            Some(ImageFormat::WebP)
+        );
     }
 }
