@@ -79,6 +79,74 @@ fn the_binary_boots_and_answers_health() {
     );
 }
 
+/// A model file that exists, so a boot failure is about
+/// the runtime, never about a missing model.
+fn configured_model() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("crabcrop-boot-model-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("model.onnx");
+    std::fs::write(&model, b"not a real model").unwrap();
+    model
+}
+
+#[test]
+fn boot_with_a_model_but_no_loadable_runtime_fails_with_the_diagnostic() {
+    // #180: with a model configured but no loadable ONNX
+    // Runtime, boot used to die on a panic inside ort (exit
+    // 101). ORT_DYLIB_PATH pointing nowhere real is exactly
+    // the fallback resolution ort performs when
+    // CRABCROP_ORT_DYLIB is unset, and it keeps the test
+    // hermetic on hosts that do have a system runtime.
+    let model = configured_model();
+    let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+        .env_clear()
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+        .env("PORT", free_port().to_string())
+        .env("CRABCROP_REMOVEBG_MODEL", &model)
+        .env("ORT_DYLIB_PATH", "/nonexistent/libonnxruntime.so")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "crabcrop: cannot load the background-removal model: \
+             cannot load the ONNX runtime from /nonexistent/libonnxruntime.so"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+#[ignore = "host-dependent: only fails where no system ONNX Runtime is installed"]
+fn boot_with_a_model_but_no_runtime_anywhere_fails_with_the_diagnostic() {
+    // The unvarnished #180 scenario: a model configured, no
+    // CRABCROP_ORT_DYLIB, no ORT_DYLIB_PATH, and no system
+    // runtime for the loader to find. On a host with a
+    // system runtime the boot succeeds instead, which is
+    // why this is ignored by default. Run it where no
+    // system runtime exists:
+    // cargo test --test boot_smoke -- --ignored boot_with_a_model_but_no_runtime_anywhere
+    let model = configured_model();
+    let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+        .env_clear()
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+        .env("PORT", free_port().to_string())
+        .env("CRABCROP_REMOVEBG_MODEL", &model)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot load the ONNX runtime from"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("onnxruntime"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
 #[test]
 fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
     // The in-process contract (cli::exec returning Err) is

@@ -61,15 +61,44 @@ pub trait MaskProvider: Send + Sync + std::fmt::Debug {
 /// configured models.
 static ENVIRONMENT: OnceLock<ort::environment::Environment> = OnceLock::new();
 
+/// The dylib path `ort` searches when no explicit path is
+/// configured, resolved the way ort resolves it: the
+/// `ORT_DYLIB_PATH` variable wins when set and non-empty;
+/// otherwise the platform's library name (`libonnxruntime.so`
+/// on Linux), which the dynamic loader searches normally.
+/// Pure, so the resolution is testable without the runtime.
+fn ort_search_path(ort_dylib_path: Option<&str>) -> std::path::PathBuf {
+    match ort_dylib_path {
+        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => std::path::PathBuf::from(format!(
+            "{}onnxruntime{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        )),
+    }
+}
+
 fn environment(dylib: Option<&str>) -> Result<&'static ort::environment::Environment, AiError> {
     if let Some(env) = ENVIRONMENT.get() {
         return Ok(env);
     }
-    let builder = match dylib {
-        Some(path) => ort::init_from(path)
-            .map_err(|e| AiError::Load(format!("cannot load the ONNX runtime from {path}: {e}")))?,
-        None => ort::init(),
+    // Load the runtime explicitly, from the configured path
+    // or from the path ort itself would search. `ort::init()`
+    // defers that load to the first API call, where a missing
+    // runtime panics inside ort; `init_from` returns the
+    // failure as an error, so a configured model with no
+    // loadable runtime fails boot with the diagnostic below
+    // instead of a panic (#180).
+    let path = match dylib {
+        Some(path) => std::path::PathBuf::from(path),
+        None => ort_search_path(std::env::var("ORT_DYLIB_PATH").ok().as_deref()),
     };
+    let builder = ort::init_from(&path).map_err(|e| {
+        AiError::Load(format!(
+            "cannot load the ONNX runtime from {}: {e}",
+            path.display()
+        ))
+    })?;
     let env = builder
         .build()
         .map_err(|e| AiError::Load(format!("cannot initialize the ONNX runtime: {e}")))?;
@@ -516,6 +545,24 @@ mod tests {
 
     fn solid(r: u8, g: u8, b: u8, w: u32, h: u32) -> DynamicImage {
         DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb([r, g, b])))
+    }
+
+    #[test]
+    fn ort_search_path_prefers_the_ort_dylib_variable() {
+        // #180: the fallback resolution mirrors ort's own, so
+        // the preflight loads exactly what ort would have
+        // loaded lazily (and panicked on).
+        assert_eq!(
+            ort_search_path(Some("/opt/ort/libonnxruntime.so")),
+            std::path::PathBuf::from("/opt/ort/libonnxruntime.so")
+        );
+        let default = std::path::PathBuf::from(format!(
+            "{}onnxruntime{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+        assert_eq!(ort_search_path(None), default);
+        assert_eq!(ort_search_path(Some("")), default);
     }
 
     #[test]

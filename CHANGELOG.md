@@ -19,6 +19,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 - Caller-supplied focal rectangle for crops: a `focal:<left>x<top>:<right>x<bottom>` segment names the source rectangle the next `crop:` must keep (center and smart crops position on it; directional alignments ignore it). The Thumbor converter now maps the `focal(...)` filter to it.
 - Corner crop alignments: `crop:` accepts `top-left`, `top-right`, `bottom-left`, and `bottom-right` alongside the single-axis alignments (each corner decomposes per axis: its horizontal component positions a width crop, its vertical component a height crop). The Thumbor converter maps corner alignment pairs to them exactly instead of approximating to the vertical side.
 
+### Fixed
+
+- Boot with an AI model configured but no loadable ONNX Runtime (no `CRABCROP_ORT_DYLIB` and no system runtime) died on a panic inside the `ort` crate instead of failing startup. The runtime is now loaded explicitly from the configured path, or from the path ort itself would search (`ORT_DYLIB_PATH`, then the system library name), and a load failure is the usual `cannot load ...` boot diagnostic with exit code 1.
+
 ## [0.1.0] - unreleased
 
 The first release, staged by the Phase 6 release pipeline and not yet published to any registry.
