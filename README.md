@@ -614,7 +614,7 @@ docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret crabcrop:latest
 
 For the AI features, build `Dockerfile.ai` on top of that image; see [AI features](#ai-features).
 
-On Kubernetes, `deploy/helm` is a Helm chart and `deploy/kustomize` the same workload in kustomize form (base, components for presets, the disk tier, and the AI variant, plus single and multi-replica overlays); `deploy/compose` runs it under Docker Compose.
+On Kubernetes, `deploy/helm` is a Helm chart and `deploy/kustomize` the same workload in kustomize form (base, components for presets, the disk tier, and the AI variant, plus single and multi-replica overlays); `deploy/compose` runs it under Docker Compose. Without Kubernetes, `deploy/ecs-fargate`, `deploy/cloud-run`, and `deploy/container-apps` are per-cloud recipes (task definition, service manifest, and app manifest, each with its secret wiring and a smoke checklist).
 
 Run crabcrop behind a reverse proxy or CDN in production. The application bounds its own work (the processing and AI gates shed overload with `503`), but connection-level protections belong at the edge: request and header timeouts, connection limits, rate limiting, and TLS termination. Restrict `/health` and `/metrics` to your internal network at the proxy: both are unauthenticated (they are served with `Cache-Control: no-store`), and the metrics expose traffic and error counters.
 

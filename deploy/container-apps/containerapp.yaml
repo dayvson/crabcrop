@@ -1,0 +1,44 @@
+type: Microsoft.App/containerApps
+apiVersion: 2024-03-01
+name: crabcrop
+location: REPLACE_ME_location
+properties:
+  managedEnvironmentId: REPLACE_ME_container_apps_environment_id
+  configuration:
+    activeRevisionsMode: Single
+    ingress:
+      external: true
+      targetPort: 3000
+    secrets:
+      # For anything real, replace `value` with a Key Vault
+      # reference (keyVaultUrl plus a managed identity), as
+      # the recipe README shows.
+      - name: crabcrop-secret
+        value: REPLACE_ME_signing_secret
+  template:
+    containers:
+      - name: crabcrop
+        image: REPLACE_ME_registry.azurecr.io/crabcrop:latest
+        env:
+          - name: PORT
+            value: "3000"
+          - name: CRABCROP_SECRET
+            secretRef: crabcrop-secret
+        probes:
+          - type: Liveness
+            httpGet:
+              path: /health
+              port: 3000
+          - type: Readiness
+            httpGet:
+              path: /health
+              port: 3000
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+    scale:
+      # One warm replica keeps its in-memory cache useful.
+      # Raise maxReplicas freely: replicas trade cache
+      # efficiency, never correctness.
+      minReplicas: 1
+      maxReplicas: 10
