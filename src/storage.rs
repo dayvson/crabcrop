@@ -35,6 +35,13 @@ struct Inner {
 /// disables storage. All operations are best-effort: IO errors
 /// degrade to misses and dropped writes, never failures,
 /// because a cache must not take the pipeline down with it.
+///
+/// The mutex guards the in-memory index only (issue #137): file
+/// reads, writes, and deletions all happen with the lock
+/// dropped, so a slow disk never stalls unrelated lookups
+/// behind it. The index mutations stay exactly as atomic as
+/// before; a race can at worst evict a fresh entry, which a
+/// cache heals on the next store.
 #[derive(Debug)]
 pub struct DiskStore {
     dir: PathBuf,
@@ -129,20 +136,30 @@ impl DiskStore {
         if self.max_bytes == 0 {
             return None;
         }
-        let mut inner = self.inner.lock().unwrap();
-        let (stem, _, _) = inner.entries.get(key)?.clone();
+        let stem = {
+            let inner = self.inner.lock().unwrap();
+            inner.entries.get(key)?.0.clone()
+        };
         let path = self.file_for(&stem);
         let parsed = std::fs::read(&path)
             .ok()
             .and_then(|data| parse_entry(&data));
         match parsed {
             Some((stored_key, image)) if stored_key == key => {
-                touch(&mut inner, key);
+                let mut inner = self.inner.lock().unwrap();
+                if inner.entries.contains_key(key) {
+                    touch(&mut inner, key);
+                }
                 Some(image)
             }
             _ => {
-                evict_entry(&mut inner, key);
-                let _ = std::fs::remove_file(&path);
+                let delete = {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.entries.contains_key(key) && evict_entry(&mut inner, key).is_some()
+                };
+                if delete {
+                    let _ = std::fs::remove_file(&path);
+                }
                 None
             }
         }
@@ -167,48 +184,55 @@ impl DiskStore {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
-        if let Some((_, old_size, _)) = inner.entries.remove(key) {
-            inner.total_bytes -= old_size;
-            remove_from_order(&mut inner, key);
-        }
-        while inner.total_bytes + data.len() > self.max_bytes {
-            let Some(oldest) = inner.order.pop_front() else {
-                break;
-            };
-            if let Some((old_stem, size, _)) = inner.entries.remove(&oldest) {
-                inner.total_bytes -= size;
-                let _ = std::fs::remove_file(self.file_for(&old_stem));
+        let mut evicted: Vec<String> = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some((_, old_size, _)) = inner.entries.remove(key) {
+                inner.total_bytes -= old_size;
+                remove_from_order(&mut inner, key);
             }
+            while inner.total_bytes + data.len() > self.max_bytes {
+                let Some(oldest) = inner.order.pop_front() else {
+                    break;
+                };
+                if let Some((old_stem, size, _)) = inner.entries.remove(&oldest) {
+                    inner.total_bytes -= size;
+                    evicted.push(old_stem);
+                }
+            }
+            inner.total_bytes += data.len();
+            inner.order.push_back(key.to_string());
+            inner
+                .entries
+                .insert(key.to_string(), (stem, data.len(), image.groups.clone()));
         }
-        inner.total_bytes += data.len();
-        inner.order.push_back(key.to_string());
-        inner
-            .entries
-            .insert(key.to_string(), (stem, data.len(), image.groups.clone()));
+        for old_stem in evicted {
+            let _ = std::fs::remove_file(self.file_for(&old_stem));
+        }
     }
 
     /// Remove every entry for `base`: the bare key plus its
     /// `#`-suffixed variants (Accept class, DPR). Returns how
     /// many entries were removed.
     pub fn purge_matching(&self, base: &str) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        // Built once, not per key examined.
-        let prefix = format!("{base}#");
-        let keys: Vec<String> = inner
-            .entries
-            .keys()
-            .filter(|k| k.as_str() == base || k.starts_with(&prefix))
-            .cloned()
-            .collect();
-        let mut removed = 0;
-        for key in keys {
-            if let Some((stem, _)) = evict_entry(&mut inner, &key) {
-                let _ = std::fs::remove_file(self.file_for(&stem));
-                removed += 1;
-            }
+        let stems: Vec<String> = {
+            let mut inner = self.inner.lock().unwrap();
+            // Built once, not per key examined.
+            let prefix = format!("{base}#");
+            let keys: Vec<String> = inner
+                .entries
+                .keys()
+                .filter(|k| k.as_str() == base || k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            keys.iter()
+                .filter_map(|key| evict_entry(&mut inner, key).map(|(stem, _)| stem))
+                .collect()
+        };
+        for stem in &stems {
+            let _ = std::fs::remove_file(self.file_for(stem));
         }
-        removed
+        stems.len()
     }
 
     /// Remove every entry belonging to `group` (RFC 9875
@@ -216,21 +240,22 @@ impl DiskStore {
     /// scan and at store time. Returns how many entries
     /// were removed.
     pub fn purge_group(&self, group: &str) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        let keys: Vec<String> = inner
-            .entries
-            .iter()
-            .filter(|(_, (_, _, groups))| groups.iter().any(|g| g == group))
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut removed = 0;
-        for key in keys {
-            if let Some((stem, _)) = evict_entry(&mut inner, &key) {
-                let _ = std::fs::remove_file(self.file_for(&stem));
-                removed += 1;
-            }
+        let stems: Vec<String> = {
+            let mut inner = self.inner.lock().unwrap();
+            let keys: Vec<String> = inner
+                .entries
+                .iter()
+                .filter(|(_, (_, _, groups))| groups.iter().any(|g| g == group))
+                .map(|(key, _)| key.clone())
+                .collect();
+            keys.iter()
+                .filter_map(|key| evict_entry(&mut inner, key).map(|(stem, _)| stem))
+                .collect()
+        };
+        for stem in &stems {
+            let _ = std::fs::remove_file(self.file_for(stem));
         }
-        removed
+        stems.len()
     }
 
     /// (entries, total bytes) currently indexed, for the boot
