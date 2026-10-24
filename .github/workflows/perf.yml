@@ -1,0 +1,22 @@
+name: Perf gate
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (release)
+        run: cargo build --release
+      - name: Run the performance gate
+        continue-on-error: true
+        run: python3 scripts/bench_gate.py
