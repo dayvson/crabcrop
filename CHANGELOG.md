@@ -7,6 +7,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 ### Added
 
 - Caller-supplied focal rectangle for crops: a `focal:<left>x<top>:<right>x<bottom>` segment names the source rectangle the next `crop:` must keep (center and smart crops position on it; directional alignments ignore it). The Thumbor converter now maps the `focal(...)` filter to it.
+- Corner crop alignments: `crop:` accepts `top-left`, `top-right`, `bottom-left`, and `bottom-right` alongside the single-axis alignments (each corner decomposes per axis: its horizontal component positions a width crop, its vertical component a height crop). The Thumbor converter maps corner alignment pairs to them exactly instead of approximating to the vertical side.
 
 ## [0.1.0] - unreleased
 

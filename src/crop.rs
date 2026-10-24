@@ -51,8 +51,8 @@ pub fn crop_to_aspect_with(
         // Source is wider: crop the width.
         let cw = ((h as u64 * target_w as u64) / target_h as u64).max(1) as u32;
         let x = match align {
-            Align::Left => 0,
-            Align::Right => w.saturating_sub(cw),
+            Align::Left | Align::TopLeft | Align::BottomLeft => 0,
+            Align::Right | Align::TopRight | Align::BottomRight => w.saturating_sub(cw),
             Align::Smart => smart_start(&img, cw, w, true, faces),
             _ => (w.saturating_sub(cw)) / 2,
         };
@@ -61,8 +61,8 @@ pub fn crop_to_aspect_with(
         // Source is taller: crop the height.
         let ch = ((w as u64 * target_h as u64) / target_w as u64).max(1) as u32;
         let y = match align {
-            Align::Top => 0,
-            Align::Bottom => h.saturating_sub(ch),
+            Align::Top | Align::TopLeft | Align::TopRight => 0,
+            Align::Bottom | Align::BottomLeft | Align::BottomRight => h.saturating_sub(ch),
             Align::Smart => smart_start(&img, ch, h, false, faces),
             _ => (h.saturating_sub(ch)) / 2,
         };
@@ -276,6 +276,42 @@ mod tests {
         let out = crop_to_aspect(hstripes(), 1, 1, Align::Bottom);
         assert_eq!((out.width(), out.height()), (60, 60));
         assert_eq!(rgb(&out, 0, 59), [0, 0, 255]);
+    }
+
+    #[test]
+    fn corner_top_left_matches_left_on_a_wider_source() {
+        // The width is cropped, so the corner's horizontal
+        // component rules: top-left is exactly left.
+        let corner = crop_to_aspect(vstripes(), 1, 1, Align::TopLeft);
+        let plain = crop_to_aspect(vstripes(), 1, 1, Align::Left);
+        assert_eq!(corner.to_rgb8(), plain.to_rgb8());
+        assert_eq!(rgb(&corner, 0, 0), [255, 0, 0]);
+    }
+
+    #[test]
+    fn corner_top_left_matches_top_on_a_taller_source() {
+        // The height is cropped, so the vertical component
+        // rules: top-left is exactly top.
+        let corner = crop_to_aspect(hstripes(), 1, 1, Align::TopLeft);
+        let plain = crop_to_aspect(hstripes(), 1, 1, Align::Top);
+        assert_eq!(corner.to_rgb8(), plain.to_rgb8());
+        assert_eq!(rgb(&corner, 0, 0), [255, 0, 0]);
+    }
+
+    #[test]
+    fn corner_bottom_right_matches_right_on_a_wider_source() {
+        let corner = crop_to_aspect(vstripes(), 1, 1, Align::BottomRight);
+        let plain = crop_to_aspect(vstripes(), 1, 1, Align::Right);
+        assert_eq!(corner.to_rgb8(), plain.to_rgb8());
+        assert_eq!(rgb(&corner, 59, 0), [0, 0, 255]);
+    }
+
+    #[test]
+    fn corner_bottom_right_matches_bottom_on_a_taller_source() {
+        let corner = crop_to_aspect(hstripes(), 1, 1, Align::BottomRight);
+        let plain = crop_to_aspect(hstripes(), 1, 1, Align::Bottom);
+        assert_eq!(corner.to_rgb8(), plain.to_rgb8());
+        assert_eq!(rgb(&corner, 0, 59), [0, 0, 255]);
     }
 
     #[test]

@@ -991,16 +991,10 @@ pub fn convert_thumbor(
         "smart"
     } else {
         match (halign, valign) {
-            (Some(h), Some("top")) if h != "center" => {
-                warnings.push(format!("corner alignment ({h}, top) approximated as top"));
-                "top"
-            }
-            (Some(h), Some("bottom")) if h != "center" => {
-                warnings.push(format!(
-                    "corner alignment ({h}, bottom) approximated as bottom"
-                ));
-                "bottom"
-            }
+            (Some("left"), Some("top")) => "top-left",
+            (Some("right"), Some("top")) => "top-right",
+            (Some("left"), Some("bottom")) => "bottom-left",
+            (Some("right"), Some("bottom")) => "bottom-right",
             (_, Some("top")) => "top",
             (_, Some("bottom")) => "bottom",
             (Some("left"), _) => "left",
@@ -1380,18 +1374,30 @@ mod tests {
         let (url, _) =
             convert_thumbor("unsafe/300x200/smart/https://e.com/a.jpg", base, Some(b"s")).unwrap();
         assert!(url.contains("/crop:300x200:smart/"), "{url}");
-        // A corner collapses to its vertical side, loudly.
+        // A corner pair maps to the corner alignment, exactly.
         let (url, warnings) = convert_thumbor(
             "unsafe/300x200/left/top/https://e.com/a.jpg",
             base,
             Some(b"s"),
         )
         .unwrap();
+        assert!(url.contains("/crop:300x200:top-left/"), "{url}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (url, _) = convert_thumbor(
+            "unsafe/300x200/right/bottom/https://e.com/a.jpg",
+            base,
+            Some(b"s"),
+        )
+        .unwrap();
+        assert!(url.contains("/crop:300x200:bottom-right/"), "{url}");
+        // A centered horizontal still collapses to the plain side.
+        let (url, _) = convert_thumbor(
+            "unsafe/300x200/center/top/https://e.com/a.jpg",
+            base,
+            Some(b"s"),
+        )
+        .unwrap();
         assert!(url.contains("/crop:300x200:top/"), "{url}");
-        assert!(
-            warnings.iter().any(|w| w.contains("corner alignment")),
-            "{warnings:?}"
-        );
     }
 
     #[test]

@@ -161,6 +161,10 @@ Crops the image to the width:height aspect ratio, then resizes to exactly that w
 | `bottom` | The bottom edge. |
 | `left` | The left edge. |
 | `right` | The right edge. |
+| `top-left` | The top-left corner: the left edge when the width is cropped, the top edge when the height is. |
+| `top-right` | The top-right corner. |
+| `bottom-left` | The bottom-left corner. |
+| `bottom-right` | The bottom-right corner. |
 | `smart` | A window centered on the focal point: a detected face when a face model is configured (see [AI features](#ai-features)), otherwise the point of greatest local detail in the image. |
 | `face` | A window around the largest detected face, expanded by the `facepad` padding (below). Requires a face model; with no faces (or a detection failure) it falls back to the `smart` window. |
 
@@ -186,7 +190,7 @@ curl "http://localhost:3000/unsafe/crop-rect:100x50:700x450/https://example.com/
 focal:<left>x<top>:<right>x<bottom>
 ```
 
-Names the rectangle the next `crop:` in the URL must keep, in source pixels. The segment produces no output of its own; the crop consumes it. A `center` or `smart` crop positions its window on the rectangle: centered on the rectangle's center, and clamped so a rectangle that fits inside the window stays fully inside it. With a focal rectangle pending, `smart` skips face and detail detection entirely, because the caller has already said what matters. The directional alignments (`top`, `bottom`, `left`, `right`) and `face` are explicit instructions of their own and ignore the rectangle. `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside the source image fails with `400`. Coordinates address source pixels and are not scaled by `dpr`.
+Names the rectangle the next `crop:` in the URL must keep, in source pixels. The segment produces no output of its own; the crop consumes it. A `center` or `smart` crop positions its window on the rectangle: centered on the rectangle's center, and clamped so a rectangle that fits inside the window stays fully inside it. With a focal rectangle pending, `smart` skips face and detail detection entirely, because the caller has already said what matters. The directional alignments (`top`, `bottom`, `left`, `right`, and the four corners) and `face` are explicit instructions of their own and ignore the rectangle. `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside the source image fails with `400`. Coordinates address source pixels and are not scaled by `dpr`.
 
 ```bash
 curl "http://localhost:3000/unsafe/focal:100x50:700x450/crop:800x600:smart/https://example.com/photo.jpg"

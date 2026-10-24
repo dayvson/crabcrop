@@ -28,5 +28,11 @@
     "secret": "correct horse battery staple",
     "remainder": "crop:1200x630:smart/filters:quality(80)/s3://media/photo.jpg",
     "signature": "368f2826d950429c19e89b431af940d3ae4d301e1a7a03e13abb8af58941fa91"
+  },
+  {
+    "description": "Corner-aligned crop",
+    "secret": "s3cr3t",
+    "remainder": "crop:100x100:top-left/https://example.com/photo.jpg",
+    "signature": "1c3500f3b3eac7e4360b1b55ccaade9d7a98e572600ffdd2745618f2380057c7"
   }
 ]

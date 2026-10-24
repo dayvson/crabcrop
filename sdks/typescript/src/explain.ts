@@ -386,7 +386,7 @@ function explainFilters(rest: string): { detail?: string; error?: string } {
   return { detail: blurbs.join("; ") };
 }
 
-const ALIGN_NAMES = new Set(["center", "smart", "face", "top", "bottom", "left", "right"]);
+const ALIGN_NAMES = new Set(["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"]);
 const U64_MAX = 18446744073709551615n;
 
 function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment, "raw"> | null {
@@ -474,7 +474,7 @@ function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment,
       return {
         kind: "operation",
         title: "Crop",
-        error: `malformed crop segment: ${seg} (want crop:<w>x<h>[:center|smart|face|top|bottom|left|right], pixels only, no flips)`,
+        error: `malformed crop segment: ${seg} (want crop:<w>x<h>[:center|smart|face|top|bottom|left|right|top-left|top-right|bottom-left|bottom-right], pixels only, no flips)`,
       };
     }
     return { kind: "operation", title: "Crop", detail: `crop to the aspect of ${dims} and resize to it; alignment: ${align === "center" ? "center (or the focal point for smart)" : align}` };

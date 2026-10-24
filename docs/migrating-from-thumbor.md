@@ -46,7 +46,7 @@ crabcrop convert-thumbor "unsafe/filters:brightness(20):focal(10x10:50x50)/https
 | `fit-in` | `fit-in:` | Flips become `flip(h)` / `flip(v)` filters, since crabcrop's fit-in size takes none |
 | `adaptive-fit-in` | `fit-in:` | Converted with a warning; there is no adaptive mode |
 | `full-fit-in` | `fit-in:` | Converted with a warning; the whole image stays inside the box |
-| `left` / `center` / `right`, `top` / `middle` / `bottom` | The crop alignment (`crop:300x200:left`) | crabcrop alignment is single-axis: corners collapse to their vertical side, with a warning |
+| `left` / `center` / `right`, `top` / `middle` / `bottom` | The crop alignment (`crop:300x200:left`) | Corner pairs map to the corner alignments (`crop:300x200:top-left`, `top-right`, `bottom-left`, `bottom-right`); a centered side collapses to the plain edge |
 | `smart` | `crop:<W>x<H>:smart` | Focal-point crop in both |
 | `filters:focal(<l>x<t>:<r>x<b>)` | `focal:<l>x<t>:<r>x<b>` | A filter in Thumbor, an operation in crabcrop; the converter places the segment ahead of the crop it steers |
 
@@ -78,7 +78,7 @@ Filters with no equivalent are dropped and named in the warnings: `frame(...)`, 
 
 1. Run crabcrop next to Thumbor, pointed at the same origins, with `CRABCROP_ALLOW_UNSAFE=1` (or presets-only) while you convert.
 2. Convert your URL *templates* with `convert-thumbor`, one per layout, and read every warning. Signed output needs the target secret; the converter validates each result against the server grammar before printing it.
-3. Compare outputs on a sample of real images. Expect pixel differences in `brightness`, `rgb`, and corner alignments; those are the documented approximations.
+3. Compare outputs on a sample of real images. Expect pixel differences in `brightness` and `rgb`; those are the documented approximations.
 4. Flip traffic, then set `CRABCROP_SECRET` enforcement by removing the unsafe allowance once every template is signed.
 
 ## Worked examples
