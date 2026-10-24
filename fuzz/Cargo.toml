@@ -1,0 +1,23 @@
+[package]
+name = "crabcrop-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the main workspace: fuzzing dependencies
+# (libfuzzer-sys, sanitizers) never enter a normal build.
+[workspace]
+
+[dependencies]
+crabcrop-url = { path = "../crates/crabcrop-url" }
+libfuzzer-sys = "0.4"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "parse_request"
+path = "fuzz_targets/parse_request.rs"

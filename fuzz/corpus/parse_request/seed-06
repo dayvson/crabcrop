@@ -1,0 +1,1 @@
+/unsafe/filters:rotate(-90):trim(25):format(avif):quality(auto):quality(80)/example.com/img.jpg
