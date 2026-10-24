@@ -34,7 +34,7 @@
 //! refused: the loader never presents Basic credentials to an
 //! origin (audit L-2).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -548,20 +548,63 @@ fn suffix_matches(host: &str, suffix: &str) -> bool {
             .is_some_and(|rest| rest.ends_with('.'))
 }
 
-/// Loopback, private, link-local, and unspecified addresses are
-/// never legitimate public image sources.
+/// Non-public addresses are never legitimate public image
+/// sources: loopback, private, link-local, unspecified, and the
+/// remaining special-purpose ranges (shared/CGNAT, reserved,
+/// multicast, broadcast, documentation, benchmarking, and the
+/// protocol-assignment blocks). IPv6 forms that embed an IPv4
+/// address (mapped, compatible, 6to4) are judged by the IPv4
+/// rules on the embedded address.
 fn is_non_public(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => {
-            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_unspecified()
+        IpAddr::V4(ip) => is_non_public_v4(ip),
+        IpAddr::V6(ip) => is_non_public_v6(ip),
+    }
+}
+
+fn is_non_public_v4(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || octets[0] == 0 // 0.0.0.0/8, "this network"
+        || (octets[0] == 100 && (octets[1] & 0xC0) == 0x40) // 100.64.0.0/10, CGNAT
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24
+        || ip.is_documentation()
+        || (octets[0] == 198 && (octets[1] & 0xFE) == 18) // 198.18.0.0/15, benchmarking
+        || (octets[0] & 0xF0) == 0xF0 // 240.0.0.0/4, reserved
+        || ip.is_broadcast() // 255.255.255.255
+        || ip.is_multicast() // 224.0.0.0/4
+}
+
+fn is_non_public_v6(ip: &Ipv6Addr) -> bool {
+    // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible
+    // (::a.b.c.d) forms inherit the IPv4 classification.
+    if let Some(ipv4) = ip.to_ipv4() {
+        return is_non_public_v4(&ipv4);
+    }
+    // 6to4 (2002::/16) embeds the relay IPv4 address in the
+    // second and third segments; a non-public relay makes the
+    // address non-public.
+    let segments = ip.segments();
+    if segments[0] == 0x2002 {
+        let relay = Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            segments[1] as u8,
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+        );
+        if is_non_public_v4(&relay) {
+            return true;
         }
     }
+    ip.is_loopback()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (segments[0] == 0x2001 && segments[1] == 0x0DB8) // 2001:db8::/32, documentation
 }
 
 /// Split the `bucket/key` remainder of a bucket URL. Both parts
@@ -809,20 +852,87 @@ mod tests {
 
     #[test]
     fn non_public_addresses_are_detected() {
+        // Plain IPv4: every special-purpose range is blocked.
         for s in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.16.0.5",
-            "192.168.1.1",
-            "169.254.1.1",
-            "0.0.0.0",
-            "::1",
-            "fe80::1",
-            "fd00::1",
+            "127.0.0.1",       // loopback
+            "127.255.0.1",     // loopback, top of 127.0.0.0/8
+            "10.1.2.3",        // private
+            "172.16.0.5",      // private
+            "172.31.255.255",  // private, top of 172.16.0.0/12
+            "192.168.1.1",     // private
+            "169.254.1.1",     // link-local
+            "0.0.0.0",         // unspecified
+            "0.0.0.1",         // 0.0.0.0/8, "this network"
+            "0.255.255.255",   // 0.0.0.0/8, top
+            "100.64.0.1",      // CGNAT, bottom of 100.64.0.0/10
+            "100.127.255.255", // CGNAT, top of 100.64.0.0/10
+            "192.0.0.1",       // 192.0.0.0/24, protocol assignments
+            "192.0.0.170",     // 192.0.0.0/24, NAT64/DNS64 well-known
+            "192.0.2.1",       // documentation TEST-NET-1
+            "198.51.100.1",    // documentation TEST-NET-2
+            "203.0.113.1",     // documentation TEST-NET-3
+            "198.18.0.1",      // benchmarking, bottom of 198.18.0.0/15
+            "198.19.255.255",  // benchmarking, top of 198.18.0.0/15
+            "240.0.0.1",       // reserved, bottom of 240.0.0.0/4
+            "250.1.2.3",       // reserved
+            "255.255.255.255", // broadcast
+            "224.0.0.1",       // multicast, bottom of 224.0.0.0/4
+            "239.255.255.255", // multicast, top
         ] {
             assert!(is_non_public(&s.parse().unwrap()), "{s}");
         }
-        for s in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+        // IPv6 spellings: native ranges, plus the IPv4-embedding
+        // forms (mapped, compatible, 6to4) of blocked IPv4 ranges.
+        for s in [
+            "::1",              // loopback
+            "::",               // unspecified
+            "fe80::1",          // link-local
+            "fd00::1",          // unique local
+            "fc00::1",          // unique local
+            "ff02::1",          // multicast
+            "2001:db8::1",      // documentation
+            "::ffff:127.0.0.1", // mapped loopback
+            "::ffff:10.0.0.1",  // mapped private
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.1.1",
+            "::ffff:0.0.0.0",
+            "::ffff:0.0.0.1",    // mapped 0.0.0.0/8
+            "::ffff:100.64.0.1", // mapped CGNAT
+            "::ffff:192.0.0.1",
+            "::ffff:192.0.2.1",
+            "::ffff:198.18.0.1",
+            "::ffff:240.0.0.1",
+            "::ffff:224.0.0.1",
+            "::ffff:255.255.255.255",
+            "::127.0.0.1",     // compatible loopback
+            "::10.0.0.1",      // compatible private
+            "2002:7f00:1::",   // 6to4, relay 127.0.0.1
+            "2002:a00:1::",    // 6to4, relay 10.0.0.1
+            "2002:6440:1::",   // 6to4, relay 100.64.0.1
+            "2002:c000:201::", // 6to4, relay 192.0.2.1
+        ] {
+            assert!(is_non_public(&s.parse().unwrap()), "{s}");
+        }
+        // Public addresses stay allowed, including the public
+        // spellings of the IPv4-embedding forms and addresses just
+        // outside the blocked ranges.
+        for s in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "11.0.0.1",
+            "172.32.0.1",      // just above 172.16.0.0/12
+            "100.63.255.255",  // just below 100.64.0.0/10
+            "100.128.0.1",     // just above 100.64.0.0/10
+            "192.0.1.1",       // just above 192.0.0.0/24
+            "198.17.255.255",  // just below 198.18.0.0/15
+            "198.20.0.1",      // just above 198.18.0.0/15
+            "223.255.255.255", // just below 224.0.0.0/4
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8", // mapped public
+            "::8.8.8.8",      // compatible public
+            "2002:808:808::", // 6to4, relay 8.8.8.8
+        ] {
             assert!(!is_non_public(&s.parse().unwrap()), "{s}");
         }
     }
