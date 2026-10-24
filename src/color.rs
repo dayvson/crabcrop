@@ -614,4 +614,146 @@ mod tests {
         let out = convert_to_srgb(img, srgb_profile_bytes()).to_rgb8();
         assert_eq!(out.get_pixel(0, 0).0, [10, 20, 30]);
     }
+
+    fn one_pixel(r: u8, g: u8, b: u8) -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([r, g, b])))
+    }
+
+    #[test]
+    fn a_cmyk_profile_is_not_honored_for_rgb_pixels() {
+        // The profile family decides, not the pixels: a
+        // CMYK source profile on RGB pixels leaves the
+        // image unchanged (the CMYK route belongs to the
+        // decoder). The fixture is a real CMYK-family
+        // profile, so the no-op pins the colour-family
+        // branch rather than a parse failure.
+        // (moxcms will not *encode* a mismatched profile,
+        // so the fixture patches the data colour space
+        // signature of an encoded profile to CMYK, the way
+        // a real CMYK profile arrives: as bytes.)
+        let mut icc = moxcms::ColorProfile::new_srgb().encode().unwrap();
+        icc[16..20].copy_from_slice(b"CMYK");
+        let parsed = moxcms::ColorProfile::new_from_slice(&icc).unwrap();
+        assert_eq!(parsed.color_space, moxcms::DataColorSpace::Cmyk);
+        let out = convert_to_srgb(one_pixel(200, 80, 40), &icc).to_rgb8();
+        assert_eq!(out.get_pixel(0, 0).0, [200, 80, 40]);
+    }
+
+    #[test]
+    fn a_grayscale_profile_is_not_honored() {
+        // Same family rule for grayscale profiles: parsed
+        // fine, declined by family, pixels unchanged, and a
+        // grayscale image itself passes through untouched.
+        let icc = moxcms::ColorProfile::new_gray_with_gamma(2.2)
+            .encode()
+            .unwrap();
+        let parsed = moxcms::ColorProfile::new_from_slice(&icc).unwrap();
+        assert_eq!(parsed.color_space, moxcms::DataColorSpace::Gray);
+        let out = convert_to_srgb(one_pixel(90, 160, 90), &icc).to_rgb8();
+        assert_eq!(out.get_pixel(0, 0).0, [90, 160, 90]);
+        let gray = DynamicImage::ImageLuma8(image::GrayImage::from_pixel(1, 1, image::Luma([77])));
+        let out = convert_to_srgb(gray, &icc).to_luma8();
+        assert_eq!(out.get_pixel(0, 0).0, [77]);
+    }
+
+    #[test]
+    fn an_unparseable_profile_leaves_the_image_unchanged() {
+        let out = convert_to_srgb(one_pixel(10, 20, 30), b"not a profile at all").to_rgb8();
+        assert_eq!(out.get_pixel(0, 0).0, [10, 20, 30]);
+    }
+
+    #[test]
+    fn webp_bytes_pass_through_both_injectors_unchanged() {
+        // Preserved metadata (and the ICC) are injected for
+        // JPEG and PNG outputs only. WebP output bytes are
+        // not a shape either injector recognizes, so a
+        // preserved WebP result carries none of it.
+        let webp: &[u8] = b"RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00\x2f\x00\x00\x00\x00\x07\x10\x11\x11\x88\x07\xa9\xbb\xee\x01\x00";
+        let meta = SourceMeta {
+            icc: Some(b"fake-profile-bytes".to_vec()),
+            exif_tiff: Some(tiff_with_orientation(6, true)),
+            xmp: Some(b"<x:xmpmeta/>".to_vec()),
+            photoshop: Some(b"Photoshop 3.0\0rest".to_vec()),
+        };
+        assert_eq!(inject_jpeg(webp, meta.icc.as_deref(), &meta, true), webp);
+        assert_eq!(inject_png(webp, meta.icc.as_deref(), &meta, true), webp);
+    }
+
+    #[test]
+    fn malformed_tiff_streams_are_left_untouched() {
+        let mut cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![b'I']),
+            ("byte order only", b"II".to_vec()),
+        ];
+        // Wrong magic where 42 belongs.
+        let mut bad_magic = b"II".to_vec();
+        bad_magic.extend_from_slice(&43u16.to_le_bytes());
+        bad_magic.extend_from_slice(&8u32.to_le_bytes());
+        bad_magic.extend_from_slice(&0u16.to_le_bytes());
+        cases.push(("wrong magic", bad_magic));
+        // The IFD offset points past the end of the stream.
+        let mut bad_offset = b"II".to_vec();
+        bad_offset.extend_from_slice(&42u16.to_le_bytes());
+        bad_offset.extend_from_slice(&1000u32.to_le_bytes());
+        cases.push(("ifd offset past the end", bad_offset));
+        // The entry count promises entries the stream does
+        // not contain.
+        let mut lying_count = b"II".to_vec();
+        lying_count.extend_from_slice(&42u16.to_le_bytes());
+        lying_count.extend_from_slice(&8u32.to_le_bytes());
+        lying_count.extend_from_slice(&5u16.to_le_bytes());
+        cases.push(("entry count past the end", lying_count));
+        // An orientation tag of the wrong type (LONG, not
+        // SHORT) is not a patchable orientation.
+        let mut wrong_type = tiff_with_orientation(6, true);
+        wrong_type[8 + 2 + 2] = 4;
+        wrong_type[8 + 2 + 3] = 0;
+        cases.push(("orientation with the wrong type", wrong_type));
+        // The entry header is complete but the stream ends
+        // inside the value field the patch would rewrite.
+        let mut truncated_value = tiff_with_orientation(6, true);
+        truncated_value.truncate(8 + 2 + 8 + 1);
+        cases.push(("value field truncated", truncated_value));
+        for (name, mut tiff) in cases {
+            let before = tiff.clone();
+            patch_tiff_orientation(&mut tiff);
+            assert_eq!(tiff, before, "{name}");
+        }
+    }
+
+    #[test]
+    fn malformed_exif_segments_extract_without_panicking() {
+        // A truncated TIFF after the Exif header is carried
+        // as-is: the orientation patch no-ops on it and the
+        // bytes survive extraction untouched.
+        let mut src = vec![0xFF, 0xD8];
+        src.extend_from_slice(&jpeg_segment(0xE1, b"Exif\0\0II").unwrap());
+        src.extend_from_slice(&[0xFF, 0xD9]);
+        let meta = extract_jpeg_meta(&src);
+        assert_eq!(meta.exif_tiff.as_deref(), Some(b"II".as_slice()));
+        // A segment whose declared length runs past the end
+        // of the data ends the walk: nothing is extracted.
+        let mut src = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x10, 0x00];
+        src.extend_from_slice(b"Exif\0\0II*\0");
+        let meta = extract_jpeg_meta(&src);
+        assert!(meta.exif_tiff.is_none() && meta.icc.is_none());
+        // Even a bare SOI (or nothing) extracts to empty.
+        assert_eq!(extract_source_meta(&[0xFF, 0xD8]), SourceMeta::default());
+        assert_eq!(extract_source_meta(&[]), SourceMeta::default());
+        // PNG: a truncated eXIf TIFF is carried the same
+        // way, and a corrupt iCCP profile (not zlib) drops
+        // to no profile instead of failing.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&png_chunk(
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0],
+        ));
+        png.extend_from_slice(&png_chunk(b"eXIf", b"MM"));
+        png.extend_from_slice(&png_chunk(b"iCCP", b"name\0\0not-zlib"));
+        png.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let meta = extract_png_meta(&png);
+        assert_eq!(meta.exif_tiff.as_deref(), Some(b"MM".as_slice()));
+        assert!(meta.icc.is_none());
+    }
 }

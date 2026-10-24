@@ -283,21 +283,36 @@ pub(crate) mod test_support {
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Injectable failure switches for the error-path
+    /// tests: while a flag is set, the matching operation
+    /// answers 500 instead of doing its work.
+    #[derive(Default)]
+    pub struct FailFlags {
+        pub get_object: bool,
+        pub put: bool,
+        pub delete: bool,
+        pub list: bool,
+    }
+
     /// A minimal in-process S3: PUT/GET/DELETE plus
     /// ListObjectsV2 over one shared map, path-style URLs.
     pub struct FakeS3 {
         pub objects: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+        pub fail: Arc<StdMutex<FailFlags>>,
         pub endpoint: String,
     }
 
     pub async fn start_fake() -> FakeS3 {
         let objects = Arc::new(StdMutex::new(HashMap::new()));
+        let fail = Arc::new(StdMutex::new(FailFlags::default()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = objects.clone();
+        let shared_fail = fail.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let objects = shared.clone();
+                let fail = shared_fail.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -334,7 +349,7 @@ pub(crate) mod test_support {
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default().to_string();
                     let target = parts.next().unwrap_or_default().to_string();
-                    let (status, payload) = handle(&objects, &method, &target, body);
+                    let (status, payload) = handle(&objects, &fail, &method, &target, body);
                     let resp = format!(
                         "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         payload.len()
@@ -346,6 +361,7 @@ pub(crate) mod test_support {
         });
         FakeS3 {
             objects,
+            fail,
             endpoint: format!("http://127.0.0.1:{port}"),
         }
     }
@@ -375,6 +391,7 @@ pub(crate) mod test_support {
 
     fn handle(
         objects: &StdMutex<HashMap<String, Vec<u8>>>,
+        fail: &StdMutex<FailFlags>,
         method: &str,
         target: &str,
         body: Vec<u8>,
@@ -385,11 +402,15 @@ pub(crate) mod test_support {
         };
         let rest = path.trim_start_matches('/');
         let key = percent_decode(rest.split_once('/').map(|(_, k)| k).unwrap_or(""));
+        let fail = fail.lock().unwrap();
+        let error = ("500 Internal Server Error".into(), Vec::new());
         match (method, query.contains("list-type=2")) {
+            ("PUT", _) if fail.put => error,
             ("PUT", _) => {
                 objects.lock().unwrap().insert(key, body);
                 ("200 OK".into(), Vec::new())
             }
+            ("GET", true) if fail.list => error,
             ("GET", true) => {
                 let prefix = query
                     .split('&')
@@ -407,10 +428,12 @@ pub(crate) mod test_support {
                 xml += "</ListBucketResult>";
                 ("200 OK".into(), xml.into_bytes())
             }
+            ("GET", false) if fail.get_object => error,
             ("GET", false) => match objects.lock().unwrap().get(&key) {
                 Some(v) => ("200 OK".into(), v.clone()),
                 None => ("404 Not Found".into(), Vec::new()),
             },
+            ("DELETE", _) if fail.delete => error,
             ("DELETE", _) => {
                 objects.lock().unwrap().remove(&key);
                 ("204 No Content".into(), Vec::new())
@@ -486,5 +509,119 @@ mod tests {
         assert_eq!(s.purge_group("hero").await, 2);
         assert!(s.get("three").await.is_some());
         assert_eq!(s.purge_group("hero").await, 0);
+    }
+
+    fn store_with_prefix(endpoint: &str, prefix: &str) -> S3Store {
+        S3Store::new(
+            "results".into(),
+            prefix.into(),
+            Some(endpoint.into()),
+            "us-east-1".into(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn read_errors_and_corrupt_entries_degrade_to_misses() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("key", &image(b"pixels", &[])).await;
+        assert!(s.get("key").await.is_some());
+        // A service error on the read is a miss, never a
+        // failed lookup: the local tiers and the origin
+        // remain available to the request.
+        fake.fail.lock().unwrap().get_object = true;
+        assert!(s.get("key").await.is_none());
+        fake.fail.lock().unwrap().get_object = false;
+        assert!(s.get("key").await.is_some());
+        // An object whose bytes are not a serialized entry
+        // reads as a miss too.
+        fake.objects.lock().unwrap().insert(
+            format!("cache/{}.bin", key_stem("key")),
+            b"not an entry".to_vec(),
+        );
+        assert!(s.get("key").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_errors_are_dropped_silently() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        fake.fail.lock().unwrap().put = true;
+        // The write reports nothing and stores nothing: the
+        // failed put must not surface as an error (put has
+        // no failure channel) nor leave a partial entry.
+        s.put("key", &image(b"pixels", &[])).await;
+        fake.fail.lock().unwrap().put = false;
+        assert!(s.get("key").await.is_none());
+        assert!(fake.objects.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn purge_errors_remove_nothing_and_report_zero() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("one", &image(b"1", &["hero"])).await;
+        s.put("two", &image(b"2", &["hero"])).await;
+        // A listing failure truncates the walk: nothing is
+        // read, nothing deleted, count zero.
+        fake.fail.lock().unwrap().list = true;
+        assert_eq!(s.purge_group("hero").await, 0);
+        assert_eq!(s.purge_matching("one").await, 0);
+        fake.fail.lock().unwrap().list = false;
+        // Entry reads failing mid-walk skip those entries
+        // the same way.
+        fake.fail.lock().unwrap().get_object = true;
+        assert_eq!(s.purge_group("hero").await, 0);
+        fake.fail.lock().unwrap().get_object = false;
+        // Deletes failing leave every entry in place, and
+        // only successful deletes count once they recover.
+        fake.fail.lock().unwrap().delete = true;
+        assert_eq!(s.purge_group("hero").await, 0);
+        fake.fail.lock().unwrap().delete = false;
+        assert!(s.get("one").await.is_some());
+        assert_eq!(s.purge_group("hero").await, 2);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_degrades_like_a_failing_bucket() {
+        // A port nothing listens on: every request fails at
+        // the transport level instead of the service level.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let s = store(&format!("http://127.0.0.1:{port}"));
+        assert!(s.get("key").await.is_none());
+        s.put("key", &image(b"pixels", &[])).await;
+        assert_eq!(s.purge_group("hero").await, 0);
+        assert_eq!(s.purge_matching("key").await, 0);
+    }
+
+    #[tokio::test]
+    async fn prefixes_namespace_the_shared_bucket() {
+        let fake = start_fake().await;
+        let a = store_with_prefix(&fake.endpoint, "a/");
+        let b = store_with_prefix(&fake.endpoint, "b/");
+        a.put("same-key", &image(b"from-a", &["hero"])).await;
+        // The same cache key under another prefix is a
+        // different entry: invisible, and independently held.
+        assert!(b.get("same-key").await.is_none());
+        b.put("same-key", &image(b"from-b", &[])).await;
+        assert_eq!(a.get("same-key").await.unwrap().bytes, b"from-a");
+        assert_eq!(b.get("same-key").await.unwrap().bytes, b"from-b");
+        assert!(
+            fake.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|k| k.starts_with("a/") || k.starts_with("b/")),
+            "objects land under their store's prefix"
+        );
+        // A purge under one prefix never reaches the other.
+        assert_eq!(a.purge_group("hero").await, 1);
+        assert!(a.get("same-key").await.is_none());
+        assert_eq!(b.get("same-key").await.unwrap().bytes, b"from-b");
+        assert_eq!(b.purge_matching("same-key").await, 1);
+        assert!(fake.objects.lock().unwrap().is_empty());
     }
 }
