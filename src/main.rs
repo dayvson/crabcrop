@@ -588,7 +588,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => None,
         };
-    let tagger = build_tagger(ort_dylib.as_deref())?;
+    let (tagger, tag_threshold) = match build_tagger(ort_dylib.as_deref())? {
+        Some(setup) => (Some(setup.provider), setup.threshold),
+        None => (None, 0.05),
+    };
     let detect = build_detector(ort_dylib.as_deref())?;
     let face: Option<Arc<dyn crate::ai::FaceProvider>> = match env::var("CRABCROP_FACE_MODEL") {
         Ok(path) if !path.is_empty() => {
@@ -645,6 +648,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         upscale,
         face,
         tagger,
+        tag_threshold,
         detect,
         font,
         fallback,
@@ -783,7 +787,7 @@ fn build_detector(
             .map_err(|e| format!("cannot load the detection model: {e}"))?;
     println!(
         "detection model loaded from {path} ({} classes, threshold {threshold})",
-        crate::ai::DetectionProvider::classes(&provider).len()
+        crate::ai::DetectionProvider::describe(&provider).len()
     );
     Ok(Some(Arc::new(provider)))
 }
@@ -791,9 +795,14 @@ fn build_detector(
 /// Build the CLIP tag provider from the environment, when
 /// configured: preloaded like every other model, with a
 /// broken configuration failing startup.
-fn build_tagger(
-    ort_dylib: Option<&str>,
-) -> Result<Option<Arc<dyn crate::ai::TagProvider>>, String> {
+/// A loaded tag provider plus the threshold its meta
+/// annotations compose with.
+struct TaggerSetup {
+    provider: Arc<dyn crate::ai::TagProvider>,
+    threshold: f32,
+}
+
+fn build_tagger(ort_dylib: Option<&str>) -> Result<Option<TaggerSetup>, String> {
     let config = clip_config(|name| env::var(name).ok())?;
     match config {
         None => Ok(None),
@@ -804,7 +813,6 @@ fn build_tagger(
                 &config.text_model,
                 &config.tokenizer,
                 &config.labels,
-                config.threshold,
             )
             .map_err(|e| format!("cannot load the CLIP tagging models: {e}"))?;
             println!(
@@ -812,7 +820,14 @@ fn build_tagger(
                 provider.label_count(),
                 config.threshold
             );
-            Ok(Some(Arc::new(provider)))
+            // The threshold is presentation, applied where
+            // the meta annotation is composed (issue #152),
+            // so it travels with the provider to the server
+            // state rather than living inside the provider.
+            Ok(Some(TaggerSetup {
+                provider: Arc::new(provider),
+                threshold: config.threshold,
+            }))
         }
     }
 }

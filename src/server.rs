@@ -56,6 +56,12 @@ pub struct AppState {
     /// boot when the `CRABCROP_CLIP_*` set is configured.
     /// `None` means meta responses carry no tags or alt text.
     pub tagger: Option<Arc<dyn crate::ai::TagProvider>>,
+    /// Tag threshold for meta annotations, from
+    /// `CRABCROP_CLIP_THRESHOLD` (default 0.05): labels whose
+    /// composed probability falls below it are omitted from
+    /// meta `tags`. The composition itself lives in
+    /// `compose_annotation` (issue #152).
+    pub tag_threshold: f32,
     /// Detection provider for class redaction and meta
     /// detections, preloaded at boot when
     /// `CRABCROP_DETECT_MODEL` is configured. `None` means
@@ -1109,6 +1115,70 @@ fn format_name(format: ImageFormat) -> &'static str {
 
 /// The meta response: what the pipeline produced, as JSON,
 /// without the image bytes.
+/// The composed meta annotation: the tags that cleared the
+/// threshold, and a readable alt text built from the best
+/// labels. Composition lives here, at the call site, not
+/// behind the tag provider (issue #152): the provider
+/// returns raw scores, so threshold tuning and debugging
+/// work from the same numbers the response is built from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub tags: Vec<crate::ai::TagScore>,
+    pub alt_text: String,
+}
+
+/// The zero-shot logit scale the composition applies to
+/// raw scores before the softmax.
+const TAG_LOGIT_SCALE: f32 = 100.0;
+
+/// Turn raw per-label scores into the annotation:
+/// probabilities are the softmax of `TAG_LOGIT_SCALE *
+/// score`; tags are the labels at or above the threshold,
+/// best first, at most 10, with scores rounded to 3
+/// decimals; alt text is the top 3 labels joined with
+/// commas, first letter capitalized.
+fn compose_annotation(scores: &[crate::ai::TagScore], threshold: f32) -> Annotation {
+    let max_logit = scores
+        .iter()
+        .map(|s| s.score * TAG_LOGIT_SCALE)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = scores
+        .iter()
+        .map(|s| (s.score * TAG_LOGIT_SCALE - max_logit).exp())
+        .collect();
+    let total: f32 = exps.iter().sum();
+    let probs: Vec<f32> = exps.iter().map(|e| e / total).collect();
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let tags: Vec<crate::ai::TagScore> = order
+        .iter()
+        .filter(|&&i| probs[i] >= threshold)
+        .take(10)
+        .map(|&i| crate::ai::TagScore {
+            label: scores[i].label.clone(),
+            score: (probs[i] * 1000.0).round() / 1000.0,
+        })
+        .collect();
+    let mut alt = order
+        .iter()
+        .take(3)
+        .map(|&i| scores[i].label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(first) = alt.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    Annotation {
+        tags,
+        alt_text: alt,
+    }
+}
+
 /// Annotate a processed image for a meta response, when a
 /// tag provider is configured. Bounded by the AI gate like
 /// every other inference; any failure (gate busy, decode,
@@ -1117,7 +1187,7 @@ fn format_name(format: ImageFormat) -> &'static str {
 async fn annotate_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
-) -> Option<crate::ai::Annotation> {
+) -> Option<Annotation> {
     let tagger = state.tagger.as_ref()?;
     let _permit = tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
         .await
@@ -1125,8 +1195,8 @@ async fn annotate_meta(
         .ok()?;
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
     let tagger = tagger.clone();
-    match tokio::task::spawn_blocking(move || tagger.annotate(&img)).await {
-        Ok(Ok(annotation)) => Some(annotation),
+    match tokio::task::spawn_blocking(move || tagger.scores(&img)).await {
+        Ok(Ok(scores)) => Some(compose_annotation(&scores, state.tag_threshold)),
         Ok(Err(e)) => {
             eprintln!("annotation error: {e}");
             None
@@ -1169,7 +1239,7 @@ async fn detect_meta(
 
 fn meta_response(
     processed: &crate::engine::ProcessedImage,
-    annotation: Option<&crate::ai::Annotation>,
+    annotation: Option<&Annotation>,
     detections: Option<&[crate::ai::Detection]>,
 ) -> Response {
     let mut body = format!(
@@ -1472,6 +1542,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,
@@ -1511,6 +1582,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,
@@ -1554,6 +1626,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,
@@ -1600,6 +1673,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: Some(Fallback::Bytes(Arc::new(png))),
@@ -1920,6 +1994,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,
@@ -2184,17 +2259,27 @@ mod tests {
     struct FakeTagger;
 
     impl crate::ai::TagProvider for FakeTagger {
-        fn annotate(
+        fn scores(
             &self,
             _img: &image::DynamicImage,
-        ) -> Result<crate::ai::Annotation, crate::ai::AiError> {
-            Ok(crate::ai::Annotation {
-                tags: vec![crate::ai::TagScore {
+        ) -> Result<Vec<crate::ai::TagScore>, crate::ai::AiError> {
+            // Raw scores (issue #152): the composition turns
+            // these into one tag (ocean, probability ~1) and
+            // the alt text "Ocean, sky, mountain".
+            Ok(vec![
+                crate::ai::TagScore {
                     label: "ocean".to_string(),
-                    score: 0.42,
-                }],
-                alt_text: "Ocean, sky".to_string(),
-            })
+                    score: 0.30,
+                },
+                crate::ai::TagScore {
+                    label: "sky".to_string(),
+                    score: 0.05,
+                },
+                crate::ai::TagScore {
+                    label: "mountain".to_string(),
+                    score: 0.02,
+                },
+            ])
         }
     }
 
@@ -2210,6 +2295,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: Some(Arc::new(FakeTagger)),
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,
@@ -2249,8 +2335,9 @@ mod tests {
             .unwrap();
         let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert_eq!(meta["tags"][0]["label"], "ocean");
-        assert_eq!(meta["tags"][0]["score"], 0.42);
-        assert_eq!(meta["alt_text"], "Ocean, sky");
+        assert_eq!(meta["tags"][0]["score"], 1.0);
+        assert_eq!(meta["tags"].as_array().unwrap().len(), 1);
+        assert_eq!(meta["alt_text"], "Ocean, sky, mountain");
         // Without one: both fields absent.
         let base = spawn_app(false).await;
         let resp = client()
@@ -2268,9 +2355,11 @@ mod tests {
     struct FakeDetector;
 
     impl crate::ai::DetectionProvider for FakeDetector {
-        fn classes(&self) -> &[String] {
-            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-            CLASSES.get_or_init(|| vec!["person".to_string()])
+        fn knows_class(&self, name: &str) -> bool {
+            name.eq_ignore_ascii_case("person")
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["person".to_string()]
         }
         fn detect(
             &self,
@@ -2291,9 +2380,11 @@ mod tests {
     struct FailingDetector;
 
     impl crate::ai::DetectionProvider for FailingDetector {
-        fn classes(&self) -> &[String] {
-            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-            CLASSES.get_or_init(|| vec!["person".to_string()])
+        fn knows_class(&self, name: &str) -> bool {
+            name.eq_ignore_ascii_case("person")
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["person".to_string()]
         }
         fn detect(
             &self,
@@ -2303,6 +2394,37 @@ mod tests {
                 "detector exploded".to_string(),
             ))
         }
+    }
+
+    #[test]
+    fn compose_annotation_picks_the_clear_winner() {
+        let scores = |pairs: &[(&str, f32)]| -> Vec<crate::ai::TagScore> {
+            pairs
+                .iter()
+                .map(|(label, score)| crate::ai::TagScore {
+                    label: label.to_string(),
+                    score: *score,
+                })
+                .collect()
+        };
+        let a = compose_annotation(
+            &scores(&[("ocean", 0.30), ("desert", 0.05), ("forest", 0.02)]),
+            0.05,
+        );
+        assert_eq!(a.tags.len(), 1);
+        assert_eq!(a.tags[0].label, "ocean");
+        assert!(a.tags[0].score > 0.99, "score {}", a.tags[0].score);
+        assert_eq!(a.alt_text, "Ocean, desert, forest");
+        // Logit gaps of 0.01 in cosine are 1.0 after the
+        // scale: probs are roughly 0.66 / 0.24 / 0.09.
+        let a = compose_annotation(&scores(&[("a", 0.10), ("b", 0.09), ("c", 0.08)]), 0.10);
+        let names: Vec<&str> = a.tags.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        // A flat distribution clears nothing but alt text
+        // still names the best labels.
+        let flat = compose_annotation(&scores(&[("a", 0.0), ("b", 0.0), ("c", 0.0)]), 0.9);
+        assert!(flat.tags.is_empty());
+        assert_eq!(flat.alt_text, "A, b, c");
     }
 
     #[test]
@@ -2341,6 +2463,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: Some(detector),
             font: None,
             fallback: None,
@@ -2384,6 +2507,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,
@@ -2972,6 +3096,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,
@@ -3012,6 +3137,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,
@@ -3361,6 +3487,7 @@ mod tests {
             upscale: None,
             face: None,
             tagger: None,
+            tag_threshold: 0.05,
             detect: None,
             font: None,
             fallback: None,

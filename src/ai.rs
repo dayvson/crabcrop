@@ -607,25 +607,24 @@ mod tests {
     }
 }
 
-/// One label and its zero-shot probability.
+/// One label and its raw score from a tag provider: for
+/// CLIP, the cosine similarity between the image embedding
+/// and the label embedding. Presentation (softmax,
+/// thresholding, capping, rounding) is the caller's job
+/// (issue #152).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TagScore {
     pub label: String,
     pub score: f32,
 }
 
-/// The result of annotating an image: the labels that
-/// cleared the threshold, and a readable alt text composed
-/// from the best labels.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Annotation {
-    pub tags: Vec<TagScore>,
-    pub alt_text: String,
-}
-
-/// Annotates images with content tags and alt text.
+/// Scores images against a fixed label set.
 pub trait TagProvider: Send + Sync + std::fmt::Debug {
-    fn annotate(&self, img: &DynamicImage) -> Result<Annotation, AiError>;
+    /// Raw scores for every configured label, in label
+    /// order: no thresholding, capping, or rounding, so
+    /// callers can tune presentation and debug borderline
+    /// labels from the same numbers.
+    fn scores(&self, img: &DynamicImage) -> Result<Vec<TagScore>, AiError>;
 }
 
 /// Zero-shot tagging backed by a CLIP image/text ONNX model
@@ -643,7 +642,6 @@ pub struct OnnxClipProvider {
     /// each row L2-normalized.
     label_embeddings: Vec<f32>,
     dim: usize,
-    threshold: f32,
 }
 
 impl OnnxClipProvider {
@@ -655,7 +653,6 @@ impl OnnxClipProvider {
         text_model: &str,
         tokenizer_path: &str,
         labels_path: &str,
-        threshold: f32,
     ) -> Result<Self, AiError> {
         let labels = read_labels(labels_path)?;
         let tokenizer =
@@ -684,7 +681,6 @@ impl OnnxClipProvider {
             labels,
             label_embeddings,
             dim,
-            threshold,
         };
         // Fail fast on a mismatched pair: embed a black
         // image once and check the projection size agrees
@@ -730,17 +726,21 @@ impl std::fmt::Debug for OnnxClipProvider {
 }
 
 impl TagProvider for OnnxClipProvider {
-    fn annotate(&self, img: &DynamicImage) -> Result<Annotation, AiError> {
+    fn scores(&self, img: &DynamicImage) -> Result<Vec<TagScore>, AiError> {
         let emb = normalize(&self.embed_image(img)?);
-        let dots: Vec<f32> = (0..self.labels.len())
-            .map(|i| {
-                emb.iter()
+        Ok(self
+            .labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| TagScore {
+                label: label.clone(),
+                score: emb
+                    .iter()
                     .zip(&self.label_embeddings[i * self.dim..(i + 1) * self.dim])
                     .map(|(a, b)| a * b)
-                    .sum()
+                    .sum(),
             })
-            .collect();
-        Ok(annotation_from_dots(&self.labels, &dots, self.threshold))
+            .collect())
     }
 }
 
@@ -898,91 +898,9 @@ fn preprocess_clip(img: &DynamicImage) -> Vec<f32> {
     out
 }
 
-/// The model's zero-shot logit scale.
-const LOGIT_SCALE: f32 = 100.0;
-
-/// Turn cosine similarities into the annotation:
-/// probabilities are the softmax of `LOGIT_SCALE * dot`;
-/// tags are the labels at or above the threshold, best
-/// first, at most 10; alt text is the top 3 labels joined
-/// with commas, first letter capitalized.
-pub fn annotation_from_dots(labels: &[String], dots: &[f32], threshold: f32) -> Annotation {
-    debug_assert_eq!(labels.len(), dots.len());
-    let max_logit = dots
-        .iter()
-        .map(|d| d * LOGIT_SCALE)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = dots
-        .iter()
-        .map(|d| (d * LOGIT_SCALE - max_logit).exp())
-        .collect();
-    let total: f32 = exps.iter().sum();
-    let probs: Vec<f32> = exps.iter().map(|e| e / total).collect();
-    let mut order: Vec<usize> = (0..labels.len()).collect();
-    order.sort_by(|&a, &b| {
-        probs[b]
-            .partial_cmp(&probs[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
-    let tags: Vec<TagScore> = order
-        .iter()
-        .filter(|&&i| probs[i] >= threshold)
-        .take(10)
-        .map(|&i| TagScore {
-            label: labels[i].clone(),
-            score: (probs[i] * 1000.0).round() / 1000.0,
-        })
-        .collect();
-    let mut alt = order
-        .iter()
-        .take(3)
-        .map(|&i| labels[i].as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if let Some(first) = alt.get_mut(..1) {
-        first.make_ascii_uppercase();
-    }
-    Annotation {
-        tags,
-        alt_text: alt,
-    }
-}
-
 #[cfg(test)]
 mod clip_tests {
     use super::*;
-
-    fn labels(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn annotation_picks_the_clear_winner() {
-        let a = annotation_from_dots(
-            &labels(&["ocean", "desert", "forest"]),
-            &[0.30, 0.05, 0.02],
-            0.05,
-        );
-        assert_eq!(a.tags.len(), 1);
-        assert_eq!(a.tags[0].label, "ocean");
-        assert!(a.tags[0].score > 0.99, "score {}", a.tags[0].score);
-        assert_eq!(a.alt_text, "Ocean, desert, forest");
-    }
-
-    #[test]
-    fn annotation_threshold_and_order() {
-        // Logit gaps of 0.01 in cosine are 1.0 after the
-        // scale: probs are roughly 0.66 / 0.24 / 0.09.
-        let a = annotation_from_dots(&labels(&["a", "b", "c"]), &[0.10, 0.09, 0.08], 0.10);
-        let names: Vec<&str> = a.tags.iter().map(|t| t.label.as_str()).collect();
-        assert_eq!(names, ["a", "b"]);
-        // A flat distribution clears nothing but alt text
-        // still names the best labels.
-        let flat = annotation_from_dots(&labels(&["a", "b", "c"]), &[0.0, 0.0, 0.0], 0.9);
-        assert!(flat.tags.is_empty());
-        assert_eq!(flat.alt_text, "A, b, c");
-    }
 
     #[test]
     #[allow(clippy::excessive_precision)] // the model's published constants
@@ -1032,15 +950,13 @@ mod clip_tests {
             &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
             &var("CRABCROP_TEST_CLIP_TOKENIZER"),
             &var("CRABCROP_TEST_CLIP_LABELS"),
-            0.01,
         )
         .unwrap();
         let img = image::open(var("CRABCROP_TEST_IMAGE")).unwrap();
-        let annotation = provider.annotate(&img).unwrap();
-        println!("tags: {:?}", annotation.tags);
-        println!("alt: {}", annotation.alt_text);
-        assert!(!annotation.tags.is_empty());
-        assert!(!annotation.alt_text.is_empty());
+        let scores = provider.scores(&img).unwrap();
+        println!("scores: {scores:?}");
+        assert_eq!(scores.len(), provider.label_count());
+        assert!(scores.iter().all(|s| s.score.is_finite()));
     }
 }
 
@@ -1060,8 +976,15 @@ pub struct Detection {
 /// provider: the classes the model knows, and the boxes it
 /// finds.
 pub trait DetectionProvider: Send + Sync + std::fmt::Debug {
-    /// The model's class vocabulary, in model order.
-    fn classes(&self) -> &[String];
+    /// Whether the model's vocabulary contains `name`,
+    /// case-insensitively, matching how class names are
+    /// written in URLs.
+    fn knows_class(&self, name: &str) -> bool;
+    /// The model's class vocabulary, in model order, as an
+    /// owned list: for boot-time reporting. Request paths
+    /// use `knows_class`; no caller needs the slice itself
+    /// (issue #152).
+    fn describe(&self) -> Vec<String>;
     fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, AiError>;
 }
 
@@ -1136,8 +1059,12 @@ impl std::fmt::Debug for OnnxDetectionProvider {
 }
 
 impl DetectionProvider for OnnxDetectionProvider {
-    fn classes(&self) -> &[String] {
-        &self.classes
+    fn knows_class(&self, name: &str) -> bool {
+        self.classes.iter().any(|c| c.eq_ignore_ascii_case(name))
+    }
+
+    fn describe(&self) -> Vec<String> {
+        self.classes.clone()
     }
 
     fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, AiError> {
@@ -1510,7 +1437,7 @@ mod detect_tests {
             0.35,
         )
         .unwrap();
-        println!("classes: {} known", provider.classes().len());
+        println!("classes: {} known", provider.describe().len());
         let img = image::open(var("CRABCROP_TEST_IMAGE")).unwrap();
         let found = provider.detect(&img).unwrap();
         for d in &found {
