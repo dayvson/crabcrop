@@ -171,6 +171,26 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:blurclass(per%24on)/" + SRC, true, SRC],
     ["filters:pixelateclass/" + SRC, true, SRC],
     ["filters:keep_profile/" + SRC, false, SRC],
+    // AP-23 parity cases: each verdict below is the Rust
+    // parser's, verified against src/url.rs.
+    ["crop-rect:50x50:0x0/" + SRC, true, SRC],
+    ["crop-rect:50x50:51x51/" + SRC, false, SRC],
+    ["filters:blur(0x10)/" + SRC, true, SRC],
+    ["filters:contrast(0x2)/" + SRC, true, SRC],
+    ["filters:blur( 1.5)/" + SRC, true, SRC],
+    ["filters:blur(1e2)/" + SRC, false, SRC],
+    ["filters:blur(.5)/" + SRC, false, SRC],
+    ["filters:overlay(a,b.png,0,0,80,normal)/" + SRC, true, SRC],
+    ["filters:overlay(a,b.png,0,0,80,normal,25)/" + SRC, false, SRC],
+    ["300x200//" + SRC, true, SRC],
+    ["filters:blurclass(" + "é".repeat(40) + ")/" + SRC, true, SRC],
+    ["filters:blurclass(" + "é".repeat(32) + ")/" + SRC, false, SRC],
+    ["filters:brighten(+5)/" + SRC, false, SRC],
+    ["filters:quality(+80)/" + SRC, false, SRC],
+    ["filters:text(Hello,+12,ff8800,center)/" + SRC, false, SRC],
+    ["+300x200/" + SRC, false, SRC],
+    ["filters:radius(+12)/" + SRC, false, SRC],
+    ["filters:pixelate(+8)/" + SRC, false, SRC],
   ];
   for (const [remainder, expectError, expectSource] of cases) {
     const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);

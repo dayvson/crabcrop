@@ -138,7 +138,7 @@ function parseDimension(part) {
   }
   if (digits === "" || digits === "0") return { kind: "proportional", flip };
   if (digits === "orig") return { kind: "original", flip };
-  if (!/^\d+$/.test(digits)) return null;
+  if (!/^\+?\d+$/.test(digits)) return null;
   if (BigInt(digits) > BigInt(MAX_DIMENSION)) return null;
   return { kind: "pixels", value: Number(digits), flip };
 }
@@ -198,11 +198,21 @@ const ANCHOR_NAMES = new Set([
 ]);
 
 function isIntIn(s, min, max) {
-  return /^-?\d+$/.test(s) && BigInt(s) >= BigInt(min) && BigInt(s) <= BigInt(max);
+  // Rust's integer from_str syntax: an optional sign (the
+  // unsigned parsers accept '+' too), then digits.
+  return /^[+-]?\d+$/.test(s) && BigInt(s) >= BigInt(min) && BigInt(s) <= BigInt(max);
 }
 
+const RUST_FLOAT = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
 function isFloat(s) {
-  return s !== "" && Number.isFinite(Number(s));
+  // Rust's f32::from_str syntax (AP-23): plain decimal with
+  // an optional exponent; no hex, no surrounding whitespace,
+  // both of which Number() would otherwise accept. The
+  // inf/nan spellings Rust also parses are non-finite, and
+  // every caller rejects non-finite values, so the verdicts
+  // agree without them.
+  return RUST_FLOAT.test(s) && Number.isFinite(Number(s));
 }
 
 function percentDecodable(s) {
@@ -257,7 +267,7 @@ function validateFilter(name, args) {
         ? null
         : bad;
     case "upscale":
-      return args !== null && /^\d+$/.test(args) && (Number(args) === 2 || Number(args) === 4)
+      return args !== null && /^[+-]?\d+$/.test(args) && (Number(args) === 2 || Number(args) === 4)
         ? null
         : bad;
     case "dpr":
@@ -274,7 +284,7 @@ function validateFilter(name, args) {
       if (args === null) return bad;
       const parts = args.split(",");
       return (parts.length === 1 || parts.length === 4) &&
-        parts.every((p) => /^\d+$/.test(p) && BigInt(p) <= 16383n)
+        parts.every((p) => isIntIn(p, 0, 16383))
         ? null
         : bad;
     }
@@ -282,9 +292,7 @@ function validateFilter(name, args) {
       if (args === null) return bad;
       const parts = args.split(",");
       return parts.length === 2 &&
-        /^\d+$/.test(parts[0]) &&
-        BigInt(parts[0]) >= 1n &&
-        BigInt(parts[0]) <= 16383n &&
+        isIntIn(parts[0], 1, 16383) &&
         /^[0-9a-fA-F]{6}$/.test(parts[1])
         ? null
         : bad;
@@ -299,26 +307,29 @@ function validateFilter(name, args) {
     case "monochrome":
       return args !== null && /^[0-9a-fA-F]{6}$/.test(args) ? null : bad;
     case "pixelate":
-      return args !== null && /^\d+$/.test(args) && BigInt(args) >= 1n && BigInt(args) <= 16383n
-        ? null
-        : bad;
+      return args !== null && isIntIn(args, 1, 16383) ? null : bad;
     case "flip":
       return args === "h" || args === "v" ? null : bad;
     case "overlay": {
       if (args === null) return bad;
-      const rest = args.split(",");
-      if (rest.length < 5) return bad;
-      let width = null;
-      if (rest.length >= 6 && /^\d+$/.test(rest[rest.length - 1])) width = rest.pop();
-      const blend = rest.pop();
+      // The server splits from the right (rsplitn(6, ',')):
+      // with six or more fields the rightmost IS the width
+      // and must parse, and the URL keeps any commas left
+      // over. Splitting any other way misreads both.
+      const fields = args.split(",");
+      if (fields.length < 5) return bad;
+      let rest = fields;
+      if (fields.length >= 6) {
+        if (!isIntIn(fields[fields.length - 1], 1, 400)) return bad;
+        rest = fields.slice(0, -1);
+      }
+      const blend = rest[rest.length - 1];
       if (!["normal", "multiply", "screen", "overlay"].includes(blend)) return bad;
-      if (width !== null && (BigInt(width) < 1n || BigInt(width) > 400n)) return bad;
-      const alpha = rest.pop();
-      if (!/^\d+$/.test(alpha) || BigInt(alpha) > 100n) return bad;
-      const y = rest.pop();
-      const x = rest.pop();
-      if (!/^-?\d+$/.test(x) || !/^-?\d+$/.test(y)) return bad;
-      return rest.join(",").length > 0 ? null : bad;
+      if (!isIntIn(rest[rest.length - 2], 0, 100)) return bad;
+      if (!isIntIn(rest[rest.length - 3], -2147483648, 2147483647)) return bad;
+      if (!isIntIn(rest[rest.length - 4], -2147483648, 2147483647)) return bad;
+      const url = percentDecodable(rest.slice(0, -4).join(","));
+      return url !== null && url !== "" ? null : bad;
     }
     case "blurclass":
     case "pixelateclass": {
@@ -327,7 +338,7 @@ function validateFilter(name, args) {
       if (decoded === null) return bad;
       const name = decoded.trim();
       return name.length >= 1 &&
-        name.length <= 64 &&
+        new TextEncoder().encode(name).length <= 64 &&
         /^[\p{L}\p{N} _.\-/]+$/u.test(name)
         ? null
         : bad;
@@ -337,15 +348,15 @@ function validateFilter(name, args) {
       if (args === null) return bad;
       const parts = args.split(",");
       return parts.length === 4 &&
-        parts.every((p) => /^\d+$/.test(p) && BigInt(p) <= 16383n) &&
-        BigInt(parts[2]) >= 1n &&
-        BigInt(parts[3]) >= 1n
+        parts.every((p) => isIntIn(p, 0, 16383)) &&
+        Number(parts[2]) >= 1 &&
+        Number(parts[3]) >= 1
         ? null
         : bad;
     }
     case "max_bytes":
       return args !== null &&
-        /^\d+$/.test(args) &&
+        /^[+-]?\d+$/.test(args) &&
         BigInt(args) >= 1n &&
         BigInt(args) <= 18446744073709551615n
         ? null
@@ -458,12 +469,17 @@ function explainSegment(seg, nowSeconds) {
   }
   if (seg.startsWith("crop-rect:")) {
     const rest = seg.slice(10);
-    const m = rest.match(/^(\d+)x(\d+):(\d+)x(\d+)$/);
-    if (!m || m.slice(1).some((n) => BigInt(n) > 4294967295n)) {
+    const m = rest.match(/^([+-]?\d+)x([+-]?\d+):([+-]?\d+)x([+-]?\d+)$/);
+    if (
+      !m ||
+      m.slice(1).some((n) => BigInt(n) < 0n || BigInt(n) > 4294967295n) ||
+      BigInt(m[3]) <= BigInt(m[1]) ||
+      BigInt(m[4]) <= BigInt(m[2])
+    ) {
       return {
         kind: "operation",
         title: "Crop rectangle",
-        error: `malformed crop-rect segment: ${seg} (want crop-rect:<l>x<t>:<r>x<b>)`,
+        error: `malformed crop-rect segment: ${seg} (want crop-rect:<l>x<t>:<r>x<b> with right > left and bottom > top)`,
       };
     }
     return { kind: "operation", title: "Crop rectangle", detail: `crop the exact rectangle ${rest} (left x top : right x bottom)` };
@@ -572,6 +588,17 @@ export function explainUrl(input, nowSeconds = Math.floor(Date.now() / 1000)) {
   for (;;) {
     const idx = rest.indexOf("/");
     const seg = idx === -1 ? rest : rest.slice(0, idx);
+    if (seg === "" && idx !== -1) {
+      // An empty segment in the operations run (a doubled
+      // slash): the server answers 400 (missing source URL)
+      // instead of treating the rest as a source with a
+      // leading slash (AP-23).
+      const error = "empty segment in the path: the server answers 400 (missing source URL)";
+      segments.push({ raw: seg, kind: "operation", title: "Empty segment", error });
+      errors.push(error);
+      rest = rest.slice(idx + 1);
+      continue;
+    }
     const explained = seg === "" ? null : explainSegment(seg, nowSeconds);
     if (!explained) {
       source = rest;
