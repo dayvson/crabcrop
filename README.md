@@ -4,7 +4,7 @@
   <img src="assets/crabcrop-mascot.webp" alt="The crabcrop mascot: a crochet crab waving hello and holding a photo" width="260">
 </p>
 
-crabcrop is an on-demand image optimization service written in Rust. You request an image with the operations encoded in the URL — resize, crop, convert, filter — and crabcrop fetches the source image, applies the operations in order, and returns the result. There are no pre-generated thumbnails and no build step: the URL is the API.
+crabcrop is an on-demand image optimization service written in Rust. You request an image with the operations encoded in the URL, resize, crop, convert, filter, and crabcrop fetches the source image, applies the operations in order, and returns the result. There are no pre-generated thumbnails and no build step: the URL is the API.
 
 crabcrop is for sites and apps that serve the same images at many sizes and want signed, cacheable image URLs in front of an origin image store.
 
@@ -53,7 +53,7 @@ GET /<signature>/<operations>/<source-url>
 
 ### Sign a request
 
-Compute HMAC-SHA256 over the remainder of the path — the operations and the source URL exactly as they appear, with no leading slash — keyed with your `CRABCROP_SECRET`, and hex-encode the result:
+Compute HMAC-SHA256 over the remainder of the path, the operations and the source URL exactly as they appear, with no leading slash, keyed with your `CRABCROP_SECRET`, and hex-encode the result:
 
 ```bash
 printf '%s' '300x200/https://example.com/photo.jpg' | openssl dgst -sha256 -hmac 'your-secret'
@@ -241,28 +241,28 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | --- | --- | --- | --- |
 | `grayscale` | none | Desaturate to gray. | `filters:grayscale` |
 | `invert` | none | Invert every channel. | `filters:invert` |
-| `blur` | `blur(2.5)` — sigma, a positive number | Gaussian blur. | `filters:blur(2.5)` |
-| `brighten` | `brighten(40)` — integer from −255 to 255, added to every channel and clamped to 0–255 | Brighten (or darken, with a negative value). | `filters:brighten(40)` |
-| `contrast` | `contrast(25)` — percent, −100 to 100; 0 is unchanged, −100 is flat gray, positive raises contrast | Adjust contrast. | `filters:contrast(25)` |
-| `huerotate` | `huerotate(90)` — degrees, integer | Rotate the hue. | `filters:huerotate(90)` |
-| `sharpen` | `sharpen(1.5)` — strength, a positive number | Unsharp-mask sharpening. | `filters:sharpen(1.5)` |
-| `saturation` | `saturation(1.5)` — 0 to 255; 0 is grayscale, 1 is unchanged | Scale color saturation. | `filters:saturation(0.5)` |
-| `rgb` | `rgb(10,-5,0)` — per-channel offsets, each −255 to 255 | Add offsets to the red, green, and blue channels. | `filters:rgb(10,-5,0)` |
-| `curve` | `curve(rgb,0,0,255,255)` — a channel (`rgb`, `r`, `g`, or `b`), then 2 to 16 `x,y` control points, each 0–255 with x strictly increasing | Remap tones through the control points, linearly interpolated; inputs outside the points' x range clamp to the nearest end value. Repeat the filter to shape channels independently. | `filters:curve(r,0,64,255,255)` |
-| `convolution` | `convolution(0,-1,0,-1,5,-1,0,-1,0,0)` — 9 (3×3) or 25 (5×5) kernel values in row-major order, each a plain decimal from −1024 to 1024, then a normalize flag (0 or 1) | Apply the kernel once over the image; edges replicate. With the flag on, the kernel is scaled by the sum of its entries first (an all-ones kernel averages); a zero sum applies the kernel as written. | `filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)` |
-| `noise` | `noise(40)` — strength, an integer from 0 to 100, percent of full scale | Monochrome film grain: one noise value per pixel, uniform within ±strength percent of full scale, added equally to the red, green, and blue channels (alpha untouched). The field is deterministic — seeded from the image content and the amount — so the same request always returns the same bytes and caches soundly. `noise(0)` changes nothing. On animated sources it applies per frame, seeded from each frame's own content, so the frames grain independently. | `filters:noise(40)` |
+| `blur` | `blur(2.5)`, sigma, a positive number | Gaussian blur. | `filters:blur(2.5)` |
+| `brighten` | `brighten(40)`, integer from −255 to 255, added to every channel and clamped to 0–255 | Brighten (or darken, with a negative value). | `filters:brighten(40)` |
+| `contrast` | `contrast(25)`, percent, −100 to 100; 0 is unchanged, −100 is flat gray, positive raises contrast | Adjust contrast. | `filters:contrast(25)` |
+| `huerotate` | `huerotate(90)`, degrees, integer | Rotate the hue. | `filters:huerotate(90)` |
+| `sharpen` | `sharpen(1.5)`, strength, a positive number | Unsharp-mask sharpening. | `filters:sharpen(1.5)` |
+| `saturation` | `saturation(1.5)`, 0 to 255; 0 is grayscale, 1 is unchanged | Scale color saturation. | `filters:saturation(0.5)` |
+| `rgb` | `rgb(10,-5,0)`, per-channel offsets, each −255 to 255 | Add offsets to the red, green, and blue channels. | `filters:rgb(10,-5,0)` |
+| `curve` | `curve(rgb,0,0,255,255)`, a channel (`rgb`, `r`, `g`, or `b`), then 2 to 16 `x,y` control points, each 0–255 with x strictly increasing | Remap tones through the control points, linearly interpolated; inputs outside the points' x range clamp to the nearest end value. Repeat the filter to shape channels independently. | `filters:curve(r,0,64,255,255)` |
+| `convolution` | `convolution(0,-1,0,-1,5,-1,0,-1,0,0)`, 9 (3×3) or 25 (5×5) kernel values in row-major order, each a plain decimal from −1024 to 1024, then a normalize flag (0 or 1) | Apply the kernel once over the image; edges replicate. With the flag on, the kernel is scaled by the sum of its entries first (an all-ones kernel averages); a zero sum applies the kernel as written. | `filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)` |
+| `noise` | `noise(40)`, strength, an integer from 0 to 100, percent of full scale | Monochrome film grain: one noise value per pixel, uniform within ±strength percent of full scale, added equally to the red, green, and blue channels (alpha untouched). The field is deterministic, seeded from the image content and the amount, so the same request always returns the same bytes and caches soundly. `noise(0)` changes nothing. On animated sources it applies per frame, seeded from each frame's own content, so the frames grain independently. | `filters:noise(40)` |
 | `equalize` | none | Histogram equalization, per channel. | `filters:equalize` |
-| `rotate` | `rotate(45)` — any angle in degrees, decimals allowed; negatives allowed | Rotate the image. Multiples of 90 are exact quarter turns; other angles expand the canvas to fit, filling the uncovered corners with the `fill` color (white by default) or transparency when the image carries alpha. | `filters:rotate(-90)` |
-| `trim` | `trim` or `trim(20)` — tolerance 0–255, default 10 | Crop away the border that matches the top-left corner color within the tolerance. | `filters:trim(20)` |
+| `rotate` | `rotate(45)`, any angle in degrees, decimals allowed; negatives allowed | Rotate the image. Multiples of 90 are exact quarter turns; other angles expand the canvas to fit, filling the uncovered corners with the `fill` color (white by default) or transparency when the image carries alpha. | `filters:rotate(-90)` |
+| `trim` | `trim` or `trim(20)`, tolerance 0–255, default 10 | Crop away the border that matches the top-left corner color within the tolerance. | `filters:trim(20)` |
 | `sepia` | none | The classic warm sepia tone. | `filters:sepia` |
-| `duotone` | `duotone(1a1a40,ffd9a0)` — two colors, six hex digits each | Map shadows to the first color and highlights to the second, by luminance. | `filters:duotone(1a1a40,ffd9a0)` |
-| `monochrome` | `monochrome(ff8000)` — six hex digits | Single-hue rendering: each pixel's luminance scaled by the color, so full luminance renders exactly that color. | `filters:monochrome(ff8000)` |
-| `pixelate` | `pixelate(8)` — block size in pixels, at least 1 | Mosaic the image into square blocks, each painted with the average of its pixels. | `filters:pixelate(8)` |
+| `duotone` | `duotone(1a1a40,ffd9a0)`, two colors, six hex digits each | Map shadows to the first color and highlights to the second, by luminance. | `filters:duotone(1a1a40,ffd9a0)` |
+| `monochrome` | `monochrome(ff8000)`, six hex digits | Single-hue rendering: each pixel's luminance scaled by the color, so full luminance renders exactly that color. | `filters:monochrome(ff8000)` |
+| `pixelate` | `pixelate(8)`, block size in pixels, at least 1 | Mosaic the image into square blocks, each painted with the average of its pixels. | `filters:pixelate(8)` |
 | `flip` | `flip(h)` or `flip(v)` | Mirror the image horizontally or vertically, at this point in the chain. | `filters:flip(h)` |
-| `blur_region` | `blur_region(x,y,w,h)` — pixels | Gaussian-blur one rectangle (license plates, screens, documents). Coordinates address the image at this point in the chain; blur strength scales with the region. A region that overflows the image is an error, not a partial redaction. | `filters:blur_region(120,40,180,60)` |
-| `pixelate_region` | `pixelate_region(x,y,w,h)` — pixels | Pixelate one rectangle, with the same bounds rule as `blur_region`. Block size scales with the region. | `filters:pixelate_region(120,40,180,60)` |
-| `radius` | `radius(24)` — pixels; or four values `radius(24,24,0,0)` in CSS corner order (top-left, top-right, bottom-right, bottom-left) | Round the corners, antialiased. Radii larger than the frame shrink proportionally so corners never overlap. The output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:radius(24):format(png)` |
-| `border` | `border(4,000000)` — width in pixels, color as six hex digits | Paint an opaque band of the color inside the frame. Dimensions do not change. Works on any format. | `filters:border(4,000000)` |
+| `blur_region` | `blur_region(x,y,w,h)`, pixels | Gaussian-blur one rectangle (license plates, screens, documents). Coordinates address the image at this point in the chain; blur strength scales with the region. A region that overflows the image is an error, not a partial redaction. | `filters:blur_region(120,40,180,60)` |
+| `pixelate_region` | `pixelate_region(x,y,w,h)`, pixels | Pixelate one rectangle, with the same bounds rule as `blur_region`. Block size scales with the region. | `filters:pixelate_region(120,40,180,60)` |
+| `radius` | `radius(24)`, pixels; or four values `radius(24,24,0,0)` in CSS corner order (top-left, top-right, bottom-right, bottom-left) | Round the corners, antialiased. Radii larger than the frame shrink proportionally so corners never overlap. The output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:radius(24):format(png)` |
+| `border` | `border(4,000000)`, width in pixels, color as six hex digits | Paint an opaque band of the color inside the frame. Dimensions do not change. Works on any format. | `filters:border(4,000000)` |
 | `mask` | `mask(circle)` or `mask(ellipse)` | Keep only the inscribed shape (the circle's diameter is the smaller dimension); the rest becomes transparent. The output format must carry alpha. | `filters:mask(circle):format(png)` |
 
 The `curve` filter is the fine tone control the additive filters only approximate. Each control point says "an input of x becomes y"; between points the mapping is a straight line, and inputs below the first point's x take its y (likewise above the last point's), so a curve need not span the whole range. `filters:curve(rgb,0,20,128,160,255,255)` lifts the shadows and midtones of every channel at once, and a second `curve` with `r`, `g`, or `b` then shapes one channel at a time. The identity curve `curve(rgb,0,0,255,255)` changes nothing.
@@ -277,16 +277,16 @@ curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/
 
 | Directive | Parameters | Description | Example |
 | --- | --- | --- | --- |
-| `format` | `format(webp)` — `jpeg` (or `jpg`), `png`, `webp`, `jxl`, `avif`, `gif`, `mp4`, `webm` | Output format. Overrides `Accept` negotiation. The video formats are explicit-only (never negotiated) and need an animated source plus a configured encoder; see [Video output](#video-output). | `filters:format(avif)` |
-| `quality` | `quality(80)` — 1 to 100, or `quality(auto)` | Encoding quality for JPEG, JPEG XL, AVIF, and WebP. Default 80. | `filters:quality(auto)` |
-| `max_bytes` | `max_bytes(50000)` — byte budget, at least 1 | Re-encode at decreasing quality until the output fits the budget. | `filters:max_bytes(50000)` |
-| `fill` | `fill(ff0000)` — six hex digits, RGB | Background color used to flatten transparency when encoding to JPEG. | `filters:fill(ffffff)` |
+| `format` | `format(webp)`, `jpeg` (or `jpg`), `png`, `webp`, `jxl`, `avif`, `gif`, `mp4`, `webm` | Output format. Overrides `Accept` negotiation. The video formats are explicit-only (never negotiated) and need an animated source plus a configured encoder; see [Video output](#video-output). | `filters:format(avif)` |
+| `quality` | `quality(80)`, 1 to 100, or `quality(auto)` | Encoding quality for JPEG, JPEG XL, AVIF, and WebP. Default 80. | `filters:quality(auto)` |
+| `max_bytes` | `max_bytes(50000)`, byte budget, at least 1 | Re-encode at decreasing quality until the output fits the budget. | `filters:max_bytes(50000)` |
+| `fill` | `fill(ff0000)`, six hex digits, RGB | Background color used to flatten transparency when encoding to JPEG. | `filters:fill(ffffff)` |
 | `no_upscale` | none | Cap every resize in the request at the source dimensions. | `filters:no_upscale` |
-| `dpr` | `dpr(2)` — one of `1`, `1.5`, `2`, `3` | Scale size and crop targets by the device pixel ratio, so one URL serves standard and retina displays. | `filters:dpr(2)` |
+| `dpr` | `dpr(2)`, one of `1`, `1.5`, `2`, `3` | Scale size and crop targets by the device pixel ratio, so one URL serves standard and retina displays. | `filters:dpr(2)` |
 
 Notes on the directives:
 
-- `quality(auto)` picks a quality per image, from 50 for flat images to 95 for detailed ones, based on content analysis. For JPEG and JPEG XL the pick is then verified: crabcrop encodes, decodes the result, and scores it against the processed source with SSIMULACRA2, adjusting quality (at most 4 encodes) until the score lands at the target, 75 by default and configurable with `CRABCROP_SSIM_TARGET`. The achieved score is reported in meta responses as `ssimulacra2`. Verification happens on cache misses only, but it is real work: scoring a full-size image takes about a second. When crabcrop picks the quality — for `quality(auto)`, or when `max_bytes` steps quality down — the response carries an `X-Crabcrop-Quality` header with the value used.
+- `quality(auto)` picks a quality per image, from 50 for flat images to 95 for detailed ones, based on content analysis. For JPEG and JPEG XL the pick is then verified: crabcrop encodes, decodes the result, and scores it against the processed source with SSIMULACRA2, adjusting quality (at most 4 encodes) until the score lands at the target, 75 by default and configurable with `CRABCROP_SSIM_TARGET`. The achieved score is reported in meta responses as `ssimulacra2`. Verification happens on cache misses only, but it is real work: scoring a full-size image takes about a second. When crabcrop picks the quality, for `quality(auto)`, or when `max_bytes` steps quality down, the response carries an `X-Crabcrop-Quality` header with the value used.
 - `max_bytes` can only steer formats with a quality setting: JPEG, JPEG XL, AVIF, and WebP. If quality reaches its floor and the output is still over budget, you get the smallest encode rather than an error. PNG and GIF ignore the budget.
 - WebP encodes lossy at the requested quality (default 80); `quality(100)` selects the lossless encode. `quality` has no effect on PNG or GIF output.
 - JPEG has no alpha channel. With `fill`, transparent pixels are composited over the fill color; without it, the stored RGB values are used as-is.
@@ -370,7 +370,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 | `pixelatefaces` | none | Pixelate every detected face (privacy redaction). Requires a face model. | `filters:pixelatefaces` |
 | `blurclass` | `blurclass(person)` | Blur every detected object of the class (privacy redaction). Repeat for more classes. Requires a detection model. | `filters:blurclass(person)` |
 | `pixelateclass` | `pixelateclass(car)` | Pixelate every detected object of the class (privacy redaction). Repeat for more classes. Requires a detection model. | `filters:pixelateclass(car)` |
-| `facepad` | `facepad(0.5)` — 0 to 3 | Padding for `crop:...:face`: that fraction of the face's size added on every side of the crop window. Default 0.5. | `crop:200x200:face/filters:facepad(1)` |
+| `facepad` | `facepad(0.5)`, 0 to 3 | Padding for `crop:...:face`: that fraction of the face's size added on every side of the crop window. Default 0.5. | `crop:200x200:face/filters:facepad(1)` |
 | `upscale` | `upscale(2)` or `upscale(4)` | AI super-resolution by that factor. Output is capped at 4096 px per dimension. | `filters:upscale(2)` |
 
 ```bash
@@ -395,7 +395,7 @@ curl "http://localhost:3000/<signature>/preset:og-card/https://example.com/photo
 
 The signature covers the preset reference; the server expands it deterministically after verification, and cache entries key on the expanded operations. Treat a preset as a stable template: **never edit a definition in place**. Roll a change out under a new name (`thumb2`) and update your templates to reference it. Editing in place changes the bytes behind URLs already signed and shared, and image responses travel with `Cache-Control: immutable` for a year, so browsers and CDNs holding the old response keep serving it, beyond the reach of any purge. (This server's own caches are not the problem: they key on the expanded form, so they would pick the edit up. Downstream copies are the ones stranded.) Purging accepts the preset URL itself, exactly as an operator holds it; the server expands it before matching entries, and `/purge-group` clears a preset's whole output set at once. An unknown preset name is a `400`. Preset definitions are validated at startup: malformed entries refuse the boot, and presets cannot contain a source segment, an `exp:`, or another preset.
 
-With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: requests may use preset references, `exp:` metadata, and bare sources only. The mode does not change signature rules. Combined with `CRABCROP_ALLOW_UNSAFE=1` it makes a public deployment where browsers and CMSs can build URLs from preset names alone, with no secret to hold and no way to invent a transform.
+With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: requests may use preset references, `exp:` and `maxage:` metadata, and bare sources only. The mode does not change signature rules. Combined with `CRABCROP_ALLOW_UNSAFE=1` it makes a public deployment where browsers and CMSs can build URLs from preset names alone, with no secret to hold and no way to invent a transform.
 
 ## Client libraries
 
@@ -522,7 +522,7 @@ Preservation copies the source segments rather than re-serializing them, with on
 
 ### Fallback image
 
-With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at startup), a source that cannot be fetched or decoded degrades to the fallback instead of an error: the fallback runs through the same operations and is served with `200` and the header `X-Crabcrop-Fallback: 1`. Signature and parse failures never fall back — a `403` or `400` stays honest — and neither does a source-policy refusal. Fallback responses are never cached, so a recovered origin is picked up on the next request; they are also served with `Cache-Control: no-store`, so a CDN or browser never pins the placeholder in place of the real image. With no fallback configured, error behavior is unchanged.
+With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at startup), a source that cannot be fetched or decoded degrades to the fallback instead of an error: the fallback runs through the same operations and is served with `200` and the header `X-Crabcrop-Fallback: 1`. Signature and parse failures never fall back, a `403` or `400` stays honest, and neither does a source-policy refusal. Fallback responses are never cached, so a recovered origin is picked up on the next request; they are also served with `Cache-Control: no-store`, so a CDN or browser never pins the placeholder in place of the real image. With no fallback configured, error behavior is unchanged.
 
 ## Errors
 
@@ -532,9 +532,12 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 | --- | --- |
 | `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image, a video format asked of a still source. |
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
+| `404` | A `PUT` to `/upload/...` when uploads are not configured, or a `PUT` to any path that is not the upload route. |
+| `413` | An upload body larger than the `CRABCROP_UPLOAD_MAX_MB` cap. |
 | `500` | Encoding the output failed, or an AI model failed at inference time (the runtime errored, or a model session lock was poisoned by an earlier failure). A model that cannot be loaded at all fails startup instead of answering requests. |
 | `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font, a video format with no encoder configured. |
-| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image — including AVIF sources in builds without AVIF decoding, corrupt HEIC sources, and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). A configured video encoder that fails, times out, or exceeds its output cap also lands here. |
+| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image, including AVIF sources in builds without AVIF decoding, corrupt HEIC sources, and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). A configured video encoder that fails, times out, or exceeds its output cap also lands here. |
+| `503` | The server shed the request because a processing, AI, or video gate waited past its timeout; the response carries `Retry-After`. |
 | `504` | The source fetch timed out (10 seconds). |
 
 For example, a `removebg` request to a server with no background-removal model returns `501` with the body `removebg is not configured on this server`.
@@ -585,7 +588,7 @@ One posture note, stated plainly: enabling uploads changes this server from fetc
 
 ### Cache headers and groups
 
-Image responses carry two standard headers. `Cache-Status` (RFC 9211) reports what the server's own caches did: `crabcrop; hit` for a memory hit, `crabcrop; hit; detail="disk"` for a disk hit, and `crabcrop; fwd=uri-miss` when the response was produced from the origin.
+Image responses carry two standard headers. `Cache-Status` (RFC 9211) reports what the server's own caches did: `crabcrop; hit` for a memory hit, `crabcrop; hit; detail="disk"` for a disk hit, `crabcrop; hit; detail="shared"` for a shared-tier hit, and `crabcrop; fwd=uri-miss` when the response was produced from the origin.
 
 A response also belongs to a cache group (RFC 9875) for each preset its URL referenced, listed in the `Cache-Group` header:
 
@@ -599,7 +602,7 @@ Groups make preset-wide invalidation one call instead of a script over every URL
 curl -X POST "http://localhost:3000/purge-group/<signature>/small"
 ```
 
-The response is `200` with a body like `purged 3`: every entry recorded in the group, across both tiers. A bad signature is a `403` and removes nothing; an unknown group answers `purged 0`.
+The response is `200` with a body like `purged 3`: every entry recorded in the group, across all cache tiers. A bad signature is a `403` and removes nothing; an unknown group answers `purged 0`.
 
 Every image request also writes one structured JSON log line to stdout, with the operation summary, status, per-stage timings, and cache result (never the full source URL).
 
@@ -637,11 +640,11 @@ crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
 
 ## Configuration
 
-All configuration comes from environment variables. Invalid values are startup errors, booleans included — the server refuses to start rather than run with a wrong port, cache budget, or safety flag. Boolean variables accept `1`, `true`, `yes`, `on` (any case) for on and `0`, `false`, `no`, `off` for off; anything else fails the boot with the variable named. Names follow one pattern: `*_MODEL` is an AI model artifact, `*_FILE` is a file read at boot, `*_DIR` is a directory, and `*_MAX_MB` is a size budget in megabytes.
+All configuration comes from environment variables. Invalid values are startup errors, booleans included, the server refuses to start rather than run with a wrong port, cache budget, or safety flag. Boolean variables accept `1`, `true`, `yes`, `on` (any case) for on and `0`, `false`, `no`, `off` for off; anything else fails the boot with the variable named. Names follow one pattern: `*_MODEL` is an AI model artifact, `*_FILE` is a file read at boot, `*_DIR` is a directory, and `*_MAX_MB` is a size budget in megabytes.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CRABCROP_SECRET` | — (required) | The HMAC secret used to verify signed URLs. The server will not start without it. |
+| `CRABCROP_SECRET` | required | The HMAC secret used to verify signed URLs, at least 16 bytes. The server will not start without it. |
 | `CRABCROP_SECRET_KEY_ID` | `current` | The current secret's key ID, named by keyed signature segments (`<key-id>:<tag>`). |
 | `CRABCROP_SECRET_PREVIOUS` | unset | The outgoing secret during a rotation window; the server verifies it alongside the current one. Same minimum length. |
 | `CRABCROP_SECRET_PREVIOUS_KEY_ID` | `previous` | The previous secret's key ID. Must differ from the current one. |
@@ -655,7 +658,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_AVIF_SPEED` | `8` | ravif speed tier for AVIF encodes, 1 (slowest, smallest output) to 10 (fastest). At 800w and quality 80, speed 8 encodes in about 1 s cold and produces the smallest files of the fast tiers; speed 10 is roughly 3x quicker for about 47% more bytes. |
 | `CRABCROP_JXL_SPEED` | `fast` | jixel speed tier for JPEG XL encodes: `ultrafast`, `fastest`, `fast`, `medium`, `slow`, or `extraslow`. Slower tiers shrink output with steep latency costs (`slow` is about 8x the latency of `fast` for about 18% fewer bytes at 800w). |
 | `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](#presets). |
-| `CRABCROP_ONLY_PRESETS` | off | Rejects free-form operations in requests; only preset references (and `exp:` metadata) are allowed. Requires at least one preset. |
+| `CRABCROP_ONLY_PRESETS` | off | Rejects free-form operations in requests; only preset references (and `exp:` / `maxage:` metadata) are allowed. Requires at least one preset. |
 | `CRABCROP_ALLOWED_SOURCES` | unset (all hosts allowed) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
 | `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | Refuses sources whose host is, or resolves to, a loopback, private, link-local, or unspecified address. Checked before connecting and again on every redirect hop. |
 | `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |
@@ -713,16 +716,16 @@ An unknown key ID is indistinguishable from a bad signature, by design: `403`, n
 
 ## AI features
 
-Three features run ONNX models in-process: `removebg` (background removal), `upscale` (super-resolution), and face detection for crops and redaction. The models are files you supply — deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
+Three features run ONNX models in-process: `removebg` (background removal), `upscale` (super-resolution), and face detection for crops and redaction. The models are files you supply, deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
 
 How configuration works:
 
 - Point `CRABCROP_REMOVEBG_MODEL` at a U²-Net-family model file (320×320 input; the U2Netp export is a good fit) and/or `CRABCROP_UPSCALE_MODEL` at a super-resolution model. The upscale contract is dynamic-size RGB in (values 0..1), the same image out at an integer factor; Real-ESRGAN-family ONNX exports follow it.
-- Point `CRABCROP_FACE_MODEL` at a YuNet model to make `crop:...:smart` center on detected faces (the area-weighted center of the faces found). Face detection only ever improves a smart crop: no model, no faces, or a detection failure all fall back to the detail-based focal point, and a smart crop without the model behaves exactly as before. The same model powers the explicit face operations: `crop:...:face` (crop around the largest face; falls back to the smart window when detection fails or finds nothing), and the `blurfaces` / `pixelatefaces` redaction filters. Those require the model — without one they return `501` — and a detection failure fails a redaction request with `500` rather than serve an unredacted image. Chained face operations in one request share a single detection.
+- Point `CRABCROP_FACE_MODEL` at a YuNet model to make `crop:...:smart` center on detected faces (the area-weighted center of the faces found). Face detection only ever improves a smart crop: no model, no faces, or a detection failure all fall back to the detail-based focal point, and a smart crop without the model behaves exactly as before. The same model powers the explicit face operations: `crop:...:face` (crop around the largest face; falls back to the smart window when detection fails or finds nothing), and the `blurfaces` / `pixelatefaces` redaction filters. Those require the model, without one they return `501`, and a detection failure fails a redaction request with `500` rather than serve an unredacted image. Chained face operations in one request share a single detection.
 - Point the `CRABCROP_CLIP_*` set at a CLIP model pair (image and text ONNX exports with the projection head), its `tokenizer.json`, and a label file with one label per line, and meta responses gain `tags` and `alt_text`: zero-shot labels scored against the processed image, plus a short alt text composed from the best three. Labels are embedded once at boot, so a meta request runs only the image encoder, behind the same inference gate; a tagging failure omits the fields instead of failing the response. Labels are embedded exactly as written, so phrase-style labels (`aerial view of a beach`) work as well as single words.
 - Point `CRABCROP_DETECT_MODEL` at a YOLOv8-family detection export and two more surfaces unlock. The class redaction filters `blurclass(<class>)` and `pixelateclass(<class>)` redact every detected object of a class (repeat the filter for more classes; matching is case-insensitive). They inherit the face redaction rules: no model is a `501`, an unknown class is a `400`, and a detection failure is a `500`, never an unredacted response. And meta requests with `detections=1` return the detection boxes for debugging. The class vocabulary comes from the model's own `names` metadata, which Ultralytics exports carry; for exports without it, `CRABCROP_DETECT_LABELS` supplies one class per line in index order. A model whose output is not the YOLOv8 layout is rejected at boot.
-- Models load at boot, before the server reports ready. A configured model that cannot be loaded — missing file, wrong shape — is a startup error with a one-line diagnostic, not a surprise for the first request. The upscale model's native factor is probed at load with a 16×16 test image; a model that does not enlarge by an integer factor is rejected at boot.
-- With no model configured, the filter is off: requests that use it fail cleanly with `501` (`removebg is not configured on this server`, `upscale is not configured on this server`). There is no silent fallback — `upscale` never degrades into a plain resize.
+- Models load at boot, before the server reports ready. A configured model that cannot be loaded, missing file, wrong shape, is a startup error with a one-line diagnostic, not a surprise for the first request. The upscale model's native factor is probed at load with a 16×16 test image; a model that does not enlarge by an integer factor is rejected at boot.
+- With no model configured, the filter is off: requests that use it fail cleanly with `501` (`removebg is not configured on this server`, `upscale is not configured on this server`). There is no silent fallback, `upscale` never degrades into a plain resize.
 - Inference runs behind a server-wide gate of 2 concurrent inferences, so a burst of AI requests cannot starve the normal transform pipeline.
 
 ### Declared detectors
@@ -753,14 +756,14 @@ Beyond the one built-in detection model, `CRABCROP_DETECTORS_FILE` points at a J
 ```
 
 - `name` (required) identifies the declaration: letters, digits, `_`, `-`; duplicate names are a startup error. `model` (required) is the ONNX file path. `kind` (required) is `"boxes"` or `"focal"`; anything else is a startup error naming the declaration.
-- **`boxes`** is a YOLOv8-family detector, decoded by the same post-processing as `CRABCROP_DETECT_MODEL`. Its class vocabulary comes from the declaration's `labels` — a path to a labels file (one class per line, in index order) or an inline array of class names — when given, and from the model's `names` metadata otherwise; declared labels win when both exist. `threshold` (0 to 1) sets its score floor, default 0.5 like the built-in detector. A `boxes` declaration with no vocabulary from either source is a startup error, as is a model whose output the decoder cannot read.
+- **`boxes`** is a YOLOv8-family detector, decoded by the same post-processing as `CRABCROP_DETECT_MODEL`. Its class vocabulary comes from the declaration's `labels`, a path to a labels file (one class per line, in index order) or an inline array of class names, when given, and from the model's `names` metadata otherwise; declared labels win when both exist. `threshold` (0 to 1) sets its score floor, default 0.5 like the built-in detector. A `boxes` declaration with no vocabulary from either source is a startup error, as is a model whose output the decoder cannot read.
 - **`focal`** is a heatmap model: one fixed `[1, C, H, W]` input (C is 1 for luma, 3 for RGB) and exactly one output shaped `[H, W]`, `[1, H, W]`, or `[1, 1, H, W]`. The focal point is the heatmap's hottest cell, ties going to the first in row-major order. `labels` and `threshold` do not apply to this kind.
 - Class redaction resolves a class across providers in a fixed order: the built-in detector first, then declared `boxes` detectors in file order; the first provider whose vocabulary knows the class runs it. Chained class filters still share one run per provider per request.
 - Meta detections aggregate every configured detector: the built-in's boxes first, then each declared detector's in file order, and every box carries a `detector` field naming its source (`"builtin"`, or the declaration's name). One detector's failure omits only its own boxes.
 - Smart crops consult focal sources in this order: a caller `focal:` rectangle, then the face model, then the first declared `focal` provider, then the built-in saliency estimate. Only the first `focal` declaration is consulted; later ones are loaded and probed at boot, then stand by.
 - Every declaration is loaded and probed at boot, like every other model: a missing model file, an unreadable or malformed declarations file, an unknown kind, or an output that does not fit the contract is a startup error naming the declaration.
 - `upscale(4)` on a server whose model is natively 2× composes two model runs and lands the exact requested size; when the native factor does not divide the request, a final high-quality resize trims the difference. Source transparency is carried across an upscale even though the model only sees RGB.
-- The ONNX Runtime library itself comes from `CRABCROP_ORT_DYLIB`, or the system library search path when that is unset.
+- The ONNX Runtime library itself comes from `CRABCROP_ORT_DYLIB`, or from the standard `ORT_DYLIB_PATH` variable, or the system library search path when neither is set.
 
 The `Dockerfile.ai` variant in this repo shows the intended shape: the base image stays free of AI payload, and a second layer adds the pinned ONNX Runtime 1.31.0, the U2Netp model, and the YuNet model, each hash-checked at image build time, and enables the features by setting the variables above. Layer your own super-resolution model the same way and set `CRABCROP_UPSCALE_MODEL` to enable `upscale`.
 
@@ -774,7 +777,7 @@ Guides for moving existing URL templates over:
 
 ## Deployment
 
-The repo ships a multi-stage `Dockerfile` (the runtime image carries only the binary and CA certificates):
+The repo ships a multi-stage `Dockerfile` (the runtime image carries the binary, CA certificates, and the dav1d library for AVIF decoding):
 
 ```bash
 docker build -t crabcrop:latest .
@@ -783,7 +786,7 @@ docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret crabcrop:latest
 
 For the AI features, build `Dockerfile.ai` on top of that image; see [AI features](#ai-features).
 
-On Kubernetes, `deploy/helm` is a Helm chart and `deploy/kustomize` the same workload in kustomize form (base, components for presets, the disk tier, and the AI variant, plus single and multi-replica overlays); `deploy/compose` runs it under Docker Compose. Without Kubernetes, `deploy/ecs-fargate`, `deploy/cloud-run`, and `deploy/container-apps` are per-cloud recipes (task definition, service manifest, and app manifest, each with its secret wiring and a smoke checklist).
+On Kubernetes, `deploy/helm` is a Helm chart and `deploy/kustomize` the same workload in kustomize form (base, components for presets, the disk tier, and the AI variant, plus single, multi-replica, and full overlays); `deploy/compose` runs it under Docker Compose. Without Kubernetes, `deploy/ecs-fargate`, `deploy/cloud-run`, and `deploy/container-apps` are per-cloud recipes (task definition, service manifest, and app manifest, each with its secret wiring and a smoke checklist).
 
 Run crabcrop behind a reverse proxy or CDN in production. The application bounds its own work (the processing and AI gates shed overload with `503`), but connection-level protections belong at the edge: request and header timeouts, connection limits, rate limiting, and TLS termination. Restrict `/health` and `/metrics` to your internal network at the proxy: both are unauthenticated (they are served with `Cache-Control: no-store`), and the metrics expose traffic and error counters.
 
