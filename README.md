@@ -440,9 +440,9 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 | --- | --- |
 | `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image. |
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
-| `500` | Encoding the output failed, or an AI model failed at inference time. |
+| `500` | Encoding the output failed, or an AI model failed at inference time (the runtime errored, or a model session lock was poisoned by an earlier failure). A model that cannot be loaded at all fails startup instead of answering requests. |
 | `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font. |
-| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image — including HEIC sources and undecodable formats. A watermark that fails to load also lands here. |
+| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image — including HEIC sources and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). |
 | `504` | The source fetch timed out (10 seconds). |
 
 For example, a `removebg` request to a server with no background-removal model returns `501` with the body `removebg is not configured on this server`.

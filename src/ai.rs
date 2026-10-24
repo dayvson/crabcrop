@@ -12,11 +12,48 @@ use image::{DynamicImage, GrayImage, imageops::FilterType};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::sync::{Mutex, OnceLock};
 
+/// How an AI operation failed, typed so callers can map the
+/// failure class to a response instead of collapsing every
+/// cause into one 500 (AP-16). The messages keep the wording
+/// the plain strings carried; the variant is the diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiError {
+    /// A model, the runtime, or a model-adjacent file (labels,
+    /// tokenizer data) could not be loaded. Raised at boot,
+    /// where it fails startup, or while preparing a provider.
+    Load(String),
+    /// The runtime failed while running a model: building an
+    /// input tensor, executing the session, a transient ORT
+    /// error.
+    Inference(String),
+    /// A provider's session lock was poisoned: an earlier
+    /// inference panicked while holding it, so the session's
+    /// state can no longer be trusted.
+    LockPoisoned,
+    /// The model ran but its output is not what the provider
+    /// contract requires: no outputs, an unreadable tensor,
+    /// an unexpected shape, an embedding of the wrong size.
+    BadOutput(String),
+}
+
+impl std::fmt::Display for AiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AiError::Load(cause) => write!(f, "{cause}"),
+            AiError::Inference(cause) => write!(f, "{cause}"),
+            AiError::LockPoisoned => write!(f, "a model session lock was poisoned"),
+            AiError::BadOutput(cause) => write!(f, "{cause}"),
+        }
+    }
+}
+
+impl std::error::Error for AiError {}
+
 /// Produces a foreground mask for an image: bright where the
 /// subject is, dark where the background is. Implemented by the
 /// ONNX provider in production and by fakes in tests.
 pub trait MaskProvider: Send + Sync + std::fmt::Debug {
-    fn mask(&self, img: &DynamicImage) -> Result<GrayImage, String>;
+    fn mask(&self, img: &DynamicImage) -> Result<GrayImage, AiError>;
 }
 
 /// The process-wide ONNX environment, created on first use:
@@ -24,40 +61,40 @@ pub trait MaskProvider: Send + Sync + std::fmt::Debug {
 /// configured models.
 static ENVIRONMENT: OnceLock<ort::environment::Environment> = OnceLock::new();
 
-fn environment(dylib: Option<&str>) -> Result<&'static ort::environment::Environment, String> {
+fn environment(dylib: Option<&str>) -> Result<&'static ort::environment::Environment, AiError> {
     if let Some(env) = ENVIRONMENT.get() {
         return Ok(env);
     }
     let builder = match dylib {
         Some(path) => ort::init_from(path)
-            .map_err(|e| format!("cannot load the ONNX runtime from {path}: {e}"))?,
+            .map_err(|e| AiError::Load(format!("cannot load the ONNX runtime from {path}: {e}")))?,
         None => ort::init(),
     };
     let env = builder
         .build()
-        .map_err(|e| format!("cannot initialize the ONNX runtime: {e}"))?;
+        .map_err(|e| AiError::Load(format!("cannot initialize the ONNX runtime: {e}")))?;
     let _ = ENVIRONMENT.set(env);
     ENVIRONMENT
         .get()
-        .ok_or_else(|| "ONNX environment unavailable".to_string())
+        .ok_or_else(|| AiError::Load("ONNX environment unavailable".to_string()))
 }
 
 /// Build an inference session for a model file and report its
 /// first input's name. Every failure is a plain message: at
 /// boot it becomes the startup diagnostic.
-fn build_session(dylib: Option<&str>, model_path: &str) -> Result<(Session, String), String> {
+fn build_session(dylib: Option<&str>, model_path: &str) -> Result<(Session, String), AiError> {
     let env = environment(dylib)?;
     let session = Session::builder(env)
-        .map_err(|e| format!("cannot create a session: {e}"))?
+        .map_err(|e| AiError::Load(format!("cannot create a session: {e}")))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|e| format!("cannot configure the session: {e}"))?
+        .map_err(|e| AiError::Load(format!("cannot configure the session: {e}")))?
         .commit_from_file(model_path)
-        .map_err(|e| format!("cannot load the model {model_path}: {e}"))?;
+        .map_err(|e| AiError::Load(format!("cannot load the model {model_path}: {e}")))?;
     let input_name = session
         .inputs()
         .first()
         .map(|i| i.name().to_string())
-        .ok_or_else(|| format!("the model {model_path} has no inputs"))?;
+        .ok_or_else(|| AiError::Load(format!("the model {model_path} has no inputs")))?;
     Ok((session, input_name))
 }
 
@@ -72,7 +109,7 @@ pub struct OnnxMaskProvider {
 impl OnnxMaskProvider {
     /// Load a model file against the runtime at `dylib` (or the
     /// runtime's own search when `None`).
-    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, String> {
+    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, AiError> {
         let (session, input_name) = build_session(dylib, model_path)?;
         Ok(Self {
             session: Mutex::new(session),
@@ -90,24 +127,22 @@ impl std::fmt::Debug for OnnxMaskProvider {
 }
 
 impl MaskProvider for OnnxMaskProvider {
-    fn mask(&self, img: &DynamicImage) -> Result<GrayImage, String> {
+    fn mask(&self, img: &DynamicImage) -> Result<GrayImage, AiError> {
         let input = preprocess(img);
-        let tensor = ort::value::Tensor::from_array(([1, 3, 320, 320], input.into_boxed_slice()))
-            .map_err(|e| format!("cannot build the input tensor: {e}"))?;
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| "mask provider lock poisoned".to_string())?;
+        let tensor =
+            ort::value::Tensor::from_array(([1, 3, 320, 320], input.into_boxed_slice()))
+                .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
-            .map_err(|e| format!("inference failed: {e}"))?;
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
         let (_, first) = outputs
             .into_iter()
             .next()
-            .ok_or_else(|| "the model produced no outputs".to_string())?;
+            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
         let (_shape, data) = first
             .try_extract_tensor::<f32>()
-            .map_err(|e| format!("cannot read the model output: {e}"))?;
+            .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
         Ok(postprocess(data, img.width(), img.height()))
     }
 }
@@ -174,7 +209,7 @@ pub fn apply_mask(img: &DynamicImage, mask: &GrayImage) -> DynamicImage {
 pub trait UpscaleProvider: Send + Sync + std::fmt::Debug {
     /// The model's native upscale factor (2, 3, 4...).
     fn factor(&self) -> u32;
-    fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, String>;
+    fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, AiError>;
 }
 
 /// Super-resolution backed by an ONNX model with the usual
@@ -192,7 +227,7 @@ impl OnnxUpscaleProvider {
     /// anywhere in the format, so it is probed at load with a
     /// 16x16 image: a model that does not enlarge by an integer
     /// factor is rejected here, at boot, not per request.
-    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, String> {
+    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, AiError> {
         let (session, input_name) = build_session(dylib, model_path)?;
         let probe = Self {
             session: Mutex::new(session),
@@ -201,12 +236,12 @@ impl OnnxUpscaleProvider {
         };
         let out = probe.upscale(&DynamicImage::new_rgb8(16, 16))?;
         if out.width() % 16 != 0 || out.width() / 16 < 2 || out.height() != out.width() {
-            return Err(format!(
+            return Err(AiError::Load(format!(
                 "the model {model_path} is not an integer-factor super-resolution model \
                  (a 16x16 probe produced {}x{})",
                 out.width(),
                 out.height()
-            ));
+            )));
         }
         Ok(Self {
             factor: out.width() / 16,
@@ -229,7 +264,7 @@ impl UpscaleProvider for OnnxUpscaleProvider {
         self.factor
     }
 
-    fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, String> {
+    fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, AiError> {
         let (w, h) = (img.width() as usize, img.height() as usize);
         let rgb = img.to_rgb8();
         let mut input = vec![0f32; 3 * w * h];
@@ -239,23 +274,22 @@ impl UpscaleProvider for OnnxUpscaleProvider {
             }
         }
         let tensor = ort::value::Tensor::from_array(([1, 3, h, w], input.into_boxed_slice()))
-            .map_err(|e| format!("cannot build the input tensor: {e}"))?;
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| "upscale provider lock poisoned".to_string())?;
+            .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
-            .map_err(|e| format!("inference failed: {e}"))?;
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
         let (_, first) = outputs
             .into_iter()
             .next()
-            .ok_or_else(|| "the model produced no outputs".to_string())?;
+            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
         let (shape, data) = first
             .try_extract_tensor::<f32>()
-            .map_err(|e| format!("cannot read the model output: {e}"))?;
+            .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
         if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
-            return Err(format!("unexpected model output shape: {shape:?}"));
+            return Err(AiError::BadOutput(format!(
+                "unexpected model output shape: {shape:?}"
+            )));
         }
         let (ow, oh) = (shape[3] as u32, shape[2] as u32);
         let mut out = image::RgbImage::new(ow, oh);
@@ -301,7 +335,7 @@ pub struct FaceBox {
 /// Detects faces in an image. Implemented by the ONNX provider
 /// in production and by fakes in tests.
 pub trait FaceProvider: Send + Sync + std::fmt::Debug {
-    fn detect(&self, img: &DynamicImage) -> Result<Vec<FaceBox>, String>;
+    fn detect(&self, img: &DynamicImage) -> Result<Vec<FaceBox>, AiError>;
 }
 
 /// Face detection backed by YuNet (the 2023mar ONNX export):
@@ -316,7 +350,7 @@ pub struct OnnxFaceProvider {
 }
 
 impl OnnxFaceProvider {
-    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, String> {
+    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, AiError> {
         let (session, input_name) = build_session(dylib, model_path)?;
         Ok(Self {
             session: Mutex::new(session),
@@ -341,7 +375,7 @@ const FACE_SCORE_THRESHOLD: f32 = 0.6;
 const FACE_NMS_THRESHOLD: f32 = 0.3;
 
 impl FaceProvider for OnnxFaceProvider {
-    fn detect(&self, img: &DynamicImage) -> Result<Vec<FaceBox>, String> {
+    fn detect(&self, img: &DynamicImage) -> Result<Vec<FaceBox>, AiError> {
         let (ow, oh) = (img.width(), img.height());
         if ow == 0 || oh == 0 {
             return Ok(Vec::new());
@@ -365,27 +399,24 @@ impl FaceProvider for OnnxFaceProvider {
             [1, 3, FACE_INPUT as usize, FACE_INPUT as usize],
             input.into_boxed_slice(),
         ))
-        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| "face provider lock poisoned".to_string())?;
+        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
-            .map_err(|e| format!("inference failed: {e}"))?;
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
         let mut by_name: std::collections::HashMap<String, Vec<f32>> =
             std::collections::HashMap::new();
         for (name, value) in outputs.into_iter() {
             let (_, data) = value
                 .try_extract_tensor::<f32>()
-                .map_err(|e| format!("cannot read the model output: {e}"))?;
+                .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
             by_name.insert(name.to_string(), data.to_vec());
         }
         drop(session);
-        let get = |name: &str| -> Result<&Vec<f32>, String> {
+        let get = |name: &str| -> Result<&Vec<f32>, AiError> {
             by_name
                 .get(name)
-                .ok_or_else(|| format!("the model produced no {name} output"))
+                .ok_or_else(|| AiError::BadOutput(format!("the model produced no {name} output")))
         };
         let mut candidates: Vec<FaceBox> = Vec::new();
         for stride in [8u32, 16, 32] {
@@ -594,7 +625,7 @@ pub struct Annotation {
 
 /// Annotates images with content tags and alt text.
 pub trait TagProvider: Send + Sync + std::fmt::Debug {
-    fn annotate(&self, img: &DynamicImage) -> Result<Annotation, String>;
+    fn annotate(&self, img: &DynamicImage) -> Result<Annotation, AiError>;
 }
 
 /// Zero-shot tagging backed by a CLIP image/text ONNX model
@@ -625,21 +656,24 @@ impl OnnxClipProvider {
         tokenizer_path: &str,
         labels_path: &str,
         threshold: f32,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, AiError> {
         let labels = read_labels(labels_path)?;
-        let tokenizer = crate::tokenizer::ClipTokenizer::load(tokenizer_path)?;
+        let tokenizer =
+            crate::tokenizer::ClipTokenizer::load(tokenizer_path).map_err(AiError::Load)?;
         let (text, _) = build_session(dylib, text_model)?;
         let text_inputs: Vec<String> = text.inputs().iter().map(|i| i.name().to_string()).collect();
         let mut text = text;
         let mut label_embeddings: Vec<f32> = Vec::new();
         let mut dim = 0usize;
         for label in &labels {
-            let (ids, mask) = tokenizer.encode(label)?;
+            let (ids, mask) = tokenizer.encode(label).map_err(AiError::Load)?;
             let emb = run_text(&mut text, &text_inputs, &ids, &mask)?;
             if dim == 0 {
                 dim = emb.len();
             } else if emb.len() != dim {
-                return Err("the text model returned inconsistent embedding sizes".to_string());
+                return Err(AiError::Load(
+                    "the text model returned inconsistent embedding sizes".to_string(),
+                ));
             }
             label_embeddings.extend_from_slice(&normalize(&emb));
         }
@@ -658,11 +692,11 @@ impl OnnxClipProvider {
         let probe = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
         let emb = provider.embed_image(&probe)?;
         if emb.len() != provider.dim {
-            return Err(format!(
+            return Err(AiError::Load(format!(
                 "the image model produced a {}-dimensional embedding but the text model produced {}: the pair does not share a projection space",
                 emb.len(),
                 provider.dim
-            ));
+            )));
         }
         Ok(provider)
     }
@@ -672,17 +706,15 @@ impl OnnxClipProvider {
         self.labels.len()
     }
 
-    fn embed_image(&self, img: &DynamicImage) -> Result<Vec<f32>, String> {
+    fn embed_image(&self, img: &DynamicImage) -> Result<Vec<f32>, AiError> {
         let input = preprocess_clip(img);
-        let tensor = ort::value::Tensor::from_array(([1, 3, 224, 224], input.into_boxed_slice()))
-            .map_err(|e| format!("cannot build the input tensor: {e}"))?;
-        let mut session = self
-            .vision
-            .lock()
-            .map_err(|_| "clip provider lock poisoned".to_string())?;
+        let tensor =
+            ort::value::Tensor::from_array(([1, 3, 224, 224], input.into_boxed_slice()))
+                .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let mut session = self.vision.lock().map_err(|_| AiError::LockPoisoned)?;
         let outputs = session
             .run(ort::inputs![self.vision_input.as_str() => tensor])
-            .map_err(|e| format!("inference failed: {e}"))?;
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
         let outputs = collect_outputs(outputs)?;
         pick_embedding(&outputs, None)
     }
@@ -698,7 +730,7 @@ impl std::fmt::Debug for OnnxClipProvider {
 }
 
 impl TagProvider for OnnxClipProvider {
-    fn annotate(&self, img: &DynamicImage) -> Result<Annotation, String> {
+    fn annotate(&self, img: &DynamicImage) -> Result<Annotation, AiError> {
         let emb = normalize(&self.embed_image(img)?);
         let dots: Vec<f32> = (0..self.labels.len())
             .map(|i| {
@@ -714,9 +746,9 @@ impl TagProvider for OnnxClipProvider {
 
 /// Read the label file: one label per line, blank lines
 /// and `#` comments skipped. No labels is an error.
-fn read_labels(path: &str) -> Result<Vec<String>, String> {
+fn read_labels(path: &str) -> Result<Vec<String>, AiError> {
     let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read the label file {path}: {e}"))?;
+        .map_err(|e| AiError::Load(format!("cannot read the label file {path}: {e}")))?;
     let labels: Vec<String> = raw
         .lines()
         .map(str::trim)
@@ -724,7 +756,9 @@ fn read_labels(path: &str) -> Result<Vec<String>, String> {
         .map(str::to_string)
         .collect();
     if labels.is_empty() {
-        return Err(format!("the label file {path} contains no labels"));
+        return Err(AiError::Load(format!(
+            "the label file {path} contains no labels"
+        )));
     }
     Ok(labels)
 }
@@ -737,19 +771,20 @@ fn run_text(
     input_names: &[String],
     ids: &[i64],
     mask: &[i64],
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<f32>, AiError> {
     let n = ids.len();
     let ids_tensor = ort::value::Tensor::from_array(([1, n], ids.to_vec().into_boxed_slice()))
-        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
+        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
     let mask_tensor = ort::value::Tensor::from_array(([1, n], mask.to_vec().into_boxed_slice()))
-        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
-    let zeros_tensor = ort::value::Tensor::from_array(([1, n], vec![0i64; n].into_boxed_slice()))
-        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
+        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+    let zeros_tensor =
+        ort::value::Tensor::from_array(([1, n], vec![0i64; n].into_boxed_slice()))
+            .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
     let ids_name = input_names
         .iter()
         .find(|name| name.contains("input_ids"))
         .or_else(|| input_names.first())
-        .ok_or("the text model has no inputs")?;
+        .ok_or_else(|| AiError::Load("the text model has no inputs".to_string()))?;
     let mask_name = input_names.iter().find(|name| name.contains("attention"));
     let types_name = input_names.iter().find(|name| name.contains("token_type"));
     let outputs = match (mask_name, types_name) {
@@ -768,7 +803,7 @@ fn run_text(
         ]),
         (None, None) => session.run(ort::inputs![ids_name.as_str() => ids_tensor]),
     }
-    .map_err(|e| format!("inference failed: {e}"))?;
+    .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
     let outputs = collect_outputs(outputs)?;
     // The text embedding is the pooled row at the EOT
     // position: the last non-padding token.
@@ -780,12 +815,12 @@ fn run_text(
 type ModelOutput = (String, Vec<i64>, Vec<f32>);
 
 /// Collect a session's outputs as (name, dims, data).
-fn collect_outputs(outputs: ort::session::SessionOutputs<'_>) -> Result<Vec<ModelOutput>, String> {
+fn collect_outputs(outputs: ort::session::SessionOutputs<'_>) -> Result<Vec<ModelOutput>, AiError> {
     let mut out = Vec::new();
     for (name, value) in outputs.into_iter() {
         let (shape, data) = value
             .try_extract_tensor::<f32>()
-            .map_err(|e| format!("cannot read the model output: {e}"))?;
+            .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
         let dims: Vec<i64> = shape.iter().copied().collect();
         out.push((name.to_string(), dims, data.to_vec()));
     }
@@ -796,19 +831,23 @@ fn collect_outputs(outputs: ort::session::SessionOutputs<'_>) -> Result<Vec<Mode
 /// `image_embeds` / `text_embeds` first, then
 /// `pooled_output`, then the first output (row 0, or the
 /// EOT row for text hidden states).
-fn pick_embedding(outputs: &[ModelOutput], eot_row: Option<usize>) -> Result<Vec<f32>, String> {
+fn pick_embedding(outputs: &[ModelOutput], eot_row: Option<usize>) -> Result<Vec<f32>, AiError> {
     for wanted in ["image_embeds", "text_embeds", "pooled_output"] {
         if let Some((_, dims, data)) = outputs.iter().find(|(name, _, _)| name == wanted) {
             return Ok(first_row(dims, data));
         }
     }
-    let (_, dims, data) = outputs.first().ok_or("the model produced no outputs")?;
+    let (_, dims, data) = outputs
+        .first()
+        .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
     if dims.len() == 3 {
         let dim = dims[2] as usize;
         let row = eot_row.unwrap_or(0);
         let start = row * dim;
         if start + dim > data.len() {
-            return Err("the model output is smaller than its declared shape".to_string());
+            return Err(AiError::BadOutput(
+                "the model output is smaller than its declared shape".to_string(),
+            ));
         }
         return Ok(data[start..start + dim].to_vec());
     }
@@ -1023,7 +1062,7 @@ pub struct Detection {
 pub trait DetectionProvider: Send + Sync + std::fmt::Debug {
     /// The model's class vocabulary, in model order.
     fn classes(&self) -> &[String];
-    fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, String>;
+    fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, AiError>;
 }
 
 /// The detector's fixed input edge (YOLO letterbox).
@@ -1055,17 +1094,17 @@ impl OnnxDetectionProvider {
         model_path: &str,
         labels_path: Option<&str>,
         threshold: f32,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, AiError> {
         let (session, input_name) = build_session(dylib, model_path)?;
         let classes = match classes_from_metadata(&session) {
             Some(classes) => classes,
             None => match labels_path {
                 Some(path) => read_labels(path)
-                    .map_err(|e| format!("cannot read the detection labels: {e}"))?,
+                    .map_err(|e| AiError::Load(format!("cannot read the detection labels: {e}")))?,
                 None => {
-                    return Err(format!(
+                    return Err(AiError::Load(format!(
                         "the model {model_path} carries no class names metadata and no CRABCROP_DETECT_LABELS file was configured"
-                    ));
+                    )));
                 }
             },
         };
@@ -1079,9 +1118,11 @@ impl OnnxDetectionProvider {
         // detections found are discarded, but a layout the
         // post-processor cannot read fails here.
         let probe = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
-        provider
-            .detect(&probe)
-            .map_err(|e| format!("the detection model is not a YOLOv8-family export: {e}"))?;
+        provider.detect(&probe).map_err(|e| {
+            AiError::Load(format!(
+                "the detection model is not a YOLOv8-family export: {e}"
+            ))
+        })?;
         Ok(provider)
     }
 }
@@ -1099,25 +1140,22 @@ impl DetectionProvider for OnnxDetectionProvider {
         &self.classes
     }
 
-    fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, String> {
+    fn detect(&self, img: &DynamicImage) -> Result<Vec<Detection>, AiError> {
         let (input, scale, pad_x, pad_y) = letterbox(img);
         let tensor = ort::value::Tensor::from_array((
             [1, 3, DETECT_INPUT as usize, DETECT_INPUT as usize],
             input.into_boxed_slice(),
         ))
-        .map_err(|e| format!("cannot build the input tensor: {e}"))?;
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| "detection provider lock poisoned".to_string())?;
+        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
-            .map_err(|e| format!("inference failed: {e}"))?;
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
         let outputs = collect_outputs(outputs)?;
         let (_, dims, data) = outputs
             .into_iter()
             .next()
-            .ok_or("the model produced no outputs")?;
+            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
         postprocess_detections(
             &data,
             &dims,
@@ -1207,20 +1245,20 @@ fn postprocess_detections(
     scale: f32,
     pad_x: u32,
     pad_y: u32,
-) -> Result<Vec<Detection>, String> {
+) -> Result<Vec<Detection>, AiError> {
     if dims.len() != 3 || dims[0] != 1 {
-        return Err(format!(
+        return Err(AiError::BadOutput(format!(
             "expected a [1, 4+classes, N] output, got dims {dims:?}"
-        ));
+        )));
     }
     let rows = (4 + classes.len()) as i64;
     let channels_first = dims[1] == rows;
     let transposed = dims[2] == rows;
     if !channels_first && !transposed {
-        return Err(format!(
+        return Err(AiError::BadOutput(format!(
             "expected a [1, 4+classes, N] output for {} classes, got dims {dims:?}",
             classes.len()
-        ));
+        )));
     }
     let n = if channels_first { dims[2] } else { dims[1] } as usize;
     let stride = rows as usize;
@@ -1417,7 +1455,30 @@ mod detect_tests {
             0,
         )
         .unwrap_err();
-        assert!(err.contains("4+classes"), "{err}");
+        assert!(
+            matches!(err, AiError::BadOutput(_)) && err.to_string().contains("4+classes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ai_error_display_keeps_the_cause() {
+        // The typed variants carry the same messages the
+        // plain strings carried, so boot diagnostics and log
+        // lines read as they did before AP-16.
+        assert_eq!(
+            AiError::Load("cannot load the model x: boom".to_string()).to_string(),
+            "cannot load the model x: boom"
+        );
+        assert_eq!(
+            AiError::Inference("inference failed: boom".to_string()).to_string(),
+            "inference failed: boom"
+        );
+        assert_eq!(
+            AiError::BadOutput("unexpected model output shape: [1]".to_string()).to_string(),
+            "unexpected model output shape: [1]"
+        );
+        assert!(AiError::LockPoisoned.to_string().contains("poisoned"));
     }
 
     #[test]
