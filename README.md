@@ -520,6 +520,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_SECRET_KEY_ID` | `current` | The current secret's key ID, named by keyed signature segments (`<key-id>:<tag>`). |
 | `CRABCROP_SECRET_PREVIOUS` | unset | The outgoing secret during a rotation window; the server verifies it alongside the current one. Same minimum length. |
 | `CRABCROP_SECRET_PREVIOUS_KEY_ID` | `previous` | The previous secret's key ID. Must differ from the current one. |
+| `CRABCROP_DEFAULT_OPS` | unset | Operations prepended to every request (a house format, quality, or watermark), validated at boot. See [Server-wide default operations](#server-wide-default-operations). |
 | `PORT` | `3000` | Listen port. `CRABCROP_PORT` is the namespaced alias and wins when both are set. |
 | `CRABCROP_ALLOW_UNSAFE` | off | Honors `unsafe` URLs (for the boolean spellings, see above). |
 | `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
@@ -555,6 +556,16 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_RESULT_STORAGE_MAX_MB` | `512` | Disk result store budget in megabytes. `0` disables storage even with a directory set. |
 
 With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves the host to check its addresses and pins the connection to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
+
+### Server-wide default operations
+
+`CRABCROP_DEFAULT_OPS` holds an operations string (the same grammar as a URL's operations, `preset:` references included) that the server prepends to every request, for a house format, quality, or watermark you do not want baked into every URL. The decisions, once:
+
+- **The signature never covers the defaults.** They are operator configuration, applied after verification, like preset expansion.
+- **Defaults sit before the URL's own operations**, and for the singleton directives (format, quality, fill, dpr, max_bytes) the URL wins by the default being dropped from the merged list. A bare request under defaults and the same request spelled out in full therefore produce the same operations and share a cache entry. Everything else (sizes, filters, watermarks) applies from both, in order: a default blur and a URL blur stack.
+- **Cache entries key on the merged operations**, exactly like presets, so changing the defaults changes the keys and old entries age out unused. Purges account for the merge too: purging a URL removes its merged entry.
+- **Presets-only mode is unaffected in what it rejects** (the URL's own operations), and the defaults still apply: they are not URL content.
+- Cache groups stay the URL's own presets; a preset referenced only by the defaults does not join entries to its group.
 
 ### Rotating the secret
 

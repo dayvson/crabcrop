@@ -99,6 +99,11 @@ pub struct AppState {
     /// Presets-only mode, from `CRABCROP_ONLY_PRESETS`: reject
     /// free-form operations in requests.
     pub only_presets: bool,
+    /// Server-wide default operations (issue #145), parsed at
+    /// boot from `CRABCROP_DEFAULT_OPS` and prepended to every
+    /// request's operations before analysis, processing, and
+    /// cache keying.
+    pub default_ops: Vec<crate::url::Operation>,
 }
 
 /// Build the router.
@@ -294,7 +299,21 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
             Err(_) => target,
         }
     };
-    let key_form = crate::url::canonical_key_form(target);
+    // Entries are keyed post-merge (issue #145): with
+    // defaults configured, the purge target's key form is
+    // the canonical form of the merged operations, or the
+    // purge silently removes nothing.
+    let key_form = if state.default_ops.is_empty() {
+        crate::url::canonical_key_form(target)
+    } else {
+        match parse_operations_with_expiry(target) {
+            Ok((ops, source, _)) => {
+                let merged = crate::url::merge_default_ops(&state.default_ops, ops);
+                crate::url::canonical_form(&merged, source)
+            }
+            Err(_) => crate::url::canonical_key_form(target),
+        }
+    };
     let mut removed = state.cache.purge_matching(&key_form);
     if let Some(store) = &state.store {
         removed += store.purge_matching(&key_form);
@@ -589,6 +608,14 @@ async fn serve(
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
         .to_string();
+    // Server-wide defaults (issue #145) merge here: prepended
+    // to the request's own operations, so the directive
+    // analysis below, the engine, and the cache key all see
+    // the merged list, and the URL wins every last-wins
+    // directive (format, quality, fill) by coming later. The
+    // signature never covers the defaults: they are operator
+    // configuration, not request content.
+    let ops = crate::url::merge_default_ops(&state.default_ops, ops);
     // Expiry is enforced after signature verification (the
     // segment is inside the signed remainder, so a tampered
     // expiry already failed as a bad signature) and before the
@@ -1445,6 +1472,47 @@ mod tests {
             preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            default_ops: Vec::new(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// An app with server-wide default operations (issue
+    /// #145), optionally in presets-only mode.
+    async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
+        let presets = std::collections::HashMap::new();
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            detect: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets,
+            only_presets,
+            default_ops: crate::url::parse_default_ops(defaults, &std::collections::HashMap::new())
+                .unwrap(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1486,6 +1554,7 @@ mod tests {
             preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            default_ops: Vec::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1531,6 +1600,7 @@ mod tests {
             preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            default_ops: Vec::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1850,6 +1920,7 @@ mod tests {
             preserve_metadata: false,
             presets,
             only_presets,
+            default_ops: Vec::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2136,6 +2207,7 @@ mod tests {
             preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            default_ops: Vec::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2234,6 +2306,7 @@ mod tests {
             preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            default_ops: Vec::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2277,6 +2350,7 @@ mod tests {
             preserve_metadata: false,
             presets,
             only_presets: false,
+            default_ops: Vec::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2829,6 +2903,7 @@ mod tests {
             preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            default_ops: Vec::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2873,6 +2948,7 @@ mod tests {
             preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            default_ops: Vec::new(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2943,6 +3019,80 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "purged: origin refetched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn default_ops_apply_under_the_url_and_key_post_merge() {
+        let (src_host, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_defaults("filters:format(webp):quality(80)", false).await;
+        // A bare request takes the house format.
+        let bare = src_host.to_string();
+        let sig = sign(&bare);
+        let resp = client()
+            .get(format!("{base}/{sig}/{bare}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The explicit URL spelling of the same merged
+        // request hits the same cache entry: keys are
+        // post-merge.
+        let explicit = format!("filters:format(webp):quality(80)/{src_host}");
+        let sig = sign(&explicit);
+        let resp = client()
+            .get(format!("{base}/{sig}/{explicit}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "post-merge key shared");
+        // The URL wins a singleton directive over the default.
+        let png = format!("filters:format(png)/{src_host}");
+        let sig = sign(&png);
+        let resp = client()
+            .get(format!("{base}/{sig}/{png}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        // A signed purge of the bare URL removes the merged
+        // entry, so the next bare request refetches.
+        let purge_sig = crate::url::purge_signature(SECRET, &bare);
+        let ok = client()
+            .post(format!("{base}/purge/{purge_sig}/{bare}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        assert!(ok.text().await.unwrap().contains("purged 1"));
+        let sig = sign(&bare);
+        let resp = client()
+            .get(format!("{base}/{sig}/{bare}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "purged entry refetched");
+    }
+
+    #[tokio::test]
+    async fn default_ops_apply_in_presets_only_mode() {
+        let (src_host, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_defaults("filters:format(webp)", true).await;
+        // No operations in the URL at all: presets-only has
+        // nothing to reject, and the defaults still apply.
+        let bare = src_host.to_string();
+        let sig = sign(&bare);
+        let resp = client()
+            .get(format!("{base}/{sig}/{bare}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
     }
 
     #[tokio::test]
@@ -3140,6 +3290,7 @@ mod tests {
             preserve_metadata: false,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            default_ops: Vec::new(),
         };
         let job = ProcessJob {
             save_data: false,
