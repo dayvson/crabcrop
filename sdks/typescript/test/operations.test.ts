@@ -28,6 +28,7 @@ test("typed segments match the canonical spellings", () => {
     [ops.maxage(60), "maxage:60"],
     [ops.maxage(0), "maxage:0"],
     [ops.maxage(31536000), "maxage:31536000"],
+    [ops.debugFocal(), "debug:focal"],
   ];
   for (const [got, want] of cases) {
     assert.equal(got, want);

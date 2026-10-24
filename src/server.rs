@@ -712,6 +712,24 @@ async fn serve(
             record,
         );
     }
+    // The debug view (issue #164) is a diagnostic computed
+    // from this request's own processing: it bypasses the
+    // cache in both directions (the meta precedent) and is
+    // served no-store. Meta cannot describe it either: the
+    // bytes are a marked-up canvas, not the transform result
+    // the meta document reports on.
+    let debug = directives.debug_focal;
+    if meta && debug {
+        return (
+            (
+                StatusCode::BAD_REQUEST,
+                "meta is not available for debug output: debug:focal serves a diagnostic image, not a transform result"
+                    .to_string(),
+            )
+                .into_response(),
+            record,
+        );
+    }
     let key_base = crate::url::canonical_form(&ops, source_url);
     let mut cache_key = if directives.explicit_format.is_some() {
         key_base.clone()
@@ -738,9 +756,12 @@ async fn serve(
     // be served without touching the loader or the engine. Meta
     // requests bypass the cache in both directions: they must
     // never be answered with image bytes, and their JSON is never
-    // stored as an image entry.
+    // stored as an image entry. Debug requests bypass it too:
+    // the diagnostic must never be served from, or stored into,
+    // any tier (its key differs from the plain URL's anyway, but
+    // the bypass is the rule, not the key's accident).
     let mut cache_status = "crabcrop; fwd=uri-miss";
-    let hit = if meta {
+    let hit = if meta || debug {
         None
     } else {
         record.cache_looked_up = true;
@@ -753,7 +774,7 @@ async fn serve(
             cache_status = "crabcrop; hit";
             Some(h)
         }
-        None if meta => None,
+        None if meta || debug => None,
         None => match &state.store {
             Some(store) => {
                 let found = store.get(&cache_key);
@@ -770,7 +791,7 @@ async fn serve(
     // both local tiers so the next repeat is local.
     let hit = match hit {
         Some(h) => Some(h),
-        None if meta => None,
+        None if meta || debug => None,
         None => match &state.shared_store {
             Some(shared) => {
                 let found = shared.get(&cache_key).await;
@@ -973,8 +994,10 @@ async fn serve(
     // Meta responses are not image entries and are not cached.
     // Fallback responses are not cached either: the placeholder
     // must never be stored as if it were the real image, so the
-    // origin gets retried on the next request.
-    if !meta && !used_fallback {
+    // origin gets retried on the next request. Debug responses
+    // are not cached: the diagnostic is not the transform
+    // result its key would claim.
+    if !meta && !used_fallback && !debug {
         let entry = CachedImage {
             bytes: processed.bytes.clone(),
             format: processed.format,
@@ -1026,6 +1049,13 @@ async fn serve(
         // A fallback is a placeholder for a transient failure:
         // it must never be pinned downstream for the immutable
         // year (audit PL-2).
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
+    if debug {
+        // A diagnostic is computed for this request only: no
+        // downstream cache may pin it.
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
@@ -2257,6 +2287,85 @@ mod tests {
         assert_eq!(
             header(&third, "cache-control"),
             "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_focal_bypasses_the_cache_in_both_directions() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let plain = format!("crop:50x50:smart/{src}");
+        let debug = format!("debug:focal/crop:50x50:smart/{src}");
+        // Populate the cache with the plain result.
+        let first = get_signed(&base, &plain).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(header(&first, "cache-status"), "crabcrop; fwd=uri-miss");
+        let first_bytes = first.bytes().await.unwrap();
+        let second = get_signed(&base, &plain).await;
+        assert_eq!(header(&second, "cache-status"), "crabcrop; hit");
+        assert_eq!(second.bytes().await.unwrap(), first_bytes);
+        // The debug request is not served the cached entry:
+        // it computes the diagnostic (the 100x60 canvas the
+        // crop ran on, not the 50x50 result) and serves it
+        // no-store.
+        let dbg = get_signed(&base, &debug).await;
+        assert_eq!(dbg.status(), StatusCode::OK);
+        assert_eq!(header(&dbg, "cache-control"), "no-store");
+        assert_eq!(header(&dbg, "cache-status"), "crabcrop; fwd=uri-miss");
+        let dbg_bytes = dbg.bytes().await.unwrap();
+        assert_ne!(dbg_bytes, first_bytes);
+        let img = image::load_from_memory(&dbg_bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (100, 60));
+        // A repeat debug request recomputes the identical
+        // diagnostic; it was never stored, so still no hit.
+        let dbg2 = get_signed(&base, &debug).await;
+        assert_eq!(header(&dbg2, "cache-control"), "no-store");
+        assert_eq!(header(&dbg2, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(dbg2.bytes().await.unwrap(), dbg_bytes);
+        // The plain entry was never poisoned by the debug
+        // responses: still the true result, still a hit.
+        let third = get_signed(&base, &plain).await;
+        assert_eq!(header(&third, "cache-status"), "crabcrop; hit");
+        assert_eq!(third.bytes().await.unwrap(), first_bytes);
+    }
+
+    #[tokio::test]
+    async fn malformed_debug_is_a_bad_request() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // Signed properly over an unknown debug view:
+        // verification passes, parsing rejects it, and the
+        // 400 body is the parser's own message.
+        let remainder = format!("debug:banana/300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "invalid debug segment: debug:banana"
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_is_not_available_for_debug_output() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("debug:focal/crop:50x50:smart/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("meta is not available for debug output"),
+            "body: {body}"
         );
     }
 

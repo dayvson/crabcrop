@@ -239,6 +239,18 @@ export const ops = {
     return `maxage:${intIn("maxage seconds", seconds, 0, 31536000)}`;
   },
 
+  /**
+   * `debug:focal`; the smart-crop debug view. Place it
+   * before the crop it annotates: the response is a
+   * diagnostic image of the focal decision (focal point,
+   * focal rectangle, crop window drawn on the crop's
+   * canvas), never the transform result, and it is never
+   * cached (served with Cache-Control: no-store).
+   */
+  debugFocal(): string {
+    return "debug:focal";
+  },
+
   /** Join filter calls into one `filters:` segment. */
   filters(...calls: string[]): string {
     if (calls.length === 0) {

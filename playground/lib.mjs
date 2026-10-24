@@ -513,6 +513,22 @@ function explainSegment(seg, nowSeconds) {
           : `this response is served with Cache-Control max-age ${value} seconds instead of the default year; the stored image is unchanged`,
     };
   }
+  if (seg.startsWith("debug:")) {
+    const value = seg.slice(6);
+    if (value !== "focal") {
+      return {
+        kind: "debug",
+        title: "Debug view",
+        error: `unsupported debug view: ${seg} (want debug:focal; the server answers 400)`,
+      };
+    }
+    return {
+      kind: "debug",
+      title: "Debug view",
+      detail:
+        "the response is a diagnostic image instead of the transform result: the canvas the next crop operates on, with the chosen focal point (magenta crosshair), the focal rectangle when one is in play, detected face boxes (amber), and the crop window outline (blue); with no crop it shows the focal analysis of the final image; debug responses are never cached and are served with Cache-Control: no-store; animated sources and video formats are refused with 400",
+    };
+  }
   if (seg.startsWith("preset:")) {
     const name = seg.slice(7);
     if (!name) {

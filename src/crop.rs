@@ -27,6 +27,27 @@ pub fn crop_to_aspect(
     crop_to_aspect_with(img, target_w, target_h, align, None)
 }
 
+/// What a crop decided, reported by the `*_traced` crop
+/// entry points for the `debug:focal` view: the window the
+/// crop cut, and the focal point it positioned on (with the
+/// face boxes that produced that point) when the alignment
+/// has one. Directional alignments position by rule and
+/// report no focal point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CropTrace {
+    /// The cut window: (left, top, width, height) in source
+    /// pixels. A crop whose aspect already matches reports
+    /// the full frame.
+    pub window: (u32, u32, u32, u32),
+    /// The focal point the window was positioned on, as
+    /// fractions of the image dimensions.
+    pub focal: Option<crate::focus::FocalPoint>,
+    /// The detected faces that produced the focal point
+    /// (smart alignment with a face provider); empty
+    /// otherwise.
+    pub faces: Vec<crate::ai::FaceBox>,
+}
+
 /// [`crop_to_aspect`] with an optional face provider: when one
 /// is configured, smart alignment prefers detected faces over
 /// the saliency estimate.
@@ -37,23 +58,68 @@ pub fn crop_to_aspect_with(
     align: Align,
     faces: Option<&dyn crate::ai::FaceProvider>,
 ) -> DynamicImage {
+    crop_to_aspect_impl(img, target_w, target_h, align, faces, false).0
+}
+
+/// [`crop_to_aspect_with`], also reporting what the crop
+/// decided (see [`CropTrace`]). The window is positioned on
+/// the very focal value the trace reports: the trace is a
+/// by-product of the real decision, never a recomputation.
+/// The trace is `None` only when no crop ran at all (a zero
+/// target dimension).
+pub fn crop_to_aspect_traced(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    align: Align,
+    faces: Option<&dyn crate::ai::FaceProvider>,
+) -> (DynamicImage, Option<CropTrace>) {
+    crop_to_aspect_impl(img, target_w, target_h, align, faces, true)
+}
+
+fn crop_to_aspect_impl(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    align: Align,
+    faces: Option<&dyn crate::ai::FaceProvider>,
+    trace: bool,
+) -> (DynamicImage, Option<CropTrace>) {
     if target_w == 0 || target_h == 0 {
-        return img;
+        return (img, None);
     }
     let (w, h) = (img.width(), img.height());
     // Compare w/h with target_w/target_h via cross-multiplication.
     let src_ratio = w as u64 * target_h as u64;
     let dst_ratio = target_w as u64 * h as u64;
     if src_ratio == dst_ratio {
-        return img;
+        // No crop runs, so the plain path decides nothing
+        // (and runs no detection, exactly as before). The
+        // traced path still reports the focal analysis: a
+        // full-frame window positioned on the point.
+        let traced = trace.then(|| focal_for(align, &img, faces));
+        return (
+            img,
+            traced.map(|(point, face_boxes)| CropTrace {
+                window: (0, 0, w, h),
+                focal: point,
+                faces: face_boxes,
+            }),
+        );
     }
+    let (mut focal, mut face_boxes) = (None, Vec::new());
     let (x, y, cw, ch) = if src_ratio > dst_ratio {
         // Source is wider: crop the width.
         let cw = ((h as u64 * target_w as u64) / target_h as u64).max(1) as u32;
         let x = match align {
             Align::Left | Align::TopLeft | Align::BottomLeft => 0,
             Align::Right | Align::TopRight | Align::BottomRight => w.saturating_sub(cw),
-            Align::Smart => smart_start(&img, cw, w, true, faces),
+            Align::Smart => {
+                let (point, boxes) = crate::focus::focal_point_traced(&img, faces);
+                focal = Some(point);
+                face_boxes = boxes;
+                point_start(point.x, cw, w)
+            }
             _ => (w.saturating_sub(cw)) / 2,
         };
         (x, 0, cw, h)
@@ -63,13 +129,57 @@ pub fn crop_to_aspect_with(
         let y = match align {
             Align::Top | Align::TopLeft | Align::TopRight => 0,
             Align::Bottom | Align::BottomLeft | Align::BottomRight => h.saturating_sub(ch),
-            Align::Smart => smart_start(&img, ch, h, false, faces),
+            Align::Smart => {
+                let (point, boxes) = crate::focus::focal_point_traced(&img, faces);
+                focal = Some(point);
+                face_boxes = boxes;
+                point_start(point.y, ch, h)
+            }
             _ => (h.saturating_sub(ch)) / 2,
         };
         (0, y, w, ch)
     };
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
-    DynamicImage::ImageRgba8(cropped)
+    (
+        DynamicImage::ImageRgba8(cropped),
+        trace.then_some(CropTrace {
+            window: (x, y, cw, ch),
+            focal: if align == Align::Center {
+                Some(crate::focus::CENTER)
+            } else {
+                focal
+            },
+            faces: face_boxes,
+        }),
+    )
+}
+
+/// The focal point an alignment positions on, for the
+/// aspect-matched trace: `Smart` runs the face-plus-saliency
+/// estimate, `Center` is the image center by definition, and
+/// directional alignments have no point.
+fn focal_for(
+    align: Align,
+    img: &DynamicImage,
+    faces: Option<&dyn crate::ai::FaceProvider>,
+) -> (Option<crate::focus::FocalPoint>, Vec<crate::ai::FaceBox>) {
+    match align {
+        Align::Smart => {
+            let (point, boxes) = crate::focus::focal_point_traced(img, faces);
+            (Some(point), boxes)
+        }
+        Align::Center => (Some(crate::focus::CENTER), Vec::new()),
+        _ => (None, Vec::new()),
+    }
+}
+
+/// Window start along one axis for a window positioned on a
+/// focal coordinate: center the `window` span on the point,
+/// clamped so the window stays inside the image.
+fn point_start(frac: f32, window: u32, extent: u32) -> u32 {
+    let center = (frac * extent as f32).round() as i32;
+    let max_start = extent.saturating_sub(window) as i32;
+    (center - window as i32 / 2).clamp(0, max_start) as u32
 }
 
 /// Crop `img` to the `target_w:target_h` aspect ratio, positioned
@@ -86,15 +196,28 @@ pub fn crop_to_aspect_focal(
     target_h: u32,
     rect: (u32, u32, u32, u32),
 ) -> DynamicImage {
+    crop_to_aspect_focal_traced(img, target_w, target_h, rect).0
+}
+
+/// [`crop_to_aspect_focal`], also reporting the window it
+/// cut, as (left, top, width, height): `None` when no crop
+/// ran (a zero target), the full frame when the aspect
+/// already matched.
+pub fn crop_to_aspect_focal_traced(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    rect: (u32, u32, u32, u32),
+) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
     if target_w == 0 || target_h == 0 {
-        return img;
+        return (img, None);
     }
     let (w, h) = (img.width(), img.height());
     // Compare w/h with target_w/target_h via cross-multiplication.
     let src_ratio = w as u64 * target_h as u64;
     let dst_ratio = target_w as u64 * h as u64;
     if src_ratio == dst_ratio {
-        return img;
+        return (img, Some((0, 0, w, h)));
     }
     let (left, top, right, bottom) = rect;
     let (x, y, cw, ch) = if src_ratio > dst_ratio {
@@ -107,7 +230,7 @@ pub fn crop_to_aspect_focal(
         (0, focal_start(top, bottom, ch, h), w, ch)
     };
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
-    DynamicImage::ImageRgba8(cropped)
+    (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
 }
 
 /// Crop `img` to the `target_w:target_h` aspect around `face`:
@@ -125,8 +248,21 @@ pub fn crop_around_face(
     face: &crate::ai::FaceBox,
     padding: f32,
 ) -> DynamicImage {
+    crop_around_face_traced(img, target_w, target_h, face, padding).0
+}
+
+/// [`crop_around_face`], also reporting the window it cut,
+/// as (left, top, width, height): `None` when no crop ran
+/// (a zero target or an empty image).
+pub fn crop_around_face_traced(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    face: &crate::ai::FaceBox,
+    padding: f32,
+) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
     if target_w == 0 || target_h == 0 || img.width() == 0 || img.height() == 0 {
-        return img;
+        return (img, None);
     }
     let (w, h) = (img.width() as f64, img.height() as f64);
     let (tw, th) = (target_w as f64, target_h as f64);
@@ -154,7 +290,7 @@ pub fn crop_around_face(
     let x = (ox.round() as u32).min(img.width() - cw);
     let y = (oy.round() as u32).min(img.height() - ch);
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
-    DynamicImage::ImageRgba8(cropped)
+    (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
 }
 
 /// Window start along one axis for a focal rectangle spanning
@@ -174,23 +310,6 @@ fn focal_start(rect_start: u32, rect_end: u32, window: u32, extent: u32) -> u32 
         preferred.clamp(0, max_start)
     };
     start as u32
-}
-
-/// Window start along one axis for smart alignment: center the
-/// `window` span on the focal point's coordinate along that
-/// axis, clamped so the window stays inside the image.
-fn smart_start(
-    img: &DynamicImage,
-    window: u32,
-    extent: u32,
-    horizontal: bool,
-    faces: Option<&dyn crate::ai::FaceProvider>,
-) -> u32 {
-    let f = crate::focus::focal_point_with(img, faces);
-    let frac = if horizontal { f.x } else { f.y };
-    let center = (frac * extent as f32).round() as i32;
-    let max_start = extent.saturating_sub(window) as i32;
-    (center - window as i32 / 2).clamp(0, max_start) as u32
 }
 
 #[cfg(test)]
@@ -356,6 +475,49 @@ mod tests {
         let smart = crop_to_aspect(right_block(), 1, 1, Align::Smart);
         assert_eq!((smart.width(), smart.height()), (100, 100));
         assert!(has_pure_red(&smart));
+    }
+
+    #[test]
+    fn traced_crop_reports_the_window_it_cut() {
+        // The trace is a by-product of the real crop: same
+        // pixels out, and the window matches the crop.
+        let (out, trace) = crop_to_aspect_traced(vstripes(), 1, 1, Align::Center, None);
+        let plain = crop_to_aspect(vstripes(), 1, 1, Align::Center);
+        assert_eq!(out.to_rgb8(), plain.to_rgb8());
+        let trace = trace.unwrap();
+        assert_eq!(trace.window, (20, 0, 60, 60));
+        assert_eq!(trace.focal, Some(crate::focus::CENTER));
+        assert!(trace.faces.is_empty());
+        // A directional alignment reports no focal point.
+        let (_, trace) = crop_to_aspect_traced(vstripes(), 1, 1, Align::Left, None);
+        let trace = trace.unwrap();
+        assert_eq!(trace.window, (0, 0, 60, 60));
+        assert_eq!(trace.focal, None);
+        // A zero target runs no crop and traces nothing.
+        let (_, trace) = crop_to_aspect_traced(vstripes(), 0, 0, Align::Center, None);
+        assert!(trace.is_none());
+    }
+
+    #[test]
+    fn traced_smart_crop_window_covers_the_reported_point() {
+        let (_, trace) = crop_to_aspect_traced(right_block(), 1, 1, Align::Smart, None);
+        let trace = trace.unwrap();
+        let point = trace.focal.unwrap();
+        let px = (point.x * 200.0).round() as u32;
+        let (x, _, cw, _) = trace.window;
+        assert!(
+            x <= px && px < x + cw,
+            "window {x}..{} vs point {px}",
+            x + cw
+        );
+    }
+
+    #[test]
+    fn traced_focal_and_face_crops_report_their_windows() {
+        let (_, window) = crop_to_aspect_focal_traced(vstripes(), 1, 1, (80, 10, 100, 50));
+        assert_eq!(window, Some((40, 0, 60, 60)));
+        let (_, window) = crop_around_face_traced(face_canvas(), 1, 1, &face(300, 20, 60, 60), 0.5);
+        assert_eq!(window, Some((270, 0, 120, 120)));
     }
 
     #[test]

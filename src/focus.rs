@@ -30,17 +30,34 @@ const MAX_DIM: u32 = 128;
 /// the crop should land on faces, and saliency is the fallback
 /// for everything else (no provider, no faces, or a detection
 /// failure, which never fails the request it enhances).
+/// The composed form is kept for tests and callers that do
+/// not need the trace; the engine consumes
+/// [`focal_point_traced`].
+#[allow(dead_code)]
 pub fn focal_point_with(
     img: &DynamicImage,
     faces: Option<&dyn crate::ai::FaceProvider>,
 ) -> FocalPoint {
+    focal_point_traced(img, faces).0
+}
+
+/// [`focal_point_with`], also returning the face boxes that
+/// produced the point (empty when the point came from the
+/// saliency estimate): the `debug:focal` view draws what fed
+/// the decision, so the traced form is the one it consumes.
+/// Detection itself happens exactly as in [`focal_point_with`]:
+/// one provider call, faces first, saliency otherwise.
+pub fn focal_point_traced(
+    img: &DynamicImage,
+    faces: Option<&dyn crate::ai::FaceProvider>,
+) -> (FocalPoint, Vec<crate::ai::FaceBox>) {
     if let Some(provider) = faces
         && let Ok(found) = provider.detect(img)
         && let Some(point) = face_focal_point(img, &found)
     {
-        return point;
+        return (point, found);
     }
-    focal_point(img)
+    (focal_point(img), Vec::new())
 }
 
 /// The area-weighted centroid of the detected faces' centers:
@@ -190,6 +207,22 @@ mod tests {
         let img = block_at(70, 40);
         let p = focal_point_with(&img, Some(&FixedFace));
         assert!(p.x < 0.2 && p.y < 0.2, "got {p:?}");
+    }
+
+    #[test]
+    fn traced_reports_the_faces_that_fed_the_point() {
+        let img = block_at(70, 40);
+        let (point, boxes) = focal_point_traced(&img, Some(&FixedFace));
+        assert_eq!(point, focal_point_with(&img, Some(&FixedFace)));
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(
+            (boxes[0].x, boxes[0].y, boxes[0].w, boxes[0].h),
+            (0, 0, 20, 20)
+        );
+        // Saliency-fed points trace no boxes.
+        let (point, boxes) = focal_point_traced(&img, Some(&NoFaces));
+        assert_eq!(point, focal_point(&img));
+        assert!(boxes.is_empty());
     }
 
     #[test]
