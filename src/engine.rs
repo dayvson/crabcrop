@@ -181,6 +181,11 @@ pub enum EngineError {
     /// (issue #148): the server maps BadOutput to 502 and
     /// the rest to 500.
     Inference(crate::ai::AiError),
+    /// The external video encoder failed (issue #162):
+    /// spawn failure, non-zero exit, timeout, output past
+    /// the cap, or no output. The server maps it to 502:
+    /// the URL was fine, the operator's encoder was not.
+    Video(String),
     /// A text overlay could not be rendered. Carries the cause.
     Render(String),
 }
@@ -202,6 +207,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::Inference(cause) => {
                 write!(f, "AI inference failed: {cause}")
+            }
+            EngineError::Video(cause) => {
+                write!(f, "video encoder failed: {cause}")
             }
             EngineError::Render(cause) => {
                 write!(f, "cannot render text overlay: {cause}")
@@ -235,6 +243,9 @@ pub struct ProcessContext<'a> {
     pub detect_provider: Option<&'a dyn crate::ai::DetectionProvider>,
     /// Text renderer, when a font is configured.
     pub text_renderer: Option<&'a dyn crate::text::TextRenderer>,
+    /// Video encoder, when the deployment configured an
+    /// external encoder program (`CRABCROP_VIDEO_ENCODER`).
+    pub video_encoder: Option<&'a crate::video::VideoEncoder>,
     /// DPR fallback from the request's client hint, used when
     /// the URL carries no explicit `dpr` directive.
     pub dpr: Option<f32>,
@@ -274,6 +285,7 @@ impl Default for ProcessContext<'_> {
             face_provider: None,
             detect_provider: None,
             text_renderer: None,
+            video_encoder: None,
             dpr: None,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             save_data: false,
@@ -382,6 +394,21 @@ impl Engine {
                 "upscale is not configured on this server".to_string(),
             ));
         }
+        // Video output is validated like the AI features:
+        // before any real work, and distinctly. The URL is
+        // fine but the deployment cannot do it (no encoder
+        // configured), so this is NotConfigured (501), never
+        // a silent fallback to an animated image format.
+        if matches!(
+            directives.explicit_format.or(ctx.preferred),
+            Some(ImageFormat::Mp4 | ImageFormat::WebM)
+        ) && ctx.video_encoder.is_none()
+        {
+            return Err(EngineError::NotConfigured(
+                "video output is not configured on this server (no CRABCROP_VIDEO_ENCODER)"
+                    .to_string(),
+            ));
+        }
         if directives.text && ctx.text_renderer.is_none() {
             return Err(EngineError::NotConfigured(
                 "text is not configured on this server (no font)".to_string(),
@@ -445,6 +472,9 @@ impl Engine {
             if frames.len() > 1 && resolved == ImageFormat::Gif {
                 return self.process_animated(frames, ops, &ctx, ImageFormat::Gif, None);
             }
+            if frames.len() > 1 && resolved.is_video() {
+                return self.process_video(frames, ops, &ctx, resolved);
+            }
             DynamicImage::ImageRgba8(
                 frames
                     .into_iter()
@@ -477,6 +507,9 @@ impl Engine {
             }
             if frames.len() > 1 && matches!(resolved, ImageFormat::WebP | ImageFormat::Gif) {
                 return self.process_animated(frames, ops, &ctx, resolved, Some(loop_count));
+            }
+            if frames.len() > 1 && resolved.is_video() {
+                return self.process_video(frames, ops, &ctx, resolved);
             }
             DynamicImage::ImageRgba8(
                 frames
@@ -546,6 +579,18 @@ impl Engine {
             format = f;
         } else if let Some(p) = ctx.preferred {
             format = p;
+        }
+        // A video format that reaches the still pipeline is
+        // a still source asking for video: animated sources
+        // returned through `process_video` above. There is
+        // no first-frame fallback: the request named a video
+        // and this source cannot become one.
+        if format.is_video() {
+            return Err(EngineError::Unsupported(format!(
+                "format({}) encodes video and needs an animated source \
+                 (an animated GIF or WebP); this source is a still image",
+                crate::url::format_text(format)
+            )));
         }
         // Resolve the quality directive against the final image.
         // `quality(auto)` is reported back: it is the one the caller
@@ -764,6 +809,82 @@ impl Engine {
             quality: None,
             width,
             height,
+            source_width,
+            source_height,
+            placeholder,
+            ssimulacra2: None,
+        })
+    }
+
+    /// Process an animated source (GIF or WebP) into a
+    /// video (issue #162): every frame runs the same
+    /// operations as the animated image paths, then the
+    /// operator-configured external encoder turns the frames
+    /// into MP4 or WebM under the pipe contract in
+    /// [`crate::video`]. Frame delays travel with the
+    /// frames; the encoder side turns them into a constant
+    /// frame rate (see `frame_schedule`). The reported
+    /// dimensions are the encoder's: odd dimensions pad up
+    /// to even for 4:2:0.
+    fn process_video(
+        &self,
+        frames: Vec<image::Frame>,
+        ops: &[Operation],
+        ctx: &ProcessContext<'_>,
+        format: ImageFormat,
+    ) -> Result<ProcessedImage, EngineError> {
+        let encoder = ctx.video_encoder.ok_or_else(|| {
+            EngineError::NotConfigured(
+                "video output is not configured on this server (no CRABCROP_VIDEO_ENCODER)"
+                    .to_string(),
+            )
+        })?;
+        let directives = crate::url::RequestDirectives::analyze(ops);
+        let (source_width, source_height) = {
+            let b = frames[0].buffer();
+            (b.width(), b.height())
+        };
+        let first = frames[0].buffer();
+        let cap = if directives.no_upscale {
+            Some((first.width(), first.height()))
+        } else {
+            None
+        };
+        let dpr = dpr_factor(directives.dpr, ctx);
+        let mut out_frames = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
+            let img = DynamicImage::ImageRgba8(frame.into_buffer());
+            let (img, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            out_frames.push(crate::video::VideoFrame {
+                pixels: img.to_rgba8(),
+                delay_ms,
+            });
+        }
+        // The placeholder (a meta-only surface; meta itself
+        // refuses video URLs in the server) describes the
+        // first processed frame, as the animated paths do.
+        let placeholder = if ctx.placeholders {
+            out_frames
+                .first()
+                .map(|f| crate::placeholder::compute(&DynamicImage::ImageRgba8(f.pixels.clone())))
+        } else {
+            None
+        };
+        let bytes = encoder.encode(&out_frames, format).map_err(|e| match e {
+            crate::video::VideoError::Unsupported(what) => EngineError::Unsupported(what),
+            crate::video::VideoError::Failed(what) => EngineError::Video(what),
+        })?;
+        let (width, height) = out_frames
+            .first()
+            .map(|f| (f.pixels.width(), f.pixels.height()))
+            .unwrap_or((source_width, source_height));
+        Ok(ProcessedImage {
+            bytes,
+            format,
+            quality: None,
+            width: crate::video::padded_dimension(width),
+            height: crate::video::padded_dimension(height),
             source_width,
             source_height,
             placeholder,
@@ -1581,6 +1702,9 @@ fn encode(
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
+        ImageFormat::Mp4 | ImageFormat::WebM => {
+            unreachable!("video formats are encoded by process_video, never here")
+        }
     }
     Ok(buf)
 }
@@ -3697,6 +3821,167 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Jxl);
+    }
+
+    /// A fake video encoder for the video tests: drains
+    /// stdin and answers with the script's canned behavior.
+    fn video_test_encoder(script: &str) -> crate::video::VideoEncoder {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("crabcrop-engine-video-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("encoder.sh");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
+            .unwrap()
+    }
+
+    const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDEO'\n";
+
+    #[test]
+    fn animated_gif_to_mp4_uses_the_configured_encoder() {
+        let engine = Engine;
+        let src = animated_gif_bytes();
+        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)])],
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Mp4);
+        assert_eq!(out.bytes, b"ENGINE-VIDEO");
+        assert_eq!((out.width, out.height), (40, 20));
+        assert_eq!((out.source_width, out.source_height), (40, 20));
+    }
+
+    #[test]
+    fn animated_webp_to_webm_uses_the_configured_encoder() {
+        let engine = Engine;
+        let src = animated_webp_bytes();
+        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::WebM)])],
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebM);
+        assert_eq!(out.bytes, b"ENGINE-VIDEO");
+    }
+
+    #[test]
+    fn video_output_runs_the_operations_per_frame() {
+        let engine = Engine;
+        let src = animated_gif_bytes();
+        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let out = engine
+            .process_preferred(
+                &src,
+                &[
+                    size_op(Dimension::Pixels(20), Dimension::Pixels(10)),
+                    Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)]),
+                ],
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Mp4);
+        assert_eq!((out.width, out.height), (20, 10));
+        assert_eq!((out.source_width, out.source_height), (40, 20));
+    }
+
+    #[test]
+    fn video_format_on_a_still_source_is_a_specific_error() {
+        let engine = Engine;
+        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let ctx = ProcessContext {
+            video_encoder: Some(&encoder),
+            ..Default::default()
+        };
+        // A still PNG, and a single-frame GIF: both stills,
+        // both refused with the animated-source error, and
+        // neither falls back to a first-frame image.
+        let stills = [
+            png_bytes(&DynamicImage::new_rgb8(20, 12)),
+            gif_bytes(&DynamicImage::new_rgb8(20, 12)),
+        ];
+        for src in stills {
+            let err = engine
+                .process_preferred(
+                    &src,
+                    &[Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)])],
+                    ctx.clone(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+            assert!(err.to_string().contains("animated source"), "{err}");
+            assert!(err.to_string().contains("still image"), "{err}");
+        }
+    }
+
+    #[test]
+    fn video_format_without_an_encoder_is_not_configured() {
+        let engine = Engine;
+        // Animated source: the deployment cannot do it.
+        let err = engine
+            .process(
+                &animated_gif_bytes(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)])],
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+        assert!(err.to_string().contains("CRABCROP_VIDEO_ENCODER"), "{err}");
+        // Still source, same answer: the not-configured
+        // preflight runs before the still check, so an
+        // unconfigured server never blames the source.
+        let err = engine
+            .process(
+                &png_bytes(&DynamicImage::new_rgb8(20, 12)),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::WebM)])],
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_failing_encoder_is_a_video_error() {
+        let engine = Engine;
+        let encoder =
+            video_test_encoder("#!/bin/sh\ncat > /dev/null\necho 'no codec' >&2\nexit 3\n");
+        let err = engine
+            .process_preferred(
+                &animated_gif_bytes(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)])],
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Video(_)), "{err:?}");
+        assert!(err.to_string().contains("video encoder failed"), "{err}");
+        assert!(err.to_string().contains("no codec"), "{err}");
     }
 
     /// Three 40x20 frames: red, green, blue, with delays of

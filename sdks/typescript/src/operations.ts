@@ -13,7 +13,7 @@
  */
 
 /** Output formats the `format(...)` filter accepts. */
-export type ImageFormat = "jpeg" | "jpg" | "png" | "webp" | "jxl" | "avif" | "gif";
+export type ImageFormat = "jpeg" | "jpg" | "png" | "webp" | "jxl" | "avif" | "gif" | "mp4" | "webm";
 
 /** Crop alignments; `center` is the bare `crop:WxH` spelling. */
 export type CropAlign = "center" | "smart" | "face" | "top" | "bottom" | "left" | "right" | "top-left" | "top-right" | "bottom-left" | "bottom-right";
@@ -157,7 +157,7 @@ const ANCHORS: readonly string[] = [
 ];
 const BLEND_MODES: readonly string[] = ["normal", "multiply", "screen", "overlay"];
 const CURVE_CHANNELS: readonly string[] = ["rgb", "r", "g", "b"];
-const IMAGE_FORMATS: readonly string[] = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif"];
+const IMAGE_FORMATS: readonly string[] = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"];
 
 /** Operation segments, one typed call per segment kind. */
 export const ops = {

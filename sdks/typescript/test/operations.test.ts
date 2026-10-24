@@ -114,6 +114,8 @@ test("typed filters match the canonical spellings", () => {
     [filter.quality(1), "quality(1)"],
     [filter.quality("auto"), "quality(auto)"],
     [filter.format("webp"), "format(webp)"],
+    [filter.format("mp4"), "format(mp4)"],
+    [filter.format("webm"), "format(webm)"],
     [filter.fill("FF8800"), "fill(ff8800)"],
     [filter.facePad(0.25), "facepad(0.25)"],
     [filter.upscale(2), "upscale(2)"],

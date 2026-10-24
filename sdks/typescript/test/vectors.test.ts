@@ -156,6 +156,9 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:blurclass(per%24on)/" + SRC, true, SRC],
     ["filters:pixelateclass/" + SRC, true, SRC],
     ["filters:keep_profile/" + SRC, false, SRC],
+    ["filters:format(mp4)/" + SRC, false, SRC],
+    ["filters:format(webm)/" + SRC, false, SRC],
+    ["filters:format(mov)/" + SRC, true, SRC],
     // AP-23 parity cases: each verdict below is the Rust
     // parser's, verified against src/url.rs.
     ["crop-rect:50x50:0x0/" + SRC, true, SRC],

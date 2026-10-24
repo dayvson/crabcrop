@@ -110,6 +110,17 @@ pub struct AppState {
     /// request's operations before analysis, processing, and
     /// cache keying.
     pub default_ops: Vec<crate::url::Operation>,
+    /// External video encoder (issue #162), validated at
+    /// boot when `CRABCROP_VIDEO_ENCODER` is configured.
+    /// `None` means video output does not exist on this
+    /// server; `format(mp4)` and `format(webm)` then fail
+    /// with the specific not-configured error.
+    pub video_encoder: Option<Arc<crate::video::VideoEncoder>>,
+    /// Bounds concurrent video encodes: the subprocess is
+    /// the server's most expensive and least predictable
+    /// work, so it gets its own small gate (2 permits, like
+    /// the AI gate) on top of the process gate.
+    pub video_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// Build the router.
@@ -459,6 +470,7 @@ struct ProcessJob {
     face_provider: Option<Arc<dyn crate::ai::FaceProvider>>,
     detect_provider: Option<Arc<dyn crate::ai::DetectionProvider>>,
     text_renderer: Option<Arc<dyn crate::text::TextRenderer>>,
+    video_encoder: Option<Arc<crate::video::VideoEncoder>>,
     dpr: Option<f32>,
     ssim_target: f64,
     avif_speed: u8,
@@ -485,6 +497,13 @@ const PROCESS_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5)
 /// How long an AI-backed request may wait for an inference
 /// slot before the server sheds it with a 503 (audit PL-14).
 const AI_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a video request may wait for an encode slot
+/// before the server sheds it with a 503. Encodes run for
+/// seconds behind a 2-permit gate; the wait is the AI
+/// gate's, and a shed request can retry into a drained
+/// queue.
+const VIDEO_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run the engine under the process gate on a blocking
 /// thread, so CPU-bound work neither stalls the async
@@ -517,6 +536,7 @@ async fn run_process(
             upscale_provider: job.upscale_provider.as_deref(),
             face_provider: job.face_provider.as_deref(),
             detect_provider: job.detect_provider.as_deref(),
+            video_encoder: job.video_encoder.as_deref(),
             save_data: job.save_data,
             preserve_metadata: job.preserve_metadata,
             text_renderer: job.text_renderer.as_deref(),
@@ -675,6 +695,23 @@ async fn serve(
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);
     let placeholders = meta && wants_placeholders(accept);
+    let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
+    // Meta describes an image; a video result is not one.
+    // Refuse specifically rather than describing encoded
+    // video bytes as if they were a still image.
+    if meta && wants_video {
+        return (
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "meta is not available for video output: format({}) serves encoded video, not an image",
+                    crate::url::format_text(directives.explicit_format.unwrap())
+                ),
+            )
+                .into_response(),
+            record,
+        );
+    }
     let key_base = crate::url::canonical_form(&ops, source_url);
     let mut cache_key = if directives.explicit_format.is_some() {
         key_base.clone()
@@ -834,6 +871,26 @@ async fn serve(
     } else {
         None
     };
+    // Video encodes sit behind their own gate, on top of
+    // the process gate inside `run_process`: the external
+    // encoder is the server's most expensive and least
+    // predictable work (seconds per job, a subprocess), so
+    // a burst of video requests sheds here instead of
+    // queueing unboundedly behind the transform pipeline.
+    let _video_permit = if wants_video {
+        match tokio::time::timeout(VIDEO_GATE_WAIT, state.video_gate.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => Some(permit),
+            _ => {
+                return (
+                    busy_response("server busy: video encoding queue is full", 5),
+                    record,
+                );
+            }
+        }
+    } else {
+        None
+    };
     // A width hint applies only when the URL sizes nothing
     // itself: it synthesizes the width-only size op a client
     // URL would have carried, ahead of the URL's own ops.
@@ -862,6 +919,7 @@ async fn serve(
         face_provider: state.face.clone(),
         detect_provider: state.detect.clone(),
         text_renderer: state.font.clone(),
+        video_encoder: state.video_encoder.clone(),
         dpr: dpr_hint,
         ssim_target: state.ssim_target,
         avif_speed: state.avif_speed,
@@ -1116,6 +1174,8 @@ fn format_name(format: ImageFormat) -> &'static str {
         ImageFormat::Jxl => "jxl",
         ImageFormat::Avif => "avif",
         ImageFormat::Gif => "gif",
+        ImageFormat::Mp4 => "mp4",
+        ImageFormat::WebM => "webm",
     }
 }
 
@@ -1341,6 +1401,8 @@ fn respond(
         ImageFormat::Jxl => "image/jxl",
         ImageFormat::Gif => "image/gif",
         ImageFormat::Avif => "image/avif",
+        ImageFormat::Mp4 => "video/mp4",
+        ImageFormat::WebM => "video/webm",
     };
     let cache_control = match max_age {
         None => "public, max-age=31536000, immutable".to_string(),
@@ -1453,6 +1515,14 @@ fn engine_error_response(e: EngineError) -> Response {
         EngineError::Render(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "image rendering failed".to_string(),
+        ),
+        // The encoder is the operator's own program: its
+        // failure is an upstream fault (502), and the body
+        // names it (including its truncated stderr) because
+        // the operator is the one who can fix it.
+        EngineError::Video(cause) => (
+            StatusCode::BAD_GATEWAY,
+            format!("video encoder failed: {cause}"),
         ),
     };
     (status, message).into_response()
@@ -1581,6 +1651,8 @@ mod tests {
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1588,6 +1660,182 @@ mod tests {
             axum::serve(listener, app(state)).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// Two-frame animated GIF bytes for the video tests.
+    fn animated_gif_bytes() -> Vec<u8> {
+        let delay = image::Delay::from_numer_denom_ms(100, 1);
+        let frames = vec![
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255])),
+                0,
+                0,
+                delay,
+            ),
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 0, 255, 255])),
+                0,
+                0,
+                delay,
+            ),
+        ];
+        let mut out = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut out)
+            .encode_frames(frames)
+            .unwrap();
+        out
+    }
+
+    /// An app with a fake video encoder configured (issue
+    /// #162): the script drains stdin and answers with its
+    /// canned behavior, so the whole video path runs without
+    /// a real encoder.
+    async fn spawn_app_with_video(script: &str) -> String {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("crabcrop-server-video-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("encoder.sh");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let encoder = crate::video::VideoEncoder::new(
+            path,
+            std::time::Duration::from_secs(30),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            detect: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: Some(Arc::new(encoder)),
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn serves_video_from_an_animated_source_and_caches_it() {
+        let src = spawn_bytes_server(animated_gif_bytes()).await;
+        let base =
+            spawn_app_with_video("#!/bin/sh\ncat > /dev/null\nprintf 'SERVER-VIDEO'\n").await;
+        let remainder = format!("filters:format(mp4)/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let first = client().get(&url).send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(header(&first, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(first.bytes().await.unwrap().as_ref(), b"SERVER-VIDEO");
+        // The repeat is the same stored video: the encoder
+        // runs once per unique URL, like every other
+        // expensive transform.
+        let second = client().get(&url).send().await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(header(&second, "cache-status"), "crabcrop; hit");
+        assert_eq!(second.bytes().await.unwrap().as_ref(), b"SERVER-VIDEO");
+    }
+
+    #[tokio::test]
+    async fn video_requests_fail_specifically() {
+        let gif = spawn_bytes_server(animated_gif_bytes()).await;
+        let png = spawn_image_server().await;
+        // Unconfigured server: 501 naming the configuration,
+        // never a silent fallback to the animated GIF.
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(mp4)/{gif}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("video output is not configured"), "{body}");
+        // Configured server, still source: 400 naming the
+        // animated-source requirement.
+        let base = spawn_app_with_video("#!/bin/sh\ncat > /dev/null\nprintf 'V'\n").await;
+        let remainder = format!("filters:format(webm)/{png}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("animated source"), "{body}");
+        // Meta on a video URL: refused specifically rather
+        // than describing video bytes as an image.
+        let remainder = format!("filters:format(mp4)/{gif}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("meta is not available for video output"),
+            "{body}"
+        );
+        // A failing encoder: 502 naming the encoder and its
+        // own error output.
+        let base =
+            spawn_app_with_video("#!/bin/sh\ncat > /dev/null\necho 'broken encoder' >&2\nexit 1\n")
+                .await;
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("video encoder failed"), "{body}");
+        assert!(body.contains("broken encoder"), "{body}");
     }
 
     /// An app with server-wide default operations (issue
@@ -1622,6 +1870,8 @@ mod tests {
             only_presets,
             default_ops: crate::url::parse_default_ops(defaults, &std::collections::HashMap::new())
                 .unwrap(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1665,6 +1915,8 @@ mod tests {
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1712,6 +1964,8 @@ mod tests {
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2161,6 +2415,8 @@ mod tests {
             presets,
             only_presets,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2462,6 +2718,8 @@ mod tests {
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2630,6 +2888,8 @@ mod tests {
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2675,6 +2935,8 @@ mod tests {
             presets,
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3265,6 +3527,8 @@ mod tests {
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3311,6 +3575,8 @@ mod tests {
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3654,6 +3920,8 @@ mod tests {
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let job = ProcessJob {
             save_data: false,
@@ -3667,6 +3935,7 @@ mod tests {
             face_provider: None,
             detect_provider: None,
             text_renderer: None,
+            video_encoder: None,
             dpr: None,
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,

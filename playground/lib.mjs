@@ -186,7 +186,7 @@ const NO_ARG_FILTERS = new Set([
   "blurfaces",
   "pixelatefaces",
 ]);
-const FORMAT_NAMES = new Set(["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif"]);
+const FORMAT_NAMES = new Set(["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"]);
 const ANCHOR_NAMES = new Set([
   "top-left",
   "top-center",

@@ -52,5 +52,17 @@
     "secret": "s3cr3t",
     "remainder": "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)/https://example.com/photo.jpg",
     "signature": "8002b5a43eeef37c6a89d2b6a6499db9e8d3773d8778c2f5e72fee8dba4f7c5f"
+  },
+  {
+    "description": "Video output (MP4)",
+    "secret": "s3cr3t",
+    "remainder": "filters:format(mp4)/https://example.com/photo.gif",
+    "signature": "97b27f0fe291acea2f148538a8e9c75c07de26cefaa7c0d58f12cd64a200ed3e"
+  },
+  {
+    "description": "Video output (WebM)",
+    "secret": "s3cr3t",
+    "remainder": "filters:format(webm)/https://example.com/photo.webp",
+    "signature": "b020df4afd3d889e0c80a8e919a3ebe3b689797aef3b8904e1c434ed50a99733"
   }
 ]

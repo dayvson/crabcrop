@@ -264,7 +264,10 @@ impl Anchor {
     }
 }
 
-/// Output image format requested by a `format(...)` filter.
+/// Output format requested by a `format(...)` filter.
+/// Mostly image formats; `Mp4` and `WebM` are video outputs
+/// (issue #162), produced from animated sources by the
+/// operator-configured external encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
     Jpeg,
@@ -273,6 +276,17 @@ pub enum ImageFormat {
     Jxl,
     Avif,
     Gif,
+    Mp4,
+    WebM,
+}
+
+impl ImageFormat {
+    /// Whether this format is a video output (`mp4`,
+    /// `webm`): animated sources only, an external encoder,
+    /// and no `Accept` negotiation.
+    pub fn is_video(self) -> bool {
+        matches!(self, ImageFormat::Mp4 | ImageFormat::WebM)
+    }
 }
 
 /// Encoding quality from a `quality(...)` filter.
@@ -825,6 +839,8 @@ fn parse_format(s: &str) -> Option<ImageFormat> {
         "jxl" => Some(ImageFormat::Jxl),
         "avif" => Some(ImageFormat::Avif),
         "gif" => Some(ImageFormat::Gif),
+        "mp4" => Some(ImageFormat::Mp4),
+        "webm" => Some(ImageFormat::WebM),
         _ => None,
     }
 }
@@ -1844,7 +1860,7 @@ fn anchor_text(anchor: Anchor) -> &'static str {
     }
 }
 
-fn format_text(format: ImageFormat) -> &'static str {
+pub(crate) fn format_text(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Jpeg => "jpeg",
         ImageFormat::Png => "png",
@@ -1852,6 +1868,8 @@ fn format_text(format: ImageFormat) -> &'static str {
         ImageFormat::Gif => "gif",
         ImageFormat::Avif => "avif",
         ImageFormat::Jxl => "jxl",
+        ImageFormat::Mp4 => "mp4",
+        ImageFormat::WebM => "webm",
     }
 }
 
@@ -3292,6 +3310,23 @@ mod tests {
             ops,
             vec![Operation::Filters(vec![Filter::Format(ImageFormat::Avif)])]
         );
+    }
+
+    #[test]
+    fn parses_video_formats() {
+        for (spelling, format) in [("mp4", ImageFormat::Mp4), ("webm", ImageFormat::WebM)] {
+            let (ops, _) =
+                parse_operations(&format!("filters:format({spelling})/example.com/img.gif"))
+                    .unwrap();
+            assert_eq!(ops, vec![Operation::Filters(vec![Filter::Format(format)])]);
+            assert!(format.is_video());
+            // The canonical form spells them back unchanged.
+            assert_eq!(
+                canonical_form(&ops, "example.com/img.gif"),
+                format!("filters:format({spelling})/example.com/img.gif")
+            );
+        }
+        assert!(!ImageFormat::Gif.is_video());
     }
 
     #[test]
