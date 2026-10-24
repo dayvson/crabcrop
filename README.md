@@ -74,6 +74,20 @@ Add an `exp:<unix-seconds>` segment anywhere among the operations to make a sign
 
 The segment is inside the signed remainder, so the HMAC covers it: extending the expiry without the secret breaks the signature. Past the expiry the request gets `403` with the body `signature expired`, and expired URLs never serve from the cache. The comparison is exact: the URL is valid strictly before its `exp` second, with no built-in allowance for clock skew. Keep the server's clock synchronized (NTP), and mint expiries with whatever margin your own clock situation needs. URLs without `exp` never expire, exactly as before.
 
+### Per-request cache lifetime
+
+Image responses are cached by clients and CDNs for a year: `Cache-Control: public, max-age=31536000, immutable`, because a signed URL's bytes never change. When one response should live shorter, add a `maxage:<seconds>` segment anywhere among the operations:
+
+```text
+/<signature>/maxage:60/300x200/https://example.com/photo.jpg
+```
+
+The value runs from 0 to 31536000. The response to that request carries `Cache-Control: public, max-age=60, immutable` instead of the year; every other response is unchanged. `maxage:0` answers `Cache-Control: public, max-age=0` with no `immutable`: the response is stale on arrival, so caches must revalidate before reusing it.
+
+The directive changes the response header only. It never enters the cache key, so URLs that differ only in `maxage` share one stored image, and purging is unaffected. The shared result cache (S3) stores bodies, not headers, so the per-response header composes there too: each request's lifetime is applied as its response is built, wherever the body came from.
+
+Like `exp`, the segment sits inside the signed remainder and repeated segments resolve to the last one. A malformed or out-of-range value is a `400`, never a silent fallback to the default. Presets stay immutable by default; putting `maxage` on a preset URL is the caller's explicit choice for that response, and preset definitions cannot contain it (it is per-request metadata, like `exp`).
+
 ### Source images
 
 The loader fetches the source under fixed limits, for every source kind:

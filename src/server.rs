@@ -313,7 +313,7 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         crate::url::canonical_key_form(target)
     } else {
         match parse_operations_with_expiry(target) {
-            Ok((ops, source, _)) => {
+            Ok((ops, source, _, _)) => {
                 let merged = crate::url::merge_default_ops(&state.default_ops, ops);
                 crate::url::canonical_form(&merged, source)
             }
@@ -604,7 +604,7 @@ async fn serve(
             }
         }
     };
-    let (ops, source_url, expiry) = match parse_operations_with_expiry(rest) {
+    let (ops, source_url, expiry, max_age) = match parse_operations_with_expiry(rest) {
         Ok(v) => v,
         Err(e) => {
             return (parse_failure(&e, accept), record);
@@ -670,7 +670,8 @@ async fn serve(
     // The key is the request's canonical form (Q1): the
     // parsed operations re-serialized in their one
     // spelling, so equivalent requests share an entry.
-    // Expiry is not an operation, so it never enters it.
+    // Expiry and the cache lifetime are not operations,
+    // so neither ever enters it.
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);
     let placeholders = meta && wants_placeholders(accept);
@@ -751,7 +752,7 @@ async fn serve(
     if let Some(hit) = hit {
         record.cache_hit = true;
         record.bytes_out = hit.bytes.len();
-        let mut response = respond(hit.format, hit.quality, hit.bytes);
+        let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
         attach_cache_headers(&mut response, cache_status, &groups);
         return (response, record);
     }
@@ -949,7 +950,12 @@ async fn serve(
     let mut response = if meta {
         meta_response(&processed, annotation.as_ref(), detections.as_deref())
     } else {
-        respond(processed.format, processed.quality, processed.bytes)
+        respond(
+            processed.format,
+            processed.quality,
+            processed.bytes,
+            max_age,
+        )
     };
     if !meta {
         attach_cache_headers(&mut response, cache_status, &groups);
@@ -1310,9 +1316,24 @@ fn meta_response(
     (StatusCode::OK, headers, body).into_response()
 }
 
-/// Build a successful image response: content type, immutable cache
+/// Build a successful image response: content type, cache
 /// headers, and the auto-quality header when quality was chosen.
-fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response {
+///
+/// The cache lifetime is the immutable year unless the request
+/// carried a `maxage:` directive (issue #159), which substitutes
+/// its own value for that response only: the stored entry is
+/// shared, headers are composed per response. `immutable` rides
+/// along at any positive value (during the lifetime the body
+/// will not change, so no revalidation is owed); at `max-age=0`
+/// it is dropped, because a response that is stale on arrival
+/// cannot also promise to never change, and the pair would tell
+/// caches to pin what the caller just asked them to revalidate.
+fn respond(
+    format: ImageFormat,
+    quality: Option<u8>,
+    bytes: Vec<u8>,
+    max_age: Option<u32>,
+) -> Response {
     let content_type = match format {
         ImageFormat::Jpeg => "image/jpeg",
         ImageFormat::Png => "image/png",
@@ -1321,12 +1342,14 @@ fn respond(format: ImageFormat, quality: Option<u8>, bytes: Vec<u8>) -> Response
         ImageFormat::Gif => "image/gif",
         ImageFormat::Avif => "image/avif",
     };
+    let cache_control = match max_age {
+        None => "public, max-age=31536000, immutable".to_string(),
+        Some(0) => "public, max-age=0".to_string(),
+        Some(n) => format!("public, max-age={n}, immutable"),
+    };
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
-    headers.insert(
-        header::CACHE_CONTROL,
-        "public, max-age=31536000, immutable".parse().unwrap(),
-    );
+    headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
     // The format may have been negotiated from the request's Accept.
     headers.insert(header::VARY, "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data".parse().unwrap());
     // Advertise the client hints the server reads, so
@@ -1875,6 +1898,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn maxage_overrides_the_response_cache_lifetime() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // The directive substitutes its own max-age for the
+        // immutable year, on this response only.
+        let resp = get_signed(&base, &format!("maxage:60/300x50/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "cache-control"),
+            "public, max-age=60, immutable"
+        );
+        // The cap itself spells exactly today's header.
+        let resp = get_signed(&base, &format!("maxage:31536000/300x50/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "cache-control"),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_maxage_keeps_the_default_header_byte_for_byte() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let resp = get_signed(&base, &format!("300x50/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "cache-control"),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn maxage_zero_means_revalidate() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // Zero keeps `public` but drops `immutable`: a response
+        // that is stale on arrival cannot also promise never
+        // to change.
+        let resp = get_signed(&base, &format!("maxage:0/300x50/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "cache-control"), "public, max-age=0");
+    }
+
+    #[tokio::test]
+    async fn malformed_maxage_is_a_bad_request() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // Signed properly over a malformed or out-of-range
+        // lifetime: verification passes, parsing rejects it.
+        for remainder in [
+            format!("maxage:soon/300x50/{src}"),
+            format!("maxage:31536001/300x50/{src}"),
+            format!("maxage:-1/300x50/{src}"),
+        ] {
+            let resp = client()
+                .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{remainder}");
+        }
+        // The 400 body is the parser's own message.
+        let remainder = format!("maxage:soon/300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "invalid maxage segment: maxage:soon"
+        );
+    }
+
+    #[tokio::test]
+    async fn maxage_variants_share_one_cache_entry() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        // The lifetime is response dressing, not content: the
+        // second spelling is a hit on the first one's entry,
+        // and each response still carries its own header.
+        let first = get_signed(&base, &format!("maxage:60/300x50/{src}")).await;
+        assert_eq!(header(&first, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(
+            header(&first, "cache-control"),
+            "public, max-age=60, immutable"
+        );
+        let first_bytes = first.bytes().await.unwrap();
+        let second = get_signed(&base, &format!("maxage:120/300x50/{src}")).await;
+        assert_eq!(header(&second, "cache-status"), "crabcrop; hit");
+        assert_eq!(
+            header(&second, "cache-control"),
+            "public, max-age=120, immutable"
+        );
+        assert_eq!(second.bytes().await.unwrap(), first_bytes);
+        // The plain spelling is the same entry again.
+        let third = get_signed(&base, &format!("300x50/{src}")).await;
+        assert_eq!(header(&third, "cache-status"), "crabcrop; hit");
+        assert_eq!(
+            header(&third, "cache-control"),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn preset_urls_take_maxage_as_the_callers_choice() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        // Without the directive a preset response is today's
+        // immutable year (Q5: presets are stable templates).
+        let resp = get_signed(&base, &format!("preset:small/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "cache-control"),
+            "public, max-age=31536000, immutable"
+        );
+        // With it, the caller's explicit lifetime wins for
+        // that response; the preset itself is untouched.
+        let resp = get_signed(&base, &format!("maxage:30/preset:small/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "cache-control"),
+            "public, max-age=30, immutable"
+        );
     }
 
     #[tokio::test]
