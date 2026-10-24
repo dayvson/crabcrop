@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crabcrop
+spec:
+  template:
+    spec:
+      containers:
+        - name: crabcrop
+          # The AI variant image (Dockerfile.ai): the models
+          # are a layer in the image or a mounted volume,
+          # never kustomize content.
+          image: crabcrop-ai:latest
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+      volumes:
+        # An operator-provided claim holding the ONNX
+        # models and the ONNX Runtime library. Point the
+        # model env vars at it from your overlay (see the
+        # kustomize README).
+        - name: models
+          persistentVolumeClaim:
+            claimName: crabcrop-models

@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Three replicas with resource budgets and pod
+# anti-affinity, mirroring the Helm chart's
+# values-multireplica.yaml.
+#
+# Read this before scaling out: the result cache is
+# per-replica (memory) plus per-pod (disk tier), so replicas
+# trade cache efficiency, never correctness. For a cache the
+# replicas actually share, set CRABCROP_RESULT_BUCKET (and
+# CRABCROP_RESULT_PREFIX) in the env patch below instead of
+# sharing one disk volume; see the kustomize README.
+resources:
+  - ../../base
+
+replicas:
+  - name: crabcrop
+    count: 3
+
+patches:
+  - path: resources-patch.yaml
+    target:
+      kind: Deployment
+      name: crabcrop
+  - path: env-patch.yaml
+    target:
+      kind: Deployment
+      name: crabcrop

@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crabcrop
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: crabcrop
+        app.kubernetes.io/instance: crabcrop
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: crabcrop
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: crabcrop
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi

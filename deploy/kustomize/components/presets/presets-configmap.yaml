@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crabcrop-presets
+  labels:
+    app.kubernetes.io/name: crabcrop
+    app.kubernetes.io/instance: crabcrop
+data:
+  # name = operations, one per line. Edit, or replace the
+  # whole ConfigMap from your own file with configMapGenerator.
+  presets.txt: |
+    thumb = 300x200
+    gray = filters:grayscale
