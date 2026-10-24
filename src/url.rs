@@ -85,6 +85,10 @@ pub enum ParseError {
     /// [`MAX_KERNEL_VALUE`] bound, or a normalize flag other
     /// than 0 or 1. Carries the offending segment.
     InvalidConvolution(String),
+    /// A `noise(...)` filter inside a `filters:...` segment
+    /// did not parse: the amount is not an integer in
+    /// 0..=100. Carries the offending segment.
+    InvalidNoise(String),
     /// No source URL followed the operations.
     MissingSourceUrl,
 }
@@ -113,6 +117,7 @@ impl ParseError {
             ParseError::InvalidFilters(_) => "invalid_filters",
             ParseError::InvalidCurve(_) => "invalid_curve",
             ParseError::InvalidConvolution(_) => "invalid_convolution",
+            ParseError::InvalidNoise(_) => "invalid_noise",
             ParseError::MissingSourceUrl => "missing_source_url",
         }
     }
@@ -149,6 +154,9 @@ impl std::fmt::Display for ParseError {
             }
             ParseError::InvalidConvolution(seg) => {
                 write!(f, "invalid convolution filter in segment: {seg}")
+            }
+            ParseError::InvalidNoise(seg) => {
+                write!(f, "invalid noise filter in segment: {seg}")
             }
             ParseError::MissingSourceUrl => write!(f, "missing source URL"),
         }
@@ -379,6 +387,14 @@ pub enum Filter {
     /// of its entries before it applies (a zero sum applies
     /// the kernel as written).
     Convolution(Vec<f64>, bool),
+    /// Monochrome film grain: one noise value per pixel,
+    /// added equally to the red, green, and blue channels
+    /// (alpha untouched), the value uniform in plus or
+    /// minus this percent of full scale. The field is
+    /// deterministic, seeded from the image content and
+    /// the amount, so a request always renders the same
+    /// bytes. 0 is a no-op.
+    Noise(u8),
     /// Histogram equalization per channel.
     Equalize,
     /// Rotate by the given angle in degrees (issue #144):
@@ -1099,6 +1115,20 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     values.push(parse_kernel_value(part).map_err(|_| bad_conv())?);
                 }
                 Filter::Convolution(values, normalize)
+            }
+            ("noise", Some(p)) => {
+                // noise(<amount>): film grain strength, an
+                // integer 0 to 100 percent of full scale, in
+                // the numeric filter-table style. Noise
+                // failures carry their own error code
+                // (invalid_noise), not the segment-wide
+                // invalid_filters.
+                let bad_noise = || ParseError::InvalidNoise(seg.to_string());
+                let amount: u8 = p.parse().map_err(|_| bad_noise())?;
+                if amount > 100 {
+                    return Err(bad_noise());
+                }
+                Filter::Noise(amount)
             }
             ("equalize", None) => Filter::Equalize,
             ("removebg", None) => Filter::RemoveBg,
@@ -1930,6 +1960,7 @@ fn filter_text(filter: &Filter) -> String {
             text.push_str(if *normalize { ",1)" } else { ",0)" });
             text
         }
+        Filter::Noise(v) => format!("noise({v})"),
         Filter::Equalize => "equalize".to_string(),
         Filter::Rotate(v) => format!("rotate({})", format_angle(*v)),
         Filter::Trim(v) => format!("trim({v})"),
@@ -2481,6 +2512,7 @@ mod tests {
                 ParseError::InvalidConvolution("x".into()),
                 "invalid_convolution",
             ),
+            (ParseError::InvalidNoise("x".into()), "invalid_noise"),
             (ParseError::MissingSourceUrl, "missing_source_url"),
         ];
         let mut seen = std::collections::HashSet::new();
@@ -2588,6 +2620,8 @@ mod tests {
             "filters:curve(rgb,0,0,255,255):curve(b,32,10,224,245)",
             "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)",
             "filters:convolution(0.0625,0.125,0.0625,0.125,0.25,0.125,0.0625,0.125,0.0625,1)",
+            "filters:noise(0)",
+            "filters:noise(40)",
             "filters:flip(h):blur_region(1,2,30,40):pixelate_region(5,6,70,80)",
             "300x200/filters:grayscale",
             "filters:grayscale/300x200/filters:blur(2)",
@@ -3231,6 +3265,55 @@ mod tests {
             Err(ParseError::InvalidFilters(
                 "filters:convolution".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn parses_noise_filter() {
+        let (ops, _) = parse_operations("filters:noise(40)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Noise(40)])]);
+        // The ends of the range parse: 0 (a no-op) and 100
+        // (full scale).
+        assert!(parse_operations("filters:noise(0)/example.com/img.jpg").is_ok());
+        assert!(parse_operations("filters:noise(100)/example.com/img.jpg").is_ok());
+        // Leading zeros and a `+` sign are spelling, not
+        // meaning: the canonical form prints the plain value.
+        assert_eq!(
+            canonical_key_form("filters:noise(007)/example.com/img.jpg"),
+            "filters:noise(7)/example.com/img.jpg"
+        );
+        assert_eq!(
+            canonical_key_form("filters:noise(+40)/example.com/img.jpg"),
+            "filters:noise(40)/example.com/img.jpg"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_noise() {
+        // Every noise failure is invalid_noise, not the
+        // segment-wide invalid_filters.
+        for seg in [
+            // Past the 0..=100 range (256 does not even
+            // fit the u8 the amount parses as).
+            "filters:noise(101)",
+            "filters:noise(256)",
+            // Not an integer in the grammar.
+            "filters:noise(-1)",
+            "filters:noise(1.5)",
+            "filters:noise(abc)",
+            "filters:noise(1,2)",
+        ] {
+            assert_eq!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")),
+                Err(ParseError::InvalidNoise(seg.to_string())),
+                "segment: {seg:?}"
+            );
+        }
+        // A bare `noise` with no argument list is a plain
+        // invalid filters segment, like every other filter.
+        assert_eq!(
+            parse_operations("filters:noise/example.com/img.jpg"),
+            Err(ParseError::InvalidFilters("filters:noise".to_string()))
         );
     }
 

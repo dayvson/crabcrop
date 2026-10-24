@@ -105,6 +105,7 @@ const FILTER_BLURBS = {
   rgb: "tint toward the given red/green/blue amounts",
   curve: "tone curve: remap the named channel (rgb, r, g, or b) through 2 to 16 x,y control points, linearly interpolated, ends clamped",
   convolution: "convolve with a 3x3 or 5x5 kernel: 9 or 25 row-major values (plain decimals, -1024..1024), then a normalize flag (0 or 1); edges replicate",
+  noise: "add monochrome film grain: one deterministic noise value per pixel on all channels, strength 0..100 percent of full scale (0 is a no-op)",
   trim: "trim uniform borders",
   dpr: "device pixel ratio the sizes are multiplied by",
   watermark: "overlay a watermark image",
@@ -294,6 +295,8 @@ function validateFilter(name, args) {
       if (flag !== "0" && flag !== "1") return bad;
       return parts.slice(0, -1).every((p) => isKernelValue(p)) ? null : bad;
     }
+    case "noise":
+      return args !== null && isIntIn(args, 0, 100) ? null : bad;
     case "facepad":
       return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 3
         ? null
