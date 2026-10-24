@@ -5,6 +5,7 @@
     "moduleResolution": "NodeNext",
     "outDir": "dist",
     "rewriteRelativeImportExtensions": true,
+    "rootDir": "./src",
     "skipLibCheck": true,
     "strict": true,
     "target": "ES2022"
