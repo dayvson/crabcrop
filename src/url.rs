@@ -56,6 +56,10 @@ pub enum ParseError {
     /// lifetime: whole seconds from 0 to [`MAX_CACHE_AGE`].
     /// Carries the offending segment.
     InvalidMaxAge(String),
+    /// A `debug:...` segment named a debug view the grammar
+    /// does not have: the only one is `debug:focal`. Carries
+    /// the offending segment.
+    InvalidDebug(String),
     /// A `preset:<name>` segment named a preset the server has
     /// not configured. Carries the name.
     UnknownPreset(String),
@@ -102,6 +106,7 @@ impl ParseError {
             ParseError::InvalidPad(_) => "invalid_pad",
             ParseError::InvalidExpiry(_) => "invalid_expiry",
             ParseError::InvalidMaxAge(_) => "invalid_maxage",
+            ParseError::InvalidDebug(_) => "invalid_debug",
             ParseError::UnknownPreset(_) => "unknown_preset",
             ParseError::InvalidPreset(_) => "invalid_preset",
             ParseError::PresetsOnly(_) => "presets_only",
@@ -130,6 +135,7 @@ impl std::fmt::Display for ParseError {
             ParseError::InvalidPad(seg) => write!(f, "invalid pad segment: {seg}"),
             ParseError::InvalidExpiry(seg) => write!(f, "invalid expiry segment: {seg}"),
             ParseError::InvalidMaxAge(seg) => write!(f, "invalid maxage segment: {seg}"),
+            ParseError::InvalidDebug(seg) => write!(f, "invalid debug segment: {seg}"),
             ParseError::UnknownPreset(name) => write!(f, "unknown preset: {name}"),
             ParseError::InvalidPreset(text) => write!(f, "invalid preset: {text}"),
             ParseError::PresetsOnly(seg) => {
@@ -554,6 +560,14 @@ pub enum Operation {
         right: u32,
         bottom: u32,
     },
+    /// Render the smart-crop debug view (`debug:focal`): the
+    /// response is a diagnostic image of the focal decision
+    /// the next `Crop` makes (or of the final image, when no
+    /// crop follows), never the transform result. Unlike
+    /// `exp:`/`maxage:` this is an operation, not metadata:
+    /// it changes the response, so it stays in the canonical
+    /// form (and therefore the cache key form) in place.
+    DebugFocal,
     /// Filters applied in order after resize.
     Filters(Vec<Filter>),
 }
@@ -681,6 +695,12 @@ pub fn parse_signature(path: &str) -> Result<(Signature, Option<String>, &str), 
 /// means it starts the source URL. A segment that claims to be an
 /// operation (`crop:` / `filters:` prefix) but is malformed is an error.
 fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
+    if let Some(rest) = seg.strip_prefix("debug:") {
+        return Some(match rest {
+            "focal" => Ok(Operation::DebugFocal),
+            _ => Err(ParseError::InvalidDebug(seg.to_string())),
+        });
+    }
     if let Some(rest) = seg.strip_prefix("crop-rect:") {
         return Some(parse_crop_rect(rest, seg));
     }
@@ -1671,6 +1691,9 @@ pub struct RequestDirectives {
     /// order of first appearance. The server fetches each one
     /// before the engine runs.
     pub watermark_urls: Vec<String>,
+    /// Any `debug:focal` segment: the response is the focal
+    /// debug view, never a cached transform result.
+    pub debug_focal: bool,
 }
 
 impl RequestDirectives {
@@ -1693,6 +1716,7 @@ impl RequestDirectives {
             classes: Vec::new(),
             face_padding: 0.5,
             watermark_urls: Vec::new(),
+            debug_focal: false,
         };
         for op in ops {
             match op {
@@ -1701,6 +1725,7 @@ impl RequestDirectives {
                 | Operation::FitIn(_)
                 | Operation::Pad { .. }
                 | Operation::CropRect { .. } => d.has_size_operation = true,
+                Operation::DebugFocal => d.debug_focal = true,
                 _ => {}
             }
             if let Operation::Crop { align, .. } = op {
@@ -2014,6 +2039,7 @@ fn operation_text(op: &Operation) -> String {
             right,
             bottom,
         } => format!("focal:{left}x{top}:{right}x{bottom}"),
+        Operation::DebugFocal => "debug:focal".to_string(),
         Operation::Filters(_) => unreachable!("filters are merged by canonical_form"),
     }
 }
@@ -2445,6 +2471,7 @@ mod tests {
             (ParseError::InvalidPad("x".into()), "invalid_pad"),
             (ParseError::InvalidExpiry("x".into()), "invalid_expiry"),
             (ParseError::InvalidMaxAge("x".into()), "invalid_maxage"),
+            (ParseError::InvalidDebug("x".into()), "invalid_debug"),
             (ParseError::UnknownPreset("x".into()), "unknown_preset"),
             (ParseError::InvalidPreset("x".into()), "invalid_preset"),
             (ParseError::PresetsOnly("x".into()), "presets_only"),
@@ -2540,6 +2567,8 @@ mod tests {
             "crop-rect:1x2:30x40",
             "focal:1x2:30x40",
             "focal:1x2:30x40/crop:100x100:smart",
+            "debug:focal",
+            "debug:focal/crop:100x100:smart",
             "maxage:60/300x200",
             "fit-in:300x200",
             "pad:300x200",
@@ -3716,6 +3745,55 @@ mod tests {
                 .unwrap();
         assert_eq!(exp, Some(1893456000));
         assert_eq!(max_age, Some(60));
+    }
+
+    #[test]
+    fn parses_debug_focal_segments() {
+        let (ops, src, _, _) =
+            parse_operations_with_expiry("debug:focal/crop:100x100:smart/example.com/img.jpg")
+                .unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                Operation::DebugFocal,
+                Operation::Crop {
+                    size: ImageSize {
+                        width: Dimension::Pixels(100),
+                        height: Dimension::Pixels(100),
+                        flip_horizontal: false,
+                        flip_vertical: false,
+                    },
+                    align: Align::Smart,
+                },
+            ]
+        );
+        assert_eq!(src, "example.com/img.jpg");
+        // The directive analysis sees it.
+        assert!(RequestDirectives::analyze(&ops).debug_focal);
+        // It is an operation, not metadata: it stays in the
+        // canonical form in place, so a debug URL keys apart
+        // from the same URL without it (and the server bypasses
+        // the cache for it regardless).
+        let with = canonical_key_form("debug:focal/crop:100x100:smart/example.com/img.jpg");
+        let without = canonical_key_form("crop:100x100:smart/example.com/img.jpg");
+        assert_eq!(with, "debug:focal/crop:100x100:smart/example.com/img.jpg");
+        assert_ne!(with, without);
+        // Once the source URL starts, `debug:` is just URL text.
+        let (ops, src, _, _) = parse_operations_with_expiry("example.com/debug:focal").unwrap();
+        assert!(ops.is_empty());
+        assert_eq!(src, "example.com/debug:focal");
+        // Any other debug view is a parse error of the
+        // dedicated kind.
+        for bad in [
+            "debug:/example.com/i.jpg",
+            "debug:banana/example.com/i.jpg",
+            "debug:focalx/example.com/i.jpg",
+            "debug:smart/example.com/i.jpg",
+        ] {
+            let err = parse_operations_with_expiry(bad).unwrap_err();
+            assert!(matches!(err, ParseError::InvalidDebug(_)), "{bad}");
+            assert_eq!(err.code(), "invalid_debug");
+        }
     }
 
     fn preset_map() -> std::collections::HashMap<String, String> {

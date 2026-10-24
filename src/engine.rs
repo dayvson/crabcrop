@@ -454,6 +454,12 @@ impl Engine {
             // with the first frame, which is also what converting an
             // animated GIF to a still format means.
             let frames = decode_gif_frames(bytes)?;
+            if frames.len() > 1 && directives.debug_focal {
+                return Err(EngineError::Unsupported(
+                    "debug:focal renders a diagnostic image and cannot annotate an animated source"
+                        .to_string(),
+                ));
+            }
             let mut resolved = directives
                 .explicit_format
                 .or(ctx.preferred)
@@ -490,6 +496,12 @@ impl Engine {
             // is also what converting an animated WebP to a still
             // format means.
             let frames = decode_webp_frames(bytes)?;
+            if frames.len() > 1 && directives.debug_focal {
+                return Err(EngineError::Unsupported(
+                    "debug:focal renders a diagnostic image and cannot annotate an animated source"
+                        .to_string(),
+                ));
+            }
             let mut resolved = directives
                 .explicit_format
                 .or(ctx.preferred)
@@ -586,6 +598,13 @@ impl Engine {
         // no first-frame fallback: the request named a video
         // and this source cannot become one.
         if format.is_video() {
+            if directives.debug_focal {
+                return Err(EngineError::Unsupported(format!(
+                    "debug:focal renders a diagnostic image and cannot be served as \
+                     format({}), which encodes video",
+                    crate::url::format_text(format)
+                )));
+            }
             return Err(EngineError::Unsupported(format!(
                 "format({}) encodes video and needs an animated source \
                  (an animated GIF or WebP); this source is a still image",
@@ -1175,8 +1194,16 @@ fn apply_operations(
     // The pending focal rectangle from a `focal:` segment,
     // consumed by the next crop.
     let mut focal: Option<(u32, u32, u32, u32)> = None;
+    // The `debug:focal` state: armed by the segment, captured
+    // by the first crop that follows it. The capture holds
+    // the values that crop actually used (threaded out of the
+    // crop functions, never recomputed), and the response is
+    // the rendered capture instead of the transform result.
+    let mut debug_armed = false;
+    let mut debug_capture: Option<crate::debugview::FocalCapture> = None;
     for op in ops {
         match op {
+            Operation::DebugFocal => debug_armed = true,
             Operation::Size(size) => img = apply_size(img, size, cap, dpr)?,
             Operation::FitIn(size) => img = apply_fit_in(img, size, cap, dpr)?,
             Operation::Pad { size, fill } => {
@@ -1244,8 +1271,32 @@ fn apply_operations(
                 let focal_rect = focal
                     .take()
                     .filter(|_| *align == Align::Center || *align == Align::Smart);
+                // With the debug view armed, this crop is the
+                // one the view annotates: clone the canvas it
+                // operates on and run the traced crop variants,
+                // which report the decision they actually made.
+                let want_trace = debug_armed && debug_capture.is_none();
+                let canvas = want_trace.then(|| img.clone());
                 img = if let Some(rect) = focal_rect {
-                    crate::crop::crop_to_aspect_focal(img, tw, th, rect)
+                    if want_trace {
+                        let (cropped, window) =
+                            crate::crop::crop_to_aspect_focal_traced(img, tw, th, rect);
+                        let canvas = canvas.expect("want_trace clones the canvas");
+                        let (cw, ch) = (canvas.width(), canvas.height());
+                        debug_capture = Some(crate::debugview::FocalCapture {
+                            canvas,
+                            focal: Some((
+                                ((rect.0 + rect.2) / 2).min(cw.saturating_sub(1)),
+                                ((rect.1 + rect.3) / 2).min(ch.saturating_sub(1)),
+                            )),
+                            focal_rect: Some(rect),
+                            window,
+                            faces: Vec::new(),
+                        });
+                        cropped
+                    } else {
+                        crate::crop::crop_to_aspect_focal(img, tw, th, rect)
+                    }
                 } else if *align == Align::Face {
                     // Crop around the largest detected face. A
                     // detection failure or an empty result falls
@@ -1254,24 +1305,73 @@ fn apply_operations(
                     // request.
                     match detect_faces(&mut face_memo, &img, ctx) {
                         Ok(faces) if !faces.is_empty() => {
-                            let face = faces
+                            let face = *faces
                                 .iter()
                                 .max_by_key(|f| f.w as u64 * f.h as u64)
                                 .expect("faces is non-empty");
-                            crate::crop::crop_around_face(
-                                img,
-                                tw,
-                                th,
-                                face,
-                                directives.face_padding,
-                            )
+                            if want_trace {
+                                let (cropped, window) = crate::crop::crop_around_face_traced(
+                                    img,
+                                    tw,
+                                    th,
+                                    &face,
+                                    directives.face_padding,
+                                );
+                                debug_capture = Some(crate::debugview::FocalCapture {
+                                    canvas: canvas.expect("want_trace clones the canvas"),
+                                    focal: Some((face.x + face.w / 2, face.y + face.h / 2)),
+                                    focal_rect: Some((
+                                        face.x,
+                                        face.y,
+                                        face.x + face.w,
+                                        face.y + face.h,
+                                    )),
+                                    window,
+                                    faces,
+                                });
+                                cropped
+                            } else {
+                                crate::crop::crop_around_face(
+                                    img,
+                                    tw,
+                                    th,
+                                    &face,
+                                    directives.face_padding,
+                                )
+                            }
                         }
-                        Ok(_) => crate::crop::crop_to_aspect_with(img, tw, th, Align::Smart, None),
-                        Err(EngineError::Inference(_)) => {
-                            crate::crop::crop_to_aspect_with(img, tw, th, Align::Smart, None)
+                        Ok(_) | Err(EngineError::Inference(_)) => {
+                            if want_trace {
+                                let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                                    img,
+                                    tw,
+                                    th,
+                                    Align::Smart,
+                                    None,
+                                );
+                                if let Some(trace) = trace {
+                                    debug_capture = Some(capture_from_trace(
+                                        canvas.expect("want_trace clones the canvas"),
+                                        trace,
+                                    ));
+                                }
+                                cropped
+                            } else {
+                                crate::crop::crop_to_aspect_with(img, tw, th, Align::Smart, None)
+                            }
                         }
                         Err(e) => return Err(e),
                     }
+                } else if want_trace {
+                    let (cropped, trace) =
+                        crate::crop::crop_to_aspect_traced(img, tw, th, *align, ctx.face_provider);
+                    if let Some(trace) = trace {
+                        debug_capture = Some(capture_from_trace(
+                            canvas.expect("want_trace clones the canvas"),
+                            trace,
+                        ));
+                    }
+                    cropped
                 } else {
                     crate::crop::crop_to_aspect_with(img, tw, th, *align, ctx.face_provider)
                 };
@@ -1398,7 +1498,55 @@ fn apply_operations(
             }
         }
     }
+    if debug_armed {
+        // The debug view replaces the transform result. With
+        // no capture, no crop followed the segment: the view
+        // shows the focal analysis of the final image. With
+        // one, it shows the decision that crop actually made,
+        // on the canvas it operated on.
+        let capture = match debug_capture {
+            Some(capture) => capture,
+            None => {
+                let (point, faces) = crate::focus::focal_point_traced(&img, ctx.face_provider);
+                let (w, h) = (img.width(), img.height());
+                crate::debugview::FocalCapture {
+                    canvas: img.clone(),
+                    focal: Some((
+                        ((point.x * w as f32).round() as u32).min(w.saturating_sub(1)),
+                        ((point.y * h as f32).round() as u32).min(h.saturating_sub(1)),
+                    )),
+                    focal_rect: None,
+                    window: None,
+                    faces,
+                }
+            }
+        };
+        img = crate::debugview::render(&capture);
+    }
     Ok((img, encode_opts))
+}
+
+/// Build the debug capture for a crop that reported a
+/// [`crate::crop::CropTrace`]: the traced focal fraction
+/// becomes a pixel point on the canvas the crop ran on.
+fn capture_from_trace(
+    canvas: DynamicImage,
+    trace: crate::crop::CropTrace,
+) -> crate::debugview::FocalCapture {
+    let (w, h) = (canvas.width(), canvas.height());
+    let focal = trace.focal.map(|p| {
+        (
+            ((p.x * w as f32).round() as u32).min(w.saturating_sub(1)),
+            ((p.y * h as f32).round() as u32).min(h.saturating_sub(1)),
+        )
+    });
+    crate::debugview::FocalCapture {
+        canvas,
+        focal,
+        focal_rect: None,
+        window: Some(trace.window),
+        faces: trace.faces,
+    }
 }
 
 /// The EXIF orientation stored in the source bytes (1-8), if the
@@ -3304,6 +3452,172 @@ mod tests {
         assert_eq!(dims_of(&with_focal), dims_of(&plain));
     }
 
+    fn crop_op(w: u32, h: u32, align: Align) -> Operation {
+        Operation::Crop {
+            size: ImageSize {
+                width: Dimension::Pixels(w),
+                height: Dimension::Pixels(h),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            align,
+        }
+    }
+
+    fn debug_px(out: &ProcessedImage, x: u32, y: u32) -> image::Rgba<u8> {
+        *image::load_from_memory(&out.bytes)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(x, y)
+    }
+
+    /// 100x100 gray with a 20x20 checker block at (70, 40):
+    /// the saliency fixture the focus tests use, so the focal
+    /// point is deterministic (near the block's center).
+    fn debug_block_image() -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(100, 100);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if (70..90).contains(&x) && (40..60).contains(&y) {
+                if (x + y) % 2 == 0 {
+                    image::Rgb([200, 200, 200])
+                } else {
+                    image::Rgb([50, 50, 50])
+                }
+            } else {
+                image::Rgb([128, 128, 128])
+            };
+        }
+        img
+    }
+
+    #[test]
+    fn debug_focal_draws_the_smart_crop_decision() {
+        let engine = Engine;
+        let img = debug_block_image();
+        let src = png_bytes(&img);
+        let point = crate::focus::focal_point(&img);
+        let (fx, fy) = (
+            (point.x * 100.0).round() as u32,
+            (point.y * 100.0).round() as u32,
+        );
+        let out = engine
+            .process(
+                &src,
+                &[Operation::DebugFocal, crop_op(50, 100, Align::Smart)],
+            )
+            .unwrap();
+        // The response is the 100x100 canvas the crop ran
+        // on, not the 50x100 crop result.
+        assert_eq!(dims_of(&out), (100, 100));
+        // The crosshair sits on the focal point the crop used.
+        assert_eq!(debug_px(&out, fx, fy), crate::debugview::FOCAL_COLOR);
+        // The window outline matches the window the same URL
+        // without the debug segment cuts: 50 wide, positioned
+        // on the focal point, full height.
+        let start = ((point.x * 100.0).round() as i32 - 25).clamp(0, 50) as u32;
+        assert_eq!(debug_px(&out, start, 0), crate::debugview::WINDOW_COLOR);
+        assert_eq!(
+            debug_px(&out, start + 49, 99),
+            crate::debugview::WINDOW_COLOR
+        );
+        let plain = engine
+            .process(&src, &[crop_op(50, 100, Align::Smart)])
+            .unwrap();
+        assert_eq!(dims_of(&plain), (50, 100));
+        // An unmarked pixel keeps the canvas value.
+        assert_eq!(debug_px(&out, 10, 10), image::Rgba([128, 128, 128, 255]));
+    }
+
+    #[test]
+    fn debug_focal_draws_the_caller_focal_rectangle() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        let out = engine
+            .process(
+                &src,
+                &[
+                    Operation::DebugFocal,
+                    focal_op(5, 2, 7, 4),
+                    square_crop(Align::Smart),
+                ],
+            )
+            .unwrap();
+        // The canvas is the 8x4 pattern, not the 2x2 result.
+        assert_eq!(dims_of(&out), (8, 4));
+        // The focal rectangle's top edge, clear of the window.
+        assert_eq!(debug_px(&out, 6, 2), crate::debugview::FOCAL_COLOR);
+        // The crosshair at the rectangle's center (6, 3) is
+        // drawn last, over the window's bottom band.
+        assert_eq!(debug_px(&out, 6, 3), crate::debugview::FOCAL_COLOR);
+        // The crop window is x 4..8, full height (the same
+        // window the plain focal test crops to all black).
+        assert_eq!(debug_px(&out, 4, 0), crate::debugview::WINDOW_COLOR);
+        assert_eq!(debug_px(&out, 7, 0), crate::debugview::WINDOW_COLOR);
+        // The same chain without the debug segment still
+        // produces the plain 2x2 crop.
+        let plain = engine
+            .process(&src, &[focal_op(5, 2, 7, 4), square_crop(Align::Smart)])
+            .unwrap();
+        assert_eq!(dims_of(&plain), (2, 2));
+    }
+
+    #[test]
+    fn debug_focal_without_a_crop_marks_the_final_image() {
+        let engine = Engine;
+        let img = debug_block_image();
+        let src = png_bytes(&img);
+        let point = crate::focus::focal_point(&img);
+        let (fx, fy) = (
+            (point.x * 100.0).round() as u32,
+            (point.y * 100.0).round() as u32,
+        );
+        let out = engine.process(&src, &[Operation::DebugFocal]).unwrap();
+        assert_eq!(dims_of(&out), (100, 100));
+        assert_eq!(debug_px(&out, fx, fy), crate::debugview::FOCAL_COLOR);
+        // No crop ran, so no window outline exists anywhere.
+        let rgba = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert!(rgba.pixels().all(|p| *p != crate::debugview::WINDOW_COLOR));
+        // And the diagnostic is not the plain result.
+        let plain = engine.process(&src, &[]).unwrap();
+        assert_ne!(out.bytes, plain.bytes);
+    }
+
+    #[test]
+    fn debug_focal_on_an_animated_source_is_a_specific_error() {
+        let engine = Engine;
+        for src in [animated_gif_bytes(), animated_webp_bytes()] {
+            let err = engine
+                .process_preferred(&src, &[Operation::DebugFocal], ProcessContext::default())
+                .unwrap_err();
+            assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+            assert!(err.to_string().contains("debug:focal"), "{err}");
+            assert!(err.to_string().contains("animated"), "{err}");
+        }
+    }
+
+    #[test]
+    fn debug_focal_with_a_video_format_is_a_specific_error() {
+        let engine = Engine;
+        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let src = png_bytes(&DynamicImage::new_rgb8(20, 12));
+        let err = engine
+            .process_preferred(
+                &src,
+                &[
+                    Operation::DebugFocal,
+                    Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)]),
+                ],
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("debug:focal"), "{err}");
+        assert!(err.to_string().contains("mp4"), "{err}");
+    }
+
     #[test]
     fn no_upscale_caps_every_resize_mode() {
         let engine = Engine;
@@ -5020,6 +5334,57 @@ mod tests {
         let center = result.get_pixel(50, 50);
         assert!(center[0] < 40 || center[0] > 200, "center {center:?}");
         assert_eq!(result.get_pixel(2, 2), &image::Rgb([90, 90, 90]));
+    }
+
+    #[test]
+    fn debug_focal_face_crop_marks_the_face_it_centered_on() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &face_scene(),
+                &[Operation::DebugFocal, face_crop_op()],
+                ProcessContext {
+                    face_provider: Some(&KnownFace),
+                    detect_provider: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The canvas is the 200x160 scene, not the 100x100 crop.
+        assert_eq!(dims_of(&out), (200, 160));
+        // The chosen face is the focal rectangle: its corner
+        // carries the focal color, and the crosshair sits at
+        // its center (160, 50).
+        assert_eq!(debug_px(&out, 140, 30), crate::debugview::FOCAL_COLOR);
+        assert_eq!(debug_px(&out, 160, 50), crate::debugview::FOCAL_COLOR);
+        // The window is the padded-face window the plain test
+        // documents: 80x80 at (120, 10).
+        assert_eq!(debug_px(&out, 120, 10), crate::debugview::WINDOW_COLOR);
+        assert_eq!(debug_px(&out, 199, 89), crate::debugview::WINDOW_COLOR);
+    }
+
+    #[test]
+    fn debug_focal_smart_crop_draws_the_faces_that_fed_it() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &face_scene(),
+                &[Operation::DebugFocal, crop_op(100, 100, Align::Smart)],
+                ProcessContext {
+                    face_provider: Some(&KnownFace),
+                    detect_provider: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (200, 160));
+        // The detected face box is amber; the crosshair is on
+        // its center, which is where the smart window went.
+        assert_eq!(debug_px(&out, 140, 30), crate::debugview::FACE_COLOR);
+        assert_eq!(debug_px(&out, 160, 50), crate::debugview::FOCAL_COLOR);
+        // Window: 160 wide (the full height at 1:1), starting
+        // at x 40 (centered on the face, clamped).
+        assert_eq!(debug_px(&out, 40, 0), crate::debugview::WINDOW_COLOR);
     }
 
     #[test]

@@ -64,5 +64,11 @@
     "secret": "s3cr3t",
     "remainder": "filters:format(webm)/https://example.com/photo.webp",
     "signature": "b020df4afd3d889e0c80a8e919a3ebe3b689797aef3b8904e1c434ed50a99733"
+  },
+  {
+    "description": "Smart-crop debug view",
+    "secret": "s3cr3t",
+    "remainder": "debug:focal/crop:100x100:smart/https://example.com/photo.jpg",
+    "signature": "031e8be3ae557f4974d229a532d06215cec3f5616ca6666a030d7f12f9a997a8"
   }
 ]

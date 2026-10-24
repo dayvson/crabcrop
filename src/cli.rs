@@ -369,6 +369,9 @@ fn describe_operation(segment: &str, op: &Operation) -> Vec<String> {
             }
             lines
         }
+        Operation::DebugFocal => vec![format!(
+            "  {segment}  render the smart-crop debug view (focal point, focal rectangle, and crop window drawn on the crop's canvas; never cached)"
+        )],
     }
 }
 

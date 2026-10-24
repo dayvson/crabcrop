@@ -210,6 +210,20 @@ Names the rectangle the next `crop:` in the URL must keep, in source pixels. The
 curl "http://localhost:3000/unsafe/focal:100x50:700x450/crop:800x600:smart/https://example.com/photo.jpg"
 ```
 
+### Debug view
+
+```text
+debug:focal
+```
+
+Renders the smart-crop debug view: instead of the transform result, the response is a diagnostic image, the canvas the next `crop:` in the URL operates on, with the decision that crop actually makes drawn on it. A magenta crosshair marks the chosen focal point, and the focal rectangle outline (magenta) is drawn when one is in play: a caller `focal:` rectangle, or the face a `face` crop centers on. Detected face boxes that fed the decision are amber, and the crop window outline is blue. Line width and crosshair size scale with the image. With no crop in the URL, the view shows the focal analysis of the final image. Saliency alone drives it when no AI models are configured; any other `debug:` value fails with `400`.
+
+Debug responses are never stored in, or served from, any cache tier, and are served with `Cache-Control: no-store`: the diagnostic is computed from the request's own processing, every time. An animated source, or a chain whose resolved format is a video format, fails with `400` rather than serving a half-applied debug view.
+
+```bash
+curl "http://localhost:3000/unsafe/debug:focal/crop:800x600:smart/https://example.com/photo.jpg"
+```
+
 ### Filters
 
 ```text

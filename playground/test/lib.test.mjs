@@ -157,6 +157,10 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["maxage:31536000/300x200/" + SRC, false, SRC], // the cap itself
     ["maxage:31536001/300x200/" + SRC, true, SRC], // past the cap
     ["maxage:soon/300x200/" + SRC, true, SRC], // not a number
+    ["debug:focal/crop:100x100:smart/" + SRC, false, SRC], // the debug view annotates the crop
+    ["debug:focal/" + SRC, false, SRC], // no crop: the final image's focal analysis
+    ["debug:banana/300x200/" + SRC, true, SRC], // unknown debug view
+    ["debug:/300x200/" + SRC, true, SRC], // empty debug view
     ["filters:radius(12)/" + SRC, false, SRC],
     ["filters:radius(1,2,3,4):mask(circle)/" + SRC, false, SRC],
     ["filters:radius(1,2)/" + SRC, true, SRC],

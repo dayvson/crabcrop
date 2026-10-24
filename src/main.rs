@@ -133,6 +133,7 @@ mod cache;
 mod cli;
 mod color;
 mod crop;
+mod debugview;
 mod engine;
 mod filters;
 mod focus;
