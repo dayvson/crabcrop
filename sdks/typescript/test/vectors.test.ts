@@ -7,6 +7,8 @@ import {
   purgeGroupSignature,
   purgeSignature,
   sign,
+  signWithKeyId,
+  verifyUrlSignature,
 } from "../src/index.ts";
 
 // The canonical cross-language vectors: this package's whole
@@ -150,4 +152,37 @@ test("purge signatures match the published vectors", () => {
     purgeGroupSignature("test-secret", "thumb"),
     purgeSignature("test-secret", "purge-group/thumb"),
   );
+});
+
+test("signWithKeyId stamps the segment and buildURL uses it", () => {
+  const remainder = "300x200/example.com/i.jpg";
+  assert.equal(
+    signWithKeyId("test-secret", "k2", remainder),
+    `k2:${sign("test-secret", remainder)}`,
+  );
+  assert.equal(
+    buildURL("https://img.example.com", "test-secret", "300x200", "example.com/i.jpg", { keyId: "k2" }),
+    `https://img.example.com/k2:${sign("test-secret", remainder)}/300x200/example.com/i.jpg`,
+  );
+  assert.throws(() => signWithKeyId("test-secret", "bad id", remainder));
+  assert.throws(() =>
+    buildURL("https://img.example.com", null, "300x200", "example.com/i.jpg", { keyId: "k2" }),
+  );
+});
+
+test("verifyUrlSignature routes by key ID with a keyring", () => {
+  const remainder = "300x200/example.com/i.jpg";
+  const keyed = `https://img.example.com/${signWithKeyId("old-secret", "k-old", remainder)}/${remainder}`;
+  const unkeyed = `https://img.example.com/${sign("old-secret", remainder)}/${remainder}`;
+  const ring = { "k-old": "old-secret", "k-new": "new-secret" };
+  // Keyed: exactly the named key.
+  assert.equal(verifyUrlSignature(ring, keyed), true);
+  assert.equal(verifyUrlSignature({ "k-new": "new-secret" }, keyed), false);
+  assert.equal(verifyUrlSignature({ "k-old": "new-secret" }, keyed), false);
+  // Unkeyed: any key in the ring.
+  assert.equal(verifyUrlSignature(ring, unkeyed), true);
+  assert.equal(verifyUrlSignature({ "k-new": "other" }, unkeyed), false);
+  // A bare secret ignores the ID and checks the tag.
+  assert.equal(verifyUrlSignature("old-secret", keyed), true);
+  assert.equal(verifyUrlSignature("new-secret", keyed), false);
 });

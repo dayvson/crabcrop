@@ -546,8 +546,11 @@ export function explainUrl(input, nowSeconds = Math.floor(Date.now() / 1000)) {
   const signatureRaw = path.slice(0, slash);
   const remainder = path.slice(slash + 1);
   let signature;
+  const keyed = signatureRaw.match(/^([A-Za-z0-9_-]{1,32}):([0-9a-f]{64})$/);
   if (signatureRaw === "unsafe") {
     signature = { kind: "unsafe", value: signatureRaw, detail: "unsigned; the server honors it only with CRABCROP_ALLOW_UNSAFE or in presets-only deployments" };
+  } else if (keyed) {
+    signature = { kind: "hmac", value: keyed[2], keyId: keyed[1], detail: `HMAC-SHA256 of the remainder, signed with key "${keyed[1]}"; the server verifies it against that key only (secret rotation)` };
   } else if (/^[0-9a-f]{64}$/.test(signatureRaw)) {
     signature = { kind: "hmac", value: signatureRaw, detail: "HMAC-SHA256 of the remainder; paste the secret to verify it below" };
   } else if (/^[0-9a-f]+$/.test(signatureRaw)) {

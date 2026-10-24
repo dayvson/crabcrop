@@ -43,6 +43,29 @@ export function purgeGroupSignature(secret: string, group: string): string {
 export interface BuildOptions {
   /** Unix-seconds expiry, emitted as a leading `exp:` segment. */
   expires?: number;
+  /**
+   * Key ID to stamp on the signature segment (`<key-id>:<tag>`),
+   * for servers running a secret rotation: they verify a keyed
+   * segment against the named key only. Requires a non-null
+   * secret (an `unsafe` URL has no key to name).
+   */
+  keyId?: string;
+}
+
+/** Whether `id` is a well-formed key ID (1-32 of `[A-Za-z0-9_-]`). */
+export function isValidKeyId(id: string): boolean {
+  return /^[A-Za-z0-9_-]{1,32}$/.test(id);
+}
+
+/**
+ * The signature segment for a keyed signature: `<key-id>:`
+ * followed by the hex tag `sign` computes.
+ */
+export function signWithKeyId(secret: string, keyId: string, remainder: string): string {
+  if (!isValidKeyId(keyId)) {
+    throw new Error(`invalid key ID ${JSON.stringify(keyId)}: 1 to 32 characters of [A-Za-z0-9_-]`);
+  }
+  return `${keyId}:${sign(secret, remainder)}`;
 }
 
 /**
@@ -114,7 +137,17 @@ export function buildURL(
     remainder += `${operations}/`;
   }
   remainder += source;
-  const signature = secret === null ? "unsafe" : sign(secret, remainder);
+  let signature: string;
+  if (secret === null) {
+    if (options.keyId !== undefined) {
+      throw new Error("keyId requires a secret: an unsafe URL has no key to name");
+    }
+    signature = "unsafe";
+  } else if (options.keyId !== undefined) {
+    signature = signWithKeyId(secret, options.keyId, remainder);
+  } else {
+    signature = sign(secret, remainder);
+  }
   return `${trimmedBase}/${signature}/${remainder}`;
 }
 
@@ -144,17 +177,37 @@ export type { ExplainedSegment, Explanation } from "./explain.ts";
 import { explainUrl } from "./explain.ts";
 
 /**
- * Verify a URL's signature against a secret, locally. Returns
- * true or false, or null when the URL is unsigned or malformed.
+ * Verify a URL's signature locally. Returns true or false, or
+ * null when the URL is unsigned or malformed.
+ *
+ * With a single secret string, the key ID (when the URL
+ * carries one) is ignored: the question is whether this
+ * secret made the tag. With a keyring (a map of key ID to
+ * secret), the server's rotation semantics apply: a keyed
+ * URL consults exactly its named key (an unknown ID is
+ * false), and an unkeyed URL consults every key in the map.
  */
-export function verifyUrlSignature(secret: string, input: string): boolean | null {
+export function verifyUrlSignature(
+  secret: string | Record<string, string>,
+  input: string,
+): boolean | null {
   const { signature, remainder } = explainUrl(input);
   if (!signature || signature.kind !== "hmac") {
     return null;
   }
   // Constant-time, like the Rust and Python verifiers: a
   // plain === leaks how much of the tag was right.
-  const expected = Buffer.from(sign(secret, remainder), "utf8");
   const given = Buffer.from(signature.value, "utf8");
-  return expected.length === given.length && timingSafeEqual(expected, given);
+  const matches = (candidate: string): boolean => {
+    const expected = Buffer.from(sign(candidate, remainder), "utf8");
+    return expected.length === given.length && timingSafeEqual(expected, given);
+  };
+  if (typeof secret === "string") {
+    return matches(secret);
+  }
+  if (signature.keyId !== undefined) {
+    const candidate = secret[signature.keyId];
+    return candidate === undefined ? false : matches(candidate);
+  }
+  return Object.values(secret).some(matches);
 }

@@ -34,6 +34,32 @@ pub fn sign(secret: &[u8], remainder: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Whether `id` is a well-formed key ID: 1 to 32 characters
+/// of `[A-Za-z0-9_-]`. Mirrors the server grammar rule.
+pub fn is_valid_key_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The signature segment for a keyed signature: `<key-id>:`
+/// followed by the hex tag [`sign`] computes. Servers verify
+/// a keyed segment against the named key only, which is what
+/// makes secret rotation possible without invalidating every
+/// outstanding URL (see the server's rotation runbook).
+pub fn sign_with_key_id(
+    secret: &[u8],
+    key_id: &str,
+    remainder: &str,
+) -> Result<String, BuildError> {
+    if !is_valid_key_id(key_id) {
+        return Err(BuildError::InvalidKeyId(key_id.to_string()));
+    }
+    Ok(format!("{key_id}:{}", sign(secret, remainder)))
+}
+
 /// Verify a presented signature segment against a remainder,
 /// in constant time. A segment that is not a 64-character hex
 /// SHA-256 tag fails without panicking.
@@ -61,6 +87,9 @@ pub enum BuildError {
     /// A srcset width is not a positive dimension within
     /// the grammar's cap. Carries the width.
     InvalidWidth(u32),
+    /// A key ID is not 1 to 32 characters of `[A-Za-z0-9_-]`.
+    /// Carries the offending ID.
+    InvalidKeyId(String),
 }
 
 impl std::fmt::Display for BuildError {
@@ -73,6 +102,10 @@ impl std::fmt::Display for BuildError {
             BuildError::InvalidWidth(w) => write!(
                 f,
                 "srcset width must be a positive integer no larger than {MAX_DIMENSION}, got {w}"
+            ),
+            BuildError::InvalidKeyId(id) => write!(
+                f,
+                "invalid key ID {id:?}: 1 to 32 characters of [A-Za-z0-9_-]"
             ),
         }
     }
@@ -156,6 +189,36 @@ pub fn build_url(
         None => "unsafe".to_string(),
     };
     Ok(format!("{base}/{signature}/{remainder}"))
+}
+
+/// [`build_url`] with a key ID stamped on the signature
+/// segment, via [`sign_with_key_id`]. With `secret` None the
+/// URL would be `unsafe` and a key ID is meaningless there,
+/// so it is rejected rather than silently dropped.
+pub fn build_url_with_key_id(
+    base: &str,
+    secret: Option<(&[u8], &str)>,
+    operations: &str,
+    source: &str,
+    expires: Option<u64>,
+) -> Result<String, BuildError> {
+    validate_url_text(operations, "operations")?;
+    validate_url_text(source, "source")?;
+    let base = base.trim_end_matches('/');
+    let mut remainder = String::new();
+    if let Some(exp) = expires {
+        remainder.push_str(&format!("exp:{exp}/"));
+    }
+    if !operations.is_empty() {
+        remainder.push_str(operations);
+        remainder.push('/');
+    }
+    remainder.push_str(source);
+    let segment = match secret {
+        Some((secret, key_id)) => sign_with_key_id(secret, key_id, &remainder)?,
+        None => return Err(BuildError::InvalidKeyId(String::new())),
+    };
+    Ok(format!("{base}/{segment}/{remainder}"))
 }
 
 /// Build an `srcset` attribute value: one `{width}x0` URL per
@@ -350,6 +413,48 @@ mod tests {
             srcset,
             "https://img.example.com/unsafe/320x0/https://example.com/a.jpg 320w, \
              https://img.example.com/unsafe/640x0/https://example.com/a.jpg 640w"
+        );
+    }
+
+    #[test]
+    fn keyed_signing_stamps_the_id_and_validates_it() {
+        let segment = sign_with_key_id(b"test-secret", "k2", "300x200/example.com/i.jpg").unwrap();
+        assert_eq!(
+            segment,
+            format!("k2:{}", sign(b"test-secret", "300x200/example.com/i.jpg"))
+        );
+        for bad in ["", "has space", "has:colon", &"x".repeat(33)] {
+            assert!(matches!(
+                sign_with_key_id(b"test-secret", bad, "r"),
+                Err(BuildError::InvalidKeyId(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn build_url_with_key_id_places_the_segment() {
+        let url = build_url_with_key_id(
+            "https://img.example.com/",
+            Some((b"test-secret", "k2")),
+            "300x200",
+            "example.com/i.jpg",
+            None,
+        )
+        .unwrap();
+        let segment = sign_with_key_id(b"test-secret", "k2", "300x200/example.com/i.jpg").unwrap();
+        assert_eq!(
+            url,
+            format!("https://img.example.com/{segment}/300x200/example.com/i.jpg")
+        );
+        assert!(
+            build_url_with_key_id(
+                "https://img.example.com",
+                None,
+                "300x200",
+                "example.com/i.jpg",
+                None,
+            )
+            .is_err()
         );
     }
 }

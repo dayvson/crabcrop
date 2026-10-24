@@ -123,6 +123,7 @@ const TOOLS = [
         base: { type: "string", description: "crabcrop endpoint origin. Defaults to CRABCROP_BASE." },
         secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET; omit for unsafe URLs. Sensitive, deprecated: prefer the CRABCROP_SECRET environment variable; a per-call secret is kept in client transcripts." },
         expires: { type: "number", description: "Optional unix-seconds expiry, emitted as an exp: segment." },
+        keyId: { type: "string", description: "Optional key ID stamped on the signature segment (`<key-id>:<tag>`) for servers running a secret rotation; they verify a keyed segment against the named key only." },
       },
       required: ["operations", "source"],
       additionalProperties: false,
@@ -133,6 +134,7 @@ const TOOLS = [
       const secret = optionalStringArg(args, "secret") ?? envSecret;
       const url = buildURL(base, secret, stringArg(args, "operations"), stringArg(args, "source"), {
         expires: numberArg(args, "expires"),
+        keyId: optionalStringArg(args, "keyId"),
       });
       return textResult(url);
     },

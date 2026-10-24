@@ -14,6 +14,7 @@ from crabcrop_url import (  # noqa: E402
     purge_group_signature,
     purge_signature,
     sign,
+    sign_with_key_id,
     verify,
 )
 
@@ -130,6 +131,42 @@ class TestBuilders(unittest.TestCase):
                     "https://example.com/a.jpg",
                     expires=bad_expires,
                 )
+
+
+class TestKeyIds(unittest.TestCase):
+    def test_sign_with_key_id_stamps_the_segment(self):
+        remainder = "300x200/example.com/i.jpg"
+        self.assertEqual(
+            sign_with_key_id("test-secret", "k2", remainder),
+            f"k2:{sign('test-secret', remainder)}",
+        )
+        self.assertEqual(
+            build_url(
+                "https://img.example.com",
+                "test-secret",
+                "300x200",
+                "example.com/i.jpg",
+                key_id="k2",
+            ),
+            f"https://img.example.com/k2:{sign('test-secret', remainder)}/300x200/example.com/i.jpg",
+        )
+        with self.assertRaises(ValueError):
+            sign_with_key_id("test-secret", "bad id", remainder)
+        with self.assertRaises(ValueError):
+            build_url(
+                "https://img.example.com",
+                None,
+                "300x200",
+                "example.com/i.jpg",
+                key_id="k2",
+            )
+
+    def test_verify_accepts_a_keyed_segment_for_its_secret(self):
+        remainder = "300x200/example.com/i.jpg"
+        segment = sign_with_key_id("old-secret", "k-old", remainder)
+        self.assertTrue(verify("old-secret", segment, remainder))
+        self.assertFalse(verify("new-secret", segment, remainder))
+        self.assertFalse(verify("old-secret", "bad id:" + sign("old-secret", remainder), remainder))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,36 @@ def _key(secret: Union[str, bytes]) -> bytes:
     return secret.encode("utf-8") if isinstance(secret, str) else secret
 
 
+_KEY_ID_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
+
+
+def is_valid_key_id(key_id: str) -> bool:
+    """Whether ``key_id`` is a well-formed key ID: 1 to 32
+    characters of ``[A-Za-z0-9_-]``."""
+    return (
+        isinstance(key_id, str)
+        and 1 <= len(key_id) <= 32
+        and all(c in _KEY_ID_CHARS for c in key_id)
+    )
+
+
+def sign_with_key_id(
+    secret: Union[str, bytes], key_id: str, remainder: str
+) -> str:
+    """The signature segment for a keyed signature:
+    ``<key-id>:`` followed by the hex tag ``sign`` computes.
+    Servers verify a keyed segment against the named key
+    only, which is what makes secret rotation possible
+    without invalidating every outstanding URL."""
+    if not is_valid_key_id(key_id):
+        raise ValueError(
+            f"invalid key ID {key_id!r}: 1 to 32 characters of [A-Za-z0-9_-]"
+        )
+    return f"{key_id}:{sign(secret, remainder)}"
+
+
 def sign(secret: Union[str, bytes], remainder: str) -> str:
     """Compute the signature segment for a remainder: the
     lowercase hex HMAC-SHA256 of ``remainder`` under ``secret``.
@@ -57,6 +87,15 @@ def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
     a malformed one returns False instead of raising."""
     if not isinstance(signature, str) or not signature.isascii():
         return False
+    # A keyed segment (`<key-id>:<tag>`) verifies against the
+    # one secret given here: the ID is routing metadata, and
+    # this function's question is whether this secret made
+    # the tag. A malformed ID makes the segment malformed.
+    if ":" in signature:
+        key_id, _, tag = signature.partition(":")
+        if not is_valid_key_id(key_id):
+            return False
+        signature = tag
     return hmac.compare_digest(sign(secret, remainder), signature)
 
 
@@ -92,6 +131,7 @@ def build_url(
     operations: str,
     source: str,
     expires: Optional[int] = None,
+    key_id: Optional[str] = None,
 ) -> str:
     """Assemble a signed (or ``unsafe``) crabcrop URL.
     ``operations`` is the operation string verbatim (several
@@ -109,7 +149,14 @@ def build_url(
     if operations:
         remainder += f"{operations}/"
     remainder += source
-    signature = "unsafe" if secret is None else sign(secret, remainder)
+    if secret is None:
+        if key_id is not None:
+            raise ValueError("key_id requires a secret: an unsafe URL has no key to name")
+        signature = "unsafe"
+    elif key_id is not None:
+        signature = sign_with_key_id(secret, key_id, remainder)
+    else:
+        signature = sign(secret, remainder)
     return f"{base.rstrip('/')}/{signature}/{remainder}"
 
 
