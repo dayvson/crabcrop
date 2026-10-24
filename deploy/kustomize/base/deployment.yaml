@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crabcrop
+  labels:
+    app.kubernetes.io/name: crabcrop
+    app.kubernetes.io/instance: crabcrop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: crabcrop
+      app.kubernetes.io/instance: crabcrop
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: crabcrop
+        app.kubernetes.io/instance: crabcrop
+    spec:
+      containers:
+        - name: crabcrop
+          image: crabcrop:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "3000"
+            - name: CRABCROP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: crabcrop
+                  key: CRABCROP_SECRET
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5

@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Everything on: presets, the disk result tier, and the AI
+# variant, composed from the components. An example to copy
+# and trim, and the build that proves the components
+# compose. The AI component expects a PersistentVolumeClaim
+# named crabcrop-models to exist in the namespace.
+resources:
+  - ../../base
+
+components:
+  - ../../components/presets
+  - ../../components/result-storage
+  - ../../components/ai
