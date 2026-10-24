@@ -30,7 +30,8 @@
  * Modifier mapping:
  *   width + height, fit cover (default) -> crop:WxH:smart
  *   width + height, fit contain         -> pad:WxH:blur
- *   width + height, fit inside/outside  -> fit-in:WxH
+ *   width + height, fit inside          -> fit-in:WxH
+ *   width + height, fit outside         -> crop:WxH (see below)
  *   width + height, fit fill            -> WxH
  *   width only -> Wx0 ; height only -> 0xH
  *   format (jpg -> jpeg)                -> filters:format(...)
@@ -75,17 +76,18 @@ const dim = (v: number | string | undefined, name: string): number | undefined =
 const FORMATS = new Set(["jpeg", "png", "webp", "avif", "jxl", "gif"]);
 
 /**
- * Quality is an integer 0-100 in the grammar (0 is legal:
- * the smallest file). It is not a dimension, so it gets
- * its own validation instead of riding dim(): a present
- * but invalid value throws rather than minting
+ * Quality is an integer 1-100 in the grammar (0 has no
+ * meaning distinct from the minimum for any encoder, so
+ * the server rejects it at parse). It is not a dimension,
+ * so it gets its own validation instead of riding dim():
+ * a present but invalid value throws rather than minting
  * filters:quality(undefined) or quality(150).
  */
 const quality = (v: number | string): number => {
   const n = Number(v);
-  if (!Number.isInteger(n) || n < 0 || n > 100) {
+  if (!Number.isInteger(n) || n < 1 || n > 100) {
     throw new Error(
-      `crabcrop provider: quality must be an integer between 0 and 100, got ${v}`,
+      `crabcrop provider: quality must be an integer between 1 and 100, got ${v}`,
     );
   }
   return n;
@@ -112,8 +114,19 @@ export const getImage = (
         operations.push(`pad:${width}x${height}:blur`);
         break;
       case "inside":
-      case "outside":
         operations.push(`fit-in:${width}x${height}`);
+        break;
+      case "outside":
+        // Nuxt's outside promises the result COVERS the box
+        // (>= the box on both axes) without cropping.
+        // crabcrop has no uncropped cover resize, and the
+        // old mapping to fit-in was the opposite geometry
+        // (result <= box). The honest approximation is a
+        // centered crop to exactly WxH: both dimensions are
+        // honored, at the price of the overflow the cover
+        // promise would have kept (issue #153, documented
+        // in the provider README).
+        operations.push(`crop:${width}x${height}`);
         break;
       case "fill":
         operations.push(`${width}x${height}`);
