@@ -144,10 +144,15 @@ jobs:
       # the avif-decode feature (dist-workspace.toml) builds
       # dav1d from vendored sources, which needs meson and
       # ninja on the PATH.
-      - name: Install meson and ninja (vendored dav1d)
+      - name: Install meson, ninja, and nasm (vendored dav1d)
         run: |
           python3 -m pip install --user --break-system-packages meson ninja
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y nasm
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          brew install nasm
+      fi
       - name: Build artifacts
         env:
           # Vendored static dav1d, so the release binaries
