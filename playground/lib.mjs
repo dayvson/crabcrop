@@ -104,6 +104,7 @@ const FILTER_BLURBS = {
   text: "draw a text overlay (needs a font on the server)",
   rgb: "tint toward the given red/green/blue amounts",
   curve: "tone curve: remap the named channel (rgb, r, g, or b) through 2 to 16 x,y control points, linearly interpolated, ends clamped",
+  convolution: "convolve with a 3x3 or 5x5 kernel: 9 or 25 row-major values (plain decimals, -1024..1024), then a normalize flag (0 or 1); edges replicate",
   trim: "trim uniform borders",
   dpr: "device pixel ratio the sizes are multiplied by",
   watermark: "overlay a watermark image",
@@ -216,6 +217,16 @@ function isFloat(s) {
   return RUST_FLOAT.test(s) && Number.isFinite(Number(s));
 }
 
+const KERNEL_VALUE = /^-?\d+(\.\d+)?$/;
+
+function isKernelValue(s) {
+  // The server's kernel-value grammar (url.rs
+  // parse_kernel_value): the rotate angle's strict decimal
+  // form, no exponent and no leading dot, bounded to 1024
+  // in absolute value.
+  return KERNEL_VALUE.test(s) && Math.abs(Number(s)) <= 1024;
+}
+
 function percentDecodable(s) {
   try {
     return decodeURIComponent(s);
@@ -274,6 +285,14 @@ function validateFilter(name, args) {
         if (Number(coords[i]) <= Number(coords[i - 2])) return bad;
       }
       return null;
+    }
+    case "convolution": {
+      if (args === null) return bad;
+      const parts = args.split(",");
+      if (parts.length !== 10 && parts.length !== 26) return bad;
+      const flag = parts[parts.length - 1];
+      if (flag !== "0" && flag !== "1") return bad;
+      return parts.slice(0, -1).every((p) => isKernelValue(p)) ? null : bad;
     }
     case "facepad":
       return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 3

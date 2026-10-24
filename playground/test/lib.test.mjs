@@ -173,6 +173,15 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:curve(rgb,0,0,256,255)/" + SRC, true, SRC], // coordinate past 255
     ["filters:curve(rgb,128,0,64,255)/" + SRC, true, SRC], // x decreasing
     ["filters:curve(rgb,0,0,0,255)/" + SRC, true, SRC], // x repeated
+    ["filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)/" + SRC, false, SRC], // a 3x3 sharpen kernel
+    ["filters:convolution(0.0625,0.125,0.0625,0.125,0.25,0.125,0.0625,0.125,0.0625,1)/" + SRC, false, SRC], // a normalized gaussian
+    ["filters:convolution(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)/" + SRC, false, SRC], // a 5x5 identity kernel
+    ["filters:convolution(0,0,0,0,1,0,0,0,0)/" + SRC, true, SRC], // 8 values plus the flag
+    ["filters:convolution(0,0,0,0,1,0,0,0,0,0,0)/" + SRC, true, SRC], // 10 values plus the flag
+    ["filters:convolution(0,-1,0,-1,5,-1,0,-1,0,2)/" + SRC, true, SRC], // flag other than 0 or 1
+    ["filters:convolution(0,-1,0,-1,1e2,-1,0,-1,0,0)/" + SRC, true, SRC], // exponent spelling
+    ["filters:convolution(0,-1,0,-1,.5,-1,0,-1,0,0)/" + SRC, true, SRC], // leading dot
+    ["filters:convolution(0,-1,0,-1,1025,-1,0,-1,0,0)/" + SRC, true, SRC], // value past the 1024 bound
     ["filters:monochrome(ff8000):pixelate(8)/" + SRC, false, SRC],
     ["filters:pixelate(0)/" + SRC, true, SRC],
     ["filters:flip(x)/" + SRC, true, SRC],

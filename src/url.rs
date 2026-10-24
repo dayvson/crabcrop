@@ -74,6 +74,13 @@ pub enum ParseError {
     /// x values not strictly increasing. Carries the offending
     /// segment.
     InvalidCurve(String),
+    /// A `convolution(...)` filter inside a `filters:...`
+    /// segment did not parse: a value count other than 9
+    /// kernel values plus the flag (3x3) or 25 plus the flag
+    /// (5x5), a value outside the kernel grammar or the
+    /// [`MAX_KERNEL_VALUE`] bound, or a normalize flag other
+    /// than 0 or 1. Carries the offending segment.
+    InvalidConvolution(String),
     /// No source URL followed the operations.
     MissingSourceUrl,
 }
@@ -100,6 +107,7 @@ impl ParseError {
             ParseError::PresetsOnly(_) => "presets_only",
             ParseError::InvalidFilters(_) => "invalid_filters",
             ParseError::InvalidCurve(_) => "invalid_curve",
+            ParseError::InvalidConvolution(_) => "invalid_convolution",
             ParseError::MissingSourceUrl => "missing_source_url",
         }
     }
@@ -132,6 +140,9 @@ impl std::fmt::Display for ParseError {
             }
             ParseError::InvalidCurve(seg) => {
                 write!(f, "invalid curve filter in segment: {seg}")
+            }
+            ParseError::InvalidConvolution(seg) => {
+                write!(f, "invalid convolution filter in segment: {seg}")
             }
             ParseError::MissingSourceUrl => write!(f, "missing source URL"),
         }
@@ -341,6 +352,13 @@ pub enum Filter {
     /// is linear; inputs outside the points' x range clamp
     /// to the nearest end point's y.
     Curve(CurveChannel, Vec<(u8, u8)>),
+    /// A caller-supplied convolution kernel: 9 values (3x3)
+    /// or 25 (5x5) in row-major order, each within
+    /// [`MAX_KERNEL_VALUE`] in absolute value. With the
+    /// normalize flag set, the kernel is scaled by the sum
+    /// of its entries before it applies (a zero sum applies
+    /// the kernel as written).
+    Convolution(Vec<f64>, bool),
     /// Histogram equalization per channel.
     Equalize,
     /// Rotate by the given angle in degrees (issue #144):
@@ -552,6 +570,14 @@ pub const MAX_DIMENSION: u32 = 16_383;
 /// may shorten its response's lifetime, never extend it past
 /// the default the immutable policy already grants.
 pub const MAX_CACHE_AGE: u32 = 31_536_000;
+
+/// The largest absolute value a `convolution(...)` kernel
+/// entry may carry. Kernel entries are weights, not pixel
+/// values; real kernels (sharpen, blur, edge detection) stay
+/// in single digits, so the bound is generous headroom that
+/// still keeps a hostile kernel's accumulated sums far from
+/// any overflow concern.
+pub const MAX_KERNEL_VALUE: f64 = 1024.0;
 
 fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
     let (flip, digits) = match part.strip_prefix('-') {
@@ -860,6 +886,47 @@ fn format_angle(value: f32) -> String {
     }
 }
 
+/// Parse a `convolution` kernel value: the rotate angle's
+/// strict decimal grammar (an optional minus, digits, and an
+/// optional fraction, with no exponent and no leading dot),
+/// so every implementation of the grammar reads the same
+/// strings. Bounded to [`MAX_KERNEL_VALUE`] in absolute
+/// value; decimals are expected here (a gaussian kernel is
+/// fractions), unlike the integer-only filter arguments.
+fn parse_kernel_value(text: &str) -> Result<f64, ()> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (digits, None),
+    };
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    if let Some(f) = fraction
+        && (f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(());
+    }
+    let value: f64 = text.parse().map_err(|_| ())?;
+    if !value.is_finite() || value.abs() > MAX_KERNEL_VALUE {
+        return Err(());
+    }
+    Ok(value)
+}
+
+/// The canonical spelling of a kernel value, matching the
+/// rotate angle's: whole values print as integers, fractions
+/// use the shortest round-trip form, so spellings like
+/// `0.50` and `-1.0` collapse to `0.5` and `-1` in the
+/// canonical form and share a cache key.
+pub(crate) fn format_kernel_value(value: f64) -> String {
+    if value == value.trunc() {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
 fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidFilters(seg.to_string());
     if rest.is_empty() {
@@ -973,6 +1040,29 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     points.push((x, y));
                 }
                 Filter::Curve(channel, points)
+            }
+            ("convolution", Some(p)) => {
+                // convolution(<v1>,...,<vN>,<normalize>): the
+                // kernel values in row-major order, 9 of them
+                // (3x3) or 25 (5x5), then the normalize flag,
+                // 0 or 1. Convolution failures carry their own
+                // error code (invalid_convolution), not the
+                // segment-wide invalid_filters.
+                let bad_conv = || ParseError::InvalidConvolution(seg.to_string());
+                let parts: Vec<&str> = p.split(',').collect();
+                if parts.len() != 10 && parts.len() != 26 {
+                    return Err(bad_conv());
+                }
+                let normalize = match parts[parts.len() - 1] {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(bad_conv()),
+                };
+                let mut values = Vec::with_capacity(parts.len() - 1);
+                for part in &parts[..parts.len() - 1] {
+                    values.push(parse_kernel_value(part).map_err(|_| bad_conv())?);
+                }
+                Filter::Convolution(values, normalize)
             }
             ("equalize", None) => Filter::Equalize,
             ("removebg", None) => Filter::RemoveBg,
@@ -1786,6 +1876,17 @@ fn filter_text(filter: &Filter) -> String {
             text.push(')');
             text
         }
+        Filter::Convolution(values, normalize) => {
+            let mut text = "convolution(".to_string();
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    text.push(',');
+                }
+                text.push_str(&format_kernel_value(*v));
+            }
+            text.push_str(if *normalize { ",1)" } else { ",0)" });
+            text
+        }
         Filter::Equalize => "equalize".to_string(),
         Filter::Rotate(v) => format!("rotate({})", format_angle(*v)),
         Filter::Trim(v) => format!("trim({v})"),
@@ -2331,6 +2432,10 @@ mod tests {
             (ParseError::PresetsOnly("x".into()), "presets_only"),
             (ParseError::InvalidFilters("x".into()), "invalid_filters"),
             (ParseError::InvalidCurve("x".into()), "invalid_curve"),
+            (
+                ParseError::InvalidConvolution("x".into()),
+                "invalid_convolution",
+            ),
             (ParseError::MissingSourceUrl, "missing_source_url"),
         ];
         let mut seen = std::collections::HashSet::new();
@@ -2434,6 +2539,8 @@ mod tests {
             "filters:fill(00ff00):radius(1,2,3,4):border(3,102030):mask(ellipse)",
             "filters:sepia:duotone(101010,f0e0c0):monochrome(336699):pixelate(8)",
             "filters:curve(rgb,0,0,255,255):curve(b,32,10,224,245)",
+            "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)",
+            "filters:convolution(0.0625,0.125,0.0625,0.125,0.25,0.125,0.0625,0.125,0.0625,1)",
             "filters:flip(h):blur_region(1,2,30,40):pixelate_region(5,6,70,80)",
             "300x200/filters:grayscale",
             "filters:grayscale/300x200/filters:blur(2)",
@@ -2972,6 +3079,111 @@ mod tests {
         assert_eq!(
             parse_operations("filters:curve/example.com/img.jpg"),
             Err(ParseError::InvalidFilters("filters:curve".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_convolution_filter() {
+        let (ops, _) =
+            parse_operations("filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)/example.com/img.jpg")
+                .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Convolution(
+                vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0],
+                false,
+            )])]
+        );
+        // Decimal values (a gaussian kernel) and the flag.
+        let (ops, _) = parse_operations(
+            "filters:convolution(0.0625,0.125,0.0625,0.125,0.25,0.125,0.0625,0.125,0.0625,1)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Convolution(
+                vec![
+                    0.0625, 0.125, 0.0625, 0.125, 0.25, 0.125, 0.0625, 0.125, 0.0625
+                ],
+                true,
+            )])]
+        );
+        // A 5x5 kernel parses: 25 values plus the flag.
+        let taps: Vec<String> = (0..25)
+            .map(|i| {
+                if i == 12 {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            })
+            .collect();
+        assert!(
+            parse_operations(&format!(
+                "filters:convolution({},0)/example.com/img.jpg",
+                taps.join(",")
+            ))
+            .is_ok()
+        );
+        // The bound itself is allowed, on either sign.
+        assert!(
+            parse_operations("filters:convolution(1024,-1024,0,0,1,0,0,0,0,0)/example.com/img.jpg")
+                .is_ok()
+        );
+        // Spelling variants collapse in the canonical form:
+        // trailing fraction zeros and a `.0` are the value,
+        // not the spelling.
+        assert_eq!(
+            canonical_key_form(
+                "filters:convolution(0.50,-1.0,0,0,1,0,0,0,0,0)/example.com/img.jpg"
+            ),
+            "filters:convolution(0.5,-1,0,0,1,0,0,0,0,0)/example.com/img.jpg"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_convolutions() {
+        // Every convolution failure is invalid_convolution,
+        // not the segment-wide invalid_filters.
+        for seg in [
+            // Wrong counts: 8 values, 10 values, 24 values,
+            // 26 values (each plus the flag).
+            "filters:convolution(0,0,0,0,1,0,0,0,0)",
+            "filters:convolution(0,0,0,0,1,0,0,0,0,0,0)",
+            "filters:convolution(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)",
+            "filters:convolution(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0)",
+            // The flag is exactly 0 or 1.
+            "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,2)",
+            "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,-1)",
+            "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,true)",
+            "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,01)",
+            // Values outside the strict decimal grammar: no
+            // exponent, no leading dot, no plus, no bare dot.
+            "filters:convolution(0,-1,0,-1,1e2,-1,0,-1,0,0)",
+            "filters:convolution(0,-1,0,-1,.5,-1,0,-1,0,0)",
+            "filters:convolution(0,-1,0,-1,+5,-1,0,-1,0,0)",
+            "filters:convolution(0,-1,0,-1,5.,-1,0,-1,0,0)",
+            "filters:convolution(0,-1,0,-1,x,-1,0,-1,0,0)",
+            "filters:convolution(0,-1,0,-1,,-1,0,-1,0,0)",
+            // Values past the kernel bound.
+            "filters:convolution(0,-1,0,-1,1025,-1,0,-1,0,0)",
+            "filters:convolution(0,-1,0,-1,-1024.5,-1,0,-1,0,0)",
+            "filters:convolution(0,-1,0,-1,999999999999999999999,-1,0,-1,0,0)",
+        ] {
+            assert_eq!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")),
+                Err(ParseError::InvalidConvolution(seg.to_string())),
+                "segment: {seg:?}"
+            );
+        }
+        // A bare `convolution` with no argument list is a
+        // plain invalid filters segment, like every other
+        // filter.
+        assert_eq!(
+            parse_operations("filters:convolution/example.com/img.jpg"),
+            Err(ParseError::InvalidFilters(
+                "filters:convolution".to_string()
+            ))
         );
     }
 

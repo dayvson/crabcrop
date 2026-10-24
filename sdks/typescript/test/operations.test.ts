@@ -83,6 +83,28 @@ test("typed filters match the canonical spellings", () => {
       ]),
       "curve(g,0,0,128,255,255,255)",
     ],
+    [
+      filter.convolution([0, -1, 0, -1, 5, -1, 0, -1, 0]),
+      "convolution(0,-1,0,-1,5,-1,0,-1,0,0)",
+    ],
+    [
+      filter.convolution([0, -1, 0, -1, 5, -1, 0, -1, 0], true),
+      "convolution(0,-1,0,-1,5,-1,0,-1,0,1)",
+    ],
+    [
+      filter.convolution(
+        [0.0625, 0.125, 0.0625, 0.125, 0.25, 0.125, 0.0625, 0.125, 0.0625],
+        1,
+      ),
+      "convolution(0.0625,0.125,0.0625,0.125,0.25,0.125,0.0625,0.125,0.0625,1)",
+    ],
+    [
+      filter.convolution(
+        Array.from({ length: 25 }, (_, i) => (i === 12 ? 1 : 0)),
+        0,
+      ),
+      "convolution(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)",
+    ],
     [filter.rotate(45.5), "rotate(45.5)"],
     [filter.rotate(90), "rotate(90)"],
     [filter.rotate(-30.25), "rotate(-30.25)"],
@@ -181,6 +203,12 @@ test("typed builders reject what the server would reject", () => {
     () => filter.curve("rgb", [[0, 0], [256, 255]]),
     () => filter.curve("rgb", [[0, 0], [255, -1]]),
     () => filter.curve("rgb", [[0, 0], [255, 255.5]]),
+    () => filter.convolution([0, 0, 0, 0, 1, 0, 0, 0]),
+    () => filter.convolution(Array.from({ length: 26 }, () => 0)),
+    () => filter.convolution([0, -1, 0, -1, 1025, -1, 0, -1, 0]),
+    () => filter.convolution([0, -1, 0, -1, Number.NaN, -1, 0, -1, 0]),
+    () => filter.convolution([0, -1, 0, -1, Infinity, -1, 0, -1, 0]),
+    () => filter.convolution([0, -1, 0, -1, 5, -1, 0, -1, 0], 2 as never),
     () => filter.rotate(36001),
     () => ops.size(16384, 10),
     () => ops.size(1.5, 10),

@@ -46,5 +46,11 @@
     "secret": "s3cr3t",
     "remainder": "filters:curve(rgb,0,0,255,255)/https://example.com/photo.jpg",
     "signature": "d0976f5bfc4ac633ca3f9f26772fa185de1a6a88b5b8d95be95df84d3ffdbedf"
+  },
+  {
+    "description": "Convolution filter",
+    "secret": "s3cr3t",
+    "remainder": "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)/https://example.com/photo.jpg",
+    "signature": "8002b5a43eeef37c6a89d2b6a6499db9e8d3773d8778c2f5e72fee8dba4f7c5f"
   }
 ]
