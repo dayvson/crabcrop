@@ -20,6 +20,19 @@ use image::DynamicImage;
 use crate::color::SourceMeta;
 use crate::engine::{EngineError, MAX_DECODE_ALLOC, MAX_DECODE_DIMENSION};
 
+/// The decode budget in pixels: the 256 MiB allocation limit
+/// expressed as RGBA pixels.
+const MAX_DECODE_PIXELS: u64 = MAX_DECODE_ALLOC / 4;
+
+/// How far an H.265 coded picture may run past its item's
+/// declared size before the file is rejected as mismatched.
+/// Encoders pad the coded picture to a coding-tree-block
+/// boundary (64 samples at most) and signal the difference as
+/// the conformance window, so legitimate files stay well under
+/// this; the audit's attack shape (a 64x64 declaration in front
+/// of a 16384x16384 coded picture) is nowhere near it.
+const SPS_SIZE_TOLERANCE: u32 = 128;
+
 /// The decoded image's own axes are bounded through the decoder's
 /// limits, set from the same constants the image-crate path uses,
 /// so a HEIC source cannot allocate past the shared budget:
@@ -28,11 +41,246 @@ fn decode_options() -> oxideav_heif::DecodeOptions {
     oxideav_heif::DecodeOptions::default()
         .with_max_width(Some(MAX_DECODE_DIMENSION))
         .with_max_height(Some(MAX_DECODE_DIMENSION))
-        .with_max_pixels(Some(MAX_DECODE_ALLOC / 4))
+        .with_max_pixels(Some(MAX_DECODE_PIXELS))
 }
 
 fn decode_failed(cause: impl std::fmt::Display) -> EngineError {
     EngineError::Decode(format!("HEIC/HEIF source: {cause}"))
+}
+
+/// Enforce the shared decode budget on everything the primary
+/// decode is about to decode, before the decoder allocates for
+/// any of it (issue #184; audit findings R2-02 and R2-11).
+///
+/// The decoder's own limit check covers only the primary item's
+/// announced output size. Inside a coded decode, though, the
+/// H.265 codec allocates its planes from the SPS geometry in
+/// the bitstream, which nothing ties to the announced size: a
+/// 64x64 ispe in front of a 16384x16384 SPS decodes into
+/// roughly 768 MiB of planes per picture, an allocation failure
+/// there aborts the process instead of unwinding, and the depth
+/// and gain map items decode just as eagerly with no size check
+/// at all. So this walks every item the decode can reach (the
+/// primary's derivation tree with its alpha and depth
+/// auxiliaries, the gain map item, and the primary's `altr`
+/// alternatives, which the decoder falls back to when the
+/// primary itself fails) and checks each one twice:
+///
+/// - its announced size against the shared budget, through
+///   [`check_announced_size`], and
+/// - every HEVC SPS it carries, in its configuration record
+///   and in band in its payload, against that announced size,
+///   through [`check_coded_geometry`].
+///
+/// Residuals, honestly: non-HEVC coded items (AV1, AVC, VVC)
+/// carry no SPS this module can parse with the crates at hand,
+/// so their coded geometry is bounded only by the announced
+/// size check, the decoder's own frame cap, and the post-decode
+/// recheck in [`decode_heic`]; and the `tili` packed-tile
+/// stream is not a plain NAL stream to scan, so a tiled item is
+/// covered through its configuration record only.
+fn validate_decode_budget(bytes: &[u8]) -> Result<(), EngineError> {
+    let file = oxideav_heif::HeifFile::parse_borrowed(bytes).map_err(decode_failed)?;
+    let mut seen = std::collections::HashSet::new();
+    if let Ok(node) = oxideav_heif::build_primary_graph(&file) {
+        validate_node(&file, &node, &mut seen)?;
+    }
+    let Ok(primary) = file.primary_item() else {
+        return Ok(());
+    };
+    if let Some(gain) = gain_map_node(&file, primary.id) {
+        validate_node(&file, &gain, &mut seen)?;
+    }
+    if let Ok(meta) = file.meta() {
+        for group in meta.groups_containing(primary.id, b"altr") {
+            for &alt in &group.entity_ids {
+                if alt != primary.id
+                    && let Ok(node) = oxideav_heif::build_graph(&file, alt)
+                {
+                    validate_node(&file, &node, &mut seen)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The gain map image of a primary that is not itself a `tmap`
+/// (a `tmap` primary's gain map is its second input, already in
+/// its graph): the second derivation input of the `tmap` item
+/// whose first input is the primary, mirroring the decoder's
+/// own lookup in `find_gain_map`.
+fn gain_map_node<D: AsRef<[u8]>>(
+    file: &oxideav_heif::HeifFile<D>,
+    primary_id: u32,
+) -> Option<oxideav_heif::ImageNode> {
+    let meta = file.meta().ok()?;
+    let tmap = meta.items.iter().find(|item| {
+        item.item_type == oxideav_heif::meta::ITEM_TYPE_TMAP
+            && meta.derivation_inputs(item.id).first() == Some(&primary_id)
+    })?;
+    let inputs = meta.derivation_inputs(tmap.id);
+    oxideav_heif::build_graph(file, *inputs.get(1)?).ok()
+}
+
+/// Check one graph node and, recursively, everything it pulls
+/// into the decode: derivation inputs, the alpha auxiliary, and
+/// the depth auxiliary. Items are visited once per validation;
+/// an item's properties do not depend on where it is referenced
+/// from, so a repeat visit could only repeat the verdict.
+fn validate_node<D: AsRef<[u8]>>(
+    file: &oxideav_heif::HeifFile<D>,
+    node: &oxideav_heif::ImageNode,
+    seen: &mut std::collections::HashSet<u32>,
+) -> Result<(), EngineError> {
+    if !seen.insert(node.item.id) {
+        return Ok(());
+    }
+    if let Ok((width, height)) = node.output_size() {
+        check_announced_size(node.item.id, width, height)?;
+    }
+    validate_coded_geometry(file, node)?;
+    for input in &node.inputs {
+        validate_node(file, input, seen)?;
+    }
+    if let Some(alpha) = &node.alpha {
+        validate_node(file, alpha, seen)?;
+    }
+    if let Some(depth) = &node.depth {
+        validate_node(file, depth, seen)?;
+    }
+    Ok(())
+}
+
+/// One item's announced size against the shared decode budget:
+/// the same 16384 px per axis and 256 MiB of RGBA pixels every
+/// other decoder is held to. The decoder itself applies this
+/// only to the primary's output; auxiliaries, grid tiles, and
+/// gain maps announce sizes nothing else checks.
+fn check_announced_size(item_id: u32, width: u32, height: u32) -> Result<(), EngineError> {
+    if width > MAX_DECODE_DIMENSION || height > MAX_DECODE_DIMENSION {
+        return Err(decode_failed(format!(
+            "item {item_id} announces {width}x{height}, past the {MAX_DECODE_DIMENSION} px decode limit"
+        )));
+    }
+    if width as u64 * height as u64 > MAX_DECODE_PIXELS {
+        return Err(decode_failed(format!(
+            "item {item_id} announces {width}x{height}, past the decode pixel budget"
+        )));
+    }
+    Ok(())
+}
+
+/// Check every HEVC SPS an item carries against its declared
+/// size: the configuration record's arrays (hvcC, or lhvC for a
+/// layered item) and any SPS travelling in band in the item
+/// payload, which the codec would honor just the same. Items of
+/// other codecs, and items whose SPS does not parse (the codec
+/// rejects those itself), pass without a verdict.
+fn validate_coded_geometry<D: AsRef<[u8]>>(
+    file: &oxideav_heif::HeifFile<D>,
+    node: &oxideav_heif::ImageNode,
+) -> Result<(), EngineError> {
+    let mut configs: Vec<(&[oxideav_heif::hvcc::NalArray], u8)> = Vec::new();
+    if let Some(hvcc) = node.properties.hvcc() {
+        configs.push((&hvcc.arrays, hvcc.length_size));
+    }
+    if let Some(lhvc) = node.properties.lhvc() {
+        configs.push((&lhvc.arrays, lhvc.length_size));
+    }
+    if configs.is_empty() {
+        return Ok(());
+    }
+    let ispe = node.ispe();
+    for (arrays, _) in &configs {
+        for array in *arrays {
+            if array.nal_unit_type != 33 {
+                continue; // not an SPS array
+            }
+            for nal in &array.nal_units {
+                check_sps_nal(nal, node.item.id, ispe)?;
+            }
+        }
+    }
+    let length_size = configs[0].1;
+    if let Ok(data) = file.item_data(node.item.id)
+        && let Ok(nals) = oxideav_heif::hvcc::split_length_prefixed(&data, length_size)
+    {
+        for nal in nals {
+            if nal.len() > 2 && (nal[0] >> 1) & 0x3f == 33 {
+                check_sps_nal(nal, node.item.id, ispe)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse one SPS NAL (header included, as the configuration
+/// record and the payload both carry it) and check its coded
+/// geometry. An SPS that does not parse yields no verdict: the
+/// codec runs the same parser and fails the decode itself.
+fn check_sps_nal(nal: &[u8], item_id: u32, ispe: Option<(u32, u32)>) -> Result<(), EngineError> {
+    let unescaped = oxideav_h265::nal::strip_emulation_prevention(nal);
+    if unescaped.len() <= 2 {
+        return Ok(());
+    }
+    let Ok(sps) = oxideav_h265::sps::SeqParameterSet::parse(&unescaped[2..]) else {
+        return Ok(());
+    };
+    check_coded_geometry(
+        item_id,
+        sps.pic_width_in_luma_samples,
+        sps.pic_height_in_luma_samples,
+        ispe,
+    )
+}
+
+/// The coded-geometry rule itself: a coded picture may not pass
+/// the per-axis decode cap at all, and may exceed the item's
+/// declared size only by [`SPS_SIZE_TOLERANCE`] per axis (the
+/// block-alignment padding every encoder writes). With no
+/// declared size to compare against, the coded picture is held
+/// to the pixel budget directly.
+fn check_coded_geometry(
+    item_id: u32,
+    coded_width: u32,
+    coded_height: u32,
+    ispe: Option<(u32, u32)>,
+) -> Result<(), EngineError> {
+    if coded_width > MAX_DECODE_DIMENSION || coded_height > MAX_DECODE_DIMENSION {
+        return Err(decode_failed(format!(
+            "item {item_id} codes {coded_width}x{coded_height}, past the {MAX_DECODE_DIMENSION} px decode limit"
+        )));
+    }
+    match ispe {
+        Some((width, height)) => {
+            if coded_width > width.saturating_add(SPS_SIZE_TOLERANCE)
+                || coded_height > height.saturating_add(SPS_SIZE_TOLERANCE)
+            {
+                return Err(decode_failed(format!(
+                    "item {item_id} codes {coded_width}x{coded_height} against a declared {width}x{height}"
+                )));
+            }
+        }
+        None => {
+            if coded_width as u64 * coded_height as u64 > MAX_DECODE_PIXELS {
+                return Err(decode_failed(format!(
+                    "item {item_id} codes {coded_width}x{coded_height}, past the decode pixel budget"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Metadata the decoder hands back, held to the same size caps
+/// the JPEG/PNG extraction path applies (issue #184): the crate
+/// is built without its `deflate` feature, so a deflated
+/// metadata item can no longer inflate toward the crate's 1 GiB
+/// cap on every decode, and anything still oversized after
+/// decode is dropped rather than cloned into the pipeline.
+fn cap_metadata(bytes: Option<Vec<u8>>, cap: usize) -> Option<Vec<u8>> {
+    bytes.filter(|bytes| bytes.len() <= cap)
 }
 
 /// Decode a HEIC/HEIF source to an upright image plus its source
@@ -41,6 +289,11 @@ fn decode_failed(cause: impl std::fmt::Display) -> EngineError {
 /// Rust and its error surface on hostile input is errors, not
 /// aborts (320 mutants, zero panics, in the issue #163 spike).
 pub(crate) fn decode_heic(bytes: &[u8]) -> Result<(DynamicImage, SourceMeta), EngineError> {
+    // The budget is enforced on the declared and coded geometry
+    // of everything the decode will touch before it starts;
+    // see validate_decode_budget for why the decoder's own
+    // checks do not cover this.
+    validate_decode_budget(bytes)?;
     let mut img = oxideav_heif::decode_with(bytes, &decode_options()).map_err(decode_failed)?;
     // The colour the decoder assumed is only a default when the
     // file carries no nclx colr box; the bitstream's own word on
@@ -49,9 +302,10 @@ pub(crate) fn decode_heic(bytes: &[u8]) -> Result<(DynamicImage, SourceMeta), En
         img.color = color;
     }
     let (width, height) = (img.width, img.height);
-    // The decoder's limits are the first line; the decoded size
-    // is re-checked against the shared budget in our own code,
-    // the same defence in depth decode_image applies.
+    // The pre-decode validation and the decoder's limits run
+    // first; the decoded size is still re-checked against the
+    // shared budget in our own code, the same defence in depth
+    // decode_image applies.
     crate::engine::check_decoded_dimensions(width as u64, height as u64)?;
     if width as u64 * height as u64 * 4 > MAX_DECODE_ALLOC {
         return Err(decode_failed(format!(
@@ -71,9 +325,9 @@ pub(crate) fn decode_heic(bytes: &[u8]) -> Result<(DynamicImage, SourceMeta), En
         image = crate::engine::apply_orientation(image, orientation);
     }
     let mut meta = SourceMeta {
-        icc: img.metadata.icc.clone(),
-        exif_tiff: img.metadata.exif.clone(),
-        xmp: img.metadata.xmp.clone(),
+        icc: cap_metadata(img.metadata.icc.clone(), crate::color::MAX_ICC_BYTES),
+        exif_tiff: cap_metadata(img.metadata.exif.clone(), crate::color::MAX_META_BYTES),
+        xmp: cap_metadata(img.metadata.xmp.clone(), crate::color::MAX_META_BYTES),
         photoshop: None,
     };
     // The pixels are upright now; a preserved EXIF must say so,
@@ -415,5 +669,111 @@ mod tests {
                 other => panic!("{w}x{h}: expected a decode error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn coded_geometry_far_past_the_declared_size_is_rejected() {
+        // The audit's mismatch shape, in miniature: shrink the
+        // grid tiles' shared ispe to 16x16 while their SPS still
+        // codes 256x256 pictures. The coded geometry runs far
+        // past the declared size plus the padding tolerance, so
+        // validation must refuse the file before the codec
+        // allocates a single plane. The rejection message is the
+        // coded-geometry one, which only the pre-decode check
+        // produces.
+        let mut bytes = GRID.to_vec();
+        let mut rewritten = 0;
+        let mut pos = 0;
+        while let Some(found) = bytes[pos..].windows(4).position(|w| w == b"ispe") {
+            let at = pos + found;
+            let dims = (
+                u32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap()),
+                u32::from_be_bytes(bytes[at + 12..at + 16].try_into().unwrap()),
+            );
+            if dims == (256, 256) {
+                bytes[at + 8..at + 12].copy_from_slice(&16u32.to_be_bytes());
+                bytes[at + 12..at + 16].copy_from_slice(&16u32.to_be_bytes());
+                rewritten += 1;
+            }
+            pos = at + 4;
+        }
+        assert_eq!(rewritten, 1, "the tiles share one ispe box");
+        match decode_heic(&bytes) {
+            Err(EngineError::Decode(msg)) => {
+                assert!(msg.contains("codes 256x256"), "{msg}")
+            }
+            other => panic!("expected a coded-geometry rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coded_geometry_rule_bounds() {
+        // Coded size equal to the declaration, and padding out
+        // to the tolerance, are what every encoder produces.
+        check_coded_geometry(7, 64, 64, Some((64, 64))).unwrap();
+        check_coded_geometry(7, 64 + SPS_SIZE_TOLERANCE, 64, Some((64, 64))).unwrap();
+        // One sample past the tolerance is the mismatch shape.
+        let err =
+            check_coded_geometry(7, 64 + SPS_SIZE_TOLERANCE + 1, 64, Some((64, 64))).unwrap_err();
+        assert!(format!("{err}").contains("codes"), "{err}");
+        // The audit's numbers, verbatim: a small declaration in
+        // front of a near-cap coded picture.
+        assert!(check_coded_geometry(7, 16_384, 16_384, Some((64, 64))).is_err());
+        // The per-axis cap binds even when the declaration agrees.
+        check_coded_geometry(7, MAX_DECODE_DIMENSION, 8, Some((MAX_DECODE_DIMENSION, 8))).unwrap();
+        assert!(
+            check_coded_geometry(
+                7,
+                MAX_DECODE_DIMENSION + 1,
+                8,
+                Some((MAX_DECODE_DIMENSION, 8))
+            )
+            .is_err()
+        );
+        // No declared size: the pixel budget binds the coded
+        // picture directly, at the budget exactly and past it.
+        check_coded_geometry(7, 8192, 8192, None).unwrap();
+        assert!(check_coded_geometry(7, 8192, 8193, None).is_err());
+    }
+
+    #[test]
+    fn announced_size_rule_bounds() {
+        check_announced_size(7, MAX_DECODE_DIMENSION, 8).unwrap();
+        check_announced_size(7, 8192, 8192).unwrap(); // exactly the pixel budget
+        assert!(check_announced_size(7, MAX_DECODE_DIMENSION + 1, 8).is_err());
+        assert!(check_announced_size(7, 8192, 8193).is_err());
+    }
+
+    #[test]
+    fn deflated_metadata_is_never_inflated() {
+        // R2-11: with the crate's deflate feature off, a deflated
+        // metadata payload (here 1 MiB of zeros, a few KB on the
+        // wire) comes back as no metadata at all instead of
+        // being inflated toward the crate's 1 GiB cap.
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![0u8; 1 << 20]).unwrap();
+        let deflated = encoder.finish().unwrap();
+        assert!(deflated.len() < 8192, "deflate test payload sanity");
+        assert_eq!(
+            oxideav_heif::decode::inflate_metadata(&deflated).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn metadata_over_the_cap_is_dropped() {
+        let at_cap = vec![0u8; crate::color::MAX_META_BYTES];
+        assert_eq!(
+            cap_metadata(Some(at_cap.clone()), crate::color::MAX_META_BYTES),
+            Some(at_cap)
+        );
+        let over_cap = vec![0u8; crate::color::MAX_META_BYTES + 1];
+        assert_eq!(
+            cap_metadata(Some(over_cap), crate::color::MAX_META_BYTES),
+            None
+        );
+        assert_eq!(cap_metadata(None, crate::color::MAX_META_BYTES), None);
     }
 }
