@@ -137,6 +137,7 @@ mod debugview;
 mod engine;
 mod filters;
 mod focus;
+mod heic;
 mod loader;
 mod observe;
 mod placeholder;
