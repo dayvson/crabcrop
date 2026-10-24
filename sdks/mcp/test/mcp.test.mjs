@@ -4,7 +4,9 @@
  *
  * Precondition: the debug server binary is built
  * (`cargo build` in the repository root). The image source is
- * the repository's bench fixture, served locally.
+ * the repository's shared test fixture (test-fixtures/),
+ * served locally; CRABCROP_TEST_FIXTURES overrides its
+ * directory.
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -72,7 +74,7 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
     stdio: "ignore",
   });
   const fixtureServer = spawn("python3", ["-m", "http.server", "8912"], {
-    cwd: `${root}../spikes/bench/fixtures`,
+    cwd: process.env.CRABCROP_TEST_FIXTURES ?? `${root}test-fixtures`,
     stdio: "ignore",
   });
   const mcp = spawn(
