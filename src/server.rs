@@ -71,6 +71,10 @@ pub struct AppState {
     /// Disk-backed result storage, the persistent tier under
     /// the memory cache, when configured.
     pub store: Option<Arc<crate::storage::DiskStore>>,
+    /// Shared result storage (issue #142): the multi-replica
+    /// tier behind the local ones, consulted on a local miss
+    /// and written through in the background, when configured.
+    pub shared_store: Option<Arc<crate::s3store::S3Store>>,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
@@ -292,6 +296,9 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
     if let Some(store) = &state.store {
         removed += store.purge_matching(&key_form);
     }
+    if let Some(shared) = &state.shared_store {
+        removed += shared.purge_matching(&key_form).await;
+    }
     state.metrics.record_purge();
     purge_log("purge", target, Some(removed));
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
@@ -329,6 +336,9 @@ async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri)
     let mut removed = state.cache.purge_group(group);
     if let Some(store) = &state.store {
         removed += store.purge_group(group);
+    }
+    if let Some(shared) = &state.shared_store {
+        removed += shared.purge_group(group).await;
     }
     state.metrics.record_purge();
     purge_log("purge-group", &target, Some(removed));
@@ -677,6 +687,26 @@ async fn serve(
             None => None,
         },
     };
+    // Shared tier last (issue #142): a hit is promoted into
+    // both local tiers so the next repeat is local.
+    let hit = match hit {
+        Some(h) => Some(h),
+        None if meta => None,
+        None => match &state.shared_store {
+            Some(shared) => {
+                let found = shared.get(&cache_key).await;
+                if let Some(image) = &found {
+                    cache_status = "crabcrop; hit; detail=\"shared\"";
+                    state.cache.put(cache_key.clone(), image.clone());
+                    if let Some(store) = &state.store {
+                        store.put(&cache_key, image);
+                    }
+                }
+                found
+            }
+            None => None,
+        },
+    };
     if let Some(hit) = hit {
         record.cache_hit = true;
         record.bytes_out = hit.bytes.len();
@@ -854,6 +884,14 @@ async fn serve(
         state.cache.put(cache_key.clone(), entry.clone());
         if let Some(store) = &state.store {
             store.put(&cache_key, &entry);
+        }
+        if let Some(shared) = &state.shared_store {
+            // Write-through off the response path: the local
+            // tiers already hold the entry, and the shared
+            // tier is best-effort by design.
+            let shared = shared.clone();
+            let key = cache_key.clone();
+            tokio::spawn(async move { shared.put(&key, &entry).await });
         }
     }
     record.bytes_out = processed.bytes.len();
@@ -1389,6 +1427,7 @@ mod tests {
             font: None,
             fallback: None,
             store: None,
+            shared_store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -1433,6 +1472,7 @@ mod tests {
             font: None,
             fallback: Some(Fallback::Bytes(Arc::new(png))),
             store: None,
+            shared_store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -1751,6 +1791,7 @@ mod tests {
             font: None,
             fallback: None,
             store: None,
+            shared_store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2036,6 +2077,7 @@ mod tests {
             font: None,
             fallback: None,
             store: None,
+            shared_store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2133,6 +2175,7 @@ mod tests {
             font: None,
             fallback: None,
             store: None,
+            shared_store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2175,6 +2218,7 @@ mod tests {
             fallback: None,
             store: dir
                 .map(|d| Arc::new(crate::storage::DiskStore::open(d, 16 * 1024 * 1024).unwrap())),
+            shared_store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2726,6 +2770,51 @@ mod tests {
             store: Some(Arc::new(
                 crate::storage::DiskStore::open(dir, 16 * 1024 * 1024).unwrap(),
             )),
+            shared_store: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// An app with shared (S3) result storage against the
+    /// fake endpoint, and optionally a disk tier at `dir`.
+    async fn spawn_app_with_shared(dir: Option<&std::path::Path>, endpoint: &str) -> String {
+        let state = AppState {
+            secret: SECRET.to_vec(),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            detect: None,
+            font: None,
+            fallback: None,
+            store: dir
+                .map(|d| Arc::new(crate::storage::DiskStore::open(d, 16 * 1024 * 1024).unwrap())),
+            shared_store: Some(Arc::new(crate::s3store::S3Store::new(
+                "results".into(),
+                String::new(),
+                Some(endpoint.into()),
+                "us-east-1".into(),
+                None,
+            ))),
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2804,6 +2893,84 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "purged: origin refetched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn shared_results_serve_a_second_replica_and_promote_to_disk() {
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let remainder = format!("25x25/{src}");
+        let sig = sign(&remainder);
+        let url_path = format!("{sig}/{remainder}");
+        // Replica A: no local tiers worth the name, processes
+        // and writes through to the shared bucket in the
+        // background.
+        let base_a = spawn_app_with_shared(None, &fake.endpoint).await;
+        let resp = client()
+            .get(format!("{base_a}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The write-through is spawned; wait for it to land.
+        let mut landed = false;
+        for _ in 0..50 {
+            if !fake.objects.lock().unwrap().is_empty() {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(landed, "the shared write-through never landed");
+        // Replica B: cold memory, empty disk, same bucket. The
+        // shared tier answers and the origin is not touched.
+        let base_b = spawn_app_with_shared(Some(&dir), &fake.endpoint).await;
+        let resp = client()
+            .get(format!("{base_b}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "served from the shared tier"
+        );
+        let status = resp
+            .headers()
+            .get("cache-status")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            status.contains("detail=\"shared\""),
+            "cache-status: {status}"
+        );
+        // The shared hit promoted into B's disk: replica C has
+        // only that disk and still does not refetch.
+        let base_c = spawn_app_with_storage(&dir).await;
+        let resp = client()
+            .get(format!("{base_c}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "promoted to disk");
+        // A signed purge fans out to every tier B holds
+        // (memory, disk, shared): three entries.
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let ok = client()
+            .post(format!("{base_b}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        assert!(ok.text().await.unwrap().contains("purged 3"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2890,6 +3057,7 @@ mod tests {
             font: None,
             fallback: None,
             store: None,
+            shared_store: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
