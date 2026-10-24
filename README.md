@@ -489,8 +489,8 @@ For example, a `removebg` request to a server with no background-removal model r
 | --- | --- |
 | `GET /health` | Health check. Returns `200` with the body `ok`. |
 | `GET /metrics` | Prometheus metrics in text format: request counts by status class (`crabcrop_requests_total`), request/load/process durations, cache hit and miss counters, loader and engine error counters, and byte totals. |
-| `POST /purge/<signature>/<path>` | Invalidate every stored variant of one result, in both cache tiers. See below. |
-| `POST /purge-group/<signature>/<group>` | Invalidate every stored result in a cache group, in both cache tiers. See below. |
+| `POST /purge/<signature>/<path>` | Invalidate every stored variant of one result, across all cache tiers. See below. |
+| `POST /purge-group/<signature>/<group>` | Invalidate every stored result in a cache group, across all cache tiers. See below. |
 | `GET /<signature>/...` | Image requests, as documented above. |
 
 ### Purge a cached result
