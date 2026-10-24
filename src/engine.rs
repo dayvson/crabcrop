@@ -388,11 +388,7 @@ impl Engine {
                 )
             })?;
             for class in &directives.classes {
-                if !provider
-                    .classes()
-                    .iter()
-                    .any(|c| c.eq_ignore_ascii_case(class))
-                {
+                if !provider.knows_class(class) {
                     return Err(EngineError::Unsupported(format!(
                         "unknown detection class {class:?}: not in the detection model's vocabulary"
                     )));
@@ -4036,9 +4032,13 @@ mod tests {
     }
 
     impl crate::ai::DetectionProvider for KnownObjects {
-        fn classes(&self) -> &[String] {
-            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-            CLASSES.get_or_init(|| vec!["person".to_string(), "car".to_string()])
+        fn knows_class(&self, name: &str) -> bool {
+            ["person", "car"]
+                .iter()
+                .any(|c| name.eq_ignore_ascii_case(c))
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["person".to_string(), "car".to_string()]
         }
         fn detect(
             &self,
@@ -4052,9 +4052,11 @@ mod tests {
     struct FailingObjects;
 
     impl crate::ai::DetectionProvider for FailingObjects {
-        fn classes(&self) -> &[String] {
-            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-            CLASSES.get_or_init(|| vec!["person".to_string()])
+        fn knows_class(&self, name: &str) -> bool {
+            name.eq_ignore_ascii_case("person")
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["person".to_string()]
         }
         fn detect(
             &self,
@@ -4072,9 +4074,13 @@ mod tests {
     }
 
     impl crate::ai::DetectionProvider for CountingObjects {
-        fn classes(&self) -> &[String] {
-            static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-            CLASSES.get_or_init(|| vec!["person".to_string(), "car".to_string()])
+        fn knows_class(&self, name: &str) -> bool {
+            ["person", "car"]
+                .iter()
+                .any(|c| name.eq_ignore_ascii_case(c))
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["person".to_string(), "car".to_string()]
         }
         fn detect(
             &self,
