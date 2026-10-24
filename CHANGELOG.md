@@ -6,6 +6,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Added
 
+- Per-request cache lifetime: a `maxage:<seconds>` segment (0 to 31536000) overrides the response `Cache-Control` max-age for that request only. Header-only: it never enters the cache key, so URLs differing only in `maxage` share one stored image; `maxage:0` answers `max-age=0` without `immutable`.
 - Caller-supplied focal rectangle for crops: a `focal:<left>x<top>:<right>x<bottom>` segment names the source rectangle the next `crop:` must keep (center and smart crops position on it; directional alignments ignore it). The Thumbor converter now maps the `focal(...)` filter to it.
 - Corner crop alignments: `crop:` accepts `top-left`, `top-right`, `bottom-left`, and `bottom-right` alongside the single-axis alignments (each corner decomposes per axis: its horizontal component positions a width crop, its vertical component a height crop). The Thumbor converter maps corner alignment pairs to them exactly instead of approximating to the vertical side.
 

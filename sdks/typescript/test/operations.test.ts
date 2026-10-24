@@ -25,6 +25,9 @@ test("typed segments match the canonical spellings", () => {
     [ops.pad(100, 100, "FF8800"), "pad:100x100:ff8800"],
     [ops.pad(100, 100, "blur"), "pad:100x100:blur"],
     [ops.preset("thumb"), "preset:thumb"],
+    [ops.maxage(60), "maxage:60"],
+    [ops.maxage(0), "maxage:0"],
+    [ops.maxage(31536000), "maxage:31536000"],
   ];
   for (const [got, want] of cases) {
     assert.equal(got, want);
@@ -146,6 +149,9 @@ test("typed builders reject what the server would reject", () => {
     () => ops.cropRect(10, 10, 10, 20),
     () => ops.focal(10, 10, 10, 20),
     () => ops.focal(-1, 0, 10, 20),
+    () => ops.maxage(-1),
+    () => ops.maxage(31536001),
+    () => ops.maxage(1.5),
     () => filter.text("", 32, "ff8800", "center"),
     () => filter.text("hi", 32, "ff88", "center"),
     () => filter.watermark("", 0, 0, 50),

@@ -52,6 +52,10 @@ pub enum ParseError {
     /// An `exp:...` segment did not carry a valid unix
     /// timestamp. Carries the offending segment.
     InvalidExpiry(String),
+    /// A `maxage:...` segment did not carry a valid cache
+    /// lifetime: whole seconds from 0 to [`MAX_CACHE_AGE`].
+    /// Carries the offending segment.
+    InvalidMaxAge(String),
     /// A `preset:<name>` segment named a preset the server has
     /// not configured. Carries the name.
     UnknownPreset(String),
@@ -84,6 +88,7 @@ impl ParseError {
             ParseError::InvalidFocalRect(_) => "invalid_focal_rect",
             ParseError::InvalidPad(_) => "invalid_pad",
             ParseError::InvalidExpiry(_) => "invalid_expiry",
+            ParseError::InvalidMaxAge(_) => "invalid_maxage",
             ParseError::UnknownPreset(_) => "unknown_preset",
             ParseError::InvalidPreset(_) => "invalid_preset",
             ParseError::PresetsOnly(_) => "presets_only",
@@ -109,6 +114,7 @@ impl std::fmt::Display for ParseError {
             }
             ParseError::InvalidPad(seg) => write!(f, "invalid pad segment: {seg}"),
             ParseError::InvalidExpiry(seg) => write!(f, "invalid expiry segment: {seg}"),
+            ParseError::InvalidMaxAge(seg) => write!(f, "invalid maxage segment: {seg}"),
             ParseError::UnknownPreset(name) => write!(f, "unknown preset: {name}"),
             ParseError::InvalidPreset(text) => write!(f, "invalid preset: {text}"),
             ParseError::PresetsOnly(seg) => {
@@ -488,6 +494,12 @@ pub struct Request<'a> {
 /// ceiling and matches the strictest encoder limit in the
 /// pipeline (WebP's 16383).
 pub const MAX_DIMENSION: u32 = 16_383;
+
+/// The largest cache lifetime a `maxage:` directive may name,
+/// in seconds: one year, the server's own default. A request
+/// may shorten its response's lifetime, never extend it past
+/// the default the immutable policy already grants.
+pub const MAX_CACHE_AGE: u32 = 31_536_000;
 
 fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
     let (flip, digits) = match part.strip_prefix('-') {
@@ -1142,20 +1154,27 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
 /// slashes intact). The first segment that is not an operation starts
 /// the source URL.
 pub fn parse_operations(input: &str) -> Result<(Vec<Operation>, &str), ParseError> {
-    let (operations, source_url, _) = parse_operations_with_expiry(input)?;
+    let (operations, source_url, _, _) = parse_operations_with_expiry(input)?;
     Ok((operations, source_url))
 }
 
+/// What parsing a remainder yields: the operations, the
+/// source URL, and the per-request metadata that is not
+/// operations (the `exp:` expiry, then the `maxage:` cache
+/// lifetime).
+pub type ParsedRemainder<'a> = (Vec<Operation>, &'a str, Option<u64>, Option<u32>);
+
 /// Parse the operation segments off the front of the remainder,
-/// also extracting the request's expiry: an `exp:<unix-seconds>`
-/// segment may appear anywhere among the operations. It is
-/// metadata, not an operation, and it sits inside the signed
-/// remainder, so the HMAC covers it. The last `exp` wins.
-pub fn parse_operations_with_expiry(
-    input: &str,
-) -> Result<(Vec<Operation>, &str, Option<u64>), ParseError> {
+/// also extracting the request's metadata segments: an
+/// `exp:<unix-seconds>` expiry and a `maxage:<seconds>` cache
+/// lifetime may appear anywhere among the operations. Both are
+/// metadata, not operations, and both sit inside the signed
+/// remainder, so the HMAC covers them. The last one of each
+/// kind wins.
+pub fn parse_operations_with_expiry(input: &str) -> Result<ParsedRemainder<'_>, ParseError> {
     let mut operations = Vec::new();
     let mut expiry = None;
+    let mut max_age = None;
     let mut rest = input;
     loop {
         let (seg, remaining) = match rest.split_once('/') {
@@ -1173,6 +1192,20 @@ pub fn parse_operations_with_expiry(
             rest = remaining;
             continue;
         }
+        if let Some(secs) = seg.strip_prefix("maxage:") {
+            if secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ParseError::InvalidMaxAge(seg.to_string()));
+            }
+            let value = secs
+                .parse::<u64>()
+                .map_err(|_| ParseError::InvalidMaxAge(seg.to_string()))?;
+            if value > u64::from(MAX_CACHE_AGE) {
+                return Err(ParseError::InvalidMaxAge(seg.to_string()));
+            }
+            max_age = Some(value as u32);
+            rest = remaining;
+            continue;
+        }
         match parse_operation(seg) {
             Some(Ok(op)) => {
                 operations.push(op);
@@ -1183,7 +1216,7 @@ pub fn parse_operations_with_expiry(
                 if seg.is_empty() {
                     return Err(ParseError::MissingSourceUrl);
                 }
-                return Ok((operations, rest, expiry));
+                return Ok((operations, rest, expiry, max_age));
             }
         }
     }
@@ -1191,16 +1224,18 @@ pub fn parse_operations_with_expiry(
 
 /// Parse an operations-only string, the shape of a preset
 /// definition: every segment must be an operation, and neither
-/// `exp:` metadata nor nested `preset:` references are allowed.
-/// Used to validate preset definitions at server boot; request
-/// expansion itself is textual (see [`expand_presets`]).
+/// `exp:` or `maxage:` metadata nor nested `preset:` references
+/// are allowed: both metadata kinds are per-request, and a
+/// preset is a stable template. Used to validate preset
+/// definitions at server boot; request expansion itself is
+/// textual (see [`expand_presets`]).
 pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError> {
     if input.is_empty() {
         return Err(ParseError::InvalidPreset(input.to_string()));
     }
     let mut operations = Vec::new();
     for seg in input.split('/') {
-        if seg.starts_with("preset:") || seg.starts_with("exp:") {
+        if seg.starts_with("preset:") || seg.starts_with("exp:") || seg.starts_with("maxage:") {
             return Err(ParseError::InvalidPreset(input.to_string()));
         }
         match parse_operation(seg) {
@@ -1231,8 +1266,8 @@ pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError
 ///
 /// With `only_presets`, any real operation segment in the
 /// request is an error: the operations must all arrive via
-/// presets. `exp:` metadata stays allowed; it is not an
-/// operation.
+/// presets. `exp:` and `maxage:` metadata stay allowed; neither
+/// is an operation.
 /// The preset names a remainder references, in order,
 /// deduplicated: the cache groups (RFC 9875) the response
 /// belongs to. Scans the same leading segment run
@@ -1250,7 +1285,10 @@ pub fn preset_names(rest: &str) -> Vec<String> {
             if !name.is_empty() && !out.iter().any(|n| n == name) {
                 out.push(name.to_string());
             }
-        } else if !(seg.starts_with("exp:") || parse_operation(seg).is_some_and(|r| r.is_ok())) {
+        } else if !(seg.starts_with("exp:")
+            || seg.starts_with("maxage:")
+            || parse_operation(seg).is_some_and(|r| r.is_ok()))
+        {
             break;
         }
         if remaining.is_empty() {
@@ -1333,7 +1371,7 @@ pub fn parse_default_ops(
     // defaults string is an operator error, not an
     // operation.
     let terminated = format!("{expanded}/example.com/defaults");
-    let (ops, source, _) = parse_operations_with_expiry(&terminated)?;
+    let (ops, source, _, _) = parse_operations_with_expiry(&terminated)?;
     if source != "example.com/defaults" {
         return Err(ParseError::InvalidPreset(text.to_string()));
     }
@@ -1357,8 +1395,11 @@ pub fn expand_presets(
                 .get(name)
                 .ok_or_else(|| ParseError::UnknownPreset(name.to_string()))?;
             out.push_str(definition);
-        } else if seg.starts_with("exp:") || parse_operation(seg).is_some_and(|r| r.is_ok()) {
-            if only_presets && !seg.starts_with("exp:") {
+        } else if seg.starts_with("exp:")
+            || seg.starts_with("maxage:")
+            || parse_operation(seg).is_some_and(|r| r.is_ok())
+        {
+            if only_presets && !seg.starts_with("exp:") && !seg.starts_with("maxage:") {
                 return Err(ParseError::PresetsOnly(seg.to_string()));
             }
             out.push_str(seg);
@@ -1816,16 +1857,18 @@ pub fn canonical_form(ops: &[Operation], source: &str) -> String {
 /// textual form.
 pub fn canonical_key_form(remainder: &str) -> String {
     match parse_operations_with_expiry(remainder) {
-        Ok((ops, source, _)) => canonical_form(&ops, source),
+        Ok((ops, source, _, _)) => canonical_form(&ops, source),
         Err(_) => cache_key_form(remainder),
     }
 }
 
 /// The cache-key form of an expanded remainder: identical,
-/// except every `exp:` segment is removed (audit P-2).
-/// Expiry is enforced before lookup, so it must not fragment
-/// the cache or shield entries from purges. Unparseable
-/// remainders pass through unchanged.
+/// except every `exp:` and `maxage:` segment is removed (audit
+/// P-2). Both are per-request metadata enforced or applied
+/// outside the stored entry (expiry before lookup, the cache
+/// lifetime on the response), so neither may fragment the
+/// cache or shield entries from purges. Unparseable remainders
+/// pass through unchanged.
 pub fn cache_key_form(remainder: &str) -> String {
     let Ok((_, source)) = parse_operations(remainder) else {
         return remainder.to_string();
@@ -1835,7 +1878,7 @@ pub fn cache_key_form(remainder: &str) -> String {
     };
     let kept: Vec<&str> = ops_part
         .split('/')
-        .filter(|seg| !seg.is_empty() && !seg.starts_with("exp:"))
+        .filter(|seg| !seg.is_empty() && !seg.starts_with("exp:") && !seg.starts_with("maxage:"))
         .collect();
     if kept.is_empty() {
         source.to_string()
@@ -2167,6 +2210,19 @@ mod tests {
         // An exp: segment inside the source is URL text, kept.
         let tricky = "https://example.com/exp:123/a.jpg";
         assert_eq!(cache_key_form(tricky), tricky);
+        // maxage: is per-request metadata too: stripped wherever
+        // it sits among the operations, kept inside the source.
+        assert_eq!(
+            cache_key_form(&format!("maxage:60/300x200/{src}")),
+            format!("300x200/{src}")
+        );
+        assert_eq!(
+            cache_key_form(&format!("300x200/maxage:60/{src}")),
+            format!("300x200/{src}")
+        );
+        assert_eq!(cache_key_form(&format!("maxage:60/{src}")), src);
+        let tricky = "https://example.com/maxage:60/a.jpg";
+        assert_eq!(cache_key_form(tricky), tricky);
     }
 
     #[test]
@@ -2184,6 +2240,7 @@ mod tests {
             ),
             (ParseError::InvalidPad("x".into()), "invalid_pad"),
             (ParseError::InvalidExpiry("x".into()), "invalid_expiry"),
+            (ParseError::InvalidMaxAge("x".into()), "invalid_maxage"),
             (ParseError::UnknownPreset("x".into()), "unknown_preset"),
             (ParseError::InvalidPreset("x".into()), "invalid_preset"),
             (ParseError::PresetsOnly("x".into()), "presets_only"),
@@ -2241,6 +2298,16 @@ mod tests {
             canonical_key_form(&format!("exp:1893456000/300x200/{src}")),
             canonical_key_form(&format!("300x200/{src}"))
         );
+        // Neither does the cache lifetime: two URLs that differ
+        // only in maxage share one cache entry.
+        assert_eq!(
+            canonical_key_form(&format!("maxage:60/300x200/{src}")),
+            canonical_key_form(&format!("maxage:31536000/300x200/{src}"))
+        );
+        assert_eq!(
+            canonical_key_form(&format!("maxage:60/300x200/{src}")),
+            canonical_key_form(&format!("300x200/{src}"))
+        );
         // Order is meaning, not spelling: it stays in the key.
         assert_ne!(
             canonical_key_form(&format!("filters:blur(2):grayscale/{src}")),
@@ -2264,6 +2331,7 @@ mod tests {
             "crop-rect:1x2:30x40",
             "focal:1x2:30x40",
             "focal:1x2:30x40/crop:100x100:smart",
+            "maxage:60/300x200",
             "fit-in:300x200",
             "pad:300x200",
             "pad:300x200:blur",
@@ -2291,8 +2359,8 @@ mod tests {
                 canonical,
                 "canonical form of {text} is not a fixed point"
             );
-            let (ops_before, _, _) = parse_operations_with_expiry(&remainder).unwrap();
-            let (ops_after, _, _) = parse_operations_with_expiry(&canonical).unwrap();
+            let (ops_before, _, _, _) = parse_operations_with_expiry(&remainder).unwrap();
+            let (ops_after, _, _, _) = parse_operations_with_expiry(&canonical).unwrap();
             assert_eq!(ops_before, ops_after, "canonical form changed {text}");
         }
     }
@@ -3159,21 +3227,21 @@ mod tests {
 
     #[test]
     fn parses_expiry_segments() {
-        let (ops, src, exp) =
+        let (ops, src, exp, _) =
             parse_operations_with_expiry("exp:1893456000/300x200/example.com/img.jpg").unwrap();
         assert_eq!(exp, Some(1893456000));
         assert_eq!(ops.len(), 1);
         assert_eq!(src, "example.com/img.jpg");
         // Position-independent among the operations; last wins.
-        let (_, _, exp) =
+        let (_, _, exp, _) =
             parse_operations_with_expiry("300x200/exp:100/exp:200/example.com/img.jpg").unwrap();
         assert_eq!(exp, Some(200));
         // Once the source URL starts, `exp:` is just URL text.
-        let (ops, src, exp) = parse_operations_with_expiry("example.com/exp:123").unwrap();
+        let (ops, src, exp, _) = parse_operations_with_expiry("example.com/exp:123").unwrap();
         assert!(ops.is_empty() && exp.is_none());
         assert_eq!(src, "example.com/exp:123");
         // Absent means no expiry.
-        let (_, _, exp) = parse_operations_with_expiry("300x200/example.com/img.jpg").unwrap();
+        let (_, _, exp, _) = parse_operations_with_expiry("300x200/example.com/img.jpg").unwrap();
         assert_eq!(exp, None);
         // Malformed values are parse errors.
         for bad in [
@@ -3185,6 +3253,60 @@ mod tests {
         ] {
             assert!(parse_operations_with_expiry(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn parses_maxage_segments() {
+        let (ops, src, _, max_age) =
+            parse_operations_with_expiry("maxage:60/300x200/example.com/img.jpg").unwrap();
+        assert_eq!(max_age, Some(60));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(src, "example.com/img.jpg");
+        // Position-independent among the operations; last wins.
+        let (_, _, _, max_age) =
+            parse_operations_with_expiry("300x200/maxage:100/maxage:200/example.com/img.jpg")
+                .unwrap();
+        assert_eq!(max_age, Some(200));
+        // Zero is valid (revalidate every time), and so is the
+        // one-year cap itself.
+        let (_, _, _, max_age) =
+            parse_operations_with_expiry("maxage:0/example.com/img.jpg").unwrap();
+        assert_eq!(max_age, Some(0));
+        let (_, _, _, max_age) =
+            parse_operations_with_expiry("maxage:31536000/example.com/img.jpg").unwrap();
+        assert_eq!(max_age, Some(MAX_CACHE_AGE));
+        // Once the source URL starts, `maxage:` is just URL text.
+        let (ops, src, _, max_age) = parse_operations_with_expiry("example.com/maxage:60").unwrap();
+        assert!(ops.is_empty() && max_age.is_none());
+        assert_eq!(src, "example.com/maxage:60");
+        // Absent means the server default.
+        let (_, _, _, max_age) =
+            parse_operations_with_expiry("300x200/example.com/img.jpg").unwrap();
+        assert_eq!(max_age, None);
+        // Malformed and out-of-range values are parse errors of
+        // the dedicated kind.
+        for bad in [
+            "maxage:/example.com/i.jpg",
+            "maxage:abc/example.com/i.jpg",
+            "maxage:-1/example.com/i.jpg",
+            "maxage:12.5/example.com/i.jpg",
+            "maxage:31536001/example.com/i.jpg",
+            "maxage:99999999999999999999999999/example.com/i.jpg",
+        ] {
+            assert!(
+                matches!(
+                    parse_operations_with_expiry(bad),
+                    Err(ParseError::InvalidMaxAge(_))
+                ),
+                "{bad}"
+            );
+        }
+        // The two metadata kinds extract side by side.
+        let (_, _, exp, max_age) =
+            parse_operations_with_expiry("exp:1893456000/maxage:60/300x200/example.com/img.jpg")
+                .unwrap();
+        assert_eq!(exp, Some(1893456000));
+        assert_eq!(max_age, Some(60));
     }
 
     fn preset_map() -> std::collections::HashMap<String, String> {
@@ -3207,12 +3329,14 @@ mod tests {
                 .len(),
             2
         );
-        // Source-like segments, expiry, nested presets, and the
-        // empty string are all invalid definitions.
+        // Source-like segments, expiry, cache-lifetime metadata,
+        // nested presets, and the empty string are all invalid
+        // definitions.
         for bad in [
             "",
             "example.com/img.jpg",
             "exp:123/300x200",
+            "maxage:60/300x200",
             "preset:other/300x200",
             "300x200/",
         ] {
@@ -3230,6 +3354,17 @@ mod tests {
         assert_eq!(
             expand_presets("preset:og/exp:999/example.com/img.jpg", &map, false).unwrap(),
             "crop:1200x630:smart/filters:format(webp)/exp:999/example.com/img.jpg"
+        );
+        // maxage: metadata walks like exp: it neither stops the
+        // expansion nor is expanded itself, on either side of a
+        // preset reference.
+        assert_eq!(
+            expand_presets("maxage:60/preset:thumb/example.com/img.jpg", &map, false).unwrap(),
+            "maxage:60/300x200/example.com/img.jpg"
+        );
+        assert_eq!(
+            expand_presets("preset:thumb/maxage:60/example.com/img.jpg", &map, false).unwrap(),
+            "300x200/maxage:60/example.com/img.jpg"
         );
         // Mixed with free-form operations.
         assert_eq!(
@@ -3258,6 +3393,7 @@ mod tests {
         let map = preset_map();
         assert!(expand_presets("preset:thumb/example.com/img.jpg", &map, true).is_ok());
         assert!(expand_presets("exp:999/preset:thumb/example.com/img.jpg", &map, true).is_ok());
+        assert!(expand_presets("maxage:60/preset:thumb/example.com/img.jpg", &map, true).is_ok());
         assert!(expand_presets("example.com/img.jpg", &map, true).is_ok());
         assert_eq!(
             expand_presets("300x200/example.com/img.jpg", &map, true),

@@ -152,12 +152,18 @@ fn split_signed(input: &str, base: &str) -> (Option<Signature>, Option<String>, 
     }
 }
 
+/// What validating a CLI remainder yields: how many leading
+/// segments preset expansion dropped, then the parse (the
+/// operations, the source, and the `exp:` / `maxage:`
+/// metadata).
+type PresetParse = (usize, Vec<Operation>, String, Option<u64>, Option<u32>);
+
 /// Parse a remainder that may lead with preset references:
 /// drop leading segments until the grammar accepts the
 /// rest, returning how many were dropped. Server presets
 /// expand before parsing, so the CLI cannot parse them
 /// itself; it can only step aside.
-fn parse_with_presets(rest: &str) -> Result<(usize, Vec<Operation>, String, Option<u64>), String> {
+fn parse_with_presets(rest: &str) -> Result<PresetParse, String> {
     let segments: Vec<&str> = rest.split('/').collect();
     let mut first_error = String::new();
     for dropped in 0..segments.len() {
@@ -169,8 +175,8 @@ fn parse_with_presets(rest: &str) -> Result<(usize, Vec<Operation>, String, Opti
         }
         let candidate = segments[dropped..].join("/");
         match crate::url::parse_operations_with_expiry(&candidate) {
-            Ok((ops, source, expiry)) => {
-                return Ok((dropped, ops, source.to_string(), expiry));
+            Ok((ops, source, expiry, max_age)) => {
+                return Ok((dropped, ops, source.to_string(), expiry, max_age));
             }
             Err(e) => {
                 if dropped == 0 {
@@ -261,7 +267,7 @@ fn explain(config: &Config, positional: &[String]) -> Result<String, String> {
     }
     let segments: Vec<&str> = rest.split('/').collect();
     match parse_with_presets(&rest) {
-        Ok((dropped, ops, source, expiry)) => {
+        Ok((dropped, ops, source, expiry, max_age)) => {
             for seg in &segments[..dropped] {
                 lines.push(format!(
                     "  {seg}  preset reference (expanded by the server)"
@@ -269,10 +275,16 @@ fn explain(config: &Config, positional: &[String]) -> Result<String, String> {
             }
             let mut op_iter = ops.iter();
             let mut expiry_printed = false;
+            let mut max_age_printed = false;
             for seg in &segments[dropped..segments.len() - source.matches('/').count() - 1] {
                 if let Some(ts) = seg.strip_prefix("exp:") {
                     lines.push(format!("  {seg}  link expires at unix time {ts}"));
                     expiry_printed = true;
+                    continue;
+                }
+                if let Some(secs) = seg.strip_prefix("maxage:") {
+                    lines.push(format!("  {seg}  response cache lifetime: {secs} seconds"));
+                    max_age_printed = true;
                     continue;
                 }
                 match op_iter.next() {
@@ -282,6 +294,12 @@ fn explain(config: &Config, positional: &[String]) -> Result<String, String> {
             }
             if expiry.is_some() && !expiry_printed {
                 lines.push(format!("  exp:{}  link expiry", expiry.unwrap_or_default()));
+            }
+            if max_age.is_some() && !max_age_printed {
+                lines.push(format!(
+                    "  maxage:{}  response cache lifetime",
+                    max_age.unwrap_or_default()
+                ));
             }
             lines.push(format!("source: {source}"));
             lines.push(format!(

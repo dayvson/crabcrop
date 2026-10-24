@@ -18,6 +18,12 @@
     "signature": "878f5cb69f5ac5770161176099fcdd64dcce17d6e6f846a3108ffacfa4644386"
   },
   {
+    "description": "Per-request cache lifetime",
+    "secret": "s3cr3t",
+    "remainder": "maxage:60/300x200/https://example.com/photo.jpg",
+    "signature": "abd0de02b38ce2cf5c3fe02bfba07fed611ff36f85ce5ecdfbc01f043166c71b"
+  },
+  {
     "description": "Preset reference and filter chain",
     "secret": "s3cr3t",
     "remainder": "preset:og-card/filters:grayscale/https://example.com/photo.jpg",

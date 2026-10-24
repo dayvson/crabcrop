@@ -152,6 +152,11 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["focal:0x0:50/" + SRC, true, SRC],
     ["16384x10/" + SRC, false, "16384x10/" + SRC], // oversize bare size is not an op: the source starts there
     ["exp:1893456000/300x200/" + SRC, false, SRC],
+    ["maxage:60/300x200/" + SRC, false, SRC], // cache lifetime is metadata too
+    ["maxage:0/300x200/" + SRC, false, SRC], // zero is a real lifetime
+    ["maxage:31536000/300x200/" + SRC, false, SRC], // the cap itself
+    ["maxage:31536001/300x200/" + SRC, true, SRC], // past the cap
+    ["maxage:soon/300x200/" + SRC, true, SRC], // not a number
     ["filters:radius(12)/" + SRC, false, SRC],
     ["filters:radius(1,2,3,4):mask(circle)/" + SRC, false, SRC],
     ["filters:radius(1,2)/" + SRC, true, SRC],

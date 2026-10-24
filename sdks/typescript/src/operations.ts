@@ -224,6 +224,17 @@ export const ops = {
     return `preset:${name}`;
   },
 
+  /**
+   * `maxage:60`; this response's Cache-Control lifetime in
+   * seconds (0 to 31536000), overriding the default year for
+   * this request only. Header-only: it never enters the
+   * cache key, so spellings that differ only here share one
+   * stored image.
+   */
+  maxage(seconds: number): string {
+    return `maxage:${intIn("maxage seconds", seconds, 0, 31536000)}`;
+  },
+
   /** Join filter calls into one `filters:` segment. */
   filters(...calls: string[]): string {
     if (calls.length === 0) {

@@ -456,6 +456,31 @@ function explainSegment(seg, nowSeconds) {
       expired,
     };
   }
+  if (seg.startsWith("maxage:")) {
+    const value = seg.slice(7);
+    if (!/^\d+$/.test(value)) {
+      return {
+        kind: "maxage",
+        title: "Max-age",
+        error: `malformed maxage: ${seg} (want maxage:<seconds> from 0 to 31536000)`,
+      };
+    }
+    if (BigInt(value) > 31536000n) {
+      return {
+        kind: "maxage",
+        title: "Max-age",
+        error: `maxage out of range: ${seg} (0 to 31536000 seconds; the server answers 400)`,
+      };
+    }
+    return {
+      kind: "maxage",
+      title: "Max-age",
+      detail:
+        value === "0"
+          ? "this response is served with Cache-Control: public, max-age=0 and no immutable flag: caches must revalidate before reuse; the stored image is unchanged"
+          : `this response is served with Cache-Control max-age ${value} seconds instead of the default year; the stored image is unchanged`,
+    };
+  }
   if (seg.startsWith("preset:")) {
     const name = seg.slice(7);
     if (!name) {
