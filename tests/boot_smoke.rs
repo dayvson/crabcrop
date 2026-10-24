@@ -78,3 +78,55 @@ fn the_binary_boots_and_answers_health() {
         "no 200 from /health before the deadline; got status line {status_line:?}"
     );
 }
+
+#[test]
+fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
+    // The in-process contract (cli::exec returning Err) is
+    // covered by unit tests; this pins the process shell
+    // around it: exit code 1, the error on stderr prefixed
+    // like every other crabcrop failure, nothing on stdout.
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .args(args)
+            // Hermetic: no CRABCROP_BASE / CRABCROP_SECRET
+            // from the test shell may leak in.
+            .env_clear()
+            .output()
+            .unwrap()
+    };
+    let dead_base = format!("http://127.0.0.1:{}", free_port());
+    let target = "50x50/http://127.0.0.1:9/src.png";
+
+    // Unreachable server: the request error, reported.
+    let out = run(&[
+        "meta",
+        "--base",
+        dead_base.as_str(),
+        "--secret",
+        "cli-smoke-secret",
+        target,
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("crabcrop: request failed"), "{stderr}");
+
+    // No secret anywhere: purge refuses before any request.
+    let out = run(&["purge", "--base", dead_base.as_str(), target]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("no secret"), "{stderr}");
+
+    // An unknown verb is an error, never a server start.
+    let out = run(&["sgin", target]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("unknown verb \"sgin\""), "{stderr}");
+
+    // Help stays a success: usage on stdout, exit 0.
+    let out = run(&["--help"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("crabcrop purge"), "{stdout}");
+}
