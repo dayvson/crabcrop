@@ -5,6 +5,9 @@ edition = "2024"
 description = "URL building and signing for crabcrop image service URLs"
 license = "MIT"
 repository = "https://github.com/dayvson/crabcrop"
+readme = "README.md"
+keywords = ["image", "url", "signing", "hmac", "cdn"]
+categories = ["web-programming", "multimedia::images"]
 
 [dependencies]
 hex = "0.4"
