@@ -1042,8 +1042,8 @@ fn wants_meta(accept: Option<&str>) -> bool {
 }
 
 /// Whether the accepted `application/json` entry also asks for
-/// placeholder fields: a `placeholders` parameter on that entry,
-/// bare or set to a truthy value (`0`/`false` decline).
+/// placeholder fields: a `placeholders` parameter on that entry
+/// in an opt-in form (see `wants_meta_param`).
 fn wants_placeholders(accept: Option<&str>) -> bool {
     wants_meta_param(accept, "placeholders")
 }
@@ -1056,7 +1056,11 @@ fn wants_detections(accept: Option<&str>) -> bool {
 }
 
 /// Whether the accepted `application/json` entry carries
-/// the named parameter, bare or set to a truthy value.
+/// the named parameter in an opt-in form (issue #151): bare,
+/// or set to exactly `1` or `true`, case-insensitively.
+/// Anything else (`0`, `false`, or any other value) is not
+/// an opt-in. Every `application/json` entry is considered;
+/// an entry the client refused with `q=0` does not count.
 fn wants_meta_param(accept: Option<&str>, name: &str) -> bool {
     let Some(accept) = accept else {
         return false;
@@ -1076,11 +1080,17 @@ fn wants_meta_param(accept: Option<&str>, name: &str) -> bool {
         if refused {
             continue;
         }
-        return params.iter().any(|p| {
+        for p in &params {
             let mut kv = p.trim().splitn(2, '=');
-            kv.next() == Some(name)
-                && !matches!(kv.next().map(str::trim), Some("0") | Some("false"))
-        });
+            if kv.next().map(str::trim) != Some(name) {
+                continue;
+            }
+            match kv.next().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+                None => return true,
+                Some("1" | "true") => return true,
+                _ => {}
+            }
+        }
     }
     false
 }
@@ -2798,6 +2808,42 @@ mod tests {
         let meta = get_meta(base, "application/json; detections=1").await;
         assert!(meta.get("detections").is_none());
         assert_eq!(meta["width"], 40);
+    }
+
+    #[test]
+    fn meta_opt_ins_take_exact_tokens() {
+        // Issue #151: bare, 1, or true (any case) opt in;
+        // everything else does not, including values the old
+        // loose check used to accept.
+        let yes = [
+            "application/json; placeholders",
+            "application/json; placeholders=1",
+            "application/json; placeholders=true",
+            "application/json; placeholders=TRUE",
+            "application/json; placeholders = 1",
+            "text/html, application/json; placeholders=1",
+            "application/json;q=0, application/json; placeholders=1",
+        ];
+        for accept in yes {
+            assert!(wants_placeholders(Some(accept)), "{accept}");
+        }
+        let no = [
+            "application/json",
+            "application/json; placeholders=0",
+            "application/json; placeholders=false",
+            "application/json; placeholders=FALSE",
+            "application/json; placeholders=banana",
+            "application/json; placeholders=yes",
+            "application/json; placeholders=2",
+            "application/json; placeholders=1;q=0",
+            "text/html; placeholders=1",
+        ];
+        for accept in no {
+            assert!(!wants_placeholders(Some(accept)), "{accept}");
+        }
+        assert!(!wants_placeholders(None));
+        assert!(wants_detections(Some("application/json; detections")));
+        assert!(!wants_detections(Some("application/json; placeholders=1")));
     }
 
     #[tokio::test]

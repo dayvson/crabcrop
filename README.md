@@ -391,7 +391,7 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 
 Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other.
 
-Add the `placeholders` parameter to the media type to also get placeholder data, computed from the final processed pixels:
+Add the `placeholders` parameter to the media type to also get placeholder data, computed from the final processed pixels. The parameter opts in when it is bare (`; placeholders`), set to `1`, or set to `true` (case-insensitive); any other value, including `0` and `false`, does not. The `detections` parameter below follows the same rule. On the CLI, `crabcrop meta --placeholders` and `crabcrop meta --detections` set them for you:
 
 ```bash
 curl -H "Accept: application/json; placeholders=1" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
@@ -501,6 +501,9 @@ crabcrop explain "http://localhost:3000/<signature>/300x200/filters:grayscale/ht
 
 # Fetch the meta JSON for an image (a bare remainder is signed first)
 crabcrop meta "300x200/https://example.com/photo.jpg"
+
+# ... with placeholder fields and detection boxes included
+crabcrop meta --placeholders --detections "300x200/https://example.com/photo.jpg"
 
 # Purge one URL, or a whole preset group (Cache-Group)
 crabcrop purge "300x200/https://example.com/photo.jpg"

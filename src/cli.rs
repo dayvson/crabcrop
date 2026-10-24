@@ -20,6 +20,7 @@ CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_
   crabcrop sign <remainder>           Print the signed URL for an operations + source remainder.
   crabcrop explain <url-or-path>      Break a URL down segment by segment.
   crabcrop meta <url-or-remainder>    Fetch and print the meta JSON for an image.
+                                      (--placeholders / --detections ask for those fields.)
   crabcrop purge <url-or-remainder>   Purge one URL's cached variants.
   crabcrop purge-group <name>         Purge every cached entry in a preset group.
   crabcrop convert-thumbor <url>      Convert a Thumbor URL to a crabcrop URL.";
@@ -30,12 +31,19 @@ struct Config {
     /// Key ID to stamp on minted signatures (issue #143),
     /// from `--key-id` or `CRABCROP_SECRET_KEY_ID`.
     key_id: Option<String>,
+    /// Meta opt-ins (issue #151): ask the meta endpoint for
+    /// placeholder fields / detection boxes. Only the `meta`
+    /// verb accepts them.
+    placeholders: bool,
+    detections: bool,
 }
 
 fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
     let mut base: Option<String> = None;
     let mut secret: Option<String> = None;
     let mut key_id: Option<String> = None;
+    let mut placeholders = false;
+    let mut detections = false;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -61,6 +69,16 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
                     key_id = Some(value);
                 } else {
                     secret = Some(value);
+                }
+            }
+            "--placeholders" | "--detections" => {
+                if inline_value.is_some() {
+                    return Err(format!("{flag} takes no value\n\n{USAGE}"));
+                }
+                if flag == "--placeholders" {
+                    placeholders = true;
+                } else {
+                    detections = true;
                 }
             }
             _ if arg.starts_with("--") => return Err(format!("unknown flag {arg:?}\n\n{USAGE}")),
@@ -89,6 +107,8 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
             base,
             secret,
             key_id,
+            placeholders,
+            detections,
         },
         positional,
     ))
@@ -176,6 +196,11 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
         return Ok(USAGE.to_string());
     }
     let (config, positional) = parse_flags(&args[1..])?;
+    if verb != "meta" && (config.placeholders || config.detections) {
+        return Err(format!(
+            "--placeholders and --detections only apply to the meta verb\n\n{USAGE}"
+        ));
+    }
     match verb {
         "sign" => sign(&config, &positional),
         "explain" => Ok(explain(&config, &positional)?),
@@ -441,9 +466,16 @@ fn target_url(config: &Config, input: &str) -> Result<String, String> {
 async fn meta(config: &Config, positional: &[String]) -> Result<String, String> {
     let input = one_target(positional, "meta")?;
     let url = target_url(config, &input)?;
+    let mut accept = "application/json".to_string();
+    if config.placeholders {
+        accept.push_str("; placeholders=1");
+    }
+    if config.detections {
+        accept.push_str("; detections=1");
+    }
     let response = http_client()?
         .get(&url)
-        .header("accept", "application/json")
+        .header("accept", accept)
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -1393,6 +1425,15 @@ mod tests {
                 .any(|w| w.contains("Accept: application/json")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn meta_opt_in_flags_parse_and_default_off() {
+        let (config, _) = parse_flags(&args(&["--placeholders", "--detections"])).unwrap();
+        assert!(config.placeholders && config.detections);
+        let (config, _) = parse_flags(&args(&[])).unwrap();
+        assert!(!config.placeholders && !config.detections);
+        assert!(parse_flags(&args(&["--placeholders=1"])).is_err());
     }
 
     #[test]
