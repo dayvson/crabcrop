@@ -34,6 +34,10 @@ def sub_once(rel, pattern, repl, flags=0):
     return new
 
 
+def read_text(rel):
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+
 def edits(version):
     out = {}
     for rel in CARGO_FILES:
@@ -51,6 +55,15 @@ def edits(version):
         rf"\g<1>{version}\g<2>",
         re.S | re.M,
     )
+    # server.json carries the version twice: the manifest
+    # itself and its npm package entry. Both must move.
+    manifest = read_text("sdks/mcp/server.json")
+    manifest, count = re.subn(
+        r'("version":\s*")[^"]+(")', rf"\g<1>{version}\g<2>", manifest
+    )
+    if count != 2:
+        raise SystemExit(f"sdks/mcp/server.json: version matched {count} times, expected 2")
+    out["sdks/mcp/server.json"] = manifest
     chart = sub_once(
         "deploy/helm/crabcrop/Chart.yaml", r"^version:\s*\S+", f"version: {version}", re.M
     )

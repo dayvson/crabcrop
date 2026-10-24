@@ -27,6 +27,12 @@ def json_version(rel):
     return json.loads(read(rel)).get("version")
 
 
+def mcp_manifest_versions(rel):
+    data = json.loads(read(rel))
+    packages = data.get("packages") or [{}]
+    return data.get("version"), packages[0].get("version")
+
+
 def pyproject_version(rel):
     match = re.search(r'\[project\][^\[]*?^version\s*=\s*"([^"]+)"', read(rel), re.S | re.M)
     return match.group(1) if match else None
@@ -50,6 +56,9 @@ def sites():
         "frameworks/hydrogen/package.json": json_version("frameworks/hydrogen/package.json"),
         "sdks/python/pyproject.toml": pyproject_version("sdks/python/pyproject.toml"),
     }
+    manifest, manifest_pkg = mcp_manifest_versions("sdks/mcp/server.json")
+    found["sdks/mcp/server.json version"] = manifest
+    found["sdks/mcp/server.json packages[0].version"] = manifest_pkg
     chart, app = chart_versions("deploy/helm/crabcrop/Chart.yaml")
     found["deploy/helm/crabcrop/Chart.yaml version"] = chart
     found["deploy/helm/crabcrop/Chart.yaml appVersion"] = app

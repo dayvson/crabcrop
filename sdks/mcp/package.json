@@ -10,7 +10,7 @@
   "name": "@crabcrop/mcp",
   "scripts": {
     "build": "tsc",
-    "prepack": "npm run build",
+    "prepack": "npm --prefix ../typescript run build && npm run build",
     "start": "node src/index.ts",
     "test": "node --test test/*.test.mjs"
   },
@@ -20,5 +20,31 @@
     "@types/node": "^26.6.5",
     "typescript": "^5.9.3"
   },
-  "main": "./dist/index.js"
+  "main": "./dist/index.js",
+  "bundleDependencies": [
+    "@crabcrop/url"
+  ],
+  "mcpName": "io.github.crabcrop/crabcrop",
+  "files": [
+    "dist",
+    "server.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dayvson/crabcrop.git",
+    "directory": "sdks/mcp"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "image",
+    "cdn",
+    "crabcrop"
+  ]
 }
