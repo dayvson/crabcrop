@@ -29,8 +29,8 @@ fn ensure_jxl_decoder() {
 /// request fails cheaply instead of allocating gigabytes.
 pub(crate) const MAX_DECODE_DIMENSION: u32 = 16_384;
 const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
-const MAX_GIF_FRAMES: usize = 200;
-const MAX_GIF_PIXELS: u64 = 100_000_000;
+const MAX_ANIMATED_FRAMES: usize = 200;
+const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 
 /// The per-request encode budget (audit E-6): the
@@ -412,6 +412,14 @@ impl Engine {
         // (policy permitting) the metadata injection at the
         // end.
         let source_meta = crate::color::extract_source_meta(bytes);
+        // An animated WebP source (one carrying an ANIM chunk)
+        // gets the GIF treatment below; the probe also yields
+        // the loop count the animated path carries over.
+        let webp_anim = if detected == ImageFormat::WebP {
+            webp_animation_params(bytes)
+        } else {
+            None
+        };
         let img = if detected == ImageFormat::Gif {
             // GIF sources decode frame by frame: an animated source
             // whose output stays GIF keeps its frames (each runs the
@@ -435,13 +443,46 @@ impl Engine {
                 resolved = ImageFormat::Gif;
             }
             if frames.len() > 1 && resolved == ImageFormat::Gif {
-                return self.process_animated_gif(frames, ops, &ctx);
+                return self.process_animated(frames, ops, &ctx, ImageFormat::Gif, None);
             }
             DynamicImage::ImageRgba8(
                 frames
                     .into_iter()
                     .next()
                     .expect("decode_gif_frames returns at least one frame")
+                    .into_buffer(),
+            )
+        } else if let Some((loop_count, _)) = webp_anim {
+            // Animated WebP sources decode frame by frame, like
+            // GIFs: an animated output (WebP or GIF) keeps its
+            // frames (each runs the operations, delays preserved);
+            // anything else continues with the first frame, which
+            // is also what converting an animated WebP to a still
+            // format means.
+            let frames = decode_webp_frames(bytes)?;
+            let mut resolved = directives
+                .explicit_format
+                .or(ctx.preferred)
+                .unwrap_or(detected);
+            if frames.len() > 1
+                && resolved == ImageFormat::Jxl
+                && directives.explicit_format.is_none()
+            {
+                // Animated sources stay out of JXL negotiation:
+                // a negotiated JXL would silently drop the frames,
+                // so the preference falls back to WebP. An explicit
+                // format(jxl) still converts (first frame), as
+                // documented for still conversions.
+                resolved = ImageFormat::WebP;
+            }
+            if frames.len() > 1 && matches!(resolved, ImageFormat::WebP | ImageFormat::Gif) {
+                return self.process_animated(frames, ops, &ctx, resolved, Some(loop_count));
+            }
+            DynamicImage::ImageRgba8(
+                frames
+                    .into_iter()
+                    .next()
+                    .expect("decode_webp_frames returns at least one frame")
                     .into_buffer(),
             )
         } else if let Some(prep) = &prepared_svg {
@@ -659,15 +700,20 @@ impl Engine {
         })
     }
 
-    /// Process an animated GIF frame by frame: every frame runs
-    /// the same operations and keeps its delay, so the output
-    /// stays animated. Encoding directives do not apply (GIF has
-    /// no quality lever and keeps its alpha).
-    fn process_animated_gif(
+    /// Process an animated source (GIF or WebP) frame by frame:
+    /// every frame runs the same operations and keeps its delay,
+    /// so the output stays animated in `format`. Encoding
+    /// directives do not apply (neither animated encoder here
+    /// has a quality lever). A WebP output carries the source's
+    /// loop count over; GIF output keeps the GIF encoder's
+    /// default, as it always has.
+    fn process_animated(
         &self,
         frames: Vec<image::Frame>,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
+        format: ImageFormat,
+        loop_count: Option<u16>,
     ) -> Result<ProcessedImage, EngineError> {
         let directives = crate::url::RequestDirectives::analyze(ops);
         let (source_width, source_height) = {
@@ -701,13 +747,20 @@ impl Engine {
         } else {
             None
         };
-        let mut out = Vec::new();
-        image::codecs::gif::GifEncoder::new(&mut out)
-            .encode_frames(out_frames)
-            .map_err(|e| EngineError::Encode(e.to_string()))?;
+        let out = match format {
+            ImageFormat::Gif => {
+                let mut out = Vec::new();
+                image::codecs::gif::GifEncoder::new(&mut out)
+                    .encode_frames(out_frames)
+                    .map_err(|e| EngineError::Encode(e.to_string()))?;
+                out
+            }
+            ImageFormat::WebP => encode_animated_webp(&out_frames, loop_count.unwrap_or(0))?,
+            _ => unreachable!("process_animated is only called for GIF and WebP"),
+        };
         Ok(ProcessedImage {
             bytes: out,
-            format: ImageFormat::Gif,
+            format,
             quality: None,
             width,
             height,
@@ -719,12 +772,42 @@ impl Engine {
     }
 }
 
+/// Collect an animation decoder's frames under the shared
+/// limits: a frame cap and a total-decoded-pixels budget, so a
+/// small file cannot expand into gigabytes of frames. Errors
+/// when the source is malformed, over budget, or carries no
+/// frames. `format` names the source format in error messages.
+fn collect_frames(
+    frames: impl Iterator<Item = Result<image::Frame, image::ImageError>>,
+    format: &str,
+) -> Result<Vec<image::Frame>, EngineError> {
+    let mut collected = Vec::new();
+    let mut total_pixels: u64 = 0;
+    for frame in frames {
+        let frame = frame.map_err(|e| EngineError::Decode(e.to_string()))?;
+        if collected.len() >= MAX_ANIMATED_FRAMES {
+            return Err(EngineError::Decode(format!(
+                "{format} has more than {MAX_ANIMATED_FRAMES} frames"
+            )));
+        }
+        total_pixels += frame.buffer().width() as u64 * frame.buffer().height() as u64;
+        if total_pixels > MAX_ANIMATED_PIXELS {
+            return Err(EngineError::Decode(format!(
+                "{format} frames exceed the {MAX_ANIMATED_PIXELS} decoded-pixel limit"
+            )));
+        }
+        collected.push(frame);
+    }
+    if collected.is_empty() {
+        return Err(EngineError::Decode(format!("{format} has no frames")));
+    }
+    Ok(collected)
+}
+
 /// Decode all frames of a GIF source, under the shared limits:
 /// the decoder gets explicit dimension/allocation limits (its
-/// defaults are none), and collection enforces a frame cap and
-/// a total-decoded-pixels budget, so a small file cannot expand
-/// into gigabytes of frames. Errors when the GIF is malformed,
-/// over budget, or carries no frames.
+/// defaults are none) and collection enforces the shared
+/// frame and pixel budgets (see [`collect_frames`]).
 fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
     use image::{AnimationDecoder, ImageDecoder};
     let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
@@ -732,27 +815,64 @@ fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
     decoder
         .set_limits(decode_limits())
         .map_err(|e| EngineError::Decode(e.to_string()))?;
-    let mut frames = Vec::new();
-    let mut total_pixels: u64 = 0;
-    for frame in decoder.into_frames() {
-        let frame = frame.map_err(|e| EngineError::Decode(e.to_string()))?;
-        if frames.len() >= MAX_GIF_FRAMES {
-            return Err(EngineError::Decode(format!(
-                "GIF has more than {MAX_GIF_FRAMES} frames"
-            )));
-        }
-        total_pixels += frame.buffer().width() as u64 * frame.buffer().height() as u64;
-        if total_pixels > MAX_GIF_PIXELS {
-            return Err(EngineError::Decode(format!(
-                "GIF frames exceed the {MAX_GIF_PIXELS} decoded-pixel limit"
-            )));
-        }
-        frames.push(frame);
+    collect_frames(decoder.into_frames(), "GIF")
+}
+
+/// The ANIM parameters of a WebP source: `(loop count,
+/// background color as [R, G, B, A])`, or `None` when the
+/// source carries no ANIM chunk (a still) or its container
+/// does not parse; genuinely malformed files fail at decode
+/// either way.
+fn webp_animation_params(bytes: &[u8]) -> Option<(u16, [u8; 4])> {
+    oxideav_webp::animation_params(bytes).ok().flatten()
+}
+
+/// Decode all frames of an animated WebP source, under the
+/// same limits as GIF. The in-tree decoder (image-webp)
+/// composites every frame onto the full canvas, honoring
+/// sub-rectangle frames and the blending flag; disposal of
+/// a frame to the background color is honored only when the
+/// file's ANIM background color has been set on the decoder
+/// first (the decoder otherwise leaves the disposed rectangle
+/// in place), so the color is read from the container and set
+/// before iterating.
+fn decode_webp_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
+    use image::{AnimationDecoder, ImageDecoder};
+    let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
+        .map_err(|e| EngineError::Decode(e.to_string()))?;
+    decoder
+        .set_limits(decode_limits())
+        .map_err(|e| EngineError::Decode(e.to_string()))?;
+    if let Some((_, background)) = webp_animation_params(bytes) {
+        // Losing the fill on a decoder refusal only costs the
+        // disposal behavior; the frames still decode.
+        let _ = decoder.set_background_color(image::Rgba(background));
     }
-    if frames.is_empty() {
-        return Err(EngineError::Decode("GIF has no frames".to_string()));
-    }
-    Ok(frames)
+    collect_frames(decoder.into_frames(), "WebP")
+}
+
+/// Encode frames as an animated WebP. The pure-Rust encoder
+/// (oxideav-webp, the crate the lossy still path uses) writes
+/// lossless VP8L frames and has no lossy animation mode, so
+/// there is no quality lever here; `loop_count` is carried
+/// over from the source (0 loops forever).
+fn encode_animated_webp(frames: &[image::Frame], loop_count: u16) -> Result<Vec<u8>, EngineError> {
+    let frames: Vec<oxideav_webp::Frame> = frames
+        .iter()
+        .map(|frame| -> Result<oxideav_webp::Frame, EngineError> {
+            let buffer = frame.buffer();
+            let image = oxideav_webp::WebpImage::from_rgba8(
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw().clone(),
+            )
+            .map_err(|e| EngineError::Encode(e.to_string()))?;
+            let delay: std::time::Duration = frame.delay().into();
+            Ok(oxideav_webp::Frame::new(image, Some(delay)))
+        })
+        .collect::<Result<_, _>>()?;
+    let opts = oxideav_webp::EncodeOptions::default().with_loop_count(loop_count);
+    oxideav_webp::encode_animation(&frames, &opts).map_err(|e| EngineError::Encode(e.to_string()))
 }
 
 /// The largest width or height an AI upscale may produce.
@@ -800,7 +920,8 @@ fn upscale_image(
 
 /// Apply the operations to one image, collecting the encoding
 /// directives along the way. Shared by the still pipeline and
-/// the animated-GIF path, which runs it once per frame.
+/// the animated paths (GIF and WebP), which run it once per
+/// frame.
 /// The effective DPR factor: an explicit `dpr(...)` directive
 /// wins, then the client hint carried on the context, else 1.
 fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
@@ -3576,6 +3697,204 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Jxl);
+    }
+
+    /// Three 40x20 frames: red, green, blue, with delays of
+    /// 100, 200, and 300 ms. Built with the oxideav encoder
+    /// (the image crate's WebP encoder writes stills only);
+    /// frames are coded lossless so colors round-trip exactly.
+    fn animated_webp_bytes() -> Vec<u8> {
+        let frame = |rgb: [u8; 3], delay_ms: u64| {
+            let img =
+                image::RgbaImage::from_pixel(40, 20, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+            let image = oxideav_webp::WebpImage::from_rgba8(40, 20, img.as_raw().clone()).unwrap();
+            oxideav_webp::Frame::new(image, Some(std::time::Duration::from_millis(delay_ms)))
+        };
+        let frames = vec![
+            frame([255, 0, 0], 100),
+            frame([0, 200, 0], 200),
+            frame([0, 0, 255], 300),
+        ];
+        let opts = oxideav_webp::EncodeOptions::default()
+            .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
+        oxideav_webp::encode_animation(&frames, &opts).unwrap()
+    }
+
+    fn decoded_webp_frames(bytes: &[u8]) -> Vec<image::Frame> {
+        use image::AnimationDecoder;
+        let decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).unwrap();
+        decoder.into_frames().collect_frames().unwrap()
+    }
+
+    fn frame_delay_ms(frame: &image::Frame) -> u64 {
+        let duration: std::time::Duration = frame.delay().into();
+        duration.as_millis() as u64
+    }
+
+    #[test]
+    fn animated_webp_fixture_decodes_to_its_frames() {
+        let frames = decode_webp_frames(&animated_webp_bytes()).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.buffer().width() == 40 && f.buffer().height() == 20)
+        );
+        let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
+        assert_eq!(delays, [100, 200, 300]);
+        assert_eq!(
+            frames[0].buffer().get_pixel(0, 0),
+            &image::Rgba([255, 0, 0, 255])
+        );
+        assert_eq!(
+            frames[2].buffer().get_pixel(0, 0),
+            &image::Rgba([0, 0, 255, 255])
+        );
+    }
+
+    #[test]
+    fn animated_webp_keeps_its_frames_through_resize() {
+        let engine = Engine;
+        let src = animated_webp_bytes();
+        let out = engine
+            .process(
+                &src,
+                &[size_op(Dimension::Pixels(20), Dimension::Pixels(10))],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        let frames = decoded_webp_frames(&out.bytes);
+        assert_eq!(frames.len(), 3);
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.buffer().width() == 20 && f.buffer().height() == 10)
+        );
+        let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
+        assert_eq!(delays, [100, 200, 300]);
+        // Lossless frames: the colors survive the resize exactly.
+        assert_eq!(
+            frames[1].buffer().get_pixel(0, 0),
+            &image::Rgba([0, 200, 0, 255])
+        );
+    }
+
+    #[test]
+    fn animated_webp_keeps_its_frames_through_grayscale() {
+        let engine = Engine;
+        let src = animated_webp_bytes();
+        let out = engine
+            .process(&src, &[Operation::Filters(vec![Filter::Grayscale])])
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        let frames = decoded_webp_frames(&out.bytes);
+        assert_eq!(frames.len(), 3);
+        let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
+        assert_eq!(delays, [100, 200, 300]);
+        for frame in &frames {
+            let p = frame.buffer().get_pixel(0, 0);
+            assert_eq!(p[0], p[1], "pixel {p:?}");
+            assert_eq!(p[1], p[2], "pixel {p:?}");
+        }
+    }
+
+    #[test]
+    fn animated_webp_to_gif_keeps_its_frames() {
+        let engine = Engine;
+        let src = animated_webp_bytes();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Gif)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        let frames = decoded_gif_frames(&out.bytes);
+        assert_eq!(frames.len(), 3);
+        let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
+        assert_eq!(delays, [100, 200, 300]);
+    }
+
+    #[test]
+    fn animated_webp_to_a_still_format_keeps_the_first_frame() {
+        let engine = Engine;
+        let src = animated_webp_bytes();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jpeg);
+        // The first frame is solid red (JPEG is lossy: near,
+        // not exact).
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        let p = img.get_pixel(0, 0);
+        assert!(p[0] > 200 && p[1] < 60 && p[2] < 60, "pixel {p:?}");
+    }
+
+    #[test]
+    fn animated_webp_stays_out_of_jxl_negotiation() {
+        let engine = Engine;
+        let src = animated_webp_bytes();
+        // A negotiated (preferred) JXL falls back to WebP so the
+        // frames survive.
+        let out = engine
+            .process_preferred(
+                &src,
+                &[],
+                ProcessContext {
+                    preferred: Some(ImageFormat::Jxl),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        assert_eq!(decoded_webp_frames(&out.bytes).len(), 3);
+        // An explicit format(jxl) still converts, first frame only.
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])],
+                ProcessContext {
+                    preferred: Some(ImageFormat::Jxl),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jxl);
+    }
+
+    #[test]
+    fn webp_frame_cap_rejects_frame_bombs() {
+        // Build a one-frame animation, then restamp its ANMF
+        // chunk 201 times (the RIFF size is the only other field
+        // that changes). Encoding 201 frames with the VP8L
+        // encoder just for this test would take minutes; the
+        // decoder cannot tell the difference.
+        let one = {
+            let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 255]));
+            let image = oxideav_webp::WebpImage::from_rgba8(4, 4, img.as_raw().clone()).unwrap();
+            let frame = oxideav_webp::Frame::new(image, Some(std::time::Duration::from_millis(50)));
+            let opts = oxideav_webp::EncodeOptions::default()
+                .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
+            oxideav_webp::encode_animation(&[frame], &opts).unwrap()
+        };
+        assert_eq!(decode_webp_frames(&one).unwrap().len(), 1);
+        let anmf_at = one
+            .windows(4)
+            .position(|w| w == b"ANMF")
+            .expect("a one-frame animation has an ANMF chunk");
+        let chunk_len =
+            u32::from_le_bytes(one[anmf_at + 4..anmf_at + 8].try_into().unwrap()) as usize;
+        let chunk_span = 8 + chunk_len + (chunk_len % 2);
+        let mut bomb = one[..anmf_at].to_vec();
+        for _ in 0..201 {
+            bomb.extend_from_slice(&one[anmf_at..anmf_at + chunk_span]);
+        }
+        let riff_size = (bomb.len() - 8) as u32;
+        bomb[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert!(decode_webp_frames(&bomb).is_err());
     }
 
     #[test]
