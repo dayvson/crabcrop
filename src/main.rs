@@ -86,6 +86,11 @@
 //!   the fallback image served (through the same operations,
 //!   marked `X-Crabcrop-Fallback: 1`) when a source cannot be
 //!   loaded or decoded. Unset keeps today's error behavior.
+//! - `CRABCROP_RESULT_BUCKET`: S3 bucket for the shared
+//!   result-storage tier (multi-replica), reusing
+//!   `CRABCROP_S3_ENDPOINT`, `CRABCROP_S3_REGION`, and the
+//!   ambient AWS credentials; `CRABCROP_RESULT_PREFIX`
+//!   namespaces its objects.
 //! - `CRABCROP_RESULT_STORAGE_DIR`: directory for the
 //!   disk-backed result store (the persistent tier under the
 //!   memory cache). Unset disables it.
@@ -116,6 +121,7 @@ mod loader;
 mod observe;
 mod placeholder;
 mod quality;
+mod s3store;
 mod server;
 mod sigv4;
 mod storage;
@@ -463,6 +469,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    // Shared result storage (issue #142): one S3 bucket as
+    // the multi-replica tier. It reuses the source S3
+    // configuration (endpoint, region, ambient AWS
+    // credentials); a prefix namespaces the entries.
+    let shared_store = match env::var("CRABCROP_RESULT_BUCKET") {
+        Ok(bucket) if !bucket.is_empty() => {
+            let prefix = env::var("CRABCROP_RESULT_PREFIX").unwrap_or_default();
+            let store = crate::s3store::S3Store::new(
+                bucket.clone(),
+                prefix,
+                sources.s3_endpoint.clone(),
+                sources.s3_region.clone(),
+                sources.aws_creds.clone(),
+            );
+            println!("shared result storage: bucket {bucket}");
+            Some(Arc::new(store))
+        }
+        _ => None,
+    };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
 
     // AI models are configured, never downloaded, and preloaded
@@ -555,6 +580,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         font,
         fallback,
         store,
+        shared_store,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate: Arc::new(tokio::sync::Semaphore::new(
             std::thread::available_parallelism()

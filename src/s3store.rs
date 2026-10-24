@@ -1,0 +1,490 @@
+//! Shared result storage (issue #142): the multi-replica tier
+//! consulted after the local memory and disk caches, backed by
+//! one S3 bucket (or an S3-compatible endpoint).
+//!
+//! Entries are the disk store's serialized form (the CRABDISK
+//! bytes: key and cache groups embedded), one object per
+//! entry, named by the SHA-256 of the cache key under a
+//! configurable prefix. Purges list the prefix and read each
+//! entry's stored key and groups, which keeps purge semantics
+//! identical across tiers at the cost of reads an
+//! administrative operation can afford.
+//!
+//! Like the disk store, every operation is best-effort: a
+//! network or service error degrades to a miss or a dropped
+//! write, never a failed request, because a cache must not
+//! take the pipeline down with it. Requests are signed with
+//! SigV4 exactly like the source loader's (`sigv4`), with the
+//! same ambient AWS credential chain; with no credentials the
+//! requests go unsigned, for local S3-compatible development
+//! stores.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+use crate::cache::CachedImage;
+use crate::sigv4::{self, Credentials};
+use crate::storage::{key_stem, parse_entry, serialize_entry};
+
+#[derive(Debug)]
+pub struct S3Store {
+    client: reqwest::Client,
+    bucket: String,
+    /// Normalized object prefix: empty, or ending in `/`.
+    prefix: String,
+    endpoint: Option<String>,
+    region: String,
+    creds: Option<Credentials>,
+}
+
+impl S3Store {
+    pub fn new(
+        bucket: String,
+        prefix: String,
+        endpoint: Option<String>,
+        region: String,
+        creds: Option<Credentials>,
+    ) -> Self {
+        let trimmed = prefix.trim_matches('/');
+        let prefix = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}/")
+        };
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+            bucket,
+            prefix,
+            endpoint,
+            region,
+            creds,
+        }
+    }
+
+    fn object_key(&self, stem: &str) -> String {
+        format!("{}{stem}.bin", self.prefix)
+    }
+
+    /// One signed (or unsigned) request against the bucket.
+    /// `object_key` empty addresses the bucket itself (LIST).
+    /// Returns the response, or None on any transport error:
+    /// callers read every failure as a cache miss.
+    async fn request(
+        &self,
+        method: &str,
+        object_key: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Option<reqwest::Response> {
+        let path_part = if object_key.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", sigv4::encode_path(object_key))
+        };
+        let mut url_string = match &self.endpoint {
+            Some(ep) => format!("{ep}/{}{path_part}", self.bucket),
+            None => format!(
+                "https://{}.s3.{}.amazonaws.com{path_part}",
+                self.bucket, self.region
+            ),
+        };
+        if !query.is_empty() {
+            let qs: Vec<String> = query
+                .iter()
+                .map(|(k, v)| format!("{}={}", sigv4::uri_encode(k), sigv4::uri_encode(v)))
+                .collect();
+            url_string = format!("{url_string}?{}", qs.join("&"));
+        }
+        let url = reqwest::Url::parse(&url_string).ok()?;
+        let payload_hash = {
+            let digest = Sha256::digest(&body);
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let verb = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
+        let mut request = self
+            .client
+            .request(verb, url.clone())
+            .header("x-amz-content-sha256", payload_hash.clone())
+            .body(body);
+        if let Some(creds) = &self.creds {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let amz_date = sigv4::amz_date(now);
+            let host = match url.port() {
+                Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+                None => url.host_str().unwrap_or_default().to_string(),
+            };
+            let mut sign_headers: Vec<(&str, &str)> = vec![
+                ("host", host.as_str()),
+                ("x-amz-content-sha256", payload_hash.as_str()),
+                ("x-amz-date", amz_date.as_str()),
+            ];
+            if let Some(token) = &creds.session_token {
+                sign_headers.push(("x-amz-security-token", token.as_str()));
+            }
+            let authorization = sigv4::authorization(
+                creds,
+                &sigv4::SignRequest {
+                    method,
+                    path: url.path(),
+                    query,
+                    headers: &sign_headers,
+                    region: &self.region,
+                    service: "s3",
+                    payload_sha256: &payload_hash,
+                    amz_date: &amz_date,
+                },
+            );
+            request = request
+                .header("Authorization", authorization)
+                .header("x-amz-date", amz_date);
+            if let Some(token) = &creds.session_token {
+                request = request.header("x-amz-security-token", token.as_str());
+            }
+        }
+        request.send().await.ok()
+    }
+
+    /// Look up `key`. Any failure (missing object, unreadable
+    /// entry, transport error) is a miss.
+    pub async fn get(&self, key: &str) -> Option<CachedImage> {
+        let object = self.object_key(&key_stem(key));
+        let resp = self.request("GET", &object, &[], Vec::new()).await?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let data = resp.bytes().await.ok()?;
+        let (stored_key, image) = parse_entry(&data)?;
+        if stored_key != key {
+            return None;
+        }
+        Some(image)
+    }
+
+    /// Store `image` under `key`. Errors are dropped silently:
+    /// the local tiers already hold the entry.
+    pub async fn put(&self, key: &str, image: &CachedImage) {
+        let object = self.object_key(&key_stem(key));
+        let data = serialize_entry(key, image);
+        let _ = self.request("PUT", &object, &[], data).await;
+    }
+
+    /// Every object key under the store prefix, following
+    /// continuation tokens. An error yields what was listed so
+    /// far (possibly nothing).
+    async fn list_objects(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut query: Vec<(&str, &str)> = vec![("list-type", "2")];
+            if !self.prefix.is_empty() {
+                query.push(("prefix", self.prefix.as_str()));
+            }
+            if let Some(t) = &token {
+                query.push(("continuation-token", t.as_str()));
+            }
+            let Some(resp) = self.request("GET", "", &query, Vec::new()).await else {
+                break;
+            };
+            if !resp.status().is_success() {
+                break;
+            }
+            let Ok(text) = resp.text().await else { break };
+            for chunk in text.split("<Key>").skip(1) {
+                if let Some(end) = chunk.find("</Key>") {
+                    keys.push(xml_unescape(&chunk[..end]));
+                }
+            }
+            if !text.contains("<IsTruncated>true</IsTruncated>") {
+                break;
+            }
+            token = text
+                .split("<NextContinuationToken>")
+                .nth(1)
+                .and_then(|rest| rest.split("</NextContinuationToken>").next())
+                .map(xml_unescape);
+            if token.is_none() {
+                break;
+            }
+        }
+        keys
+    }
+
+    /// Remove every entry whose stored key is `base` or one of
+    /// its `#`-suffixed variants. Returns how many entries were
+    /// removed.
+    pub async fn purge_matching(&self, base: &str) -> usize {
+        self.purge_where(|stored_key, _| {
+            stored_key == base || stored_key.starts_with(&format!("{base}#"))
+        })
+        .await
+    }
+
+    /// Remove every entry belonging to `group`. Returns how
+    /// many entries were removed.
+    pub async fn purge_group(&self, group: &str) -> usize {
+        self.purge_where(|_, image| image.groups.iter().any(|g| g == group))
+            .await
+    }
+
+    /// The shared purge walk: list, read each entry, delete the
+    /// matches. Reads are full entries (an administrative
+    /// operation; correctness over speed).
+    async fn purge_where(&self, matches: impl Fn(&str, &CachedImage) -> bool) -> usize {
+        let mut removed = 0;
+        for object in self.list_objects().await {
+            let Some(resp) = self.request("GET", &object, &[], Vec::new()).await else {
+                continue;
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let Ok(data) = resp.bytes().await else {
+                continue;
+            };
+            let Some((stored_key, image)) = parse_entry(&data) else {
+                continue;
+            };
+            if !matches(&stored_key, &image) {
+                continue;
+            }
+            if let Some(resp) = self.request("DELETE", &object, &[], Vec::new()).await
+                && resp.status().is_success()
+            {
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+
+/// The five predefined XML entities, the only escaping S3
+/// applies to listed keys.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A minimal in-process S3: PUT/GET/DELETE plus
+    /// ListObjectsV2 over one shared map, path-style URLs.
+    pub struct FakeS3 {
+        pub objects: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+        pub endpoint: String,
+    }
+
+    pub async fn start_fake() -> FakeS3 {
+        let objects = Arc::new(StdMutex::new(HashMap::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shared = objects.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let objects = shared.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let header_end;
+                    loop {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = find(&buf, b"\r\n\r\n") {
+                            header_end = pos + 4;
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let mut lines = head.lines();
+                    let request_line = lines.next().unwrap_or_default().to_string();
+                    let mut content_length: usize = 0;
+                    for line in lines {
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(v) = lower.strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    while buf.len() < header_end + content_length {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let body = buf[header_end..header_end + content_length].to_vec();
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let target = parts.next().unwrap_or_default().to_string();
+                    let (status, payload) = handle(&objects, &method, &target, body);
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                });
+            }
+        });
+        FakeS3 {
+            objects,
+            endpoint: format!("http://127.0.0.1:{port}"),
+        }
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    fn handle(
+        objects: &StdMutex<HashMap<String, Vec<u8>>>,
+        method: &str,
+        target: &str,
+        body: Vec<u8>,
+    ) -> (String, Vec<u8>) {
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (target, ""),
+        };
+        let rest = path.trim_start_matches('/');
+        let key = percent_decode(rest.split_once('/').map(|(_, k)| k).unwrap_or(""));
+        match (method, query.contains("list-type=2")) {
+            ("PUT", _) => {
+                objects.lock().unwrap().insert(key, body);
+                ("200 OK".into(), Vec::new())
+            }
+            ("GET", true) => {
+                let prefix = query
+                    .split('&')
+                    .find_map(|p| p.strip_prefix("prefix="))
+                    .map(percent_decode)
+                    .unwrap_or_default();
+                let mut xml = String::from(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><IsTruncated>false</IsTruncated>",
+                );
+                for k in objects.lock().unwrap().keys() {
+                    if k.starts_with(&prefix) {
+                        xml += &format!("<Contents><Key>{k}</Key></Contents>");
+                    }
+                }
+                xml += "</ListBucketResult>";
+                ("200 OK".into(), xml.into_bytes())
+            }
+            ("GET", false) => match objects.lock().unwrap().get(&key) {
+                Some(v) => ("200 OK".into(), v.clone()),
+                None => ("404 Not Found".into(), Vec::new()),
+            },
+            ("DELETE", _) => {
+                objects.lock().unwrap().remove(&key);
+                ("204 No Content".into(), Vec::new())
+            }
+            _ => ("400 Bad Request".into(), Vec::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::start_fake;
+    use super::*;
+    use crate::url::ImageFormat;
+
+    fn store(endpoint: &str) -> S3Store {
+        S3Store::new(
+            "results".into(),
+            "cache/".into(),
+            Some(endpoint.into()),
+            "us-east-1".into(),
+            None,
+        )
+    }
+
+    fn image(bytes: &[u8], groups: &[&str]) -> CachedImage {
+        CachedImage {
+            bytes: bytes.to_vec(),
+            format: ImageFormat::WebP,
+            quality: Some(80),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_get_round_trip_across_instances() {
+        let fake = start_fake().await;
+        let a = store(&fake.endpoint);
+        let b = store(&fake.endpoint);
+        assert!(a.get("300x200/example.com/i.jpg").await.is_none());
+        a.put("300x200/example.com/i.jpg", &image(b"pixels", &["hero"]))
+            .await;
+        // A second instance (another replica) reads it back.
+        let got = b.get("300x200/example.com/i.jpg").await.unwrap();
+        assert_eq!(got.bytes, b"pixels");
+        assert_eq!(got.groups, vec!["hero".to_string()]);
+        assert_eq!(got.quality, Some(80));
+    }
+
+    #[tokio::test]
+    async fn purge_matching_removes_the_base_and_its_variants_only() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        for key in [
+            "a/example.com/i.jpg",
+            "a/example.com/i.jpg#w2",
+            "ab/example.com/i.jpg",
+        ] {
+            s.put(key, &image(b"x", &[])).await;
+        }
+        assert_eq!(s.purge_matching("a/example.com/i.jpg").await, 2);
+        assert!(s.get("a/example.com/i.jpg").await.is_none());
+        assert!(s.get("ab/example.com/i.jpg").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn purge_group_removes_only_its_members() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("one", &image(b"1", &["hero"])).await;
+        s.put("two", &image(b"2", &["hero", "side"])).await;
+        s.put("three", &image(b"3", &["side"])).await;
+        assert_eq!(s.purge_group("hero").await, 2);
+        assert!(s.get("three").await.is_some());
+        assert_eq!(s.purge_group("hero").await, 0);
+    }
+}

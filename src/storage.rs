@@ -266,7 +266,7 @@ impl DiskStore {
     }
 }
 
-fn key_stem(key: &str) -> String {
+pub(crate) fn key_stem(key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -312,7 +312,7 @@ fn parse_format(name: &str) -> Option<ImageFormat> {
     })
 }
 
-fn serialize_entry(key: &str, image: &CachedImage) -> Vec<u8> {
+pub(crate) fn serialize_entry(key: &str, image: &CachedImage) -> Vec<u8> {
     let quality = image
         .quality
         .map(|q| q.to_string())
@@ -423,7 +423,7 @@ fn parse_header_bytes(data: &[u8]) -> Option<EntryHeader> {
     })
 }
 
-fn parse_entry(data: &[u8]) -> Option<(String, CachedImage)> {
+pub(crate) fn parse_entry(data: &[u8]) -> Option<(String, CachedImage)> {
     let header = parse_header_bytes(data)?;
     let bytes = data.get(header.payload_offset..)?.to_vec();
     if bytes.is_empty() {
