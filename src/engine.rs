@@ -33,6 +33,15 @@ const MAX_ANIMATED_FRAMES: usize = 200;
 const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 
+/// The most operations one request may execute, after preset
+/// expansion (issue #182, audit R2-12): each operation counts
+/// once, and each filter inside a `filters:` segment counts
+/// once, because each is a pass over the pixels. Real chains
+/// (a size, a crop, a dozen filters) sit far below this; the
+/// cap exists so thousands of repeated cheap operations
+/// cannot burn a process-gate slot on CPU alone.
+const MAX_OPERATIONS: usize = 100;
+
 /// The per-request encode budget (audit E-6): the
 /// quality(auto) verification loop and the max_bytes ladder
 /// draw from one pool, so their multipliers cannot stack
@@ -169,6 +178,67 @@ fn check_output_pixels(width: u32, height: u32) -> Result<(), EngineError> {
     if width as u64 * height as u64 > MAX_OUTPUT_PIXELS {
         return Err(EngineError::Unsupported(format!(
             "requested output {width}x{height} exceeds the {MAX_OUTPUT_PIXELS} pixel limit"
+        )));
+    }
+    Ok(())
+}
+
+/// A running total of output pixels across the frames of one
+/// animated or video output, charged against the same budget
+/// a single still output gets (issue #182, audit R2-01). The
+/// per-frame check alone lets 200 individually legal frames
+/// retain hundreds of millions of pixels before any encoder
+/// runs; charging each frame as it is produced rejects the
+/// request once the total passes the budget, so what is
+/// retained stays within the budget plus one frame.
+struct OutputBudget {
+    limit: u64,
+    total: u64,
+}
+
+impl OutputBudget {
+    fn new() -> Self {
+        Self {
+            limit: MAX_OUTPUT_PIXELS,
+            total: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limit(limit: u64) -> Self {
+        Self { limit, total: 0 }
+    }
+
+    /// Charge one frame's output pixels against the budget.
+    fn charge(&mut self, width: u32, height: u32) -> Result<(), EngineError> {
+        self.total = self
+            .total
+            .saturating_add(u64::from(width) * u64::from(height));
+        if self.total > self.limit {
+            return Err(EngineError::Unsupported(format!(
+                "animated output exceeds the {} pixel budget across frames",
+                self.limit
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Reject a request whose expanded operation list runs past
+/// [`MAX_OPERATIONS`]: the count the engine executes, not the
+/// count the URL spells, so preset expansion cannot multiply
+/// work past the cap (issue #182, audit R2-12).
+fn check_operation_count(ops: &[Operation]) -> Result<(), EngineError> {
+    let count: usize = ops
+        .iter()
+        .map(|op| match op {
+            Operation::Filters(filters) => filters.len(),
+            _ => 1,
+        })
+        .sum();
+    if count > MAX_OPERATIONS {
+        return Err(EngineError::Unsupported(format!(
+            "request has {count} operations, over the {MAX_OPERATIONS} operation limit"
         )));
     }
     Ok(())
@@ -852,11 +922,13 @@ impl Engine {
             None
         };
         let dpr = dpr_factor(directives.dpr, ctx);
+        let mut budget = OutputBudget::new();
         let mut out_frames = Vec::with_capacity(frames.len());
         for frame in frames {
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
             let (img, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            budget.charge(img.width(), img.height())?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
         let (width, height) = out_frames
@@ -880,7 +952,7 @@ impl Engine {
                     .map_err(|e| EngineError::Encode(e.to_string()))?;
                 out
             }
-            ImageFormat::WebP => encode_animated_webp(&out_frames, loop_count.unwrap_or(0))?,
+            ImageFormat::WebP => encode_animated_webp(out_frames, loop_count.unwrap_or(0))?,
             _ => unreachable!("process_animated is only called for GIF and WebP"),
         };
         Ok(ProcessedImage {
@@ -931,11 +1003,13 @@ impl Engine {
             None
         };
         let dpr = dpr_factor(directives.dpr, ctx);
+        let mut budget = OutputBudget::new();
         let mut out_frames = Vec::with_capacity(frames.len());
         for frame in frames {
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
             let (img, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            budget.charge(img.width(), img.height())?;
             out_frames.push(crate::video::VideoFrame {
                 pixels: img.to_rgba8(),
                 delay_ms,
@@ -1056,19 +1130,24 @@ fn decode_webp_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
 /// (oxideav-webp, the crate the lossy still path uses) writes
 /// lossless VP8L frames and has no lossy animation mode, so
 /// there is no quality lever here; `loop_count` is carried
-/// over from the source (0 loops forever).
-fn encode_animated_webp(frames: &[image::Frame], loop_count: u16) -> Result<Vec<u8>, EngineError> {
+/// over from the source (0 loops forever). The frames are
+/// consumed so each pixel buffer moves into the encoder
+/// instead of being cloned a second time (issue #182).
+fn encode_animated_webp(
+    frames: Vec<image::Frame>,
+    loop_count: u16,
+) -> Result<Vec<u8>, EngineError> {
     let frames: Vec<oxideav_webp::Frame> = frames
-        .iter()
+        .into_iter()
         .map(|frame| -> Result<oxideav_webp::Frame, EngineError> {
-            let buffer = frame.buffer();
+            let delay: std::time::Duration = frame.delay().into();
+            let buffer = frame.into_buffer();
             let image = oxideav_webp::WebpImage::from_rgba8(
                 buffer.width(),
                 buffer.height(),
-                buffer.as_raw().clone(),
+                buffer.into_raw(),
             )
             .map_err(|e| EngineError::Encode(e.to_string()))?;
-            let delay: std::time::Duration = frame.delay().into();
             Ok(oxideav_webp::Frame::new(image, Some(delay)))
         })
         .collect::<Result<_, _>>()?;
@@ -1288,6 +1367,7 @@ fn apply_operations(
     ctx: &ProcessContext<'_>,
     directives: &crate::url::RequestDirectives,
 ) -> Result<(DynamicImage, EncodeOptions), EngineError> {
+    check_operation_count(ops)?;
     let mut encode_opts = EncodeOptions::default();
     let mut face_memo: FaceMemo = None;
     // One detection memo per provider, in resolution order
@@ -1619,6 +1699,19 @@ fn apply_operations(
                                 .map_err(EngineError::Render)?;
                         }
                         other => {
+                            // Arbitrary-angle rotation is
+                            // the one plain filter that grows
+                            // the canvas: check the canvas it
+                            // is about to allocate before it
+                            // allocates (issue #182, R2-12).
+                            if let Filter::Rotate(degrees) = other {
+                                let (cw, ch) = crate::filters::rotated_canvas(
+                                    img.width(),
+                                    img.height(),
+                                    *degrees,
+                                );
+                                check_output_pixels(cw, ch)?;
+                            }
                             let (new_img, options) = crate::filters::apply_filters_filled(
                                 img,
                                 std::slice::from_ref(other),
@@ -1628,9 +1721,18 @@ fn apply_operations(
                             encode_opts.absorb(options);
                         }
                     }
+                    // Every filter leaves the image inside
+                    // the output budget: growth is checked
+                    // before it compounds across a chain,
+                    // not just at the size operations.
+                    check_output_pixels(img.width(), img.height())?;
                 }
             }
         }
+        // The running image stays inside the output budget
+        // after every operation, not only after the ones
+        // that size it (issue #182, audit R2-12).
+        check_output_pixels(img.width(), img.height())?;
     }
     if debug_armed {
         // The debug view replaces the transform result. With
@@ -1658,6 +1760,10 @@ fn apply_operations(
         };
         img = crate::debugview::render(&capture);
     }
+    // The last word on size: whatever the chain did, the
+    // image that goes to the encoder is inside the output
+    // budget (issue #182, audit R2-12).
+    check_output_pixels(img.width(), img.height())?;
     Ok((img, encode_opts))
 }
 
@@ -4460,6 +4566,142 @@ mod tests {
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
         let err = apply_pad(img, 16_383, 16_383, PadFill::Directive, None, None).unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn output_budget_charges_frames_against_one_total() {
+        let mut budget = OutputBudget::with_limit(250);
+        assert!(budget.charge(10, 10).is_ok());
+        assert!(budget.charge(10, 10).is_ok());
+        // Each frame is inside the limit on its own; the
+        // running total is what passes it (issue #182).
+        let err = budget.charge(10, 10).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        // A single frame can also blow the budget by itself.
+        let mut budget = OutputBudget::with_limit(250);
+        assert!(budget.charge(20, 20).is_err());
+    }
+
+    /// Two 100x100 frames, tiny on every input cap. Padded
+    /// (with upscale capped, so the pad is a canvas fill,
+    /// not a resample) to 10000x6000, each frame is 60M
+    /// output pixels: individually inside the per-frame
+    /// budget, 120M in sum, past the one shared budget.
+    fn aggregate_overflow_gif() -> Vec<u8> {
+        let delay = image::Delay::from_numer_denom_ms(100, 1);
+        let frames: Vec<image::Frame> = (0..2)
+            .map(|_| image::Frame::from_parts(image::RgbaImage::new(100, 100), 0, 0, delay))
+            .collect();
+        let mut src = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut src)
+            .encode_frames(frames)
+            .unwrap();
+        src
+    }
+
+    fn aggregate_overflow_ops() -> Vec<Operation> {
+        vec![
+            Operation::Filters(vec![Filter::NoUpscale]),
+            Operation::Pad {
+                size: ImageSize {
+                    width: Dimension::Pixels(10_000),
+                    height: Dimension::Pixels(6_000),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                fill: PadFill::Color([0, 0, 0]),
+            },
+        ]
+    }
+
+    #[test]
+    fn animated_output_budget_rejects_aggregate_overflow() {
+        // Issue #182, audit R2-01: the frames pass every
+        // per-frame check; only the aggregate charge refuses.
+        let engine = Engine;
+        let err = engine
+            .process(&aggregate_overflow_gif(), &aggregate_overflow_ops())
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("across frames"), "{err}");
+    }
+
+    #[test]
+    fn video_output_budget_rejects_aggregate_overflow() {
+        // The same aggregate budget guards the video path:
+        // the request fails before the encoder ever runs.
+        let engine = Engine;
+        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let mut ops = aggregate_overflow_ops();
+        ops.push(Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)]));
+        let err = engine
+            .process_preferred(
+                &aggregate_overflow_gif(),
+                &ops,
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("across frames"), "{err}");
+    }
+
+    #[test]
+    fn rotate_canvas_is_checked_before_it_allocates() {
+        // An 8000x8000 image is a legal size; a 45 degree
+        // rotation would land on a 11314x11314 canvas (128M
+        // px), past the output budget. The chain is rejected
+        // by the canvas check, before the rotation runs
+        // (issue #182, audit R2-12).
+        let img = DynamicImage::new_rgba8(8000, 8000);
+        let ops = [Operation::Filters(vec![Filter::Rotate(45.0)])];
+        let directives = crate::url::RequestDirectives::analyze(&ops);
+        let ctx = ProcessContext::default();
+        let err = apply_operations(img.clone(), &ops, None, 1.0, &ctx, &directives).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        // A quarter turn keeps the pixel count and passes.
+        let ops = [Operation::Filters(vec![Filter::Rotate(90.0)])];
+        let directives = crate::url::RequestDirectives::analyze(&ops);
+        let (out, _) = apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
+        assert_eq!((out.width(), out.height()), (8000, 8000));
+    }
+
+    #[test]
+    fn rotate_chains_inside_the_budget_still_work() {
+        let engine = Engine;
+        let out = engine
+            .process(
+                &solid_png(100, 100, [200, 30, 30]),
+                &[Operation::Filters(vec![
+                    Filter::Rotate(45.0),
+                    Filter::Rotate(45.0),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(decode_dims(&out.bytes), (201, 201));
+    }
+
+    #[test]
+    fn operation_count_cap_rejects_overlong_chains() {
+        let engine = Engine;
+        let src = solid_png(4, 4, [1, 2, 3]);
+        // One segment carrying MAX_OPERATIONS + 1 cheap
+        // filters is over: filters count individually.
+        let one_segment = vec![Operation::Filters(vec![Filter::Invert; MAX_OPERATIONS + 1])];
+        let err = engine.process(&src, &one_segment).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        // So are MAX_OPERATIONS + 1 single-filter segments.
+        let many_segments: Vec<Operation> = (0..=MAX_OPERATIONS)
+            .map(|_| Operation::Filters(vec![Filter::Invert]))
+            .collect();
+        assert!(engine.process(&src, &many_segments).is_err());
+        // Exactly at the cap still processes.
+        let at_cap: Vec<Operation> = (0..MAX_OPERATIONS)
+            .map(|_| Operation::Filters(vec![Filter::Invert]))
+            .collect();
+        assert!(engine.process(&src, &at_cap).is_ok());
     }
 
     #[test]

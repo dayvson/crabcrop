@@ -190,8 +190,28 @@ pub fn apply_filters_filled(
     (img, options)
 }
 
-/// Rec. 601 luma, the same weights the saturation filter
-/// and the image crate's grayscale use.
+/// The canvas a rotation of a `w` by `h` image lands on:
+/// quarter turns swap the axes, an arbitrary angle gets the
+/// rotated bounding box. Shared with the engine, which
+/// checks the canvas against the output pixel budget before
+/// the rotation allocates it (issue #182, audit R2-12).
+pub(crate) fn rotated_canvas(w: u32, h: u32, degrees: f32) -> (u32, u32) {
+    let normalized = ((degrees % 360.0) + 360.0) % 360.0;
+    if normalized == 90.0 || normalized == 270.0 {
+        return (h, w);
+    }
+    if normalized == 0.0 || normalized == 180.0 {
+        return (w, h);
+    }
+    let theta = normalized.to_radians();
+    let (sin, cos) = theta.sin_cos();
+    let (w, h) = (w as f32, h as f32);
+    (
+        (w * cos.abs() + h * sin.abs()).ceil().max(1.0) as u32,
+        (w * sin.abs() + h * cos.abs()).ceil().max(1.0) as u32,
+    )
+}
+
 /// Rotate by a non-quarter angle (issue #144): the canvas
 /// expands to the rotated bounding box, destination pixels
 /// inverse-map to the source with bilinear sampling, and
@@ -211,8 +231,7 @@ fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> D
     let (w, h) = (src.width() as f32, src.height() as f32);
     let theta = degrees.to_radians();
     let (sin, cos) = theta.sin_cos();
-    let new_w = (w * cos.abs() + h * sin.abs()).ceil().max(1.0) as u32;
-    let new_h = (w * sin.abs() + h * cos.abs()).ceil().max(1.0) as u32;
+    let (new_w, new_h) = rotated_canvas(src.width(), src.height(), degrees);
     let (scx, scy) = ((w - 1.0) / 2.0, (h - 1.0) / 2.0);
     let (dcx, dcy) = ((new_w as f32 - 1.0) / 2.0, (new_h as f32 - 1.0) / 2.0);
     let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
@@ -269,6 +288,8 @@ fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> D
     }
 }
 
+/// Rec. 601 luma, the same weights the saturation filter
+/// and the image crate's grayscale use.
 fn luma(r: u8, g: u8, b: u8) -> f32 {
     0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
 }
