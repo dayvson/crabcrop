@@ -8,6 +8,30 @@ crabcrop is an on-demand image optimization service written in Rust. You request
 
 crabcrop is for sites and apps that serve the same images at many sizes and want signed, cacheable image URLs in front of an origin image store.
 
+## Install
+
+**Shell installer** (macOS and Linux):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releases/latest/download/crabcrop-installer.sh | sh
+```
+
+**Homebrew:** download `crabcrop.rb` from the [latest release](https://github.com/dayvson/crabcrop/releases/latest), then:
+
+```bash
+brew install --formula ./crabcrop.rb
+```
+
+**Docker:** the base image, and the AI variant with background removal and face detection on board:
+
+```bash
+docker pull ghcr.io/dayvson/crabcrop:0.1.0
+docker pull ghcr.io/dayvson/crabcrop-ai:0.1.0
+docker run -e CRABCROP_SECRET=your-secret -p 3000:3000 ghcr.io/dayvson/crabcrop:0.1.0
+```
+
+**Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases). To build from source instead, see [Deployment](#deployment).
+
 ## Quickstart
 
 **1. Start the server.** A secret is required. For local development, also allow unsigned URLs:
