@@ -152,7 +152,7 @@ jobs:
             sudo apt-get update && sudo apt-get install -y nasm
           elif [ "$RUNNER_OS" = "macOS" ]; then
             brew install nasm
-        fi
+          fi
       - name: Build artifacts
         env:
           # Vendored static dav1d, so the release binaries
