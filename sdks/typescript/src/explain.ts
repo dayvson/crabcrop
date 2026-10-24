@@ -557,9 +557,15 @@ function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment,
   }
   if (seg.startsWith("fit-in:")) {
     const rest = seg.slice(7);
-    const size = parseSizeSegment(rest);
-    if (!size || size.w.flip || size.h.flip) {
-      return { kind: "operation", title: "Fit in", error: `malformed fit-in segment: ${seg} (flips are not allowed here)` };
+    const idx = rest.indexOf(":");
+    const dims = idx === -1 ? rest : rest.slice(0, idx);
+    const modifier = idx === -1 ? null : rest.slice(idx + 1);
+    const size = parseSizeSegment(dims);
+    if (!size || size.w.flip || size.h.flip || (modifier !== null && modifier !== "adaptive")) {
+      return { kind: "operation", title: "Fit in", error: `malformed fit-in segment: ${seg} (want fit-in:<w>x<h>[:adaptive], flips are not allowed here)` };
+    }
+    if (modifier === "adaptive") {
+      return { kind: "operation", title: "Fit inside a box", detail: `scale proportionally to fit inside ${dims}, swapping the box axes when the source orientation disagrees (adaptive)` };
     }
     return { kind: "operation", title: "Fit inside a box", detail: `scale proportionally to fit inside ${rest}` };
   }

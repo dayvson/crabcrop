@@ -139,13 +139,16 @@ curl "http://localhost:3000/unsafe/300x0/https://example.com/photo.jpg"
 ### Fit inside a box
 
 ```text
-fit-in:<width>x<height>
+fit-in:<width>x<height>[:adaptive]
 ```
 
 Scales the image proportionally so it fits inside the box. A `0` axis is unbounded. Flips are not allowed here.
 
+With `:adaptive`, the box axes swap when the source orientation disagrees with the box's: a portrait photo fitted into a landscape box fits inside the swapped (portrait) box instead, so it is not squeezed by the tighter axis. When the orientations agree, adaptive changes nothing. A square source, a square box, and a box with a `0` or `orig` axis have no orientation to disagree with and never swap.
+
 ```bash
 curl "http://localhost:3000/unsafe/fit-in:800x600/https://example.com/photo.jpg"
+curl "http://localhost:3000/unsafe/fit-in:800x600:adaptive/https://example.com/photo.jpg"
 ```
 
 ### Pad to an exact size
@@ -154,7 +157,7 @@ curl "http://localhost:3000/unsafe/fit-in:800x600/https://example.com/photo.jpg"
 pad:<width>x<height>[:<fill>]
 ```
 
-Fits the image inside the box (the fit-in rules, including `no_upscale`), centers it, and fills the rest of the canvas so the output is exactly the requested size. Both dimensions are required in pixels: a proportional (`0`) axis, `orig`, and flipped sizes are rejected, the same exact-box contract as `crop:`. The fill is a 6-digit hex color, or `blur` for ambient bars: a cover-scaled, heavily blurred copy of the image itself, the standard treatment for user-generated content in fixed-aspect slots. With no fill named, the request's `fill(...)` filter color is used, or black when there is none.
+Fits the image inside the box (the fit-in rules, including `no_upscale`), centers it, and fills the rest of the canvas so the output is exactly the requested size. There is no adaptive form of `pad:`: the canvas is explicit, so it is never swapped. Both dimensions are required in pixels: a proportional (`0`) axis, `orig`, and flipped sizes are rejected, the same exact-box contract as `crop:`. The fill is a 6-digit hex color, or `blur` for ambient bars: a cover-scaled, heavily blurred copy of the image itself, the standard treatment for user-generated content in fixed-aspect slots. With no fill named, the request's `fill(...)` filter color is used, or black when there is none.
 
 ```bash
 curl "http://localhost:3000/unsafe/pad:1200x630:blur/https://example.com/photo.jpg"

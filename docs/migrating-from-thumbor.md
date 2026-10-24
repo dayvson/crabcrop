@@ -44,7 +44,7 @@ crabcrop convert-thumbor "unsafe/filters:brightness(20):focal(10x10:50x50)/https
 | `orig` as a dimension | `orig` | Same meaning |
 | Negative dimension (`-300x200`) | Inside a plain size; a `flip(h)` / `flip(v)` filter where the size takes no flips (`crop:`, `fit-in:`) | A flip on that axis in both |
 | `fit-in` | `fit-in:` | Flips become `flip(h)` / `flip(v)` filters, since crabcrop's fit-in size takes none |
-| `adaptive-fit-in` | `fit-in:` | Converted with a warning; there is no adaptive mode |
+| `adaptive-fit-in` | `fit-in:<W>x<H>:adaptive` | Converted exactly; the box swaps when the source orientation disagrees with it |
 | `full-fit-in` | `fit-in:` | Converted with a warning; the whole image stays inside the box |
 | `left` / `center` / `right`, `top` / `middle` / `bottom` | The crop alignment (`crop:300x200:left`) | Corner pairs map to the corner alignments (`crop:300x200:top-left`, `top-right`, `bottom-left`, `bottom-right`); a centered side collapses to the plain edge |
 | `smart` | `crop:<W>x<H>:smart` | Focal-point crop in both |

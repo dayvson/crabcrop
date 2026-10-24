@@ -14,6 +14,7 @@ test("typed segments match the canonical spellings", () => {
     [ops.size("orig", 200), "origx200"],
     [ops.size(-300, 200), "-300x200"],
     [ops.fitIn(800, 600), "fit-in:800x600"],
+    [ops.fitIn(800, 600, true), "fit-in:800x600:adaptive"],
     [ops.crop(1200, 630), "crop:1200x630"],
     [ops.crop(1200, 630, "smart"), "crop:1200x630:smart"],
     [ops.crop(100, 100, "face"), "crop:100x100:face"],
