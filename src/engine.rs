@@ -476,7 +476,7 @@ impl Engine {
         } else {
             None
         };
-        let (img, directives) = apply_operations(
+        let (img, encode_opts) = apply_operations(
             img,
             ops,
             cap,
@@ -491,7 +491,7 @@ impl Engine {
         } else {
             None
         };
-        if let Some(f) = directives.format {
+        if let Some(f) = encode_opts.format {
             format = f;
         } else if let Some(p) = ctx.preferred {
             format = p;
@@ -499,7 +499,7 @@ impl Engine {
         // Resolve the quality directive against the final image.
         // `quality(auto)` is reported back: it is the one the caller
         // did not choose themselves.
-        let (encode_quality, mut chosen_quality) = match directives.quality {
+        let (encode_quality, mut chosen_quality) = match encode_opts.quality {
             Some(Quality::Value(q)) => (Some(q), None),
             Some(Quality::Auto) => {
                 let q = auto_quality(&img);
@@ -524,9 +524,10 @@ impl Engine {
         // score with SSIMULACRA2, and bisect on quality until the
         // score lands in the target band. The heuristic pick is
         // the first guess. Other formats keep the one-shot pick.
-        let perceptual = matches!(directives.quality, Some(Quality::Auto))
+        let perceptual = matches!(encode_opts.quality, Some(Quality::Auto))
             && matches!(format, ImageFormat::Jpeg | ImageFormat::Jxl);
         let mut ssim: Option<f64> = None;
+        let enc_src = EncodeBuffers::new(&img);
         let mut encode_budget = MAX_REQUEST_ENCODES;
         let mut bytes = if perceptual {
             let first_guess = encode_quality.expect("auto quality resolves a value");
@@ -536,10 +537,10 @@ impl Engine {
                 &mut encode_budget,
                 |q| {
                     let candidate = encode(
-                        &img,
+                        &enc_src,
                         format,
                         Some(q),
-                        directives.fill,
+                        encode_opts.fill,
                         ctx.avif_speed,
                         ctx.jxl_speed,
                     )?;
@@ -554,10 +555,10 @@ impl Engine {
             scored.bytes
         } else {
             let bytes = encode(
-                &img,
+                &enc_src,
                 format,
                 encode_quality,
-                directives.fill,
+                encode_opts.fill,
                 ctx.avif_speed,
                 ctx.jxl_speed,
             )?;
@@ -577,7 +578,7 @@ impl Engine {
             ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
         );
         let mut ladder_ran = false;
-        if let Some(budget) = directives.max_bytes.filter(|_| quality_bearing) {
+        if let Some(budget) = encode_opts.max_bytes.filter(|_| quality_bearing) {
             let mut current = chosen_quality.or(encode_quality).unwrap_or(80);
             let mut attempts = 0;
             while bytes.len() as u64 > budget
@@ -587,10 +588,10 @@ impl Engine {
             {
                 current = next_quality(format, current);
                 bytes = encode(
-                    &img,
+                    &enc_src,
                     format,
                     Some(current),
-                    directives.fill,
+                    encode_opts.fill,
                     ctx.avif_speed,
                     ctx.jxl_speed,
                 )?;
@@ -613,7 +614,7 @@ impl Engine {
         // profile (it was not converted away), preserved
         // metadata when the operator policy allows it. Only
         // JPEG and PNG outputs carry either in this pass.
-        let keep_profile = directives.keep_profile;
+        let keep_profile = encode_opts.keep_profile;
         let bytes = if (keep_profile && source_meta.icc.is_some()) || ctx.preserve_metadata {
             let embed_icc = if keep_profile {
                 source_meta.icc.as_deref()
@@ -1284,18 +1285,50 @@ fn max_quality_attempts(format: ImageFormat) -> u32 {
     }
 }
 
-/// Encode `img` to `format`. `quality` applies to JPEG, JPEG XL,
-/// AVIF, and WebP (where 100 selects the lossless encode).
-/// `fill` composites transparency for formats without an
-/// alpha channel (only JPEG needs it here).
+/// Pixel layouts for one encode phase, converted at most once
+/// each and shared by every encode of the same image (issue
+/// #138). The quality ladders (perceptual bisection, max_bytes)
+/// re-encode one image up to a dozen times; converting the
+/// full frame inside each attempt copied it every time. The
+/// buffers compute lazily: a JPEG-only request never pays for
+/// the RGBA layout.
+struct EncodeBuffers<'a> {
+    img: &'a DynamicImage,
+    rgb: std::cell::OnceCell<image::RgbImage>,
+    rgba: std::cell::OnceCell<image::RgbaImage>,
+}
+
+impl<'a> EncodeBuffers<'a> {
+    fn new(img: &'a DynamicImage) -> Self {
+        Self {
+            img,
+            rgb: std::cell::OnceCell::new(),
+            rgba: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn rgb(&self) -> &image::RgbImage {
+        self.rgb.get_or_init(|| self.img.to_rgb8())
+    }
+
+    fn rgba(&self) -> &image::RgbaImage {
+        self.rgba.get_or_init(|| self.img.to_rgba8())
+    }
+}
+
+/// Encode `src.img` to `format`. `quality` applies to JPEG,
+/// JPEG XL, AVIF, and WebP (where 100 selects the lossless
+/// encode). `fill` composites transparency for formats without
+/// an alpha channel (only JPEG needs it here).
 fn encode(
-    img: &DynamicImage,
+    src: &EncodeBuffers<'_>,
     format: ImageFormat,
     quality: Option<u8>,
     fill: Option<[u8; 3]>,
     avif_speed: u8,
     jxl_speed: jixel::Speed,
 ) -> Result<Vec<u8>, EngineError> {
+    let img = src.img;
     let (w, h) = (img.width(), img.height());
     if format == ImageFormat::Jxl {
         // Pure-Rust encoder (jixel). Its quality is a libjpeg-like
@@ -1304,16 +1337,14 @@ fn encode(
             .with_quality(quality.unwrap_or(80) as f32)
             .with_speed(jxl_speed);
         let encoded = if img.color().has_alpha() {
-            let rgba = img.to_rgba8();
-            jixel::encode_image_with_alpha(rgba.as_raw(), w as usize, h as usize, &config)
+            jixel::encode_image_with_alpha(src.rgba().as_raw(), w as usize, h as usize, &config)
         } else {
-            let rgb = img.to_rgb8();
-            jixel::encode_image(rgb.as_raw(), w as usize, h as usize, &config)
+            jixel::encode_image(src.rgb().as_raw(), w as usize, h as usize, &config)
         };
         return encoded.map_err(|e| EngineError::Encode(e.to_string()));
     }
     if format == ImageFormat::WebP {
-        return encode_webp(img, quality);
+        return encode_webp(src, quality);
     }
     let mut buf = Vec::new();
     let (pixels, color) = (img.as_bytes(), ExtendedColorType::from(img.color()));
@@ -1329,9 +1360,13 @@ fn encode(
             // jpeg-encoder's optimized tables for degenerate
             // (tiny, flat) inputs produce files zune-jpeg decodes
             // incorrectly, an interop hazard measured in #38.
-            let rgb = match fill {
-                Some(bg) if img.color().has_alpha() => flatten(img, bg),
-                _ => img.to_rgb8(),
+            let flattened;
+            let rgb: &image::RgbImage = match fill {
+                Some(bg) if img.color().has_alpha() => {
+                    flattened = flatten(img, bg);
+                    &flattened
+                }
+                _ => src.rgb(),
             };
             if w > u16::MAX as u32 || h > u16::MAX as u32 {
                 return Err(EngineError::Encode(
@@ -1369,7 +1404,7 @@ fn encode(
         }
         ImageFormat::Gif => {
             image::codecs::gif::GifEncoder::new(&mut buf)
-                .encode(img.to_rgba8().as_raw(), w, h, ExtendedColorType::Rgba8)
+                .encode(src.rgba().as_raw(), w, h, ExtendedColorType::Rgba8)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
@@ -1381,7 +1416,8 @@ fn encode(
 /// oxideav-webp (pure Rust); quality 100 (or an encode the ladder
 /// starts there) keeps the image crate's lossless VP8L encode.
 /// The default quality is 80, like the other lossy formats.
-fn encode_webp(img: &DynamicImage, quality: Option<u8>) -> Result<Vec<u8>, EngineError> {
+fn encode_webp(src: &EncodeBuffers<'_>, quality: Option<u8>) -> Result<Vec<u8>, EngineError> {
+    let img = src.img;
     let q = quality.unwrap_or(80);
     if q >= 100 {
         let mut buf = Vec::new();
@@ -1403,11 +1439,9 @@ fn encode_webp(img: &DynamicImage, quality: Option<u8>) -> Result<Vec<u8>, Engin
     }
     let opts = oxideav_webp::EncodeOptions::default().with_quality(q as f32);
     let encoded = if img.color().has_alpha() {
-        let rgba = img.to_rgba8();
-        oxideav_webp::encode_rgba8(img.width(), img.height(), rgba.as_raw(), &opts)
+        oxideav_webp::encode_rgba8(img.width(), img.height(), src.rgba().as_raw(), &opts)
     } else {
-        let rgb = img.to_rgb8();
-        oxideav_webp::encode_rgb8(img.width(), img.height(), rgb.as_raw(), &opts)
+        oxideav_webp::encode_rgb8(img.width(), img.height(), src.rgb().as_raw(), &opts)
     };
     encoded.map_err(|e| EngineError::Encode(e.to_string()))
 }
@@ -3245,7 +3279,7 @@ mod tests {
     fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(24, 16));
         let bytes = encode(
-            &img,
+            &EncodeBuffers::new(&img),
             ImageFormat::Jxl,
             Some(80),
             None,
