@@ -4208,6 +4208,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_heic_source_resized_to_png() {
+        // The orientation fixture (tests/fixtures/orient6.heic):
+        // stored 64x48 with EXIF Orientation=6, so the served
+        // image is the upright 48x64.
+        let src =
+            spawn_bytes_server(include_bytes!("../tests/fixtures/orient6.heic").to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("24x32/filters:format(png)/{src}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = resp.bytes().await.unwrap();
+        let out = image::load_from_memory(&body).unwrap();
+        assert_eq!((out.width(), out.height()), (24, 32));
+    }
+
+    #[tokio::test]
     async fn auto_quality_sets_header() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;

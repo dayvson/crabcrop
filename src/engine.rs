@@ -28,7 +28,7 @@ fn ensure_jxl_decoder() {
 /// every entry point, so a hostile source or an oversized
 /// request fails cheaply instead of allocating gigabytes.
 pub(crate) const MAX_DECODE_DIMENSION: u32 = 16_384;
-const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 const MAX_ANIMATED_FRAMES: usize = 200;
 const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
@@ -95,7 +95,7 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
         .map_err(|e| EngineError::Decode(e.to_string()))
 }
 
-fn check_decoded_dimensions(width: u64, height: u64) -> Result<(), EngineError> {
+pub(crate) fn check_decoded_dimensions(width: u64, height: u64) -> Result<(), EngineError> {
     if width > MAX_DECODE_DIMENSION as u64 || height > MAX_DECODE_DIMENSION as u64 {
         return Err(EngineError::Decode(format!(
             "image dimensions {width}x{height} exceed the {MAX_DECODE_DIMENSION} px decode limit"
@@ -330,17 +330,11 @@ impl Engine {
         // the pipeline reads (issue #136); nothing below
         // re-walks the list looking for them.
         let directives = crate::url::RequestDirectives::analyze(ops);
-        // HEIC/HEIF sources are detected explicitly so the failure
-        // names the real problem instead of a generic decode error.
-        // The decoder evaluation (issue #24) found no option that
-        // is both license-compatible with this MIT crate and
-        // buildable in the project's environments today; this
-        // check is the seam a future decoder plugs into.
-        if is_heic(bytes) {
-            return Err(EngineError::Decode(
-                "HEIC/HEIF source: no HEIC decoder in this build".to_string(),
-            ));
-        }
+        // HEIC/HEIF sources are detected explicitly: they decode
+        // through the pure-Rust oxideav stack (issue #163), in the
+        // decode chain below, so the format gets its own metadata
+        // path instead of the generic one.
+        let heic_source = is_heic(bytes);
         // SVG sources are sniffed by content (the declared type
         // can lie), sanitized, and parsed up front: the raster
         // becomes the decoded image below, and the output
@@ -438,7 +432,10 @@ impl Engine {
         // the ICC profile drives color conversion below and
         // (policy permitting) the metadata injection at the
         // end.
-        let source_meta = crate::color::extract_source_meta(bytes);
+        // Replaced wholesale by the HEIC branch of the decode
+        // chain, whose metadata comes from the decoder rather
+        // than the container bytes.
+        let mut source_meta = crate::color::extract_source_meta(bytes);
         // An animated WebP source (one carrying an ANIM chunk)
         // gets the GIF treatment below; the probe also yields
         // the loop count the animated path carries over.
@@ -538,6 +535,21 @@ impl Engine {
             let (tw, th) =
                 svg_raster_target(ops, prep.intrinsic(), dpr_factor(directives.dpr, &ctx));
             prep.render(tw, th).map_err(EngineError::Decode)?
+        } else if heic_source {
+            // HEIC/HEIF: the oxideav decode applies the EXIF
+            // orientation from the decoder's own metadata (the
+            // container bytes carry no orientation the generic
+            // reader can see) and hands back the source metadata
+            // the rest of the pipeline expects. Color management
+            // then runs exactly as for the other formats.
+            let (mut img, meta) = crate::heic::decode_heic(bytes)?;
+            source_meta = meta;
+            if !directives.keep_profile
+                && let Some(icc) = &source_meta.icc
+            {
+                img = crate::color::convert_to_srgb(img, icc);
+            }
+            img
         } else {
             if detected == ImageFormat::Jxl {
                 check_jxl_dimensions(bytes)?;
@@ -1553,7 +1565,7 @@ fn capture_from_trace(
 /// container carries a readable one. Missing or malformed metadata
 /// yields `None`; re-encoding drops EXIF from outputs, so this read
 /// is the only place orientation exists.
-fn exif_orientation(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn exif_orientation(bytes: &[u8]) -> Option<u32> {
     let mut cursor = std::io::Cursor::new(bytes);
     let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
     let field = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?;
@@ -1562,7 +1574,7 @@ fn exif_orientation(bytes: &[u8]) -> Option<u32> {
 
 /// Apply the transform an EXIF orientation value prescribes.
 /// Values outside 1-8 leave the image untouched.
-fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
+pub(crate) fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
     match orientation {
         2 => img.fliph(),
         3 => img.rotate180(),
@@ -4534,7 +4546,11 @@ mod tests {
     }
 
     #[test]
-    fn heic_source_fails_with_a_specific_error() {
+    fn heic_source_without_an_image_fails_with_a_specific_error() {
+        // The ftyp brands alone are not an image: the HEIC decode
+        // path fails, by name, instead of falling through to a
+        // generic format error. The full decode behaviour lives
+        // in the heic module's tests.
         let engine = Engine;
         let heic: &[u8] = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1....";
         let err = engine.process(heic, &[]).unwrap_err();
