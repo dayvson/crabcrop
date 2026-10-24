@@ -32,7 +32,7 @@ const FILTER_BLURBS = {
   brighten: "brighten by the given amount (-255..255)",
   contrast: "contrast multiplier (1 is identity)",
   huerotate: "rotate the hue by the given degrees",
-  rotate: "rotate by a multiple of 90 degrees",
+  rotate: "rotate by the given angle in degrees; the canvas expands to fit",
   quality: "output quality 0..100, or `auto` for perceptual targeting",
   format: "force the output format",
   fill: "the background color other operations pad with",
@@ -206,7 +206,7 @@ function validateFilter(name, args) {
         ? null
         : bad;
     case "rotate":
-      return args !== null && isIntIn(args, -2147483648, 2147483647) && Number(args) % 90 === 0
+      return args !== null && /^-?\d+(\.\d+)?$/.test(args) && Math.abs(Number(args)) <= 36000
         ? null
         : bad;
     case "fill":

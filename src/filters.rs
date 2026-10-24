@@ -58,7 +58,19 @@ pub type WatermarkImages = std::collections::HashMap<String, DynamicImage>;
 ///
 /// Returns the transformed image plus the encoding directives.
 /// Later directives win when a filter repeats.
+#[cfg(test)]
 pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, EncodeOptions) {
+    apply_filters_filled(img, filters, None)
+}
+
+/// [`apply_filters`] with the request's resolved fill color,
+/// which arbitrary-angle rotation uses for the corners the
+/// turned image leaves uncovered (issue #144).
+pub fn apply_filters_filled(
+    img: DynamicImage,
+    filters: &[Filter],
+    fill: Option<[u8; 3]>,
+) -> (DynamicImage, EncodeOptions) {
     let mut img = img;
     let mut options = EncodeOptions::default();
     for filter in filters {
@@ -98,11 +110,17 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
                 img = DynamicImage::ImageRgb8(equalize(&img.into_rgb8()));
             }
             Filter::Rotate(degrees) => {
-                img = match ((degrees % 360) + 360) % 360 {
-                    90 => img.rotate90(),
-                    180 => img.rotate180(),
-                    270 => img.rotate270(),
-                    _ => img,
+                let normalized = ((degrees % 360.0) + 360.0) % 360.0;
+                img = if normalized == 90.0 {
+                    img.rotate90()
+                } else if normalized == 180.0 {
+                    img.rotate180()
+                } else if normalized == 270.0 {
+                    img.rotate270()
+                } else if normalized == 0.0 {
+                    img
+                } else {
+                    rotate_arbitrary(img, normalized, fill)
                 };
             }
             Filter::Trim(tolerance) => img = trim(img, *tolerance),
@@ -165,6 +183,83 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
 
 /// Rec. 601 luma, the same weights the saturation filter
 /// and the image crate's grayscale use.
+/// Rotate by a non-quarter angle (issue #144): the canvas
+/// expands to the rotated bounding box, destination pixels
+/// inverse-map to the source with bilinear sampling, and
+/// uncovered corners take the background: transparent when
+/// the image carries alpha, otherwise the request's fill
+/// color, defaulting to white like `pad`. Positive angles
+/// turn clockwise, matching the quarter-turn filters.
+fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> DynamicImage {
+    let has_alpha = img.color().has_alpha();
+    let background: [u8; 4] = if has_alpha {
+        [0, 0, 0, 0]
+    } else {
+        let [r, g, b] = fill.unwrap_or([255, 255, 255]);
+        [r, g, b, 255]
+    };
+    let src = img.into_rgba8();
+    let (w, h) = (src.width() as f32, src.height() as f32);
+    let theta = degrees.to_radians();
+    let (sin, cos) = theta.sin_cos();
+    let new_w = (w * cos.abs() + h * sin.abs()).ceil().max(1.0) as u32;
+    let new_h = (w * sin.abs() + h * cos.abs()).ceil().max(1.0) as u32;
+    let (scx, scy) = ((w - 1.0) / 2.0, (h - 1.0) / 2.0);
+    let (dcx, dcy) = ((new_w as f32 - 1.0) / 2.0, (new_h as f32 - 1.0) / 2.0);
+    let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
+    let sample = |x: i32, y: i32| -> [f32; 4] {
+        if x < 0 || y < 0 || x >= src.width() as i32 || y >= src.height() as i32 {
+            [
+                background[0] as f32,
+                background[1] as f32,
+                background[2] as f32,
+                background[3] as f32,
+            ]
+        } else {
+            let p = src.get_pixel(x as u32, y as u32).0;
+            [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]
+        }
+    };
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let dx = x as f32 - dcx;
+            let dy = y as f32 - dcy;
+            let sx = cos * dx + sin * dy + scx;
+            let sy = -sin * dx + cos * dy + scy;
+            let x0 = sx.floor();
+            let y0 = sy.floor();
+            let fx = sx - x0;
+            let fy = sy - y0;
+            let (x0, y0) = (x0 as i32, y0 as i32);
+            let mut px = [0f32; 4];
+            for (wx, xx) in [(1.0 - fx, x0), (fx, x0 + 1)] {
+                for (wy, yy) in [(1.0 - fy, y0), (fy, y0 + 1)] {
+                    let tap = sample(xx, yy);
+                    let weight = wx * wy;
+                    for (i, channel) in px.iter_mut().enumerate() {
+                        *channel += tap[i] * weight;
+                    }
+                }
+            }
+            out.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    px[0].round() as u8,
+                    px[1].round() as u8,
+                    px[2].round() as u8,
+                    px[3].round() as u8,
+                ]),
+            );
+        }
+    }
+    if has_alpha {
+        DynamicImage::ImageRgba8(out)
+    } else {
+        DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(out).to_rgb8())
+    }
+}
+
 fn luma(r: u8, g: u8, b: u8) -> f32 {
     0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
 }
@@ -1041,12 +1136,78 @@ mod tests {
     }
 
     #[test]
+    fn rotate_45_expands_the_canvas_and_fills_corners() {
+        let img = DynamicImage::ImageRgb8(solid(255, 0, 0).to_rgb8());
+        let img = img.resize_exact(4, 2, image::imageops::FilterType::Nearest);
+        let (out, _) = apply_filters(img, &[Filter::Rotate(45.0)]);
+        // ceil(4*cos45 + 2*sin45) = ceil(4.243) = 5 on both axes.
+        assert_eq!((out.width(), out.height()), (5, 5));
+        let rgb = out.to_rgb8();
+        // The uncovered corner takes the default background.
+        assert_eq!(rgb.get_pixel(0, 0).0, [255, 255, 255]);
+        // The middle is still the source color.
+        assert_eq!(rgb.get_pixel(2, 2).0, [255, 0, 0]);
+    }
+
+    #[test]
+    fn rotate_45_uses_the_request_fill_for_corners() {
+        let img = DynamicImage::ImageRgb8(solid(255, 0, 0).to_rgb8()).resize_exact(
+            4,
+            2,
+            image::imageops::FilterType::Nearest,
+        );
+        let (out, _) = apply_filters_filled(img, &[Filter::Rotate(45.0)], Some([10, 20, 30]));
+        assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [10, 20, 30]);
+    }
+
+    #[test]
+    fn rotate_45_keeps_alpha_corners_transparent() {
+        let mut rgba = image::RgbaImage::new(4, 2);
+        for p in rgba.pixels_mut() {
+            *p = image::Rgba([255, 0, 0, 255]);
+        }
+        let (out, _) = apply_filters(DynamicImage::ImageRgba8(rgba), &[Filter::Rotate(45.0)]);
+        let rgba = out.to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0).0[3], 0);
+        assert_eq!(rgba.get_pixel(2, 2).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rotate_positive_angles_turn_clockwise() {
+        // A marker above center moves to the upper right under
+        // a positive (clockwise) rotation, matching rotate90.
+        let mut rgb = image::RgbImage::new(20, 20);
+        rgb.put_pixel(10, 2, image::Rgb([255, 0, 0]));
+        let (out, _) = apply_filters(DynamicImage::ImageRgb8(rgb), &[Filter::Rotate(45.0)]);
+        let rgb = out.to_rgb8();
+        // Track the reddest pixel (the white corners have no
+        // red-over-green excess).
+        let (mut bx, mut by, mut best) = (0u32, 0u32, 0i16);
+        for (x, y, p) in rgb.enumerate_pixels() {
+            let excess = p.0[0] as i16 - p.0[1] as i16;
+            if excess > best {
+                best = excess;
+                bx = x;
+                by = y;
+            }
+        }
+        assert!(bx > out.width() / 2, "marker x {bx} of {}", out.width());
+        assert!(by < out.height() / 2, "marker y {by} of {}", out.height());
+    }
+
+    #[test]
+    fn rotate_full_turns_are_identity() {
+        let (out, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(360.0)]);
+        assert_eq!((out.width(), out.height()), (4, 2));
+    }
+
+    #[test]
     fn rotate_swaps_dimensions() {
-        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(90)]);
+        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(90.0)]);
         assert_eq!((img.width(), img.height()), (2, 4));
-        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(-90)]);
+        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(-90.0)]);
         assert_eq!((img.width(), img.height()), (2, 4));
-        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(180)]);
+        let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(180.0)]);
         assert_eq!((img.width(), img.height()), (4, 2));
     }
 
