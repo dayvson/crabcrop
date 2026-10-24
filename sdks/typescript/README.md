@@ -36,8 +36,9 @@ const srcset = buildSrcSet(
 // The raw signature for a remainder, if you assemble URLs yourself.
 const signature = sign("your-secret", "300x200/https://example.com/photo.jpg");
 
-// Verify a signature in constant time (malformed tags return false).
-const ok = verifyUrlSignature("your-secret", signature, "300x200/https://example.com/photo.jpg");
+// Verify a signed URL's signature locally, in constant time
+// (unsigned or malformed URLs return null).
+const ok = verifyUrlSignature("your-secret", url);
 
 // Purge signatures for the server's /purge and /purge-group endpoints
 // are domain-separated under a derived subkey; the helpers sign the
@@ -47,6 +48,23 @@ const group = purgeGroupSignature("your-secret", "thumb");
 ```
 
 Pass `null` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode.
+
+## Typed operations
+
+The operation string is the spec, and passing it verbatim stays the primary API. For callers who would rather build it, `ops` and `filter` are typed builders that validate each argument against the server's grammar and return the canonical spelling, so the typed and hand-written forms sign byte-identical URLs (the test suite pins this against the canonical corpus):
+
+```ts
+import { buildURL, filter, joinOps, ops } from "@crabcrop/url";
+
+const operations = joinOps(
+  ops.crop(1200, 630, "smart"),
+  ops.filters(filter.format("webp"), filter.quality(80)),
+);
+// operations === "crop:1200x630:smart/filters:format(webp):quality(80)"
+const url = buildURL("https://images.example.com", "your-secret", operations, "https://example.com/photo.jpg");
+```
+
+A value the server would reject (`filter.quality(0)`, `filter.brighten(256)`, `ops.crop(0, 100)`) throws at build time instead of minting a URL that fails at the edge. The closed sets are exported as types (`ImageFormat`, `CropAlign`, `Anchor`, `BlendMode`, `MaskShape`, `Dimension`), and `FILTER_DESCRIPTIONS` is the filter metadata table the explainer uses.
 
 ## Runtime
 
