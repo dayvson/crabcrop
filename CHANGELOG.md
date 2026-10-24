@@ -4,30 +4,40 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-24
+
+The first public release.
+
 ### Added
 
 - Upload endpoint: an optional `PUT /upload/<signature>/<name>` stores originals in an operator-configured destination (a local directory, `CRABCROP_UPLOAD_DIR`, or an S3 bucket, `CRABCROP_UPLOAD_BUCKET`), off by default and absent (404) when not configured. Uploads are signed in their own domain (an upload subkey derived from the secret, like purge signatures) via new `upload_signature` / `uploadSignature` helpers in the Rust crate and the TypeScript and Python SDKs, plus a `crabcrop upload` CLI verb. Bodies are capped by `CRABCROP_UPLOAD_MAX_MB` (default 10, tied to the source fetch cap), must decode as an image the pipeline can serve before they are stored, and never overwrite an existing object unless `CRABCROP_UPLOAD_ALLOW_OVERWRITE` is on (409 otherwise). The response is the exact `file://` or `s3://` source reference to embed in transform URLs. There is no listing and no delete.
+
 - Orientation-adaptive fit-in: `fit-in:<w>x<h>:adaptive` fits inside the transposed box when the source orientation and the box orientation disagree (portrait source, landscape box, or the reverse), and behaves exactly like plain fit-in when they agree; square sources, square boxes, and boxes without two pixel axes never swap. `pad:` has no adaptive form, since its canvas is explicit. The Thumbor converter now maps `adaptive-fit-in` to it exactly instead of downgrading with a warning.
+
 - Declared detectors: `CRABCROP_DETECTORS_FILE` points at a JSON file wiring operator ONNX models to two built-in contracts, with no operator code loaded: `boxes` detectors (YOLOv8-family, class names from the declaration or the model's metadata) join class redaction (resolved built-in first, then declared in file order) and meta detections (aggregated, each box attributed with a `detector` field), and `focal` heatmap models feed smart crops between the face model and saliency (first declaration wins, later ones stand by). Every declaration is validated, loaded, and probed at boot; a broken one is a startup error naming it.
+
 - Film grain: a `noise(<amount>)` filter adds monochrome grain — one noise value per pixel applied equally to all three channels (alpha untouched), the value uniform within plus or minus the amount, an integer 0 to 100 percent of full scale. The field is deterministic, seeded from the image content and the amount, so the same URL always produces the same bytes; `noise(0)` is a byte-identical no-op, and animated sources grain per frame from each frame's own content. Malformed amounts report their own error code, `invalid_noise`.
+
 - HEIC/HEIF source decoding: HEIC sources now decode in every build through the pure-Rust oxideav stack (`oxideav-heif` + `oxideav-h265`) — no feature flag, configuration, or external tool. The primary image is decoded with grid and overlay compositions resolved, EXIF orientation is applied at decode, embedded ICC profiles feed the usual convert-to-sRGB path, and 10-bit sources flatten to the 8-bit working space. A file whose only colour description lives in the bitstream (no `nclx` colour box) is converted per its SPS VUI, limited range included, matching other decoders instead of the container default. Corrupt HEIC sources keep failing with a specific 502.
+
 - Smart-crop debug view: a `debug:focal` segment answers with a diagnostic image instead of the transform result — the canvas the next crop operates on, with the chosen focal point (magenta crosshair), the focal rectangle when one is in play, detected face boxes (amber), and the crop window outline (blue) drawn on it; with no crop it shows the focal analysis of the final image. Debug responses are never cached and are served `Cache-Control: no-store`; animated sources and video output formats are refused with 400. Unknown debug views report their own error code, `invalid_debug`.
+
 - Video output (gifv): an animated GIF or WebP source can be served as H.264 MP4 or VP9 WebM through an explicit `format(mp4)` / `format(webm)` (never negotiated). The encode runs in an operator-configured external program (`CRABCROP_VIDEO_ENCODER`) over a fixed pipe contract (raw RGBA in on stdin, video out on stdout), bounded by a two-permit gate, a wall-clock timeout (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30), and an output cap (`CRABCROP_VIDEO_MAX_MB`, default 64). Unconfigured servers answer 501, still sources 400, encoder failures 502; crabcrop ships no codec, so codec licensing stays with the operator.
+
 - Convolution: a `convolution(<v1>,...,<vN>,<normalize>)` filter applies a caller-supplied kernel — 9 values (3x3) or 25 (5x5) in row-major order, each a plain decimal from −1024 to 1024 — once over the image with edge replication. The trailing flag (0 or 1) scales the kernel by the sum of its entries first; a zero sum applies the kernel as written. Malformed kernels report their own error code, `invalid_convolution`.
+
 - Tone curves: a `curve(<channel>,<x>,<y>,...)` filter remaps the `rgb`, `r`, `g`, or `b` channel through 2 to 16 control points (each 0–255, x strictly increasing), linearly interpolated with the ends clamped, for per-channel tone control the additive filters only approximate. Malformed curves report their own error code, `invalid_curve`.
+
 - Per-request cache lifetime: a `maxage:<seconds>` segment (0 to 31536000) overrides the response `Cache-Control` max-age for that request only. Header-only: it never enters the cache key, so URLs differing only in `maxage` share one stored image; `maxage:0` answers `max-age=0` without `immutable`.
+
 - Caller-supplied focal rectangle for crops: a `focal:<left>x<top>:<right>x<bottom>` segment names the source rectangle the next `crop:` must keep (center and smart crops position on it; directional alignments ignore it). The Thumbor converter now maps the `focal(...)` filter to it.
+
 - Corner crop alignments: `crop:` accepts `top-left`, `top-right`, `bottom-left`, and `bottom-right` alongside the single-axis alignments (each corner decomposes per axis: its horizontal component positions a width crop, its vertical component a height crop). The Thumbor converter maps corner alignment pairs to them exactly instead of approximating to the vertical side.
+
+- The server: signed image URLs (HMAC-SHA256) with resize, crop (including smart and face-aware), fit-in, pad, crop-rect, and a 45+ filter catalog; AVIF, JPEG XL, and WebP output with `Accept` q-value negotiation; canonical cache keys with memory and disk tiers; presets with purge and purge-group invalidation; meta JSON responses with placeholders (dominant color, palette, ThumbHash); optional AI features (background removal, upscale, face and class redaction, CLIP tags and alt text) behind operator-supplied ONNX models.
+
+- Client libraries implementing the signing spec in `spec/url-signing.md`: the `crabcrop-url` Rust crate, `@crabcrop/url` for TypeScript, `crabcrop_url` for Python, framework loaders for Next.js, Nuxt, and Hydrogen, an MCP server, and the operator CLI built into the binary (sign, explain, meta, purge, purge-group, convert-thumbor).
 
 ### Fixed
 
 - Boot with an AI model configured but no loadable ONNX Runtime (no `CRABCROP_ORT_DYLIB` and no system runtime) died on a panic inside the `ort` crate instead of failing startup. The runtime is now loaded explicitly from the configured path, or from the path ort itself would search (`ORT_DYLIB_PATH`, then the system library name), and a load failure is the usual `cannot load ...` boot diagnostic with exit code 1.
-
-## [0.1.0] - unreleased
-
-The first release, staged by the Phase 6 release pipeline and not yet published to any registry.
-
-### Added
-
-- The server: signed image URLs (HMAC-SHA256) with resize, crop (including smart and face-aware), fit-in, pad, crop-rect, and a 45+ filter catalog; AVIF, JPEG XL, and WebP output with `Accept` q-value negotiation; canonical cache keys with memory and disk tiers; presets with purge and purge-group invalidation; meta JSON responses with placeholders (dominant color, palette, ThumbHash); optional AI features (background removal, upscale, face and class redaction, CLIP tags and alt text) behind operator-supplied ONNX models.
-- Client libraries implementing the signing spec in `spec/url-signing.md`: the `crabcrop-url` Rust crate, `@crabcrop/url` for TypeScript, `crabcrop_url` for Python, framework loaders for Next.js, Nuxt, and Hydrogen, an MCP server, and the operator CLI built into the binary (sign, explain, meta, purge, purge-group, convert-thumbor).
