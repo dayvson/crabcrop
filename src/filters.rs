@@ -70,7 +70,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
             Filter::Blur(sigma) => img = img.blur(*sigma),
             Filter::Brighten(amount) => img = img.brighten(*amount),
             Filter::Contrast(amount) => {
-                let rgb = image::imageops::contrast(&img.to_rgb8(), *amount);
+                let rgb = image::imageops::contrast(&img.into_rgb8(), *amount);
                 img = DynamicImage::ImageRgb8(rgb);
             }
             Filter::HueRotate(degrees) => img = img.huerotate(*degrees),
@@ -79,14 +79,14 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
                 // boosted, the cross neighbors subtracted.
                 let a = *amount;
                 let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
-                let rgb = image::imageops::filter3x3(&img.to_rgb8(), &kernel);
+                let rgb = image::imageops::filter3x3(&img.into_rgb8(), &kernel);
                 img = DynamicImage::ImageRgb8(rgb);
             }
             Filter::Saturation(amount) => {
-                img = DynamicImage::ImageRgb8(saturate(&img.to_rgb8(), *amount));
+                img = DynamicImage::ImageRgb8(saturate(&img.into_rgb8(), *amount));
             }
             Filter::Rgb(r, g, b) => {
-                let mut rgb = img.to_rgb8();
+                let mut rgb = img.into_rgb8();
                 for p in rgb.pixels_mut() {
                     p[0] = (p[0] as i32 + r).clamp(0, 255) as u8;
                     p[1] = (p[1] as i32 + g).clamp(0, 255) as u8;
@@ -95,7 +95,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
                 img = DynamicImage::ImageRgb8(rgb);
             }
             Filter::Equalize => {
-                img = DynamicImage::ImageRgb8(equalize(&img.to_rgb8()));
+                img = DynamicImage::ImageRgb8(equalize(&img.into_rgb8()));
             }
             Filter::Rotate(degrees) => {
                 img = match ((degrees % 360) + 360) % 360 {
@@ -703,7 +703,7 @@ mod tests {
         let edge = alpha_at(&img, 5, 6);
         assert!(edge > 0 && edge < 255, "antialiased edge, got {edge}");
         // Color channels are untouched.
-        assert_eq!(img.to_rgba8().get_pixel(50, 50).0, [255, 0, 0, 255]);
+        assert_eq!(img.into_rgba8().get_pixel(50, 50).0, [255, 0, 0, 255]);
     }
 
     #[test]
@@ -765,7 +765,7 @@ mod tests {
     fn border_paints_inside_the_frame() {
         let img = draw_border(&opaque(10, 10, [255, 0, 0]), 2, [0, 255, 0]);
         assert_eq!((img.width(), img.height()), (10, 10));
-        let rgba = img.to_rgba8();
+        let rgba = img.into_rgba8();
         for (x, y) in [(0, 0), (1, 5), (9, 9), (5, 0), (8, 8)] {
             assert_eq!(
                 rgba.get_pixel(x, y).0,
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn border_wider_than_half_paints_everything() {
         let img = draw_border(&opaque(10, 10, [255, 0, 0]), 5, [0, 0, 255]);
-        assert_eq!(img.to_rgba8().get_pixel(5, 5).0, [0, 0, 255, 255]);
+        assert_eq!(img.into_rgba8().get_pixel(5, 5).0, [0, 0, 255, 255]);
     }
 
     #[test]
@@ -865,7 +865,7 @@ mod tests {
         assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [128, 0, 128]);
         assert_eq!(out.to_rgb8().get_pixel(3, 1).0, [128, 0, 128]);
         // Block 1 is the identity.
-        assert_eq!(pixelate(&img, 1).to_rgb8(), img.to_rgb8());
+        assert_eq!(pixelate(&img, 1).to_rgb8(), img.into_rgb8());
     }
 
     #[test]
@@ -999,7 +999,7 @@ mod tests {
             *p = Rgb([v, v, v]);
         }
         let (img, _) = apply_filters(img, &[Filter::Sharpen(1.0)]);
-        let rgb = img.to_rgb8();
+        let rgb = img.into_rgb8();
         let left = rgb.get_pixel(7, 8)[0] as i32;
         let right = rgb.get_pixel(8, 8)[0] as i32;
         assert!(right - left > 100, "left {left} right {right}");
@@ -1033,7 +1033,7 @@ mod tests {
             *p = Rgb([v, v, v]);
         }
         let (img, _) = apply_filters(img, &[Filter::Equalize]);
-        let rgb = img.to_rgb8();
+        let rgb = img.into_rgb8();
         let min = rgb.pixels().map(|p| p[0]).min().unwrap();
         let max = rgb.pixels().map(|p| p[0]).max().unwrap();
         assert_eq!(min, 0);
@@ -1102,7 +1102,7 @@ mod tests {
     #[test]
     fn grayscale_desaturates() {
         let (img, _) = apply_filters(striped(), &[Filter::Grayscale]);
-        for p in img.to_rgb8().pixels() {
+        for p in img.into_rgb8().pixels() {
             assert_eq!(p[0], p[1]);
             assert_eq!(p[1], p[2]);
         }
@@ -1134,7 +1134,7 @@ mod tests {
             *p = Rgb([v, v, v]);
         }
         let (img, _) = apply_filters(img, &[Filter::Blur(2.0)]);
-        let rgb = img.to_rgb8();
+        let rgb = img.into_rgb8();
         // Pixels hugging the edge are now a blend of black and white.
         for (x, y, p) in rgb.enumerate_pixels() {
             if x == 15 || x == 16 {
