@@ -46,6 +46,17 @@ signature for POST /purge-group/<signature>/<group> = lowercase_hex( HMAC_SHA256
 
 `path` is the request remainder exactly as presented. The server canonicalizes it before matching entries, so any equivalent spelling signed this way evicts the shared entry. Domain separation is the point: an image signature can never be replayed as a purge signature, and vice versa. Purges never honor `unsafe`: without a secret there is no purge, in every mode. Client libraries expose these as `purge_signature` / `purge_group_signature` helpers so the signed strings are never assembled by hand.
 
+## Upload signatures
+
+The upload endpoint (issue #168) is signed under its own derived subkey, the same construction in a third domain:
+
+```text
+subkey = HMAC_SHA256( key = secret, message = "crabcrop/upload-key" )   (raw bytes)
+signature for PUT /upload/<signature>/<name> = lowercase_hex( HMAC_SHA256( subkey, name ) )
+```
+
+`name` is the object name exactly as presented after the signature segment (it may contain `/`-separated segments). Domain separation is the point, as with purges: an image signature or a purge signature can never be replayed as an upload signature, and an upload signature authorizes nothing else. Uploads never honor `unsafe`. Signature segments accept the same `<key-id>:` prefix and routing as purge segments. Client libraries expose this as an `upload_signature` / `uploadSignature` helper so the signed string is never assembled by hand.
+
 ## Building URLs
 
 A builder assembles, in order:

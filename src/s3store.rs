@@ -178,6 +178,33 @@ impl S3Store {
         let _ = self.request("PUT", &object, &[], data).await;
     }
 
+    /// Store raw bytes under `name`, verbatim (issue #168):
+    /// the object key is the store prefix plus `name`, with
+    /// no cache-entry serialization and no `.bin` suffix.
+    /// This is the upload destination's write path, so
+    /// unlike the cache `put` it reports failure: an upload
+    /// that did not land must not answer as if it did.
+    /// Returns whether the store accepted the object.
+    pub async fn put_raw(&self, name: &str, bytes: Vec<u8>) -> bool {
+        let object = format!("{}{name}", self.prefix);
+        match self.request("PUT", &object, &[], bytes).await {
+            Some(resp) => resp.status().is_success(),
+            None => false,
+        }
+    }
+
+    /// Read the raw bytes stored under `name` (see
+    /// [`S3Store::put_raw`]). Any failure (missing object,
+    /// transport error) is `None`.
+    pub async fn get_raw(&self, name: &str) -> Option<Vec<u8>> {
+        let object = format!("{}{name}", self.prefix);
+        let resp = self.request("GET", &object, &[], Vec::new()).await?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.bytes().await.ok().map(|b| b.to_vec())
+    }
+
     /// Every object key under the store prefix, following
     /// continuation tokens. An error yields what was listed so
     /// far (possibly nothing).

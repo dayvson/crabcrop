@@ -7,6 +7,7 @@ import {
   purgeGroupSignature,
   purgeSignature,
   sign,
+  uploadSignature,
   signWithKeyId,
   verifyUrlSignature,
 } from "../src/index.ts";
@@ -219,6 +220,21 @@ test("purge signatures match the published vectors", () => {
   assert.equal(
     purgeGroupSignature("test-secret", "thumb"),
     purgeSignature("test-secret", "purge-group/thumb"),
+  );
+});
+
+test("upload signatures match the published vectors", () => {
+  // The same pinned literals the Rust crate asserts: one
+  // wire scheme across every implementation.
+  assert.equal(
+    uploadSignature("test-secret", "heroes/cat.jpg"),
+    "81d87b588203fdad32f5431c0a893bf7ddad8188f5cca123a1b057a439b34b84",
+  );
+  // Domain separation from both other signature kinds.
+  assert.notEqual(uploadSignature("test-secret", "heroes/cat.jpg"), sign("test-secret", "heroes/cat.jpg"));
+  assert.notEqual(
+    uploadSignature("test-secret", "heroes/cat.jpg"),
+    purgeSignature("test-secret", "heroes/cat.jpg"),
   );
 });
 

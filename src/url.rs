@@ -2246,6 +2246,35 @@ pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool 
     }
 }
 
+/// Derive the upload signing key from the server secret
+/// (issue #168). Upload signatures live in their own
+/// domain beside the purge domain, under this derived
+/// key, so neither an image signature nor a purge
+/// signature can be replayed against the upload endpoint.
+pub fn upload_key(secret: &[u8]) -> Vec<u8> {
+    crabcrop_url::upload_key(secret)
+}
+
+/// The upload signature for an object name: HMAC-SHA256
+/// of the name alone, under the derived upload key.
+/// Delegates to the `crabcrop-url` crate. The server only
+/// verifies; this mints, for operators and tests.
+#[allow(dead_code)]
+pub fn upload_signature(secret: &[u8], name: &str) -> String {
+    crabcrop_url::upload_signature(secret, name)
+}
+
+/// Verify an upload signature. Like purges, uploads are
+/// a write operation and never honor `unsafe`: an HMAC
+/// under the upload subkey is always required, whatever
+/// the image-read mode.
+pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
+    match signature {
+        Signature::Unsafe => false,
+        Signature::Hmac(hex_digest) => crabcrop_url::verify(&upload_key(secret), hex_digest, name),
+    }
+}
+
 /// The server's signing keys (issue #143): one current key,
 /// and during a rotation window one previous key. A URL may
 /// name its key with the `<key-id>:` signature prefix; the
@@ -2314,6 +2343,14 @@ impl Keyring {
         self.candidates(key_id)
             .iter()
             .any(|secret| verify_purge(secret, signature, target))
+    }
+
+    /// Verify an upload signature against the ring (see
+    /// [`verify_upload`]).
+    pub fn verify_upload(&self, key_id: Option<&str>, signature: &Signature, name: &str) -> bool {
+        self.candidates(key_id)
+            .iter()
+            .any(|secret| verify_upload(secret, signature, name))
     }
 }
 
@@ -2672,6 +2709,71 @@ mod tests {
         assert!(!verify_purge(secret, &Signature::Hmac(image_sig), target));
         // Purges never honor unsafe (Q3), in any mode.
         assert!(!verify_purge(secret, &Signature::Unsafe, target));
+    }
+
+    #[test]
+    fn upload_signatures_are_domain_separated() {
+        let secret = b"test-secret";
+        let name = "heroes/cat.jpg";
+        let upload_sig = upload_signature(secret, name);
+        assert_eq!(
+            upload_sig,
+            "81d87b588203fdad32f5431c0a893bf7ddad8188f5cca123a1b057a439b34b84"
+        );
+        assert!(verify_upload(
+            secret,
+            &Signature::Hmac(upload_sig.clone()),
+            name
+        ));
+        // Neither an image signature nor a purge signature
+        // over the same string verifies as an upload
+        // signature, and the upload signature verifies in
+        // neither other domain.
+        let image_sig = crabcrop_url::sign(secret, name);
+        let purge_sig = purge_signature(secret, name);
+        assert!(!verify_upload(
+            secret,
+            &Signature::Hmac(image_sig.clone()),
+            name
+        ));
+        assert!(!verify_upload(secret, &Signature::Hmac(purge_sig), name));
+        assert!(!verify_purge(
+            secret,
+            &Signature::Hmac(upload_sig.clone()),
+            name
+        ));
+        assert!(!verify(
+            secret,
+            &Signature::Hmac(upload_sig.clone()),
+            name,
+            false
+        ));
+        // Uploads never honor unsafe, in any mode.
+        assert!(!verify_upload(secret, &Signature::Unsafe, name));
+        // A signature for one name authorizes no other.
+        assert!(!verify_upload(
+            secret,
+            &Signature::Hmac(upload_sig),
+            "heroes/dog.jpg"
+        ));
+    }
+
+    #[test]
+    fn keyring_upload_verification_keeps_domain_separation() {
+        let ring = Keyring {
+            current_id: "k-new".to_string(),
+            current: b"new-secret-value".to_vec(),
+            previous: Some(("k-old".to_string(), b"old-secret-value".to_vec())),
+        };
+        let name = "heroes/cat.jpg";
+        let old_upload = Signature::Hmac(crabcrop_url::upload_signature(b"old-secret-value", name));
+        assert!(ring.verify_upload(Some("k-old"), &old_upload, name));
+        assert!(ring.verify_upload(None, &old_upload, name));
+        assert!(!ring.verify_upload(Some("k-new"), &old_upload, name));
+        // An image signature under the old key is not an
+        // upload signature under any routing.
+        let image_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", name));
+        assert!(!ring.verify_upload(Some("k-old"), &image_sig, name));
     }
 
     #[test]

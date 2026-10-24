@@ -136,6 +136,7 @@ struct Inner {
     load_ms_sum: f64,
     load_count: u64,
     purges: u64,
+    uploads: u64,
     process_ms_sum: f64,
     process_count: u64,
     duration_buckets: [u64; BUCKETS_MS.len() + 1],
@@ -196,6 +197,13 @@ impl Metrics {
     /// PL-8: the destructive endpoint must leave a trace).
     pub fn record_purge(&self) {
         self.inner.lock().unwrap().purges += 1;
+    }
+
+    /// Count one upload request, accepted or rejected
+    /// (issue #168: the write endpoint leaves the same
+    /// audit trace purges do).
+    pub fn record_upload(&self) {
+        self.inner.lock().unwrap().uploads += 1;
     }
 
     /// Render the counters in Prometheus text format.
@@ -278,6 +286,9 @@ impl Metrics {
         out.push_str("# HELP crabcrop_purges_total Purge requests, accepted or rejected.\n");
         out.push_str("# TYPE crabcrop_purges_total counter\n");
         out.push_str(&format!("crabcrop_purges_total {}\n", m.purges));
+        out.push_str("# HELP crabcrop_uploads_total Upload requests, accepted or rejected.\n");
+        out.push_str("# TYPE crabcrop_uploads_total counter\n");
+        out.push_str(&format!("crabcrop_uploads_total {}\n", m.uploads));
         out
     }
 }

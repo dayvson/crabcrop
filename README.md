@@ -547,6 +547,7 @@ For example, a `removebg` request to a server with no background-removal model r
 | `GET /metrics` | Prometheus metrics in text format: request counts by status class (`crabcrop_requests_total`), request/load/process durations, cache hit and miss counters, loader and engine error counters, and byte totals. |
 | `POST /purge/<signature>/<path>` | Invalidate every stored variant of one result, across all cache tiers. See below. |
 | `POST /purge-group/<signature>/<group>` | Invalidate every stored result in a cache group, across all cache tiers. See below. |
+| `PUT /upload/<signature>/<name>` | Store one original in the configured upload destination. Only exists when uploads are configured. See [Upload an original](#upload-an-original). |
 | `GET /<signature>/...` | Image requests, as documented above. |
 
 ### Purge a cached result
@@ -556,6 +557,31 @@ curl -X POST "http://localhost:3000/purge/<signature>/300x200/https://example.co
 ```
 
 The `<path>` is the original request path without its signature. The signature covers the target exactly as presented; the target is then canonicalized the same way entries are keyed, so purging any equivalent spelling of a path (the `jpg` alias, leading zeros, a preset reference) evicts the shared entry, `exp:` variants included. Compute the signature with your client library (`purge_signature` in the Rust crate and the Python SDK, `purgeSignature` in TypeScript): the HMAC-SHA256 of the path under a purge subkey derived from the secret, so only the secret holder can invalidate, and an image signature can never be replayed as a purge signature. The response is `200` with a body like `purged 2`: the count covers the entry and all of its variants (per format class and DPR). A bad purge signature is a `403` and removes nothing; purging a path that is not stored answers `purged 0`.
+
+### Upload an original
+
+crabcrop is a fetch-only service by design: sources live somewhere else, and transforms reference them by URL. The upload endpoint is the one deliberate exception, and it is off unless the operator turns it on. Configure exactly one destination:
+
+- `CRABCROP_UPLOAD_DIR=/srv/originals` stores originals as files in a local directory.
+- `CRABCROP_UPLOAD_BUCKET=originals` stores them in an S3 bucket, reusing the source S3 configuration (endpoint, region, and ambient AWS credentials); `CRABCROP_UPLOAD_PREFIX` namespaces the objects. With credentials configured, the bucket must also appear in `CRABCROP_ALLOWED_BUCKETS`, because uploaded objects are served back as `s3://` sources. There is no GCS destination: `gs://` sources are read-only in crabcrop.
+
+With neither variable set, the endpoint does not exist: a `PUT` is a plain `404`. With one set, an upload is one signed `PUT`:
+
+```bash
+curl -X PUT --data-binary @photo.jpg "http://localhost:3000/upload/<signature>/heroes/photo.jpg"
+```
+
+The `<name>` is the object name, `/`-separated segments of `[A-Za-z0-9._-]` (no empty, `.`, or `..` segments, nothing starting with a dot, at most 255 bytes). The signature covers the name exactly as presented, under an upload subkey derived from the secret, the same domain-separation construction purge signatures use: only the secret holder can upload, an image signature or a purge signature can never be replayed here, and `unsafe` never authorizes an upload. Compute it with your client library (`upload_signature` in the Rust crate and the Python SDK, `uploadSignature` in TypeScript), or let the CLI do the whole job:
+
+```bash
+crabcrop upload ./photo.jpg heroes/photo.jpg
+```
+
+The body must decode as an image this server can serve (the same decode paths a transform request uses, size and dimension caps included); anything else is a `415` and is never stored. `CRABCROP_UPLOAD_MAX_MB` caps one upload (default 10 MB, the source fetch cap, so a stored original is always one the loader will fetch back; larger configurations are refused at startup). An upload to an existing name is a `409`; set `CRABCROP_UPLOAD_ALLOW_OVERWRITE=1` to let a `PUT` replace it (a `200` instead of the new-object `201`). There is no listing and no delete.
+
+The response body is the exact source reference to embed in transform URLs (`file:///heroes/photo.jpg` for a local destination, `s3://originals/heroes/photo.jpg` for a bucket), also returned in the `X-Crabcrop-Source` header. Serving works through the normal loader: a local destination doubles as the `file://` source root when no `CRABCROP_FILE_ROOT` is configured (and must sit under one that is), so the uploaded original is transformable the moment the `PUT` answers.
+
+One posture note, stated plainly: enabling uploads changes this server from fetch-only to a service that accepts and stores caller-supplied bytes. The mitigations are the ones above (off by default, its own signature domain, decode-before-store, a size cap, no overwrite by default, no listing or delete), and the destination should still be a directory or bucket dedicated to uploads, watched like any other store of user-supplied originals.
 
 ### Cache headers and groups
 
@@ -600,6 +626,10 @@ crabcrop meta --placeholders --detections "300x200/https://example.com/photo.jpg
 # Purge one URL, or a whole preset group (Cache-Group)
 crabcrop purge "300x200/https://example.com/photo.jpg"
 crabcrop purge-group thumb
+
+# Upload an original to the server's upload store (prints the
+# source reference for transform URLs; see Upload an original)
+crabcrop upload ./photo.jpg heroes/photo.jpg
 
 # Convert a Thumbor URL (re-signed; losses are reported on stderr)
 crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
@@ -653,6 +683,11 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_RESULT_BUCKET` | unset | S3 bucket for the shared result store (multi-replica third tier). Unset disables it. |
 | `CRABCROP_RESULT_PREFIX` | empty | Object prefix namespacing the shared result store's entries. |
 | `CRABCROP_RESULT_STORAGE_MAX_MB` | `512` | Disk result store budget in megabytes. `0` disables storage even with a directory set. |
+| `CRABCROP_UPLOAD_DIR` | unset | Local directory destination for the upload endpoint. Exactly one of this and `CRABCROP_UPLOAD_BUCKET` may be set; neither disables uploads (the route is a 404). Also becomes the `file://` source root when no `CRABCROP_FILE_ROOT` is set, and must sit under one that is. See [Upload an original](#upload-an-original). |
+| `CRABCROP_UPLOAD_BUCKET` | unset | S3 bucket destination for the upload endpoint, reusing the source S3 endpoint, region, and ambient AWS credentials. |
+| `CRABCROP_UPLOAD_PREFIX` | empty | Object prefix namespacing the upload bucket's objects. |
+| `CRABCROP_UPLOAD_MAX_MB` | `10` | Cap on one upload in megabytes, 1 to 10 (the source fetch cap: a stored original must stay servable). |
+| `CRABCROP_UPLOAD_ALLOW_OVERWRITE` | off | Lets an upload `PUT` replace an existing object. Off, an existing name is a `409`. |
 
 With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves the host to check its addresses and pins the connection to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
 

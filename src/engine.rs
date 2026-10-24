@@ -95,6 +95,44 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
         .map_err(|e| EngineError::Decode(e.to_string()))
 }
 
+/// Validate that `bytes` are an image this server can
+/// actually serve (issue #168): the upload endpoint's
+/// acceptance test. This walks the same decode branches
+/// `process_preferred` walks (SVG through the sanitizer,
+/// HEIC through the oxideav stack, animated GIF and WebP
+/// frame by frame under the animation caps, JPEG XL
+/// through its header probe, everything else through the
+/// bounded generic decode), so bytes accepted here are
+/// bytes a transform request can process, and bytes the
+/// pipeline would reject are rejected here, before they
+/// are stored. The decoded pixels are discarded; only
+/// decodability is the question.
+pub(crate) fn validate_source_image(bytes: &[u8]) -> Result<(), EngineError> {
+    ensure_jxl_decoder();
+    if crate::svg::is_svg(bytes) {
+        crate::svg::prepare(bytes).map_err(EngineError::Decode)?;
+        return Ok(());
+    }
+    if is_heic(bytes) {
+        crate::heic::decode_heic(bytes)?;
+        return Ok(());
+    }
+    let detected = detect_format(bytes);
+    if detected == ImageFormat::Gif {
+        decode_gif_frames(bytes)?;
+        return Ok(());
+    }
+    if detected == ImageFormat::WebP && webp_animation_params(bytes).is_some() {
+        decode_webp_frames(bytes)?;
+        return Ok(());
+    }
+    if detected == ImageFormat::Jxl {
+        check_jxl_dimensions(bytes)?;
+    }
+    decode_image(bytes)?;
+    Ok(())
+}
+
 pub(crate) fn check_decoded_dimensions(width: u64, height: u64) -> Result<(), EngineError> {
     if width > MAX_DECODE_DIMENSION as u64 || height > MAX_DECODE_DIMENSION as u64 {
         return Err(EngineError::Decode(format!(
@@ -2437,6 +2475,26 @@ mod tests {
     fn decode_dims(bytes: &[u8]) -> (u32, u32) {
         let img = image::load_from_memory(bytes).unwrap();
         (img.width(), img.height())
+    }
+
+    #[test]
+    fn validate_source_image_accepts_the_servable_set() {
+        // The upload acceptance test (issue #168) walks the
+        // pipeline's own decode branches.
+        assert!(validate_source_image(&solid_png(20, 10, [1, 2, 3])).is_ok());
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="red"/></svg>"#;
+        assert!(validate_source_image(svg).is_ok());
+        // Non-images, truncated images, and empty bodies
+        // are refused.
+        assert!(validate_source_image(b"not an image at all").is_err());
+        assert!(validate_source_image(b"").is_err());
+        let truncated = &solid_png(20, 10, [1, 2, 3])[..20];
+        assert!(validate_source_image(truncated).is_err());
+        // A script-carrying SVG is still an SVG the
+        // sanitizer renders safely, so it validates like
+        // any other SVG source would.
+        let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><script>alert(1)</script><rect width="4" height="4"/></svg>"#;
+        assert!(validate_source_image(hostile).is_ok());
     }
 
     #[test]

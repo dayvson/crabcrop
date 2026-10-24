@@ -42,8 +42,11 @@ use reqwest::{Client, Url, header, redirect};
 
 use crate::sigv4::{self, Credentials};
 
-/// Default cap on response bodies: 10 MiB.
-const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Default cap on response bodies: 10 MiB. The upload
+/// endpoint's size cap is tied to this one (issue #168):
+/// an original larger than the loader will fetch could
+/// be stored but never served.
+pub(crate) const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Default total request timeout: 10 seconds.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum redirects followed per request.
