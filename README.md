@@ -94,7 +94,7 @@ Three more source kinds cover originals that do not live behind a public URL:
 
 Bucket sources are gated by `CRABCROP_ALLOWED_BUCKETS` rather than the host policy, since the endpoint is operator configuration, not request input. When signing credentials are configured, the allowlist is required: the server refuses to boot without it, because signed fetches would otherwise reach every bucket the credentials can read. List `*` to deliberately allow all buckets. Store responses are not redirected: a 3xx from a store surfaces as its status code.
 
-JPEG, PNG, WebP, GIF, and JPEG XL sources are decoded. EXIF orientation is applied before any operation runs, so phone photos come out upright. Animated GIFs keep their frames when the output format is GIF; converting an animated GIF to a still format uses the first frame. HEIC/HEIF sources are rejected, and AVIF sources cannot be decoded in this build (AVIF is an output-only format here); both fail with `502`.
+JPEG, PNG, WebP, GIF, and JPEG XL sources are decoded. EXIF orientation is applied before any operation runs, so phone photos come out upright. Animated GIFs keep their frames when the output format is GIF; converting an animated GIF to a still format uses the first frame. AVIF sources are decoded in builds that include AVIF decoding: the Docker image, the release binaries, and the Homebrew install (which ships the release binary). A source build includes it with `--features avif-decode`, which links dav1d (a system libdav1d 1.3 or newer, or a vendored build); without it, AVIF sources fail with `502` and an error naming the feature. Animated AVIF sources decode their first frame. HEIC/HEIF sources are rejected and also fail with `502`.
 
 SVG sources are supported and detected by content, not by the declared content type. An SVG is sanitized before it is rendered: script elements, event handlers, and references to external resources are stripped, so a source SVG can only draw what it carries with it. The sanitized document is rasterized at the size the URL asks for (or its intrinsic size when the URL asks for none) and then runs through the normal pipeline. Output defaults to PNG for SVG sources.
 
@@ -442,7 +442,7 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
 | `500` | Encoding the output failed, or an AI model failed at inference time (the runtime errored, or a model session lock was poisoned by an earlier failure). A model that cannot be loaded at all fails startup instead of answering requests. |
 | `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font. |
-| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image — including HEIC sources and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). |
+| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image — including HEIC sources, AVIF sources in builds without AVIF decoding, and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). |
 | `504` | The source fetch timed out (10 seconds). |
 
 For example, a `removebg` request to a server with no background-removal model returns `501` with the body `removebg is not configured on this server`.
@@ -626,6 +626,12 @@ Run crabcrop behind a reverse proxy or CDN in production. The application bounds
 ```bash
 cargo build
 cargo test
+```
+
+AVIF source decoding is behind the `avif-decode` cargo feature (off by default, on in the Docker image and the release builds; see the source-format notes above). Building with it needs dav1d 1.3 or newer reachable through pkg-config, or a vendored build:
+
+```bash
+SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always cargo build --features avif-decode
 ```
 
 Running the server locally takes only a secret:

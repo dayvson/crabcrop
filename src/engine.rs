@@ -62,6 +62,18 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// (some valid files have headers the probe cannot read), the
 /// limited decode behind it is the second line.
 pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
+    // AVIF decoding is compiled in only with the avif-decode
+    // feature (issue #141): dav1d is a C dependency the
+    // default build does not carry. Name the way out rather
+    // than surfacing the image crate's bare unsupported
+    // error. Feature builds fall through to the generic
+    // bounded decode below, dav1d included.
+    #[cfg(not(feature = "avif-decode"))]
+    if matches!(image::guess_format(bytes), Ok(image::ImageFormat::Avif)) {
+        return Err(EngineError::Decode(
+            "AVIF sources cannot be decoded in this build (built without AVIF decoding: the Docker image and release binaries include it; source builds enable it with --features avif-decode)".to_string(),
+        ));
+    }
     let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
     if let Ok(probe) = probe
         && let Ok((width, height)) = probe.into_dimensions()
@@ -2744,6 +2756,40 @@ mod tests {
         // ISOBMFF layout: box size, then "ftyp", then the brand.
         assert_eq!(&out.bytes[4..8], b"ftyp");
         assert_eq!(&out.bytes[8..12], b"avif");
+    }
+
+    #[test]
+    fn avif_sources_decode_or_fail_clearly() {
+        // Encode a small AVIF with the always-available
+        // encoder, then run it through the bounded decode.
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            24,
+            16,
+            image::Rgb([200, 40, 90]),
+        ));
+        let mut bytes = Vec::new();
+        image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut bytes, 10, 100)
+            .write_image(img.as_bytes(), 24, 16, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert_eq!(&bytes[8..12], b"avif");
+        #[cfg(feature = "avif-decode")]
+        {
+            let decoded = decode_image(&bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (24, 16));
+            let px = decoded.to_rgb8().get_pixel(12, 8).0;
+            assert!(
+                px[0] > 150 && px[1] < 110 && px[2] > 50 && px[2] < 140,
+                "decoded pixel {px:?} drifted from the source color"
+            );
+        }
+        #[cfg(not(feature = "avif-decode"))]
+        {
+            let err = decode_image(&bytes).unwrap_err();
+            let EngineError::Decode(message) = err else {
+                panic!("expected a decode error, got {err:?}");
+            };
+            assert!(message.contains("avif-decode"), "{message}");
+        }
     }
 
     #[test]

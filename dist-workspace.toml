@@ -13,3 +13,9 @@ installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 # Servers and developer machines: Linux and macOS, both architectures.
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# AVIF decoding ships in the release binaries (issue #141,
+# option A): dav1d is built from vendored sources so the
+# tarballs stay self-contained (the release workflow sets
+# SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always and provides
+# meson + ninja; see docs/release-workflow.yml).
+features = ["avif-decode"]

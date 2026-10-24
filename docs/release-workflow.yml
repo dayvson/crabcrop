@@ -139,7 +139,21 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      # crabcrop addition (re-append after any `cargo dist
+      # generate`, like the jobs at the bottom of this file):
+      # the avif-decode feature (dist-workspace.toml) builds
+      # dav1d from vendored sources, which needs meson and
+      # ninja on the PATH.
+      - name: Install meson and ninja (vendored dav1d)
+        run: |
+          python3 -m pip install --user meson ninja
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Build artifacts
+        env:
+          # Vendored static dav1d, so the release binaries
+          # decode AVIF with no system dependency (issue
+          # #141, option A).
+          SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"
         run: |
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
