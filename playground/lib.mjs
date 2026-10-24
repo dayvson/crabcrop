@@ -484,6 +484,23 @@ function explainSegment(seg, nowSeconds) {
     }
     return { kind: "operation", title: "Crop rectangle", detail: `crop the exact rectangle ${rest} (left x top : right x bottom)` };
   }
+  if (seg.startsWith("focal:")) {
+    const rest = seg.slice(6);
+    const m = rest.match(/^([+-]?\d+)x([+-]?\d+):([+-]?\d+)x([+-]?\d+)$/);
+    if (
+      !m ||
+      m.slice(1).some((n) => BigInt(n) < 0n || BigInt(n) > 4294967295n) ||
+      BigInt(m[3]) <= BigInt(m[1]) ||
+      BigInt(m[4]) <= BigInt(m[2])
+    ) {
+      return {
+        kind: "operation",
+        title: "Focal rectangle",
+        error: `malformed focal segment: ${seg} (want focal:<l>x<t>:<r>x<b> with right > left and bottom > top)`,
+      };
+    }
+    return { kind: "operation", title: "Focal rectangle", detail: `set the focal rectangle ${rest} for the next crop (left x top : right x bottom)` };
+  }
   if (seg.startsWith("crop:")) {
     const rest = seg.slice(5);
     const idx = rest.indexOf(":");

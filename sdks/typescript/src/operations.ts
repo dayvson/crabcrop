@@ -196,6 +196,18 @@ export const ops = {
     return `crop-rect:${left}x${top}:${right}x${bottom}`;
   },
 
+  /** `focal:10x20:110x220` (left x top : right x bottom); steers the next crop. */
+  focal(left: number, top: number, right: number, bottom: number): string {
+    intIn("focal left", left, 0, 4294967295);
+    intIn("focal top", top, 0, 4294967295);
+    intIn("focal right", right, 0, 4294967295);
+    intIn("focal bottom", bottom, 0, 4294967295);
+    if (right <= left || bottom <= top) {
+      fail("focal", `${left}x${top}:${right}x${bottom}`, "right > left and bottom > top");
+    }
+    return `focal:${left}x${top}:${right}x${bottom}`;
+  },
+
   /** `pad:300x200`, optionally `:blur` or a RRGGBB fill color. */
   pad(width: number, height: number, fill?: "blur" | string): string {
     const box = pixelBox("pad", width, height);

@@ -72,6 +72,44 @@ pub fn crop_to_aspect_with(
     DynamicImage::ImageRgba8(cropped)
 }
 
+/// Crop `img` to the `target_w:target_h` aspect ratio, positioned
+/// on the caller-supplied focal rectangle `(left, top, right,
+/// bottom)` (a `focal:` segment): the window is centered on the
+/// rectangle's center, then clamped so a rectangle that fits
+/// inside the window stays fully inside it. Like
+/// [`crop_to_aspect`], it keeps as many source pixels as possible
+/// and returns `img` unchanged when the ratios already match or
+/// the target dimensions are zero.
+pub fn crop_to_aspect_focal(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    rect: (u32, u32, u32, u32),
+) -> DynamicImage {
+    if target_w == 0 || target_h == 0 {
+        return img;
+    }
+    let (w, h) = (img.width(), img.height());
+    // Compare w/h with target_w/target_h via cross-multiplication.
+    let src_ratio = w as u64 * target_h as u64;
+    let dst_ratio = target_w as u64 * h as u64;
+    if src_ratio == dst_ratio {
+        return img;
+    }
+    let (left, top, right, bottom) = rect;
+    let (x, y, cw, ch) = if src_ratio > dst_ratio {
+        // Source is wider: crop the width.
+        let cw = ((h as u64 * target_w as u64) / target_h as u64).max(1) as u32;
+        (focal_start(left, right, cw, w), 0, cw, h)
+    } else {
+        // Source is taller: crop the height.
+        let ch = ((w as u64 * target_h as u64) / target_w as u64).max(1) as u32;
+        (0, focal_start(top, bottom, ch, h), w, ch)
+    };
+    let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
+    DynamicImage::ImageRgba8(cropped)
+}
+
 /// Crop `img` to the `target_w:target_h` aspect around `face`:
 /// the smallest region with that aspect which contains the face
 /// expanded by `padding` (a fraction of the face's size, added
@@ -117,6 +155,25 @@ pub fn crop_around_face(
     let y = (oy.round() as u32).min(img.height() - ch);
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
     DynamicImage::ImageRgba8(cropped)
+}
+
+/// Window start along one axis for a focal rectangle spanning
+/// `rect_start..rect_end`: center the `window` span on the
+/// rectangle's center, clamped so a rectangle that fits inside
+/// the window stays fully inside it, and so the window stays
+/// inside the image either way.
+fn focal_start(rect_start: u32, rect_end: u32, window: u32, extent: u32) -> u32 {
+    let max_start = extent.saturating_sub(window) as i64;
+    let preferred = (rect_start as i64 + rect_end as i64) / 2 - window as i64 / 2;
+    let start = if rect_end - rect_start <= window {
+        // The rectangle fits: keep every pixel of it.
+        let lo = (rect_end as i64 - window as i64).max(0);
+        let hi = (rect_start as i64).min(max_start);
+        preferred.clamp(lo, hi)
+    } else {
+        preferred.clamp(0, max_start)
+    };
+    start as u32
 }
 
 /// Window start along one axis for smart alignment: center the
@@ -336,5 +393,65 @@ mod tests {
         assert_eq!((out.width(), out.height()), (120, 120));
         assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
         assert_eq!(rgb(&out, 119, 119), [128, 128, 128]);
+    }
+
+    #[test]
+    fn focal_crop_keeps_a_fitting_rectangle_fully_inside() {
+        // A square crop of the 100x60 stripes is 60 wide. The
+        // rectangle x 70..95 fits, so the window slides right
+        // until the rectangle's right edge is inside: start 40,
+        // window x 40..100 (a centered window would end at 80
+        // and cut the rectangle).
+        let out = crop_to_aspect_focal(vstripes(), 1, 1, (70, 0, 95, 60));
+        assert_eq!((out.width(), out.height()), (60, 60));
+        assert_eq!(rgb(&out, 0, 0), [0, 255, 0]);
+        // The rectangle spans x 30..55 of the crop...
+        assert_eq!(rgb(&out, 30, 0), [0, 255, 0]);
+        assert_eq!(rgb(&out, 54, 0), [0, 0, 255]);
+        // ...and the window's last column is the image's edge.
+        assert_eq!(rgb(&out, 59, 59), [0, 0, 255]);
+    }
+
+    #[test]
+    fn focal_crop_centers_on_an_oversized_rectangle() {
+        // The rectangle x 10..95 is wider than the 60px window:
+        // the window centers on the rectangle's center (52),
+        // start 22, instead of pinning either edge.
+        let out = crop_to_aspect_focal(vstripes(), 1, 1, (10, 0, 95, 60));
+        assert_eq!((out.width(), out.height()), (60, 60));
+        assert_eq!(rgb(&out, 0, 0), [0, 255, 0]);
+        // x 81 in the source: blue. A centered crop (start 20)
+        // would end at x 79, still green.
+        assert_eq!(rgb(&out, 59, 0), [0, 0, 255]);
+    }
+
+    #[test]
+    fn focal_crop_hugs_the_edge_the_rectangle_hugs() {
+        // A rectangle against the left edge keeps the window
+        // against the left edge too: start 0.
+        let out = crop_to_aspect_focal(vstripes(), 1, 1, (0, 0, 25, 60));
+        assert_eq!((out.width(), out.height()), (60, 60));
+        assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
+        assert_eq!(rgb(&out, 19, 0), [255, 0, 0]);
+        assert_eq!(rgb(&out, 59, 0), [0, 255, 0]);
+    }
+
+    #[test]
+    fn focal_crop_positions_on_the_vertical_axis() {
+        // A square crop of the 60x100 stripes is 60 tall. The
+        // rectangle y 70..95 fits, so the window slides down:
+        // start 40, window y 40..100.
+        let out = crop_to_aspect_focal(hstripes(), 1, 1, (0, 70, 60, 95));
+        assert_eq!((out.width(), out.height()), (60, 60));
+        assert_eq!(rgb(&out, 0, 0), [0, 255, 0]);
+        assert_eq!(rgb(&out, 0, 59), [0, 0, 255]);
+    }
+
+    #[test]
+    fn focal_crop_is_a_no_op_when_ratios_match() {
+        let out = crop_to_aspect_focal(vstripes(), 5, 3, (70, 0, 95, 60));
+        assert_eq!((out.width(), out.height()), (100, 60));
+        assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
+        assert_eq!(rgb(&out, 99, 0), [0, 0, 255]);
     }
 }

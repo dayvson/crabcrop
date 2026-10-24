@@ -42,6 +42,10 @@ pub enum ParseError {
     /// `crop-rect:<left>x<top>:<right>x<bottom>` with right > left
     /// and bottom > top. Carries the offending segment.
     InvalidCropRect(String),
+    /// A `focal:...` segment did not match
+    /// `focal:<left>x<top>:<right>x<bottom>` with right > left
+    /// and bottom > top. Carries the offending segment.
+    InvalidFocalRect(String),
     /// A `pad:...` segment did not match `pad:<WxH>[:<fill>]`.
     /// Carries the offending segment.
     InvalidPad(String),
@@ -77,6 +81,7 @@ impl ParseError {
             ParseError::InvalidSize(_) => "invalid_size",
             ParseError::InvalidCrop(_) => "invalid_crop",
             ParseError::InvalidCropRect(_) => "invalid_crop_rect",
+            ParseError::InvalidFocalRect(_) => "invalid_focal_rect",
             ParseError::InvalidPad(_) => "invalid_pad",
             ParseError::InvalidExpiry(_) => "invalid_expiry",
             ParseError::UnknownPreset(_) => "unknown_preset",
@@ -98,6 +103,9 @@ impl std::fmt::Display for ParseError {
             ParseError::InvalidCrop(seg) => write!(f, "invalid crop segment: {seg}"),
             ParseError::InvalidCropRect(seg) => {
                 write!(f, "invalid crop-rect segment: {seg}")
+            }
+            ParseError::InvalidFocalRect(seg) => {
+                write!(f, "invalid focal segment: {seg}")
             }
             ParseError::InvalidPad(seg) => write!(f, "invalid pad segment: {seg}"),
             ParseError::InvalidExpiry(seg) => write!(f, "invalid expiry segment: {seg}"),
@@ -438,6 +446,15 @@ pub enum Operation {
         right: u32,
         bottom: u32,
     },
+    /// Name the rectangle the next crop must keep
+    /// (`focal:<left>x<top>:<right>x<bottom>`). Produces no
+    /// pixels of its own; the next `Crop` consumes it.
+    FocalRect {
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+    },
     /// Filters applied in order after resize.
     Filters(Vec<Filter>),
 }
@@ -554,6 +571,9 @@ fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
     if let Some(rest) = seg.strip_prefix("crop-rect:") {
         return Some(parse_crop_rect(rest, seg));
     }
+    if let Some(rest) = seg.strip_prefix("focal:") {
+        return Some(parse_focal_rect(rest, seg));
+    }
     if let Some(rest) = seg.strip_prefix("crop:") {
         return Some(parse_crop(rest, seg));
     }
@@ -583,18 +603,36 @@ fn parse_fit_in(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     Ok(Operation::FitIn(size))
 }
 
-/// Parse `<left>x<top>:<right>x<bottom>` after `crop-rect:`.
-/// Ordering is validated here; bounds against the actual image are
-/// the engine's job, since they depend on the source.
-fn parse_crop_rect(rest: &str, seg: &str) -> Result<Operation, ParseError> {
-    let invalid = || ParseError::InvalidCropRect(seg.to_string());
-    let (lt, rb) = rest.split_once(':').ok_or_else(invalid)?;
-    let (left, top) = parse_point(lt).ok_or_else(invalid)?;
-    let (right, bottom) = parse_point(rb).ok_or_else(invalid)?;
+/// Parse `<left>x<top>:<right>x<bottom>` with ordered corners
+/// (right > left, bottom > top). Bounds against the actual image
+/// are the engine's job, since they depend on the source.
+fn parse_rect_points(rest: &str) -> Option<(u32, u32, u32, u32)> {
+    let (lt, rb) = rest.split_once(':')?;
+    let (left, top) = parse_point(lt)?;
+    let (right, bottom) = parse_point(rb)?;
     if right <= left || bottom <= top {
-        return Err(invalid());
+        return None;
     }
+    Some((left, top, right, bottom))
+}
+
+/// Parse `<left>x<top>:<right>x<bottom>` after `crop-rect:`.
+fn parse_crop_rect(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let (left, top, right, bottom) =
+        parse_rect_points(rest).ok_or_else(|| ParseError::InvalidCropRect(seg.to_string()))?;
     Ok(Operation::CropRect {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+/// Parse `<left>x<top>:<right>x<bottom>` after `focal:`.
+fn parse_focal_rect(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let (left, top, right, bottom) =
+        parse_rect_points(rest).ok_or_else(|| ParseError::InvalidFocalRect(seg.to_string()))?;
+    Ok(Operation::FocalRect {
         left,
         top,
         right,
@@ -1708,6 +1746,12 @@ fn operation_text(op: &Operation) -> String {
             right,
             bottom,
         } => format!("crop-rect:{left}x{top}:{right}x{bottom}"),
+        Operation::FocalRect {
+            left,
+            top,
+            right,
+            bottom,
+        } => format!("focal:{left}x{top}:{right}x{bottom}"),
         Operation::Filters(_) => unreachable!("filters are merged by canonical_form"),
     }
 }
@@ -2117,6 +2161,10 @@ mod tests {
             (ParseError::InvalidSize("x".into()), "invalid_size"),
             (ParseError::InvalidCrop("x".into()), "invalid_crop"),
             (ParseError::InvalidCropRect("x".into()), "invalid_crop_rect"),
+            (
+                ParseError::InvalidFocalRect("x".into()),
+                "invalid_focal_rect",
+            ),
             (ParseError::InvalidPad("x".into()), "invalid_pad"),
             (ParseError::InvalidExpiry("x".into()), "invalid_expiry"),
             (ParseError::UnknownPreset("x".into()), "unknown_preset"),
@@ -2196,6 +2244,8 @@ mod tests {
             "-300xorig",
             "crop:100x100:smart",
             "crop-rect:1x2:30x40",
+            "focal:1x2:30x40",
+            "focal:1x2:30x40/crop:100x100:smart",
             "fit-in:300x200",
             "pad:300x200",
             "pad:300x200:blur",
@@ -2818,6 +2868,41 @@ mod tests {
             let path = format!("{seg}/example.com/img.jpg");
             assert!(
                 matches!(parse_operations(&path), Err(ParseError::InvalidCropRect(_))),
+                "{seg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_focal_rect() {
+        let (ops, _) = parse_operations("focal:10x20:110x220/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::FocalRect {
+                left: 10,
+                top: 20,
+                right: 110,
+                bottom: 220,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_focal_rect() {
+        for seg in [
+            "focal:10x20",
+            "focal:110x220:10x20",
+            "focal:10x20:10x220",
+            "focal:10x20:110x20",
+            "focal:-1x0:10x10",
+            "focal:axbx:cxdx",
+        ] {
+            let path = format!("{seg}/example.com/img.jpg");
+            assert!(
+                matches!(
+                    parse_operations(&path),
+                    Err(ParseError::InvalidFocalRect(_))
+                ),
                 "{seg}"
             );
         }

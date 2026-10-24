@@ -930,6 +930,9 @@ fn apply_operations(
     let mut encode_opts = EncodeOptions::default();
     let mut face_memo: FaceMemo = None;
     let mut detection_memo: DetectionMemo = None;
+    // The pending focal rectangle from a `focal:` segment,
+    // consumed by the next crop.
+    let mut focal: Option<(u32, u32, u32, u32)> = None;
     for op in ops {
         match op {
             Operation::Size(size) => img = apply_size(img, size, cap, dpr)?,
@@ -946,6 +949,24 @@ fn apply_operations(
                     }
                 };
                 img = apply_pad(img, tw, th, *fill, directives.fill, cap)?;
+            }
+            Operation::FocalRect {
+                left,
+                top,
+                right,
+                bottom,
+            } => {
+                // Same stance as crop-rect: a rectangle that
+                // overflows the image in effect at this point
+                // fails the request.
+                if *right > img.width() || *bottom > img.height() {
+                    return Err(EngineError::Unsupported(format!(
+                        "focal {left}x{top}:{right}x{bottom} exceeds image bounds {}x{}",
+                        img.width(),
+                        img.height()
+                    )));
+                }
+                focal = Some((*left, *top, *right, *bottom));
             }
             Operation::CropRect {
                 left,
@@ -973,7 +994,17 @@ fn apply_operations(
                         ));
                     }
                 };
-                img = if *align == Align::Face {
+                // The crop consumes any pending focal rectangle.
+                // Center and smart crops position on it (smart
+                // skips face and saliency detection entirely);
+                // face and directional alignments were explicit
+                // caller instructions and ignore it.
+                let focal_rect = focal
+                    .take()
+                    .filter(|_| *align == Align::Center || *align == Align::Smart);
+                img = if let Some(rect) = focal_rect {
+                    crate::crop::crop_to_aspect_focal(img, tw, th, rect)
+                } else if *align == Align::Face {
                     // Crop around the largest detected face. A
                     // detection failure or an empty result falls
                     // back to the saliency smart crop: a crop
@@ -2929,6 +2960,103 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    fn focal_op(left: u32, top: u32, right: u32, bottom: u32) -> Operation {
+        Operation::FocalRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    fn square_crop(align: Align) -> Operation {
+        Operation::Crop {
+            size: ImageSize {
+                width: Dimension::Pixels(2),
+                height: Dimension::Pixels(2),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            align,
+        }
+    }
+
+    #[test]
+    fn focal_smart_crop_keeps_the_named_region() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        // The focal rectangle names the black bottom-right of
+        // the 8x4 pattern. A square crop window is 4 wide; the
+        // rectangle forces it to x 4..8, all black.
+        let out = engine
+            .process(&src, &[focal_op(4, 2, 8, 4), square_crop(Align::Smart)])
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert_eq!((img.width(), img.height()), (2, 2));
+        assert!(img.pixels().all(|p| p[0] == 0));
+        // Control: the same smart crop without the rectangle
+        // keeps part of the white quadrant.
+        let out = engine.process(&src, &[square_crop(Align::Smart)]).unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().any(|p| p[0] > 0));
+    }
+
+    #[test]
+    fn focal_center_crop_centers_on_the_rectangle() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        let out = engine
+            .process(&src, &[focal_op(4, 2, 8, 4), square_crop(Align::Center)])
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert_eq!((img.width(), img.height()), (2, 2));
+        assert!(img.pixels().all(|p| p[0] == 0));
+        // Control: a plain centered crop of the pattern keeps
+        // part of the white quadrant.
+        let out = engine.process(&src, &[square_crop(Align::Center)]).unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().any(|p| p[0] > 0));
+    }
+
+    #[test]
+    fn focal_is_ignored_by_a_directional_align() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        // Left alignment is an explicit instruction: the crop
+        // takes the left half (white quadrant included) even
+        // though the focal rectangle names the right side.
+        let out = engine
+            .process(&src, &[focal_op(4, 2, 8, 4), square_crop(Align::Left)])
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert_eq!((img.width(), img.height()), (2, 2));
+        assert!(img.pixels().any(|p| p[0] > 0));
+    }
+
+    #[test]
+    fn focal_out_of_bounds_is_an_error() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        let err = engine
+            .process(&src, &[focal_op(0, 0, 9, 4), square_crop(Align::Smart)])
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        let err = engine
+            .process(&src, &[focal_op(0, 0, 8, 5), square_crop(Align::Smart)])
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn focal_without_a_crop_is_a_no_op() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        let plain = engine.process(&src, &[]).unwrap();
+        let with_focal = engine.process(&src, &[focal_op(1, 1, 7, 3)]).unwrap();
+        assert_eq!(with_focal.bytes, plain.bytes);
+        assert_eq!(dims_of(&with_focal), dims_of(&plain));
     }
 
     #[test]

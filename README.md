@@ -180,6 +180,18 @@ Cuts the exact pixel rectangle between the two corners. `right` must be greater 
 curl "http://localhost:3000/unsafe/crop-rect:100x50:700x450/https://example.com/photo.jpg"
 ```
 
+### Focal rectangle
+
+```text
+focal:<left>x<top>:<right>x<bottom>
+```
+
+Names the rectangle the next `crop:` in the URL must keep, in source pixels. The segment produces no output of its own; the crop consumes it. A `center` or `smart` crop positions its window on the rectangle: centered on the rectangle's center, and clamped so a rectangle that fits inside the window stays fully inside it. With a focal rectangle pending, `smart` skips face and detail detection entirely, because the caller has already said what matters. The directional alignments (`top`, `bottom`, `left`, `right`) and `face` are explicit instructions of their own and ignore the rectangle. `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside the source image fails with `400`. Coordinates address source pixels and are not scaled by `dpr`.
+
+```bash
+curl "http://localhost:3000/unsafe/focal:100x50:700x450/crop:800x600:smart/https://example.com/photo.jpg"
+```
+
 ### Filters
 
 ```text
@@ -237,7 +249,7 @@ Notes on the directives:
 - WebP encodes lossy at the requested quality (default 80); `quality(100)` selects the lossless encode. `quality` has no effect on PNG or GIF output.
 - JPEG has no alpha channel. With `fill`, transparent pixels are composited over the fill color; without it, the stored RGB values are used as-is.
 - `no_upscale` applies to the whole request wherever it appears: a `300x200` resize of a 200×150 source returns 200×150, scaled proportionally.
-- `dpr` also applies request-wide, and it scales targets *before* the `no_upscale` cap sees them, so `dpr` never invents pixels past the source when both are set. Targets round to whole pixels. `crop-rect` coordinates address source pixels and are not scaled. When the URL carries no `dpr`, the server honors the `DPR` client hint header (same set of values; an invalid hint is ignored). An explicit `dpr` in the URL always beats the header.
+- `dpr` also applies request-wide, and it scales targets *before* the `no_upscale` cap sees them, so `dpr` never invents pixels past the source when both are set. Targets round to whole pixels. `crop-rect` and `focal` coordinates address source pixels and are not scaled. When the URL carries no `dpr`, the server honors the `DPR` client hint header (same set of values; an invalid hint is ignored). An explicit `dpr` in the URL always beats the header.
 
 #### Client hints
 

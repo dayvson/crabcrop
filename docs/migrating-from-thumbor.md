@@ -13,10 +13,9 @@ crabcrop convert-thumbor "https://thumbor.example.com/unsafe/300x200/smart/filte
 Losses are printed to stderr, one per line, so the URL on stdout stays clean:
 
 ```bash
-crabcrop convert-thumbor "unsafe/filters:brightness(20):focal(10,10,50,50)/https://images.example.com/photo.jpg"
+crabcrop convert-thumbor "unsafe/filters:brightness(20):focal(10x10:50x50)/https://images.example.com/photo.jpg"
 # warning: brightness(20) approximated as brighten(51): Thumbor scales brightness, crabcrop shifts it
-# warning: focal(...) does not convert; see the smart and face crop alignments
-# https://img.example.com/<signature>/filters:brighten(51)/https://images.example.com/photo.jpg
+# https://img.example.com/<signature>/focal:10x10:50x50/filters:brighten(51)/https://images.example.com/photo.jpg
 ```
 
 ## Concepts
@@ -49,6 +48,7 @@ crabcrop convert-thumbor "unsafe/filters:brightness(20):focal(10,10,50,50)/https
 | `full-fit-in` | `fit-in:` | Converted with a warning; the whole image stays inside the box |
 | `left` / `center` / `right`, `top` / `middle` / `bottom` | The crop alignment (`crop:300x200:left`) | crabcrop alignment is single-axis: corners collapse to their vertical side, with a warning |
 | `smart` | `crop:<W>x<H>:smart` | Focal-point crop in both |
+| `filters:focal(<l>x<t>:<r>x<b>)` | `focal:<l>x<t>:<r>x<b>` | A filter in Thumbor, an operation in crabcrop; the converter places the segment ahead of the crop it steers |
 
 ## Filters
 
@@ -64,7 +64,7 @@ Filters whose scale differs:
 | `rgb(10,0,-10)` | `rgb(26,0,-26)` | Approximate, same reason: channel scaling becomes additive offsets |
 | `blur(2)` | `blur(2)` | The value carries over; the two blurs weight radius and sigma slightly differently |
 
-Filters with no equivalent are dropped and named in the warnings: `focal(...)`, `frame(...)`, `background_color(...)`, per-format encoder options (`webp_options`, `jpeg_options`, and friends), and anything else the converter does not know. `fill(auto)` is dropped too. `strip_exif()` and `strip_icc()` need no conversion: metadata handling is server policy in crabcrop (`CRABCROP_METADATA`, `strip` by default), not a per-URL option.
+Filters with no equivalent are dropped and named in the warnings: `frame(...)`, `background_color(...)`, per-format encoder options (`webp_options`, `jpeg_options`, and friends), and anything else the converter does not know. `fill(auto)` is dropped too. `strip_exif()` and `strip_icc()` need no conversion: metadata handling is server policy in crabcrop (`CRABCROP_METADATA`, `strip` by default), not a per-URL option.
 
 ## The differences that bite
 
