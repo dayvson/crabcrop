@@ -3311,6 +3311,468 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_meta_reports_the_fixture_and_honors_its_flags() {
+        let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        // The fixture is the 100x60 test PNG: the meta JSON
+        // names the result's dimensions, its format, and the
+        // source's own dimensions.
+        let out = crate::cli::exec(&cli(&[
+            "meta",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(meta["width"], 50);
+        assert_eq!(meta["height"], 30);
+        assert_eq!(meta["source_width"], 100);
+        assert_eq!(meta["source_height"], 60);
+        assert_eq!(meta["format"], "png");
+        assert!(meta["bytes"].as_u64().unwrap() > 0);
+        // Neither opt-in was passed: both field groups stay out.
+        assert!(meta.get("dominant_color").is_none());
+        assert!(meta.get("placeholder").is_none());
+        assert!(meta.get("detections").is_none());
+        // A full signed URL passes through untouched, so meta
+        // needs no secret of its own.
+        let signed = crate::cli::exec(&cli(&[
+            "sign",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        let out = crate::cli::exec(&cli(&["meta", &signed])).await.unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(meta["width"], 50);
+        // --placeholders puts the placeholder fields in.
+        let out = crate::cli::exec(&cli(&[
+            "meta",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            "--placeholders",
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let color = meta["dominant_color"].as_str().unwrap();
+        assert!(color.starts_with('#') && color.len() == 7, "{color}");
+        assert!(
+            meta["placeholder"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
+        assert!(!meta["palette"].as_array().unwrap().is_empty());
+        assert!(meta["thumbhash"].as_str().unwrap().len() >= 20);
+        // --detections against a server with no detector:
+        // asked but unconfigured, the field stays out and the
+        // meta still succeeds.
+        let out = crate::cli::exec(&cli(&[
+            "meta",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            "--detections",
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(meta.get("detections").is_none());
+        assert_eq!(meta["width"], 50);
+        // --detections with a detector configured: the fake's
+        // box comes back in the printed JSON.
+        let base = spawn_app_with_detector(Arc::new(FakeDetector)).await;
+        let out = crate::cli::exec(&cli(&[
+            "meta",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            "--detections",
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let boxes = meta["detections"].as_array().unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0]["label"], "person");
+        assert_eq!(boxes[0]["x"], 1);
+        assert_eq!(boxes[0]["w"], 30);
+    }
+
+    #[tokio::test]
+    async fn cli_purge_evicts_so_the_next_fetch_misses() {
+        let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("40x24/{src}");
+        let signed = crate::cli::exec(&cli(&[
+            "sign",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        // Prime the entry: a miss, then a hit, one source fetch.
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Purge by the full signed URL: the entry is gone.
+        let out = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &signed,
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 1");
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // Purge by bare remainder: the CLI signs the purge
+        // itself, and the refetched entry goes away again.
+        let out = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 1");
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        // A purge signed with the wrong secret is refused by
+        // the server, surfaces as a CLI error, and the entry
+        // survives.
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        let err = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "the-wrong-secret",
+            "--base",
+            &base,
+            &signed,
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.contains("HTTP 403"), "{err}");
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn cli_purge_group_evicts_every_grouped_entry() {
+        let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        // Two distinct entries, both landing in the "small"
+        // group, plus one ungrouped entry that must survive.
+        let grouped = [
+            format!("preset:small/{src}"),
+            format!("preset:small/filters:grayscale/{src}"),
+        ];
+        let plain = format!("40x24/{src}");
+        for remainder in grouped.iter().chain(std::iter::once(&plain)) {
+            let resp = get_signed(&base, remainder).await;
+            assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+            let resp = get_signed(&base, remainder).await;
+            assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        let out = crate::cli::exec(&cli(&[
+            "purge-group",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            "small",
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 2");
+        // Both grouped entries miss again; the ungrouped one
+        // still hits.
+        for remainder in &grouped {
+            let resp = get_signed(&base, remainder).await;
+            assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        let resp = get_signed(&base, &plain).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        // An unknown group is a successful no-op.
+        let out = crate::cli::exec(&cli(&[
+            "purge-group",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            "nope",
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 0");
+    }
+
+    #[tokio::test]
+    async fn cli_purge_with_a_key_id_verifies_against_a_rotating_keyring() {
+        let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_rotating().await;
+        let remainder = format!("25x25/{src}");
+        // Mint the URL under the previous key, through the CLI.
+        let signed = crate::cli::exec(&cli(&[
+            "sign",
+            "--secret",
+            "the-old-server-secret",
+            "--key-id",
+            "k-old",
+            "--base",
+            &base,
+            &remainder,
+        ]))
+        .await
+        .unwrap();
+        assert!(signed.contains("/k-old:"), "{signed}");
+        // It serves and caches.
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Purge naming the old key: the purge signature
+        // verifies against the keyring's previous slot and
+        // the entry goes away.
+        let out = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "the-old-server-secret",
+            "--key-id",
+            "k-old",
+            "--base",
+            &base,
+            &signed,
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 1");
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // The old secret under the new key's name routes to
+        // the wrong key: refused, and the entry survives.
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        let err = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "the-old-server-secret",
+            "--key-id",
+            "k-new",
+            "--base",
+            &base,
+            &signed,
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.contains("HTTP 403"), "{err}");
+        let resp = client().get(&signed).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        // A purge under the current key verifies too.
+        let out = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "the-new-server-secret",
+            "--key-id",
+            "k-new",
+            "--base",
+            &base,
+            &signed,
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 1");
+        // purge-group signs under a key ID the same way: the
+        // rotating app has no presets, so a verified group
+        // purge removes nothing, and the same secret under
+        // the wrong key's name is refused.
+        let out = crate::cli::exec(&cli(&[
+            "purge-group",
+            "--secret",
+            "the-old-server-secret",
+            "--key-id",
+            "k-old",
+            "--base",
+            &base,
+            "small",
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, "purged 0");
+        let err = crate::cli::exec(&cli(&[
+            "purge-group",
+            "--secret",
+            "the-old-server-secret",
+            "--key-id",
+            "k-new",
+            "--base",
+            &base,
+            "small",
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.contains("HTTP 403"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
+        let cli = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // A base nothing listens on: bind a port, then drop
+        // the listener so connections are refused.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            format!("http://{addr}")
+        };
+        let target = "50x50/http://127.0.0.1:9/src.png";
+        for verb in ["meta", "purge"] {
+            let err = crate::cli::exec(&cli(&[
+                verb,
+                "--secret",
+                "test-secret",
+                "--base",
+                &dead,
+                target,
+            ]))
+            .await
+            .unwrap_err();
+            assert!(err.contains("request failed"), "{verb}: {err}");
+        }
+        let err = crate::cli::exec(&cli(&[
+            "purge-group",
+            "--secret",
+            "test-secret",
+            "--base",
+            &dead,
+            "small",
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.contains("request failed"), "{err}");
+
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        // Unknown preset: the CLI's own validation steps over
+        // preset references, the server answers 400, and the
+        // CLI surfaces the status instead of succeeding.
+        let err = crate::cli::exec(&cli(&[
+            "meta",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &format!("preset:nope/{src}"),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.contains("HTTP 400"), "{err}");
+        // Malformed operations fail in the CLI's grammar
+        // check, before any request is made.
+        let err = crate::cli::exec(&cli(&[
+            "meta",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            &format!("300x200/filters:bogus(1)/{src}"),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("invalid filters segment: filters:bogus(1)"),
+            "{err}"
+        );
+        // A well-formed signature from the wrong secret: the
+        // server refuses the meta fetch and the CLI reports it.
+        let remainder = format!("50x50/{src}");
+        let forged = format!(
+            "{base}/{}/{remainder}",
+            crabcrop_url::sign(b"some-other-secret", &remainder)
+        );
+        let err = crate::cli::exec(&cli(&["meta", &forged]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("HTTP 403"), "{err}");
+        // No secret for a remainder target: refused locally.
+        for verb in ["meta", "purge"] {
+            let err = crate::cli::exec(&cli(&[verb, "--base", &base, &remainder]))
+                .await
+                .unwrap_err();
+            assert!(err.contains("no secret"), "{verb}: {err}");
+        }
+        // Argument shape: missing and extra targets.
+        let err = crate::cli::exec(&cli(&["meta", "--secret", "test-secret"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("meta needs an argument"), "{err}");
+        let err = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "test-secret",
+            &remainder,
+            &remainder,
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.contains("takes exactly one argument"), "{err}");
+        // The meta opt-ins belong to the meta verb only.
+        let err = crate::cli::exec(&cli(&[
+            "purge",
+            "--secret",
+            "test-secret",
+            "--base",
+            &base,
+            "--placeholders",
+            &remainder,
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.contains("only apply to the meta verb"), "{err}");
+    }
+
+    #[tokio::test]
     async fn cache_status_reports_miss_then_memory_hit() {
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
         let base = spawn_app(false).await;
