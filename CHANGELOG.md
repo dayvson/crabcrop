@@ -6,6 +6,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Added
 
+- Convolution: a `convolution(<v1>,...,<vN>,<normalize>)` filter applies a caller-supplied kernel — 9 values (3x3) or 25 (5x5) in row-major order, each a plain decimal from −1024 to 1024 — once over the image with edge replication. The trailing flag (0 or 1) scales the kernel by the sum of its entries first; a zero sum applies the kernel as written. Malformed kernels report their own error code, `invalid_convolution`.
 - Tone curves: a `curve(<channel>,<x>,<y>,...)` filter remaps the `rgb`, `r`, `g`, or `b` channel through 2 to 16 control points (each 0–255, x strictly increasing), linearly interpolated with the ends clamped, for per-channel tone control the additive filters only approximate. Malformed curves report their own error code, `invalid_curve`.
 - Per-request cache lifetime: a `maxage:<seconds>` segment (0 to 31536000) overrides the response `Cache-Control` max-age for that request only. Header-only: it never enters the cache key, so URLs differing only in `maxage` share one stored image; `maxage:0` answers `max-age=0` without `immutable`.
 - Caller-supplied focal rectangle for crops: a `focal:<left>x<top>:<right>x<bottom>` segment names the source rectangle the next `crop:` must keep (center and smart crops position on it; directional alignments ignore it). The Thumbor converter now maps the `focal(...)` filter to it.

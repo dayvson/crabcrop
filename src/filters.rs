@@ -109,6 +109,9 @@ pub fn apply_filters_filled(
             Filter::Curve(channel, points) => {
                 img = tone_curve(&img, *channel, points);
             }
+            Filter::Convolution(values, normalize) => {
+                img = convolve(&img, values, *normalize);
+            }
             Filter::Equalize => {
                 img = DynamicImage::ImageRgb8(equalize(&img.into_rgb8()));
             }
@@ -348,6 +351,70 @@ pub fn tone_curve(img: &DynamicImage, channel: CurveChannel, points: &[(u8, u8)]
             b_lut[usize::from(b)],
         ]
     })
+}
+
+/// Round to the nearest integer, halves away from zero
+/// (the `f64::round` rule), and clamp to the byte range:
+/// the finish for the float pixel math (the tone curve's
+/// table applies the same rule in exact integer form).
+fn round_clamp(value: f64) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
+}
+
+/// Apply a caller-supplied convolution kernel to the RGB
+/// channels. `kernel` is row-major; its length picks the
+/// size, 9 for 3x3 or 25 for 5x5 (the parser guarantees
+/// nothing else reaches here). The edges replicate: a tap
+/// outside the frame reads the nearest edge pixel, mirroring
+/// the image edges like the blur and sharpen filters built
+/// on the image crate's own convolution. With `normalize`
+/// set, the kernel is first scaled by the sum of its
+/// entries, so an all-ones kernel averages its window; a
+/// zero sum has no scale to apply, and the kernel applies
+/// as written. Accumulation is `f64`, rounded to nearest
+/// with halves away from zero and clamped to 0-255. Alpha
+/// is never touched.
+pub fn convolve(img: &DynamicImage, kernel: &[f64], normalize: bool) -> DynamicImage {
+    let size = if kernel.len() == 9 { 3 } else { 5 };
+    let radius = (size / 2) as i32;
+    let sum: f64 = kernel.iter().sum();
+    let scale = if normalize && sum != 0.0 {
+        1.0 / sum
+    } else {
+        1.0
+    };
+    let has_alpha = img.color().has_alpha();
+    let rgba = img.to_rgba8();
+    let (width, height) = (rgba.width() as i32, rgba.height() as i32);
+    let mut out = rgba.clone();
+    for y in 0..height {
+        for x in 0..width {
+            let mut acc = [0.0f64; 3];
+            for ky in 0..size as i32 {
+                let sy = (y + ky - radius).clamp(0, height - 1) as u32;
+                for kx in 0..size as i32 {
+                    let k = kernel[(ky as usize) * size + kx as usize] * scale;
+                    if k == 0.0 {
+                        continue;
+                    }
+                    let sx = (x + kx - radius).clamp(0, width - 1) as u32;
+                    let p = rgba.get_pixel(sx, sy);
+                    for (c, a) in acc.iter_mut().enumerate() {
+                        *a += k * f64::from(p[c]);
+                    }
+                }
+            }
+            let o = out.get_pixel_mut(x as u32, y as u32);
+            for (c, a) in acc.iter().enumerate() {
+                o[c] = round_clamp(*a);
+            }
+        }
+    }
+    if has_alpha {
+        DynamicImage::ImageRgba8(out)
+    } else {
+        DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(out).to_rgb8())
+    }
 }
 
 /// The classic warm sepia tone (the standard sepia matrix).
@@ -1093,6 +1160,204 @@ mod tests {
             ],
         );
         assert_eq!(row_rgb(&out), vec![[255, 128, 128]]);
+    }
+
+    fn gray_grid(rows: &[&[u8]]) -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(rows[0].len() as u32, rows.len() as u32);
+        for (y, row) in rows.iter().enumerate() {
+            for (x, v) in row.iter().enumerate() {
+                img.as_mut_rgb8()
+                    .unwrap()
+                    .get_pixel_mut(x as u32, y as u32)
+                    .0 = [*v, *v, *v];
+            }
+        }
+        img
+    }
+
+    fn gray_values(img: &DynamicImage) -> Vec<Vec<u8>> {
+        let rgb = img.to_rgb8();
+        (0..rgb.height())
+            .map(|y| (0..rgb.width()).map(|x| rgb.get_pixel(x, y)[0]).collect())
+            .collect()
+    }
+
+    /// The gradient fixture several convolution tests share.
+    fn gradient() -> DynamicImage {
+        gray_grid(&[&[0, 10, 20], &[30, 40, 50], &[60, 70, 80]])
+    }
+
+    #[test]
+    fn convolution_identity_is_a_no_op() {
+        let img = striped();
+        let before = img.to_rgb8().into_raw();
+        let mut identity5 = vec![0.0; 25];
+        identity5[12] = 1.0;
+        for kernel in [
+            (vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], false),
+            (vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], true),
+            (identity5, false),
+        ] {
+            let (out, _) = apply_filters(img.clone(), &[Filter::Convolution(kernel.0, kernel.1)]);
+            assert_eq!(out.to_rgb8().into_raw(), before);
+        }
+    }
+
+    #[test]
+    fn convolution_sharpen_matches_hand_computed_pixels() {
+        // The classic sharpen kernel on a lone bright pixel:
+        // the center is 5 * 50 - (10 + 10 + 10 + 10) = 210,
+        // and every other window's sum goes negative (the
+        // bright pixel is at most one cross tap) and clamps
+        // to 0.
+        let img = gray_grid(&[&[0, 10, 0], &[10, 50, 10], &[0, 10, 0]]);
+        let (out, _) = apply_filters(
+            img,
+            &[Filter::Convolution(
+                vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0],
+                false,
+            )],
+        );
+        assert_eq!(
+            gray_values(&out),
+            vec![vec![0, 0, 0], vec![0, 210, 0], vec![0, 0, 0]]
+        );
+    }
+
+    #[test]
+    fn convolution_normalized_box_averages_the_window() {
+        // An all-ones kernel with normalize on is the box
+        // average over the edge-replicated window: the center
+        // is 360 / 9 = 40, the corner counts its replicated
+        // taps (120 / 9, rounding to 13), and so on.
+        let (out, _) = apply_filters(gradient(), &[Filter::Convolution(vec![1.0; 9], true)]);
+        assert_eq!(
+            gray_values(&out),
+            vec![vec![13, 20, 27], vec![33, 40, 47], vec![53, 60, 67]]
+        );
+        // Rounding is to nearest: a lone 5 in a 3x3 of zeros
+        // averages to 5 / 9 = 0.55..., which rounds up to 1
+        // in every window (each contains the 5 exactly once).
+        let lone = gray_grid(&[&[0, 0, 0], &[0, 5, 0], &[0, 0, 0]]);
+        let (out, _) = apply_filters(lone, &[Filter::Convolution(vec![1.0; 9], true)]);
+        assert_eq!(
+            gray_values(&out),
+            vec![vec![1, 1, 1], vec![1, 1, 1], vec![1, 1, 1]]
+        );
+    }
+
+    #[test]
+    fn convolution_unnormalized_box_sums_and_clamps() {
+        // The same kernel without normalize sums the window:
+        // the top row stays under the ceiling, everything
+        // from the middle row down clamps at 255.
+        let (out, _) = apply_filters(gradient(), &[Filter::Convolution(vec![1.0; 9], false)]);
+        assert_eq!(
+            gray_values(&out),
+            vec![
+                vec![120, 180, 240],
+                vec![255, 255, 255],
+                vec![255, 255, 255]
+            ]
+        );
+    }
+
+    #[test]
+    fn convolution_zero_sum_kernel_ignores_normalize() {
+        // An edge kernel sums to zero, so normalize has no
+        // scale to apply: both spellings must produce the
+        // kernel exactly as written (center: the cross taps
+        // sum to 10 + 30 + 50 + 70 = 160, minus 4 * 40, is 0).
+        let kernel = vec![0.0, 1.0, 0.0, 1.0, -4.0, 1.0, 0.0, 1.0, 0.0];
+        let (plain, _) = apply_filters(gradient(), &[Filter::Convolution(kernel.clone(), false)]);
+        let (normalized, _) = apply_filters(gradient(), &[Filter::Convolution(kernel, true)]);
+        assert_eq!(plain.to_rgb8().into_raw(), normalized.to_rgb8().into_raw());
+        assert_eq!(gray_values(&normalized)[1][1], 0);
+    }
+
+    #[test]
+    fn convolution_five_by_five_applies_its_taps() {
+        // A single tap in the kernel's top-left corner: every
+        // output reads the source two pixels up and left,
+        // clamped to the frame (the edge replication rule).
+        let img = gray_grid(&[
+            &[0, 1, 2, 3, 4],
+            &[5, 6, 7, 8, 9],
+            &[10, 11, 12, 13, 14],
+            &[15, 16, 17, 18, 19],
+            &[20, 21, 22, 23, 24],
+        ]);
+        let mut kernel = vec![0.0; 25];
+        kernel[0] = 1.0;
+        let (out, _) = apply_filters(img, &[Filter::Convolution(kernel, false)]);
+        assert_eq!(
+            gray_values(&out),
+            vec![
+                vec![0, 0, 0, 1, 2],
+                vec![0, 0, 0, 1, 2],
+                vec![0, 0, 0, 1, 2],
+                vec![5, 5, 5, 6, 7],
+                vec![10, 10, 10, 11, 12],
+            ]
+        );
+    }
+
+    #[test]
+    fn convolution_edges_replicate_at_the_corners() {
+        // A kernel with only its right tap set: each output
+        // is the pixel to its right, and the right column
+        // reads itself (the edge, replicated).
+        let img = gray_grid(&[&[10, 20], &[30, 40]]);
+        let (out, _) = apply_filters(
+            img,
+            &[Filter::Convolution(
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                false,
+            )],
+        );
+        assert_eq!(gray_values(&out), vec![vec![20, 20], vec![40, 40]]);
+    }
+
+    #[test]
+    fn convolution_decimal_kernel_matches_hand_computed_values() {
+        // The 3x3 gaussian (weights sum to 1) on the linear
+        // gradient: the center is the corners at 1/16
+        // (160 / 16 = 10), the edges at 1/8 (160 / 8 = 20),
+        // and the center at 1/4 (40 / 4 = 10), totaling 40.
+        let gaussian = vec![
+            0.0625, 0.125, 0.0625, 0.125, 0.25, 0.125, 0.0625, 0.125, 0.0625,
+        ];
+        let (out, _) = apply_filters(gradient(), &[Filter::Convolution(gaussian.clone(), false)]);
+        assert_eq!(gray_values(&out)[1][1], 40);
+        // On a flat field the weights summing to 1 leave the
+        // value alone, exactly (every weight is dyadic).
+        let flat = gray_grid(&[&[80, 80, 80], &[80, 80, 80], &[80, 80, 80]]);
+        let (out, _) = apply_filters(flat, &[Filter::Convolution(gaussian, false)]);
+        assert_eq!(
+            gray_values(&out),
+            vec![vec![80, 80, 80], vec![80, 80, 80], vec![80, 80, 80]]
+        );
+    }
+
+    #[test]
+    fn convolution_never_touches_alpha() {
+        let mut img = DynamicImage::new_rgba8(2, 2);
+        let px = [
+            [10, 20, 30, 77],
+            [40, 50, 60, 77],
+            [70, 80, 90, 77],
+            [100, 110, 120, 77],
+        ];
+        for (i, p) in img.as_mut_rgba8().unwrap().pixels_mut().enumerate() {
+            *p = image::Rgba(px[i]);
+        }
+        let (out, _) = apply_filters(img, &[Filter::Convolution(vec![1.0; 9], true)]);
+        let rgba = out.to_rgba8();
+        // The box average at (0, 0) weights the corner pixel
+        // four times, its edge neighbors twice, and the far
+        // corner once: (360, 450, 540) / 9 = (40, 50, 60).
+        assert_eq!(rgba.get_pixel(0, 0).0, [40, 50, 60, 77]);
+        assert!(rgba.pixels().all(|p| p[3] == 77));
     }
 
     #[test]

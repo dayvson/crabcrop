@@ -339,6 +339,40 @@ export const filter = {
     return `curve(${channel},${flat.join(",")})`;
   },
   /**
+   * Convolution: apply a caller-supplied kernel, 9 values
+   * (3x3) or 25 (5x5) in row-major order, each a plain
+   * decimal from -1024 to 1024. With normalize set the
+   * server scales the kernel by the sum of its entries
+   * first (a zero sum applies the kernel as written). The
+   * edges replicate. `normalize` is a boolean or the 0/1
+   * flag itself.
+   */
+  convolution(values: number[], normalize: boolean | 0 | 1 = false): string {
+    if (values.length !== 9 && values.length !== 25) {
+      fail("convolution kernel", values, "9 (3x3) or 25 (5x5) values");
+    }
+    for (const v of values) {
+      floatIn("convolution kernel value", v, -1024, 1024);
+      if (!/^-?\d+(\.\d+)?$/.test(num(v))) {
+        fail(
+          "convolution kernel value",
+          v,
+          "a plain decimal (the grammar takes no exponent forms)",
+        );
+      }
+    }
+    if (
+      normalize !== true &&
+      normalize !== false &&
+      normalize !== 0 &&
+      normalize !== 1
+    ) {
+      fail("convolution normalize", normalize, "a boolean or 0/1");
+    }
+    const flag = normalize === true || normalize === 1 ? 1 : 0;
+    return `convolution(${values.map(num).join(",")},${flag})`;
+  },
+  /**
    * Rotate by an angle in degrees (decimals allowed, no
    * exponent spelling); multiples of 90 are exact quarter
    * turns on the server.

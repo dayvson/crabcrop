@@ -395,6 +395,18 @@ fn describe_filter(filter: &Filter) -> String {
             text.push_str("): remap tones through the control points");
             text
         }
+        Filter::Convolution(values, normalize) => {
+            let mut text = "convolution(".to_string();
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    text.push(',');
+                }
+                text.push_str(&crate::url::format_kernel_value(*v));
+            }
+            text.push_str(if *normalize { ",1" } else { ",0" });
+            text.push_str("): apply the kernel to the image");
+            text
+        }
         Filter::Equalize => "equalize: histogram equalization".into(),
         Filter::Rotate(v) => format!("rotate({v}): rotate by a multiple of 90 degrees"),
         Filter::Trim(v) => format!("trim({v}): trim near-uniform borders"),
@@ -1255,6 +1267,13 @@ mod tests {
         for filter in [
             Filter::HueRotate(90),
             Filter::Curve(crate::url::CurveChannel::Rgb, vec![(0, 0), (255, 255)]),
+            Filter::Convolution(vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0], false),
+            Filter::Convolution(
+                vec![
+                    0.0625, 0.125, 0.0625, 0.125, 0.25, 0.125, 0.0625, 0.125, 0.0625,
+                ],
+                true,
+            ),
             Filter::Flip(FlipDirection::Horizontal),
             Filter::Flip(FlipDirection::Vertical),
             Filter::Quality(Quality::Value(80)),
