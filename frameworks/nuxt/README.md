@@ -34,13 +34,16 @@ Provider options: `base` (required), `preset` (recommended: the transform policy
 |---|---|
 | `width` + `height`, fit `cover` (default) | `crop:WxH:smart` |
 | `width` + `height`, fit `contain` | `pad:WxH:blur` (blurred ambient bars) |
-| `width` + `height`, fit `inside` / `outside` | `fit-in:WxH` |
+| `width` + `height`, fit `inside` | `fit-in:WxH` |
+| `width` + `height`, fit `outside` | `crop:WxH` (approximation, see below) |
 | `width` + `height`, fit `fill` | `WxH` |
 | `width` only / `height` only | `Wx0` / `0xH` |
 | `format` (`jpg` becomes `jpeg`) | `filters:format(...)` |
 | `quality` | `filters:quality(...)` |
 
 With a preset configured, `preset:<name>` leads and the geometry and filters above append after it.
+
+About `outside`: in @nuxt/image semantics, `outside` means the result covers the box (at least the box on both axes, aspect preserved) without cropping. crabcrop has no uncropped cover resize, so the provider maps `outside` to a centered `crop:WxH`: both requested dimensions are honored exactly, but the overflow is cropped away instead of kept. (The earlier mapping to `fit-in:WxH` was the opposite geometry: its result could be smaller than the box on one axis.) If keeping the whole frame matters more than the exact size, use `fit: "inside"` and let your layout clip the overflow.
 
 ## Registry status
 
