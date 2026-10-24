@@ -15,7 +15,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  AI_ASSETS: ${{ runner.temp }}/ai-assets
+  # AI_ASSETS is set by the first step: the runner context is not
+  # available in a top-level env block, so it cannot be defined here.
 
 jobs:
   ai-models:
@@ -25,6 +26,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set the asset directory
+        run: echo "AI_ASSETS=$RUNNER_TEMP/ai-assets" >> "$GITHUB_ENV"
 
       - name: Cache the pinned AI test assets
         uses: actions/cache@v4
