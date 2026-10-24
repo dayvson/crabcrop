@@ -358,7 +358,8 @@ pub enum Filter {
     Grayscale,
     /// Invert every channel.
     Invert,
-    /// Gaussian blur; sigma must be positive.
+    /// Gaussian blur; sigma is a positive, normal f32 no
+    /// larger than [`MAX_BLUR_SIGMA`].
     Blur(f32),
     /// Add to every channel (-255..=255), clamped to 0-255.
     Brighten(i32),
@@ -626,6 +627,17 @@ pub const MAX_CACHE_AGE: u32 = 31_536_000;
 /// still keeps a hostile kernel's accumulated sums far from
 /// any overflow concern.
 pub const MAX_KERNEL_VALUE: f64 = 1024.0;
+
+/// The largest `blur(...)` sigma the grammar accepts. The
+/// Gaussian kernel grows at about 6.67 entries per unit of
+/// sigma and is allocated per axis before any pixel is
+/// processed, so an unbounded sigma is an allocation dial:
+/// sigma 1e8 asks for gigabytes of kernel. 512 is already a
+/// full wash on any canvas the output budget allows, so the
+/// cap costs no real image. Non-normal values are rejected
+/// with the cap: a subnormal sigma panics the image crate's
+/// Gaussian setup, which asserts `sigma.is_normal()`.
+pub const MAX_BLUR_SIGMA: f32 = 512.0;
 
 fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
     let (flip, digits) = match part.strip_prefix('-') {
@@ -1016,7 +1028,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             ("no_upscale", None) => Filter::NoUpscale,
             ("blur", Some(p)) => {
                 let sigma: f32 = p.parse().map_err(|_| invalid())?;
-                if !sigma.is_finite() || sigma <= 0.0 {
+                if !sigma.is_normal() || sigma <= 0.0 || sigma > MAX_BLUR_SIGMA {
                     return Err(invalid());
                 }
                 Filter::Blur(sigma)
@@ -4300,6 +4312,13 @@ mod tests {
             "filters:blur(0)",
             "filters:blur(-1.5)",
             "filters:blur(lots)",
+            "filters:blur(513)",
+            "filters:blur(512.5)",
+            "filters:blur(1000000000)",
+            "filters:blur(1e-45)",
+            "filters:blur(1e-40)",
+            "filters:blur(inf)",
+            "filters:blur(NaN)",
             "filters:brighten()",
             "filters:brighten(lots)",
             "filters:contrast()",
@@ -4314,6 +4333,23 @@ mod tests {
                 "segment: {seg:?}"
             );
         }
+    }
+
+    #[test]
+    fn blur_sigma_cap_boundary() {
+        // The cap itself, and a small normal sigma, are accepted.
+        let (ops, _) = parse_operations("filters:blur(512)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Blur(512.0)])]);
+        let (ops, _) = parse_operations("filters:blur(0.001)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Blur(0.001)])]);
+        // Just over the cap is invalid_filters, like any other
+        // out-of-range filter parameter.
+        assert_eq!(
+            parse_operations("filters:blur(512.5)/example.com/img.jpg"),
+            Err(ParseError::InvalidFilters(
+                "filters:blur(512.5)".to_string()
+            ))
+        );
     }
 
     #[test]

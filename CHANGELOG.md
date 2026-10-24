@@ -7,6 +7,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 ### Fixed
 
 - One aggregate output budget for animated and video outputs: output pixels are charged per frame against the shared 100M px budget instead of per frame only, final dimensions are rechecked after the operation chain (with the rotation canvas checked before it allocates), requests are capped at 100 executed operations, and animated WebP encoding no longer clones every frame buffer (issue #182).
+- `blur(...)` sigma is capped at 512 and must be a normal float: larger or subnormal values are rejected with `invalid_filters` instead of sizing multi-gigabyte Gaussian kernel allocations or panicking inside the image crate, and the same bound is enforced where blur is applied (issue #183).
 
 ## [0.1.0] - 2026-10-24
 
