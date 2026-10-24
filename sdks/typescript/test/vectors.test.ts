@@ -103,6 +103,8 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     ["pad:100x100:red/" + SRC, true, SRC],
     ["crop-rect:0x0:50x50/" + SRC, false, SRC],
     ["crop-rect:0x0:50/" + SRC, true, SRC],
+    ["focal:0x0:50x50/" + SRC, false, SRC],
+    ["focal:0x0:50/" + SRC, true, SRC],
     ["16384x10/" + SRC, false, "16384x10/" + SRC],
     ["exp:1893456000/300x200/" + SRC, false, SRC],
     ["filters:radius(12)/" + SRC, false, SRC],
@@ -133,6 +135,8 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     // parser's, verified against src/url.rs.
     ["crop-rect:50x50:0x0/" + SRC, true, SRC],
     ["crop-rect:50x50:51x51/" + SRC, false, SRC],
+    ["focal:50x50:0x0/" + SRC, true, SRC],
+    ["focal:50x50:51x51/" + SRC, false, SRC],
     ["filters:blur(0x10)/" + SRC, true, SRC],
     ["filters:contrast(0x2)/" + SRC, true, SRC],
     ["filters:blur( 1.5)/" + SRC, true, SRC],

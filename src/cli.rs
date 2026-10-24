@@ -336,6 +336,14 @@ fn describe_operation(segment: &str, op: &Operation) -> Vec<String> {
         } => vec![format!(
             "  {segment}  crop the rectangle {left},{top} to {right},{bottom}"
         )],
+        Operation::FocalRect {
+            left,
+            top,
+            right,
+            bottom,
+        } => vec![format!(
+            "  {segment}  set the focal rectangle {left},{top} to {right},{bottom} for the next crop"
+        )],
         Operation::Filters(filters) => {
             let mut lines = vec![format!("  {segment}")];
             for filter in filters {
@@ -628,8 +636,15 @@ fn format_factor(f: f64) -> String {
 
 /// Convert one Thumbor filter to its crabcrop filter text.
 /// Anything with no faithful equivalent is dropped and
-/// named in `warnings` instead of being guessed at.
-fn convert_thumbor_filter(item: &str, warnings: &mut Vec<String>) -> Option<String> {
+/// named in `warnings` instead of being guessed at. A
+/// `focal(...)` filter is not a crabcrop filter: it lands in
+/// the `focal` side channel (the last one in a chain wins)
+/// and becomes a `focal:` segment ahead of the crop.
+fn convert_thumbor_filter(
+    item: &str,
+    warnings: &mut Vec<String>,
+    focal: &mut Option<(u32, u32, u32, u32)>,
+) -> Option<String> {
     let (name, args) = match item.split_once('(') {
         Some((n, rest)) => (n, rest.strip_suffix(')').unwrap_or(rest)),
         None => (item, ""),
@@ -815,10 +830,16 @@ fn convert_thumbor_filter(item: &str, warnings: &mut Vec<String>) -> Option<Stri
              and the fill filter"
                 .to_string(),
         ),
-        "focal" => drop_it(
-            warnings,
-            "focal(...) does not convert; see the smart and face crop alignments".to_string(),
-        ),
+        "focal" => match parse_thumbor_crop(args) {
+            Some(rect) => {
+                *focal = Some(rect);
+                None
+            }
+            None => drop_it(
+                warnings,
+                format!("focal({args}): not a <left>x<top>:<right>x<bottom> rectangle; dropped"),
+            ),
+        },
         _ => drop_it(
             warnings,
             format!("{item} has no crabcrop equivalent; dropped"),
@@ -886,6 +907,7 @@ pub fn convert_thumbor(
     let mut halign: Option<&str> = None;
     let mut valign: Option<&str> = None;
     let mut smart = false;
+    let mut focal: Option<(u32, u32, u32, u32)> = None;
     let mut filters_text: Vec<String> = Vec::new();
 
     while idx < segments.len() {
@@ -946,7 +968,7 @@ pub fn convert_thumbor(
                 chain.push_str(segments[idx]);
             }
             for item in split_filter_chain(&chain) {
-                if let Some(text) = convert_thumbor_filter(item, &mut warnings) {
+                if let Some(text) = convert_thumbor_filter(item, &mut warnings, &mut focal) {
                     filters_text.push(text);
                 }
             }
@@ -1061,6 +1083,11 @@ pub fn convert_thumbor(
     }
     if !crop_flips.is_empty() {
         ops.push(format!("filters:{}", crop_flips.join(":")));
+    }
+    if let Some((l, t, r, b)) = focal {
+        // Ahead of the size op, so the crop it steers is the
+        // next one in the converted URL.
+        ops.push(format!("focal:{l}x{t}:{r}x{b}"));
     }
     if let Some(op) = size_op {
         ops.push(op);
@@ -1398,11 +1425,22 @@ mod tests {
             url.contains("watermark(https%3A%2F%2Fe.com%2Flogo.png,10,-10,50)"),
             "{url}"
         );
-        // The unconvertible are dropped and named.
+        // The unconvertible are dropped and named. (Comma-form
+        // focal arguments are not the rectangle grammar, so
+        // this focal is malformed and drops like the rest.)
         let (url, warnings) =
             conv("unsafe/filters:focal(1,2,3,4):rotate(45):fill(auto)/https://e.com/a.jpg");
         assert!(!url.contains("focal") && !url.contains("rotate"), "{url}");
         assert_eq!(warnings.len(), 3, "{warnings:?}");
+        // A rectangle focal converts to a focal: segment ahead
+        // of the crop it steers.
+        let (url, warnings) =
+            conv("unsafe/300x200/smart/filters:focal(10x20:110x220)/https://e.com/a.jpg");
+        assert!(
+            url.contains("/focal:10x20:110x220/crop:300x200:smart/"),
+            "{url}"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
         // strip_exif is a policy note, not a filter.
         let (_, warnings) = conv("unsafe/filters:strip_exif()/https://e.com/a.jpg");
         assert!(
