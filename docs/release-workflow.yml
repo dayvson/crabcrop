@@ -146,13 +146,16 @@ jobs:
       # ninja on the PATH.
       - name: Install meson, ninja, and nasm (vendored dav1d)
         run: |
-          python3 -m pip install --user --break-system-packages meson ninja
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y nasm
-          elif [ "$RUNNER_OS" = "macOS" ]; then
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python3 -m pip install --user --break-system-packages meson ninja
             brew install nasm
+          else
+            python3 -m pip install --user meson ninja
+            if [ "$(uname -m)" = "x86_64" ]; then
+              sudo apt-get update && sudo apt-get install -y nasm || { apt-get update && apt-get install -y nasm; }
+            fi
           fi
+          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
       - name: Build artifacts
         env:
           # Vendored static dav1d, so the release binaries
