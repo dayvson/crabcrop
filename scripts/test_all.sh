@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run every test suite in the repository: Rust (binary and
 # crate), the TypeScript SDK, the Python SDK, the MCP server,
-# the Nuxt module, and the playground (unit and integration).
+# the framework modules (Nuxt, Next.js, Hydrogen), and the
+# playground (unit and integration).
 #
 # The integration suites need live servers; this script starts
 # and stops them:
@@ -48,6 +49,12 @@ step "MCP server"
 
 step "Nuxt module"
 (cd frameworks/nuxt && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+
+step "Next.js module"
+(cd frameworks/nextjs && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+
+step "Hydrogen module"
+(cd frameworks/hydrogen && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
 
 step "Playground (unit)"
 (cd playground && npm test)
