@@ -4,7 +4,7 @@
  *
  * Preconditions (this is not part of the hermetic suite):
  *   - crabcrop on 127.0.0.1:3321 with CRABCROP_SECRET=playground-secret
- *   - any image source on 127.0.0.1:8909 (the repo's bench fixtures)
+ *   - any image source on 127.0.0.1:8909 (the repo's test-fixtures/ serve this)
  * Run with: npm run test:integration
  */
 import assert from "node:assert/strict";
