@@ -241,6 +241,14 @@ pub struct ProcessContext<'a> {
     /// Detection provider for class redaction, when
     /// configured.
     pub detect_provider: Option<&'a dyn crate::ai::DetectionProvider>,
+    /// Declared detection providers (issue #166), in
+    /// declaration order: class resolution walks the
+    /// built-in provider first, then these.
+    pub declared_detect_providers: &'a [&'a dyn crate::ai::DetectionProvider],
+    /// Declared focal provider for smart crops (issue
+    /// #166): the first `focal` declaration, consulted
+    /// between the face provider and saliency.
+    pub focal_provider: Option<&'a dyn crate::ai::FocalProvider>,
     /// Text renderer, when a font is configured.
     pub text_renderer: Option<&'a dyn crate::text::TextRenderer>,
     /// Video encoder, when the deployment configured an
@@ -284,6 +292,8 @@ impl Default for ProcessContext<'_> {
             upscale_provider: None,
             face_provider: None,
             detect_provider: None,
+            declared_detect_providers: &[],
+            focal_provider: None,
             text_renderer: None,
             video_encoder: None,
             dpr: None,
@@ -414,14 +424,15 @@ impl Engine {
             ));
         }
         if directives.has_class_redaction() {
-            let provider = ctx.detect_provider.ok_or_else(|| {
-                EngineError::NotConfigured(
+            let providers = detection_providers(&ctx);
+            if providers.is_empty() {
+                return Err(EngineError::NotConfigured(
                     "class redaction is not configured on this server (no detection model)"
                         .to_string(),
-                )
-            })?;
+                ));
+            }
             for class in &directives.classes {
-                if !provider.knows_class(class) {
+                if resolve_detector(&providers, class).is_none() {
                     return Err(EngineError::Unsupported(format!(
                         "unknown detection class {class:?}: not in the detection model's vocabulary"
                     )));
@@ -1125,20 +1136,35 @@ type DetectionMemo = Option<(
     Result<Vec<crate::ai::Detection>, crate::ai::AiError>,
 )>;
 
-/// Detect objects in `img` through the context's provider,
-/// memoized like face detection. A provider failure is an
-/// inference error: on a redaction request that fails the
-/// request (never an unredacted response).
+/// Every detection provider that can answer for this
+/// request, in resolution order (issue #166): the built-in
+/// detector first, then the declared detectors in
+/// declaration order.
+fn detection_providers<'a>(ctx: &ProcessContext<'a>) -> Vec<&'a dyn crate::ai::DetectionProvider> {
+    let mut providers: Vec<&dyn crate::ai::DetectionProvider> = Vec::new();
+    if let Some(provider) = ctx.detect_provider {
+        providers.push(provider);
+    }
+    providers.extend(ctx.declared_detect_providers.iter().copied());
+    providers
+}
+
+/// The slot of the first provider (in resolution order)
+/// whose vocabulary knows `class`: the one provider a
+/// class filter runs.
+fn resolve_detector(providers: &[&dyn crate::ai::DetectionProvider], class: &str) -> Option<usize> {
+    providers.iter().position(|p| p.knows_class(class))
+}
+
+/// Detect objects in `img` through one provider, memoized
+/// like face detection. A provider failure is an inference
+/// error: on a redaction request that fails the request
+/// (never an unredacted response).
 fn detect_objects(
     memo: &mut DetectionMemo,
     img: &DynamicImage,
-    ctx: &ProcessContext<'_>,
+    provider: &dyn crate::ai::DetectionProvider,
 ) -> Result<Vec<crate::ai::Detection>, EngineError> {
-    let provider = ctx.detect_provider.ok_or_else(|| {
-        EngineError::NotConfigured(
-            "class redaction is not configured on this server (no detection model)".to_string(),
-        )
-    })?;
     if let Some((w, h, cached)) = &memo
         && *w == img.width()
         && *h == img.height()
@@ -1148,6 +1174,30 @@ fn detect_objects(
     let found = provider.detect(img);
     *memo = Some((img.width(), img.height(), found.clone()));
     found.map_err(EngineError::Inference)
+}
+
+/// The detections of one class, through the provider that
+/// resolution picks for it (issue #166): each provider has
+/// its own memo slot, so chained class filters still share
+/// one run per provider per image state.
+fn detect_for_class(
+    memos: &mut [DetectionMemo],
+    providers: &[&dyn crate::ai::DetectionProvider],
+    img: &DynamicImage,
+    class: &str,
+) -> Result<Vec<crate::ai::Detection>, EngineError> {
+    if providers.is_empty() {
+        return Err(EngineError::NotConfigured(
+            "class redaction is not configured on this server (no detection model)".to_string(),
+        ));
+    }
+    let slot = resolve_detector(providers, class).ok_or_else(|| {
+        EngineError::Unsupported(format!(
+            "unknown detection class {class:?}: not in the detection model's vocabulary"
+        ))
+    })?;
+    let detections = detect_objects(&mut memos[slot], img, providers[slot])?;
+    Ok(detections_of_class(&detections, class))
 }
 
 /// The detections of one class (case-insensitive, the
@@ -1202,7 +1252,10 @@ fn apply_operations(
 ) -> Result<(DynamicImage, EncodeOptions), EngineError> {
     let mut encode_opts = EncodeOptions::default();
     let mut face_memo: FaceMemo = None;
-    let mut detection_memo: DetectionMemo = None;
+    // One detection memo per provider, in resolution order
+    // (issue #166).
+    let detect_providers = detection_providers(ctx);
+    let mut detection_memos: Vec<DetectionMemo> = vec![None; detect_providers.len()];
     // The pending focal rectangle from a `focal:` segment,
     // consumed by the next crop.
     let mut focal: Option<(u32, u32, u32, u32)> = None;
@@ -1360,6 +1413,7 @@ fn apply_operations(
                                     th,
                                     Align::Smart,
                                     None,
+                                    ctx.focal_provider,
                                 );
                                 if let Some(trace) = trace {
                                     debug_capture = Some(capture_from_trace(
@@ -1369,14 +1423,27 @@ fn apply_operations(
                                 }
                                 cropped
                             } else {
-                                crate::crop::crop_to_aspect_with(img, tw, th, Align::Smart, None)
+                                crate::crop::crop_to_aspect_with(
+                                    img,
+                                    tw,
+                                    th,
+                                    Align::Smart,
+                                    None,
+                                    ctx.focal_provider,
+                                )
                             }
                         }
                         Err(e) => return Err(e),
                     }
                 } else if want_trace {
-                    let (cropped, trace) =
-                        crate::crop::crop_to_aspect_traced(img, tw, th, *align, ctx.face_provider);
+                    let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                        img,
+                        tw,
+                        th,
+                        *align,
+                        ctx.face_provider,
+                        ctx.focal_provider,
+                    );
                     if let Some(trace) = trace {
                         debug_capture = Some(capture_from_trace(
                             canvas.expect("want_trace clones the canvas"),
@@ -1385,7 +1452,14 @@ fn apply_operations(
                     }
                     cropped
                 } else {
-                    crate::crop::crop_to_aspect_with(img, tw, th, *align, ctx.face_provider)
+                    crate::crop::crop_to_aspect_with(
+                        img,
+                        tw,
+                        th,
+                        *align,
+                        ctx.face_provider,
+                        ctx.focal_provider,
+                    )
                 };
                 img = apply_size(
                     img,
@@ -1453,13 +1527,21 @@ fn apply_operations(
                             // detection failure fails the
                             // request rather than serve the
                             // image unredacted.
-                            let detections = detect_objects(&mut detection_memo, &img, ctx)?;
-                            let boxes = detections_of_class(&detections, class);
+                            let boxes = detect_for_class(
+                                &mut detection_memos,
+                                &detect_providers,
+                                &img,
+                                class,
+                            )?;
                             img = crate::filters::blur_detections(&img, &boxes);
                         }
                         Filter::PixelateClass(class) => {
-                            let detections = detect_objects(&mut detection_memo, &img, ctx)?;
-                            let boxes = detections_of_class(&detections, class);
+                            let boxes = detect_for_class(
+                                &mut detection_memos,
+                                &detect_providers,
+                                &img,
+                                class,
+                            )?;
                             img = crate::filters::pixelate_detections(&img, &boxes);
                         }
                         // Padding is read from the request as a
@@ -1519,7 +1601,8 @@ fn apply_operations(
         let capture = match debug_capture {
             Some(capture) => capture,
             None => {
-                let (point, faces) = crate::focus::focal_point_traced(&img, ctx.face_provider);
+                let (point, faces) =
+                    crate::focus::focal_point_chained(&img, ctx.face_provider, ctx.focal_provider);
                 let (w, h) = (img.width(), img.height());
                 crate::debugview::FocalCapture {
                     canvas: img.clone(),
@@ -5287,6 +5370,287 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A declared detector (issue #166) whose vocabulary is
+    /// its own: zebra, over the car box of the class scene.
+    #[derive(Debug)]
+    struct DeclaredObjects;
+
+    impl crate::ai::DetectionProvider for DeclaredObjects {
+        fn knows_class(&self, name: &str) -> bool {
+            name.eq_ignore_ascii_case("zebra")
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["zebra".to_string()]
+        }
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
+            Ok(vec![crate::ai::Detection {
+                label: "zebra".to_string(),
+                score: 0.7,
+                x: 120,
+                y: 10,
+                w: 60,
+                h: 80,
+            }])
+        }
+    }
+
+    /// A declared detector that knows person (shared with
+    /// the built-in) and zebra (its own), counting its runs:
+    /// the resolution-order witness.
+    #[derive(Debug, Default)]
+    struct CountingDeclared {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::ai::DetectionProvider for CountingDeclared {
+        fn knows_class(&self, name: &str) -> bool {
+            ["person", "zebra"]
+                .iter()
+                .any(|c| name.eq_ignore_ascii_case(c))
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["person".to_string(), "zebra".to_string()]
+        }
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                crate::ai::Detection {
+                    label: "person".to_string(),
+                    score: 0.9,
+                    x: 10,
+                    y: 10,
+                    w: 60,
+                    h: 80,
+                },
+                crate::ai::Detection {
+                    label: "zebra".to_string(),
+                    score: 0.7,
+                    x: 120,
+                    y: 10,
+                    w: 60,
+                    h: 80,
+                },
+            ])
+        }
+    }
+
+    fn declared_ctx<'a>(
+        builtin: Option<&'a dyn crate::ai::DetectionProvider>,
+        declared: &'a [&'a dyn crate::ai::DetectionProvider],
+    ) -> ProcessContext<'a> {
+        ProcessContext {
+            detect_provider: builtin,
+            declared_detect_providers: declared,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn declared_detector_drives_redaction_for_its_own_class() {
+        let engine = Engine;
+        let declared: [&dyn crate::ai::DetectionProvider; 1] = [&DeclaredObjects];
+        let out = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::PixelateClass(
+                    "zebra".to_string(),
+                )])],
+                declared_ctx(Some(&KnownObjects), &declared),
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // The zebra box (the declared provider's) is
+        // pixelated: neighbors inside it agree.
+        assert_eq!(result.get_pixel(121, 11), result.get_pixel(122, 11));
+        // The person box is untouched: only the declared
+        // provider ran, and it returns no person boxes.
+        assert_ne!(result.get_pixel(11, 11), result.get_pixel(12, 11));
+    }
+
+    #[test]
+    fn class_resolution_prefers_the_builtin_detector() {
+        let engine = Engine;
+        let builtin = CountingObjects::default();
+        let declared_counter = CountingDeclared::default();
+        let declared: [&dyn crate::ai::DetectionProvider; 1] = [&declared_counter];
+        engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::BlurClass(
+                    "person".to_string(),
+                )])],
+                declared_ctx(Some(&builtin), &declared),
+            )
+            .unwrap();
+        // Both providers know "person": the built-in runs,
+        // the declared one never does.
+        assert_eq!(builtin.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            declared_counter
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn declared_detectors_resolve_in_order_and_share_one_run_each() {
+        let engine = Engine;
+        let counting = CountingDeclared::default();
+        let declared: [&dyn crate::ai::DetectionProvider; 2] = [&DeclaredObjects, &counting];
+        // Zebra resolves to the first declared provider
+        // (DeclaredObjects); person only exists on the
+        // second. Each runs at most once for the request.
+        engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![
+                    Filter::PixelateClass("zebra".to_string()),
+                    Filter::BlurClass("person".to_string()),
+                    Filter::PixelateClass("person".to_string()),
+                ])],
+                declared_ctx(None, &declared),
+            )
+            .unwrap();
+        assert_eq!(counting.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A class no provider knows is still a clean
+        // refusal with declared providers configured.
+        let err = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::BlurClass(
+                    "giraffe".to_string(),
+                )])],
+                declared_ctx(None, &declared),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    /// A declared focal provider pinned to the right edge
+    /// (issue #166).
+    #[derive(Debug)]
+    struct RightFocal;
+
+    impl crate::ai::FocalProvider for RightFocal {
+        fn focal_point(&self, _img: &DynamicImage) -> Result<(f32, f32), crate::ai::AiError> {
+            Ok((0.95, 0.5))
+        }
+    }
+
+    /// Left half red, right half blue: the scene the face
+    /// smart-crop test uses, reused for focal precedence.
+    fn halves_scene() -> Vec<u8> {
+        let mut img = image::RgbImage::new(100, 100);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            *p = if x < 50 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        png_bytes(&DynamicImage::ImageRgb8(img))
+    }
+
+    fn smart_half_crop() -> Operation {
+        Operation::Crop {
+            size: ImageSize {
+                width: Dimension::Pixels(50),
+                height: Dimension::Pixels(100),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            align: Align::Smart,
+        }
+    }
+
+    #[test]
+    fn declared_focal_point_steers_a_smart_crop() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &halves_scene(),
+                &[smart_half_crop()],
+                ProcessContext {
+                    focal_provider: Some(&RightFocal),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // The declared point at x 0.95 takes the right
+        // (blue) half wholesale.
+        assert_eq!(result.get_pixel(25, 50), &image::Rgb([0, 0, 255]));
+    }
+
+    /// A face provider reporting a face over the left half:
+    /// the mirror of RightFace, for precedence against the
+    /// declared focal point at the right.
+    #[derive(Debug)]
+    struct LeftFace;
+
+    impl crate::ai::FaceProvider for LeftFace {
+        fn detect(
+            &self,
+            img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
+            Ok(vec![crate::ai::FaceBox {
+                x: 0,
+                y: 0,
+                w: img.width() / 2,
+                h: img.height(),
+                score: 0.95,
+            }])
+        }
+    }
+
+    #[test]
+    fn face_provider_beats_the_declared_focal_point() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &halves_scene(),
+                &[smart_half_crop()],
+                ProcessContext {
+                    face_provider: Some(&LeftFace),
+                    focal_provider: Some(&RightFocal),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(result.get_pixel(25, 50), &image::Rgb([255, 0, 0]));
+    }
+
+    #[test]
+    fn caller_focal_rect_beats_the_declared_focal_point() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        // The focal rectangle names the black bottom-right;
+        // the declared provider would pull a smart crop to
+        // the pattern's own saliency (which keeps some
+        // white, as the control in
+        // focal_smart_crop_keeps_the_named_region shows).
+        let out = engine
+            .process_preferred(
+                &src,
+                &[focal_op(4, 2, 8, 4), square_crop(Align::Smart)],
+                ProcessContext {
+                    focal_provider: Some(&RightFocal),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().all(|p| p[0] == 0));
     }
 
     #[test]

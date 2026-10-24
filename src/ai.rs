@@ -1202,7 +1202,11 @@ impl TagProvider for OnnxClipProvider {
 
 /// Read the label file: one label per line, blank lines
 /// and `#` comments skipped. No labels is an error.
-fn read_labels(path: &str) -> Result<Vec<String>, AiError> {
+/// Public for the declared-detector builder (issue #166),
+/// which resolves a declaration's labels path to a
+/// vocabulary before loading, so declared labels win over
+/// model metadata exactly like inline ones.
+pub fn read_labels(path: &str) -> Result<Vec<String>, AiError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| AiError::Load(format!("cannot read the label file {path}: {e}")))?;
     let labels: Vec<String> = raw
@@ -1730,17 +1734,38 @@ impl OnnxDetectionProvider {
         labels_path: Option<&str>,
         threshold: f32,
     ) -> Result<Self, AiError> {
+        Self::load_with_classes(dylib, model_path, None, labels_path, threshold)
+    }
+
+    /// Load a detection model with an optional class
+    /// vocabulary declared by the operator (issue #166, the
+    /// `boxes` contract). Declared classes win over the
+    /// model's own `names` metadata when both exist: the
+    /// declaration is the operator's statement of what the
+    /// boxes mean. With no declared classes the vocabulary
+    /// resolves exactly as [`Self::load`] documents.
+    pub fn load_with_classes(
+        dylib: Option<&str>,
+        model_path: &str,
+        declared_classes: Option<Vec<String>>,
+        labels_path: Option<&str>,
+        threshold: f32,
+    ) -> Result<Self, AiError> {
         let (session, input_name) = build_session(dylib, model_path)?;
-        let classes = match classes_from_metadata(&session) {
+        let classes = match declared_classes {
             Some(classes) => classes,
-            None => match labels_path {
-                Some(path) => read_labels(path)
-                    .map_err(|e| AiError::Load(format!("cannot read the detection labels: {e}")))?,
-                None => {
-                    return Err(AiError::Load(format!(
-                        "the model {model_path} carries no class names metadata and no CRABCROP_DETECT_LABELS file was configured"
-                    )));
-                }
+            None => match classes_from_metadata(&session) {
+                Some(classes) => classes,
+                None => match labels_path {
+                    Some(path) => read_labels(path).map_err(|e| {
+                        AiError::Load(format!("cannot read the detection labels: {e}"))
+                    })?,
+                    None => {
+                        return Err(AiError::Load(format!(
+                            "the model {model_path} carries no class names metadata and no CRABCROP_DETECT_LABELS file was configured"
+                        )));
+                    }
+                },
             },
         };
         let provider = Self {
@@ -1977,6 +2002,191 @@ fn detection_iou(a: &Detection, b: &Detection) -> f32 {
     let inter = ((x2 - x1) * (y2 - y1)) as f32;
     let union = (a.w * a.h + b.w * b.h) as f32 - inter;
     if union <= 0.0 { 0.0 } else { inter / union }
+}
+
+/// Supplies a focal point for smart crops, in the shape of
+/// the other providers: implemented by the ONNX provider in
+/// production and by fakes in tests. The point is a pair of
+/// fractions of the image width and height, each in
+/// 0.0..=1.0: the shape `crate::focus::FocalPoint` carries
+/// through the cropper, without this module depending on it.
+pub trait FocalProvider: Send + Sync + std::fmt::Debug {
+    fn focal_point(&self, img: &DynamicImage) -> Result<(f32, f32), AiError>;
+}
+
+/// Focal point backed by a declared heatmap model (issue
+/// #166, the `focal` contract). The model declares one
+/// fixed `[1, C, H, W]` float input, C 1 or 3, and produces
+/// exactly one output: a heatmap in `[H, W]`, `[1, H, W]`,
+/// or `[1, 1, H, W]` layout. The image is resampled to the
+/// model's own input size (RGB planes for a 3-channel
+/// input, luma for 1-channel, values at 0..1); the point
+/// is the heatmap's argmax cell center. Both the input
+/// shape and the output contract are probed at load, so a
+/// model that does not fit refuses at boot.
+pub struct OnnxFocalProvider {
+    session: Mutex<Session>,
+    input_name: String,
+    channels: usize,
+    input_w: u32,
+    input_h: u32,
+}
+
+impl OnnxFocalProvider {
+    /// Load a focal model against the runtime at `dylib`
+    /// (or the runtime's own search when `None`).
+    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, AiError> {
+        let (session, input_name) = build_session(dylib, model_path)?;
+        let (channels, input_w, input_h) = focal_input_shape(&session, model_path)?;
+        let provider = Self {
+            session: Mutex::new(session),
+            input_name,
+            channels,
+            input_w,
+            input_h,
+        };
+        // Probe the output contract with a blank image, like
+        // the detection probe: a wrong-shape output fails
+        // here, not on the first smart-crop request.
+        let probe = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        provider.run_heatmap(&probe).map_err(|e| {
+            AiError::Load(format!(
+                "the focal model {model_path} does not produce a heatmap output: {e}"
+            ))
+        })?;
+        Ok(provider)
+    }
+
+    /// Run the model and return the heatmap's dims and
+    /// values, the output contract validated.
+    fn run_heatmap(&self, img: &DynamicImage) -> Result<(Vec<i64>, Vec<f32>), AiError> {
+        let resized = img.resize_exact(self.input_w, self.input_h, FilterType::Triangle);
+        let plane = (self.input_w * self.input_h) as usize;
+        let mut input = vec![0f32; self.channels * plane];
+        if self.channels == 3 {
+            let rgb = resized.to_rgb8();
+            for (i, px) in rgb.pixels().enumerate() {
+                for c in 0..3 {
+                    input[c * plane + i] = px[c] as f32 / 255.0;
+                }
+            }
+        } else {
+            let gray = resized.to_luma8();
+            for (i, px) in gray.pixels().enumerate() {
+                input[i] = px[0] as f32 / 255.0;
+            }
+        }
+        let tensor = ort::value::Tensor::from_array((
+            [
+                1usize,
+                self.channels,
+                self.input_h as usize,
+                self.input_w as usize,
+            ],
+            input.into_boxed_slice(),
+        ))
+        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+        let outputs = session
+            .run(ort::inputs![self.input_name.as_str() => tensor])
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+        let outputs = collect_outputs(outputs)?;
+        if outputs.len() != 1 {
+            return Err(AiError::BadOutput(format!(
+                "the focal model produced {} outputs; the contract takes exactly one heatmap",
+                outputs.len()
+            )));
+        }
+        let (_, dims, data) = outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
+        heatmap_dims(&dims, data.len())?;
+        Ok((dims, data))
+    }
+}
+
+impl std::fmt::Debug for OnnxFocalProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxFocalProvider")
+            .field("input_name", &self.input_name)
+            .field("input", &(self.channels, self.input_w, self.input_h))
+            .finish_non_exhaustive()
+    }
+}
+
+impl FocalProvider for OnnxFocalProvider {
+    fn focal_point(&self, img: &DynamicImage) -> Result<(f32, f32), AiError> {
+        let (dims, data) = self.run_heatmap(img)?;
+        heatmap_argmax(&dims, &data)
+    }
+}
+
+/// The focal model's declared input contract: a fixed
+/// `[1, C, H, W]` tensor shape with C 1 (luma) or 3 (RGB).
+/// A dynamic dimension anywhere, another rank, or another
+/// channel count is a load error naming the actual shape.
+fn focal_input_shape(session: &Session, model_path: &str) -> Result<(usize, u32, u32), AiError> {
+    let input = session
+        .inputs()
+        .first()
+        .ok_or_else(|| AiError::Load(format!("the focal model {model_path} has no inputs")))?;
+    let dims: Vec<i64> = match input.dtype() {
+        ort::value::ValueType::Tensor { shape, .. } => shape.iter().copied().collect(),
+        _ => {
+            return Err(AiError::Load(format!(
+                "the focal model {model_path} input is not a tensor"
+            )));
+        }
+    };
+    match dims.as_slice() {
+        [1, c, h, w] if (*c == 1 || *c == 3) && *h > 0 && *w > 0 => {
+            Ok((*c as usize, *w as u32, *h as u32))
+        }
+        _ => Err(AiError::Load(format!(
+            "the focal model {model_path} must declare a fixed [1, 1 or 3, H, W] input, got {dims:?}"
+        ))),
+    }
+}
+
+/// The heatmap behind an output: `[H, W]`, `[1, H, W]`, or
+/// `[1, 1, H, W]`, with exactly H * W values. Returns the
+/// grid size.
+fn heatmap_dims(dims: &[i64], values: usize) -> Result<(usize, usize), AiError> {
+    let (h, w) = match dims {
+        [h, w] => (*h, *w),
+        [1, h, w] => (*h, *w),
+        [1, 1, h, w] => (*h, *w),
+        _ => {
+            return Err(AiError::BadOutput(format!(
+                "expected a heatmap output ([H, W], [1, H, W], or [1, 1, H, W]), got dims {dims:?}"
+            )));
+        }
+    };
+    if h <= 0 || w <= 0 || h as usize * w as usize != values {
+        return Err(AiError::BadOutput(format!(
+            "heatmap dims {dims:?} do not match the {values} output values"
+        )));
+    }
+    Ok((h as usize, w as usize))
+}
+
+/// The focal point of a heatmap: the argmax cell's center,
+/// as fractions of the width and height. Ties resolve to
+/// the first maximum in row-major order (a strict-greater
+/// scan), so repeated runs always agree.
+fn heatmap_argmax(dims: &[i64], data: &[f32]) -> Result<(f32, f32), AiError> {
+    let (h, w) = heatmap_dims(dims, data.len())?;
+    let mut best = 0usize;
+    for (i, v) in data.iter().enumerate() {
+        if *v > data[best] {
+            best = i;
+        }
+    }
+    Ok((
+        (best % w) as f32 / w as f32 + 0.5 / w as f32,
+        (best / w) as f32 / h as f32 + 0.5 / h as f32,
+    ))
 }
 
 #[cfg(test)]
@@ -2355,5 +2565,294 @@ mod detect_tests {
             0.5,
         ));
         assert!(message.contains("not a YOLOv8-family export"), "{message}");
+    }
+
+    /// Eighty class names in model order with index 0
+    /// renamed: enough for the real YOLO export's probe,
+    /// and proof of which vocabulary won.
+    fn renamed_vocabulary() -> Vec<String> {
+        (0..80)
+            .map(|i| {
+                if i == 0 {
+                    "human".to_string()
+                } else {
+                    format!("class{i}")
+                }
+            })
+            .collect()
+    }
+
+    /// Declared classes win over the model's own `names`
+    /// metadata (issue #166): the same YOLO export, loaded
+    /// with a declaration vocabulary, reports and returns
+    /// the declaration's names.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_DETECT_MODEL=...
+    /// CRABCROP_TEST_IMAGE=...
+    /// cargo test -- --ignored declared_classes_win
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn declared_classes_win_over_model_metadata() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let provider = OnnxDetectionProvider::load_with_classes(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_DETECT_MODEL"),
+            Some(renamed_vocabulary()),
+            None,
+            0.35,
+        )
+        .unwrap();
+        assert_eq!(provider.describe()[0], "human");
+        assert!(provider.knows_class("human"));
+        assert!(!provider.knows_class("person"));
+        let img = image::open(var("CRABCROP_TEST_IMAGE")).unwrap();
+        let found = provider.detect(&img).unwrap();
+        assert!(
+            found.iter().any(|d| d.label == "human"),
+            "no human in {found:?}"
+        );
+        assert!(
+            found.iter().all(|d| d.label != "person"),
+            "metadata vocabulary leaked into {found:?}"
+        );
+    }
+
+    /// A declared detector whose model file is missing
+    /// fails as AiError::Load.
+    /// CRABCROP_TEST_ORT_DYLIB=...
+    /// cargo test -- --ignored declared_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn declared_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let message = expect_load(OnnxDetectionProvider::load_with_classes(
+            Some(&dylib),
+            &missing_path("declared"),
+            Some(renamed_vocabulary()),
+            None,
+            0.5,
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A garbage declared model file fails the same way.
+    /// CRABCROP_TEST_ORT_DYLIB=...
+    /// cargo test -- --ignored declared_load_garbage
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn declared_load_garbage_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let garbage = temp_file("declared-garbage", b"this is not an onnx model at all");
+        let message = expect_load(OnnxDetectionProvider::load_with_classes(
+            Some(&dylib),
+            &garbage,
+            Some(renamed_vocabulary()),
+            None,
+            0.5,
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// Declared classes do not save a non-YOLO model: the
+    /// probe still refuses it as Load.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_REMOVEBG_MODEL=...
+    /// cargo test -- --ignored declared_load_non_yolo
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn declared_load_non_yolo_model_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_REMOVEBG_MODEL").unwrap();
+        let message = expect_load(OnnxDetectionProvider::load_with_classes(
+            Some(&dylib),
+            &model,
+            Some(vec!["a".to_string(), "b".to_string()]),
+            None,
+            0.5,
+        ));
+        assert!(message.contains("not a YOLOv8-family export"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod focal_tests {
+    use super::*;
+
+    fn grid(h: usize, w: usize, max_at: usize) -> Vec<f32> {
+        let mut data = vec![0f32; h * w];
+        data[max_at] = 9.0;
+        data
+    }
+
+    #[test]
+    fn heatmap_argmax_reads_every_accepted_layout() {
+        // 4 rows x 5 cols, max at row 2, col 3: the cell
+        // center is (3.5/5, 2.5/4).
+        let data = grid(4, 5, 2 * 5 + 3);
+        for dims in [&[4, 5][..], &[1, 4, 5][..], &[1, 1, 4, 5][..]] {
+            let (x, y) = heatmap_argmax(dims, &data).unwrap();
+            assert!((x - 0.7).abs() < 1e-6, "x {x} for {dims:?}");
+            assert!((y - 0.625).abs() < 1e-6, "y {y} for {dims:?}");
+        }
+    }
+
+    #[test]
+    fn heatmap_argmax_takes_the_first_maximum_in_row_major_order() {
+        let mut data = grid(3, 3, 8);
+        data[2] = 9.0; // an equal maximum, earlier in row-major order
+        let (x, y) = heatmap_argmax(&[3, 3], &data).unwrap();
+        assert!((x - 2.5 / 3.0).abs() < 1e-6, "x {x}");
+        assert!((y - 0.5 / 3.0).abs() < 1e-6, "y {y}");
+    }
+
+    #[test]
+    fn heatmap_argmax_of_a_single_cell_is_the_center() {
+        let (x, y) = heatmap_argmax(&[1, 1], &[0.25]).unwrap();
+        assert_eq!((x, y), (0.5, 0.5));
+    }
+
+    #[test]
+    fn heatmap_argmax_rejects_shapes_outside_the_contract() {
+        let cases: Vec<(Vec<i64>, usize)> = vec![
+            (vec![9], 9),             // a vector, not a grid
+            (vec![2, 3, 3], 18),      // a batch of two grids
+            (vec![1, 2, 3, 3], 18),   // two channels
+            (vec![1, 1, 1, 3, 3], 9), // rank five
+            (vec![3, 3], 8),          // fewer values than cells
+            (vec![3, 3], 10),         // more values than cells
+            (vec![0, 3], 0),          // an empty grid
+        ];
+        for (dims, len) in cases {
+            let data = vec![0f32; len];
+            let err = heatmap_argmax(&dims, &data).unwrap_err();
+            assert!(matches!(err, AiError::BadOutput(_)), "{dims:?}: {err}");
+        }
+    }
+
+    /// Assert a focal load() result failed as AiError::Load
+    /// and return the message for wording checks.
+    fn expect_load(result: Result<OnnxFocalProvider, AiError>) -> String {
+        match result {
+            Err(AiError::Load(message)) => message,
+            Err(other) => panic!("expected a load error, got {other}"),
+            Ok(_) => panic!("expected a load error, but the load succeeded"),
+        }
+    }
+
+    /// Live check with the authored luma-heatmap model
+    /// (spikes/166-focal): the brightest block of the
+    /// fixture is the argmax. Ignored: needs the runtime
+    /// and the model: CRABCROP_TEST_ORT_DYLIB=...
+    /// CRABCROP_TEST_FOCAL_MODEL=...
+    /// cargo test -- --ignored focal_live
+    #[test]
+    #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
+    fn focal_live_point_tracks_the_brightest_block() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let provider = OnnxFocalProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_FOCAL_MODEL"),
+        )
+        .unwrap();
+        // 64x64 black with a white block at x 40..48,
+        // y 8..16; the model sees it at 32x32, so the
+        // block lands at x 20..24, y 4..8 and the first
+        // row-major maximum is its top-left cell.
+        let mut img = image::RgbImage::new(64, 64);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            if (40..48).contains(&x) && (8..16).contains(&y) {
+                *p = image::Rgb([255, 255, 255]);
+            }
+        }
+        let (x, y) = provider.focal_point(&DynamicImage::ImageRgb8(img)).unwrap();
+        assert!((0.60..0.70).contains(&x), "x {x}");
+        assert!((0.10..0.20).contains(&y), "y {y}");
+    }
+
+    /// A missing focal model file fails as AiError::Load.
+    /// CRABCROP_TEST_ORT_DYLIB=...
+    /// cargo test -- --ignored focal_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
+    fn focal_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let missing = std::env::temp_dir()
+            .join(format!(
+                "crabcrop-focal-missing-{}.onnx",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let message = expect_load(OnnxFocalProvider::load(Some(&dylib), &missing));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A garbage focal model file fails the same way.
+    /// CRABCROP_TEST_ORT_DYLIB=...
+    /// cargo test -- --ignored focal_load_garbage
+    #[test]
+    #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
+    fn focal_load_garbage_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let path =
+            std::env::temp_dir().join(format!("crabcrop-focal-garbage-{}.bin", std::process::id()));
+        std::fs::write(&path, b"this is not an onnx model at all").unwrap();
+        let message = expect_load(OnnxFocalProvider::load(
+            Some(&dylib),
+            &path.to_string_lossy(),
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A multi-output model (the face detector stands in)
+    /// fails the probe: the contract takes exactly one
+    /// heatmap.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_FACE_MODEL=...
+    /// cargo test -- --ignored focal_load_multi_output
+    #[test]
+    #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
+    fn focal_load_multi_output_model_is_a_load_error() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let message = expect_load(OnnxFocalProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_FACE_MODEL"),
+        ));
+        assert!(
+            message.contains("does not produce a heatmap output"),
+            "{message}"
+        );
+        assert!(message.contains("exactly one heatmap"), "{message}");
+    }
+
+    /// The segmentation model fails the same probe with
+    /// its seven outputs.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_REMOVEBG_MODEL=...
+    /// cargo test -- --ignored focal_load_seven_output
+    #[test]
+    #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
+    fn focal_load_seven_output_model_is_a_load_error() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let message = expect_load(OnnxFocalProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_REMOVEBG_MODEL"),
+        ));
+        assert!(message.contains("exactly one heatmap"), "{message}");
+    }
+
+    /// A model whose input shape is dynamic (the identity
+    /// fixture) never reaches the probe: the input contract
+    /// refuses it at load.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_IDENTITY_MODEL=...
+    /// cargo test -- --ignored focal_load_dynamic_input
+    #[test]
+    #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
+    fn focal_load_dynamic_input_model_is_a_load_error() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let message = expect_load(OnnxFocalProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_IDENTITY_MODEL"),
+        ));
+        assert!(
+            message.contains("must declare a fixed [1, 1 or 3, H, W] input"),
+            "{message}"
+        );
     }
 }
