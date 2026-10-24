@@ -112,6 +112,14 @@
 //!   `CRABCROP_DETECT_LABELS` (one class per line) covers
 //!   exports without it. `CRABCROP_DETECT_THRESHOLD` sets
 //!   the score floor (default 0.5).
+//! - `CRABCROP_DETECTORS_FILE`: path to a JSON file
+//!   declaring additional detectors against two built-in
+//!   contracts (issue #166): `boxes` (a YOLO-family model
+//!   joining class redaction and meta detections) and
+//!   `focal` (a heatmap model feeding smart crops). Every
+//!   declaration is loaded and probed at boot; a broken
+//!   one is a startup error naming it. Unset declares
+//!   none. See the README's AI section for the format.
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
 //! - `CRABCROP_VIDEO_ENCODER`: path to an external video
@@ -613,6 +621,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tagger: ai.tagger,
         tag_threshold: ai.tag_threshold,
         detect: ai.detect,
+        detectors: ai.detectors,
+        focal: ai.focal,
         font,
         fallback,
         store,
@@ -730,6 +740,8 @@ struct AiProviders {
     tagger: Option<Arc<dyn crate::ai::TagProvider>>,
     tag_threshold: f32,
     detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
+    detectors: Vec<server::NamedDetector>,
+    focal: Option<Arc<dyn crate::ai::FocalProvider>>,
 }
 
 /// Build every AI provider from the environment, read
@@ -763,6 +775,7 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         None => (None, 0.05),
     };
     let detect = build_detector(ort_dylib.as_deref(), &get)?;
+    let declared = build_declared_detectors(ort_dylib.as_deref(), &get)?;
     let face: Option<Arc<dyn crate::ai::FaceProvider>> = match get("CRABCROP_FACE_MODEL") {
         Some(path) if !path.is_empty() => {
             let provider = crate::ai::OnnxFaceProvider::load(ort_dylib.as_deref(), &path)
@@ -779,6 +792,8 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         tagger,
         tag_threshold,
         detect,
+        detectors: declared.boxes,
+        focal: declared.focal,
     })
 }
 
@@ -892,6 +907,270 @@ fn build_detector(
         crate::ai::DetectionProvider::describe(&provider).len()
     );
     Ok(Some(Arc::new(provider)))
+}
+
+/// The contract a declared detector binds to (issue #166).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectorKind {
+    /// A YOLO-family detector: joins class redaction and
+    /// meta detections through `DetectionProvider`.
+    Boxes,
+    /// A heatmap model: feeds smart crops through
+    /// `FocalProvider`.
+    Focal,
+}
+
+/// Where a `boxes` declaration's class vocabulary comes
+/// from when the declaration carries one.
+#[derive(Debug, Clone, PartialEq)]
+enum LabelsDecl {
+    /// A path to a labels file (one class per line), like
+    /// `CRABCROP_DETECT_LABELS`.
+    Path(String),
+    /// Class names written inline in the declaration.
+    Inline(Vec<String>),
+}
+
+/// One validated detector declaration from
+/// `CRABCROP_DETECTORS_FILE`.
+#[derive(Debug, Clone, PartialEq)]
+struct DetectorDeclaration {
+    name: String,
+    model: String,
+    kind: DetectorKind,
+    labels: Option<LabelsDecl>,
+    threshold: Option<f32>,
+}
+
+/// Parse the detectors file's text into declarations,
+/// strictly: this runs before any model is touched, so
+/// every refusal here is raisable (and testable) without
+/// the ONNX runtime. Unknown fields, kinds, and
+/// misapplied options are errors naming the declaration.
+fn parse_detector_declarations(text: &str) -> Result<Vec<DetectorDeclaration>, String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("CRABCROP_DETECTORS_FILE is not valid JSON: {e}"))?;
+    let entries = value.as_array().ok_or_else(|| {
+        "CRABCROP_DETECTORS_FILE must hold a JSON array of detector declarations".to_string()
+    })?;
+    let mut declarations: Vec<DetectorDeclaration> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let at = format!("detector declaration {}", i + 1);
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("{at} is not a JSON object"))?;
+        let name = match obj.get("name").and_then(serde_json::Value::as_str) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => return Err(format!("{at}: \"name\" must be a non-empty string")),
+        };
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!("invalid detector name: {name:?}"));
+        }
+        if declarations.iter().any(|d| d.name == name) {
+            return Err(format!("duplicate detector name: {name}"));
+        }
+        let named = format!("detector {name:?}");
+        for key in obj.keys() {
+            if !["name", "model", "kind", "labels", "threshold"].contains(&key.as_str()) {
+                return Err(format!("{named}: unknown field {key:?}"));
+            }
+        }
+        let model = match obj.get("model").and_then(serde_json::Value::as_str) {
+            Some(model) if !model.is_empty() => model.to_string(),
+            _ => {
+                return Err(format!(
+                    "{named}: \"model\" must be a non-empty path string"
+                ));
+            }
+        };
+        let kind = match obj.get("kind").and_then(serde_json::Value::as_str) {
+            Some("boxes") => DetectorKind::Boxes,
+            Some("focal") => DetectorKind::Focal,
+            Some(other) => {
+                return Err(format!(
+                    "{named}: unknown kind {other:?} (expected \"boxes\" or \"focal\")"
+                ));
+            }
+            None => {
+                return Err(format!("{named}: \"kind\" must be \"boxes\" or \"focal\""));
+            }
+        };
+        let labels = match obj.get("labels") {
+            None => None,
+            Some(_) if kind == DetectorKind::Focal => {
+                return Err(format!(
+                    "{named}: \"labels\" applies only to \"boxes\" detectors"
+                ));
+            }
+            Some(serde_json::Value::String(path)) if !path.is_empty() => {
+                Some(LabelsDecl::Path(path.clone()))
+            }
+            Some(serde_json::Value::Array(items)) => {
+                if items.is_empty() {
+                    return Err(format!("{named}: \"labels\" must name at least one class"));
+                }
+                let mut names = Vec::new();
+                for item in items {
+                    match item.as_str() {
+                        Some(class) if !class.trim().is_empty() => names.push(class.to_string()),
+                        _ => {
+                            return Err(format!(
+                                "{named}: \"labels\" entries must be non-empty strings"
+                            ));
+                        }
+                    }
+                }
+                Some(LabelsDecl::Inline(names))
+            }
+            Some(_) => {
+                return Err(format!(
+                    "{named}: \"labels\" must be a file path string or an array of class names"
+                ));
+            }
+        };
+        let threshold = match obj.get("threshold") {
+            None => None,
+            Some(_) if kind == DetectorKind::Focal => {
+                return Err(format!(
+                    "{named}: \"threshold\" applies only to \"boxes\" detectors"
+                ));
+            }
+            Some(value) => match value.as_f64() {
+                Some(v) if (0.0..=1.0).contains(&v) => Some(v as f32),
+                Some(v) => {
+                    return Err(format!(
+                        "{named}: \"threshold\" must be within 0..=1, got {v}"
+                    ));
+                }
+                None => {
+                    return Err(format!("{named}: \"threshold\" must be a number"));
+                }
+            },
+        };
+        declarations.push(DetectorDeclaration {
+            name,
+            model,
+            kind,
+            labels,
+            threshold,
+        });
+    }
+    Ok(declarations)
+}
+
+/// The declared detectors, built: every `boxes` provider
+/// in declaration order, and the one active focal
+/// provider (the first `focal` declaration).
+struct DeclaredDetectors {
+    boxes: Vec<server::NamedDetector>,
+    focal: Option<Arc<dyn crate::ai::FocalProvider>>,
+}
+
+/// Build the declared detectors from
+/// `CRABCROP_DETECTORS_FILE`, when set (issue #166). The
+/// file only names models and options: each declaration
+/// is loaded and probed against its built-in contract
+/// here, exactly like the configured models, and any
+/// failure is a startup error naming the declaration.
+/// Additional `focal` declarations are loaded and probed
+/// the same way, then stand by: only the first feeds
+/// smart crops.
+fn build_declared_detectors(
+    ort_dylib: Option<&str>,
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<DeclaredDetectors, String> {
+    let path = match get("CRABCROP_DETECTORS_FILE") {
+        Some(path) if !path.is_empty() => path,
+        _ => {
+            return Ok(DeclaredDetectors {
+                boxes: Vec::new(),
+                focal: None,
+            });
+        }
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read CRABCROP_DETECTORS_FILE ({path}): {e}"))?;
+    let declarations = parse_detector_declarations(&text)?;
+    let mut boxes = Vec::new();
+    let mut focal: Option<Arc<dyn crate::ai::FocalProvider>> = None;
+    let mut active_focal: Option<String> = None;
+    for decl in &declarations {
+        match decl.kind {
+            DetectorKind::Boxes => {
+                // Declared labels win over the model's own
+                // vocabulary (issue #166), in both forms: a
+                // labels path resolves to its class list
+                // here, before the load, rather than taking
+                // the fallback slot `CRABCROP_DETECT_LABELS`
+                // uses for the built-in detector.
+                let declared_classes = match &decl.labels {
+                    Some(LabelsDecl::Inline(names)) => Some(names.clone()),
+                    Some(LabelsDecl::Path(path)) => {
+                        Some(crate::ai::read_labels(path).map_err(|e| {
+                            format!(
+                                "cannot load declared detector {:?} (boxes) from {}: {e}",
+                                decl.name, decl.model
+                            )
+                        })?)
+                    }
+                    None => None,
+                };
+                let threshold = decl.threshold.unwrap_or(0.5);
+                let provider = crate::ai::OnnxDetectionProvider::load_with_classes(
+                    ort_dylib,
+                    &decl.model,
+                    declared_classes,
+                    None,
+                    threshold,
+                )
+                .map_err(|e| {
+                    format!(
+                        "cannot load declared detector {:?} (boxes) from {}: {e}",
+                        decl.name, decl.model
+                    )
+                })?;
+                println!(
+                    "declared detector {} (boxes) loaded from {} ({} classes, threshold {})",
+                    decl.name,
+                    decl.model,
+                    crate::ai::DetectionProvider::describe(&provider).len(),
+                    threshold
+                );
+                boxes.push(server::NamedDetector {
+                    name: decl.name.clone(),
+                    provider: Arc::new(provider),
+                });
+            }
+            DetectorKind::Focal => {
+                let provider =
+                    crate::ai::OnnxFocalProvider::load(ort_dylib, &decl.model).map_err(|e| {
+                        format!(
+                            "cannot load declared detector {:?} (focal) from {}: {e}",
+                            decl.name, decl.model
+                        )
+                    })?;
+                if focal.is_none() {
+                    println!(
+                        "declared detector {} (focal) loaded from {}",
+                        decl.name, decl.model
+                    );
+                    focal = Some(Arc::new(provider));
+                    active_focal = Some(decl.name.clone());
+                } else {
+                    println!(
+                        "declared detector {} (focal) loaded from {} (standby: {} is the active focal provider)",
+                        decl.name,
+                        decl.model,
+                        active_focal.as_deref().unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
+    Ok(DeclaredDetectors { boxes, focal })
 }
 
 /// Build the CLIP tag provider from the environment, when
@@ -1373,6 +1652,8 @@ mod tests {
         assert!(ai.face.is_none());
         assert!(ai.tagger.is_none());
         assert!(ai.detect.is_none());
+        assert!(ai.detectors.is_empty());
+        assert!(ai.focal.is_none());
         // The default tag threshold still reaches the state.
         assert_eq!(ai.tag_threshold, 0.05);
     }
@@ -1503,6 +1784,263 @@ mod tests {
         assert!(ai.face.is_some());
         assert!(ai.tagger.is_some());
         assert!(ai.detect.is_some());
+    }
+
+    #[test]
+    fn parses_detector_declarations() {
+        let decls = parse_detector_declarations(
+            r#"[
+              {"name": "crates", "model": "/models/crates.onnx", "kind": "boxes",
+               "labels": "/models/crates.txt", "threshold": 0.4},
+              {"name": "logos", "model": "/models/logos.onnx", "kind": "boxes",
+               "labels": ["nike", "adidas"]},
+              {"name": "saliency", "model": "/models/saliency.onnx", "kind": "focal"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(decls.len(), 3);
+        assert_eq!(decls[0].kind, DetectorKind::Boxes);
+        assert_eq!(
+            decls[0].labels,
+            Some(LabelsDecl::Path("/models/crates.txt".to_string()))
+        );
+        assert_eq!(decls[0].threshold, Some(0.4));
+        assert_eq!(
+            decls[1].labels,
+            Some(LabelsDecl::Inline(vec![
+                "nike".to_string(),
+                "adidas".to_string()
+            ]))
+        );
+        assert_eq!(decls[1].threshold, None);
+        assert_eq!(decls[2].kind, DetectorKind::Focal);
+        assert_eq!(decls[2].labels, None);
+        // An empty file declares nothing, validly.
+        assert!(parse_detector_declarations("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn detector_declaration_refusals_name_the_declaration() {
+        // Every refusal class that precedes model contact,
+        // each pinned by its wording (issue #166).
+        let cases: &[(&str, &str)] = &[
+            ("not json", "not valid JSON"),
+            ("{}", "must hold a JSON array"),
+            (r#"["crates"]"#, "is not a JSON object"),
+            (
+                r#"[{"model": "/m.onnx", "kind": "boxes"}]"#,
+                "\"name\" must be a non-empty string",
+            ),
+            (
+                r#"[{"name": "bad name!", "model": "/m.onnx", "kind": "boxes"}]"#,
+                "invalid detector name",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "boxes"},
+                    {"name": "a", "model": "/n.onnx", "kind": "focal"}]"#,
+                "duplicate detector name: a",
+            ),
+            (
+                r#"[{"name": "a", "kind": "boxes"}]"#,
+                "\"model\" must be a non-empty path string",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx"}]"#,
+                "\"kind\" must be \"boxes\" or \"focal\"",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "heatmap"}]"#,
+                "unknown kind \"heatmap\"",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "boxes", "extra": 1}]"#,
+                "unknown field \"extra\"",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "focal", "labels": "/l.txt"}]"#,
+                "\"labels\" applies only to \"boxes\" detectors",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "focal", "threshold": 0.4}]"#,
+                "\"threshold\" applies only to \"boxes\" detectors",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "boxes", "labels": 42}]"#,
+                "\"labels\" must be a file path string or an array of class names",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "boxes", "labels": []}]"#,
+                "\"labels\" must name at least one class",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "boxes", "labels": ["ok", " "]}]"#,
+                "\"labels\" entries must be non-empty strings",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "boxes", "threshold": "high"}]"#,
+                "\"threshold\" must be a number",
+            ),
+            (
+                r#"[{"name": "a", "model": "/m.onnx", "kind": "boxes", "threshold": 1.5}]"#,
+                "\"threshold\" must be within 0..=1",
+            ),
+        ];
+        for (text, wording) in cases {
+            let err = expect_err(parse_detector_declarations(text));
+            assert!(err.contains(wording), "{text}: {err}");
+        }
+        // The unknown-kind refusal names the declaration.
+        let err = expect_err(parse_detector_declarations(
+            r#"[{"name": "crates", "model": "/m.onnx", "kind": "heatmap"}]"#,
+        ));
+        assert!(err.contains("\"crates\""), "{err}");
+    }
+
+    #[test]
+    fn declared_detectors_refuse_files_that_fail_before_any_load() {
+        // These refusals precede model contact, so they run
+        // in the plain gate through full construction.
+        let missing = missing_path("detectors");
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_DETECTORS_FILE",
+            missing.as_str(),
+        )])));
+        assert!(err.contains("cannot read CRABCROP_DETECTORS_FILE"), "{err}");
+        let bad_kind = temp_file(
+            "detectors-kind",
+            br#"[{"name": "crates", "model": "/m.onnx", "kind": "heatmap"}]"#,
+        );
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_DETECTORS_FILE",
+            bad_kind.as_str(),
+        )])));
+        assert!(err.contains("unknown kind \"heatmap\""), "{err}");
+        assert!(err.contains("\"crates\""), "{err}");
+        let dup = temp_file(
+            "detectors-dup",
+            br#"[{"name": "a", "model": "/m.onnx", "kind": "boxes"},
+                 {"name": "a", "model": "/n.onnx", "kind": "focal"}]"#,
+        );
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_DETECTORS_FILE",
+            dup.as_str(),
+        )])));
+        assert!(err.contains("duplicate detector name: a"), "{err}");
+    }
+
+    /// Declared detectors with real models (issue #166):
+    /// a boxes declaration with inline classes whose count
+    /// matches the export, and two focal declarations (the
+    /// second stands by) build into the provider set.
+    /// Ignored like the other construction tests:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_DETECT_MODEL=...
+    /// CRABCROP_TEST_FOCAL_MODEL=...
+    /// cargo test -- --ignored declared_detectors_build_from
+    #[test]
+    #[ignore = "needs the ONNX runtime and model files (env-configured)"]
+    fn declared_detectors_build_from_a_file_with_real_models() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let dylib = var("CRABCROP_TEST_ORT_DYLIB");
+        let yolo = var("CRABCROP_TEST_DETECT_MODEL");
+        let focal_model = var("CRABCROP_TEST_FOCAL_MODEL");
+        // The declaration's vocabulary must match the
+        // export's class count (the load probe enforces
+        // it): 80 generated names.
+        let names: Vec<String> = (0..80).map(|i| format!("\"class{i}\"")).collect();
+        // The same vocabulary as a labels file, its first
+        // name renamed: labels in path form win over the
+        // model's metadata exactly like the inline form.
+        let labels_text: String = (0..80)
+            .map(|i| {
+                if i == 0 {
+                    "human\n".to_string()
+                } else {
+                    format!("class{i}\n")
+                }
+            })
+            .collect();
+        let labels_file = temp_file("detectors-labels", labels_text.as_bytes());
+        let text = format!(
+            r#"[
+              {{"name": "things", "model": "{yolo}", "kind": "boxes",
+                "labels": [{}], "threshold": 0.4}},
+              {{"name": "things-file", "model": "{yolo}", "kind": "boxes",
+                "labels": "{labels_file}"}},
+              {{"name": "saliency", "model": "{focal_model}", "kind": "focal"}},
+              {{"name": "saliency-2", "model": "{focal_model}", "kind": "focal"}}
+            ]"#,
+            names.join(",")
+        );
+        let file = temp_file("detectors-build", text.as_bytes());
+        let ai = build_ai_providers(env_of(&[
+            ("CRABCROP_ORT_DYLIB", dylib.as_str()),
+            ("CRABCROP_DETECTORS_FILE", file.as_str()),
+        ]))
+        .unwrap();
+        assert_eq!(ai.detectors.len(), 2);
+        assert_eq!(ai.detectors[0].name, "things");
+        assert_eq!(
+            crate::ai::DetectionProvider::describe(&*ai.detectors[0].provider).len(),
+            80
+        );
+        assert_eq!(ai.detectors[1].name, "things-file");
+        assert_eq!(
+            crate::ai::DetectionProvider::describe(&*ai.detectors[1].provider)[0],
+            "human"
+        );
+        assert!(ai.focal.is_some());
+    }
+
+    /// Each load-level refusal of a declared detector
+    /// surfaces at construction, naming the declaration
+    /// (issue #166). Ignored like the other load tests:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_DETECT_MODEL=...
+    /// CRABCROP_TEST_FACE_MODEL=... CRABCROP_TEST_REMOVEBG_MODEL=...
+    /// cargo test -- --ignored declared_detectors_refuse_unloadable
+    #[test]
+    #[ignore = "needs the ONNX runtime and model files (env-configured)"]
+    fn declared_detectors_refuse_unloadable_models_at_boot() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let dylib = var("CRABCROP_TEST_ORT_DYLIB");
+        let missing = missing_path("declared-model");
+        let build = |text: String| {
+            let file = temp_file("detectors-refuse", text.as_bytes());
+            expect_err(build_ai_providers(env_of(&[
+                ("CRABCROP_ORT_DYLIB", dylib.as_str()),
+                ("CRABCROP_DETECTORS_FILE", file.as_str()),
+            ])))
+        };
+        // A boxes declaration whose model file is missing.
+        let err = build(format!(
+            r#"[{{"name": "crates", "model": "{missing}", "kind": "boxes", "labels": ["crate"]}}]"#
+        ));
+        assert!(
+            err.contains("cannot load declared detector \"crates\" (boxes)"),
+            "{err}"
+        );
+        // A boxes declaration with no vocabulary anywhere:
+        // the model carries no names metadata and the
+        // declaration gives no labels.
+        let removebg = var("CRABCROP_TEST_REMOVEBG_MODEL");
+        let err = build(format!(
+            r#"[{{"name": "crates", "model": "{removebg}", "kind": "boxes"}}]"#
+        ));
+        assert!(
+            err.contains("cannot load declared detector \"crates\" (boxes)"),
+            "{err}"
+        );
+        assert!(err.contains("carries no class names metadata"), "{err}");
+        // A focal declaration on a multi-output model fails
+        // the heatmap probe.
+        let yunet = var("CRABCROP_TEST_FACE_MODEL");
+        let err = build(format!(
+            r#"[{{"name": "saliency", "model": "{yunet}", "kind": "focal"}}]"#
+        ));
+        assert!(
+            err.contains("cannot load declared detector \"saliency\" (focal)"),
+            "{err}"
+        );
+        assert!(err.contains("does not produce a heatmap output"), "{err}");
     }
 
     #[test]

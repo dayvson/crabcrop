@@ -25,6 +25,25 @@ use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
 use crate::url::{ImageFormat, parse_operations_with_expiry, parse_signature};
 
+/// One declared `boxes` detector (issue #166): the name
+/// its declaration carries in `CRABCROP_DETECTORS_FILE`
+/// and its provider. Kept in declaration order on the
+/// state: meta aggregation and class resolution both walk
+/// the built-in detector first, then these.
+#[derive(Clone)]
+pub struct NamedDetector {
+    pub name: String,
+    pub provider: Arc<dyn crate::ai::DetectionProvider>,
+}
+
+impl std::fmt::Debug for NamedDetector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamedDetector")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Shared state for the handlers.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -68,6 +87,18 @@ pub struct AppState {
     /// class redaction fails cleanly and meta carries no
     /// detections.
     pub detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
+    /// Declared `boxes` detectors from
+    /// `CRABCROP_DETECTORS_FILE` (issue #166), in
+    /// declaration order: class redaction resolves across
+    /// the built-in detector and these, and meta detections
+    /// aggregate all of them, each box attributed by name.
+    pub detectors: Vec<NamedDetector>,
+    /// Declared focal provider for smart crops (issue
+    /// #166): the first `focal` declaration in
+    /// `CRABCROP_DETECTORS_FILE`. Later focal declarations
+    /// are probed at boot and stand by. `None` means smart
+    /// crops fall back to faces, then saliency.
+    pub focal: Option<Arc<dyn crate::ai::FocalProvider>>,
     /// Text renderer, loaded at boot when `CRABCROP_FONT_PATH`
     /// is configured. `None` means `text(...)` requests fail
     /// cleanly.
@@ -469,6 +500,8 @@ struct ProcessJob {
     upscale_provider: Option<Arc<dyn crate::ai::UpscaleProvider>>,
     face_provider: Option<Arc<dyn crate::ai::FaceProvider>>,
     detect_provider: Option<Arc<dyn crate::ai::DetectionProvider>>,
+    declared_detect_providers: Vec<Arc<dyn crate::ai::DetectionProvider>>,
+    focal_provider: Option<Arc<dyn crate::ai::FocalProvider>>,
     text_renderer: Option<Arc<dyn crate::text::TextRenderer>>,
     video_encoder: Option<Arc<crate::video::VideoEncoder>>,
     dpr: Option<f32>,
@@ -528,6 +561,11 @@ async fn run_process(
     let engine = state.engine;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let declared_refs: Vec<&dyn crate::ai::DetectionProvider> = job
+            .declared_detect_providers
+            .iter()
+            .map(|p| p.as_ref())
+            .collect();
         let ctx = crate::engine::ProcessContext {
             preferred: job.preferred,
             watermarks: Some(&job.watermarks),
@@ -536,6 +574,8 @@ async fn run_process(
             upscale_provider: job.upscale_provider.as_deref(),
             face_provider: job.face_provider.as_deref(),
             detect_provider: job.detect_provider.as_deref(),
+            declared_detect_providers: &declared_refs,
+            focal_provider: job.focal_provider.as_deref(),
             video_encoder: job.video_encoder.as_deref(),
             save_data: job.save_data,
             preserve_metadata: job.preserve_metadata,
@@ -939,6 +979,8 @@ async fn serve(
         upscale_provider: state.upscale.clone(),
         face_provider: state.face.clone(),
         detect_provider: state.detect.clone(),
+        declared_detect_providers: state.detectors.iter().map(|d| d.provider.clone()).collect(),
+        focal_provider: state.focal.clone(),
         text_renderer: state.font.clone(),
         video_encoder: state.video_encoder.clone(),
         dpr: dpr_hint,
@@ -1304,39 +1346,59 @@ async fn annotate_meta(
     }
 }
 
-/// Run object detection for a meta response, when a
-/// detection provider is configured and the request asked
-/// (`detections=1`). Same failure stance as annotation:
-/// detection is a debugging surface here, so a failure
-/// omits the field rather than failing the response.
+/// Run object detection for a meta response, when at
+/// least one detection provider is configured and the
+/// request asked (`detections=1`). Detections aggregate
+/// every configured provider (issue #166): the built-in
+/// detector first (source name `builtin`), then the
+/// declared detectors in declaration order, each box
+/// carrying its provider's name. Same failure stance as
+/// annotation, per provider: one provider's failure omits
+/// only its own boxes, and the field appears when at
+/// least one configured provider answered.
 async fn detect_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
-) -> Option<Vec<crate::ai::Detection>> {
-    let detector = state.detect.as_ref()?;
+) -> Option<Vec<(String, crate::ai::Detection)>> {
+    let mut providers: Vec<(String, Arc<dyn crate::ai::DetectionProvider>)> = Vec::new();
+    if let Some(detector) = &state.detect {
+        providers.push(("builtin".to_string(), detector.clone()));
+    }
+    for declared in &state.detectors {
+        providers.push((declared.name.clone(), declared.provider.clone()));
+    }
+    if providers.is_empty() {
+        return None;
+    }
     let _permit = tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
         .await
         .ok()?
         .ok()?;
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
-    let detector = detector.clone();
-    match tokio::task::spawn_blocking(move || detector.detect(&img)).await {
-        Ok(Ok(detections)) => Some(detections),
-        Ok(Err(e)) => {
-            eprintln!("detection error: {e}");
-            None
-        }
-        Err(e) => {
-            eprintln!("detection task failed: {e}");
-            None
+    let mut aggregated: Vec<(String, crate::ai::Detection)> = Vec::new();
+    let mut any_answered = false;
+    for (name, provider) in providers {
+        let provider_img = img.clone();
+        match tokio::task::spawn_blocking(move || provider.detect(&provider_img)).await {
+            Ok(Ok(detections)) => {
+                any_answered = true;
+                aggregated.extend(detections.into_iter().map(|d| (name.clone(), d)));
+            }
+            Ok(Err(e)) => {
+                eprintln!("detection error from {name}: {e}");
+            }
+            Err(e) => {
+                eprintln!("detection task failed for {name}: {e}");
+            }
         }
     }
+    any_answered.then_some(aggregated)
 }
 
 fn meta_response(
     processed: &crate::engine::ProcessedImage,
     annotation: Option<&Annotation>,
-    detections: Option<&[crate::ai::Detection]>,
+    detections: Option<&[(String, crate::ai::Detection)]>,
 ) -> Response {
     let mut body = format!(
         "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}",
@@ -1366,17 +1428,22 @@ fn meta_response(
         ));
     }
     if let Some(detections) = detections {
+        // Each box keeps its original fields and gains a
+        // trailing `detector`: the provider that produced
+        // it (`builtin`, or a declared detector's name from
+        // `CRABCROP_DETECTORS_FILE`, issue #166).
         let boxes: Vec<String> = detections
             .iter()
-            .map(|d| {
+            .map(|(source, d)| {
                 format!(
-                    "{{\"label\":{},\"score\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                    "{{\"label\":{},\"score\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"detector\":{}}}",
                     serde_json::to_string(&d.label).unwrap_or_default(),
                     d.score,
                     d.x,
                     d.y,
                     d.w,
-                    d.h
+                    d.h,
+                    serde_json::to_string(source).unwrap_or_default()
                 )
             })
             .collect();
@@ -1667,6 +1734,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: None,
@@ -1756,6 +1825,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: None,
@@ -1885,6 +1956,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: None,
@@ -1931,6 +2004,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: None,
@@ -1980,6 +2055,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: Some(Fallback::Bytes(Arc::new(png))),
             store: None,
@@ -2510,6 +2587,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: None,
@@ -2813,6 +2892,8 @@ mod tests {
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: None,
@@ -2970,6 +3051,13 @@ mod tests {
     }
 
     async fn spawn_app_with_detector(detector: Arc<dyn crate::ai::DetectionProvider>) -> String {
+        spawn_app_with_providers(Some(detector), Vec::new()).await
+    }
+
+    async fn spawn_app_with_providers(
+        detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
+        detectors: Vec<NamedDetector>,
+    ) -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
@@ -2982,7 +3070,9 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
-            detect: Some(detector),
+            detect,
+            detectors,
+            focal: None,
             font: None,
             fallback: None,
             store: None,
@@ -3029,6 +3119,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: dir
@@ -3906,6 +3998,9 @@ mod tests {
         assert_eq!(boxes[0]["label"], "person");
         assert_eq!(boxes[0]["score"], 0.87);
         assert_eq!(boxes[0]["w"], 30);
+        // The built-in detector attributes as "builtin"
+        // (issue #166).
+        assert_eq!(boxes[0]["detector"], "builtin");
         // Configured but not asked: absent.
         let base = spawn_app_with_detector(Arc::new(FakeDetector)).await;
         let meta = get_meta(base, "application/json").await;
@@ -3916,6 +4011,89 @@ mod tests {
         let meta = get_meta(base, "application/json; detections=1").await;
         assert!(meta.get("detections").is_none());
         assert_eq!(meta["width"], 40);
+    }
+
+    /// A declared detector's fake (issue #166): one crate
+    /// box, disjoint from the built-in fake's person.
+    #[derive(Debug)]
+    struct FakeDeclaredDetector;
+
+    impl crate::ai::DetectionProvider for FakeDeclaredDetector {
+        fn knows_class(&self, name: &str) -> bool {
+            name.eq_ignore_ascii_case("crate")
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["crate".to_string()]
+        }
+        fn detect(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
+            Ok(vec![crate::ai::Detection {
+                label: "crate".to_string(),
+                score: 0.5,
+                x: 5,
+                y: 6,
+                w: 10,
+                h: 12,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn meta_aggregates_declared_detectors_with_attribution() {
+        let src = spawn_image_server().await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let get_meta = |base: String| {
+            let url_path = url_path.clone();
+            async move {
+                let resp = client()
+                    .get(format!("{base}{url_path}"))
+                    .header("Accept", "application/json; detections=1")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                serde_json::from_str::<serde_json::Value>(&resp.text().await.unwrap()).unwrap()
+            }
+        };
+        let declared = vec![NamedDetector {
+            name: "crates".to_string(),
+            provider: Arc::new(FakeDeclaredDetector),
+        }];
+        // Built-in first, then declared in order, each box
+        // carrying its provider's name.
+        let base = spawn_app_with_providers(Some(Arc::new(FakeDetector)), declared).await;
+        let meta = get_meta(base).await;
+        let boxes = meta["detections"].as_array().unwrap();
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0]["label"], "person");
+        assert_eq!(boxes[0]["detector"], "builtin");
+        assert_eq!(boxes[1]["label"], "crate");
+        assert_eq!(boxes[1]["detector"], "crates");
+        assert_eq!(boxes[1]["x"], 5);
+        // Declared alone (no built-in) still reports.
+        let declared = vec![NamedDetector {
+            name: "crates".to_string(),
+            provider: Arc::new(FakeDeclaredDetector),
+        }];
+        let base = spawn_app_with_providers(None, declared).await;
+        let meta = get_meta(base).await;
+        let boxes = meta["detections"].as_array().unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0]["detector"], "crates");
+        // A failing declared provider omits only its own
+        // boxes; the built-in's still report.
+        let declared = vec![NamedDetector {
+            name: "broken".to_string(),
+            provider: Arc::new(FailingDetector),
+        }];
+        let base = spawn_app_with_providers(Some(Arc::new(FakeDetector)), declared).await;
+        let meta = get_meta(base).await;
+        let boxes = meta["detections"].as_array().unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0]["detector"], "builtin");
     }
 
     #[test]
@@ -4082,6 +4260,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: Some(Arc::new(
@@ -4125,6 +4305,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: dir
@@ -4477,6 +4659,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             detect: None,
+            detectors: Vec::new(),
+            focal: None,
             font: None,
             fallback: None,
             store: None,
@@ -4505,6 +4689,8 @@ mod tests {
             upscale_provider: None,
             face_provider: None,
             detect_provider: None,
+            declared_detect_providers: Vec::new(),
+            focal_provider: None,
             text_renderer: None,
             video_encoder: None,
             dpr: None,

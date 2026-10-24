@@ -486,7 +486,7 @@ Add the `placeholders` parameter to the media type to also get placeholder data,
 curl -H "Accept: application/json; placeholders=1" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
 ```
 
-This adds four fields: `dominant_color`, the image's average color as `#rrggbb`; `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI; `palette`, the five most prominent colors as `#rrggbb`, most prominent first; and `thumbhash`, a ThumbHash string that ThumbHash client libraries decode into an aspect-correct blurred preview. Handy for rendering a preview while the real image loads. When a CLIP model is configured (see [AI features](#ai-features)), meta responses also carry `tags` (labels with zero-shot scores) and `alt_text` composed from the best labels, whether or not placeholders were asked for. With a detection model configured, adding `detections=1` to the same `Accept` entry adds `detections`: the objects found in the processed image as `{label, score, x, y, w, h}` in pixels, best first. Meta requests are never cached. One refusal: a meta request on a video URL answers `400`, because a video result is not an image (see [Video output](#video-output)). Errors in meta mode keep the usual status codes, and grammar failures answer with the JSON error envelope described in [Errors](#errors).
+This adds four fields: `dominant_color`, the image's average color as `#rrggbb`; `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI; `palette`, the five most prominent colors as `#rrggbb`, most prominent first; and `thumbhash`, a ThumbHash string that ThumbHash client libraries decode into an aspect-correct blurred preview. Handy for rendering a preview while the real image loads. When a CLIP model is configured (see [AI features](#ai-features)), meta responses also carry `tags` (labels with zero-shot scores) and `alt_text` composed from the best labels, whether or not placeholders were asked for. With a detection model configured, adding `detections=1` to the same `Accept` entry adds `detections`: the objects found in the processed image as `{label, score, x, y, w, h, detector}` in pixels, best first per detector; `detector` names the provider that produced the box (`builtin`, or a declared detector's name, see [Declared detectors](#declared-detectors)). Meta requests are never cached. One refusal: a meta request on a video URL answers `400`, because a video result is not an image (see [Video output](#video-output)). Errors in meta mode keep the usual status codes, and grammar failures answer with the JSON error envelope described in [Errors](#errors).
 
 ## Responses
 
@@ -639,6 +639,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_DETECT_MODEL` | unset | Path to a YOLOv8-family ONNX model for `blurclass` / `pixelateclass` and meta detections. See [AI features](#ai-features). |
 | `CRABCROP_DETECT_LABELS` | unset | Class names file (one per line, in index order) for detection exports that carry no `names` metadata. |
 | `CRABCROP_DETECT_THRESHOLD` | `0.5` | Minimum detection score. |
+| `CRABCROP_DETECTORS_FILE` | unset | Path to a JSON file declaring additional detectors (`boxes` and `focal` contracts) from your own models. See [Declared detectors](#declared-detectors). |
 | `CRABCROP_ORT_DYLIB` | unset | Path to the ONNX Runtime shared library, when it is not on the library search path. |
 | `CRABCROP_FONT_PATH` | unset | Path to a TTF/OTF font for the `text(...)` overlay filter, loaded at startup. Unset disables the filter. |
 | `CRABCROP_VIDEO_ENCODER` | unset | Path to the external video encoder program for `format(mp4)` / `format(webm)`, validated at startup. Unset disables video output. See [Video output](#video-output). |
@@ -685,6 +686,41 @@ How configuration works:
 - Models load at boot, before the server reports ready. A configured model that cannot be loaded — missing file, wrong shape — is a startup error with a one-line diagnostic, not a surprise for the first request. The upscale model's native factor is probed at load with a 16×16 test image; a model that does not enlarge by an integer factor is rejected at boot.
 - With no model configured, the filter is off: requests that use it fail cleanly with `501` (`removebg is not configured on this server`, `upscale is not configured on this server`). There is no silent fallback — `upscale` never degrades into a plain resize.
 - Inference runs behind a server-wide gate of 2 concurrent inferences, so a burst of AI requests cannot starve the normal transform pipeline.
+
+### Declared detectors
+
+Beyond the one built-in detection model, `CRABCROP_DETECTORS_FILE` points at a JSON file that declares more of your own models against two built-in contracts. The file is configuration only: crabcrop never loads or runs operator code; it wires each named model to a contract it already implements.
+
+```json
+[
+  {
+    "name": "crates",
+    "model": "/models/crates.onnx",
+    "kind": "boxes",
+    "labels": "/models/crates.txt",
+    "threshold": 0.4
+  },
+  {
+    "name": "logos",
+    "model": "/models/logos.onnx",
+    "kind": "boxes",
+    "labels": ["nike", "adidas", "puma"]
+  },
+  {
+    "name": "saliency",
+    "model": "/models/saliency.onnx",
+    "kind": "focal"
+  }
+]
+```
+
+- `name` (required) identifies the declaration: letters, digits, `_`, `-`; duplicate names are a startup error. `model` (required) is the ONNX file path. `kind` (required) is `"boxes"` or `"focal"`; anything else is a startup error naming the declaration.
+- **`boxes`** is a YOLOv8-family detector, decoded by the same post-processing as `CRABCROP_DETECT_MODEL`. Its class vocabulary comes from the declaration's `labels` — a path to a labels file (one class per line, in index order) or an inline array of class names — when given, and from the model's `names` metadata otherwise; declared labels win when both exist. `threshold` (0 to 1) sets its score floor, default 0.5 like the built-in detector. A `boxes` declaration with no vocabulary from either source is a startup error, as is a model whose output the decoder cannot read.
+- **`focal`** is a heatmap model: one fixed `[1, C, H, W]` input (C is 1 for luma, 3 for RGB) and exactly one output shaped `[H, W]`, `[1, H, W]`, or `[1, 1, H, W]`. The focal point is the heatmap's hottest cell, ties going to the first in row-major order. `labels` and `threshold` do not apply to this kind.
+- Class redaction resolves a class across providers in a fixed order: the built-in detector first, then declared `boxes` detectors in file order; the first provider whose vocabulary knows the class runs it. Chained class filters still share one run per provider per request.
+- Meta detections aggregate every configured detector: the built-in's boxes first, then each declared detector's in file order, and every box carries a `detector` field naming its source (`"builtin"`, or the declaration's name). One detector's failure omits only its own boxes.
+- Smart crops consult focal sources in this order: a caller `focal:` rectangle, then the face model, then the first declared `focal` provider, then the built-in saliency estimate. Only the first `focal` declaration is consulted; later ones are loaded and probed at boot, then stand by.
+- Every declaration is loaded and probed at boot, like every other model: a missing model file, an unreadable or malformed declarations file, an unknown kind, or an output that does not fit the contract is a startup error naming the declaration.
 - `upscale(4)` on a server whose model is natively 2× composes two model runs and lands the exact requested size; when the native factor does not divide the request, a final high-quality resize trims the difference. Source transparency is carried across an upscale even though the model only sees RGB.
 - The ONNX Runtime library itself comes from `CRABCROP_ORT_DYLIB`, or the system library search path when that is unset.
 

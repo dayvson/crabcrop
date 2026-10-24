@@ -2,7 +2,8 @@
 //!
 //! [`focal_point_with`] is the entry point the cropper uses:
 //! faces first when a face provider is configured (see
-//! [`face_focal_point`]), the saliency estimate of
+//! [`face_focal_point`]), then a declared focal provider
+//! when one is configured, the saliency estimate of
 //! [`focal_point`] otherwise. That arrangement is deliberate:
 //! crop code never learns where the point came from.
 
@@ -51,11 +52,38 @@ pub fn focal_point_traced(
     img: &DynamicImage,
     faces: Option<&dyn crate::ai::FaceProvider>,
 ) -> (FocalPoint, Vec<crate::ai::FaceBox>) {
+    focal_point_chained(img, faces, None)
+}
+
+/// The full smart-crop focal chain (issue #166): a caller
+/// `focal:` rectangle outranks everything and is consumed
+/// by the engine before this runs; here, a face provider's
+/// point wins when one is configured, then a declared
+/// focal provider's, then the saliency estimate. Providers
+/// share the face rule: a failure or an empty answer falls
+/// through to the next source and never fails the request
+/// the point enhances.
+pub fn focal_point_chained(
+    img: &DynamicImage,
+    faces: Option<&dyn crate::ai::FaceProvider>,
+    declared: Option<&dyn crate::ai::FocalProvider>,
+) -> (FocalPoint, Vec<crate::ai::FaceBox>) {
     if let Some(provider) = faces
         && let Ok(found) = provider.detect(img)
         && let Some(point) = face_focal_point(img, &found)
     {
         return (point, found);
+    }
+    if let Some(provider) = declared
+        && let Ok((x, y)) = provider.focal_point(img)
+    {
+        return (
+            FocalPoint {
+                x: x.clamp(0.0, 1.0),
+                y: y.clamp(0.0, 1.0),
+            },
+            Vec::new(),
+        );
     }
     (focal_point(img), Vec::new())
 }
@@ -230,5 +258,56 @@ mod tests {
         let img = block_at(70, 40);
         assert_eq!(focal_point_with(&img, Some(&NoFaces)), focal_point(&img));
         assert_eq!(focal_point_with(&img, None), focal_point(&img));
+    }
+
+    /// A declared focal provider with a fixed answer at
+    /// the right edge, against the saliency block's left.
+    #[derive(Debug)]
+    struct FixedFocal;
+
+    impl crate::ai::FocalProvider for FixedFocal {
+        fn focal_point(&self, _img: &DynamicImage) -> Result<(f32, f32), crate::ai::AiError> {
+            Ok((0.9, 0.5))
+        }
+    }
+
+    /// A declared focal provider that always fails.
+    #[derive(Debug)]
+    struct FailingFocal;
+
+    impl crate::ai::FocalProvider for FailingFocal {
+        fn focal_point(&self, _img: &DynamicImage) -> Result<(f32, f32), crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference(
+                "heatmap exploded".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_declared_focal_point_wins_over_saliency() {
+        // Saliency detail sits at the left (block center
+        // 0.10); the declared provider says 0.90. It wins.
+        let img = block_at(0, 40);
+        let (point, boxes) = focal_point_chained(&img, Some(&NoFaces), Some(&FixedFocal));
+        assert_eq!(point, FocalPoint { x: 0.9, y: 0.5 });
+        assert!(boxes.is_empty());
+    }
+
+    #[test]
+    fn a_face_wins_over_a_declared_focal_point() {
+        // Face center 0.10 against the declared 0.90: faces
+        // outrank declared providers in the chain.
+        let img = block_at(70, 40);
+        let (point, boxes) = focal_point_chained(&img, Some(&FixedFace), Some(&FixedFocal));
+        assert!(point.x < 0.2 && point.y < 0.2, "got {point:?}");
+        assert_eq!(boxes.len(), 1);
+    }
+
+    #[test]
+    fn a_failing_declared_focal_falls_back_to_saliency() {
+        let img = block_at(70, 40);
+        let (point, boxes) = focal_point_chained(&img, None, Some(&FailingFocal));
+        assert_eq!(point, focal_point(&img));
+        assert!(boxes.is_empty());
     }
 }
