@@ -234,7 +234,17 @@ impl OnnxUpscaleProvider {
             input_name,
             factor: 0,
         };
-        let out = probe.upscale(&DynamicImage::new_rgb8(16, 16))?;
+        // The probe runs as part of loading, so a model that
+        // cannot run it at all has failed to load, not failed
+        // an inference: classify it Load, as the detection
+        // provider's load probe does.
+        let out = probe
+            .upscale(&DynamicImage::new_rgb8(16, 16))
+            .map_err(|e| {
+                AiError::Load(format!(
+                    "the model {model_path} failed its super-resolution probe: {e}"
+                ))
+            })?;
         if out.width() % 16 != 0 || out.width() / 16 < 2 || out.height() != out.width() {
             return Err(AiError::Load(format!(
                 "the model {model_path} is not an integer-factor super-resolution model \
@@ -625,6 +635,178 @@ mod tests {
         );
     }
 
+    /// Write bytes to a fresh temp file and return its
+    /// path: the load() failure tests need real files (a
+    /// garbage model) without committing fixtures. The tag
+    /// keeps parallel tests on distinct files.
+    fn temp_file(tag: &str, contents: &[u8]) -> String {
+        let path =
+            std::env::temp_dir().join(format!("crabcrop-ai-load-{tag}-{}.bin", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A path inside the temp dir that is never created.
+    fn missing_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "crabcrop-ai-load-missing-{tag}-{}.onnx",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Assert a load() result failed as AiError::Load, the
+    /// class boot turns into a startup diagnostic, and
+    /// return the message for wording checks.
+    fn expect_load<T>(result: Result<T, AiError>) -> String {
+        match result {
+            Err(AiError::Load(message)) => message,
+            Err(other) => panic!("expected a load error, got {other}"),
+            Ok(_) => panic!("expected a load error, but the load succeeded"),
+        }
+    }
+
+    /// Load-failure coverage (#179, item 2): a missing model
+    /// file fails as AiError::Load. Ignored like the other
+    /// real-model tests: load() initializes the runtime
+    /// before it reaches the file, so a configured dylib is
+    /// required to exercise the file path at all.
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored face_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn face_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let message = expect_load(OnnxFaceProvider::load(Some(&dylib), &missing_path("face")));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A file that exists but is not a model fails the same
+    /// way: the session builder rejects it as Load.
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored face_load_garbage
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn face_load_garbage_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let garbage = temp_file("face-garbage", b"this is not an onnx model at all");
+        let message = expect_load(OnnxFaceProvider::load(Some(&dylib), &garbage));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A valid model with no inputs cannot serve as a face
+    /// detector: load() reports it as Load, not a session
+    /// with nothing to run.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_NO_INPUT_MODEL=...
+    /// cargo test -- --ignored face_load_model_without_inputs
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn face_load_model_without_inputs_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_NO_INPUT_MODEL").unwrap();
+        let message = expect_load(OnnxFaceProvider::load(Some(&dylib), &model));
+        assert!(message.contains("has no inputs"), "{message}");
+    }
+
+    /// The mask provider shares the session builder with
+    /// the face provider; its missing-file failure is the
+    /// same Load.
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored mask_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn mask_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let message = expect_load(OnnxMaskProvider::load(Some(&dylib), &missing_path("mask")));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored mask_load_garbage
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn mask_load_garbage_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let garbage = temp_file("mask-garbage", b"this is not an onnx model at all");
+        let message = expect_load(OnnxMaskProvider::load(Some(&dylib), &garbage));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_NO_INPUT_MODEL=...
+    /// cargo test -- --ignored mask_load_model_without_inputs
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn mask_load_model_without_inputs_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_NO_INPUT_MODEL").unwrap();
+        let message = expect_load(OnnxMaskProvider::load(Some(&dylib), &model));
+        assert!(message.contains("has no inputs"), "{message}");
+    }
+
+    /// The upscale provider's missing-file failure is Load,
+    /// before its probe ever runs.
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored upscale_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn upscale_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let message = expect_load(OnnxUpscaleProvider::load(
+            Some(&dylib),
+            &missing_path("upscale"),
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored upscale_load_garbage
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn upscale_load_garbage_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let garbage = temp_file("upscale-garbage", b"this is not an onnx model at all");
+        let message = expect_load(OnnxUpscaleProvider::load(Some(&dylib), &garbage));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A face model cannot run the load probe (its fixed
+    /// 640x640 input rejects the 16x16 probe): the probe is
+    /// part of loading, so the failure is Load, not a
+    /// request-time Inference.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_FACE_MODEL=...
+    /// cargo test -- --ignored upscale_load_face_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn upscale_load_face_model_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_FACE_MODEL").unwrap();
+        expect_load(OnnxUpscaleProvider::load(Some(&dylib), &model));
+    }
+
+    /// Same probe classification for a detection model.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_DETECT_MODEL=...
+    /// cargo test -- --ignored upscale_load_detection_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn upscale_load_detection_model_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_DETECT_MODEL").unwrap();
+        expect_load(OnnxUpscaleProvider::load(Some(&dylib), &model));
+    }
+
+    /// A model that runs the probe but does not enlarge
+    /// (an identity export) is rejected by the factor
+    /// check, as Load with the reason spelled out.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_IDENTITY_MODEL=...
+    /// cargo test -- --ignored upscale_load_non_upscaling
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn upscale_load_non_upscaling_model_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_IDENTITY_MODEL").unwrap();
+        let message = expect_load(OnnxUpscaleProvider::load(Some(&dylib), &model));
+        assert!(
+            message.contains("not an integer-factor super-resolution model"),
+            "{message}"
+        );
+    }
+
     /// Build a full YuNet output set with every head silent
     /// (score 0 everywhere), ready for peaks to be planted.
     fn silent_face_outputs() -> std::collections::HashMap<String, Vec<f32>> {
@@ -931,7 +1113,12 @@ impl OnnxClipProvider {
         let mut dim = 0usize;
         for label in &labels {
             let (ids, mask) = tokenizer.encode(label).map_err(AiError::Load)?;
-            let emb = run_text(&mut text, &text_inputs, &ids, &mask)?;
+            // Embedding the labels is part of loading: a text
+            // model that cannot run here is a load failure,
+            // not a request-time inference failure.
+            let emb = run_text(&mut text, &text_inputs, &ids, &mask).map_err(|e| {
+                AiError::Load(format!("the text model could not embed the labels: {e}"))
+            })?;
             if dim == 0 {
                 dim = emb.len();
             } else if emb.len() != dim {
@@ -953,7 +1140,9 @@ impl OnnxClipProvider {
         // image once and check the projection size agrees
         // with the text side.
         let probe = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
-        let emb = provider.embed_image(&probe)?;
+        let emb = provider
+            .embed_image(&probe)
+            .map_err(|e| AiError::Load(format!("the image model failed its load probe: {e}")))?;
         if emb.len() != provider.dim {
             return Err(AiError::Load(format!(
                 "the image model produced a {}-dimensional embedding but the text model produced {}: the pair does not share a projection space",
@@ -1317,6 +1506,169 @@ mod clip_tests {
         println!("scores: {scores:?}");
         assert_eq!(scores.len(), provider.label_count());
         assert!(scores.iter().all(|s| s.score.is_finite()));
+    }
+
+    /// Write bytes to a fresh temp file and return its
+    /// path: the load() failure tests need real files
+    /// (a label list, a garbage tokenizer) without
+    /// committing fixtures.
+    fn temp_file(tag: &str, contents: &[u8]) -> String {
+        let path =
+            std::env::temp_dir().join(format!("crabcrop-ai-load-{tag}-{}.bin", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A path inside the temp dir that is never created.
+    fn missing_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "crabcrop-ai-load-missing-{tag}-{}.onnx",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Assert a load() result failed as AiError::Load and
+    /// return the message for wording checks.
+    fn expect_load<T>(result: Result<T, AiError>) -> String {
+        match result {
+            Err(AiError::Load(message)) => message,
+            Err(other) => panic!("expected a load error, got {other}"),
+            Ok(_) => panic!("expected a load error, but the load succeeded"),
+        }
+    }
+
+    /// Load-failure coverage (#179, item 2). The label and
+    /// tokenizer files are read before any session is
+    /// built, so these run in the plain gate with no
+    /// runtime at all: a missing label file is Load.
+    #[test]
+    fn clip_load_missing_labels_file_is_a_load_error() {
+        let missing = missing_path("clip-labels");
+        let message = expect_load(OnnxClipProvider::load(
+            None, &missing, &missing, &missing, &missing,
+        ));
+        assert!(message.contains("cannot read the label file"), "{message}");
+    }
+
+    /// A label file with only comments and blank lines has
+    /// no labels: Load, still before the runtime is touched.
+    #[test]
+    fn clip_load_empty_labels_file_is_a_load_error() {
+        let labels = temp_file("clip-labels-empty", b"# only a comment\n\n");
+        let missing = missing_path("clip-empty");
+        let message = expect_load(OnnxClipProvider::load(
+            None, &missing, &missing, &missing, &labels,
+        ));
+        assert!(message.contains("contains no labels"), "{message}");
+    }
+
+    /// With valid labels, a missing tokenizer file is the
+    /// next pre-runtime failure: Load.
+    #[test]
+    fn clip_load_missing_tokenizer_file_is_a_load_error() {
+        let labels = temp_file("clip-labels-ok", b"cat\ndog\n");
+        let missing = missing_path("clip-tokenizer");
+        let message = expect_load(OnnxClipProvider::load(
+            None, &missing, &missing, &missing, &labels,
+        ));
+        assert!(
+            message.contains("cannot read the tokenizer file"),
+            "{message}"
+        );
+    }
+
+    /// A tokenizer file that is not BPE JSON fails the
+    /// same pre-runtime way.
+    #[test]
+    fn clip_load_garbage_tokenizer_file_is_a_load_error() {
+        let labels = temp_file("clip-labels-ok2", b"cat\ndog\n");
+        let tokenizer = temp_file("clip-tokenizer-garbage", b"{ this is not json");
+        let missing = missing_path("clip-garbage-tok");
+        let message = expect_load(OnnxClipProvider::load(
+            None, &missing, &missing, &tokenizer, &labels,
+        ));
+        assert!(message.contains("tokenizer"), "{message}");
+    }
+
+    /// With the files in place, a missing text model fails
+    /// in the session builder: Load.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_CLIP_IMAGE_MODEL=...
+    /// CRABCROP_TEST_CLIP_TOKENIZER=... CRABCROP_TEST_CLIP_LABELS=...
+    /// cargo test -- --ignored clip_load_missing_text_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
+    fn clip_load_missing_text_model_is_a_load_error() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let message = expect_load(OnnxClipProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
+            &missing_path("clip-text"),
+            &var("CRABCROP_TEST_CLIP_TOKENIZER"),
+            &var("CRABCROP_TEST_CLIP_LABELS"),
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A garbage text model file fails the same way.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_CLIP_IMAGE_MODEL=...
+    /// CRABCROP_TEST_CLIP_TOKENIZER=... CRABCROP_TEST_CLIP_LABELS=...
+    /// cargo test -- --ignored clip_load_garbage_text_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
+    fn clip_load_garbage_text_model_is_a_load_error() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let garbage = temp_file("clip-text-garbage", b"this is not an onnx model at all");
+        let message = expect_load(OnnxClipProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
+            &garbage,
+            &var("CRABCROP_TEST_CLIP_TOKENIZER"),
+            &var("CRABCROP_TEST_CLIP_LABELS"),
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A missing image model is reached only after the
+    /// text side has embedded every label; still Load.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_CLIP_TEXT_MODEL=...
+    /// CRABCROP_TEST_CLIP_TOKENIZER=... CRABCROP_TEST_CLIP_LABELS=...
+    /// cargo test -- --ignored clip_load_missing_image_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
+    fn clip_load_missing_image_model_is_a_load_error() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let message = expect_load(OnnxClipProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &missing_path("clip-image"),
+            &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
+            &var("CRABCROP_TEST_CLIP_TOKENIZER"),
+            &var("CRABCROP_TEST_CLIP_LABELS"),
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A swapped pair (the vision model as the text model)
+    /// cannot embed the labels: embedding is part of
+    /// loading, so the failure is Load, not a request-time
+    /// Inference.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_CLIP_IMAGE_MODEL=...
+    /// CRABCROP_TEST_CLIP_TEXT_MODEL=... CRABCROP_TEST_CLIP_TOKENIZER=...
+    /// CRABCROP_TEST_CLIP_LABELS=...
+    /// cargo test -- --ignored clip_load_swapped_model_pair
+    #[test]
+    #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
+    fn clip_load_swapped_model_pair_is_a_load_error() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        expect_load(OnnxClipProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
+            &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
+            &var("CRABCROP_TEST_CLIP_TOKENIZER"),
+            &var("CRABCROP_TEST_CLIP_LABELS"),
+        ));
     }
 }
 
@@ -1880,5 +2232,128 @@ mod detect_tests {
                 .any(|d| ["car", "truck", "bus"].contains(&d.label.as_str())),
             "no vehicle in {found:?}"
         );
+    }
+
+    /// Write bytes to a fresh temp file and return its
+    /// path: the load() failure tests need a real label
+    /// file without committing fixtures.
+    fn temp_file(tag: &str, contents: &[u8]) -> String {
+        let path =
+            std::env::temp_dir().join(format!("crabcrop-ai-load-{tag}-{}.bin", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A path inside the temp dir that is never created.
+    fn missing_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "crabcrop-ai-load-missing-{tag}-{}.onnx",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Assert a load() result failed as AiError::Load and
+    /// return the message for wording checks.
+    fn expect_load<T>(result: Result<T, AiError>) -> String {
+        match result {
+            Err(AiError::Load(message)) => message,
+            Err(other) => panic!("expected a load error, got {other}"),
+            Ok(_) => panic!("expected a load error, but the load succeeded"),
+        }
+    }
+
+    /// Load-failure coverage (#179, item 2): a missing
+    /// detection model file fails as AiError::Load.
+    /// CRABCROP_TEST_ORT_DYLIB=...
+    /// cargo test -- --ignored detection_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn detection_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let message = expect_load(OnnxDetectionProvider::load(
+            Some(&dylib),
+            &missing_path("detect"),
+            None,
+            0.5,
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A garbage detection model file fails the same way.
+    /// CRABCROP_TEST_ORT_DYLIB=...
+    /// cargo test -- --ignored detection_load_garbage
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn detection_load_garbage_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let garbage = temp_file("detect-garbage", b"this is not an onnx model at all");
+        let message = expect_load(OnnxDetectionProvider::load(
+            Some(&dylib),
+            &garbage,
+            None,
+            0.5,
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A model with no `names` metadata (the removebg
+    /// model stands in) and no labels file configured has
+    /// no class vocabulary: Load, naming the remedy.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_REMOVEBG_MODEL=...
+    /// cargo test -- --ignored detection_load_model_without_class_names
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn detection_load_model_without_class_names_or_labels_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_REMOVEBG_MODEL").unwrap();
+        let message = expect_load(OnnxDetectionProvider::load(Some(&dylib), &model, None, 0.5));
+        assert!(
+            message.contains("carries no class names metadata"),
+            "{message}"
+        );
+    }
+
+    /// The same model with a labels path that does not
+    /// exist fails reading the labels: Load.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_REMOVEBG_MODEL=...
+    /// cargo test -- --ignored detection_load_missing_labels
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn detection_load_missing_labels_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_REMOVEBG_MODEL").unwrap();
+        let message = expect_load(OnnxDetectionProvider::load(
+            Some(&dylib),
+            &model,
+            Some(&missing_path("detect-labels")),
+            0.5,
+        ));
+        assert!(
+            message.contains("cannot read the detection labels"),
+            "{message}"
+        );
+    }
+
+    /// With labels supplied, a non-YOLO model reaches the
+    /// load probe and fails it: Load, classified like the
+    /// other providers' probe failures.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_REMOVEBG_MODEL=...
+    /// cargo test -- --ignored detection_load_non_yolo
+    #[test]
+    #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
+    fn detection_load_non_yolo_model_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_REMOVEBG_MODEL").unwrap();
+        let labels = temp_file("detect-labels", b"person\ncar\n");
+        let message = expect_load(OnnxDetectionProvider::load(
+            Some(&dylib),
+            &model,
+            Some(&labels),
+            0.5,
+        ));
+        assert!(message.contains("not a YOLOv8-family export"), "{message}");
     }
 }
