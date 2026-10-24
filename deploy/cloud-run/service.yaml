@@ -1,0 +1,43 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: crabcrop
+spec:
+  template:
+    metadata:
+      annotations:
+        # One warm instance keeps its in-memory cache useful.
+        # Raise maxScale freely: replicas trade cache
+        # efficiency, never correctness.
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "10"
+    spec:
+      containerConcurrency: 80
+      containers:
+        - image: REPLACE_ME_region-docker.pkg.dev/REPLACE_ME_project/crabcrop/crabcrop:latest
+          # Cloud Run owns the PORT environment variable and
+          # injects 8080 by default; the server reads PORT,
+          # so the declared port matches the injection. Do
+          # not set PORT yourself on this platform.
+          ports:
+            - containerPort: 8080
+          env:
+            - name: CRABCROP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: crabcrop-secret
+                  key: latest
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
