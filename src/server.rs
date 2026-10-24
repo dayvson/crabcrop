@@ -1339,6 +1339,10 @@ fn engine_error_response(e: EngineError) -> Response {
         ),
         EngineError::Unsupported(what) => (StatusCode::BAD_REQUEST, what),
         EngineError::NotConfigured(what) => (StatusCode::NOT_IMPLEMENTED, what),
+        EngineError::Inference(crate::ai::AiError::BadOutput(_)) => (
+            StatusCode::BAD_GATEWAY,
+            "model produced unexpected output".to_string(),
+        ),
         EngineError::Inference(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "image inference failed".to_string(),
@@ -2170,7 +2174,10 @@ mod tests {
     struct FakeTagger;
 
     impl crate::ai::TagProvider for FakeTagger {
-        fn annotate(&self, _img: &image::DynamicImage) -> Result<crate::ai::Annotation, String> {
+        fn annotate(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::Annotation, crate::ai::AiError> {
             Ok(crate::ai::Annotation {
                 tags: vec![crate::ai::TagScore {
                     label: "ocean".to_string(),
@@ -2255,7 +2262,10 @@ mod tests {
             static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
             CLASSES.get_or_init(|| vec!["person".to_string()])
         }
-        fn detect(&self, _img: &image::DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
+        fn detect(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
             Ok(vec![crate::ai::Detection {
                 label: "person".to_string(),
                 score: 0.87,
@@ -2275,9 +2285,38 @@ mod tests {
             static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
             CLASSES.get_or_init(|| vec!["person".to_string()])
         }
-        fn detect(&self, _img: &image::DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
-            Err("detector exploded".to_string())
+        fn detect(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference(
+                "detector exploded".to_string(),
+            ))
         }
+    }
+
+    #[test]
+    fn ai_error_classes_map_to_distinct_statuses() {
+        // AP-16: a model that ran but produced unusable output
+        // is a 502; a runtime failure or a poisoned session
+        // lock stays a 500; the log line keeps the typed cause.
+        let status = |e: EngineError| engine_error_response(e).status();
+        assert_eq!(
+            status(EngineError::Inference(crate::ai::AiError::BadOutput(
+                "unexpected shape".to_string()
+            ))),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status(EngineError::Inference(crate::ai::AiError::Inference(
+                "inference failed: boom".to_string()
+            ))),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status(EngineError::Inference(crate::ai::AiError::LockPoisoned)),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     async fn spawn_app_with_detector(detector: Arc<dyn crate::ai::DetectionProvider>) -> String {

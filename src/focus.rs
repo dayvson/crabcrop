@@ -156,7 +156,10 @@ mod tests {
     struct FixedFace;
 
     impl crate::ai::FaceProvider for FixedFace {
-        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
             Ok(vec![crate::ai::FaceBox {
                 x: 0,
                 y: 0,
@@ -172,7 +175,10 @@ mod tests {
     struct NoFaces;
 
     impl crate::ai::FaceProvider for NoFaces {
-        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
             Ok(Vec::new())
         }
     }

@@ -165,8 +165,10 @@ pub enum EngineError {
     /// the URL is fine, the deployment cannot do it, so the
     /// server answers 501 rather than blaming the request.
     NotConfigured(String),
-    /// An AI model failed at inference time. Carries the cause.
-    Inference(String),
+    /// An AI operation failed. Carries the typed cause
+    /// (issue #148): the server maps BadOutput to 502 and
+    /// the rest to 500.
+    Inference(crate::ai::AiError),
     /// A text overlay could not be rendered. Carries the cause.
     Render(String),
 }
@@ -776,9 +778,9 @@ fn upscale_image(
         let before = (img.width(), img.height());
         img = provider.upscale(&img).map_err(EngineError::Inference)?;
         if img.width() <= before.0 || img.height() <= before.1 {
-            return Err(EngineError::Inference(
+            return Err(EngineError::Inference(crate::ai::AiError::BadOutput(
                 "the upscale model did not enlarge the image".to_string(),
-            ));
+            )));
         }
         scale *= provider.factor().max(2);
     }
@@ -802,7 +804,11 @@ fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
 /// result. Several face operations on the same image state
 /// share one inference; an operation that changes the size
 /// re-detects against the new state.
-type FaceMemo = Option<(u32, u32, Result<Vec<crate::ai::FaceBox>, String>)>;
+type FaceMemo = Option<(
+    u32,
+    u32,
+    Result<Vec<crate::ai::FaceBox>, crate::ai::AiError>,
+)>;
 
 /// Detect faces in `img` through the context's provider,
 /// serving the memoized result when the image state matches.
@@ -832,7 +838,11 @@ fn detect_faces(
 /// Memoized object detection for one pipeline run, the
 /// face memo's twin: chained class filters on the same
 /// image state share one inference.
-type DetectionMemo = Option<(u32, u32, Result<Vec<crate::ai::Detection>, String>)>;
+type DetectionMemo = Option<(
+    u32,
+    u32,
+    Result<Vec<crate::ai::Detection>, crate::ai::AiError>,
+)>;
 
 /// Detect objects in `img` through the context's provider,
 /// memoized like face detection. A provider failure is an
@@ -3725,7 +3735,7 @@ mod tests {
     struct HalfMask;
 
     impl crate::ai::MaskProvider for HalfMask {
-        fn mask(&self, img: &DynamicImage) -> Result<image::GrayImage, String> {
+        fn mask(&self, img: &DynamicImage) -> Result<image::GrayImage, crate::ai::AiError> {
             Ok(image::GrayImage::from_fn(
                 img.width(),
                 img.height(),
@@ -3819,7 +3829,7 @@ mod tests {
             2
         }
 
-        fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, String> {
+        fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, crate::ai::AiError> {
             Ok(DynamicImage::ImageRgba8(image::imageops::resize(
                 &img.to_rgba8(),
                 img.width() * 2,
@@ -3894,7 +3904,10 @@ mod tests {
     struct RightFace;
 
     impl crate::ai::FaceProvider for RightFace {
-        fn detect(&self, img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+        fn detect(
+            &self,
+            img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
             Ok(vec![crate::ai::FaceBox {
                 x: img.width() / 2,
                 y: 0,
@@ -3959,7 +3972,10 @@ mod tests {
     struct KnownFace;
 
     impl crate::ai::FaceProvider for KnownFace {
-        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
             Ok(vec![known_face()])
         }
     }
@@ -3970,7 +3986,10 @@ mod tests {
     }
 
     impl crate::ai::FaceProvider for CountingFace {
-        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(vec![known_face()])
         }
@@ -3980,8 +3999,13 @@ mod tests {
     struct FailingFace;
 
     impl crate::ai::FaceProvider for FailingFace {
-        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::FaceBox>, String> {
-            Err("detector exploded".to_string())
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference(
+                "detector exploded".to_string(),
+            ))
         }
     }
 
@@ -4016,7 +4040,10 @@ mod tests {
             static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
             CLASSES.get_or_init(|| vec!["person".to_string(), "car".to_string()])
         }
-        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
             Ok(known_detections())
         }
     }
@@ -4029,8 +4056,13 @@ mod tests {
             static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
             CLASSES.get_or_init(|| vec!["person".to_string()])
         }
-        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
-            Err("detector exploded".to_string())
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference(
+                "detector exploded".to_string(),
+            ))
         }
     }
 
@@ -4044,7 +4076,10 @@ mod tests {
             static CLASSES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
             CLASSES.get_or_init(|| vec!["person".to_string(), "car".to_string()])
         }
-        fn detect(&self, _img: &DynamicImage) -> Result<Vec<crate::ai::Detection>, String> {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(known_detections())
         }
