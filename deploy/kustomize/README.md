@@ -6,11 +6,11 @@ front-ends: pick per your platform standard, and keep the
 two in step when the workload changes (the chart's values
 are the reference for what each piece means).
 
-Nothing is published to a public registry yet: build the
-image from the repo Dockerfile, push it somewhere your
-cluster can pull from, and point `image:` (base
+Release images are published to GHCR as
+`ghcr.io/dayvson/crabcrop` and `ghcr.io/dayvson/crabcrop-ai`,
+tagged with the release version: point `image:` (base
 `deployment.yaml`, or an overlay `images:` transformer) at
-it.
+one of those, or at your own build of the repo Dockerfile.
 
 ## Layout
 
