@@ -8,7 +8,7 @@ use std::sync::Once;
 
 use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
-use crate::filters::{EncodeOptions, WatermarkImages, apply_filters};
+use crate::filters::{EncodeOptions, WatermarkImages};
 use crate::quality::auto_quality;
 use crate::url::{Align, Dimension, Filter, ImageFormat, ImageSize, Operation, PadFill, Quality};
 
@@ -1094,8 +1094,11 @@ fn apply_operations(
                                 .map_err(EngineError::Render)?;
                         }
                         other => {
-                            let (new_img, options) =
-                                apply_filters(img, std::slice::from_ref(other));
+                            let (new_img, options) = crate::filters::apply_filters_filled(
+                                img,
+                                std::slice::from_ref(other),
+                                directives.fill,
+                            );
                             img = new_img;
                             encode_opts.absorb(options);
                         }

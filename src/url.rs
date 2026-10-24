@@ -266,8 +266,11 @@ pub enum Filter {
     Rgb(i32, i32, i32),
     /// Histogram equalization per channel.
     Equalize,
-    /// Rotate by a multiple of 90 degrees.
-    Rotate(i32),
+    /// Rotate by the given angle in degrees (issue #144):
+    /// multiples of 90 take the exact quarter-turn path, any
+    /// other angle rotates geometrically onto an expanded
+    /// canvas.
+    Rotate(f32),
     /// Crop away the uniform border, keeping pixels that differ
     /// from the corner color by more than this tolerance (0-255).
     Trim(u8),
@@ -702,6 +705,44 @@ fn parse_class_name(raw: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Parse a `rotate` angle (issue #144): an optional minus,
+/// digits, and an optional fraction, with no exponent and no
+/// leading dot, so every implementation of the grammar reads
+/// the same strings. Bounded to 100 full turns; the value is
+/// stored as written and reduced at apply time.
+fn parse_angle(text: &str) -> Result<f32, ()> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (digits, None),
+    };
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    if let Some(f) = fraction
+        && (f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(());
+    }
+    let value: f32 = text.parse().map_err(|_| ())?;
+    if !value.is_finite() || value.abs() > 36000.0 {
+        return Err(());
+    }
+    Ok(value)
+}
+
+/// The canonical spelling of a rotate angle: whole values
+/// print as integers (so `rotate(90)` keeps the spelling it
+/// has always had, and with it its cache key), fractions use
+/// the shortest round-trip form.
+fn format_angle(value: f32) -> String {
+    if value == value.trunc() {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
 fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidFilters(seg.to_string());
     if rest.is_empty() {
@@ -877,13 +918,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     alpha: alpha as u8,
                 }
             }
-            ("rotate", Some(p)) => {
-                let degrees: i32 = p.parse().map_err(|_| invalid())?;
-                if degrees % 90 != 0 {
-                    return Err(invalid());
-                }
-                Filter::Rotate(degrees)
-            }
+            ("rotate", Some(p)) => Filter::Rotate(parse_angle(p).map_err(|_| invalid())?),
             ("overlay", Some(p)) => {
                 // <url>,<x>,<y>,<alpha>,<blend>[,<width>]. Like
                 // watermark, split from the right: the URL may
@@ -1487,7 +1522,7 @@ fn filter_text(filter: &Filter) -> String {
         Filter::Saturation(v) => format!("saturation({v})"),
         Filter::Rgb(r, g, b) => format!("rgb({r},{g},{b})"),
         Filter::Equalize => "equalize".to_string(),
-        Filter::Rotate(v) => format!("rotate({v})"),
+        Filter::Rotate(v) => format!("rotate({})", format_angle(*v)),
         Filter::Trim(v) => format!("trim({v})"),
         Filter::Watermark { url, x, y, alpha } => {
             format!("watermark({},{x},{y},{alpha})", encode_arg(url))
@@ -3005,8 +3040,11 @@ mod tests {
             ("saturation(2.5)", Filter::Saturation(2.5)),
             ("rgb(255,-255,0)", Filter::Rgb(255, -255, 0)),
             ("equalize", Filter::Equalize),
-            ("rotate(90)", Filter::Rotate(90)),
-            ("rotate(-90)", Filter::Rotate(-90)),
+            ("rotate(90)", Filter::Rotate(90.0)),
+            ("rotate(-90)", Filter::Rotate(-90.0)),
+            ("rotate(45)", Filter::Rotate(45.0)),
+            ("rotate(45.5)", Filter::Rotate(45.5)),
+            ("rotate(-30.25)", Filter::Rotate(-30.25)),
             ("fill(ff8800)", Filter::Fill([255, 136, 0])),
             ("max_bytes(5000)", Filter::MaxBytes(5000)),
         ];
@@ -3018,6 +3056,24 @@ mod tests {
     }
 
     #[test]
+    fn rotate_angles_canonicalize() {
+        // Whole spellings keep the historic integer form (and
+        // its cache key); fractions use the shortest form.
+        assert_eq!(
+            canonical_key_form("filters:rotate(90.0)/example.com/img.jpg"),
+            "filters:rotate(90)/example.com/img.jpg"
+        );
+        assert_eq!(
+            canonical_key_form("filters:rotate(45.50)/example.com/img.jpg"),
+            "filters:rotate(45.5)/example.com/img.jpg"
+        );
+        assert_eq!(
+            canonical_key_form("filters:rotate(-90)/example.com/img.jpg"),
+            "filters:rotate(-90)/example.com/img.jpg"
+        );
+    }
+
+    #[test]
     fn rejects_bad_filter_batch_two() {
         for seg in [
             "sharpen(0)",
@@ -3026,7 +3082,12 @@ mod tests {
             "rgb(256,0,0)",
             "rgb(1,2)",
             "equalize(1)",
-            "rotate(45)",
+            "rotate(1e2)",
+            "rotate(.5)",
+            "rotate(45.)",
+            "rotate(nan)",
+            "rotate(36001)",
+            "rotate(-)",
             "fill(ff88)",
             "fill(gggggg)",
             "max_bytes(0)",

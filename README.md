@@ -202,7 +202,7 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | `saturation` | `saturation(1.5)` — 0 is grayscale, 1 is unchanged | Scale color saturation. | `filters:saturation(0.5)` |
 | `rgb` | `rgb(10,-5,0)` — per-channel offsets, each −255 to 255 | Add offsets to the red, green, and blue channels. | `filters:rgb(10,-5,0)` |
 | `equalize` | none | Histogram equalization, per channel. | `filters:equalize` |
-| `rotate` | `rotate(90)` — a multiple of 90; negatives allowed | Rotate the image. | `filters:rotate(-90)` |
+| `rotate` | `rotate(45)` — any angle in degrees, decimals allowed; negatives allowed | Rotate the image. Multiples of 90 are exact quarter turns; other angles expand the canvas to fit, filling the uncovered corners with the `fill` color (white by default) or transparency when the image carries alpha. | `filters:rotate(-90)` |
 | `trim` | `trim` or `trim(20)` — tolerance 0–255, default 10 | Crop away the border that matches the top-left corner color within the tolerance. | `filters:trim(20)` |
 | `sepia` | none | The classic warm sepia tone. | `filters:sepia` |
 | `duotone` | `duotone(1a1a40,ffd9a0)` — two colors, six hex digits each | Map shadows to the first color and highlights to the second, by luminance. | `filters:duotone(1a1a40,ffd9a0)` |
