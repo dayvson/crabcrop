@@ -172,7 +172,17 @@ export function buildSrcSet(
 }
 
 export { explainUrl } from "./explain.ts";
-export type { ExplainedSegment, Explanation } from "./explain.ts";
+export { FILTER_DESCRIPTIONS } from "./explain.ts";
+export type { ExplainedSegment, Explanation, SegmentKind, SignatureKind } from "./explain.ts";
+export { filter, joinOps, ops } from "./operations.ts";
+export type {
+  Anchor,
+  BlendMode,
+  CropAlign,
+  Dimension,
+  ImageFormat,
+  MaskShape,
+} from "./operations.ts";
 
 import { explainUrl } from "./explain.ts";
 

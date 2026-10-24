@@ -6,9 +6,15 @@
  * same verdict corpus (audit PL-10, P-3).
  */
 
+/** The segment kinds an explanation is made of. */
+export type SegmentKind = "expiry" | "preset" | "operation";
+
+/** The signature kinds an explanation can report. */
+export type SignatureKind = "hmac" | "unsafe" | "invalid";
+
 export interface ExplainedSegment {
   raw: string;
-  kind: string;
+  kind: SegmentKind;
   title: string;
   detail?: string;
   error?: string;
@@ -16,14 +22,14 @@ export interface ExplainedSegment {
 }
 
 export interface Explanation {
-  signature: { kind: string; value: string; detail: string; keyId?: string } | null;
+  signature: { kind: SignatureKind; value: string; detail: string; keyId?: string } | null;
   segments: ExplainedSegment[];
   source: string;
   remainder: string;
   errors: string[];
 }
 
-const FILTER_BLURBS = {
+export const FILTER_DESCRIPTIONS: Record<string, string> = {
   grayscale: "convert to grayscale",
   invert: "invert the colors",
   no_upscale: "never enlarge the source",
@@ -75,21 +81,32 @@ const MAX_DIMENSION = 16383;
  * the dimension cap. Returns null when the segment is not a
  * size, which in the server's dispatch means the source starts.
  */
-function parseDimension(part) {
+interface ParsedDimension {
+  kind: "proportional" | "original" | "pixels";
+  value: number;
+  flip: boolean;
+}
+
+interface ParsedSize {
+  w: ParsedDimension;
+  h: ParsedDimension;
+}
+
+function parseDimension(part: string): ParsedDimension | null {
   let flip = false;
   let digits = part;
   if (digits.startsWith("-")) {
     flip = true;
     digits = digits.slice(1);
   }
-  if (digits === "" || digits === "0") return { kind: "proportional", flip };
-  if (digits === "orig") return { kind: "original", flip };
+  if (digits === "" || digits === "0") return { kind: "proportional", value: 0, flip };
+  if (digits === "orig") return { kind: "original", value: 0, flip };
   if (!/^\d+$/.test(digits)) return null;
   if (BigInt(digits) > BigInt(MAX_DIMENSION)) return null;
   return { kind: "pixels", value: Number(digits), flip };
 }
 
-function parseSizeSegment(seg) {
+function parseSizeSegment(seg: string): ParsedSize | null {
   const x = seg.indexOf("x");
   if (x === -1) return null;
   const w = parseDimension(seg.slice(0, x));
@@ -98,15 +115,15 @@ function parseSizeSegment(seg) {
   return { w, h };
 }
 
-function isExactBox(size) {
-  const px = (d) => d.kind === "pixels" && d.value >= 1 && !d.flip;
+function isExactBox(size: ParsedSize): boolean {
+  const px = (d: ParsedDimension) => d.kind === "pixels" && d.value >= 1 && !d.flip;
   return px(size.w) && px(size.h);
 }
 
-function sizeBlurb(seg) {
+function sizeBlurb(seg: string): string {
   const size = parseSizeSegment(seg);
   if (!size) return `resize per ${seg}`;
-  const describe = (d, axis) =>
+  const describe = (d: ParsedDimension, axis: string) =>
     d.kind === "original"
       ? `the original ${axis}`
       : d.kind === "proportional"
@@ -143,15 +160,15 @@ const ANCHOR_NAMES = new Set([
   "bottom-right",
 ]);
 
-function isIntIn(s, min, max) {
+function isIntIn(s: string, min: number, max: number): boolean {
   return /^-?\d+$/.test(s) && BigInt(s) >= BigInt(min) && BigInt(s) <= BigInt(max);
 }
 
-function isFloat(s) {
+function isFloat(s: string): boolean {
   return s !== "" && Number.isFinite(Number(s));
 }
 
-function percentDecodable(s) {
+function percentDecodable(s: string): string | null {
   try {
     return decodeURIComponent(s);
   } catch {
@@ -166,7 +183,7 @@ function percentDecodable(s) {
  * server) and the raw argument string otherwise. Returns an
  * error string, or null when the server would accept it.
  */
-function validateFilter(name, args) {
+function validateFilter(name: string, args: string | null): string | null {
   const bad = `the server rejects this filter: ${name}${args === null ? "" : `(${args})`}`;
   if (NO_ARG_FILTERS.has(name)) {
     return args === null ? null : bad;
@@ -192,7 +209,7 @@ function validateFilter(name, args) {
     case "quality":
       return args === "auto" || (args !== null && isIntIn(args, 1, 100)) ? null : bad;
     case "format":
-      return FORMAT_NAMES.has(args) ? null : bad;
+      return args !== null && FORMAT_NAMES.has(args) ? null : bad;
     case "rgb": {
       if (args === null) return bad;
       const parts = args.split(",");
@@ -333,7 +350,7 @@ function validateFilter(name, args) {
   }
 }
 
-function explainFilters(rest) {
+function explainFilters(rest: string): { detail?: string; error?: string } {
   // The server splits the list naively on ':'; a ':' inside
   // parentheses is not special there either.
   const parts = rest.split(":");
@@ -345,7 +362,7 @@ function explainFilters(rest) {
     }
     const [, name, rawArgs] = match;
     const args = rawArgs === undefined || rawArgs === "" ? null : rawArgs;
-    const blurb = FILTER_BLURBS[name];
+    const blurb = FILTER_DESCRIPTIONS[name];
     if (!blurb) {
       return { error: `unknown filter: ${name}` };
     }
@@ -361,7 +378,7 @@ function explainFilters(rest) {
 const ALIGN_NAMES = new Set(["center", "smart", "face", "top", "bottom", "left", "right"]);
 const U64_MAX = 18446744073709551615n;
 
-function explainSegment(seg, nowSeconds) {
+function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment, "raw"> | null {
   if (seg.startsWith("exp:")) {
     const value = seg.slice(4);
     if (!/^\d+$/.test(value)) {
@@ -405,7 +422,7 @@ function explainSegment(seg, nowSeconds) {
   if (seg.startsWith("crop-rect:")) {
     const rest = seg.slice(10);
     const m = rest.match(/^(\d+)x(\d+):(\d+)x(\d+)$/);
-    if (!m || m.slice(1).some((n) => BigInt(n) > 4294967295n)) {
+    if (!m || m.slice(1).some((n: string) => BigInt(n) > 4294967295n)) {
       return {
         kind: "operation",
         title: "Crop rectangle",
@@ -492,14 +509,14 @@ export function explainUrl(
   if (cut !== -1) {
     path = path.slice(0, cut);
   }
-  const errors = [];
+  const errors: string[] = [];
   const slash = path.indexOf("/");
   if (slash === -1) {
     return { signature: null, segments: [], source: "", remainder: "", errors: ["no signature segment: the path is a single segment"] };
   }
   const signatureRaw = path.slice(0, slash);
   const remainder = path.slice(slash + 1);
-  let signature;
+  let signature: Explanation["signature"];
   const keyed = signatureRaw.match(/^([A-Za-z0-9_-]{1,32}):([0-9a-f]{64})$/);
   if (signatureRaw === "unsafe") {
     signature = { kind: "unsafe", value: signatureRaw, detail: "unsigned; the server honors it only with CRABCROP_ALLOW_UNSAFE or in presets-only deployments" };
@@ -515,7 +532,7 @@ export function explainUrl(
     errors.push("malformed signature segment");
   }
 
-  const segments = [];
+  const segments: ExplainedSegment[] = [];
   let rest = remainder;
   let source = "";
   for (;;) {

@@ -348,7 +348,7 @@ With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: re
 The URL grammar and signing scheme are specified in [`spec/url-signing.md`](spec/url-signing.md), with a canonical set of test vectors in [`spec/test-vectors.json`](spec/test-vectors.json) that every implementation runs as its test suite. Builders on top of the spec:
 
 - **Rust**: the `crabcrop-url` crate in this workspace (`crates/crabcrop-url`) with `sign`, `verify`, `build_url`, `build_srcset`, and the purge helpers `purge_signature` and `purge_group_signature`. The server verifies with this same crate, so client and server cannot drift.
-- **TypeScript**: [`sdks/typescript`](sdks/typescript), `@crabcrop/url`, with `sign`, `verifyUrlSignature`, `buildURL`, `buildSrcSet`, `purgeSignature`, and `purgeGroupSignature`. Standard library only; tests run on `node --test`.
+- **TypeScript**: [`sdks/typescript`](sdks/typescript), `@crabcrop/url`, with `sign`, `verifyUrlSignature`, `buildURL`, `buildSrcSet`, `purgeSignature`, and `purgeGroupSignature`, plus typed operation builders (`ops`, `filter`) that validate against the grammar and compile to the same canonical strings. Standard library only; tests run on `node --test`.
 - **Python**: [`sdks/python`](sdks/python), `crabcrop_url`, with `sign`, `verify`, `build_url`, `build_srcset`, `purge_signature`, and `purge_group_signature`. Standard library only; tests run on `python3 -m unittest`.
 
 All three take an optional expiry (emitted as a leading `exp:` segment) and a null secret for the `unsafe` form used by unsafe and presets-only deployments.
