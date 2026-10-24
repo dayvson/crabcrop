@@ -1,40 +1,46 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readdirSync } from "node:fs";
+import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const mcpDir = join(dirname(fileURLToPath(import.meta.url)), "..");
-const sdkDir = join(mcpDir, "..", "typescript");
 
-test("the packed MCP server runs outside the repo layout (audit PL-10)", async () => {
-  // Build the SDK first: a registry install of @crabcrop/url
-  // carries its compiled dist, and the MCP's own prepack build
-  // type-resolves against it.
-  execFileSync("npm", ["run", "--silent", "build"], { cwd: sdkDir });
-  const work = mkdtempSync(join(tmpdir(), "crabcrop-pack-"));
-  execFileSync("npm", ["pack", "--silent", mcpDir], { cwd: work });
-  const tarball = readdirSync(work).find((f) => f.endsWith(".tgz"));
+test("the packed MCP server installs and runs outside the repo (audit PL-10, issue #154)", async () => {
+  // Pack exactly what would be published. The package's
+  // prepack builds the SDK and then the server, and
+  // bundleDependencies puts the SDK's published form
+  // (package.json + dist) inside the tarball: the declared
+  // file: dependency can never resolve from a registry, so
+  // the tarball has to be self-contained (AP-27).
+  const packDir = mkdtempSync(join(tmpdir(), "crabcrop-pack-"));
+  execFileSync("npm", ["pack", "--silent", mcpDir], { cwd: packDir });
+  const tarball = readdirSync(packDir).find((f) => f.endsWith(".tgz"));
   assert.ok(tarball, "npm pack produced a tarball");
-  execFileSync("tar", ["-xzf", join(work, tarball), "-C", work]);
-  const pkgDir = join(work, "package");
-  // Simulate a registry install's node_modules: the SDK in its
-  // published form (package.json + dist), and nothing else from
-  // the repo around it. In particular there is no
-  // ../../../playground to import from, and Node will not
-  // type-strip sources under node_modules, so only the
-  // compiled layout can work here.
-  const nm = join(pkgDir, "node_modules", "@crabcrop", "url");
-  mkdirSync(nm, { recursive: true });
-  cpSync(join(sdkDir, "package.json"), join(nm, "package.json"));
-  cpSync(join(sdkDir, "dist"), join(nm, "dist"), { recursive: true });
 
-  const child = spawn("node", [join(pkgDir, "dist", "index.js")], {
+  // Install the tarball into a fresh project with npm, the
+  // way a registry consumer would. Nothing else is
+  // available to resolve: if the bundled SDK were missing
+  // or the layout wrong, the install or the run below
+  // would fail. No hand-simulated node_modules.
+  const consumer = mkdtempSync(join(tmpdir(), "crabcrop-consumer-"));
+  writeFileSync(
+    join(consumer, "package.json"),
+    JSON.stringify({ name: "consumer", version: "1.0.0", type: "module" }),
+  );
+  execFileSync(
+    "npm",
+    ["install", "--no-audit", "--no-fund", join(packDir, tarball)],
+    { cwd: consumer, stdio: "pipe" },
+  );
+  const bin = join(consumer, "node_modules", ".bin", "crabcrop-mcp");
+
+  const child = spawn(bin, [], {
     env: {
       ...process.env,
-      CRABCROP_SECRET: "pack-smoke-secret-0123",
+      CRABCROP_SECRET: "playground-secret",
       CRABCROP_BASE: "http://127.0.0.1:9",
     },
     stdio: ["pipe", "pipe", "inherit"],
@@ -53,7 +59,7 @@ test("the packed MCP server runs outside the repo layout (audit PL-10)", async (
     };
     const line = await new Promise((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error("packed server did not answer in 15s")),
+        () => reject(new Error("installed server did not answer in 15s")),
         15000,
       );
       let buf = "";
@@ -71,7 +77,7 @@ test("the packed MCP server runs outside the repo layout (audit PL-10)", async (
       });
       child.on("exit", (code) => {
         clearTimeout(timer);
-        reject(new Error(`packed server exited early (${code})`));
+        reject(new Error(`installed server exited early (${code})`));
       });
       child.stdin.write(JSON.stringify(request) + "\n");
     });

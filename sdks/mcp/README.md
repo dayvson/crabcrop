@@ -13,7 +13,24 @@ A first-party MCP (Model Context Protocol) server for crabcrop, so coding agents
 
 ## Setup
 
-The server runs over stdio with Node >= 22 (it is TypeScript, run directly). Point your MCP client at it:
+The server runs over stdio with Node >= 22. Once published, point your MCP client at the installed package:
+
+```json
+{
+  "mcpServers": {
+    "crabcrop": {
+      "command": "npx",
+      "args": ["-y", "@crabcrop/mcp"],
+      "env": {
+        "CRABCROP_BASE": "https://images.example.com",
+        "CRABCROP_SECRET": "your-secret"
+      }
+    }
+  }
+}
+```
+
+From a checkout, it also runs directly from source (Node type-strips the TypeScript):
 
 ```json
 {
@@ -41,4 +58,6 @@ claude mcp add crabcrop \
 
 `CRABCROP_BASE` and `CRABCROP_SECRET` are the defaults, and the environment is the recommended home for the secret: `sign_url` and `purge_result` still accept per-call `base`/`secret` overrides, but the per-call secret is deprecated because agentic clients persist tool arguments in their transcripts. With no secret configured, `sign_url` produces `unsafe` URLs for servers that allow them. `purge_result` always requires a secret.
 
-Both this package and `@crabcrop/url` ship compiled `dist/` builds (their `prepack` runs `tsc`). In this repository's tests (no install step), a register hook maps `@crabcrop/url` to the SDK sources; a packed-install smoke test covers the real layout. The end-to-end test (`npm test`) spawns this server plus a real crabcrop binary and runs sign -> fetch -> meta -> purge against it; it needs `cargo build` to have produced `target/debug/crabcrop` and uses the bench fixture photo as its source.
+Both this package and `@crabcrop/url` ship compiled `dist/` builds (their `prepack` runs `tsc`). The published tarball is self-contained: the declared `@crabcrop/url` dependency is a `file:` path, which no registry install could resolve, so the package bundles it (`bundleDependencies`); the tarball carries the SDK's published form under its own `node_modules`, and installing the package is all a consumer does. In this repository's tests (no install step), a register hook maps `@crabcrop/url` to the SDK sources, and the pack test does the real thing instead of simulating it: `npm pack`, `npm install` the tarball into a fresh project, and a JSON-RPC round trip against the installed bin. The end-to-end test (`npm test`) spawns this server plus a real crabcrop binary and runs sign -> fetch -> meta -> purge against it; it needs `cargo build` to have produced `target/debug/crabcrop` and uses the bench fixture photo as its source.
+
+`server.json` in this directory is the MCP registry manifest (name `io.github.crabcrop/crabcrop`, matching the `mcpName` field in `package.json`); its versions are bumped by the same one-version tooling as every other artifact. The registry submission itself is a separate step and has not been made yet.
