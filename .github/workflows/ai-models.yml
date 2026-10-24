@@ -1,0 +1,219 @@
+name: AI models (real inference)
+
+# The real-model AI tests are #[ignore]d in the normal gate: they
+# need the ONNX Runtime and model files, which are deployment
+# artifacts and never committed. This job downloads the pinned
+# artifacts, verifies them against the same sha256 pins as
+# Dockerfile.ai (plus the pins recorded for the test-only models),
+# recreates the three tiny authored fixture models, and runs the
+# ignored AI tests for real. Manual dispatch plus a weekly run.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  AI_ASSETS: ${{ runner.temp }}/ai-assets
+
+jobs:
+  ai-models:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the pinned AI test assets
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.AI_ASSETS }}
+          # Bump the trailing version when any pin below changes.
+          key: ai-assets-v1-ort1.31.0-u2netp309c84-yunet8f238-yoloabc0dd-clip583fd1-bus-c02019
+
+      - name: Download the pinned assets
+        run: |
+          set -euo pipefail
+          mkdir -p "$AI_ASSETS"
+          fetch() { # name url
+            if [ ! -s "$AI_ASSETS/$1" ]; then
+              echo "downloading $1"
+              curl -fsSL "$2" -o "$AI_ASSETS/$1"
+            fi
+          }
+          # ONNX Runtime 1.31.0 and u2netp + YuNet: the same URLs
+          # and pins as Dockerfile.ai.
+          fetch onnxruntime.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz
+          fetch u2netp.onnx https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx
+          fetch yunet.onnx https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+          # YOLOv8n: the exact export the tests were built against.
+          # It is a Git LFS object, so its sha256 is also its LFS
+          # object id; the official Ultralytics release asset is a
+          # different export and is deliberately not used.
+          fetch yolov8n.onnx https://media.githubusercontent.com/media/hnlyf168/SimdYolo/main/models/onnx/yolov8n.onnx
+          # CLIP ViT-B/32 (quantized ONNX) and its tokenizer.
+          fetch vision_model_quantized.onnx https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model_quantized.onnx
+          fetch text_model_quantized.onnx https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/text_model_quantized.onnx
+          fetch tokenizer.json https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/tokenizer.json
+          # Test photo for the live CLIP/detection tests: people
+          # and a bus, the classes the detection test asserts.
+          fetch bus.jpg https://github.com/ultralytics/assets/releases/download/v0.0.0/bus.jpg
+
+      - name: Extract the ONNX Runtime library
+        run: |
+          set -euo pipefail
+          if [ ! -s "$AI_ASSETS/libonnxruntime.so" ]; then
+            tar -xzf "$AI_ASSETS/onnxruntime.tgz" -C "$AI_ASSETS"
+            cp "$AI_ASSETS/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0" "$AI_ASSETS/libonnxruntime.so"
+          fi
+
+      - name: Verify asset checksums
+        run: |
+          set -euo pipefail
+          cd "$AI_ASSETS"
+          sha256sum -c - <<'EOF'
+          cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57  onnxruntime.tgz
+          469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e  libonnxruntime.so
+          309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  u2netp.onnx
+          8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  yunet.onnx
+          abc0ddbab9f194039ff41216a8cc6c8b0b2133f1bdadeb6591d4fee7ad270aa7  yolov8n.onnx
+          583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299  vision_model_quantized.onnx
+          73baab855d406190da9faa498cfedf65cf309f4cc7385b7b032e6d08e5c3a  text_model_quantized.onnx
+          f7f3b7af117d467b58374797691a6438d3e6b9e9cef800dfd5dced7f697a90cd  tokenizer.json
+          c02019c4979c191eb739ddd944445ef408dad5679acab6fd520ef9d434bfbc63  bus.jpg
+          EOF
+
+      - name: Generate the authored fixture models
+        run: |
+          set -euo pipefail
+          # Three fixtures have no upstream download: they were
+          # authored for the load tests (issue #179 item 2), so CI
+          # recreates them. IR 8 / opset 13 throughout: the current
+          # onnx package defaults to an IR that ORT 1.31 rejects.
+          python3 -m venv "$RUNNER_TEMP/ai-venv"
+          "$RUNNER_TEMP/ai-venv/bin/pip" install --quiet onnx==1.23.2
+          "$RUNNER_TEMP/ai-venv/bin/python" - "$AI_ASSETS" <<'PYEOF'
+          import sys
+          from pathlib import Path
+
+          import numpy as np
+          import onnx
+          from onnx import TensorProto, helper, numpy_helper
+
+          out = Path(sys.argv[1])
+
+          def save(model, name):
+              model.ir_version = 8
+              onnx.checker.check_model(model)
+              onnx.save(model, out / name)
+
+          # Constant-only graph, no inputs: face/mask load must refuse it.
+          const = helper.make_tensor("v", TensorProto.FLOAT, [3], [0.0, 0.0, 0.0])
+          graph = helper.make_graph(
+              [helper.make_node("Constant", [], ["y"], value=const)],
+              "no-inputs",
+              [],
+              [helper.make_tensor_value_info("y", TensorProto.FLOAT, [3])],
+          )
+          save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+               "no_inputs.onnx")
+
+          # Identity: the upscale factor probe measures 1x and refuses it.
+          graph = helper.make_graph(
+              [helper.make_node("Identity", ["x"], ["y"])],
+              "identity",
+              [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["N", "C", "H", "W"])],
+              [helper.make_tensor_value_info("y", TensorProto.FLOAT, ["N", "C", "H", "W"])],
+          )
+          save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+               "identity.onnx")
+
+          # Minimal ESPCN-style x2 net: the probe must measure factor 2.
+          rng = np.random.RandomState(42)
+          inits = [
+              numpy_helper.from_array((rng.randn(12, 3, 3, 3) * 0.05).astype(np.float32), "c1_w"),
+              numpy_helper.from_array(np.zeros(12, dtype=np.float32), "c1_b"),
+              numpy_helper.from_array((rng.randn(12, 12, 3, 3) * 0.05).astype(np.float32), "c2_w"),
+              numpy_helper.from_array(np.zeros(12, dtype=np.float32), "c2_b"),
+          ]
+          nodes = [
+              helper.make_node("Conv", ["input", "c1_w", "c1_b"], ["h1"], pads=[1, 1, 1, 1]),
+              helper.make_node("Relu", ["h1"], ["h2"]),
+              helper.make_node("Conv", ["h2", "c2_w", "c2_b"], ["h3"], pads=[1, 1, 1, 1]),
+              helper.make_node("DepthToSpace", ["h3"], ["output"], blocksize=2, mode="CRD"),
+          ]
+          graph = helper.make_graph(
+              nodes,
+              "sr-x2",
+              [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, "H", "W"])],
+              [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, "H2", "W2"])],
+              inits,
+          )
+          save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+               "sr-x2.onnx")
+          print("fixtures generated")
+          PYEOF
+
+      - name: Write the CLIP label set
+        run: |
+          cat > "$AI_ASSETS/labels.txt" <<'EOF'
+          # general-purpose label set for the #61 live smoke
+          ocean
+          sea
+          beach
+          sand
+          sky
+          clouds
+          waves
+          surfing
+          kite surfing
+          sailboat
+          boat
+          palm tree
+          sunset
+          sunrise
+          mountains
+          forest
+          meadow
+          desert
+          snow
+          lake
+          river
+          waterfall
+          city skyline
+          buildings
+          street
+          people
+          portrait
+          dog
+          cat
+          bird
+          aerial view
+          underwater
+          food
+          car
+          bicycle
+          flowers
+          night scene
+          EOF
+
+      - name: Run the real-model AI tests
+        env:
+          CRABCROP_TEST_ORT_DYLIB: ${{ env.AI_ASSETS }}/libonnxruntime.so
+          CRABCROP_TEST_FACE_MODEL: ${{ env.AI_ASSETS }}/yunet.onnx
+          CRABCROP_TEST_REMOVEBG_MODEL: ${{ env.AI_ASSETS }}/u2netp.onnx
+          CRABCROP_TEST_UPSCALE_MODEL: ${{ env.AI_ASSETS }}/sr-x2.onnx
+          CRABCROP_TEST_DETECT_MODEL: ${{ env.AI_ASSETS }}/yolov8n.onnx
+          CRABCROP_TEST_NO_INPUT_MODEL: ${{ env.AI_ASSETS }}/no_inputs.onnx
+          CRABCROP_TEST_IDENTITY_MODEL: ${{ env.AI_ASSETS }}/identity.onnx
+          CRABCROP_TEST_CLIP_IMAGE_MODEL: ${{ env.AI_ASSETS }}/vision_model_quantized.onnx
+          CRABCROP_TEST_CLIP_TEXT_MODEL: ${{ env.AI_ASSETS }}/text_model_quantized.onnx
+          CRABCROP_TEST_CLIP_TOKENIZER: ${{ env.AI_ASSETS }}/tokenizer.json
+          CRABCROP_TEST_CLIP_LABELS: ${{ env.AI_ASSETS }}/labels.txt
+          CRABCROP_TEST_IMAGE: ${{ env.AI_ASSETS }}/bus.jpg
+          # CRABCROP_TEST_DETECT_LABELS is deliberately unset: the
+          # detection tests then read the class names embedded in
+          # the YOLO export, which is the production path.
+        run: cargo test -- --ignored --skip avif_encode_bench --skip real_ffmpeg_encodes_mp4_and_webm
