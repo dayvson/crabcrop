@@ -11,7 +11,10 @@
   },
   "license": "MIT",
   "name": "@crabcrop/url",
-  "repository": "https://github.com/dayvson/crabcrop",
+  "keywords": ["image", "url", "signing", "hmac", "cdn", "crabcrop"],
+  "files": ["dist"],
+  "publishConfig": { "access": "public" },
+  "repository": { "type": "git", "url": "git+https://github.com/dayvson/crabcrop.git", "directory": "sdks/typescript" },
   "scripts": {
     "build": "tsc",
     "prepack": "npm run build",

@@ -1,0 +1,15 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.33.1"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app (shell installer; the Homebrew
+# formula is generated from the release checksums, see RELEASING.md)
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+# Servers and developer machines: Linux and macOS, both architectures.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
