@@ -78,6 +78,23 @@ def purge_group_signature(secret: Union[str, bytes], group: str) -> str:
     return purge_signature(secret, f"purge-group/{group}")
 
 
+def upload_key(secret: Union[str, bytes]) -> bytes:
+    """The upload subkey: the raw bytes of the HMAC-SHA256
+    of the domain label ``crabcrop/upload-key`` under the
+    secret. Upload signatures live under this derived key,
+    so neither an image signature nor a purge signature can
+    be replayed as one."""
+    return bytes.fromhex(sign(secret, "crabcrop/upload-key"))
+
+
+def upload_signature(secret: Union[str, bytes], name: str) -> str:
+    """The signature segment for
+    ``PUT /upload/<signature>/<name>``: HMAC-SHA256 of the
+    object name under the upload subkey."""
+    key = upload_key(secret)
+    return hmac.new(key, name.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
     """Check a signature segment against a remainder, with
     the Rust implementation's semantics: the expected tag

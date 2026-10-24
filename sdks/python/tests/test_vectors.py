@@ -14,6 +14,7 @@ from crabcrop_url import (  # noqa: E402
     purge_group_signature,
     purge_signature,
     sign,
+    upload_signature,
     sign_with_key_id,
     verify,
 )
@@ -59,6 +60,20 @@ class TestPurgeSignatures(unittest.TestCase):
         self.assertEqual(
             purge_group_signature("test-secret", "thumb"),
             purge_signature("test-secret", "purge-group/thumb"),
+        )
+
+
+class TestUploadSignatures(unittest.TestCase):
+    def test_published_vectors(self):
+        # The same pinned literals the Rust crate and the
+        # TypeScript SDK assert.
+        self.assertEqual(
+            upload_signature("test-secret", "heroes/cat.jpg"),
+            "81d87b588203fdad32f5431c0a893bf7ddad8188f5cca123a1b057a439b34b84",
+        )
+        self.assertNotEqual(
+            upload_signature("test-secret", "heroes/cat.jpg"),
+            purge_signature("test-secret", "heroes/cat.jpg"),
         )
 
 

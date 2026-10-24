@@ -7,6 +7,9 @@
 //! header. `GET /health` is the health check and
 //! `GET /metrics` serves Prometheus metrics. Every image request
 //! leaves one structured JSON log line and one metrics update.
+//! When an upload destination is configured, a signed
+//! `PUT /upload/<signature>/<name>` stores originals in it
+//! (issue #168; see [`crate::upload`]).
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -112,6 +115,11 @@ pub struct AppState {
     /// tier behind the local ones, consulted on a local miss
     /// and written through in the background, when configured.
     pub shared_store: Option<Arc<crate::s3store::S3Store>>,
+    /// Upload destination (issue #168): where signed
+    /// `PUT /upload/...` originals land. `None` means the
+    /// endpoint does not exist on this server (the route is
+    /// never registered, so a PUT is a 404, not a refusal).
+    pub upload: Option<Arc<crate::upload::UploadStore>>,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
@@ -156,17 +164,35 @@ pub struct AppState {
 
 /// Build the router.
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/purge/{*path}", axum::routing::post(purge_handle))
         .route(
             "/purge-group/{*path}",
             axum::routing::post(purge_group_handle),
-        )
+        );
+    // The upload route exists only when a destination is
+    // configured (issue #168): an unconfigured server has
+    // no PUT surface at all, so the request is a plain 404.
+    if state.upload.is_some() {
+        router = router.route("/upload/{*path}", axum::routing::put(upload_handle));
+    }
+    router
         .route("/{*path}", get(handle))
+        // A PUT that matched no upload route is a 404, not
+        // the 405 the GET catch-all would otherwise produce
+        // for it: without an upload destination there is no
+        // PUT surface on this server at all (issue #168).
+        .route("/{*path}", axum::routing::put(put_not_found))
         .with_state(state)
         .layer(axum::middleware::from_fn(security_headers))
+}
+
+/// The PUT fallback: every PUT that is not an upload to a
+/// configured destination is simply not found.
+async fn put_not_found() -> Response {
+    (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
 /// Headers applied to every response (audit PL-5, PL-6):
@@ -418,6 +444,163 @@ async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri)
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
 }
 
+/// One structured line per upload request, the purge
+/// precedent (audit PL-8): the write endpoint must be
+/// auditable. The name is hashed for the same reason the
+/// purge target is: a raw name is caller-chosen text.
+fn upload_log(name: &str, outcome: &str) {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(name.as_bytes());
+    let hash: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    println!("{{\"event\":\"upload\",\"target\":\"{hash}\",\"outcome\":\"{outcome}\"}}");
+}
+
+/// `PUT /upload/<signature>/<name>`: store one original
+/// (issue #168). The route is registered only when a
+/// destination is configured, so `upload` here is always
+/// `Some`; the handler still answers 404 without one, so
+/// the rule holds however the state was built.
+///
+/// The signature is an HMAC over the name under an upload
+/// subkey derived from the secret (see
+/// [`crate::url::verify_upload`]): only the secret holder
+/// can upload, an image or purge signature can never be
+/// replayed here, and `unsafe` is never honored. The
+/// checks run cheapest first: signature, name shape, body
+/// size (read with the cap as a hard bound, so an
+/// oversize body is never fully buffered), image decode
+/// through the pipeline's own validation, and the
+/// overwrite policy. On success the body of the response
+/// is the exact source reference to embed in transform
+/// URLs: `201` for a new object, `200` when an allowed
+/// overwrite replaced one.
+async fn upload_handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    let Some(upload) = &state.upload else {
+        return (StatusCode::NOT_FOUND, "uploads are not configured").into_response();
+    };
+    let (parts, body) = req.into_parts();
+    let Some(tail) = parts.uri.path().strip_prefix("/upload/") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected /upload/<signature>/<name>",
+        )
+            .into_response();
+    };
+    let full = format!("/{tail}");
+    let (signature, key_id, name) = match parse_signature(&full) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    if !state
+        .keyring
+        .verify_upload(key_id.as_deref(), &signature, name)
+    {
+        state.metrics.record_upload();
+        upload_log(name, "rejected:bad-signature");
+        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+    }
+    if let Err(e) = crate::upload::validate_upload_name(name) {
+        state.metrics.record_upload();
+        upload_log(name, "rejected:bad-name");
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    // The read is bounded by the cap itself: `to_bytes`
+    // fails the moment the body passes it, which is the
+    // oversize answer (413) without ever holding more
+    // than the cap in memory. Any other read failure is
+    // a bad request body (400).
+    let bytes = match axum::body::to_bytes(body, upload.max_bytes as usize).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            state.metrics.record_upload();
+            upload_log(name, "rejected:oversize-or-unreadable");
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("upload exceeds the {}-byte limit", upload.max_bytes),
+            )
+                .into_response();
+        }
+    };
+    if bytes.is_empty() {
+        state.metrics.record_upload();
+        upload_log(name, "rejected:not-an-image");
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "upload body is empty: an image is required",
+        )
+            .into_response();
+    }
+    // The bytes must decode as an image this server can
+    // serve, through the pipeline's own decode branches:
+    // anything else is refused before it is stored, so
+    // the destination never holds an unservable object.
+    let check = {
+        let bytes = bytes.clone();
+        tokio::task::spawn_blocking(move || crate::engine::validate_source_image(&bytes)).await
+    };
+    match check {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("upload rejected: {e}");
+            state.metrics.record_upload();
+            upload_log(name, "rejected:not-an-image");
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "upload is not an image this server can decode",
+            )
+                .into_response();
+        }
+        Err(_) => {
+            state.metrics.record_upload();
+            upload_log(name, "rejected:validation-failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "image validation failed").into_response();
+        }
+    }
+    let existed = upload.exists(name).await;
+    if existed && !upload.allow_overwrite {
+        state.metrics.record_upload();
+        upload_log(name, "rejected:exists");
+        return (
+            StatusCode::CONFLICT,
+            "an object with this name already exists",
+        )
+            .into_response();
+    }
+    match upload.put(name, &bytes).await {
+        Ok(()) => {
+            state.metrics.record_upload();
+            upload_log(name, if existed { "replaced" } else { "stored" });
+            let status = if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            let mut response = (status, format!("{}\n", upload.source_ref(name))).into_response();
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-crabcrop-source"),
+                axum::http::HeaderValue::from_str(&upload.source_ref(name)).unwrap(),
+            );
+            response
+        }
+        Err(crate::upload::UploadError::Backend(cause)) => {
+            eprintln!("upload failed: {cause}");
+            state.metrics.record_upload();
+            upload_log(name, "rejected:store-failed");
+            (StatusCode::BAD_GATEWAY, "the upload store is unavailable").into_response()
+        }
+        Err(crate::upload::UploadError::Io(cause)) => {
+            eprintln!("upload failed: {cause}");
+            state.metrics.record_upload();
+            upload_log(name, "rejected:store-failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the upload could not be stored",
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Quote one string for a structured-fields string list
 /// (RFC 8941): backslash and quote are escaped.
 fn sf_quote(value: &str) -> String {
@@ -632,11 +815,16 @@ async fn serve(
     // Defense in depth for the purge domain separation (audit
     // P-1): an image remainder may not begin with the `purge`
     // segment, so the two URL shapes can never be confused.
-    if matches!(rest.split('/').next(), Some("purge" | "purge-group")) {
+    // The upload segment (issue #168) is reserved the same
+    // way, for the same reason.
+    if matches!(
+        rest.split('/').next(),
+        Some("purge" | "purge-group" | "upload")
+    ) {
         return (
             (
                 StatusCode::BAD_REQUEST,
-                "an image URL may not begin with a purge segment",
+                "an image URL may not begin with a purge or upload segment",
             )
                 .into_response(),
             record,
@@ -1740,6 +1928,7 @@ mod tests {
             fallback: None,
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -1831,6 +2020,7 @@ mod tests {
             fallback: None,
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -1962,6 +2152,7 @@ mod tests {
             fallback: None,
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2010,6 +2201,7 @@ mod tests {
             fallback: None,
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2061,6 +2253,7 @@ mod tests {
             fallback: Some(Fallback::Bytes(Arc::new(png))),
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2593,6 +2786,7 @@ mod tests {
             fallback: None,
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -2898,6 +3092,7 @@ mod tests {
             fallback: None,
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -3077,6 +3272,7 @@ mod tests {
             fallback: None,
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -3126,6 +3322,7 @@ mod tests {
             store: dir
                 .map(|d| Arc::new(crate::storage::DiskStore::open(d, 16 * 1024 * 1024).unwrap())),
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -4268,6 +4465,7 @@ mod tests {
                 crate::storage::DiskStore::open(dir, 16 * 1024 * 1024).unwrap(),
             )),
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -4318,6 +4516,7 @@ mod tests {
                 "us-east-1".into(),
                 None,
             ))),
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -4665,6 +4864,7 @@ mod tests {
             fallback: None,
             store: None,
             shared_store: None,
+            upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -4987,6 +5187,342 @@ mod tests {
         let sig = sign("");
         let resp = client().get(format!("{base}/{sig}/")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An app with uploads configured (issue #168): a
+    /// local destination at `dir`, which is also the
+    /// loader's file root, exactly as boot wires it. The
+    /// size cap is a parameter so the oversize test can
+    /// use a small one.
+    async fn spawn_app_with_upload(
+        dir: &std::path::Path,
+        max_bytes: u64,
+        allow_overwrite: bool,
+    ) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults()
+                .unwrap()
+                .with_sources(crate::loader::SourceConfig {
+                    file_root: Some(dir.clone()),
+                    ..Default::default()
+                }),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: Some(Arc::new(crate::upload::UploadStore::local(
+                dir,
+                max_bytes,
+                allow_overwrite,
+            ))),
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn upload_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("crabcrop-srv-upload-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn upload_stores_and_the_object_is_served_by_a_transform_url() {
+        let dir = upload_dir("serve");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let name = "heroes/cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            resp.headers().get("x-crabcrop-source").unwrap(),
+            "file:///heroes/cat.png"
+        );
+        let source_ref = resp.text().await.unwrap().trim().to_string();
+        assert_eq!(source_ref, "file:///heroes/cat.png");
+        // The bytes landed verbatim under the name.
+        assert_eq!(
+            std::fs::read(dir.join("heroes/cat.png")).unwrap(),
+            test_png()
+        );
+        // And the returned reference serves through a
+        // normal signed transform URL: 100x60 resized to
+        // exactly 50x30.
+        let remainder = format!("50x30/{source_ref}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.bytes().await.unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (50, 30));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_unsigned_and_wrong_kind_signatures() {
+        let dir = upload_dir("auth");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let name = "cat.png";
+        // No signature segment at all: the path does not
+        // parse as a signed upload.
+        let resp = client()
+            .put(format!("{base}/upload/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // `unsafe` never authorizes a write.
+        let resp = client()
+            .put(format!("{base}/upload/unsafe/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // A transform (image) signature over the name.
+        let resp = client()
+            .put(format!("{base}/upload/{}/{name}", sign(name)))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // A purge signature over the name.
+        let purge_sig = crate::url::purge_signature(SECRET, name);
+        let resp = client()
+            .put(format!("{base}/upload/{purge_sig}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // An upload signature for a different name.
+        let other_sig = crate::url::upload_signature(SECRET, "dog.png");
+        let resp = client()
+            .put(format!("{base}/upload/{other_sig}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Nothing was stored by any of the rejections.
+        assert!(!dir.join(name).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_bad_names_oversize_and_non_images() {
+        let dir = upload_dir("bounds");
+        // A 64-byte cap: the test PNG is larger, a tiny
+        // body is not.
+        let base = spawn_app_with_upload(&dir, 64, false).await;
+        // Oversize: a real PNG past the configured cap.
+        let name = "big.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!dir.join(name).exists());
+        // Non-image bytes under the cap.
+        let name = "note.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(b"this is not an image".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(!dir.join(name).exists());
+        // An empty body is not an image either.
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(Vec::new())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // Bad names: traversal and a leading-dot segment.
+        // The signature is over the name as presented, so
+        // these reach the name check with a valid tag.
+        for bad in ["../secret.png", ".hidden.png", "a//b.png"] {
+            let sig = crate::url::upload_signature(SECRET, bad);
+            let resp = client()
+                .put(format!("{base}/upload/{sig}/{bad}"))
+                .body(b"x".to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn upload_overwrite_is_refused_by_default_and_allowed_by_flag() {
+        let dir = upload_dir("overwrite");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let name = "cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let url = format!("{base}/upload/{sig}/{name}");
+        let resp = client().put(&url).body(test_png()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = client().put(&url).body(test_png()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        // With the flag, the same second PUT replaces and
+        // answers 200.
+        let dir2 = upload_dir("overwrite-ok");
+        let base = spawn_app_with_upload(&dir2, 10 * 1024 * 1024, true).await;
+        let url = format!("{base}/upload/{sig}/{name}");
+        let resp = client().put(&url).body(test_png()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let other = {
+            let img = DynamicImage::new_rgb8(10, 10);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let resp = client().put(&url).body(other.clone()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(dir2.join(name)).unwrap(), other);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn upload_route_is_absent_when_not_configured() {
+        // The plain test app has no upload destination:
+        // the PUT route was never registered, so this is
+        // a 404 (no upload surface at all), not a 403.
+        let base = spawn_app(false).await;
+        let name = "cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn uploads_leave_a_metric_trace() {
+        let dir = upload_dir("metrics");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let name = "cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let resp = client()
+            .put(format!("{base}/upload/deadbeef/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let metrics = client()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(metrics.contains("crabcrop_uploads_total 2"), "{metrics}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cli_upload_stores_and_prints_the_source_reference() {
+        // The CLI verb end to end, mirroring the CLI purge
+        // tests: it mints the upload signature, PUTs the
+        // file, and prints the server's source reference.
+        let dir = upload_dir("cli");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let file = dir.join("local-cat.png");
+        std::fs::write(&file, test_png()).unwrap();
+        let out = crate::cli::exec(&[
+            "upload".to_string(),
+            "--base".to_string(),
+            base.clone(),
+            "--secret".to_string(),
+            "test-secret".to_string(),
+            file.to_string_lossy().to_string(),
+            "heroes/cat.png".to_string(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(out, "file:///heroes/cat.png");
+        assert_eq!(
+            std::fs::read(dir.join("heroes/cat.png")).unwrap(),
+            test_png()
+        );
+        // A second run is the server's 409, surfaced as an
+        // error: the CLI never overwrites silently either.
+        let err = crate::cli::exec(&[
+            "upload".to_string(),
+            "--base".to_string(),
+            base.clone(),
+            "--secret".to_string(),
+            "test-secret".to_string(),
+            file.to_string_lossy().to_string(),
+            "heroes/cat.png".to_string(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(err.contains("409"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

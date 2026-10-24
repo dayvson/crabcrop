@@ -141,6 +141,23 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
     purge_signature(secret, &format!("purge-group/{group}"))
 }
 
+/// The upload subkey: the raw bytes of the HMAC-SHA256 of
+/// the domain label `crabcrop/upload-key` under the secret.
+/// Upload signatures live under this derived key, in their
+/// own domain like purge signatures, so a signature minted
+/// for an image URL (or a purge) can never be replayed
+/// against the upload endpoint (issue #168).
+pub fn upload_key(secret: &[u8]) -> Vec<u8> {
+    hex::decode(sign(secret, "crabcrop/upload-key")).expect("sign returns lowercase hex")
+}
+
+/// The upload signature for an object name: HMAC-SHA256 of
+/// the name under the upload subkey. This is the signature
+/// segment for `PUT /upload/<signature>/<name>`.
+pub fn upload_signature(secret: &[u8], name: &str) -> String {
+    sign(&upload_key(secret), name)
+}
+
 /// Assemble a signed (or `unsafe`) crabcrop URL.
 ///
 /// `operations` is the operation string verbatim (it may hold
@@ -288,6 +305,32 @@ mod tests {
         assert_eq!(
             purge_group_signature(b"test-secret", "thumb"),
             purge_signature(b"test-secret", "purge-group/thumb")
+        );
+    }
+
+    #[test]
+    fn upload_signatures_match_the_published_vectors() {
+        // Pinned literals, one wire scheme across every
+        // implementation (the TypeScript and Python SDKs
+        // assert the same values).
+        assert_eq!(
+            upload_signature(b"test-secret", "heroes/cat.jpg"),
+            "81d87b588203fdad32f5431c0a893bf7ddad8188f5cca123a1b057a439b34b84"
+        );
+        // Domain separation: an upload signature is neither
+        // an image signature nor a purge signature over a
+        // related string.
+        assert_ne!(
+            upload_signature(b"test-secret", "heroes/cat.jpg"),
+            sign(b"test-secret", "heroes/cat.jpg")
+        );
+        assert_ne!(
+            upload_signature(b"test-secret", "heroes/cat.jpg"),
+            purge_signature(b"test-secret", "heroes/cat.jpg")
+        );
+        assert_ne!(
+            upload_signature(b"test-secret", "heroes/cat.jpg"),
+            upload_signature(b"test-secret", "heroes/dog.jpg")
         );
     }
 

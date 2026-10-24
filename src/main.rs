@@ -120,6 +120,17 @@
 //!   declaration is loaded and probed at boot; a broken
 //!   one is a startup error naming it. Unset declares
 //!   none. See the README's AI section for the format.
+//! - `CRABCROP_UPLOAD_DIR` / `CRABCROP_UPLOAD_BUCKET`:
+//!   the upload destination (issue #168), a local directory
+//!   or an S3 bucket (with `CRABCROP_UPLOAD_PREFIX`
+//!   namespacing its objects). Exactly one may be set;
+//!   neither means the upload endpoint does not exist.
+//!   A local directory doubles as the `file://` source
+//!   root when no `CRABCROP_FILE_ROOT` is configured.
+//!   `CRABCROP_UPLOAD_MAX_MB` caps one upload (default
+//!   tied to the source fetch cap, 10 MB), and
+//!   `CRABCROP_UPLOAD_ALLOW_OVERWRITE` (off by default)
+//!   lets a PUT replace an existing object.
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
 //! - `CRABCROP_VIDEO_ENCODER`: path to an external video
@@ -158,6 +169,7 @@ mod svg;
 mod text;
 mod thumbhash;
 mod tokenizer;
+mod upload;
 mod url;
 mod video;
 
@@ -480,6 +492,115 @@ fn build_keyring(get: impl Fn(&str) -> Option<String>) -> Result<crate::url::Key
     Ok(keyring)
 }
 
+/// The default upload cap, in megabytes: the loader's
+/// source cap (issue #168 ties the two, so a stored
+/// original is always one the loader will fetch back).
+const DEFAULT_UPLOAD_MAX_MB: u64 = crate::loader::DEFAULT_MAX_BYTES / (1024 * 1024);
+
+/// Build the upload destination (issue #168) from the
+/// environment, read through `get` so tests can drive it.
+/// Exactly one of `CRABCROP_UPLOAD_DIR` /
+/// `CRABCROP_UPLOAD_BUCKET` may be set; neither disables
+/// uploads. A configured but unusable destination is a
+/// startup error, like every other boot config here.
+/// `sources` is the already-built source configuration:
+/// the bucket destination reuses its S3 endpoint, region,
+/// and credentials, and the caller points the loader's
+/// file root at a local destination (see `run`).
+fn build_upload_store(
+    get: impl Fn(&str) -> Option<String>,
+    sources: &SourceConfig,
+) -> Result<Option<std::sync::Arc<crate::upload::UploadStore>>, String> {
+    let nonempty = |name: &str| get(name).filter(|v| !v.is_empty());
+    let dir = nonempty("CRABCROP_UPLOAD_DIR");
+    let bucket = nonempty("CRABCROP_UPLOAD_BUCKET");
+    if dir.is_some() && bucket.is_some() {
+        return Err(
+            "CRABCROP_UPLOAD_DIR and CRABCROP_UPLOAD_BUCKET are both set: \
+             configure exactly one upload destination"
+                .to_string(),
+        );
+    }
+    if dir.is_none() && bucket.is_none() {
+        return Ok(None);
+    }
+    let max_mb: u64 = parse_env_value(
+        "CRABCROP_UPLOAD_MAX_MB",
+        get("CRABCROP_UPLOAD_MAX_MB"),
+        DEFAULT_UPLOAD_MAX_MB,
+    )?;
+    if max_mb == 0 || max_mb > DEFAULT_UPLOAD_MAX_MB {
+        return Err(format!(
+            "CRABCROP_UPLOAD_MAX_MB must be between 1 and {DEFAULT_UPLOAD_MAX_MB} \
+             (the source fetch cap an uploaded original must stay servable under), got {max_mb}"
+        ));
+    }
+    let max_bytes = max_mb * 1024 * 1024;
+    let allow_overwrite = parse_bool_value(
+        "CRABCROP_UPLOAD_ALLOW_OVERWRITE",
+        get("CRABCROP_UPLOAD_ALLOW_OVERWRITE"),
+        false,
+    )?;
+    match (dir, bucket) {
+        (Some(dir), None) => {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("CRABCROP_UPLOAD_DIR is not usable: {e}"))?;
+            let canonical = std::fs::canonicalize(&dir)
+                .map_err(|e| format!("CRABCROP_UPLOAD_DIR is not usable: {e}"))?;
+            if !canonical.is_dir() {
+                return Err("CRABCROP_UPLOAD_DIR is not a directory".to_string());
+            }
+            if let Some(root) = &sources.file_root
+                && !canonical.starts_with(root)
+            {
+                return Err("CRABCROP_UPLOAD_DIR must be under CRABCROP_FILE_ROOT \
+                     (uploaded objects are served back as file:// sources)"
+                    .to_string());
+            }
+            println!(
+                "uploads enabled: directory {dir} (cap {max_mb} MB, overwrite {allow_overwrite})"
+            );
+            Ok(Some(std::sync::Arc::new(
+                crate::upload::UploadStore::local(canonical, max_bytes, allow_overwrite),
+            )))
+        }
+        (None, Some(bucket)) => {
+            // Signed bucket fetches must not silently gain
+            // a readable bucket (audit L-1's rule, applied
+            // to serving the uploads back): with credentials
+            // configured, the destination bucket must be
+            // in the readable allowlist the boot already
+            // required to be explicit.
+            if sources.aws_creds.is_some()
+                && !sources
+                    .allowed_buckets
+                    .iter()
+                    .any(|b| b == &bucket || b == "*")
+            {
+                return Err(format!(
+                    "CRABCROP_UPLOAD_BUCKET {bucket:?} is not in CRABCROP_ALLOWED_BUCKETS: \
+                     uploaded objects are served back as s3:// sources, so the bucket \
+                     must be a readable source bucket"
+                ));
+            }
+            let prefix = get("CRABCROP_UPLOAD_PREFIX").unwrap_or_default();
+            println!(
+                "uploads enabled: bucket {bucket} (cap {max_mb} MB, overwrite {allow_overwrite})"
+            );
+            Ok(Some(std::sync::Arc::new(crate::upload::UploadStore::s3(
+                bucket,
+                prefix,
+                sources.s3_endpoint.clone(),
+                sources.s3_region.clone(),
+                sources.aws_creds.clone(),
+                max_bytes,
+                allow_overwrite,
+            ))))
+        }
+        _ => unreachable!("the both-set and neither-set cases returned above"),
+    }
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let keyring = build_keyring(|name| env::var(name).ok())?;
     let allow_unsafe = parse_bool("CRABCROP_ALLOW_UNSAFE", false)?;
@@ -522,7 +643,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     let block_private = parse_bool("CRABCROP_BLOCK_PRIVATE_SOURCES", false)?;
     let policy = SourcePolicy::new(allowed_sources, block_private);
-    let sources = build_source_config(|name| env::var(name).ok())?;
+    let mut sources = build_source_config(|name| env::var(name).ok())?;
+    // The upload destination (issue #168), built after the
+    // source configuration it reuses. A local destination
+    // becomes the file source root when none is configured,
+    // so uploaded objects serve back without a second knob;
+    // a configured root was already checked to contain it.
+    let upload = build_upload_store(|name| env::var(name).ok(), &sources)?;
+    if let Some(store) = &upload
+        && let Some(dir) = store.local_dir()
+        && sources.file_root.is_none()
+    {
+        sources.file_root = Some(dir.to_path_buf());
+    }
     let (presets, only_presets) = build_presets(|name| env::var(name).ok())?;
     // Server-wide default operations (issue #145): parsed
     // and validated now, so a bad string is a boot error
@@ -627,6 +760,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         fallback,
         store,
         shared_store,
+        upload,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate: Arc::new(tokio::sync::Semaphore::new(
             std::thread::available_parallelism()
@@ -1500,6 +1634,93 @@ mod tests {
         let dir = std::env::temp_dir().to_string_lossy().into_owned();
         let sources = build_source_config(env_of(&[("CRABCROP_FILE_ROOT", dir.as_str())])).unwrap();
         assert!(sources.file_root.is_some());
+    }
+
+    #[test]
+    fn upload_store_construction_follows_the_destination_rules() {
+        let plain = SourceConfig::default();
+        // Neither destination: uploads are off, not an error.
+        assert!(build_upload_store(env_of(&[]), &plain).unwrap().is_none());
+        // Both destinations: a startup error.
+        let err = expect_err(build_upload_store(
+            env_of(&[
+                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_BUCKET", "uploads"),
+            ]),
+            &plain,
+        ));
+        assert!(err.contains("exactly one upload destination"), "{err}");
+        // A local destination constructs with the defaults:
+        // 10 MB cap (the source cap), overwrite off.
+        let store = build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", "/tmp")]), &plain)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.max_bytes, 10 * 1024 * 1024);
+        assert!(!store.allow_overwrite);
+        assert!(store.local_dir().is_some());
+        // The cap may only move down from the source cap.
+        let err = expect_err(build_upload_store(
+            env_of(&[
+                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_MAX_MB", "11"),
+            ]),
+            &plain,
+        ));
+        assert!(err.contains("CRABCROP_UPLOAD_MAX_MB"), "{err}");
+        let store = build_upload_store(
+            env_of(&[
+                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_MAX_MB", "2"),
+                ("CRABCROP_UPLOAD_ALLOW_OVERWRITE", "true"),
+            ]),
+            &plain,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(store.max_bytes, 2 * 1024 * 1024);
+        assert!(store.allow_overwrite);
+        // A local destination outside a configured file
+        // root is refused: its objects could never serve.
+        let rooted = build_source_config(env_of(&[(
+            "CRABCROP_FILE_ROOT",
+            std::env::temp_dir().to_string_lossy().as_ref(),
+        )]))
+        .unwrap();
+        // /tmp IS the temp dir here, so it is under the root.
+        assert!(
+            build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", "/tmp")]), &rooted)
+                .unwrap()
+                .is_some()
+        );
+        let err = expect_err(build_upload_store(
+            env_of(&[("CRABCROP_UPLOAD_DIR", "/")]),
+            &rooted,
+        ));
+        assert!(err.contains("CRABCROP_FILE_ROOT"), "{err}");
+        // A bucket destination with credentials must be in
+        // the readable allowlist, or its objects could
+        // never serve back.
+        let signed = build_source_config(env_of(&[
+            ("AWS_ACCESS_KEY_ID", "AKID"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("CRABCROP_ALLOWED_BUCKETS", "photos"),
+        ]))
+        .unwrap();
+        let err = expect_err(build_upload_store(
+            env_of(&[("CRABCROP_UPLOAD_BUCKET", "uploads")]),
+            &signed,
+        ));
+        assert!(err.contains("CRABCROP_ALLOWED_BUCKETS"), "{err}");
+        let store = build_upload_store(
+            env_of(&[
+                ("CRABCROP_UPLOAD_BUCKET", "photos"),
+                ("CRABCROP_UPLOAD_PREFIX", "orig"),
+            ]),
+            &signed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(store.source_ref("a/b.jpg"), "s3://photos/orig/a/b.jpg");
     }
 
     #[test]

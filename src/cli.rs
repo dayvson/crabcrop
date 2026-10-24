@@ -1,10 +1,11 @@
 //! Operator CLI verbs, dispatched from `main` before the
 //! server starts: `sign`, `explain`, `meta`, `purge`,
-//! `purge-group`, and `convert-thumbor`. Configuration comes
-//! from `--base` / `--secret` flags over `CRABCROP_BASE` /
-//! `CRABCROP_SECRET`, the same convention as the MCP server.
-//! The verbs use the server's own URL grammar, so what the
-//! CLI validates is what the server will do.
+//! `purge-group`, `upload`, and `convert-thumbor`.
+//! Configuration comes from `--base` / `--secret` flags
+//! over `CRABCROP_BASE` / `CRABCROP_SECRET`, the same
+//! convention as the MCP server. The verbs use the
+//! server's own URL grammar, so what the CLI validates
+//! is what the server will do.
 
 use crate::url::{
     Dimension, Filter, FlipDirection, ImageFormat, MaskShape, Operation, Quality, Signature,
@@ -23,6 +24,9 @@ CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_
                                       (--placeholders / --detections ask for those fields.)
   crabcrop purge <url-or-remainder>   Purge one URL's cached variants.
   crabcrop purge-group <name>         Purge every cached entry in a preset group.
+  crabcrop upload <file> [<name>]     Upload an original to the server's upload store
+                                      (name defaults to the file's basename); prints the
+                                      source reference to use in transform URLs.
   crabcrop convert-thumbor <url>      Convert a Thumbor URL to a crabcrop URL.";
 
 struct Config {
@@ -213,6 +217,7 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
         "meta" => meta(&config, &positional).await,
         "purge" => purge(&config, &positional).await,
         "purge-group" => purge_group(&config, &positional).await,
+        "upload" => upload(&config, &positional).await,
         "convert-thumbor" => convert_thumbor_cmd(&config, &positional),
         _ => Err(format!("unknown verb {verb:?}\n\n{USAGE}")),
     }
@@ -574,6 +579,52 @@ async fn purge_group(config: &Config, positional: &[String]) -> Result<String, S
         &format!("{}/purge-group/{segment}/{name}", config.base),
     )
     .await
+}
+
+/// Upload one local file as an original (issue #168):
+/// mint the upload signature for the target name, PUT the
+/// file's bytes, and print the source reference the
+/// server answers with. The name is validated with the
+/// server's own rule before anything is sent, and the
+/// file's size is not pre-checked: the server's cap is
+/// the authority, and its 413 is a clean error here.
+async fn upload(config: &Config, positional: &[String]) -> Result<String, String> {
+    let (file, name) = match positional {
+        [file] => {
+            let name = std::path::Path::new(file)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .ok_or_else(|| format!("cannot derive an upload name from {file:?}\n\n{USAGE}"))?;
+            (file.clone(), name)
+        }
+        [file, name] => (file.clone(), name.clone()),
+        [] => return Err(format!("upload needs a file\n\n{USAGE}")),
+        _ => {
+            return Err(format!(
+                "upload takes a file and an optional name\n\n{USAGE}"
+            ));
+        }
+    };
+    crate::upload::validate_upload_name(&name)?;
+    let secret = require_secret(config)?;
+    let bytes = std::fs::read(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let sig = crate::url::upload_signature(secret, &name);
+    let segment = match &config.key_id {
+        Some(kid) => format!("{kid}:{sig}"),
+        None => sig,
+    };
+    let response = http_client()?
+        .put(format!("{}/upload/{segment}/{name}", config.base))
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {}", body.trim()));
+    }
+    Ok(body.trim().to_string())
 }
 
 async fn post_purge(config: &Config, url: &str) -> Result<String, String> {
@@ -1240,6 +1291,18 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn upload_validates_the_name_before_any_request() {
+        // A traversal name is refused by the shared rule,
+        // locally, before a secret or a server is needed.
+        let err = exec(&args(&["upload", "whatever.png", "../secret.png"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("must not start with '.'"), "{err}");
+        // No file argument is a usage error.
+        assert!(exec(&args(&["upload"])).await.is_err());
     }
 
     #[tokio::test]
