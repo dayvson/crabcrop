@@ -297,6 +297,8 @@ fn format_name(format: ImageFormat) -> &'static str {
         ImageFormat::Gif => "gif",
         ImageFormat::Jxl => "jxl",
         ImageFormat::Avif => "avif",
+        ImageFormat::Mp4 => "mp4",
+        ImageFormat::WebM => "webm",
     }
 }
 
@@ -308,6 +310,8 @@ fn parse_format(name: &str) -> Option<ImageFormat> {
         "gif" => ImageFormat::Gif,
         "jxl" => ImageFormat::Jxl,
         "avif" => ImageFormat::Avif,
+        "mp4" => ImageFormat::Mp4,
+        "webm" => ImageFormat::WebM,
         _ => return None,
     })
 }

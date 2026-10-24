@@ -259,7 +259,7 @@ curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/
 
 | Directive | Parameters | Description | Example |
 | --- | --- | --- | --- |
-| `format` | `format(webp)` — `jpeg` (or `jpg`), `png`, `webp`, `jxl`, `avif`, `gif` | Output format. Overrides `Accept` negotiation. | `filters:format(avif)` |
+| `format` | `format(webp)` — `jpeg` (or `jpg`), `png`, `webp`, `jxl`, `avif`, `gif`, `mp4`, `webm` | Output format. Overrides `Accept` negotiation. The video formats are explicit-only (never negotiated) and need an animated source plus a configured encoder; see [Video output](#video-output). | `filters:format(avif)` |
 | `quality` | `quality(80)` — 1 to 100, or `quality(auto)` | Encoding quality for JPEG, JPEG XL, AVIF, and WebP. Default 80. | `filters:quality(auto)` |
 | `max_bytes` | `max_bytes(50000)` — byte budget, at least 1 | Re-encode at decreasing quality until the output fits the budget. | `filters:max_bytes(50000)` |
 | `fill` | `fill(ff0000)` — six hex digits, RGB | Background color used to flatten transparency when encoding to JPEG. | `filters:fill(ffffff)` |
@@ -403,7 +403,45 @@ When the URL names no `format(...)`, crabcrop picks the output format from the r
 2. `image/jxl` → JPEG XL
 3. `image/webp` → WebP
 
-So `Accept: image/avif;q=0.5, image/webp` produces WebP: the client's stronger preference beats the server's. If none of the three is offered, the source image's format is kept (JPEG if the format cannot be detected). A format refused with `q=0` is never picked, and wildcards such as `*/*` do not count as an offer. An explicit `format(...)` in the URL always wins over negotiation. Animated GIF and WebP sources are the one exception: they never negotiate to JPEG XL, which would drop their frames; a GIF source keeps GIF instead, and a WebP source keeps WebP. Responses include a `Vary` covering `Accept` and the client hints so downstream caches key this correctly (the hints likewise change sizing and quality; see [Client hints](#client-hints)).
+So `Accept: image/avif;q=0.5, image/webp` produces WebP: the client's stronger preference beats the server's. If none of the three is offered, the source image's format is kept (JPEG if the format cannot be detected). A format refused with `q=0` is never picked, and wildcards such as `*/*` do not count as an offer. An explicit `format(...)` in the URL always wins over negotiation. Animated GIF and WebP sources are the one exception: they never negotiate to JPEG XL, which would drop their frames; a GIF source keeps GIF instead, and a WebP source keeps WebP. Video is the other exception: `mp4` and `webm` are never negotiated at all, and only ever come from an explicit `format(...)` (see [Video output](#video-output)). Responses include a `Vary` covering `Accept` and the client hints so downstream caches key this correctly (the hints likewise change sizing and quality; see [Client hints](#client-hints)).
+
+## Video output
+
+An animated GIF or WebP can also be served as real video: H.264 MP4 or VP9 WebM, the gifv pattern that plays inline everywhere and weighs a fraction of the GIF. Ask with an explicit format filter:
+
+```
+/<signature>/filters:format(mp4)/https://example.com/animation.gif
+```
+
+Crabcrop ships no codec. The encode runs in an external program you configure, `CRABCROP_VIDEO_ENCODER`: the path to an encoder executable on the server, with FFmpeg as the reference. The path is validated at startup (it must exist and be executable, or the server refuses to boot). With the variable unset, video is off and a video URL answers `501`, exactly like an AI filter with no model. And there is no silent fallback: a failed encode is an error response, never the GIF.
+
+### The encoder contract
+
+Crabcrop runs the program directly, with no shell and an argv it constructs; only the program path is yours. Frames go in on stdin as raw RGBA and the video comes out on stdout:
+
+```
+<encoder> -nostdin -v error -f rawvideo -pix_fmt rgba -s <W>x<H> -r <fps> -i pipe:0 -an -vf format=yuv420p <codec args> pipe:1
+```
+
+For MP4 the codec args are `-c:v libx264 -preset veryfast -crf 23 -movflags frag_keyframe+empty_moov+default_base_moof -f mp4`. The fragmented-MP4 flags are what make MP4 writable to a pipe at all; a plain MP4 needs a seekable file to finish its index. For WebM they are `-c:v libvpx-vp9 -b:v 0 -crf 30 -f webm`. A wrapper script that passes its arguments through to a real encoder (one ending in `exec ffmpeg "$@"`, say) satisfies the contract, which is how you bring an encoder build of your own. Because the codec lives outside crabcrop, so does codec licensing: H.264 patent pools and friends are the operator's concern, and that separation is the point. Output bytes vary with the encoder build, so byte-for-byte reproducibility across deployments is not promised; the URL grammar and the errors are.
+
+Details an encoder setup has to match:
+
+- Frames are composited over black and padded up to even dimensions (H.264 and VP9 need them) by replicating the edge pixels. The response describes the padded dimensions.
+- Frame timing: the pipe contract carries one constant rate, so crabcrop picks it from the fastest frame, `ceil(1000 / shortest delay)` clamped to 1-100 fps (10 fps when no frame carries a delay), and repeats each frame `round(delay × fps / 1000)` times, at least once. Total duration is preserved to within one frame period per source frame. A source whose delays total more than 600 s is refused with a `400`.
+- At most two encodes run at a time, each under a hard wall-clock timeout (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s) after which the encoder is killed, and a hard output cap (`CRABCROP_VIDEO_MAX_MB`, default 64 MB) that aborts the encode the moment it is crossed. The encoder runs with an empty environment; nothing is inherited from the server's.
+
+### Errors
+
+| Situation | Answer |
+| --- | --- |
+| No encoder configured | `501`: `video output is not configured on this server` |
+| Still source (a still image, or a one-frame GIF or WebP) | `400`: the source is a still image, and video needs an animated source |
+| Animation over the 600 s cap | `400` |
+| Encoder exits nonzero, produces nothing, exceeds the cap, or times out | `502`: `video encoder failed: ...`, with the encoder's stderr excerpt |
+| Encode queue full (both slots busy past a 10 s wait) | `503` |
+
+Video results cache like any other response, under the video content type (`video/mp4` or `video/webm`), and every operation in the URL (resize, crop, filters) applies per frame before the encode. A meta request (`Accept: application/json`) on a video URL answers `400`: meta describes images, and a video result is not one.
 
 ## Meta responses
 
@@ -433,7 +471,7 @@ Add the `placeholders` parameter to the media type to also get placeholder data,
 curl -H "Accept: application/json; placeholders=1" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
 ```
 
-This adds four fields: `dominant_color`, the image's average color as `#rrggbb`; `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI; `palette`, the five most prominent colors as `#rrggbb`, most prominent first; and `thumbhash`, a ThumbHash string that ThumbHash client libraries decode into an aspect-correct blurred preview. Handy for rendering a preview while the real image loads. When a CLIP model is configured (see [AI features](#ai-features)), meta responses also carry `tags` (labels with zero-shot scores) and `alt_text` composed from the best labels, whether or not placeholders were asked for. With a detection model configured, adding `detections=1` to the same `Accept` entry adds `detections`: the objects found in the processed image as `{label, score, x, y, w, h}` in pixels, best first. Meta requests are never cached. Errors in meta mode keep the usual status codes, and grammar failures answer with the JSON error envelope described in [Errors](#errors).
+This adds four fields: `dominant_color`, the image's average color as `#rrggbb`; `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI; `palette`, the five most prominent colors as `#rrggbb`, most prominent first; and `thumbhash`, a ThumbHash string that ThumbHash client libraries decode into an aspect-correct blurred preview. Handy for rendering a preview while the real image loads. When a CLIP model is configured (see [AI features](#ai-features)), meta responses also carry `tags` (labels with zero-shot scores) and `alt_text` composed from the best labels, whether or not placeholders were asked for. With a detection model configured, adding `detections=1` to the same `Accept` entry adds `detections`: the objects found in the processed image as `{label, score, x, y, w, h}` in pixels, best first. Meta requests are never cached. One refusal: a meta request on a video URL answers `400`, because a video result is not an image (see [Video output](#video-output)). Errors in meta mode keep the usual status codes, and grammar failures answer with the JSON error envelope described in [Errors](#errors).
 
 ## Responses
 
@@ -474,11 +512,11 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 
 | Status | Meaning |
 | --- | --- |
-| `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image. |
+| `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image, a video format asked of a still source. |
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
 | `500` | Encoding the output failed, or an AI model failed at inference time (the runtime errored, or a model session lock was poisoned by an earlier failure). A model that cannot be loaded at all fails startup instead of answering requests. |
-| `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font. |
-| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image — including HEIC sources, AVIF sources in builds without AVIF decoding, and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). |
+| `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font, a video format with no encoder configured. |
+| `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image — including HEIC sources, AVIF sources in builds without AVIF decoding, and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). A configured video encoder that fails, times out, or exceeds its output cap also lands here. |
 | `504` | The source fetch timed out (10 seconds). |
 
 For example, a `removebg` request to a server with no background-removal model returns `501` with the body `removebg is not configured on this server`.
@@ -588,6 +626,9 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_DETECT_THRESHOLD` | `0.5` | Minimum detection score. |
 | `CRABCROP_ORT_DYLIB` | unset | Path to the ONNX Runtime shared library, when it is not on the library search path. |
 | `CRABCROP_FONT_PATH` | unset | Path to a TTF/OTF font for the `text(...)` overlay filter, loaded at startup. Unset disables the filter. |
+| `CRABCROP_VIDEO_ENCODER` | unset | Path to the external video encoder program for `format(mp4)` / `format(webm)`, validated at startup. Unset disables video output. See [Video output](#video-output). |
+| `CRABCROP_VIDEO_TIMEOUT_SECS` | `30` | Hard wall-clock limit per video encode, 1 to 600 seconds. |
+| `CRABCROP_VIDEO_MAX_MB` | `64` | Output cap per video encode in megabytes, 1 to 1024. The encode aborts the moment it is crossed. |
 | `CRABCROP_FALLBACK_IMAGE` | unset | URL or local file path of the fallback image served when a source cannot be fetched or decoded. See [Fallback image](#fallback-image). |
 | `CRABCROP_RESULT_STORAGE_DIR` | unset | Directory for the disk-backed result store. Unset disables the second cache tier. |
 | `CRABCROP_RESULT_BUCKET` | unset | S3 bucket for the shared result store (multi-replica third tier). Unset disables it. |

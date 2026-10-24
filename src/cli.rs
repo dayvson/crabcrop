@@ -486,6 +486,8 @@ fn format_name(format: ImageFormat) -> &'static str {
         ImageFormat::WebP => "webp",
         ImageFormat::Avif => "avif",
         ImageFormat::Jxl => "jxl",
+        ImageFormat::Mp4 => "mp4",
+        ImageFormat::WebM => "webm",
     }
 }
 

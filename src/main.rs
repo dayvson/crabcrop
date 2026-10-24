@@ -114,6 +114,16 @@
 //!   the score floor (default 0.5).
 //! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
 //!   library, when it is not on the loader's search path.
+//! - `CRABCROP_VIDEO_ENCODER`: path to an external video
+//!   encoder program (FFmpeg is the reference) that
+//!   `format(mp4)` / `format(webm)` output runs under the
+//!   fixed pipe contract (frames in as rawvideo on stdin,
+//!   video out on stdout). Validated at boot: a set but
+//!   unusable path is a startup error. Unset disables
+//!   video output (requests fail cleanly with 501).
+//!   `CRABCROP_VIDEO_TIMEOUT_SECS` bounds one encode
+//!   (default 30, 1 to 600) and `CRABCROP_VIDEO_MAX_MB`
+//!   caps its output (default 64, 1 to 1024).
 //! - `PORT`: listen port, default 3000.
 
 #![forbid(unsafe_code)]
@@ -139,6 +149,7 @@ mod text;
 mod thumbhash;
 mod tokenizer;
 mod url;
+mod video;
 
 use std::env;
 use std::sync::Arc;
@@ -634,6 +645,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    // The video encoder (issue #162): an operator-supplied
+    // program, validated now, so a configured but unusable
+    // path is a boot error rather than a surprise at the
+    // first video request. The bounds parse unconditionally:
+    // a typo'd bound is a boot error even before the
+    // encoder itself is configured.
+    let video_timeout_secs: u64 = parse_env(
+        "CRABCROP_VIDEO_TIMEOUT_SECS",
+        crate::video::DEFAULT_TIMEOUT_SECS,
+    )?;
+    if !(1..=600).contains(&video_timeout_secs) {
+        return Err(format!(
+            "CRABCROP_VIDEO_TIMEOUT_SECS must be between 1 and 600, got {video_timeout_secs}"
+        )
+        .into());
+    }
+    let video_max_mb: usize =
+        parse_env("CRABCROP_VIDEO_MAX_MB", crate::video::DEFAULT_MAX_OUTPUT_MB)?;
+    if !(1..=1024).contains(&video_max_mb) {
+        return Err(format!(
+            "CRABCROP_VIDEO_MAX_MB must be between 1 and 1024, got {video_max_mb}"
+        )
+        .into());
+    }
+    let video_encoder = match env::var("CRABCROP_VIDEO_ENCODER") {
+        Ok(path) if !path.is_empty() => {
+            let max_bytes = video_max_mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| "CRABCROP_VIDEO_MAX_MB is too large".to_string())?;
+            let encoder = crate::video::VideoEncoder::new(
+                path.clone(),
+                std::time::Duration::from_secs(video_timeout_secs),
+                max_bytes,
+            )
+            .map_err(|e| format!("cannot use CRABCROP_VIDEO_ENCODER ({path}): {e}"))?;
+            println!(
+                "video encoder: {path} (timeout {video_timeout_secs}s, output cap {video_max_mb} MB)"
+            );
+            Some(Arc::new(encoder))
+        }
+        _ => None,
+    };
+
     let state = AppState {
         keyring,
         allow_unsafe,
@@ -668,6 +722,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         presets,
         only_presets,
         default_ops,
+        video_encoder,
+        video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
     };
     println!("crabcrop listening on port {port}");
     axum::serve(listener, app(state)).await?;
