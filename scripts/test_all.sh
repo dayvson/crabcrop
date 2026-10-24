@@ -79,4 +79,7 @@ for url in "http://127.0.0.1:8909/src00.jpg" "http://127.0.0.1:3321/health"; do
 done
 (cd playground && npm run test:integration)
 
+step "Fuzz smoke (parser invariants, corpus + mutations)"
+cargo test --manifest-path fuzz/Cargo.toml --lib --test smoke
+
 step "All suites passed"

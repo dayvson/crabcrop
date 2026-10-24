@@ -1,0 +1,1 @@
+/unsafe/filters:watermark(https://example.com/wm.png,10,10,128):text(Hello,24,ffffff,10,10)/example.com/img.jpg

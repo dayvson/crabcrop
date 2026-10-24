@@ -3,3 +3,7 @@
 node_modules/
 dist/
 __pycache__/
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/parse_request/*
+!fuzz/corpus/parse_request/seed-*

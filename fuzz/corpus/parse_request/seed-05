@@ -1,0 +1,1 @@
+/unsafe/filters:huerotate(90):sharpen(0.5):saturation(2):rgb(1,-2,3):equalize/example.com/img.jpg
