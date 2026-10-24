@@ -6,10 +6,12 @@
 # is preloaded at boot, so a broken payload fails the
 # container at startup, not at first use.
 #
-# All downloads are checksum-pinned at the ADD (audit
-# PL-13), and the extracted runtime library is hash-checked
-# again after extraction. The model is a deployment
-# artifact: it is never committed to this repo.
+# All downloads are checksum-pinned and verified before use
+# (audit PL-13): the ONNX Runtime tarball hash is checked
+# before extraction and the extracted library again after,
+# per architecture; the models are pinned at the ADD. The
+# model is a deployment artifact: it is never committed to
+# this repo.
 #
 # The base is an explicit build argument so a build cannot
 # silently layer onto a stale local image: pass a digest for
@@ -18,16 +20,39 @@
 ARG BASE_IMAGE=crabcrop:latest
 FROM ${BASE_IMAGE}
 
-ADD --checksum=sha256:cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57 https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz /tmp/ort.tgz
-RUN tar -xzf /tmp/ort.tgz -C /tmp \
-    && mkdir -p /opt/onnxruntime \
-    && cp /tmp/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0 /opt/onnxruntime/libonnxruntime.so \
-    && echo "469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e  /opt/onnxruntime/libonnxruntime.so" | sha256sum -c - \
-    && rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-x64-1.31.0
+# The base image runs as nobody; the payload steps below
+# write to /opt and /models and need root. The runtime user
+# is restored at the end of this file.
+USER root
+
+# ONNX Runtime publishes per-architecture tarballs; pick the
+# one matching the target platform and verify both hashes.
+ARG TARGETARCH
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) ort_arch=x64; \
+             tgz_sha=cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57; \
+             so_sha=469849977cb60744ea160927e1a3a0643fd4c55c0aff743251c6d293402e334e ;; \
+      arm64) ort_arch=aarch64; \
+             tgz_sha=c5b8b3cca31f3d643a3b313b8f42e2d0f16a4fcefd02cda343d97bd5306afaab; \
+             so_sha=595c7f7a6775f5c7b3d567c3ed94c04f722092575abcc092560f5208a54daf99 ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-${ort_arch}-1.31.0.tgz" -o /tmp/ort.tgz; \
+    echo "$tgz_sha  /tmp/ort.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/ort.tgz -C /tmp; \
+    mkdir -p /opt/onnxruntime; \
+    cp "/tmp/onnxruntime-linux-${ort_arch}-1.31.0/lib/libonnxruntime.so.1.31.0" /opt/onnxruntime/libonnxruntime.so; \
+    echo "$so_sha  /opt/onnxruntime/libonnxruntime.so" | sha256sum -c -; \
+    rm -rf /tmp/ort.tgz "/tmp/onnxruntime-linux-${ort_arch}-1.31.0"
 
 ADD --checksum=sha256:309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8 https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx /models/u2netp.onnx
 
 ADD --checksum=sha256:8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4 https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx /models/yunet.onnx
+
+# Remote ADD files land mode 0600; the runtime user (nobody)
+# must be able to read the models at boot preload.
+RUN chmod 644 /models/u2netp.onnx /models/yunet.onnx
 
 # The upscale model follows the same rule (layered artifact,
 # preloaded at boot). Super-resolution ONNX exports are less
@@ -40,3 +65,6 @@ ENV ORT_DISABLE_TELEMETRY=1 \
     CRABCROP_ORT_DYLIB=/opt/onnxruntime/libonnxruntime.so \
     CRABCROP_REMOVEBG_MODEL=/models/u2netp.onnx \
     CRABCROP_FACE_MODEL=/models/yunet.onnx
+
+# Restore the base image's runtime user.
+USER nobody
