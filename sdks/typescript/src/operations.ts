@@ -385,6 +385,17 @@ export const filter = {
     return `convolution(${values.map(num).join(",")},${flag})`;
   },
   /**
+   * Film grain: one noise value per pixel, added equally
+   * to all three channels (alpha untouched), the value
+   * uniform in plus or minus the given percent of full
+   * scale. The field is deterministic, seeded from the
+   * image content and the amount, so the same request
+   * always renders the same bytes; 0 is a no-op.
+   */
+  noise(amount: number): string {
+    return `noise(${intIn("noise amount", amount, 0, 100)})`;
+  },
+  /**
    * Rotate by an angle in degrees (decimals allowed, no
    * exponent spelling); multiples of 90 are exact quarter
    * turns on the server.

@@ -66,6 +66,12 @@
     "signature": "b020df4afd3d889e0c80a8e919a3ebe3b689797aef3b8904e1c434ed50a99733"
   },
   {
+    "description": "Noise filter",
+    "secret": "s3cr3t",
+    "remainder": "filters:noise(40)/https://example.com/photo.jpg",
+    "signature": "622f9da6e9e6f5989672894607c6be4c3d0f4d003b7e40beae33b2e11dfbb731"
+  },
+  {
     "description": "Smart-crop debug view",
     "secret": "s3cr3t",
     "remainder": "debug:focal/crop:100x100:smart/https://example.com/photo.jpg",

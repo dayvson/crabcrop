@@ -2699,6 +2699,38 @@ mod tests {
     }
 
     #[test]
+    fn noise_flows_through_engine_and_is_deterministic() {
+        let engine = Engine;
+        let run = |filters: Vec<Filter>| {
+            engine
+                .process(
+                    &gradient_png(),
+                    &[
+                        size_op(Dimension::Pixels(32), Dimension::Pixels(32)),
+                        Operation::Filters(filters),
+                    ],
+                )
+                .unwrap()
+        };
+        // The filter composes with resize and a format
+        // directive like any other pixel filter.
+        let noisy = run(vec![Filter::Noise(60), Filter::Format(ImageFormat::Png)]);
+        assert_eq!(noisy.format, ImageFormat::Png);
+        let decoded = image::load_from_memory(&noisy.bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (32, 32));
+        // The same request renders the same bytes on a
+        // second run: the field is seeded from content.
+        let again = run(vec![Filter::Noise(60), Filter::Format(ImageFormat::Png)]);
+        assert_eq!(noisy.bytes, again.bytes);
+        // And it is not the clean image.
+        let clean = run(vec![Filter::Format(ImageFormat::Png)]);
+        assert_ne!(noisy.bytes, clean.bytes);
+        // Amount 0 is a byte-identical no-op end to end.
+        let zero = run(vec![Filter::Noise(0), Filter::Format(ImageFormat::Png)]);
+        assert_eq!(zero.bytes, clean.bytes);
+    }
+
+    #[test]
     fn jxl_format_encodes() {
         let engine = Engine;
         let out = engine

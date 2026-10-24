@@ -410,6 +410,7 @@ fn describe_filter(filter: &Filter) -> String {
             text.push_str("): apply the kernel to the image");
             text
         }
+        Filter::Noise(v) => format!("noise({v}): add deterministic film grain"),
         Filter::Equalize => "equalize: histogram equalization".into(),
         Filter::Rotate(v) => format!("rotate({v}): rotate by a multiple of 90 degrees"),
         Filter::Trim(v) => format!("trim({v}): trim near-uniform borders"),
@@ -1279,6 +1280,7 @@ mod tests {
                 ],
                 true,
             ),
+            Filter::Noise(40),
             Filter::Flip(FlipDirection::Horizontal),
             Filter::Flip(FlipDirection::Vertical),
             Filter::Quality(Quality::Value(80)),

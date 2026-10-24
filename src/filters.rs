@@ -112,6 +112,9 @@ pub fn apply_filters_filled(
             Filter::Convolution(values, normalize) => {
                 img = convolve(&img, values, *normalize);
             }
+            Filter::Noise(amount) => {
+                img = add_noise(&img, *amount);
+            }
             Filter::Equalize => {
                 img = DynamicImage::ImageRgb8(equalize(&img.into_rgb8()));
             }
@@ -414,6 +417,71 @@ pub fn convolve(img: &DynamicImage, kernel: &[f64], normalize: bool) -> DynamicI
         DynamicImage::ImageRgba8(out)
     } else {
         DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(out).to_rgb8())
+    }
+}
+
+/// SplitMix64: a small deterministic 64-bit generator,
+/// used here only to turn a content seed into a noise
+/// field. Same seed, same stream, on every platform: the
+/// arithmetic is all wrapping integer math.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+/// The noise field's seed: an FNV-1a (64-bit) hash of the
+/// image's RGBA pixel buffer, with the amount folded in,
+/// so the field depends on both what the image is and how
+/// much grain was asked for. Same input and amount, same
+/// seed, same field, same bytes out: result caching stays
+/// sound and no RNG state or clock is involved.
+fn noise_seed(bytes: &[u8], amount: u8) -> u64 {
+    let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash ^ u64::from(amount).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Add monochrome film grain: one noise value per pixel,
+/// drawn in row-major order and applied equally to the
+/// red, green, and blue channels (alpha untouched), so
+/// the result reads as grain rather than colour speckle.
+/// `amount` is a percent of full scale: the value is
+/// uniform over plus or minus `amount * 255 / 100` (the
+/// amplitude, rounded to the nearest step), so 100 swings
+/// a channel by up to 255 in either direction before the
+/// clamp to 0-255. The field is deterministic (see
+/// [`noise_seed`]), and amount 0 returns the image
+/// untouched, byte for byte.
+pub fn add_noise(img: &DynamicImage, amount: u8) -> DynamicImage {
+    if amount == 0 {
+        return img.clone();
+    }
+    let has_alpha = img.color().has_alpha();
+    let mut rgba = img.to_rgba8();
+    let seed = noise_seed(rgba.as_raw(), amount);
+    let mut rng = SplitMix64(seed);
+    let amplitude = (i32::from(amount) * 255 + 50) / 100;
+    let span = (2 * amplitude + 1) as u64;
+    for p in rgba.pixels_mut() {
+        let delta = (rng.next_u64() % span) as i32 - amplitude;
+        for c in 0..3 {
+            p[c] = (i32::from(p[c]) + delta).clamp(0, 255) as u8;
+        }
+    }
+    if has_alpha {
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba).to_rgb8())
     }
 }
 
@@ -1358,6 +1426,105 @@ mod tests {
         // corner once: (360, 450, 540) / 9 = (40, 50, 60).
         assert_eq!(rgba.get_pixel(0, 0).0, [40, 50, 60, 77]);
         assert!(rgba.pixels().all(|p| p[3] == 77));
+    }
+
+    #[test]
+    fn noise_zero_is_a_byte_identical_no_op() {
+        // On an RGBA image (variant and alpha included) and
+        // an RGB one: amount 0 returns the image untouched.
+        let mut img = DynamicImage::new_rgba8(3, 2);
+        for (i, p) in img.as_mut_rgba8().unwrap().pixels_mut().enumerate() {
+            *p = image::Rgba([10 + 30 * i as u8, 20 + 20 * i as u8, 30 + 10 * i as u8, 77]);
+        }
+        let before = img.to_rgba8().into_raw();
+        let (out, _) = apply_filters(img, &[Filter::Noise(0)]);
+        assert!(matches!(out, DynamicImage::ImageRgba8(_)));
+        assert_eq!(out.to_rgba8().into_raw(), before);
+        let img = striped();
+        let before = img.to_rgb8().into_raw();
+        let (out, _) = apply_filters(img, &[Filter::Noise(0)]);
+        assert_eq!(out.to_rgb8().into_raw(), before);
+    }
+
+    #[test]
+    fn noise_matches_the_documented_generator() {
+        // The generator, pinned end to end: the seed is the
+        // FNV-1a hash of the RGBA buffer folded with the
+        // amount, the stream is SplitMix64, one draw per
+        // pixel in row-major order, and the delta is the
+        // draw modulo 2A+1 minus A, with A the rounded
+        // amplitude (255 at amount 100, 102 at 40). For
+        // this row the amount-100 draws give +220, +131,
+        // and -238 (the last pixel clamps at 0), and the
+        // amount-40 draws give -61, +20, and +22.
+        let img = pixel_row(&[[10, 20, 30], [100, 110, 120], [200, 210, 220]]);
+        let (out, _) = apply_filters(img.clone(), &[Filter::Noise(100)]);
+        assert_eq!(
+            row_rgb(&out),
+            vec![[230, 240, 250], [231, 241, 251], [0, 0, 0]]
+        );
+        let (out, _) = apply_filters(img, &[Filter::Noise(40)]);
+        assert_eq!(
+            row_rgb(&out),
+            vec![[0, 0, 0], [120, 130, 140], [222, 232, 242]]
+        );
+    }
+
+    #[test]
+    fn noise_is_deterministic_and_depends_on_the_amount() {
+        // The same input and amount render the same bytes
+        // every run; a different amount is a different
+        // field (and a different image).
+        let img = striped();
+        let (a, _) = apply_filters(img.clone(), &[Filter::Noise(60)]);
+        let (b, _) = apply_filters(img.clone(), &[Filter::Noise(60)]);
+        assert_eq!(a.to_rgb8().into_raw(), b.to_rgb8().into_raw());
+        let (c, _) = apply_filters(img, &[Filter::Noise(61)]);
+        assert_ne!(a.to_rgb8().into_raw(), c.to_rgb8().into_raw());
+    }
+
+    #[test]
+    fn noise_full_strength_moves_a_flat_field_both_ways() {
+        // On a flat mid-gray field at 100, some pixels land
+        // above 128 and some below: the field swings both
+        // ways and stays inside the byte range by clamping.
+        let (out, _) = apply_filters(opaque(64, 64, [128, 128, 128]), &[Filter::Noise(100)]);
+        let raw = out.to_rgb8().into_raw();
+        assert!(raw.iter().any(|&v| v > 128));
+        assert!(raw.iter().any(|&v| v < 128));
+        // No channel of any pixel may differ from another:
+        // even on the way through the clamp the value is
+        // one per pixel, shared by all three channels.
+        for px in out.to_rgb8().pixels() {
+            assert_eq!(px[0], px[1]);
+            assert_eq!(px[1], px[2]);
+        }
+    }
+
+    #[test]
+    fn noise_is_monochrome_and_preserves_alpha() {
+        // Mid-range pixels and a modest amount (amplitude
+        // 51 at 20), so nothing clamps and the per-pixel
+        // delta must be identical on all three channels.
+        let mut img = DynamicImage::new_rgba8(4, 1);
+        let src = [
+            [110, 120, 130, 77],
+            [125, 135, 145, 77],
+            [100, 140, 120, 77],
+            [130, 115, 105, 77],
+        ];
+        for (i, p) in img.as_mut_rgba8().unwrap().pixels_mut().enumerate() {
+            *p = image::Rgba(src[i]);
+        }
+        let (out, _) = apply_filters(img, &[Filter::Noise(20)]);
+        let rgba = out.to_rgba8();
+        for (x, s) in src.iter().enumerate() {
+            let o = rgba.get_pixel(x as u32, 0).0;
+            let delta = i32::from(o[0]) - i32::from(s[0]);
+            assert_eq!(i32::from(o[1]) - i32::from(s[1]), delta, "pixel {x}");
+            assert_eq!(i32::from(o[2]) - i32::from(s[2]), delta, "pixel {x}");
+            assert_eq!(o[3], 77, "alpha survives at pixel {x}");
+        }
     }
 
     #[test]

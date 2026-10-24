@@ -186,6 +186,13 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:convolution(0,-1,0,-1,1e2,-1,0,-1,0,0)/" + SRC, true, SRC], // exponent spelling
     ["filters:convolution(0,-1,0,-1,.5,-1,0,-1,0,0)/" + SRC, true, SRC], // leading dot
     ["filters:convolution(0,-1,0,-1,1025,-1,0,-1,0,0)/" + SRC, true, SRC], // value past the 1024 bound
+    ["filters:noise(0)/" + SRC, false, SRC], // no grain
+    ["filters:noise(40)/" + SRC, false, SRC], // mid-strength grain
+    ["filters:noise(100)/" + SRC, false, SRC], // full-scale grain
+    ["filters:noise(101)/" + SRC, true, SRC], // past the 0..100 range
+    ["filters:noise(256)/" + SRC, true, SRC], // does not fit the amount either
+    ["filters:noise(-1)/" + SRC, true, SRC], // negative
+    ["filters:noise(1.5)/" + SRC, true, SRC], // not an integer
     ["filters:monochrome(ff8000):pixelate(8)/" + SRC, false, SRC],
     ["filters:pixelate(0)/" + SRC, true, SRC],
     ["filters:flip(x)/" + SRC, true, SRC],
