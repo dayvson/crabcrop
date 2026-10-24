@@ -252,15 +252,17 @@ pub enum Filter {
     Invert,
     /// Gaussian blur; sigma must be positive.
     Blur(f32),
-    /// Add to every channel, clamped to 0-255.
+    /// Add to every channel (-255..=255), clamped to 0-255.
     Brighten(i32),
-    /// Adjust contrast.
+    /// Adjust contrast, percent-style (-100..=100): 0 is
+    /// identity, -100 is flat gray.
     Contrast(f32),
     /// Rotate the hue, in degrees.
     HueRotate(i32),
     /// Sharpen by this amount (unsharp mask strength, > 0).
     Sharpen(f32),
-    /// Scale color saturation: 0 is grayscale, 1 is identity.
+    /// Scale color saturation (0..=255): 0 is grayscale, 1
+    /// is identity.
     Saturation(f32),
     /// Per-channel level offsets, each -255..=255.
     Rgb(i32, i32, i32),
@@ -775,11 +777,14 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             }
             ("brighten", Some(p)) => {
                 let amount: i32 = p.parse().map_err(|_| invalid())?;
+                if !(-255..=255).contains(&amount) {
+                    return Err(invalid());
+                }
                 Filter::Brighten(amount)
             }
             ("contrast", Some(p)) => {
                 let amount: f32 = p.parse().map_err(|_| invalid())?;
-                if !amount.is_finite() {
+                if !amount.is_finite() || !(-100.0..=100.0).contains(&amount) {
                     return Err(invalid());
                 }
                 Filter::Contrast(amount)
@@ -793,7 +798,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     Filter::Quality(Quality::Auto)
                 } else {
                     let q: u8 = p.parse().map_err(|_| invalid())?;
-                    if q > 100 {
+                    if !(1..=100).contains(&q) {
                         return Err(invalid());
                     }
                     Filter::Quality(Quality::Value(q))
@@ -809,7 +814,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             }
             ("saturation", Some(p)) => {
                 let amount: f32 = p.parse().map_err(|_| invalid())?;
-                if !amount.is_finite() || amount < 0.0 {
+                if !amount.is_finite() || !(0.0..=255.0).contains(&amount) {
                     return Err(invalid());
                 }
                 Filter::Saturation(amount)
@@ -2569,11 +2574,40 @@ mod tests {
     }
 
     #[test]
+    fn numeric_filter_bounds_accept_the_endpoints() {
+        // The AP-6 validation table: the endpoints are in,
+        // one step past them is a parse error (pinned in
+        // rejects_bad_filters).
+        for seg in [
+            "filters:brighten(255)",
+            "filters:brighten(-255)",
+            "filters:contrast(100)",
+            "filters:contrast(-100)",
+            "filters:saturation(0)",
+            "filters:saturation(255)",
+            "filters:quality(1)",
+            "filters:quality(100)",
+        ] {
+            assert!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")).is_ok(),
+                "{seg}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_bad_filters() {
         for seg in [
             "filters:",
             "filters:blur()",
             "filters:quality(200)",
+            "filters:quality(0)",
+            "filters:brighten(256)",
+            "filters:brighten(-256)",
+            "filters:contrast(101)",
+            "filters:contrast(-100.5)",
+            "filters:saturation(256)",
+            "filters:saturation(-1)",
             "filters:quality()",
             "filters:quality(autoo)",
             "filters:grayscale(1)",

@@ -195,11 +195,11 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | `grayscale` | none | Desaturate to gray. | `filters:grayscale` |
 | `invert` | none | Invert every channel. | `filters:invert` |
 | `blur` | `blur(2.5)` — sigma, a positive number | Gaussian blur. | `filters:blur(2.5)` |
-| `brighten` | `brighten(40)` — integer added to every channel, clamped to 0–255 | Brighten (or darken, with a negative value). | `filters:brighten(40)` |
-| `contrast` | `contrast(25)` — number; 0 is unchanged, negative lowers contrast, positive raises it | Adjust contrast. | `filters:contrast(25)` |
+| `brighten` | `brighten(40)` — integer from −255 to 255, added to every channel and clamped to 0–255 | Brighten (or darken, with a negative value). | `filters:brighten(40)` |
+| `contrast` | `contrast(25)` — percent, −100 to 100; 0 is unchanged, −100 is flat gray, positive raises contrast | Adjust contrast. | `filters:contrast(25)` |
 | `huerotate` | `huerotate(90)` — degrees, integer | Rotate the hue. | `filters:huerotate(90)` |
 | `sharpen` | `sharpen(1.5)` — strength, a positive number | Unsharp-mask sharpening. | `filters:sharpen(1.5)` |
-| `saturation` | `saturation(1.5)` — 0 is grayscale, 1 is unchanged | Scale color saturation. | `filters:saturation(0.5)` |
+| `saturation` | `saturation(1.5)` — 0 to 255; 0 is grayscale, 1 is unchanged | Scale color saturation. | `filters:saturation(0.5)` |
 | `rgb` | `rgb(10,-5,0)` — per-channel offsets, each −255 to 255 | Add offsets to the red, green, and blue channels. | `filters:rgb(10,-5,0)` |
 | `equalize` | none | Histogram equalization, per channel. | `filters:equalize` |
 | `rotate` | `rotate(45)` — any angle in degrees, decimals allowed; negatives allowed | Rotate the image. Multiples of 90 are exact quarter turns; other angles expand the canvas to fit, filling the uncovered corners with the `fill` color (white by default) or transparency when the image carries alpha. | `filters:rotate(-90)` |
@@ -224,7 +224,7 @@ curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/
 | Directive | Parameters | Description | Example |
 | --- | --- | --- | --- |
 | `format` | `format(webp)` — `jpeg` (or `jpg`), `png`, `webp`, `jxl`, `avif`, `gif` | Output format. Overrides `Accept` negotiation. | `filters:format(avif)` |
-| `quality` | `quality(80)` — 0 to 100, or `quality(auto)` | Encoding quality for JPEG, JPEG XL, AVIF, and WebP. Default 80. | `filters:quality(auto)` |
+| `quality` | `quality(80)` — 1 to 100, or `quality(auto)` | Encoding quality for JPEG, JPEG XL, AVIF, and WebP. Default 80. | `filters:quality(auto)` |
 | `max_bytes` | `max_bytes(50000)` — byte budget, at least 1 | Re-encode at decreasing quality until the output fits the budget. | `filters:max_bytes(50000)` |
 | `fill` | `fill(ff0000)` — six hex digits, RGB | Background color used to flatten transparency when encoding to JPEG. | `filters:fill(ffffff)` |
 | `no_upscale` | none | Cap every resize in the request at the source dimensions. | `filters:no_upscale` |

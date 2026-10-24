@@ -30,10 +30,10 @@ const FILTER_BLURBS = {
   blur: "gaussian blur, argument is the sigma",
   blurfaces: "blur detected faces (needs a face model on the server)",
   brighten: "brighten by the given amount (-255..255)",
-  contrast: "contrast multiplier (1 is identity)",
+  contrast: "contrast in percent, -100..100 (0 is unchanged, -100 is flat)",
   huerotate: "rotate the hue by the given degrees",
   rotate: "rotate by the given angle in degrees; the canvas expands to fit",
-  quality: "output quality 0..100, or `auto` for perceptual targeting",
+  quality: "output quality 1..100, or `auto` for perceptual targeting",
   format: "force the output format",
   fill: "the background color other operations pad with",
   facepad: "how much a face crop expands around the face",
@@ -45,7 +45,7 @@ const FILTER_BLURBS = {
   keep_profile: "keep the source color profile instead of converting to sRGB",
   upscale: "AI upscale by the given factor (needs an AI model on the server)",
   equalize: "histogram equalization",
-  saturation: "saturation factor (0 is grayscale, 1 is identity)",
+  saturation: "saturation factor, 0..255 (0 is grayscale, 1 is identity)",
   sharpen: "sharpen by the given amount",
   text: "draw a text overlay (needs a font on the server)",
   rgb: "tint toward the given red/green/blue amounts",
@@ -178,14 +178,19 @@ function validateFilter(name, args) {
     case "sharpen":
       return args !== null && isFloat(args) && Number(args) > 0 ? null : bad;
     case "brighten":
+      return args !== null && isIntIn(args, -255, 255) ? null : bad;
     case "huerotate":
       return args !== null && isIntIn(args, -2147483648, 2147483647) ? null : bad;
     case "contrast":
-      return args !== null && isFloat(args) ? null : bad;
+      return args !== null && isFloat(args) && Number(args) >= -100 && Number(args) <= 100
+        ? null
+        : bad;
     case "saturation":
-      return args !== null && isFloat(args) && Number(args) >= 0 ? null : bad;
+      return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 255
+        ? null
+        : bad;
     case "quality":
-      return args === "auto" || (args !== null && isIntIn(args, 0, 100)) ? null : bad;
+      return args === "auto" || (args !== null && isIntIn(args, 1, 100)) ? null : bad;
     case "format":
       return FORMAT_NAMES.has(args) ? null : bad;
     case "rgb": {
