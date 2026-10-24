@@ -150,9 +150,9 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get update && sudo apt-get install -y nasm
-        elif [ "$RUNNER_OS" = "macOS" ]; then
-          brew install nasm
-      fi
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            brew install nasm
+        fi
       - name: Build artifacts
         env:
           # Vendored static dav1d, so the release binaries
