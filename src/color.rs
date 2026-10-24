@@ -27,8 +27,8 @@ const EXIF_JPEG_HEADER: &[u8] = b"Exif\0\0";
 const PHOTOSHOP_JPEG_HEADER: &[u8] = b"Photoshop 3.0\0";
 /// Sanity caps so a hostile source cannot make extraction
 /// allocate without bound.
-const MAX_ICC_BYTES: usize = 4 * 1024 * 1024;
-const MAX_META_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_ICC_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_META_BYTES: usize = 16 * 1024 * 1024;
 
 /// Extract the ICC profile and preservable metadata from a
 /// JPEG or PNG source. Other formats yield an empty result:
