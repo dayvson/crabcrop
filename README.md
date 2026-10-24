@@ -517,6 +517,9 @@ All configuration comes from environment variables. Invalid values are startup e
 | Variable | Default | Description |
 | --- | --- | --- |
 | `CRABCROP_SECRET` | — (required) | The HMAC secret used to verify signed URLs. The server will not start without it. |
+| `CRABCROP_SECRET_KEY_ID` | `current` | The current secret's key ID, named by keyed signature segments (`<key-id>:<tag>`). |
+| `CRABCROP_SECRET_PREVIOUS` | unset | The outgoing secret during a rotation window; the server verifies it alongside the current one. Same minimum length. |
+| `CRABCROP_SECRET_PREVIOUS_KEY_ID` | `previous` | The previous secret's key ID. Must differ from the current one. |
 | `PORT` | `3000` | Listen port. `CRABCROP_PORT` is the namespaced alias and wins when both are set. |
 | `CRABCROP_ALLOW_UNSAFE` | off | Honors `unsafe` URLs (for the boolean spellings, see above). |
 | `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
@@ -552,6 +555,16 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_RESULT_STORAGE_MAX_MB` | `512` | Disk result store budget in megabytes. `0` disables storage even with a directory set. |
 
 With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves the host to check its addresses and pins the connection to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
+
+### Rotating the secret
+
+Rotation never invalidates a URL that is already in the wild, in three steps:
+
+1. **Open the window.** Generate the new secret. Set `CRABCROP_SECRET` to it with `CRABCROP_SECRET_KEY_ID` naming it (say `2026-10`), and move the outgoing secret to `CRABCROP_SECRET_PREVIOUS` with `CRABCROP_SECRET_PREVIOUS_KEY_ID` naming it (say `2026-08`). Restart. The server now verifies both keys: a URL whose signature segment carries a key ID (`2026-08:<tag>`) is checked against that key only, and a URL with no ID is checked against both, so everything minted before key IDs existed keeps working too. Purge signatures route the same way.
+2. **Mint with the new key.** Point your builders at the new secret and stamp its ID: `buildURL(..., { keyId: "2026-10" })` in TypeScript, `build_url(..., key_id="2026-10")` in Python, `sign_with_key_id` / `build_url_with_key_id` in Rust, or `crabcrop sign --key-id 2026-10` on the CLI. New cache entries accumulate under the new key from here on.
+3. **Close the window.** When the old key's URLs have aged out of your caches and pages (the result cache's `max-age` is one year, but in practice your own TTLs and page lifetimes govern), remove `CRABCROP_SECRET_PREVIOUS` and restart. From that moment the old secret verifies nothing: its remaining URLs answer `403`, which is the point of rotating.
+
+An unknown key ID is indistinguishable from a bad signature, by design: `403`, no hint about which IDs exist.
 
 ## AI features
 

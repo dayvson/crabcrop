@@ -30,6 +30,7 @@ remainder = everything after the signature segment, exactly as it appears
 - The secret is the server's `CRABCROP_SECRET`, encoded as UTF-8 when it is text.
 - The message is the remainder encoded as UTF-8. Sign the bytes you send: any percent-encoding, case change, or added/removed character is a different message and fails verification.
 - Signatures have one canonical spelling: lowercase hex. Servers reject a signature segment that is not lowercase hex at parse time (`400`); builders always emit lowercase.
+- A signature segment may carry a key ID: `<key-id>:<hex>`, where the ID is 1 to 32 characters of `[A-Za-z0-9_-]`. The ID is routing metadata, not secret material: it names which of the server's keys must verify the tag, which is what makes secret rotation possible without invalidating outstanding URLs. A server verifies a keyed segment against the named key only (an unknown ID fails as a bad signature, `403`), and an unkeyed segment against every key it holds. Purge signature segments accept the same prefix and routing. Builders stamp an ID only when asked; verifiers that hold a single secret ignore the ID and check the tag.
 - The signature covers the path only. A query string is not signed, is ignored by the server, and must not be relied on for anything.
 - Verification failure is `403` with the body `bad signature`. An expired URL is `403` with the body `signature expired`. An unknown preset, a malformed segment, or free-form operations in presets-only mode is a `400`.
 

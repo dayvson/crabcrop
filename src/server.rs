@@ -23,15 +23,15 @@ use crate::cache::{Cache, CachedImage};
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
-use crate::url::{
-    ImageFormat, parse_operations_with_expiry, parse_signature, verify, verify_purge,
-};
+use crate::url::{ImageFormat, parse_operations_with_expiry, parse_signature};
 
 /// Shared state for the handlers.
 #[derive(Debug, Clone)]
 pub struct AppState {
     /// HMAC secret, from `CRABCROP_SECRET`.
-    pub secret: Vec<u8>,
+    /// The signing keyring (issue #143): the current key
+    /// plus, during a rotation window, the previous one.
+    pub keyring: crate::url::Keyring,
     /// Whether `unsafe` URLs are honored, from `CRABCROP_ALLOW_UNSAFE`.
     pub allow_unsafe: bool,
     pub loader: Loader,
@@ -263,11 +263,14 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
             .into_response();
     };
     let full = format!("/{tail}");
-    let (signature, target) = match parse_signature(&full) {
+    let (signature, key_id, target) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    if !verify_purge(&state.secret, &signature, target) {
+    if !state
+        .keyring
+        .verify_purge(key_id.as_deref(), &signature, target)
+    {
         state.metrics.record_purge();
         purge_log("purge", target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
@@ -320,7 +323,7 @@ async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri)
             .into_response();
     };
     let full = format!("/{tail}");
-    let (signature, group) = match parse_signature(&full) {
+    let (signature, key_id, group) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
@@ -328,7 +331,10 @@ async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri)
         return (StatusCode::BAD_REQUEST, "invalid purge group name").into_response();
     }
     let target = format!("purge-group/{group}");
-    if !verify_purge(&state.secret, &signature, &target) {
+    if !state
+        .keyring
+        .verify_purge(key_id.as_deref(), &signature, &target)
+    {
         state.metrics.record_purge();
         purge_log("purge-group", &target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
@@ -521,14 +527,16 @@ async fn serve(
     // message as the body: it names only what the caller
     // sent, and it is the difference between a debuggable
     // rejection and an empty one.
-    let (signature, rest) = match parse_signature(&full) {
+    let (signature, key_id, rest) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => {
             return (parse_failure(&e, accept), record);
         }
     };
     let verify_start = Instant::now();
-    let verified = verify(&state.secret, &signature, rest, state.allow_unsafe);
+    let verified = state
+        .keyring
+        .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe);
     record.verify = verify_start.elapsed();
     if !verified {
         return (
@@ -1413,8 +1421,49 @@ mod tests {
 
     async fn spawn_app(allow_unsafe: bool) -> String {
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            detect: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// An app in a rotation window: current key `k-new`,
+    /// previous key `k-old` (issue #143).
+    async fn spawn_app_rotating() -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring {
+                current_id: "k-new".to_string(),
+                current: b"the-new-server-secret".to_vec(),
+                previous: Some(("k-old".to_string(), b"the-old-server-secret".to_vec())),
+            },
+            allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
             metrics: Arc::new(Metrics::default()),
@@ -1458,7 +1507,7 @@ mod tests {
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
@@ -1777,7 +1826,7 @@ mod tests {
         only_presets: bool,
     ) -> String {
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
@@ -2063,7 +2112,7 @@ mod tests {
 
     async fn spawn_app_with_tagger() -> String {
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
@@ -2161,7 +2210,7 @@ mod tests {
 
     async fn spawn_app_with_detector(detector: Arc<dyn crate::ai::DetectionProvider>) -> String {
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
@@ -2203,7 +2252,7 @@ mod tests {
         cache_bytes: usize,
     ) -> String {
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
@@ -2754,7 +2803,7 @@ mod tests {
     /// An app with disk result storage rooted at `dir`.
     async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
@@ -2793,7 +2842,7 @@ mod tests {
     /// fake endpoint, and optionally a disk tier at `dir`.
     async fn spawn_app_with_shared(dir: Option<&std::path::Path>, endpoint: &str) -> String {
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
@@ -2894,6 +2943,30 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "purged: origin refetched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rotation_window_verifies_both_keys_and_routes_by_key_id() {
+        let (src_host, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let remainder = format!("25x25/{src_host}");
+        let base = spawn_app_rotating().await;
+        let get = |segment: String| {
+            let url = format!("{base}/{segment}/{remainder}");
+            async move { client().get(url).send().await.unwrap().status() }
+        };
+        let new_unkeyed = crabcrop_url::sign(b"the-new-server-secret", &remainder);
+        let old_unkeyed = crabcrop_url::sign(b"the-old-server-secret", &remainder);
+        // Unkeyed URLs from either era verify.
+        assert_eq!(get(new_unkeyed.clone()).await, 200);
+        assert_eq!(get(old_unkeyed.clone()).await, 200);
+        // Keyed URLs verify against their named key.
+        assert_eq!(get(format!("k-new:{new_unkeyed}")).await, 200);
+        assert_eq!(get(format!("k-old:{old_unkeyed}")).await, 200);
+        // A key ID routes strictly: the old MAC under the new
+        // key's name is a forgery, and an unknown ID fails the
+        // same way.
+        assert_eq!(get(format!("k-new:{old_unkeyed}")).await, 403);
+        assert_eq!(get(format!("k-who:{new_unkeyed}")).await, 403);
     }
 
     #[tokio::test]
@@ -3043,7 +3116,7 @@ mod tests {
         // a gated run must wait, then proceed once released
         // (audit E-5).
         let state = AppState {
-            secret: SECRET.to_vec(),
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,

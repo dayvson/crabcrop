@@ -13,6 +13,12 @@
 //! Configuration comes from the environment:
 //!
 //! - `CRABCROP_SECRET` (required, at least 16 bytes): the HMAC secret.
+//! - `CRABCROP_SECRET_KEY_ID`: the current secret's key ID
+//!   (`current` when unset). During rotation,
+//!   `CRABCROP_SECRET_PREVIOUS` holds the outgoing secret
+//!   (same minimum length) under
+//!   `CRABCROP_SECRET_PREVIOUS_KEY_ID` (default `previous`);
+//!   the server then verifies both keys.
 //! - `CRABCROP_ALLOW_UNSAFE`: `1` or `true` to honor `unsafe` URLs.
 //! - `CRABCROP_CACHE_MAX_MB`: result cache budget in megabytes,
 //!   default 256; `0` disables the cache.
@@ -389,20 +395,68 @@ fn parse_bool_value(name: &str, value: Option<String>, default: bool) -> Result<
 const MIN_SECRET_BYTES: usize = 16;
 
 fn validate_secret(secret: &[u8]) -> Result<(), String> {
+    validate_secret_named("CRABCROP_SECRET", secret)
+}
+
+fn validate_secret_named(name: &str, secret: &[u8]) -> Result<(), String> {
     if secret.len() < MIN_SECRET_BYTES {
         return Err(format!(
-            "CRABCROP_SECRET must be at least {MIN_SECRET_BYTES} bytes, got {}",
+            "{name} must be at least {MIN_SECRET_BYTES} bytes, got {}",
             secret.len()
         ));
     }
     Ok(())
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let secret = env::var("CRABCROP_SECRET")
+/// The signing keyring (issue #143): the current secret under
+/// `CRABCROP_SECRET_KEY_ID` (default `current`), plus the
+/// previous secret under `CRABCROP_SECRET_PREVIOUS_KEY_ID`
+/// (default `previous`) while a rotation window is open.
+fn build_keyring() -> Result<crate::url::Keyring, String> {
+    let current = env::var("CRABCROP_SECRET")
         .map_err(|_| "CRABCROP_SECRET must be set")?
         .into_bytes();
-    validate_secret(&secret)?;
+    validate_secret(&current)?;
+    let current_id = env::var("CRABCROP_SECRET_KEY_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "current".to_string());
+    if !crate::url::is_valid_key_id(&current_id) {
+        return Err(format!(
+            "CRABCROP_SECRET_KEY_ID {current_id:?} is not a valid key ID (1 to 32 characters of [A-Za-z0-9_-])"
+        ));
+    }
+    let previous = match env::var("CRABCROP_SECRET_PREVIOUS") {
+        Ok(p) if !p.is_empty() => {
+            let bytes = p.into_bytes();
+            validate_secret_named("CRABCROP_SECRET_PREVIOUS", &bytes)?;
+            let id = env::var("CRABCROP_SECRET_PREVIOUS_KEY_ID")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "previous".to_string());
+            if !crate::url::is_valid_key_id(&id) {
+                return Err(format!(
+                    "CRABCROP_SECRET_PREVIOUS_KEY_ID {id:?} is not a valid key ID (1 to 32 characters of [A-Za-z0-9_-])"
+                ));
+            }
+            if id == current_id {
+                return Err(
+                    "CRABCROP_SECRET_KEY_ID and CRABCROP_SECRET_PREVIOUS_KEY_ID must differ"
+                        .to_string(),
+                );
+            }
+            Some((id, bytes))
+        }
+        _ => None,
+    };
+    let mut keyring = crate::url::Keyring::single(current);
+    keyring.current_id = current_id;
+    keyring.previous = previous;
+    Ok(keyring)
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let keyring = build_keyring()?;
     let allow_unsafe = parse_bool("CRABCROP_ALLOW_UNSAFE", false)?;
     // CRABCROP_PORT is the namespaced alias for PORT and
     // wins when both are set; PORT alone keeps working for
@@ -563,7 +617,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state = AppState {
-        secret,
+        keyring,
         allow_unsafe,
         loader: Loader::with_defaults()
             .map_err(|e| format!("cannot build the loader: {e}"))?

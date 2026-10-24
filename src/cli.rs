@@ -27,11 +27,15 @@ CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_
 struct Config {
     base: String,
     secret: Option<Vec<u8>>,
+    /// Key ID to stamp on minted signatures (issue #143),
+    /// from `--key-id` or `CRABCROP_SECRET_KEY_ID`.
+    key_id: Option<String>,
 }
 
 fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
     let mut base: Option<String> = None;
     let mut secret: Option<String> = None;
+    let mut key_id: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -41,7 +45,7 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
             _ => (arg.as_str(), None),
         };
         match flag {
-            "--base" | "--secret" => {
+            "--base" | "--secret" | "--key-id" => {
                 let value = match inline_value {
                     Some(v) => v,
                     None => {
@@ -53,6 +57,8 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
                 };
                 if flag == "--base" {
                     base = Some(value);
+                } else if flag == "--key-id" {
+                    key_id = Some(value);
                 } else {
                     secret = Some(value);
                 }
@@ -70,7 +76,22 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
     let secret = secret
         .or_else(|| std::env::var("CRABCROP_SECRET").ok())
         .map(String::into_bytes);
-    Ok((Config { base, secret }, positional))
+    let key_id = key_id.or_else(|| std::env::var("CRABCROP_SECRET_KEY_ID").ok());
+    if let Some(id) = &key_id
+        && !crate::url::is_valid_key_id(id)
+    {
+        return Err(format!(
+            "invalid key ID {id:?}: 1 to 32 characters of [A-Za-z0-9_-]"
+        ));
+    }
+    Ok((
+        Config {
+            base,
+            secret,
+            key_id,
+        },
+        positional,
+    ))
 }
 
 fn require_secret(config: &Config) -> Result<&[u8], String> {
@@ -83,14 +104,14 @@ fn require_secret(config: &Config) -> Result<&[u8], String> {
 /// Split a URL or path into (signature, remainder). A full
 /// URL loses its scheme and host; a bare remainder comes
 /// back with no signature.
-fn split_signed(input: &str, base: &str) -> (Option<Signature>, String) {
+fn split_signed(input: &str, base: &str) -> (Option<Signature>, Option<String>, String) {
     let input = input.trim();
     // A URL on the configured base: strip the base, then
     // read the signature segment.
     if let Some(rest) = input.strip_prefix(&format!("{base}/")) {
         return match crate::url::parse_signature(rest) {
-            Ok((sig, remainder)) => (Some(sig), remainder.to_string()),
-            Err(_) => (None, rest.to_string()),
+            Ok((sig, kid, remainder)) => (Some(sig), kid, remainder.to_string()),
+            Err(_) => (None, None, rest.to_string()),
         };
     }
     // A full URL on any other host counts only when its
@@ -99,15 +120,15 @@ fn split_signed(input: &str, base: &str) -> (Option<Signature>, String) {
     // anything less strict would mangle it.
     if let Some((_, after_scheme)) = input.split_once("://") {
         let path = after_scheme.split_once('/').map(|(_, p)| p).unwrap_or("");
-        if let Ok((sig, remainder)) = crate::url::parse_signature(path) {
-            return (Some(sig), remainder.to_string());
+        if let Ok((sig, kid, remainder)) = crate::url::parse_signature(path) {
+            return (Some(sig), kid, remainder.to_string());
         }
-        return (None, input.to_string());
+        return (None, None, input.to_string());
     }
     let path = input.strip_prefix('/').unwrap_or(input);
     match crate::url::parse_signature(path) {
-        Ok((sig, rest)) => (Some(sig), rest.to_string()),
-        Err(_) => (None, path.to_string()),
+        Ok((sig, kid, rest)) => (Some(sig), kid, rest.to_string()),
+        Err(_) => (None, None, path.to_string()),
     }
 }
 
@@ -181,12 +202,16 @@ fn sign(config: &Config, positional: &[String]) -> Result<String, String> {
     // a bad URL fails here instead of at first request.
     parse_with_presets(&remainder)?;
     let sig = crabcrop_url::sign(secret, &remainder);
-    Ok(format!("{}/{sig}/{remainder}", config.base))
+    let segment = match &config.key_id {
+        Some(kid) => format!("{kid}:{sig}"),
+        None => sig,
+    };
+    Ok(format!("{}/{segment}/{remainder}", config.base))
 }
 
 fn explain(config: &Config, positional: &[String]) -> Result<String, String> {
     let input = one_target(positional, "explain")?;
-    let (signature, rest) = split_signed(&input, &config.base);
+    let (signature, key_id, rest) = split_signed(&input, &config.base);
     let mut lines: Vec<String> = Vec::new();
     match &signature {
         Some(Signature::Hmac(hex)) => {
@@ -200,7 +225,11 @@ fn explain(config: &Config, positional: &[String]) -> Result<String, String> {
                 }
                 None => "not verified (no secret given)",
             };
-            lines.push(format!("signature: {hex} ({note})"));
+            let kid_note = match &key_id {
+                Some(kid) => format!("key {kid}; "),
+                None => String::new(),
+            };
+            lines.push(format!("signature: {hex} ({kid_note}{note})"));
         }
         Some(Signature::Unsafe) => lines.push("signature: unsafe (unsigned URL)".to_string()),
         None => lines.push("signature: none (bare remainder)".to_string()),
@@ -403,7 +432,7 @@ fn target_url(config: &Config, input: &str) -> Result<String, String> {
         return Ok(input.to_string());
     }
     let secret = require_secret(config)?;
-    let (_, rest) = split_signed(input, &config.base);
+    let (_, _, rest) = split_signed(input, &config.base);
     parse_with_presets(&rest)?;
     let sig = crabcrop_url::sign(secret, &rest);
     Ok(format!("{}/{sig}/{rest}", config.base))
@@ -431,16 +460,28 @@ async fn meta(config: &Config, positional: &[String]) -> Result<String, String> 
 async fn purge(config: &Config, positional: &[String]) -> Result<String, String> {
     let input = one_target(positional, "purge")?;
     let secret = require_secret(config)?;
-    let (_, rest) = split_signed(&input, &config.base);
+    let (_, _, rest) = split_signed(&input, &config.base);
     let sig = crate::url::purge_signature(secret, &rest);
-    post_purge(config, &format!("{}/purge/{sig}/{rest}", config.base)).await
+    let segment = match &config.key_id {
+        Some(kid) => format!("{kid}:{sig}"),
+        None => sig,
+    };
+    post_purge(config, &format!("{}/purge/{segment}/{rest}", config.base)).await
 }
 
 async fn purge_group(config: &Config, positional: &[String]) -> Result<String, String> {
     let name = one_target(positional, "purge-group")?;
     let secret = require_secret(config)?;
     let sig = crate::url::purge_group_signature(secret, &name);
-    post_purge(config, &format!("{}/purge-group/{sig}/{name}", config.base)).await
+    let segment = match &config.key_id {
+        Some(kid) => format!("{kid}:{sig}"),
+        None => sig,
+    };
+    post_purge(
+        config,
+        &format!("{}/purge-group/{segment}/{name}", config.base),
+    )
+    .await
 }
 
 async fn post_purge(config: &Config, url: &str) -> Result<String, String> {
@@ -1047,6 +1088,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("unknown verb \"sgin\""), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sign_with_a_key_id_stamps_the_segment() {
+        let out = exec(&args(&[
+            "sign",
+            "--secret",
+            "test-secret",
+            "--key-id",
+            "k2",
+            "--base",
+            "http://img.test",
+            "300x200/https://example.com/a.jpg",
+        ]))
+        .await
+        .unwrap();
+        let expected_sig = crabcrop_url::sign(b"test-secret", "300x200/https://example.com/a.jpg");
+        assert_eq!(
+            out,
+            format!("http://img.test/k2:{expected_sig}/300x200/https://example.com/a.jpg")
+        );
+        // And explain names the key on the way back in.
+        let explained = exec(&args(&["explain", "--secret", "test-secret", &out]))
+            .await
+            .unwrap();
+        assert!(
+            explained.contains("key k2; valid for this remainder"),
+            "{explained}"
+        );
+        // A malformed key ID is refused at flag parsing.
+        assert!(
+            exec(&args(&[
+                "sign",
+                "--secret",
+                "test-secret",
+                "--key-id",
+                "bad id",
+                "300x200/https://example.com/a.jpg",
+            ]))
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

@@ -496,7 +496,19 @@ pub fn parse_size(segment: &str) -> Result<ImageSize, ParseError> {
 ///
 /// Returns the signature and the remainder of the path (operations and
 /// image URL, still slash-separated).
-pub fn parse_signature(path: &str) -> Result<(Signature, &str), ParseError> {
+/// Whether `id` is a well-formed key ID (issue #143): 1 to 32
+/// characters of `[A-Za-z0-9_-]`. Key IDs are routing metadata
+/// in the signature segment, never secret material.
+pub fn is_valid_key_id(id: &str) -> bool {
+    crabcrop_url::is_valid_key_id(id)
+}
+
+/// Split the signature segment off a request path, returning
+/// the signature, the key ID it names (issue #143: an optional
+/// `<key-id>:` prefix on the signature segment, how rotation
+/// works without invalidating every outstanding URL), and
+/// the remainder.
+pub fn parse_signature(path: &str) -> Result<(Signature, Option<String>, &str), ParseError> {
     let path = path.strip_prefix('/').unwrap_or(path);
     if path.is_empty() {
         return Err(ParseError::EmptyPath);
@@ -505,10 +517,16 @@ pub fn parse_signature(path: &str) -> Result<(Signature, &str), ParseError> {
     if first.is_empty() {
         return Err(ParseError::EmptyPath);
     }
-    let signature = if first == "unsafe" {
-        Signature::Unsafe
-    } else if !first.is_empty()
-        && first
+    if first == "unsafe" {
+        return Ok((Signature::Unsafe, None, rest));
+    }
+    let (key_id, hex) = match first.split_once(':') {
+        Some((kid, hex)) if is_valid_key_id(kid) => (Some(kid.to_string()), hex),
+        Some(_) => return Err(ParseError::MalformedSignature),
+        None => (None, first),
+    };
+    if !hex.is_empty()
+        && hex
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
@@ -516,11 +534,10 @@ pub fn parse_signature(path: &str) -> Result<(Signature, &str), ParseError> {
         // lowercase hex, and other spellings (uppercase, non-hex
         // tags) are parse errors rather than alternate forms of
         // the same URL.
-        Signature::Hmac(first.to_string())
+        Ok((Signature::Hmac(hex.to_string()), key_id, rest))
     } else {
-        return Err(ParseError::MalformedSignature);
-    };
-    Ok((signature, rest))
+        Err(ParseError::MalformedSignature)
+    }
 }
 
 /// Parse one path segment as an operation.
@@ -1649,11 +1666,12 @@ pub fn cache_key_form(remainder: &str) -> String {
 
 /// Parse a full request path into its signature and [`Request`].
 #[allow(dead_code)]
-pub fn parse_request(path: &str) -> Result<(Signature, Request<'_>), ParseError> {
-    let (signature, rest) = parse_signature(path)?;
+pub fn parse_request(path: &str) -> Result<(Signature, Option<String>, Request<'_>), ParseError> {
+    let (signature, key_id, rest) = parse_signature(path)?;
     let (operations, source_url) = parse_operations(rest)?;
     Ok((
         signature,
+        key_id,
         Request {
             operations,
             source_url,
@@ -1726,20 +1744,161 @@ pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool 
     }
 }
 
+/// The server's signing keys (issue #143): one current key,
+/// and during a rotation window one previous key. A URL may
+/// name its key with the `<key-id>:` signature prefix; the
+/// verification then consults exactly that key. A URL without
+/// a prefix is checked against every key in the ring, so URLs
+/// minted before key IDs (or by clients that do not send one)
+/// stay valid through the rotation, and age out through the
+/// caches like any other entry. An unknown key ID consults
+/// nothing and fails as a bad signature, indistinguishable
+/// from any other forgery attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keyring {
+    pub current_id: String,
+    pub current: Vec<u8>,
+    pub previous: Option<(String, Vec<u8>)>,
+}
+
+impl Keyring {
+    /// A ring with a single key: today's deployment shape.
+    pub fn single(secret: Vec<u8>) -> Self {
+        Self {
+            current_id: "current".to_string(),
+            current: secret,
+            previous: None,
+        }
+    }
+
+    fn candidates(&self, key_id: Option<&str>) -> Vec<&[u8]> {
+        match key_id {
+            Some(id) if id == self.current_id => vec![self.current.as_slice()],
+            Some(id) => match &self.previous {
+                Some((pid, secret)) if pid == id => vec![secret.as_slice()],
+                _ => Vec::new(),
+            },
+            None => {
+                let mut out = vec![self.current.as_slice()];
+                if let Some((_, secret)) = &self.previous {
+                    out.push(secret.as_slice());
+                }
+                out
+            }
+        }
+    }
+
+    /// Verify an image signature against the ring (see
+    /// [`verify`] for the single-key semantics).
+    pub fn verify(
+        &self,
+        key_id: Option<&str>,
+        signature: &Signature,
+        remainder: &str,
+        allow_unsafe: bool,
+    ) -> bool {
+        match signature {
+            Signature::Unsafe => allow_unsafe,
+            Signature::Hmac(_) => self
+                .candidates(key_id)
+                .iter()
+                .any(|secret| verify(secret, signature, remainder, false)),
+        }
+    }
+
+    /// Verify a purge signature against the ring (see
+    /// [`verify_purge`]).
+    pub fn verify_purge(&self, key_id: Option<&str>, signature: &Signature, target: &str) -> bool {
+        self.candidates(key_id)
+            .iter()
+            .any(|secret| verify_purge(secret, signature, target))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn parses_a_keyed_signature() {
+        let (sig, kid, rest) = parse_signature("/k2:a1b2c3d4/300x200/example.com/img.jpg").unwrap();
+        assert_eq!(sig, Signature::Hmac("a1b2c3d4".to_string()));
+        assert_eq!(kid.as_deref(), Some("k2"));
+        assert_eq!(rest, "300x200/example.com/img.jpg");
+    }
+
+    #[test]
+    fn rejects_malformed_key_ids() {
+        for path in [
+            "/:a1b2c3d4/300x200/x.jpg",
+            "/k ey:a1b2c3d4/300x200/x.jpg",
+            "/k2:/300x200/x.jpg",
+            "/k2:nothex!/300x200/x.jpg",
+            "/k2:unsafe/300x200/x.jpg",
+        ] {
+            assert!(
+                matches!(parse_signature(path), Err(ParseError::MalformedSignature)),
+                "{path}"
+            );
+        }
+        let long = format!("/{}/a1b2/300x200/x.jpg", "k".repeat(32));
+        assert!(parse_signature(&long.replace("/a1b2/", ":a1b2/")).is_ok());
+    }
+
+    #[test]
+    fn keyring_verifies_across_a_rotation_window() {
+        let ring = Keyring {
+            current_id: "k-new".to_string(),
+            current: b"new-secret-value".to_vec(),
+            previous: Some(("k-old".to_string(), b"old-secret-value".to_vec())),
+        };
+        let remainder = "300x200/example.com/img.jpg";
+        let new_sig = Signature::Hmac(crabcrop_url::sign(b"new-secret-value", remainder));
+        let old_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", remainder));
+        // Keyed URLs consult exactly the named key.
+        assert!(ring.verify(Some("k-new"), &new_sig, remainder, false));
+        assert!(ring.verify(Some("k-old"), &old_sig, remainder, false));
+        assert!(!ring.verify(Some("k-new"), &old_sig, remainder, false));
+        assert!(!ring.verify(Some("k-old"), &new_sig, remainder, false));
+        // Unkeyed URLs (everything minted before key IDs)
+        // consult the whole ring.
+        assert!(ring.verify(None, &new_sig, remainder, false));
+        assert!(ring.verify(None, &old_sig, remainder, false));
+        // An unknown key ID fails like any bad signature.
+        assert!(!ring.verify(Some("k-who"), &new_sig, remainder, false));
+        // Unsafe still follows the server flag only.
+        assert!(ring.verify(None, &Signature::Unsafe, remainder, true));
+        assert!(!ring.verify(Some("k-new"), &Signature::Unsafe, remainder, false));
+    }
+
+    #[test]
+    fn keyring_purge_verification_keeps_domain_separation() {
+        let ring = Keyring {
+            current_id: "k-new".to_string(),
+            current: b"new-secret-value".to_vec(),
+            previous: Some(("k-old".to_string(), b"old-secret-value".to_vec())),
+        };
+        let target = "300x200/example.com/img.jpg";
+        let old_purge = Signature::Hmac(crabcrop_url::purge_signature(b"old-secret-value", target));
+        assert!(ring.verify_purge(Some("k-old"), &old_purge, target));
+        assert!(ring.verify_purge(None, &old_purge, target));
+        assert!(!ring.verify_purge(Some("k-new"), &old_purge, target));
+        // An image signature under the old key is not a purge
+        // signature under any routing.
+        let image_sig = Signature::Hmac(crabcrop_url::sign(b"old-secret-value", target));
+        assert!(!ring.verify_purge(Some("k-old"), &image_sig, target));
+    }
+
+    #[test]
     fn parses_unsafe_signature() {
-        let (sig, rest) = parse_signature("/unsafe/300x200/example.com/img.jpg").unwrap();
+        let (sig, _kid, rest) = parse_signature("/unsafe/300x200/example.com/img.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
         assert_eq!(rest, "300x200/example.com/img.jpg");
     }
 
     #[test]
     fn parses_hmac_signature() {
-        let (sig, rest) = parse_signature("/a1b2c3d4/300x200/example.com/img.jpg").unwrap();
+        let (sig, _kid, rest) = parse_signature("/a1b2c3d4/300x200/example.com/img.jpg").unwrap();
         assert_eq!(sig, Signature::Hmac("a1b2c3d4".to_string()));
         assert_eq!(rest, "300x200/example.com/img.jpg");
     }
@@ -1759,13 +1918,13 @@ mod tests {
         // canonical-spelling rule (PL-7) it is not lowercase
         // hex either: a parse error, not an HMAC signature.
         assert!(parse_signature("/Unsafe/300x200/example.com/img.jpg").is_err());
-        let (sig, _) = parse_signature("/unsafe/300x200/example.com/img.jpg").unwrap();
+        let (sig, _kid, _) = parse_signature("/unsafe/300x200/example.com/img.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
     }
 
     #[test]
     fn works_without_leading_slash() {
-        let (sig, rest) = parse_signature("unsafe/300x200/example.com/img.jpg").unwrap();
+        let (sig, _kid, rest) = parse_signature("unsafe/300x200/example.com/img.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
         assert_eq!(rest, "300x200/example.com/img.jpg");
     }
@@ -1803,7 +1962,7 @@ mod tests {
 
     #[test]
     fn keeps_image_url_with_slashes_intact() {
-        let (sig, rest) =
+        let (sig, _kid, rest) =
             parse_signature("/unsafe/filters:grayscale()/https://example.com/a/b/c.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
         assert_eq!(rest, "filters:grayscale()/https://example.com/a/b/c.jpg");
@@ -2023,7 +2182,7 @@ mod tests {
     #[test]
     fn signature_then_size_compose() {
         // The two primitives chain: signature off the front, size next.
-        let (sig, rest) = parse_signature("/unsafe/300x200/example.com/img.jpg").unwrap();
+        let (sig, _kid, rest) = parse_signature("/unsafe/300x200/example.com/img.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
         let (size_seg, image) = rest.split_once('/').unwrap();
         let size = parse_size(size_seg).unwrap();
@@ -2093,7 +2252,7 @@ mod tests {
     #[test]
     fn parsed_signature_verifies_against_remainder() {
         let path = format!("/{KNOWN_HMAC}/{KNOWN_REMAINDER}");
-        let (sig, rest) = parse_signature(&path).unwrap();
+        let (sig, _kid, rest) = parse_signature(&path).unwrap();
         assert!(verify(b"Jefe", &sig, rest, false));
     }
 
@@ -2959,7 +3118,7 @@ mod tests {
 
     #[test]
     fn parse_request_composes_signature_and_operations() {
-        let (sig, req) =
+        let (sig, _kid, req) =
             parse_request("/unsafe/300x200/filters:grayscale()/example.com/img.jpg").unwrap();
         assert_eq!(sig, Signature::Unsafe);
         assert_eq!(req.operations.len(), 2);
