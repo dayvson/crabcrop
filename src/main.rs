@@ -13,6 +13,9 @@
 //! Configuration comes from the environment:
 //!
 //! - `CRABCROP_SECRET` (required, at least 16 bytes): the HMAC secret.
+//! - `CRABCROP_DEFAULT_OPS`: operations prepended to every
+//!   request (a house format, quality, watermark), parsed
+//!   and validated at boot.
 //! - `CRABCROP_SECRET_KEY_ID`: the current secret's key ID
 //!   (`current` when unset). During rotation,
 //!   `CRABCROP_SECRET_PREVIOUS` holds the outgoing secret
@@ -499,6 +502,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let policy = SourcePolicy::new(allowed_sources, block_private);
     let sources = build_source_config()?;
     let (presets, only_presets) = build_presets()?;
+    // Server-wide default operations (issue #145): parsed
+    // and validated now, so a bad string is a boot error
+    // naming the variable, not a per-request surprise.
+    let default_ops = match env::var("CRABCROP_DEFAULT_OPS") {
+        Ok(text) if !text.trim().is_empty() => {
+            let ops = crate::url::parse_default_ops(&text, &presets)
+                .map_err(|e| format!("invalid CRABCROP_DEFAULT_OPS: {e}"))?;
+            println!("default operations: {text}");
+            ops
+        }
+        _ => Vec::new(),
+    };
     let preserve_metadata = metadata_config(|name| env::var(name).ok())?;
 
     // Disk result storage: configured by directory, bounded
@@ -648,6 +663,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         preserve_metadata,
         presets,
         only_presets,
+        default_ops,
     };
     println!("crabcrop listening on port {port}");
     axum::serve(listener, app(state)).await?;

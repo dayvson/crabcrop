@@ -1205,6 +1205,85 @@ pub fn preset_names(rest: &str) -> Vec<String> {
     out
 }
 
+/// Merge server-wide defaults under a request's operations
+/// (issue #145): the defaults come first, the request's own
+/// operations follow, and for the singleton directives
+/// (format, quality, fill, dpr, max_bytes) the request wins
+/// by the default being dropped, not merely overridden
+/// downstream. Dropping is what makes a bare request under
+/// defaults and the same request spelled out in full parse
+/// to the same operations, and so share a cache entry.
+/// Everything else (sizes, filters, watermarks) applies from
+/// both, in order.
+pub fn merge_default_ops(defaults: &[Operation], url_ops: Vec<Operation>) -> Vec<Operation> {
+    if defaults.is_empty() {
+        return url_ops;
+    }
+    let directives = RequestDirectives::analyze(&url_ops);
+    let url_has_max_bytes = url_ops.iter().any(|op| {
+        matches!(
+            op,
+            Operation::Filters(filters)
+                if filters.iter().any(|f| matches!(f, Filter::MaxBytes(_)))
+        )
+    });
+    let keep_default_filter = |f: &Filter| -> bool {
+        match f {
+            Filter::Format(_) => directives.explicit_format.is_none(),
+            Filter::Quality(_) => !directives.quality_directive,
+            Filter::Fill(_) => directives.fill.is_none(),
+            Filter::Dpr(_) => directives.dpr.is_none(),
+            Filter::MaxBytes(_) => !url_has_max_bytes,
+            _ => true,
+        }
+    };
+    let mut merged: Vec<Operation> = Vec::with_capacity(defaults.len() + url_ops.len());
+    for op in defaults {
+        match op {
+            Operation::Filters(filters) => {
+                let kept: Vec<Filter> = filters
+                    .iter()
+                    .filter(|f| keep_default_filter(f))
+                    .cloned()
+                    .collect();
+                if !kept.is_empty() {
+                    merged.push(Operation::Filters(kept));
+                }
+            }
+            other => merged.push(other.clone()),
+        }
+    }
+    merged.extend(url_ops);
+    merged
+}
+
+/// Parse a server-wide default operations string (issue
+/// #145): preset references expand against the boot preset
+/// table, and the rest must be operations only, with no
+/// source. The operations are returned ready to prepend to a
+/// request's own. An empty string yields no operations.
+pub fn parse_default_ops(
+    text: &str,
+    presets: &std::collections::HashMap<String, String>,
+) -> Result<Vec<Operation>, ParseError> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let expanded = expand_presets(text, presets, false)?;
+    // The operations parser expects a source after the
+    // operations; a synthetic one terminates the list. The
+    // parse must land exactly on it: anything else means
+    // part of the string read as a source, which in a
+    // defaults string is an operator error, not an
+    // operation.
+    let terminated = format!("{expanded}/example.com/defaults");
+    let (ops, source, _) = parse_operations_with_expiry(&terminated)?;
+    if source != "example.com/defaults" {
+        return Err(ParseError::InvalidPreset(text.to_string()));
+    }
+    Ok(ops)
+}
+
 pub fn expand_presets(
     rest: &str,
     presets: &std::collections::HashMap<String, String>,
@@ -3053,6 +3132,60 @@ mod tests {
             let (ops, _) = parse_operations(&path).unwrap();
             assert_eq!(ops, vec![Operation::Filters(vec![want])], "{seg}");
         }
+    }
+
+    #[test]
+    fn default_ops_parse_and_expand() {
+        let mut presets = std::collections::HashMap::new();
+        presets.insert(
+            "thumb".to_string(),
+            "200x200/filters:format(webp)".to_string(),
+        );
+        // Plain operations.
+        let ops = parse_default_ops("filters:quality(80)", &presets).unwrap();
+        assert_eq!(ops.len(), 1);
+        // Preset references expand at parse (boot) time.
+        let ops = parse_default_ops("preset:thumb", &presets).unwrap();
+        assert_eq!(ops.len(), 2);
+        // Empty means none.
+        assert!(parse_default_ops("", &presets).unwrap().is_empty());
+        assert!(parse_default_ops("  ", &presets).unwrap().is_empty());
+        // Unknown presets and bad operations are errors.
+        assert!(parse_default_ops("preset:missing", &presets).is_err());
+        assert!(parse_default_ops("filters:blur(0)", &presets).is_err());
+        assert!(parse_default_ops("nonsense!!", &presets).is_err());
+    }
+
+    #[test]
+    fn default_ops_merge_drops_overridden_singletons() {
+        let presets = std::collections::HashMap::new();
+        let defaults =
+            parse_default_ops("filters:format(webp):quality(80):blur(2)", &presets).unwrap();
+        // A bare request keeps every default.
+        let (bare, _) = parse_operations("example.com/i.jpg").unwrap();
+        let merged = merge_default_ops(&defaults, bare);
+        assert_eq!(
+            canonical_form(&merged, "example.com/i.jpg"),
+            "filters:format(webp):quality(80):blur(2)/example.com/i.jpg"
+        );
+        // A request that spells out format and quality drops
+        // those defaults; the surviving default (blur) runs
+        // first.
+        let (explicit, _) =
+            parse_operations("filters:format(png):quality(60)/example.com/i.jpg").unwrap();
+        let merged = merge_default_ops(&defaults, explicit);
+        assert_eq!(
+            canonical_form(&merged, "example.com/i.jpg"),
+            "filters:blur(2):format(png):quality(60)/example.com/i.jpg"
+        );
+        // Non-singleton defaults stack with the request's own
+        // filters instead of being dropped.
+        let (blurred, _) = parse_operations("filters:blur(3)/example.com/i.jpg").unwrap();
+        let merged = merge_default_ops(&defaults, blurred);
+        assert_eq!(
+            canonical_form(&merged, "example.com/i.jpg"),
+            "filters:format(webp):quality(80):blur(2):blur(3)/example.com/i.jpg"
+        );
     }
 
     #[test]
