@@ -7,7 +7,7 @@
 
 use image::DynamicImage;
 
-use crate::url::{CurveChannel, Filter, ImageFormat, Quality};
+use crate::url::{CurveChannel, Filter, ImageFormat, MAX_BLUR_SIGMA, Quality};
 
 /// Encoding directives collected from filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -54,6 +54,22 @@ impl EncodeOptions {
 /// fetching happens outside it.
 pub type WatermarkImages = std::collections::HashMap<String, DynamicImage>;
 
+/// The sigma a `Filter::Blur` applies with. The parser caps
+/// sigma at [`MAX_BLUR_SIGMA`] and rejects non-normal values,
+/// but a filter built any other way must not reach the image
+/// crate's Gaussian setup with a sigma that panics it (a
+/// subnormal trips an `is_normal` assert) or sizes a kernel
+/// allocation by an unbounded value. Out-of-contract values
+/// clamp to the cap; a non-positive or non-normal value falls
+/// back to the smallest normal sigma, an effective no-op.
+fn blur_sigma(sigma: f32) -> f32 {
+    if sigma.is_normal() && sigma > 0.0 {
+        sigma.min(MAX_BLUR_SIGMA)
+    } else {
+        f32::MIN_POSITIVE
+    }
+}
+
 /// Apply `filters` in order.
 ///
 /// Returns the transformed image plus the encoding directives.
@@ -79,7 +95,7 @@ pub fn apply_filters_filled(
             // gray values are preserved (r == g == b).
             Filter::Grayscale => img = DynamicImage::ImageRgb8(img.grayscale().to_rgb8()),
             Filter::Invert => img.invert(),
-            Filter::Blur(sigma) => img = img.blur(*sigma),
+            Filter::Blur(sigma) => img = img.blur(blur_sigma(*sigma)),
             Filter::Brighten(amount) => img = img.brighten(*amount),
             Filter::Contrast(amount) => {
                 let rgb = image::imageops::contrast(&img.into_rgb8(), *amount);
@@ -1004,6 +1020,29 @@ mod tests {
             *p = Rgb(color);
         }
         img
+    }
+
+    #[test]
+    fn blur_at_the_sigma_cap_still_renders() {
+        let img = opaque(16, 16, [120, 30, 200]);
+        let (out, _) = apply_filters(img, &[Filter::Blur(MAX_BLUR_SIGMA)]);
+        assert_eq!((out.width(), out.height()), (16, 16));
+    }
+
+    #[test]
+    fn blur_sigma_guard_tames_out_of_contract_values() {
+        assert_eq!(blur_sigma(2.5), 2.5);
+        assert_eq!(blur_sigma(1e9), MAX_BLUR_SIGMA);
+        assert_eq!(blur_sigma(0.0), f32::MIN_POSITIVE);
+        assert_eq!(blur_sigma(f32::NAN), f32::MIN_POSITIVE);
+        // A Filter built without the parser must not panic the
+        // image crate (subnormal sigma) or size a kernel by an
+        // unbounded one.
+        let img = opaque(8, 8, [10, 20, 30]);
+        let (out, _) = apply_filters(img.clone(), &[Filter::Blur(1e-45)]);
+        assert_eq!((out.width(), out.height()), (8, 8));
+        let (out, _) = apply_filters(img, &[Filter::Blur(1e9)]);
+        assert_eq!((out.width(), out.height()), (8, 8));
     }
 
     #[test]

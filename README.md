@@ -265,7 +265,7 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | --- | --- | --- | --- |
 | `grayscale` | none | Desaturate to gray. | `filters:grayscale` |
 | `invert` | none | Invert every channel. | `filters:invert` |
-| `blur` | `blur(2.5)`, sigma, a positive number | Gaussian blur. | `filters:blur(2.5)` |
+| `blur` | `blur(2.5)`, sigma, a positive number up to 512 | Gaussian blur. | `filters:blur(2.5)` |
 | `brighten` | `brighten(40)`, integer from −255 to 255, added to every channel and clamped to 0–255 | Brighten (or darken, with a negative value). | `filters:brighten(40)` |
 | `contrast` | `contrast(25)`, percent, −100 to 100; 0 is unchanged, −100 is flat gray, positive raises contrast | Adjust contrast. | `filters:contrast(25)` |
 | `huerotate` | `huerotate(90)`, degrees, integer | Rotate the hue. | `filters:huerotate(90)` |
