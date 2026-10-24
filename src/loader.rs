@@ -19,7 +19,10 @@
 //!
 //! Bucket sources are gated by a bucket allowlist rather than the
 //! host policy: the endpoint is operator configuration, not
-//! request input. Store responses are not redirected; a 3xx from
+//! request input. Object keys carrying dot segments are refused:
+//! the request URL is path-style, and URL parsing would collapse
+//! the segments past the allowlisted bucket after the check.
+//! Store responses are not redirected; a 3xx from
 //! a store surfaces as its status.
 //!
 //! A [`SourcePolicy`] can restrict which sources may be fetched: an
@@ -324,6 +327,17 @@ impl Loader {
         bucket: &str,
         key: &str,
     ) -> Result<Vec<u8>, LoadError> {
+        // The request URL places the key after the bucket, and
+        // URL parsing collapses dot segments, so a key carrying
+        // them would move the request outside the allowlisted
+        // bucket after the check below, and the traversed
+        // request would be validly signed (audit R2-05). Refuse
+        // before anything is signed.
+        if has_dot_segment(bucket) || has_dot_segment(key) {
+            return Err(LoadError::Forbidden(
+                "bucket or object key contains a dot segment".to_string(),
+            ));
+        }
         if !self.sources.allowed_buckets.is_empty()
             && !self
                 .sources
@@ -609,6 +623,15 @@ fn is_non_public_v6(ip: &Ipv6Addr) -> bool {
 
 /// Split the `bucket/key` remainder of a bucket URL. Both parts
 /// are required; the key may itself contain slashes.
+/// Whether any `/`-separated component of `path` is a dot
+/// segment (exactly `.` or `..`). Dots inside a segment name
+/// (`a.b`, `c..d`, `...`) are ordinary key content, not
+/// segments.
+fn has_dot_segment(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment == "." || segment == "..")
+}
+
 fn split_bucket_key<'a>(rest: &'a str, scheme: &str) -> Result<(&'a str, &'a str), LoadError> {
     let invalid = || {
         LoadError::Network(format!(
@@ -1102,6 +1125,103 @@ mod tests {
         for url in ["s3://other/pic.jpg", "gs://other/pic.jpg"] {
             let err = loader.load(url).await.unwrap_err();
             assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dot_segment_keys_are_refused_for_both_schemes() {
+        // Credentials and an allowlist naming the first bucket
+        // are configured, so every URL below passes the allowlist
+        // as written; the refusal must come from the dot-segment
+        // check, before any request is signed (audit R2-05).
+        let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
+            allowed_buckets: vec!["photos".to_string()],
+            aws_creds: Some(test_creds()),
+            gcs_creds: Some(test_creds()),
+            ..Default::default()
+        });
+        let keys = [
+            "../evil.jpg",
+            "../../evil-bucket/secret.jpg",
+            "a/../../evil.jpg",
+            "a/b/..",
+            "a/..",
+            "..",
+            ".",
+            "./pic.jpg",
+            "a/./pic.jpg",
+            "a/.",
+            "a//../../evil.jpg",
+        ];
+        for key in keys {
+            for scheme in ["s3", "gs"] {
+                let url = format!("{scheme}://photos/{key}");
+                let err = loader.load(&url).await.unwrap_err();
+                assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
+            }
+        }
+        // A dot segment as the bucket is refused the same way.
+        for url in ["s3://../pic.jpg", "gs://./pic.jpg"] {
+            let err = loader.load(url).await.unwrap_err();
+            assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dot_segment_key_sends_no_request() {
+        // The canonical exploit spelling: as bucket `photos` it
+        // passes the allowlist, and URL parsing would collapse
+        // the key to a request for the other bucket. The load
+        // must fail without the endpoint seeing any request.
+        let (base, captured) = spawn_capturing_server().await;
+        let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
+            gcs_endpoint: base,
+            gcs_creds: Some(test_creds()),
+            allowed_buckets: vec!["photos".to_string()],
+            ..Default::default()
+        });
+        let err = loader
+            .load("gs://photos/../../evil-bucket/secret.jpg")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dotted_segment_names_still_load() {
+        // Dots inside a segment name are ordinary key content:
+        // none of these keys has a `.` or `..` segment, so each
+        // loads and reaches the endpoint spelled as written.
+        let keys = [
+            "a.b/c..d/pic.jpg",
+            "dir/.../pic.jpg",
+            "dir/.hidden/pic.jpg",
+            "dir/..hidden/pic.jpg",
+            "dir/file..jpg",
+        ];
+        for key in keys {
+            let (base, captured) = spawn_capturing_server().await;
+            let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
+                s3_endpoint: Some(base),
+                ..Default::default()
+            });
+            let body = loader.load(&format!("s3://photos/{key}")).await.unwrap();
+            assert_eq!(body, b"\xff\xd8\xff\xd9");
+            let head = captured.lock().unwrap().clone();
+            let first = head.lines().next().unwrap().to_string();
+            assert!(first.starts_with(&format!("GET /photos/{key} ")), "{first}");
+
+            let (base, captured) = spawn_capturing_server().await;
+            let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
+                gcs_endpoint: base,
+                ..Default::default()
+            });
+            let body = loader.load(&format!("gs://photos/{key}")).await.unwrap();
+            assert_eq!(body, b"\xff\xd8\xff\xd9");
+            let head = captured.lock().unwrap().clone();
+            let first = head.lines().next().unwrap().to_string();
+            assert!(first.starts_with(&format!("GET /photos/{key} ")), "{first}");
         }
     }
 
