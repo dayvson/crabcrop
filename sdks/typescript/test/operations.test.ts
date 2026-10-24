@@ -54,6 +54,35 @@ test("typed filters match the canonical spellings", () => {
     [filter.saturation(2), "saturation(2)"],
     [filter.saturation(0.5), "saturation(0.5)"],
     [filter.rgb(1, -2, 3), "rgb(1,-2,3)"],
+    [
+      filter.curve("rgb", [
+        [0, 0],
+        [255, 255],
+      ]),
+      "curve(rgb,0,0,255,255)",
+    ],
+    [
+      filter.curve("r", [
+        [0, 64],
+        [255, 255],
+      ]),
+      "curve(r,0,64,255,255)",
+    ],
+    [
+      filter.curve("b", [
+        [32, 10],
+        [224, 245],
+      ]),
+      "curve(b,32,10,224,245)",
+    ],
+    [
+      filter.curve("g", [
+        [0, 0],
+        [128, 255],
+        [255, 255],
+      ]),
+      "curve(g,0,0,128,255,255,255)",
+    ],
     [filter.rotate(45.5), "rotate(45.5)"],
     [filter.rotate(90), "rotate(90)"],
     [filter.rotate(-30.25), "rotate(-30.25)"],
@@ -140,6 +169,18 @@ test("typed builders reject what the server would reject", () => {
     () => filter.saturation(256),
     () => filter.blur(0),
     () => filter.rgb(0, 0, 256),
+    () => filter.curve("x" as never, [[0, 0], [255, 255]]),
+    () => filter.curve("rgb", [[0, 0]]),
+    () =>
+      filter.curve(
+        "rgb",
+        Array.from({ length: 17 }, (_, i) => [i * 15, i * 15] as [number, number]),
+      ),
+    () => filter.curve("rgb", [[0, 0], [0, 255]]),
+    () => filter.curve("rgb", [[128, 0], [64, 255]]),
+    () => filter.curve("rgb", [[0, 0], [256, 255]]),
+    () => filter.curve("rgb", [[0, 0], [255, -1]]),
+    () => filter.curve("rgb", [[0, 0], [255, 255.5]]),
     () => filter.rotate(36001),
     () => ops.size(16384, 10),
     () => ops.size(1.5, 10),

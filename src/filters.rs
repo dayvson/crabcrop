@@ -7,7 +7,7 @@
 
 use image::DynamicImage;
 
-use crate::url::{Filter, ImageFormat, Quality};
+use crate::url::{CurveChannel, Filter, ImageFormat, Quality};
 
 /// Encoding directives collected from filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +105,9 @@ pub fn apply_filters_filled(
                     p[2] = (p[2] as i32 + b).clamp(0, 255) as u8;
                 }
                 img = DynamicImage::ImageRgb8(rgb);
+            }
+            Filter::Curve(channel, points) => {
+                img = tone_curve(&img, *channel, points);
             }
             Filter::Equalize => {
                 img = DynamicImage::ImageRgb8(equalize(&img.into_rgb8()));
@@ -288,6 +291,63 @@ fn map_rgb(img: &DynamicImage, f: impl Fn(u8, u8, u8) -> [u8; 3]) -> DynamicImag
         }
         DynamicImage::ImageRgb8(rgb)
     }
+}
+
+/// The 256-entry lookup table for one tone curve: inputs at
+/// or below the first point's x take its y, inputs at or
+/// above the last point's x take its y, and everything
+/// between is linearly interpolated between the surrounding
+/// points. Interpolation rounds to the nearest value, halves
+/// away from zero, in exact integer arithmetic, so the table
+/// is the same on every platform.
+fn curve_lut(points: &[(u8, u8)]) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let first = points[0];
+    let last = points[points.len() - 1];
+    for (i, entry) in lut.iter_mut().enumerate() {
+        let v = i as i32;
+        *entry = if v <= i32::from(first.0) {
+            first.1
+        } else if v >= i32::from(last.0) {
+            last.1
+        } else {
+            // The segment whose right end is the first point
+            // at or past v (x values strictly increase).
+            let seg = points.windows(2).find(|w| v <= i32::from(w[1].0)).unwrap();
+            let (x0, y0) = (i32::from(seg[0].0), i32::from(seg[0].1));
+            let (x1, y1) = (i32::from(seg[1].0), i32::from(seg[1].1));
+            let num = (y1 - y0) * (v - x0);
+            let den = x1 - x0;
+            let delta = if num >= 0 {
+                (2 * num + den) / (2 * den)
+            } else {
+                -((2 * -num + den) / (2 * den))
+            };
+            (y0 + delta) as u8
+        };
+    }
+    lut
+}
+
+/// Remap one channel (or all three, for `rgb`) through the
+/// curve's lookup table. Untouched channels pass through the
+/// identity table, and alpha is never touched.
+pub fn tone_curve(img: &DynamicImage, channel: CurveChannel, points: &[(u8, u8)]) -> DynamicImage {
+    let identity: [u8; 256] = std::array::from_fn(|i| i as u8);
+    let curved = curve_lut(points);
+    let (r_lut, g_lut, b_lut) = match channel {
+        CurveChannel::Rgb => (&curved, &curved, &curved),
+        CurveChannel::R => (&curved, &identity, &identity),
+        CurveChannel::G => (&identity, &curved, &identity),
+        CurveChannel::B => (&identity, &identity, &curved),
+    };
+    map_rgb(img, |r, g, b| {
+        [
+            r_lut[usize::from(r)],
+            g_lut[usize::from(g)],
+            b_lut[usize::from(b)],
+        ]
+    })
 }
 
 /// The classic warm sepia tone (the standard sepia matrix).
@@ -899,6 +959,140 @@ mod tests {
         }
         let out = sepia(&img);
         assert_eq!(out.to_rgba8().get_pixel(0, 0)[3], 77);
+    }
+
+    fn pixel_row(pixels: &[[u8; 3]]) -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(pixels.len() as u32, 1);
+        for (x, _, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = Rgb(pixels[x as usize]);
+        }
+        img
+    }
+
+    fn row_rgb(img: &DynamicImage) -> Vec<[u8; 3]> {
+        img.to_rgb8().pixels().map(|p| [p[0], p[1], p[2]]).collect()
+    }
+
+    #[test]
+    fn curve_identity_is_a_no_op() {
+        let img = striped();
+        let before = img.to_rgb8().into_raw();
+        for channel in [
+            CurveChannel::Rgb,
+            CurveChannel::R,
+            CurveChannel::G,
+            CurveChannel::B,
+        ] {
+            let (out, _) = apply_filters(
+                img.clone(),
+                &[Filter::Curve(channel, vec![(0, 0), (255, 255)])],
+            );
+            assert_eq!(out.to_rgb8().into_raw(), before, "channel {channel:?}");
+        }
+    }
+
+    #[test]
+    fn curve_two_point_lift_matches_hand_computed_values() {
+        // curve(r,0,64,255,255): black lifts to 64, white
+        // stays, and 128 lands at 64 + round(191 * 128 / 255)
+        // = 64 + 96 = 160.
+        let img = pixel_row(&[[0, 10, 20], [128, 10, 20], [255, 10, 20]]);
+        let (out, _) = apply_filters(
+            img,
+            &[Filter::Curve(CurveChannel::R, vec![(0, 64), (255, 255)])],
+        );
+        assert_eq!(
+            row_rgb(&out),
+            vec![[64, 10, 20], [160, 10, 20], [255, 10, 20]]
+        );
+    }
+
+    #[test]
+    fn curve_interpolation_rounds_half_away_from_zero() {
+        // Points (0,0) and (2,1): input 1 sits exactly on the
+        // midpoint 0.5 and rounds away from zero, to 1. The
+        // descending mirror (0,1),(2,0) sends 1 to 0 by the
+        // same rule.
+        let img = pixel_row(&[[0, 0, 0], [1, 0, 0], [2, 0, 0]]);
+        let (out, _) = apply_filters(
+            img.clone(),
+            &[Filter::Curve(CurveChannel::R, vec![(0, 0), (2, 1)])],
+        );
+        assert_eq!(row_rgb(&out), vec![[0, 0, 0], [1, 0, 0], [1, 0, 0]]);
+        let (out, _) = apply_filters(img, &[Filter::Curve(CurveChannel::R, vec![(0, 1), (2, 0)])]);
+        assert_eq!(row_rgb(&out), vec![[1, 0, 0], [0, 0, 0], [0, 0, 0]]);
+    }
+
+    #[test]
+    fn curve_channels_are_independent_and_alpha_survives() {
+        let mut img = DynamicImage::new_rgba8(1, 1);
+        img.as_mut_rgba8().unwrap().get_pixel_mut(0, 0).0 = [100, 150, 200, 77];
+        let (out, _) = apply_filters(
+            img,
+            &[Filter::Curve(CurveChannel::R, vec![(0, 64), (255, 255)])],
+        );
+        // Red: 64 + round(191 * 100 / 255) = 64 + 75 = 139.
+        // Green, blue, and alpha are not the curve's business.
+        assert_eq!(out.to_rgba8().get_pixel(0, 0).0, [139, 150, 200, 77]);
+    }
+
+    #[test]
+    fn curve_clamps_outside_the_point_range() {
+        // curve(rgb,32,10,224,245): everything at or below 32
+        // is 10, everything at or above 224 is 245, and the
+        // middle interpolates (100 -> 93, and 128 is the
+        // segment midpoint: 10 + round(235 * 96 / 192) = 128).
+        let img = pixel_row(&[
+            [0, 0, 0],
+            [31, 31, 31],
+            [32, 32, 32],
+            [100, 100, 100],
+            [128, 128, 128],
+            [224, 224, 224],
+            [255, 255, 255],
+        ]);
+        let (out, _) = apply_filters(
+            img,
+            &[Filter::Curve(CurveChannel::Rgb, vec![(32, 10), (224, 245)])],
+        );
+        let mapped: Vec<u8> = row_rgb(&out).iter().map(|p| p[0]).collect();
+        assert_eq!(mapped, vec![10, 10, 10, 93, 128, 245, 245]);
+    }
+
+    #[test]
+    fn curve_uses_the_segment_around_the_input() {
+        // Three points: a steep rise to white at 128, then
+        // flat. 64 is the first segment's exact midpoint
+        // (255 * 64 / 128 = 127.5, rounding to 128); 200 sits
+        // in the flat segment and stays 255.
+        let img = pixel_row(&[[64, 64, 64], [128, 128, 128], [200, 200, 200]]);
+        let (out, _) = apply_filters(
+            img,
+            &[Filter::Curve(
+                CurveChannel::Rgb,
+                vec![(0, 0), (128, 255), (255, 255)],
+            )],
+        );
+        assert_eq!(
+            row_rgb(&out),
+            vec![[128, 128, 128], [255, 255, 255], [255, 255, 255]]
+        );
+    }
+
+    #[test]
+    fn curves_compose_in_chain_order() {
+        // An rgb curve followed by an r curve: the second
+        // sees the first's output (in the other order the red
+        // would end at 128, not 255).
+        let img = pixel_row(&[[255, 255, 255]]);
+        let (out, _) = apply_filters(
+            img,
+            &[
+                Filter::Curve(CurveChannel::Rgb, vec![(0, 0), (255, 128)]),
+                Filter::Curve(CurveChannel::R, vec![(0, 0), (128, 255)]),
+            ],
+        );
+        assert_eq!(row_rgb(&out), vec![[255, 128, 128]]);
     }
 
     #[test]

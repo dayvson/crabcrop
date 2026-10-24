@@ -40,5 +40,11 @@
     "secret": "s3cr3t",
     "remainder": "crop:100x100:top-left/https://example.com/photo.jpg",
     "signature": "1c3500f3b3eac7e4360b1b55ccaade9d7a98e572600ffdd2745618f2380057c7"
+  },
+  {
+    "description": "Tone curve filter",
+    "secret": "s3cr3t",
+    "remainder": "filters:curve(rgb,0,0,255,255)/https://example.com/photo.jpg",
+    "signature": "d0976f5bfc4ac633ca3f9f26772fa185de1a6a88b5b8d95be95df84d3ffdbedf"
   }
 ]

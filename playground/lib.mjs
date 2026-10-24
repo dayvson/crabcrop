@@ -103,6 +103,7 @@ const FILTER_BLURBS = {
   sharpen: "sharpen by the given amount",
   text: "draw a text overlay (needs a font on the server)",
   rgb: "tint toward the given red/green/blue amounts",
+  curve: "tone curve: remap the named channel (rgb, r, g, or b) through 2 to 16 x,y control points, linearly interpolated, ends clamped",
   trim: "trim uniform borders",
   dpr: "device pixel ratio the sizes are multiplied by",
   watermark: "overlay a watermark image",
@@ -261,6 +262,18 @@ function validateFilter(name, args) {
       if (args === null) return bad;
       const parts = args.split(",");
       return parts.length === 3 && parts.every((p) => isIntIn(p, -255, 255)) ? null : bad;
+    }
+    case "curve": {
+      if (args === null) return bad;
+      const parts = args.split(",");
+      if (!["rgb", "r", "g", "b"].includes(parts[0])) return bad;
+      const coords = parts.slice(1);
+      if (coords.length < 4 || coords.length > 32 || coords.length % 2 !== 0) return bad;
+      if (!coords.every((p) => isIntIn(p, 0, 255))) return bad;
+      for (let i = 2; i < coords.length; i += 2) {
+        if (Number(coords[i]) <= Number(coords[i - 2])) return bad;
+      }
+      return null;
     }
     case "facepad":
       return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 3

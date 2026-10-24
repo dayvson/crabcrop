@@ -165,6 +165,14 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:mask(square)/" + SRC, true, SRC],
     ["filters:sepia:duotone(000000,ffffff):flip(h)/" + SRC, false, SRC],
     ["filters:duotone(000000)/" + SRC, true, SRC],
+    ["filters:curve(rgb,0,0,255,255)/" + SRC, false, SRC], // the identity curve
+    ["filters:curve(r,0,64,255,255):curve(b,32,10,224,245)/" + SRC, false, SRC], // per-channel curves chain
+    ["filters:curve(x,0,0,255,255)/" + SRC, true, SRC], // unknown channel
+    ["filters:curve(rgb,0,0)/" + SRC, true, SRC], // fewer than 2 points
+    ["filters:curve(rgb,0,0,255)/" + SRC, true, SRC], // odd coordinate count
+    ["filters:curve(rgb,0,0,256,255)/" + SRC, true, SRC], // coordinate past 255
+    ["filters:curve(rgb,128,0,64,255)/" + SRC, true, SRC], // x decreasing
+    ["filters:curve(rgb,0,0,0,255)/" + SRC, true, SRC], // x repeated
     ["filters:monochrome(ff8000):pixelate(8)/" + SRC, false, SRC],
     ["filters:pixelate(0)/" + SRC, true, SRC],
     ["filters:flip(x)/" + SRC, true, SRC],

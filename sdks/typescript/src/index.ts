@@ -179,6 +179,7 @@ export type {
   Anchor,
   BlendMode,
   CropAlign,
+  CurveChannel,
   Dimension,
   ImageFormat,
   MaskShape,

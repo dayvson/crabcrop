@@ -68,6 +68,12 @@ pub enum ParseError {
     /// A `filters:...` segment did not parse. Carries the offending
     /// segment.
     InvalidFilters(String),
+    /// A `curve(...)` filter inside a `filters:...` segment did
+    /// not parse: unknown channel, a coordinate count that is
+    /// not 2 to 16 `x,y` points, a coordinate outside 0-255, or
+    /// x values not strictly increasing. Carries the offending
+    /// segment.
+    InvalidCurve(String),
     /// No source URL followed the operations.
     MissingSourceUrl,
 }
@@ -93,6 +99,7 @@ impl ParseError {
             ParseError::InvalidPreset(_) => "invalid_preset",
             ParseError::PresetsOnly(_) => "presets_only",
             ParseError::InvalidFilters(_) => "invalid_filters",
+            ParseError::InvalidCurve(_) => "invalid_curve",
             ParseError::MissingSourceUrl => "missing_source_url",
         }
     }
@@ -122,6 +129,9 @@ impl std::fmt::Display for ParseError {
             }
             ParseError::InvalidFilters(seg) => {
                 write!(f, "invalid filters segment: {seg}")
+            }
+            ParseError::InvalidCurve(seg) => {
+                write!(f, "invalid curve filter in segment: {seg}")
             }
             ParseError::MissingSourceUrl => write!(f, "missing source URL"),
         }
@@ -263,6 +273,42 @@ pub enum Quality {
     Auto,
 }
 
+/// Which channels a `curve(...)` filter remaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurveChannel {
+    /// All three color channels through the one curve (`rgb`).
+    Rgb,
+    /// The red channel only (`r`).
+    R,
+    /// The green channel only (`g`).
+    G,
+    /// The blue channel only (`b`).
+    B,
+}
+
+impl CurveChannel {
+    /// The canonical spelling of the channel, as written in
+    /// the `curve(...)` argument list.
+    pub fn name(self) -> &'static str {
+        match self {
+            CurveChannel::Rgb => "rgb",
+            CurveChannel::R => "r",
+            CurveChannel::G => "g",
+            CurveChannel::B => "b",
+        }
+    }
+
+    fn parse(s: &str) -> Option<CurveChannel> {
+        Some(match s {
+            "rgb" => CurveChannel::Rgb,
+            "r" => CurveChannel::R,
+            "g" => CurveChannel::G,
+            "b" => CurveChannel::B,
+            _ => return None,
+        })
+    }
+}
+
 /// One filter from a `filters:...` segment.
 ///
 /// `f32` parameters mean `Eq` cannot be derived; `PartialEq` is enough
@@ -289,6 +335,12 @@ pub enum Filter {
     Saturation(f32),
     /// Per-channel level offsets, each -255..=255.
     Rgb(i32, i32, i32),
+    /// Tone curve: remap the named channel(s) through the
+    /// control points (x, y), each 0-255 with x strictly
+    /// increasing, 2 to 16 points. Between points the mapping
+    /// is linear; inputs outside the points' x range clamp
+    /// to the nearest end point's y.
+    Curve(CurveChannel, Vec<(u8, u8)>),
     /// Histogram equalization per channel.
     Equalize,
     /// Rotate by the given angle in degrees (issue #144):
@@ -896,6 +948,31 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     offsets[i] = v;
                 }
                 Filter::Rgb(offsets[0], offsets[1], offsets[2])
+            }
+            ("curve", Some(p)) => {
+                // curve(<channel>,<x>,<y>,...): the channel,
+                // then a flat list of control points, 2 to 16
+                // of them, every coordinate 0-255 and the x
+                // values strictly increasing. Curve failures
+                // carry their own error code (invalid_curve),
+                // not the segment-wide invalid_filters.
+                let bad_curve = || ParseError::InvalidCurve(seg.to_string());
+                let parts: Vec<&str> = p.split(',').collect();
+                let channel = CurveChannel::parse(parts[0]).ok_or_else(bad_curve)?;
+                let coords = &parts[1..];
+                if coords.len() < 4 || coords.len() > 32 || !coords.len().is_multiple_of(2) {
+                    return Err(bad_curve());
+                }
+                let mut points: Vec<(u8, u8)> = Vec::with_capacity(coords.len() / 2);
+                for pair in coords.as_chunks::<2>().0 {
+                    let x: u8 = pair[0].parse().map_err(|_| bad_curve())?;
+                    let y: u8 = pair[1].parse().map_err(|_| bad_curve())?;
+                    if points.last().is_some_and(|last| x <= last.0) {
+                        return Err(bad_curve());
+                    }
+                    points.push((x, y));
+                }
+                Filter::Curve(channel, points)
             }
             ("equalize", None) => Filter::Equalize,
             ("removebg", None) => Filter::RemoveBg,
@@ -1701,6 +1778,14 @@ fn filter_text(filter: &Filter) -> String {
         Filter::Sharpen(v) => format!("sharpen({v})"),
         Filter::Saturation(v) => format!("saturation({v})"),
         Filter::Rgb(r, g, b) => format!("rgb({r},{g},{b})"),
+        Filter::Curve(channel, points) => {
+            let mut text = format!("curve({}", channel.name());
+            for (x, y) in points {
+                text.push_str(&format!(",{x},{y}"));
+            }
+            text.push(')');
+            text
+        }
         Filter::Equalize => "equalize".to_string(),
         Filter::Rotate(v) => format!("rotate({})", format_angle(*v)),
         Filter::Trim(v) => format!("trim({v})"),
@@ -2245,6 +2330,7 @@ mod tests {
             (ParseError::InvalidPreset("x".into()), "invalid_preset"),
             (ParseError::PresetsOnly("x".into()), "presets_only"),
             (ParseError::InvalidFilters("x".into()), "invalid_filters"),
+            (ParseError::InvalidCurve("x".into()), "invalid_curve"),
             (ParseError::MissingSourceUrl, "missing_source_url"),
         ];
         let mut seen = std::collections::HashSet::new();
@@ -2347,6 +2433,7 @@ mod tests {
             "filters:text(Hello%2C%20world,24,FFAA00CC,bottom-right)",
             "filters:fill(00ff00):radius(1,2,3,4):border(3,102030):mask(ellipse)",
             "filters:sepia:duotone(101010,f0e0c0):monochrome(336699):pixelate(8)",
+            "filters:curve(rgb,0,0,255,255):curve(b,32,10,224,245)",
             "filters:flip(h):blur_region(1,2,30,40):pixelate_region(5,6,70,80)",
             "300x200/filters:grayscale",
             "filters:grayscale/300x200/filters:blur(2)",
@@ -2811,6 +2898,81 @@ mod tests {
                 "segment: {seg:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_curve_filter() {
+        let (ops, _) = parse_operations(
+            "filters:curve(rgb,0,0,255,255):curve(r,0,64,255,255)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::Curve(CurveChannel::Rgb, vec![(0, 0), (255, 255)]),
+                Filter::Curve(CurveChannel::R, vec![(0, 64), (255, 255)]),
+            ])]
+        );
+        // The point-count endpoints: 2 and 16 points parse.
+        assert!(parse_operations("filters:curve(g,0,0,255,255)/example.com/img.jpg").is_ok());
+        let sixteen: Vec<String> = (0..16).map(|i| format!("{},{}", i * 17, i * 17)).collect();
+        assert!(
+            parse_operations(&format!(
+                "filters:curve(b,{})/example.com/img.jpg",
+                sixteen.join(",")
+            ))
+            .is_ok()
+        );
+        // Leading zeros and a `+` sign are spelling, not
+        // meaning: the canonical form prints the plain values.
+        assert_eq!(
+            canonical_key_form("filters:curve(rgb,007,0,+255,255)/example.com/img.jpg"),
+            "filters:curve(rgb,7,0,255,255)/example.com/img.jpg"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_curves() {
+        // Every curve failure is invalid_curve, not the
+        // segment-wide invalid_filters.
+        for seg in [
+            // Unknown channel.
+            "filters:curve(x,0,0,255,255)",
+            "filters:curve(RGB,0,0,255,255)",
+            "filters:curve(l,0,0,255,255)",
+            // Fewer than 2 points, and an odd coordinate count.
+            "filters:curve(rgb)",
+            "filters:curve(rgb,0,0)",
+            "filters:curve(rgb,0,0,255)",
+            "filters:curve(rgb,0,0,255,255,128)",
+            // Coordinates outside 0-255.
+            "filters:curve(rgb,0,0,256,255)",
+            "filters:curve(rgb,0,-1,255,255)",
+            "filters:curve(rgb,0,0,255,1.5)",
+            // x not strictly increasing.
+            "filters:curve(rgb,0,0,0,255)",
+            "filters:curve(rgb,128,0,64,255)",
+            "filters:curve(rgb,0,0,128,10,128,20)",
+        ] {
+            assert_eq!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")),
+                Err(ParseError::InvalidCurve(seg.to_string())),
+                "segment: {seg:?}"
+            );
+        }
+        // 17 points is one past the cap.
+        let seventeen: Vec<String> = (0..17).map(|i| format!("{},{}", i * 15, i * 15)).collect();
+        let seg = format!("filters:curve(rgb,{})", seventeen.join(","));
+        assert_eq!(
+            parse_operations(&format!("{seg}/example.com/img.jpg")),
+            Err(ParseError::InvalidCurve(seg.clone()))
+        );
+        // A bare `curve` with no argument list is a plain
+        // invalid filters segment, like every other filter.
+        assert_eq!(
+            parse_operations("filters:curve/example.com/img.jpg"),
+            Err(ParseError::InvalidFilters("filters:curve".to_string()))
+        );
     }
 
     #[test]
