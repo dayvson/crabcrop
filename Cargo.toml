@@ -34,6 +34,17 @@ serde_json = "1"
 image = { version = "0.25", features = ["avif"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "fs", "io-util"] }
 
+[features]
+# AVIF source decoding, through the image crate's avif-native
+# decoder (mp4parse + dav1d). Off by default (issue #141,
+# option A): dav1d is a C dependency, found through
+# pkg-config (a system libdav1d) or built from vendored
+# sources when SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always.
+# Everything crabcrop ships enables it: the Docker image
+# (system libdav1d), the release binaries (vendored), and
+# the Homebrew install (which ships the release binary).
+avif-decode = ["image/avif-native"]
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
