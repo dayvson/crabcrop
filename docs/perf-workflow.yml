@@ -1,7 +1,7 @@
 # Performance regression gate (issue #140). This file is the
-# complete workflow, kept in docs/ until it lands at
-# .github/workflows/perf.yml through the GitHub web UI (the API
-# credential cannot push workflow files). It runs nightly and
+# complete workflow as landed at .github/workflows/perf.yml
+# (commit 3376454, through the GitHub web UI; the API credential
+# cannot push workflow files). Keep the two in sync. It runs nightly and
 # on demand, never per pull request: shared-runner variance
 # makes per-PR numbers noise. The gate step starts
 # non-blocking (continue-on-error) while the baseline earns
