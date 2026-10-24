@@ -1270,7 +1270,9 @@ fn apply_operations(
         match op {
             Operation::DebugFocal => debug_armed = true,
             Operation::Size(size) => img = apply_size(img, size, cap, dpr)?,
-            Operation::FitIn(size) => img = apply_fit_in(img, size, cap, dpr)?,
+            Operation::FitIn { size, adaptive } => {
+                img = apply_fit_in(img, size, *adaptive, cap, dpr)?
+            }
             Operation::Pad { size, fill } => {
                 let (tw, th) = match (size.width, size.height) {
                     (Dimension::Pixels(w), Dimension::Pixels(h)) => {
@@ -1723,15 +1725,32 @@ fn svg_raster_target(ops: &[Operation], intrinsic: (f32, f32), dpr: f32) -> (u32
                 };
                 return clamp_raster(w, h);
             }
-            Operation::FitIn(size) => {
+            Operation::FitIn { size, adaptive } => {
+                // Predict with the same box the pipeline will
+                // fit into: DPR-scale the pixel axes, then let
+                // adaptive swap them against the intrinsic
+                // orientation.
+                let resolved = ImageSize {
+                    width: match size.width {
+                        Dimension::Pixels(n) => Dimension::Pixels(scale_px(n, dpr)),
+                        d => d,
+                    },
+                    height: match size.height {
+                        Dimension::Pixels(n) => Dimension::Pixels(scale_px(n, dpr)),
+                        d => d,
+                    },
+                    flip_horizontal: size.flip_horizontal,
+                    flip_vertical: size.flip_vertical,
+                };
+                let boxed = fit_in_box(&resolved, iw, ih, *adaptive);
                 let mut scale = f64::INFINITY;
-                match size.width {
-                    Dimension::Pixels(n) => scale = scale.min(scale_px(n, dpr) as f64 / iw as f64),
+                match boxed.width {
+                    Dimension::Pixels(n) => scale = scale.min(n as f64 / iw as f64),
                     Dimension::Original => scale = scale.min(1.0),
                     Dimension::Proportional => {}
                 }
-                match size.height {
-                    Dimension::Pixels(n) => scale = scale.min(scale_px(n, dpr) as f64 / ih as f64),
+                match boxed.height {
+                    Dimension::Pixels(n) => scale = scale.min(n as f64 / ih as f64),
                     Dimension::Original => scale = scale.min(1.0),
                     Dimension::Proportional => {}
                 }
@@ -2280,6 +2299,9 @@ fn apply_pad(
             flip_horizontal: false,
             flip_vertical: false,
         },
+        // Pad never adapts: the canvas is the explicit box,
+        // so the fit inside it uses the box as written.
+        false,
         cap,
         1.0,
     )?;
@@ -2313,19 +2335,51 @@ fn apply_pad(
     Ok(DynamicImage::ImageRgba8(base))
 }
 
+/// The box an adaptive fit-in actually fits into: the declared
+/// box with its axes swapped when the source orientation and
+/// the box orientation disagree (portrait source into a
+/// landscape box, or landscape source into a portrait box).
+/// Orientations compare by strict inequality, so equality on
+/// either side never swaps: a square source and a square box
+/// have no orientation to disagree with. A box without two
+/// pixel axes (a proportional or `orig` axis) likewise has no
+/// fixed orientation and never swaps.
+fn fit_in_box(size: &ImageSize, sw: u32, sh: u32, adaptive: bool) -> ImageSize {
+    if !adaptive {
+        return *size;
+    }
+    let (bw, bh) = match (size.width, size.height) {
+        (Dimension::Pixels(w), Dimension::Pixels(h)) => (w, h),
+        _ => return *size,
+    };
+    let disagree = (sh > sw && bw > bh) || (sw > sh && bh > bw);
+    if disagree {
+        ImageSize {
+            width: size.height,
+            height: size.width,
+            flip_horizontal: size.flip_horizontal,
+            flip_vertical: size.flip_vertical,
+        }
+    } else {
+        *size
+    }
+}
+
 fn apply_fit_in(
     img: DynamicImage,
     size: &ImageSize,
+    adaptive: bool,
     cap: Option<(u32, u32)>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
-    let size = &ImageSize {
+    let scaled = ImageSize {
         width: scale_dimension(size.width, dpr),
         height: scale_dimension(size.height, dpr),
         flip_horizontal: size.flip_horizontal,
         flip_vertical: size.flip_vertical,
     };
     let (sw, sh) = (img.width(), img.height());
+    let size = &fit_in_box(&scaled, sw, sh, adaptive);
     let mut scale = f64::INFINITY;
     match size.width {
         Dimension::Pixels(n) => scale = scale.min(n as f64 / sw as f64),
@@ -3388,12 +3442,27 @@ mod tests {
     }
 
     fn fit_in_op(w: Dimension, h: Dimension) -> Operation {
-        Operation::FitIn(ImageSize {
-            width: w,
-            height: h,
-            flip_horizontal: false,
-            flip_vertical: false,
-        })
+        Operation::FitIn {
+            size: ImageSize {
+                width: w,
+                height: h,
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            adaptive: false,
+        }
+    }
+
+    fn fit_in_adaptive_op(w: Dimension, h: Dimension) -> Operation {
+        Operation::FitIn {
+            size: ImageSize {
+                width: w,
+                height: h,
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            adaptive: true,
+        }
     }
 
     fn dims_of(out: &ProcessedImage) -> (u32, u32) {
@@ -3429,6 +3498,197 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dims_of(&out), (1000, 500));
+    }
+
+    #[test]
+    fn fit_in_adaptive_swaps_the_box_when_orientations_disagree() {
+        let engine = Engine;
+        // Portrait 200x400 into a landscape 300x100 box: plain
+        // fit-in is ruled by the height (50x100); adaptive fits
+        // the swapped 100x300 box instead (100x200).
+        let portrait = png_bytes(&DynamicImage::new_rgb8(200, 400));
+        let out = engine
+            .process(
+                &portrait,
+                &[fit_in_op(Dimension::Pixels(300), Dimension::Pixels(100))],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (50, 100));
+        let out = engine
+            .process(
+                &portrait,
+                &[fit_in_adaptive_op(
+                    Dimension::Pixels(300),
+                    Dimension::Pixels(100),
+                )],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (100, 200));
+        // Landscape 400x200 into a portrait 100x300 box: plain
+        // is ruled by the width (100x50); adaptive fits the
+        // swapped 300x100 box instead (200x100).
+        let landscape = png_bytes(&DynamicImage::new_rgb8(400, 200));
+        let out = engine
+            .process(
+                &landscape,
+                &[fit_in_op(Dimension::Pixels(100), Dimension::Pixels(300))],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (100, 50));
+        let out = engine
+            .process(
+                &landscape,
+                &[fit_in_adaptive_op(
+                    Dimension::Pixels(100),
+                    Dimension::Pixels(300),
+                )],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (200, 100));
+    }
+
+    #[test]
+    fn fit_in_adaptive_matches_plain_fit_in_when_orientations_agree() {
+        let engine = Engine;
+        // Landscape source, landscape box: no swap, byte-for-byte
+        // the plain behavior.
+        let landscape = png_bytes(&DynamicImage::new_rgb8(400, 200));
+        let plain = engine
+            .process(
+                &landscape,
+                &[fit_in_op(Dimension::Pixels(300), Dimension::Pixels(100))],
+            )
+            .unwrap();
+        let adaptive = engine
+            .process(
+                &landscape,
+                &[fit_in_adaptive_op(
+                    Dimension::Pixels(300),
+                    Dimension::Pixels(100),
+                )],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&adaptive), (200, 100));
+        assert_eq!(adaptive.bytes, plain.bytes);
+        // Portrait source, portrait box: no swap either.
+        let portrait = png_bytes(&DynamicImage::new_rgb8(200, 400));
+        let plain = engine
+            .process(
+                &portrait,
+                &[fit_in_op(Dimension::Pixels(100), Dimension::Pixels(300))],
+            )
+            .unwrap();
+        let adaptive = engine
+            .process(
+                &portrait,
+                &[fit_in_adaptive_op(
+                    Dimension::Pixels(100),
+                    Dimension::Pixels(300),
+                )],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&adaptive), (100, 200));
+        assert_eq!(adaptive.bytes, plain.bytes);
+    }
+
+    #[test]
+    fn fit_in_adaptive_never_swaps_square_or_open_boxes() {
+        let engine = Engine;
+        // Square source: no orientation, so the output is the
+        // plain fit-in output.
+        let square = png_bytes(&DynamicImage::new_rgb8(200, 200));
+        let plain = engine
+            .process(
+                &square,
+                &[fit_in_op(Dimension::Pixels(300), Dimension::Pixels(100))],
+            )
+            .unwrap();
+        let adaptive = engine
+            .process(
+                &square,
+                &[fit_in_adaptive_op(
+                    Dimension::Pixels(300),
+                    Dimension::Pixels(100),
+                )],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&adaptive), (100, 100));
+        assert_eq!(adaptive.bytes, plain.bytes);
+        // Square box: swapping it would change nothing, and the
+        // code does not swap it.
+        let portrait = png_bytes(&DynamicImage::new_rgb8(200, 400));
+        let plain = engine
+            .process(
+                &portrait,
+                &[fit_in_op(Dimension::Pixels(100), Dimension::Pixels(100))],
+            )
+            .unwrap();
+        let adaptive = engine
+            .process(
+                &portrait,
+                &[fit_in_adaptive_op(
+                    Dimension::Pixels(100),
+                    Dimension::Pixels(100),
+                )],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&adaptive), (50, 100));
+        assert_eq!(adaptive.bytes, plain.bytes);
+        // A box with a proportional axis has no fixed
+        // orientation: no swap, the single bound rules.
+        let plain = engine
+            .process(
+                &portrait,
+                &[fit_in_op(Dimension::Pixels(300), Dimension::Proportional)],
+            )
+            .unwrap();
+        let adaptive = engine
+            .process(
+                &portrait,
+                &[fit_in_adaptive_op(
+                    Dimension::Pixels(300),
+                    Dimension::Proportional,
+                )],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&adaptive), (300, 600));
+        assert_eq!(adaptive.bytes, plain.bytes);
+    }
+
+    #[test]
+    fn fit_in_box_swap_decision() {
+        let px = |w: u32, h: u32| ImageSize {
+            width: Dimension::Pixels(w),
+            height: Dimension::Pixels(h),
+            flip_horizontal: false,
+            flip_vertical: false,
+        };
+        // Not adaptive: never swaps, whatever the orientations.
+        assert_eq!(fit_in_box(&px(300, 100), 200, 400, false), px(300, 100));
+        // Disagreement swaps in both directions.
+        assert_eq!(fit_in_box(&px(300, 100), 200, 400, true), px(100, 300));
+        assert_eq!(fit_in_box(&px(100, 300), 400, 200, true), px(300, 100));
+        // Agreement keeps the box.
+        assert_eq!(fit_in_box(&px(300, 100), 400, 200, true), px(300, 100));
+        assert_eq!(fit_in_box(&px(100, 300), 200, 400, true), px(100, 300));
+        // Equality on either side never swaps.
+        assert_eq!(fit_in_box(&px(300, 100), 200, 200, true), px(300, 100));
+        assert_eq!(fit_in_box(&px(100, 100), 200, 400, true), px(100, 100));
+        // No two pixel axes, no swap.
+        let open = ImageSize {
+            width: Dimension::Pixels(300),
+            height: Dimension::Proportional,
+            flip_horizontal: false,
+            flip_vertical: false,
+        };
+        assert_eq!(fit_in_box(&open, 200, 400, true), open);
+        let orig = ImageSize {
+            width: Dimension::Original,
+            height: Dimension::Pixels(100),
+            flip_horizontal: false,
+            flip_vertical: false,
+        };
+        assert_eq!(fit_in_box(&orig, 200, 400, true), orig);
     }
 
     #[test]
@@ -5994,6 +6254,29 @@ mod tests {
         assert_eq!(img.get_pixel(50, 100), &image::Rgb([0, 0, 255]));
         assert_eq!(img.get_pixel(50, 74), &image::Rgb([255, 136, 0]));
         assert_eq!(img.get_pixel(50, 125), &image::Rgb([255, 136, 0]));
+    }
+
+    #[test]
+    fn pad_never_adapts_its_canvas() {
+        // `adaptive` is a fit-in modifier; pad's canvas is
+        // explicit, so an orientation mismatch never swaps it:
+        // the output is exactly the requested canvas in both
+        // mismatch directions.
+        let engine = Engine;
+        let out = engine
+            .process(
+                &solid_png(100, 200, [255, 0, 0]),
+                &[pad_op(200, 100, PadFill::Directive)],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (200, 100));
+        let out = engine
+            .process(
+                &solid_png(200, 100, [255, 0, 0]),
+                &[pad_op(100, 200, PadFill::Directive)],
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (100, 200));
     }
 
     #[test]

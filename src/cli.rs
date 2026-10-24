@@ -344,7 +344,15 @@ fn describe_operation(segment: &str, op: &Operation) -> Vec<String> {
             "  {segment}  crop to {}, aligned {align:?}",
             size_text(size)
         )],
-        Operation::FitIn(size) => vec![format!("  {segment}  fit inside {}", size_text(size))],
+        Operation::FitIn { size, adaptive } => vec![format!(
+            "  {segment}  fit inside {}{}",
+            size_text(size),
+            if *adaptive {
+                ", swapping the box when the source orientation disagrees"
+            } else {
+                ""
+            }
+        )],
         Operation::Pad { size, .. } => vec![format!("  {segment}  pad to {}", size_text(size))],
         Operation::CropRect {
             left,
@@ -947,6 +955,7 @@ pub fn convert_thumbor(
     let mut trim: Option<Option<u8>> = None;
     let mut crop_rect: Option<(u32, u32, u32, u32)> = None;
     let mut fit_in = false;
+    let mut fit_in_adaptive = false;
     let mut size: Option<(ThumborDim, ThumborDim)> = None;
     let mut halign: Option<&str> = None;
     let mut valign: Option<&str> = None;
@@ -976,10 +985,10 @@ pub fn convert_thumbor(
         } else if matches!(seg, "fit-in" | "adaptive-fit-in" | "full-fit-in") {
             fit_in = true;
             if seg == "adaptive-fit-in" {
-                warnings.push(
-                    "adaptive-fit-in converted to fit-in: crabcrop has no adaptive mode"
-                        .to_string(),
-                );
+                // An exact conversion since #167: crabcrop's
+                // fit-in has the same adaptive mode, so no
+                // warning is owed.
+                fit_in_adaptive = true;
             } else if seg == "full-fit-in" {
                 warnings.push(
                     "full-fit-in converted to fit-in: the whole image stays inside the box"
@@ -1085,7 +1094,11 @@ pub fn convert_thumbor(
                 let strip = |t: &str| t.strip_prefix('-').unwrap_or(t).to_string();
                 format!("{}x{}", strip(&wt), strip(&ht))
             };
-            format!("fit-in:{plain}")
+            if fit_in_adaptive {
+                format!("fit-in:{plain}:adaptive")
+            } else {
+                format!("fit-in:{plain}")
+            }
         } else if w_live && h_live {
             if w_flip {
                 crop_flips.push("flip(h)".to_string());
@@ -1367,6 +1380,16 @@ mod tests {
         )
         .unwrap();
         assert!(url.contains("/fit-in:300x200/"), "{url}");
+        // adaptive-fit-in converts exactly, with no warning:
+        // crabcrop's fit-in has the same adaptive mode.
+        let (url, warnings) = convert_thumbor(
+            "unsafe/adaptive-fit-in/300x200/https://e.com/a.jpg",
+            base,
+            Some(b"s"),
+        )
+        .unwrap();
+        assert!(url.contains("/fit-in:300x200:adaptive/"), "{url}");
+        assert!(warnings.is_empty(), "{warnings:?}");
         // An explicit crop rectangle is a rectangle, cut
         // before the size's own crop.
         let (url, _) = convert_thumbor(

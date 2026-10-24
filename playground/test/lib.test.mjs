@@ -128,6 +128,11 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["x200/" + SRC, false, SRC], // empty width is proportional
     ["fit-in:300x/" + SRC, false, SRC],
     ["fit-in:-300x200/" + SRC, true, SRC], // flips are invalid in fit-in
+    ["fit-in:300x200:adaptive/" + SRC, false, SRC], // the box swaps on orientation mismatch
+    ["fit-in:300x200:sideways/" + SRC, true, SRC], // adaptive is the only fit-in modifier
+    ["fit-in:300x200:adaptive:extra/" + SRC, true, SRC],
+    ["fit-in:adaptive/" + SRC, true, SRC], // adaptive is a modifier, never the box
+    ["pad:100x100:adaptive/" + SRC, true, SRC], // pad's canvas is explicit: no adaptive
     ["crop:100x100:sideways/" + SRC, true, SRC], // align is an enumerated set
     ["crop:100x100:smart/" + SRC, false, SRC],
     ["crop:100x100:top-left/" + SRC, false, SRC], // corner alignments parse

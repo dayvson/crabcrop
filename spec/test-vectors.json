@@ -76,5 +76,11 @@
     "secret": "s3cr3t",
     "remainder": "debug:focal/crop:100x100:smart/https://example.com/photo.jpg",
     "signature": "031e8be3ae557f4974d229a532d06215cec3f5616ca6666a030d7f12f9a997a8"
+  },
+  {
+    "description": "Orientation-adaptive fit-in",
+    "secret": "s3cr3t",
+    "remainder": "fit-in:300x200:adaptive/https://example.com/photo.jpg",
+    "signature": "97e32c2d061c022cf8738f376087b61d56a56e301b885f3fe3d822efe50591f6"
   }
 ]

@@ -555,7 +555,11 @@ pub enum Operation {
     /// Crop to a size with an alignment, before resize.
     Crop { size: ImageSize, align: Align },
     /// Scale proportionally to fit inside a box (`fit-in:300x200`).
-    FitIn(ImageSize),
+    /// With `adaptive` (`fit-in:300x200:adaptive`), the box axes
+    /// swap when the source orientation and the box orientation
+    /// disagree, so a portrait source fits the landscape box's
+    /// transpose instead of letterboxing into the tighter axis.
+    FitIn { size: ImageSize, adaptive: bool },
     /// Fit inside a box, then extend the canvas to exactly the
     /// box, filling the remainder (`pad:300x200[:<fill>]`).
     Pad { size: ImageSize, fill: PadFill },
@@ -742,14 +746,22 @@ fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
 }
 
 /// Parse the box after `fit-in:`. Flips make no sense when fitting,
-/// so a flipped size is invalid here.
+/// so a flipped size is invalid here. The one modifier is
+/// `:adaptive` after the box; anything else in that slot (an
+/// unknown modifier, a second modifier, `adaptive` standing in
+/// for the box) is the same `invalid_size` error as a bad box.
 fn parse_fit_in(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidSize(seg.to_string());
-    let size = parse_size(rest).map_err(|_| invalid())?;
+    let (dims, adaptive) = match rest.split_once(':') {
+        Some((dims, "adaptive")) => (dims, true),
+        Some(_) => return Err(invalid()),
+        None => (rest, false),
+    };
+    let size = parse_size(dims).map_err(|_| invalid())?;
     if size.flip_horizontal || size.flip_vertical {
         return Err(invalid());
     }
-    Ok(Operation::FitIn(size))
+    Ok(Operation::FitIn { size, adaptive })
 }
 
 /// Parse `<left>x<top>:<right>x<bottom>` with ordered corners
@@ -1752,7 +1764,7 @@ impl RequestDirectives {
             match op {
                 Operation::Size(_)
                 | Operation::Crop { .. }
-                | Operation::FitIn(_)
+                | Operation::FitIn { .. }
                 | Operation::Pad { .. }
                 | Operation::CropRect { .. } => d.has_size_operation = true,
                 Operation::DebugFocal => d.debug_focal = true,
@@ -2052,7 +2064,13 @@ fn operation_text(op: &Operation) -> String {
             Some(name) => format!("crop:{}:{name}", size_text(size)),
             None => format!("crop:{}", size_text(size)),
         },
-        Operation::FitIn(size) => format!("fit-in:{}", size_text(size)),
+        Operation::FitIn { size, adaptive } => {
+            if *adaptive {
+                format!("fit-in:{}:adaptive", size_text(size))
+            } else {
+                format!("fit-in:{}", size_text(size))
+            }
+        }
         Operation::Pad { size, fill } => match fill {
             PadFill::Directive => format!("pad:{}", size_text(size)),
             PadFill::Blur => format!("pad:{}:blur", size_text(size)),
@@ -2603,6 +2621,7 @@ mod tests {
             "debug:focal/crop:100x100:smart",
             "maxage:60/300x200",
             "fit-in:300x200",
+            "fit-in:300x200:adaptive",
             "pad:300x200",
             "pad:300x200:blur",
             "pad:300x200:A0B0C0",
@@ -3446,30 +3465,82 @@ mod tests {
         let (ops, _) = parse_operations("fit-in:300x200/example.com/img.jpg").unwrap();
         assert_eq!(
             ops,
-            vec![Operation::FitIn(ImageSize {
-                width: Dimension::Pixels(300),
-                height: Dimension::Pixels(200),
-                flip_horizontal: false,
-                flip_vertical: false,
-            })]
+            vec![Operation::FitIn {
+                size: ImageSize {
+                    width: Dimension::Pixels(300),
+                    height: Dimension::Pixels(200),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                adaptive: false,
+            }]
         );
         let (ops, _) = parse_operations("fit-in:300x0/example.com/img.jpg").unwrap();
         assert_eq!(
             ops,
-            vec![Operation::FitIn(ImageSize {
-                width: Dimension::Pixels(300),
-                height: Dimension::Proportional,
-                flip_horizontal: false,
-                flip_vertical: false,
-            })]
+            vec![Operation::FitIn {
+                size: ImageSize {
+                    width: Dimension::Pixels(300),
+                    height: Dimension::Proportional,
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                adaptive: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_adaptive_fit_in() {
+        let (ops, _) = parse_operations("fit-in:300x200:adaptive/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::FitIn {
+                size: ImageSize {
+                    width: Dimension::Pixels(300),
+                    height: Dimension::Pixels(200),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                adaptive: true,
+            }]
+        );
+        // The modifier is part of the operation: it stays in the
+        // canonical form, so an adaptive URL keys apart from the
+        // plain fit-in of the same box.
+        assert_eq!(
+            canonical_form(&ops, "example.com/img.jpg"),
+            "fit-in:300x200:adaptive/example.com/img.jpg"
+        );
+        assert_ne!(
+            canonical_key_form("fit-in:300x200:adaptive/example.com/img.jpg"),
+            canonical_key_form("fit-in:300x200/example.com/img.jpg")
         );
     }
 
     #[test]
     fn rejects_bad_fit_in() {
-        for seg in ["fit-in:-300x200", "fit-in:wide", "fit-in:"] {
+        for seg in [
+            "fit-in:-300x200",
+            "fit-in:wide",
+            "fit-in:",
+            // The modifier slot takes exactly `adaptive`, once.
+            "fit-in:300x200:sideways",
+            "fit-in:300x200:adaptive:extra",
+            "fit-in:300x200:",
+            "fit-in:300x200:Adaptive",
+            // `adaptive` is a modifier, never the box itself.
+            "fit-in:adaptive",
+            "fit-in:adaptive:300x200",
+            // A flipped box stays invalid with the modifier.
+            "fit-in:-300x200:adaptive",
+        ] {
             let path = format!("{seg}/example.com/img.jpg");
-            assert!(parse_operations(&path).is_err(), "{seg}");
+            assert_eq!(
+                parse_operations(&path),
+                Err(ParseError::InvalidSize(seg.to_string())),
+                "{seg}"
+            );
         }
     }
 
@@ -3737,6 +3808,9 @@ mod tests {
             "pad:200x100:red",
             "pad:200x100:ff88",
             "pad:200x100:blur:extra",
+            // `adaptive` belongs to fit-in: pad's canvas is
+            // explicit, so the modifier is not a pad fill.
+            "pad:200x100:adaptive",
             // The exact-box contract, same as crop:.
             "pad:200x0",
             "pad:origx100",

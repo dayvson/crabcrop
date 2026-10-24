@@ -166,8 +166,12 @@ export const ops = {
     return `${dimension("width", width)}x${dimension("height", height)}`;
   },
 
-  /** `fit-in:300x200`; no flips (the server rejects them here). */
-  fitIn(width: Dimension, height: Dimension): string {
+  /**
+   * `fit-in:300x200`; no flips (the server rejects them here).
+   * With `adaptive`, `fit-in:300x200:adaptive`: the box axes
+   * swap when the source orientation disagrees with the box's.
+   */
+  fitIn(width: Dimension, height: Dimension, adaptive = false): string {
     for (const [what, v] of [
       ["width", width],
       ["height", height],
@@ -176,7 +180,8 @@ export const ops = {
         fail(`fit-in ${what}`, v, "not a flip: fit-in takes no negative sizes");
       }
     }
-    return `fit-in:${dimension("width", width)}x${dimension("height", height)}`;
+    const base = `fit-in:${dimension("width", width)}x${dimension("height", height)}`;
+    return adaptive ? `${base}:adaptive` : base;
   },
 
   /** `crop:300x200` or `crop:300x200:smart`; an exact pixel box. */
