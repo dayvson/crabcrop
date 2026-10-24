@@ -231,6 +231,7 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | `sharpen` | `sharpen(1.5)` — strength, a positive number | Unsharp-mask sharpening. | `filters:sharpen(1.5)` |
 | `saturation` | `saturation(1.5)` — 0 to 255; 0 is grayscale, 1 is unchanged | Scale color saturation. | `filters:saturation(0.5)` |
 | `rgb` | `rgb(10,-5,0)` — per-channel offsets, each −255 to 255 | Add offsets to the red, green, and blue channels. | `filters:rgb(10,-5,0)` |
+| `curve` | `curve(rgb,0,0,255,255)` — a channel (`rgb`, `r`, `g`, or `b`), then 2 to 16 `x,y` control points, each 0–255 with x strictly increasing | Remap tones through the control points, linearly interpolated; inputs outside the points' x range clamp to the nearest end value. Repeat the filter to shape channels independently. | `filters:curve(r,0,64,255,255)` |
 | `equalize` | none | Histogram equalization, per channel. | `filters:equalize` |
 | `rotate` | `rotate(45)` — any angle in degrees, decimals allowed; negatives allowed | Rotate the image. Multiples of 90 are exact quarter turns; other angles expand the canvas to fit, filling the uncovered corners with the `fill` color (white by default) or transparency when the image carries alpha. | `filters:rotate(-90)` |
 | `trim` | `trim` or `trim(20)` — tolerance 0–255, default 10 | Crop away the border that matches the top-left corner color within the tolerance. | `filters:trim(20)` |
@@ -244,6 +245,8 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | `radius` | `radius(24)` — pixels; or four values `radius(24,24,0,0)` in CSS corner order (top-left, top-right, bottom-right, bottom-left) | Round the corners, antialiased. Radii larger than the frame shrink proportionally so corners never overlap. The output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:radius(24):format(png)` |
 | `border` | `border(4,000000)` — width in pixels, color as six hex digits | Paint an opaque band of the color inside the frame. Dimensions do not change. Works on any format. | `filters:border(4,000000)` |
 | `mask` | `mask(circle)` or `mask(ellipse)` | Keep only the inscribed shape (the circle's diameter is the smaller dimension); the rest becomes transparent. The output format must carry alpha. | `filters:mask(circle):format(png)` |
+
+The `curve` filter is the fine tone control the additive filters only approximate. Each control point says "an input of x becomes y"; between points the mapping is a straight line, and inputs below the first point's x take its y (likewise above the last point's), so a curve need not span the whole range. `filters:curve(rgb,0,20,128,160,255,255)` lifts the shadows and midtones of every channel at once, and a second `curve` with `r`, `g`, or `b` then shapes one channel at a time. The identity curve `curve(rgb,0,0,255,255)` changes nothing.
 
 ```bash
 curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/https://example.com/photo.jpg"

@@ -36,6 +36,9 @@ export type BlendMode = "normal" | "multiply" | "screen" | "overlay";
 /** Mask shapes for the `mask(...)` filter. */
 export type MaskShape = "circle" | "ellipse";
 
+/** Channels the `curve(...)` filter remaps. */
+export type CurveChannel = "rgb" | "r" | "g" | "b";
+
 /**
  * One side of a size: a pixel count (1..16383), 0 for
  * proportional, a negative count to flip that axis, or
@@ -153,6 +156,7 @@ const ANCHORS: readonly string[] = [
   "bottom-right",
 ];
 const BLEND_MODES: readonly string[] = ["normal", "multiply", "screen", "overlay"];
+const CURVE_CHANNELS: readonly string[] = ["rgb", "r", "g", "b"];
 const IMAGE_FORMATS: readonly string[] = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif"];
 
 /** Operation segments, one typed call per segment kind. */
@@ -306,6 +310,33 @@ export const filter = {
   /** Per-channel offsets, each -255..255. */
   rgb(r: number, g: number, b: number): string {
     return `rgb(${intIn("rgb red", r, -255, 255)},${intIn("rgb green", g, -255, 255)},${intIn("rgb blue", b, -255, 255)})`;
+  },
+  /**
+   * Tone curve: remap the channel through 2 to 16 [x, y]
+   * control points, each coordinate 0..255 with x strictly
+   * increasing. Between points the server interpolates
+   * linearly; inputs outside the point range clamp to the
+   * nearest end value.
+   */
+  curve(channel: CurveChannel, points: [number, number][]): string {
+    if (!CURVE_CHANNELS.includes(channel)) {
+      fail("curve channel", channel, `one of ${CURVE_CHANNELS.join(", ")}`);
+    }
+    if (points.length < 2 || points.length > 16) {
+      fail("curve points", points, "2 to 16 control points");
+    }
+    const flat: number[] = [];
+    let prevX = -1;
+    for (const [x, y] of points) {
+      intIn("curve point x", x, 0, 255);
+      intIn("curve point y", y, 0, 255);
+      if (x <= prevX) {
+        fail("curve points", points, "control points with strictly increasing x");
+      }
+      prevX = x;
+      flat.push(x, y);
+    }
+    return `curve(${channel},${flat.join(",")})`;
   },
   /**
    * Rotate by an angle in degrees (decimals allowed, no

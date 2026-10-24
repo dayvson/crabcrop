@@ -387,6 +387,14 @@ fn describe_filter(filter: &Filter) -> String {
         Filter::Sharpen(v) => format!("sharpen({v}): sharpen"),
         Filter::Saturation(v) => format!("saturation({v}): adjust saturation"),
         Filter::Rgb(r, g, b) => format!("rgb({r},{g},{b}): shift the channels"),
+        Filter::Curve(channel, points) => {
+            let mut text = format!("curve({}", channel.name());
+            for (x, y) in points {
+                text.push_str(&format!(",{x},{y}"));
+            }
+            text.push_str("): remap tones through the control points");
+            text
+        }
         Filter::Equalize => "equalize: histogram equalization".into(),
         Filter::Rotate(v) => format!("rotate({v}): rotate by a multiple of 90 degrees"),
         Filter::Trim(v) => format!("trim({v}): trim near-uniform borders"),
@@ -1246,6 +1254,7 @@ mod tests {
         // itself accepts (review CL-5).
         for filter in [
             Filter::HueRotate(90),
+            Filter::Curve(crate::url::CurveChannel::Rgb, vec![(0, 0), (255, 255)]),
             Filter::Flip(FlipDirection::Horizontal),
             Filter::Flip(FlipDirection::Vertical),
             Filter::Quality(Quality::Value(80)),
