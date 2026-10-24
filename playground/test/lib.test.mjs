@@ -130,6 +130,9 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["fit-in:-300x200/" + SRC, true, SRC], // flips are invalid in fit-in
     ["crop:100x100:sideways/" + SRC, true, SRC], // align is an enumerated set
     ["crop:100x100:smart/" + SRC, false, SRC],
+    ["crop:100x100:top-left/" + SRC, false, SRC], // corner alignments parse
+    ["crop:100x100:bottom-right/" + SRC, false, SRC],
+    ["crop:100x100:left-top/" + SRC, true, SRC], // corners are vertical-first
     ["crop:300x0/" + SRC, true, SRC], // crop is an exact box: pixels on both axes
     ["crop:-300x200/" + SRC, true, SRC], // flips are invalid in crop
     ["crop:origx100/" + SRC, true, SRC], // orig is invalid in crop

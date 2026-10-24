@@ -17,6 +17,8 @@ test("typed segments match the canonical spellings", () => {
     [ops.crop(1200, 630), "crop:1200x630"],
     [ops.crop(1200, 630, "smart"), "crop:1200x630:smart"],
     [ops.crop(100, 100, "face"), "crop:100x100:face"],
+    [ops.crop(100, 100, "top-left"), "crop:100x100:top-left"],
+    [ops.crop(100, 100, "bottom-right"), "crop:100x100:bottom-right"],
     [ops.cropRect(10, 20, 110, 220), "crop-rect:10x20:110x220"],
     [ops.focal(10, 20, 110, 220), "focal:10x20:110x220"],
     [ops.pad(100, 100), "pad:100x100"],

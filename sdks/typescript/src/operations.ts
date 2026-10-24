@@ -16,7 +16,7 @@
 export type ImageFormat = "jpeg" | "jpg" | "png" | "webp" | "jxl" | "avif" | "gif";
 
 /** Crop alignments; `center` is the bare `crop:WxH` spelling. */
-export type CropAlign = "center" | "smart" | "face" | "top" | "bottom" | "left" | "right";
+export type CropAlign = "center" | "smart" | "face" | "top" | "bottom" | "left" | "right" | "top-left" | "top-right" | "bottom-left" | "bottom-right";
 
 /** Text-overlay anchor points. */
 export type Anchor =
@@ -140,7 +140,7 @@ function className(what: string, name: string): string {
   return encodeArg(name);
 }
 
-const CROP_ALIGNS: readonly string[] = ["center", "smart", "face", "top", "bottom", "left", "right"];
+const CROP_ALIGNS: readonly string[] = ["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"];
 const ANCHORS: readonly string[] = [
   "top-left",
   "top-center",

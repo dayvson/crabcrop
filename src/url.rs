@@ -173,6 +173,15 @@ pub enum Align {
     Left,
     /// Keep the right.
     Right,
+    /// Keep the top-left corner: the left when the width is
+    /// cropped, the top when the height is.
+    TopLeft,
+    /// Keep the top-right corner.
+    TopRight,
+    /// Keep the bottom-left corner.
+    BottomLeft,
+    /// Keep the bottom-right corner.
+    BottomRight,
     /// Position on the detected focal point.
     Smart,
     /// Crop around the largest detected face.
@@ -655,6 +664,10 @@ fn parse_align(s: &str) -> Option<Align> {
         "bottom" => Some(Align::Bottom),
         "left" => Some(Align::Left),
         "right" => Some(Align::Right),
+        "top-left" => Some(Align::TopLeft),
+        "top-right" => Some(Align::TopRight),
+        "bottom-left" => Some(Align::BottomLeft),
+        "bottom-right" => Some(Align::BottomRight),
         _ => None,
     }
 }
@@ -1602,6 +1615,10 @@ fn align_text(align: Align) -> Option<&'static str> {
         Align::Bottom => Some("bottom"),
         Align::Left => Some("left"),
         Align::Right => Some("right"),
+        Align::TopLeft => Some("top-left"),
+        Align::TopRight => Some("top-right"),
+        Align::BottomLeft => Some("bottom-left"),
+        Align::BottomRight => Some("bottom-right"),
     }
 }
 
@@ -2243,6 +2260,7 @@ mod tests {
             "300x200",
             "-300xorig",
             "crop:100x100:smart",
+            "crop:100x100:bottom-right",
             "crop-rect:1x2:30x40",
             "focal:1x2:30x40",
             "focal:1x2:30x40/crop:100x100:smart",
@@ -2471,12 +2489,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_crop_with_corner_alignment() {
+        for (spelling, want) in [
+            ("top-left", Align::TopLeft),
+            ("top-right", Align::TopRight),
+            ("bottom-left", Align::BottomLeft),
+            ("bottom-right", Align::BottomRight),
+        ] {
+            let path = format!("crop:300x200:{spelling}/example.com/img.jpg");
+            let (ops, _) = parse_operations(&path).unwrap();
+            assert!(
+                matches!(
+                    ops[0],
+                    Operation::Crop { align, .. } if align == want
+                ),
+                "spelling: {spelling}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_bad_crops() {
         for seg in [
             "crop:",
             "crop:300",
             "crop:300x200:sideways",
             "crop:300x200:center:extra",
+            // Corner spellings are vertical-first, hyphenated:
+            // near-misses do not parse.
+            "crop:300x200:left-top",
+            "crop:300x200:top_left",
+            "crop:300x200:topleft",
             // The exact-box contract: pixels on both axes,
             // no flips (fit-in owns proportional boxes, and
             // a flip is filters:flip).
