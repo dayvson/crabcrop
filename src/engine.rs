@@ -1624,7 +1624,14 @@ fn apply_operations(
     for op in ops {
         match op {
             Operation::DebugFocal => debug_armed = true,
-            Operation::Size(size) => img = apply_size(img, size, cap, dpr)?,
+            Operation::Size(size) => {
+                img = apply_size(
+                    img,
+                    size,
+                    cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
+                    dpr,
+                )?
+            }
             Operation::FitIn { size, adaptive } => {
                 img = apply_fit_in(img, size, *adaptive, cap, dpr)?
             }
@@ -1826,7 +1833,7 @@ fn apply_operations(
                         flip_horizontal: false,
                         flip_vertical: false,
                     },
-                    cap,
+                    cap.map(|(cw, ch)| SizeCap::Fit(cw, ch)),
                     1.0,
                 )?;
             }
@@ -2560,12 +2567,9 @@ fn flatten(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
     DynamicImage::ImageRgba8(base).to_rgb8()
 }
 
-/// Shrink `(w, h)` proportionally to fit inside `cap`, if a cap is
-/// set and the size exceeds it. Never grows the size.
-fn cap_dimensions(w: u32, h: u32, cap: Option<(u32, u32)>) -> (u32, u32) {
-    let Some((cw, ch)) = cap else {
-        return (w, h);
-    };
+/// Shrink `(w, h)` proportionally to fit inside `cap`. Never
+/// grows the size.
+fn cap_dimensions(w: u32, h: u32, (cw, ch): (u32, u32)) -> (u32, u32) {
     if w <= cw && h <= ch {
         return (w, h);
     }
@@ -2574,6 +2578,26 @@ fn cap_dimensions(w: u32, h: u32, cap: Option<(u32, u32)>) -> (u32, u32) {
         ((w as f64 * scale).round() as u32).max(1),
         ((h as f64 * scale).round() as u32).max(1),
     )
+}
+
+/// How the `no_upscale` cap (the oriented source dimensions)
+/// bounds an [`apply_size`] target.
+#[derive(Clone, Copy)]
+enum SizeCap {
+    /// Clamp each axis independently at the source dimension.
+    /// A plain size names an exact box and distorts to it by
+    /// design, so the cap clamps the axes it names: a 300x200
+    /// request on a 200x150 source returns the source at
+    /// 200x150, as the README promises (issue #230). Shrinking
+    /// the box proportionally instead silently traded the
+    /// blocked enlargement for a resample to a third aspect
+    /// (200x133) that nobody asked for.
+    Axes(u32, u32),
+    /// Shrink the target proportionally until it fits. The
+    /// crop's resize uses this: its target carries the crop
+    /// window's own proportions, so shrinking preserves them
+    /// and the window is never enlarged or distorted.
+    Fit(u32, u32),
 }
 
 /// One pixel target under DPR: whole pixels, never zero.
@@ -2603,7 +2627,7 @@ fn scale_dimension(d: Dimension, dpr: f32) -> Dimension {
 fn apply_size(
     img: DynamicImage,
     size: &ImageSize,
-    cap: Option<(u32, u32)>,
+    cap: Option<SizeCap>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
     let size = &ImageSize {
@@ -2629,7 +2653,11 @@ fn apply_size(
             _ => sh,
         },
     };
-    let (w, h) = cap_dimensions(w, h, cap);
+    let (w, h) = match cap {
+        Some(SizeCap::Axes(cw, ch)) => (w.min(cw), h.min(ch)),
+        Some(SizeCap::Fit(cw, ch)) => cap_dimensions(w, h, (cw, ch)),
+        None => (w, h),
+    };
     check_output_pixels(w, h)?;
     let mut img = if w == sw && h == sh {
         img
@@ -2813,7 +2841,10 @@ fn apply_fit_in(
     }
     let w = ((sw as f64 * scale).round() as u32).max(1);
     let h = ((sh as f64 * scale).round() as u32).max(1);
-    let (w, h) = cap_dimensions(w, h, cap);
+    let (w, h) = match cap {
+        Some(c) => cap_dimensions(w, h, c),
+        None => (w, h),
+    };
     check_output_pixels(w, h)?;
     if w == sw && h == sh {
         Ok(img)
@@ -4472,12 +4503,39 @@ mod tests {
         let src = png_bytes(&DynamicImage::new_rgb8(200, 200));
         let directive = Operation::Filters(vec![Filter::NoUpscale]);
         // Exact size, with the directive after the size on purpose:
-        // the cap is request-wide, not positional.
+        // the cap is request-wide, not positional. Each axis
+        // clamps at the source dimension (issue #230).
         let out = engine
             .process(
                 &src,
                 &[
                     size_op(Dimension::Pixels(1000), Dimension::Pixels(500)),
+                    directive.clone(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (200, 200));
+        // The README's example: a 300x200 resize of a 200x150
+        // source returns the source at its own dimensions, not
+        // a proportional shrink to 200x133.
+        let wide = png_bytes(&DynamicImage::new_rgb8(200, 150));
+        let out = engine
+            .process(
+                &wide,
+                &[
+                    size_op(Dimension::Pixels(300), Dimension::Pixels(200)),
+                    directive.clone(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (200, 150));
+        // A mixed request clamps only the axis that would
+        // enlarge; the shrinking axis is honored as written.
+        let out = engine
+            .process(
+                &wide,
+                &[
+                    size_op(Dimension::Pixels(300), Dimension::Pixels(100)),
                     directive.clone(),
                 ],
             )

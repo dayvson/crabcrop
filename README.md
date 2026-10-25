@@ -314,7 +314,7 @@ Notes on the directives:
 - `max_bytes` can only steer formats with a quality setting: JPEG, JPEG XL, AVIF, and WebP. If quality reaches its floor of 1 and the output is still over budget, you get the smallest encode rather than an error. PNG and GIF ignore the budget.
 - WebP encodes lossy at the requested quality (default 80); `quality(100)` selects the lossless encode. `quality` has no effect on PNG or GIF output.
 - JPEG has no alpha channel. With `fill`, transparent pixels are composited over the fill color; without it, the stored RGB values are used as-is.
-- `no_upscale` applies to the whole request wherever it appears: a `300x200` resize of a 200×150 source returns 200×150, scaled proportionally.
+- `no_upscale` applies to the whole request wherever it appears. A plain resize clamps each axis at the source dimension: a `300x200` resize of a 200×150 source returns 200×150, and a `300x100` resize returns 200×100 (the axis that shrinks is honored as written). Fit-in and crop targets shrink proportionally instead, since their dimensions already carry the image's proportions.
 - `dpr` also applies request-wide, and it scales targets *before* the `no_upscale` cap sees them, so `dpr` never invents pixels past the source when both are set. Targets round to whole pixels. `crop-rect` and `focal` coordinates address source pixels and are not scaled. When the URL carries no `dpr`, the server honors the `DPR` client hint header (same set of values; an invalid hint is ignored). An explicit `dpr` in the URL always beats the header.
 
 #### Client hints
