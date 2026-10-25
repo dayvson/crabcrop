@@ -857,6 +857,7 @@ Guides for moving existing URL templates over:
 - [From Cloudinary](docs/migrating-from-cloudinary.md): transformation mapping, and what changes when assets become origin URLs.
 - [From imgix](docs/migrating-from-imgix.md): parameter-by-parameter mapping tables, including the adjustment scales that change meaning in translation.
 - [From Cloudflare Images](docs/migrating-from-cloudflare-images.md): delivery-model and option mapping, from named variants and flexible variants to presets and signed operations, including the adjustment scales that change meaning in translation.
+- [From ImageKit](docs/migrating-from-imagekit.md): transformation-chain and parameter mapping, from named transformations to presets, including the values that change meaning in translation.
 
 ## Deployment
 
