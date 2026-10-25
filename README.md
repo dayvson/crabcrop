@@ -206,7 +206,7 @@ Crops the image to the width:height aspect ratio, then resizes to exactly that w
 | `top-right` | The top-right corner. |
 | `bottom-left` | The bottom-left corner. |
 | `bottom-right` | The bottom-right corner. |
-| `smart` | A window centered on the focal point: a detected face when a face model is configured (see [AI features](#ai-features)), otherwise the point of greatest local detail in the image. |
+| `smart` | A window centered on the focal point: a detected face when a face model is configured (see [AI features](#ai-features)), otherwise the point of greatest local detail in the image. When faces are detected, the window shifts as needed to keep them whole: a position keeping every face fully inside wins, otherwise the position keeping the most face area whole (larger faces win), and a face larger than the window stays centered. The crop record behind `debug:focal` counts the faces detected and the faces the window keeps whole. |
 | `face` | A window around the largest detected face, expanded by the `facepad` padding (below). Requires a face model; with no faces (or a detection failure) it falls back to the `smart` window. |
 
 ```bash
