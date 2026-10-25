@@ -1766,6 +1766,523 @@ mod clip_tests {
     }
 }
 
+/// The outcome of one moderation run: the model that
+/// produced it, its per-category verdict scores, and any
+/// zero-shot review signals. A given provider fills
+/// exactly one of the two lists: a classifier reports
+/// verdicts, the CLIP fallback reports signals.
+/// Presentation (rounding, ordering) is the caller's job,
+/// like tag composition (issue #152).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModerationScores {
+    /// The configured model identity reported in meta:
+    /// the verdict model path, or the CLIP image model
+    /// path when the fallback produced the signals.
+    pub model: String,
+    /// Verdict scores: per-category probabilities from
+    /// the configured classifier, in the model's output
+    /// order. Empty when the CLIP fallback ran.
+    pub scores: Vec<TagScore>,
+    /// Zero-shot review signals: cosine scores against
+    /// operator prompt labels. Signals are leads for a
+    /// human or a downstream review queue, never
+    /// verdicts; the meta response marks them
+    /// review-only. Empty when a classifier produced
+    /// the verdicts.
+    pub signals: Vec<TagScore>,
+}
+
+/// Scores images for content moderation (issue #171).
+pub trait ModerationProvider: Send + Sync + std::fmt::Debug {
+    fn moderate(&self, img: &DynamicImage) -> Result<ModerationScores, AiError>;
+}
+
+/// Content moderation backed by a ViT classifier ONNX
+/// export of the Falconsai nsfw_image_detection shape
+/// (one [1, 3, 224, 224] image input, one logits row
+/// out). Category names are operator configuration;
+/// without them, a two-output model gets the Falconsai
+/// pair (`normal`, `nsfw`), and any other output count
+/// is a load error: unnamed categories would be
+/// meaningless in the meta response.
+pub struct OnnxModerationProvider {
+    session: Mutex<Session>,
+    input_name: String,
+    labels: Vec<String>,
+    model: String,
+}
+
+impl OnnxModerationProvider {
+    /// Load the model and probe it on a blank image: the
+    /// probe fixes the output count the configured
+    /// labels are resolved against, so a mismatch fails
+    /// startup instead of the first moderated request.
+    pub fn load(
+        dylib: Option<&str>,
+        model_path: &str,
+        labels: Option<Vec<String>>,
+    ) -> Result<Self, AiError> {
+        let (session, input_name) = build_session(dylib, model_path)?;
+        let mut provider = Self {
+            session: Mutex::new(session),
+            input_name,
+            labels: Vec::new(),
+            model: model_path.to_string(),
+        };
+        let probe = provider
+            .logits(&DynamicImage::new_rgb8(8, 8))
+            .map_err(|e| {
+                AiError::Load(format!(
+                    "the moderation model {model_path} failed its load probe: {e}"
+                ))
+            })?;
+        provider.labels = resolve_moderation_labels(labels, probe.len(), model_path)?;
+        Ok(provider)
+    }
+
+    /// The category names, in the model's output order.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    fn logits(&self, img: &DynamicImage) -> Result<Vec<f32>, AiError> {
+        let input = preprocess_vit(img);
+        let tensor =
+            ort::value::Tensor::from_array(([1, 3, 224, 224], input.into_boxed_slice()))
+                .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+        let outputs = session
+            .run(ort::inputs![self.input_name.as_str() => tensor])
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+        let outputs = collect_outputs(outputs)?;
+        pick_logits(&outputs)
+    }
+}
+
+impl std::fmt::Debug for OnnxModerationProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxModerationProvider")
+            .field("labels", &self.labels)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModerationProvider for OnnxModerationProvider {
+    fn moderate(&self, img: &DynamicImage) -> Result<ModerationScores, AiError> {
+        let logits = self.logits(img)?;
+        if logits.len() != self.labels.len() {
+            return Err(AiError::BadOutput(format!(
+                "the moderation model produced {} outputs for {} configured labels",
+                logits.len(),
+                self.labels.len()
+            )));
+        }
+        let probs = softmax(&logits);
+        Ok(ModerationScores {
+            model: self.model.clone(),
+            scores: self
+                .labels
+                .iter()
+                .cloned()
+                .zip(probs)
+                .map(|(label, score)| TagScore { label, score })
+                .collect(),
+            signals: Vec::new(),
+        })
+    }
+}
+
+/// Moderation signals from a CLIP tag provider: the
+/// zero-shot fallback for deployments without a verdict
+/// classifier. The wrapped provider scores operator
+/// prompt labels by cosine; this provider reports them
+/// as review signals and nothing else. Wrapping any
+/// `TagProvider` keeps the fallback on the tagger's
+/// loading path.
+pub struct ClipModerationProvider {
+    tagger: std::sync::Arc<dyn TagProvider>,
+    model: String,
+}
+
+impl ClipModerationProvider {
+    /// Wrap a tag provider; `model` is the identity the
+    /// meta response reports (the CLIP image model path).
+    pub fn new(tagger: std::sync::Arc<dyn TagProvider>, model: String) -> Self {
+        Self { tagger, model }
+    }
+}
+
+impl std::fmt::Debug for ClipModerationProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClipModerationProvider")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModerationProvider for ClipModerationProvider {
+    fn moderate(&self, img: &DynamicImage) -> Result<ModerationScores, AiError> {
+        Ok(ModerationScores {
+            model: self.model.clone(),
+            scores: Vec::new(),
+            signals: self.tagger.scores(img)?,
+        })
+    }
+}
+
+/// Resolve the category names for a moderation model
+/// against its probed output count. Configured labels
+/// win when their count matches; without labels, a
+/// two-output model gets the Falconsai pair (`normal`,
+/// `nsfw`) and any other count is a load error naming
+/// the fix.
+fn resolve_moderation_labels(
+    configured: Option<Vec<String>>,
+    outputs: usize,
+    model_path: &str,
+) -> Result<Vec<String>, AiError> {
+    match configured {
+        Some(labels) => {
+            if labels.len() == outputs {
+                Ok(labels)
+            } else {
+                Err(AiError::Load(format!(
+                    "the configured moderation labels name {} categories but the model {model_path} produces {outputs}: name one label per output, in output order",
+                    labels.len()
+                )))
+            }
+        }
+        None if outputs == 2 => Ok(vec!["normal".to_string(), "nsfw".to_string()]),
+        None => Err(AiError::Load(format!(
+            "the moderation model {model_path} produces {outputs} categories and no labels are configured: set CRABCROP_MODERATION_LABELS to name them"
+        ))),
+    }
+}
+
+/// Choose the logits row from a classifier's outputs:
+/// the output named `logits` first, then the first
+/// output. A multi-row output contributes its first
+/// row.
+fn pick_logits(outputs: &[ModelOutput]) -> Result<Vec<f32>, AiError> {
+    let (_, dims, data) = outputs
+        .iter()
+        .find(|(name, _, _)| name == "logits")
+        .or_else(|| outputs.first())
+        .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
+    if data.is_empty() {
+        return Err(AiError::BadOutput(
+            "the model produced an empty output".to_string(),
+        ));
+    }
+    Ok(first_row(dims, data))
+}
+
+/// Softmax over one logits row, max-subtracted so large
+/// logits cannot overflow the exponentials. An empty
+/// row stays empty.
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let exps: Vec<f32> = logits.iter().map(|v| (v - max).exp()).collect();
+    let total: f32 = exps.iter().sum();
+    if total == 0.0 {
+        return vec![0.0; logits.len()];
+    }
+    exps.iter().map(|e| e / total).collect()
+}
+
+/// The standard ViT preprocessing the moderation
+/// classifier was published with: resize the short side
+/// to 224 (bicubic), center crop 224x224, normalize with
+/// the ImageNet mean/std. Output is planar CHW. The
+/// geometry mirrors `preprocess_clip`; the statistics
+/// are the ones this model family declares.
+#[allow(clippy::excessive_precision)] // the model's published constants
+fn preprocess_vit(img: &DynamicImage) -> Vec<f32> {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let scale = 224.0 / w.min(h) as f32;
+    let nw = ((w as f32 * scale).round() as u32).max(224);
+    let nh = ((h as f32 * scale).round() as u32).max(224);
+    let resized = img.resize_exact(nw, nh, FilterType::CatmullRom);
+    let cropped = resized
+        .crop_imm((nw - 224) / 2, (nh - 224) / 2, 224, 224)
+        .to_rgb8();
+    const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+    const STD: [f32; 3] = [0.229, 0.224, 0.225];
+    let plane = 224 * 224;
+    let mut out = vec![0f32; 3 * plane];
+    for (i, px) in cropped.pixels().enumerate() {
+        for (c, (mean, std)) in MEAN.iter().zip(STD.iter()).enumerate() {
+            out[c * plane + i] = ((px[c] as f32 / 255.0) - mean) / std;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod moderation_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // the model's published constants
+    fn preprocess_vit_normalizes_a_solid_image() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            100,
+            50,
+            image::Rgb([255, 0, 0]),
+        ));
+        let input = preprocess_vit(&img);
+        assert_eq!(input.len(), 3 * 224 * 224);
+        // (1 - 0.485) / 0.229 = 2.2489 in red, (0 - 0.456)
+        // / 0.224 = -2.0357 in green.
+        assert!((input[0] - 2.2489).abs() < 0.001, "red {}", input[0]);
+        assert!(
+            (input[224 * 224] - -2.0357).abs() < 0.001,
+            "green {}",
+            input[224 * 224]
+        );
+        assert!(input.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn softmax_turns_logits_into_probabilities() {
+        let probs = softmax(&[1.0, 2.0, 3.0]);
+        assert_eq!(probs.len(), 3);
+        assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(probs[2] > probs[1] && probs[1] > probs[0]);
+        // Equal logits split evenly.
+        let flat = softmax(&[0.5, 0.5]);
+        assert!((flat[0] - 0.5).abs() < 1e-6);
+        // Large logits cannot overflow: the max is
+        // subtracted before the exponentials.
+        let big = softmax(&[1000.0, 1001.0]);
+        assert!(big.iter().all(|v| v.is_finite()));
+        assert!((big.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        // An empty row stays empty rather than dividing
+        // by a zero total.
+        assert!(softmax(&[]).is_empty());
+    }
+
+    #[test]
+    fn pick_logits_prefers_the_logits_output_and_takes_its_first_row() {
+        let outputs = vec![
+            (
+                "hidden".to_string(),
+                vec![1, 3],
+                vec![9.0, 9.0, 9.0],
+            ),
+            (
+                "logits".to_string(),
+                vec![1, 2],
+                vec![1.5, -0.5],
+            ),
+        ];
+        assert_eq!(pick_logits(&outputs).unwrap(), vec![1.5, -0.5]);
+        // Without a named output, the first one is used.
+        let outputs = vec![("out".to_string(), vec![2], vec![0.25, 0.75])];
+        assert_eq!(pick_logits(&outputs).unwrap(), vec![0.25, 0.75]);
+    }
+
+    #[test]
+    fn pick_logits_rejects_missing_and_empty_outputs() {
+        let err = pick_logits(&[]).unwrap_err();
+        assert!(matches!(err, AiError::BadOutput(_)), "{err}");
+        let outputs = vec![("logits".to_string(), vec![1, 0], Vec::new())];
+        let err = pick_logits(&outputs).unwrap_err();
+        assert!(matches!(err, AiError::BadOutput(_)), "{err}");
+    }
+
+    #[test]
+    fn moderation_labels_default_to_the_falconsai_pair_for_two_outputs() {
+        let labels = resolve_moderation_labels(None, 2, "model.onnx").unwrap();
+        assert_eq!(labels, vec!["normal".to_string(), "nsfw".to_string()]);
+    }
+
+    #[test]
+    fn moderation_labels_require_a_file_for_other_output_counts() {
+        let err = resolve_moderation_labels(None, 5, "model.onnx").unwrap_err();
+        assert!(matches!(err, AiError::Load(_)), "{err}");
+        assert!(err.to_string().contains("CRABCROP_MODERATION_LABELS"), "{err}");
+    }
+
+    #[test]
+    fn moderation_labels_must_match_the_output_count() {
+        let named = vec!["safe".to_string(), "explicit".to_string()];
+        let labels =
+            resolve_moderation_labels(Some(named.clone()), 2, "model.onnx").unwrap();
+        assert_eq!(labels, named);
+        let err =
+            resolve_moderation_labels(Some(vec!["only".to_string()]), 2, "model.onnx")
+                .unwrap_err();
+        assert!(matches!(err, AiError::Load(_)), "{err}");
+        assert!(err.to_string().contains("name one label per output"), "{err}");
+    }
+
+    #[derive(Debug)]
+    struct StubTagger(Result<Vec<TagScore>, AiError>);
+
+    impl TagProvider for StubTagger {
+        fn scores(&self, _img: &DynamicImage) -> Result<Vec<TagScore>, AiError> {
+            self.0.clone()
+        }
+    }
+
+    fn solid() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            16,
+            16,
+            image::Rgb([120, 120, 120]),
+        ))
+    }
+
+    #[test]
+    fn clip_moderation_reports_signals_and_no_verdicts() {
+        let tagger = StubTagger(Ok(vec![TagScore {
+            label: "a photo of a weapon".to_string(),
+            score: 0.24,
+        }]));
+        let provider =
+            ClipModerationProvider::new(std::sync::Arc::new(tagger), "clip.onnx".to_string());
+        let report = provider.moderate(&solid()).unwrap();
+        assert_eq!(report.model, "clip.onnx");
+        assert!(report.scores.is_empty());
+        assert_eq!(report.signals.len(), 1);
+        assert_eq!(report.signals[0].label, "a photo of a weapon");
+    }
+
+    #[test]
+    fn clip_moderation_propagates_tagger_failures() {
+        let tagger = StubTagger(Err(AiError::Inference("boom".to_string())));
+        let provider =
+            ClipModerationProvider::new(std::sync::Arc::new(tagger), "clip.onnx".to_string());
+        let err = provider.moderate(&solid()).unwrap_err();
+        assert!(matches!(err, AiError::Inference(_)), "{err}");
+    }
+
+    /// Write bytes to a fresh temp file and return its
+    /// path: the load() failure tests need real files
+    /// (a garbage model) without committing fixtures.
+    fn temp_file(tag: &str, contents: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "crabcrop-moderation-load-{tag}-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A path inside the temp dir that is never created.
+    fn missing_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "crabcrop-moderation-load-missing-{tag}-{}.onnx",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Assert a load() result failed as AiError::Load and
+    /// return the message for wording checks.
+    fn expect_load<T>(result: Result<T, AiError>) -> String {
+        match result {
+            Err(AiError::Load(message)) => message,
+            Err(other) => panic!("expected a load error, got {other}"),
+            Ok(_) => panic!("expected a load error, but the load succeeded"),
+        }
+    }
+
+    /// Real-model verification, run manually with the
+    /// converted Falconsai artifact in place:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_MODERATION_MODEL=...
+    /// cargo test -- --ignored moderation_with_the_real_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn moderation_with_the_real_model() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_MODERATION_MODEL").unwrap();
+        let provider = OnnxModerationProvider::load(Some(&dylib), &model, None).unwrap();
+        // No labels configured: the Falconsai pair applies.
+        assert_eq!(provider.labels(), ["normal", "nsfw"]);
+        let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
+        let img = image::load_from_memory(bytes).unwrap();
+        let report = provider.moderate(&img).unwrap();
+        assert_eq!(report.model, model);
+        assert!(report.signals.is_empty());
+        assert_eq!(report.scores.len(), 2);
+        assert_eq!(report.scores[0].label, "normal");
+        assert_eq!(report.scores[1].label, "nsfw");
+        // The spike measured this fixture at normal 0.9994+
+        // through the reference pipeline; the bound leaves
+        // room for build-to-build wobble.
+        assert!(report.scores[0].score > 0.99, "scores: {:?}", report.scores);
+        assert!(report.scores[1].score < 0.01, "scores: {:?}", report.scores);
+        let total: f32 = report.scores.iter().map(|s| s.score).sum();
+        assert!((total - 1.0).abs() < 1e-3, "total {total}");
+        // A solid image is classified too, with the same
+        // probability contract.
+        let report = provider.moderate(&solid()).unwrap();
+        assert!(
+            report
+                .scores
+                .iter()
+                .all(|s| (0.0..=1.0).contains(&s.score)),
+            "scores: {:?}",
+            report.scores
+        );
+    }
+
+    /// Operator labels rename the model's outputs when
+    /// their count matches:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_MODERATION_MODEL=...
+    /// cargo test -- --ignored moderation_labels_rename
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn moderation_labels_rename_the_outputs() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_MODERATION_MODEL").unwrap();
+        let named = vec!["safe".to_string(), "explicit".to_string()];
+        let provider =
+            OnnxModerationProvider::load(Some(&dylib), &model, Some(named)).unwrap();
+        assert_eq!(provider.labels(), ["safe", "explicit"]);
+        let report = provider.moderate(&solid()).unwrap();
+        assert_eq!(report.scores[0].label, "safe");
+        assert_eq!(report.scores[1].label, "explicit");
+        // A count that disagrees with the model is a load
+        // error, not a mislabeled response.
+        let err = expect_load(OnnxModerationProvider::load(
+            Some(&dylib),
+            &model,
+            Some(vec!["only".to_string()]),
+        ));
+        assert!(err.contains("name one label per output"), "{err}");
+    }
+
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored moderation_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn moderation_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let message = expect_load(OnnxModerationProvider::load(
+            Some(&dylib),
+            &missing_path("moderation"),
+            None,
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored moderation_load_garbage
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn moderation_load_garbage_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let garbage = temp_file("moderation-garbage", b"this is not an onnx model at all");
+        let message =
+            expect_load(OnnxModerationProvider::load(Some(&dylib), &garbage, None));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+}
+
 /// One detected object: a class label, its confidence,
 /// and its box in image pixels.
 #[derive(Debug, Clone, PartialEq)]
