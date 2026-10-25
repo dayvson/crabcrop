@@ -91,6 +91,21 @@
 //!   is a startup error. `CRABCROP_CLIP_THRESHOLD` optionally
 //!   sets the tag score floor (default 0.05). Unset disables
 //!   annotation; meta responses then carry no tags.
+//! - `CRABCROP_MODERATION_MODEL`: path to a ViT classifier
+//!   ONNX model (the Falconsai nsfw_image_detection shape)
+//!   whose per-category scores meta responses report when
+//!   they opt in with `moderation=1`. Preloaded at boot
+//!   like every model; a set but unloadable model is a
+//!   startup error. `CRABCROP_MODERATION_LABELS` (one
+//!   label per line) names the model's outputs in output
+//!   order; without it, a two-output model uses `normal`
+//!   and `nsfw`, and any other output count is a startup
+//!   error. With no model set, the labels file instead
+//!   names zero-shot prompt labels scored by the CLIP pair
+//!   (which must then be configured), reported in meta as
+//!   review signals, never verdicts. Both unset disables
+//!   moderation. Verdicts only annotate meta; nothing is
+//!   enforced at serve time.
 //! - `CRABCROP_FALLBACK_IMAGE`: a URL or local file path for
 //!   the fallback image served (through the same operations,
 //!   marked `X-Crabcrop-Fallback: 1`) when a source cannot be
@@ -784,6 +799,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         face: ai.face,
         tagger: ai.tagger,
         tag_threshold: ai.tag_threshold,
+        moderation: ai.moderation,
         detect: ai.detect,
         detectors: ai.detectors,
         focal: ai.focal,
@@ -871,6 +887,8 @@ fn config_fingerprint(
         "CRABCROP_CLIP_TEXT_MODEL",
         "CRABCROP_CLIP_TOKENIZER",
         "CRABCROP_CLIP_LABELS",
+        "CRABCROP_MODERATION_MODEL",
+        "CRABCROP_MODERATION_LABELS",
         "CRABCROP_FONT_PATH",
         "CRABCROP_VIDEO_ENCODER",
     ] {
@@ -1004,6 +1022,7 @@ struct AiProviders {
     face: Option<Arc<dyn crate::ai::FaceProvider>>,
     tagger: Option<Arc<dyn crate::ai::TagProvider>>,
     tag_threshold: f32,
+    moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
     detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
     detectors: Vec<server::NamedDetector>,
     focal: Option<Arc<dyn crate::ai::FocalProvider>>,
@@ -1039,6 +1058,7 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         Some(setup) => (Some(setup.provider), setup.threshold),
         None => (None, 0.05),
     };
+    let moderation = build_moderation(ort_dylib.as_deref(), &get)?;
     let detect = build_detector(ort_dylib.as_deref(), &get)?;
     let declared = build_declared_detectors(ort_dylib.as_deref(), &get)?;
     let face: Option<Arc<dyn crate::ai::FaceProvider>> = match get("CRABCROP_FACE_MODEL") {
@@ -1056,6 +1076,7 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         face,
         tagger,
         tag_threshold,
+        moderation,
         detect,
         detectors: declared.boxes,
         focal: declared.focal,
@@ -1555,6 +1576,66 @@ fn build_tagger(
             }))
         }
     }
+}
+
+/// Build the moderation provider from the environment,
+/// when configured (issue #171): a verdict classifier
+/// from `CRABCROP_MODERATION_MODEL`, or the CLIP
+/// zero-shot fallback when only a labels file is set.
+/// Preloaded like every other provider, with a broken
+/// configuration failing startup.
+fn build_moderation(
+    ort_dylib: Option<&str>,
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<dyn crate::ai::ModerationProvider>>, String> {
+    let model = get("CRABCROP_MODERATION_MODEL").filter(|v| !v.is_empty());
+    let labels_path = get("CRABCROP_MODERATION_LABELS").filter(|v| !v.is_empty());
+    if model.is_none() && labels_path.is_none() {
+        return Ok(None);
+    }
+    if let Some(model) = model {
+        // With a model, the labels file names its output
+        // categories; the provider checks the count
+        // against its probe at load.
+        let labels = match &labels_path {
+            Some(path) => Some(
+                crate::ai::read_labels(path)
+                    .map_err(|e| format!("cannot read the moderation labels: {e}"))?,
+            ),
+            None => None,
+        };
+        let provider = crate::ai::OnnxModerationProvider::load(ort_dylib, &model, labels)
+            .map_err(|e| format!("cannot load the moderation model: {e}"))?;
+        println!(
+            "moderation verdicts loaded from {model} ({} categories)",
+            provider.labels().len()
+        );
+        return Ok(Some(Arc::new(provider)));
+    }
+    // Labels without a model are zero-shot prompts for
+    // the CLIP fallback, which needs the CLIP set: the
+    // same model files load again with the moderation
+    // labels, so the two label sets stay independent.
+    let labels_path = labels_path.unwrap_or_default();
+    let clip = clip_config(get)?.ok_or_else(|| {
+        "CRABCROP_MODERATION_LABELS is set without CRABCROP_MODERATION_MODEL: the labels then name zero-shot prompts, which need the CRABCROP_CLIP_* set".to_string()
+    })?;
+    let tagger = crate::ai::OnnxClipProvider::load(
+        ort_dylib,
+        &clip.image_model,
+        &clip.text_model,
+        &clip.tokenizer,
+        &labels_path,
+    )
+    .map_err(|e| format!("cannot load the CLIP moderation fallback: {e}"))?;
+    println!(
+        "moderation review signals loaded from {} ({} prompt labels)",
+        clip.image_model,
+        tagger.label_count()
+    );
+    let provider =
+        crate::ai::ClipModerationProvider::new(Arc::new(tagger), clip.image_model.clone());
+    Ok(Some(Arc::new(provider)))
 }
 
 #[cfg(test)]
@@ -2193,6 +2274,7 @@ mod tests {
         assert!(ai.upscale.is_none());
         assert!(ai.face.is_none());
         assert!(ai.tagger.is_none());
+        assert!(ai.moderation.is_none());
         assert!(ai.detect.is_none());
         assert!(ai.detectors.is_empty());
         assert!(ai.focal.is_none());
@@ -2240,6 +2322,22 @@ mod tests {
             err.contains("CRABCROP_DETECT_THRESHOLD is not a number"),
             "{err}"
         );
+        // Moderation labels without a model are zero-shot
+        // prompts: without the CLIP set there is nothing to
+        // score them with, and the refusal says so.
+        let labels = missing_path("labels");
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_MODERATION_LABELS",
+            labels.as_str(),
+        )])));
+        assert!(err.contains("need the CRABCROP_CLIP_* set"), "{err}");
+        // With a model, an unreadable labels file refuses
+        // before the model load is even attempted.
+        let err = expect_err(build_ai_providers(env_of(&[
+            ("CRABCROP_MODERATION_MODEL", missing.as_str()),
+            ("CRABCROP_MODERATION_LABELS", labels.as_str()),
+        ])));
+        assert!(err.contains("cannot read the moderation labels"), "{err}");
     }
 
     /// Configured-but-unloadable models refuse construction
@@ -2320,12 +2418,22 @@ mod tests {
         if let Ok(labels) = std::env::var("CRABCROP_TEST_DETECT_LABELS") {
             map.insert("CRABCROP_DETECT_LABELS".to_string(), labels);
         }
+        // Moderation joins when its test model is provided
+        // (CRABCROP_TEST_MODERATION_MODEL), like the
+        // detector labels above.
+        let want_moderation = if let Ok(model) = std::env::var("CRABCROP_TEST_MODERATION_MODEL") {
+            map.insert("CRABCROP_MODERATION_MODEL".to_string(), model);
+            true
+        } else {
+            false
+        };
         let ai = build_ai_providers(|name: &str| map.get(name).cloned()).unwrap();
         assert!(ai.removebg.is_some());
         assert!(ai.upscale.is_some());
         assert!(ai.face.is_some());
         assert!(ai.tagger.is_some());
         assert!(ai.detect.is_some());
+        assert_eq!(ai.moderation.is_some(), want_moderation);
     }
 
     #[test]

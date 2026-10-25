@@ -2066,16 +2066,8 @@ mod moderation_tests {
     #[test]
     fn pick_logits_prefers_the_logits_output_and_takes_its_first_row() {
         let outputs = vec![
-            (
-                "hidden".to_string(),
-                vec![1, 3],
-                vec![9.0, 9.0, 9.0],
-            ),
-            (
-                "logits".to_string(),
-                vec![1, 2],
-                vec![1.5, -0.5],
-            ),
+            ("hidden".to_string(), vec![1, 3], vec![9.0, 9.0, 9.0]),
+            ("logits".to_string(), vec![1, 2], vec![1.5, -0.5]),
         ];
         assert_eq!(pick_logits(&outputs).unwrap(), vec![1.5, -0.5]);
         // Without a named output, the first one is used.
@@ -2102,20 +2094,24 @@ mod moderation_tests {
     fn moderation_labels_require_a_file_for_other_output_counts() {
         let err = resolve_moderation_labels(None, 5, "model.onnx").unwrap_err();
         assert!(matches!(err, AiError::Load(_)), "{err}");
-        assert!(err.to_string().contains("CRABCROP_MODERATION_LABELS"), "{err}");
+        assert!(
+            err.to_string().contains("CRABCROP_MODERATION_LABELS"),
+            "{err}"
+        );
     }
 
     #[test]
     fn moderation_labels_must_match_the_output_count() {
         let named = vec!["safe".to_string(), "explicit".to_string()];
-        let labels =
-            resolve_moderation_labels(Some(named.clone()), 2, "model.onnx").unwrap();
+        let labels = resolve_moderation_labels(Some(named.clone()), 2, "model.onnx").unwrap();
         assert_eq!(labels, named);
         let err =
-            resolve_moderation_labels(Some(vec!["only".to_string()]), 2, "model.onnx")
-                .unwrap_err();
+            resolve_moderation_labels(Some(vec!["only".to_string()]), 2, "model.onnx").unwrap_err();
         assert!(matches!(err, AiError::Load(_)), "{err}");
-        assert!(err.to_string().contains("name one label per output"), "{err}");
+        assert!(
+            err.to_string().contains("name one label per output"),
+            "{err}"
+        );
     }
 
     #[derive(Debug)]
@@ -2223,10 +2219,7 @@ mod moderation_tests {
         // probability contract.
         let report = provider.moderate(&solid()).unwrap();
         assert!(
-            report
-                .scores
-                .iter()
-                .all(|s| (0.0..=1.0).contains(&s.score)),
+            report.scores.iter().all(|s| (0.0..=1.0).contains(&s.score)),
             "scores: {:?}",
             report.scores
         );
@@ -2242,8 +2235,7 @@ mod moderation_tests {
         let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
         let model = std::env::var("CRABCROP_TEST_MODERATION_MODEL").unwrap();
         let named = vec!["safe".to_string(), "explicit".to_string()];
-        let provider =
-            OnnxModerationProvider::load(Some(&dylib), &model, Some(named)).unwrap();
+        let provider = OnnxModerationProvider::load(Some(&dylib), &model, Some(named)).unwrap();
         assert_eq!(provider.labels(), ["safe", "explicit"]);
         let report = provider.moderate(&solid()).unwrap();
         assert_eq!(report.scores[0].label, "safe");
@@ -2277,8 +2269,7 @@ mod moderation_tests {
     fn moderation_load_garbage_model_file_is_a_load_error() {
         let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
         let garbage = temp_file("moderation-garbage", b"this is not an onnx model at all");
-        let message =
-            expect_load(OnnxModerationProvider::load(Some(&dylib), &garbage, None));
+        let message = expect_load(OnnxModerationProvider::load(Some(&dylib), &garbage, None));
         assert!(message.contains("cannot load the model"), "{message}");
     }
 }
