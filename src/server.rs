@@ -1112,11 +1112,23 @@ async fn handle(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let dpr = dpr_hint(&headers);
     let width = width_hint(&headers);
     let save_data = save_data_hint(&headers);
-    let (response, mut record) =
-        serve(&state, path, accept.as_deref(), dpr, width, save_data).await;
+    let (response, mut record) = serve(
+        &state,
+        path,
+        accept.as_deref(),
+        if_none_match.as_deref(),
+        dpr,
+        width,
+        save_data,
+    )
+    .await;
     record.status = response.status().as_u16();
     record.total = started.elapsed();
     state.metrics.record(&record);
@@ -1258,6 +1270,7 @@ async fn serve(
     state: &AppState,
     path: &str,
     accept: Option<&str>,
+    if_none_match: Option<&str>,
     dpr_hint: Option<f32>,
     width_hint: Option<u32>,
     save_data: bool,
@@ -1463,6 +1476,7 @@ async fn serve(
     if effective_dpr != 1.0 {
         cache_key = format!("{cache_key}#dpr{effective_dpr}");
     }
+    let etag = etag_for(&cache_key);
 
     // The verified path is content-addressed: a stored response can
     // be served without touching the loader or the engine. Meta
@@ -1511,6 +1525,7 @@ async fn serve(
             record.bytes_out = hit.bytes.len();
             let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
             attach_cache_headers(&mut response, cache_status, &groups);
+            finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
         }
         if bypass {
@@ -1518,9 +1533,10 @@ async fn serve(
         }
         match state.inflight.lead(&cache_key) {
             Flight::Leader(guard) => {
-                let result = serve_miss(state, work, record).await;
+                let (mut response, record) = serve_miss(state, work, record).await;
                 drop(guard);
-                return result;
+                finalize_validators(&mut response, &etag, if_none_match);
+                return (response, record);
             }
             Flight::Follower(mut changed) => {
                 if waits >= MAX_FLIGHT_WAITS {
@@ -2801,6 +2817,43 @@ fn respond(
         );
     }
     (headers, bytes).into_response()
+}
+
+fn etag_for(cache_key: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(cache_key.as_bytes());
+    format!("\"{}\"", hex::encode(&digest[..16]))
+}
+
+fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
+    let inm = if_none_match.trim();
+    if inm == "*" {
+        return true;
+    }
+    inm.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
+fn finalize_validators(response: &mut Response, etag: &str, if_none_match: Option<&str>) {
+    let cacheable = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("public"));
+    if !cacheable || response.status() != StatusCode::OK {
+        return;
+    }
+    response
+        .headers_mut()
+        .insert(header::ETAG, etag.parse().unwrap());
+    if if_none_match.is_some_and(|inm| if_none_match_matches(inm, etag)) {
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        *response.body_mut() = axum::body::Body::empty();
+        response.headers_mut().remove(header::CONTENT_TYPE);
+        response.headers_mut().remove(header::CONTENT_LENGTH);
+    }
 }
 
 /// A 503 for a saturated gate. Retry-After tells clients
