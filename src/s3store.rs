@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::CachedImage;
 use crate::sigv4::{self, Credentials};
-use crate::storage::{key_stem, parse_entry, serialize_entry};
+use crate::storage::{MAX_ENTRY_BYTES, key_stem, parse_entry, serialize_entry};
 
 #[derive(Debug)]
 pub struct S3Store {
@@ -36,6 +36,12 @@ pub struct S3Store {
     endpoint: Option<String>,
     region: String,
     creds: Option<Credentials>,
+    /// Largest object an entry read will buffer. Objects in
+    /// the shared bucket are operator-adjacent data, not
+    /// fully trusted input: a planted oversized object must
+    /// not turn a lookup or a purge walk into an unbounded
+    /// allocation.
+    max_entry_bytes: usize,
 }
 
 impl S3Store {
@@ -62,7 +68,30 @@ impl S3Store {
             endpoint,
             region,
             creds,
+            max_entry_bytes: MAX_ENTRY_BYTES,
         }
+    }
+
+    /// Read a response body under the entry size ceiling,
+    /// streaming so an oversized object is refused as soon
+    /// as it passes the cap instead of after it has been
+    /// buffered whole. `None` on a transport error or an
+    /// oversized body; both read as a cache miss upstream.
+    async fn read_capped(&self, mut resp: reqwest::Response) -> Option<Vec<u8>> {
+        if resp
+            .content_length()
+            .is_some_and(|n| n > self.max_entry_bytes as u64)
+        {
+            return None;
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = resp.chunk().await.ok()? {
+            if data.len().checked_add(chunk.len())? > self.max_entry_bytes {
+                return None;
+            }
+            data.extend_from_slice(&chunk);
+        }
+        Some(data)
     }
 
     fn object_key(&self, stem: &str) -> String {
@@ -162,7 +191,7 @@ impl S3Store {
         if !resp.status().is_success() {
             return None;
         }
-        let data = resp.bytes().await.ok()?;
+        let data = self.read_capped(resp).await?;
         let (stored_key, image) = parse_entry(&data)?;
         if stored_key != key {
             return None;
@@ -275,7 +304,7 @@ impl S3Store {
             if !resp.status().is_success() {
                 continue;
             }
-            let Ok(data) = resp.bytes().await else {
+            let Some(data) = self.read_capped(resp).await else {
                 continue;
             };
             let Some((stored_key, image)) = parse_entry(&data) else {
@@ -568,6 +597,31 @@ mod tests {
             b"not an entry".to_vec(),
         );
         assert!(s.get("key").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_and_poisoned_objects_degrade_to_misses() {
+        let fake = start_fake().await;
+        let mut s = store(&fake.endpoint);
+        s.max_entry_bytes = 128;
+        // Under the ceiling, entries round trip as before.
+        s.put("small", &image(b"x", &["hero"])).await;
+        assert!(s.get("small").await.is_some());
+        // Over the ceiling, the read refuses the object
+        // instead of buffering it whole (R2-19), and the
+        // purge walk skips it the same way: only the
+        // readable entry is removed.
+        s.put("big", &image(&vec![7u8; 500], &["hero"])).await;
+        assert!(s.get("big").await.is_none());
+        assert_eq!(s.purge_group("hero").await, 1);
+        // A header claiming a group count far beyond the
+        // object is a miss, never a panic or an allocation
+        // sized by the count (R2-13b).
+        fake.objects.lock().unwrap().insert(
+            format!("cache/{}.bin", key_stem("evil")),
+            b"CRABDISK3\nwebp\n80\n999999999999999999\n4\n1\nevil\nx".to_vec(),
+        );
+        assert!(s.get("evil").await.is_none());
     }
 
     #[tokio::test]

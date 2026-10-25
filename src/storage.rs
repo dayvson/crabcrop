@@ -57,6 +57,34 @@ pub struct DiskStore {
 /// upgrade behavior for a cache.
 const MAGIC: &str = "CRABDISK3";
 
+/// The largest serialized entry the shared (S3) tier will
+/// read back, mirroring the disk tier's default total
+/// budget. The disk tier caps reads at its own configured
+/// budget instead: `put` there already refuses a single
+/// entry larger than the budget, so a bigger file on disk
+/// was never written by this build.
+pub(crate) const MAX_ENTRY_BYTES: usize = 512 * 1024 * 1024;
+
+/// Read a whole file, refusing anything past `cap` bytes.
+/// Cache entries are operator-adjacent data, not fully
+/// trusted input: a planted or corrupted oversized file
+/// must not turn a lookup or the boot scan into an
+/// unbounded allocation. `None` on IO error or an
+/// oversized file; both read as a corrupt entry upstream.
+fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut data = Vec::new();
+    file.by_ref()
+        .take(cap.saturating_add(1) as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() > cap {
+        return None;
+    }
+    Some(data)
+}
+
 /// The temp file a `put` writes before renaming into place.
 /// The suffix is the process id plus a per-process counter:
 /// the pid alone made every concurrent put of one key share
@@ -106,7 +134,23 @@ impl DiskStore {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            match read_header(&path) {
+            // `put` never writes an entry larger than the
+            // budget, so a bigger file was not written by
+            // this build: delete it on sight instead of
+            // reading it into memory to find out.
+            if self.max_bytes > 0 && meta.len() > self.max_bytes as u64 {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            // A zero budget disables the store (reads and
+            // writes already refuse); the scan then imposes
+            // no size cap of its own.
+            let cap = if self.max_bytes == 0 {
+                usize::MAX
+            } else {
+                self.max_bytes
+            };
+            match read_header(&path, cap) {
                 Some((key, groups)) => {
                     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                     found.push((mtime, key, stem, meta.len() as usize, groups));
@@ -141,9 +185,7 @@ impl DiskStore {
             inner.entries.get(key)?.0.clone()
         };
         let path = self.file_for(&stem);
-        let parsed = std::fs::read(&path)
-            .ok()
-            .and_then(|data| parse_entry(&data));
+        let parsed = read_capped(&path, self.max_bytes).and_then(|data| parse_entry(&data));
         match parsed {
             Some((stored_key, image)) if stored_key == key => {
                 let mut inner = self.inner.lock().unwrap();
@@ -397,25 +439,39 @@ fn parse_header_bytes(data: &[u8]) -> Option<EntryHeader> {
         .ok()?
         .parse()
         .ok()?;
-    let key_bytes = data.get(pos..pos + key_len)?;
-    if data.get(pos + key_len) != Some(&b'\n') {
+    // Every offset below is checked arithmetic: the header
+    // fields are untrusted counts, and a length near
+    // usize::MAX must fail the parse, not wrap or panic.
+    let key_end = pos.checked_add(key_len)?;
+    let key_bytes = data.get(pos..key_end)?;
+    if data.get(key_end) != Some(&b'\n') {
         return None;
     }
     let key = String::from_utf8(key_bytes.to_vec()).ok()?;
-    let mut cursor = pos + key_len + 1;
-    let mut groups = Vec::with_capacity(group_count);
+    let mut cursor = key_end + 1;
+    // Each group occupies at least three bytes on disk (a
+    // one-digit length line, its newline, and the newline
+    // after a zero-length name), so a count that cannot fit
+    // in the bytes remaining is corrupt. The check runs
+    // before the vector grows, and the vector then grows
+    // only as groups actually parse.
+    if group_count > data.len().saturating_sub(cursor) / 3 {
+        return None;
+    }
+    let mut groups = Vec::new();
     for _ in 0..group_count {
         let len_line = std::str::from_utf8(take_line(data, &mut cursor)?).ok()?;
         let glen: usize = len_line.parse().ok()?;
-        let gbytes = data.get(cursor..cursor + glen)?;
-        if data.get(cursor + glen) != Some(&b'\n') {
+        let gend = cursor.checked_add(glen)?;
+        let gbytes = data.get(cursor..gend)?;
+        if data.get(gend) != Some(&b'\n') {
             return None;
         }
         groups.push(String::from_utf8(gbytes.to_vec()).ok()?);
-        cursor += glen + 1;
+        cursor = gend + 1;
     }
     let payload_offset = cursor;
-    if data.len() != payload_offset + payload_len {
+    if payload_offset.checked_add(payload_len) != Some(data.len()) {
         return None;
     }
     Some(EntryHeader {
@@ -445,8 +501,11 @@ pub(crate) fn parse_entry(data: &[u8]) -> Option<(String, CachedImage)> {
 }
 
 /// Just the header of a stored file, for the boot scan.
-fn read_header(path: &Path) -> Option<(String, Vec<String>)> {
-    let data = std::fs::read(path).ok()?;
+/// The read is capped like any other entry read: the
+/// header parse validates against the whole file, so the
+/// file has to be in memory, but never more than `cap`.
+fn read_header(path: &Path, cap: usize) -> Option<(String, Vec<String>)> {
+    let data = read_capped(path, cap)?;
     let header = parse_header_bytes(&data)?;
     Some((header.key, header.groups))
 }
@@ -562,6 +621,101 @@ mod tests {
         assert!(store.get("b").is_none());
         assert!(store.get("c").is_some());
         assert_eq!(store.purge_group("thumb"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stored entry with the given raw header count and
+    /// length fields, for parser hardening tests.
+    fn crafted_entry(group_count: &str, key_len: &str, payload_len: &str, tail: &[u8]) -> Vec<u8> {
+        let mut v =
+            format!("{MAGIC}\npng\n-\n{group_count}\n{key_len}\n{payload_len}\n").into_bytes();
+        v.extend_from_slice(tail);
+        v
+    }
+
+    #[test]
+    fn parser_rejects_counts_and_lengths_it_cannot_trust() {
+        // Control: a normal entry with groups parses.
+        let good = serialize_entry("k", &grouped_image(b"x", &["a", "b"]));
+        let (key, parsed) = parse_entry(&good).unwrap();
+        assert_eq!(key, "k");
+        assert_eq!(parsed.groups, ["a", "b"]);
+        // A group count far beyond the bytes present is
+        // rejected before any allocation is sized by it
+        // (R2-13b: a tiny header used to force a multi-GB
+        // with_capacity, or a capacity-overflow panic).
+        let huge = usize::MAX.to_string();
+        assert_eq!(parse_entry(&crafted_entry(&huge, "0", "0", b"")), None);
+        assert_eq!(
+            parse_entry(&crafted_entry("1000000", "1", "0", b"k\n")),
+            None
+        );
+        // Length fields at usize::MAX must fail the parse,
+        // not wrap the offset arithmetic: key length,
+        // payload length, and a group's length alike.
+        assert_eq!(parse_entry(&crafted_entry("0", &huge, "0", b"")), None);
+        assert_eq!(parse_entry(&crafted_entry("0", "1", &huge, b"k\n")), None);
+        let tail = format!("k\n{huge}\n");
+        assert_eq!(
+            parse_entry(&crafted_entry("1", "1", "0", tail.as_bytes())),
+            None
+        );
+        // Truncated headers and a foreign magic are misses.
+        assert_eq!(parse_entry(b"CRABDISK3\n"), None);
+        assert_eq!(parse_entry(b"CRABDISK3\npng\n"), None);
+        let mut foreign = serialize_entry("k", &image(b"x"));
+        foreign[..9].copy_from_slice(b"CRABDISK2");
+        assert_eq!(parse_entry(&foreign), None);
+    }
+
+    #[test]
+    fn boot_scan_skips_poisoned_files_and_serves_valid_entries() {
+        let dir = temp_dir("poison");
+        {
+            let store = DiskStore::open(&dir, 1_000_000).unwrap();
+            store.put("good", &image(b"payload"));
+        }
+        let plant = |key: &str, data: &[u8]| {
+            let path = dir.join(format!("{}.bin", key_stem(key)));
+            std::fs::write(&path, data).unwrap();
+            path
+        };
+        // A header claiming a huge group count, a truncated
+        // entry, and an entry larger than the whole budget
+        // (internally consistent, but `put` never writes
+        // one, so its size alone marks it as foreign).
+        let p1 = plant(
+            "evil1",
+            &crafted_entry(&usize::MAX.to_string(), "0", "0", b""),
+        );
+        let p2 = plant("evil2", b"CRABDISK3\npng\n-");
+        let big = serialize_entry("evil3", &image(&vec![7u8; 1_100_000]));
+        assert!(big.len() > 1_000_000);
+        let p3 = plant("evil3", &big);
+        // The scan succeeds, drops all three, and still
+        // serves the valid entry.
+        let store = DiskStore::open(&dir, 1_000_000).unwrap();
+        assert_eq!(store.stats().0, 1);
+        assert!(store.get("good").is_some());
+        assert!(!p1.exists() && !p2.exists() && !p3.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_grown_past_the_budget_is_a_miss_on_get() {
+        let dir = temp_dir("grown");
+        let store = DiskStore::open(&dir, 100_000).unwrap();
+        store.put("k", &image(b"small"));
+        assert!(store.get("k").is_some());
+        // Replace the file with a larger, internally
+        // consistent entry than the budget allows, as a
+        // hostile cache writer could: the read refuses it
+        // instead of buffering and serving it (R2-19).
+        let big = serialize_entry("k", &image(&vec![7u8; 200_000]));
+        let file = store.file_for(&key_stem("k"));
+        std::fs::write(&file, &big).unwrap();
+        assert_eq!(store.get("k"), None);
+        assert!(!file.exists(), "the oversized file was cleaned up");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
