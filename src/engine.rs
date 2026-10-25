@@ -1034,7 +1034,12 @@ impl Engine {
         // budget, the smallest attempt is returned: an image that
         // misses its budget beats an error. The ladder is bounded
         // per format so a budget cannot multiply an expensive
-        // encode without limit.
+        // encode without limit, and the descent is planned against
+        // the attempts that remain (see `next_quality`), so the
+        // last allowed attempt always lands on the quality floor:
+        // the walk used to stop wherever the encode pool ran out
+        // (quality 15 from a 95 start), leaving tighter budgets
+        // silently unchased (issue #229).
         let quality_bearing = matches!(
             format,
             ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
@@ -1048,7 +1053,9 @@ impl Engine {
                 && attempts < max_quality_attempts(format)
                 && encode_budget > 0
             {
-                current = next_quality(format, current);
+                let steps_remaining = (max_quality_attempts(format) - attempts)
+                    .min(encode_budget as u32);
+                current = next_quality(current, steps_remaining);
                 bytes = encode(
                     &enc_src,
                     format,
@@ -2223,14 +2230,23 @@ fn is_heic(bytes: &[u8]) -> bool {
     )
 }
 
-/// One step down the `max_bytes` quality ladder. AVIF encodes
-/// are the pipeline's most expensive step by far, so they halve;
-/// JPEG and JPEG XL shave 30% per step.
-fn next_quality(format: ImageFormat, current: u8) -> u8 {
-    match format {
-        ImageFormat::Avif => (current / 2).max(1),
-        _ => ((current as u32 * 7 / 10) as u8).max(1),
+/// One step down the `max_bytes` quality ladder, planned
+/// against the steps that remain (the caller's smaller of the
+/// per-format attempt cap and the shared encode pool): the
+/// descent from the current quality to the floor is geometric,
+/// spaced so the final allowed step lands exactly on quality
+/// 1, the grammar's floor. A fixed-ratio walk cannot promise
+/// that (from 95 it spent the whole pool reaching 15, and
+/// budgets below that encode were never chased; issue #229).
+/// The attempt caps still bound the cost per format, AVIF's
+/// most tightly, since its encodes are the expensive ones.
+fn next_quality(current: u8, steps_remaining: u32) -> u8 {
+    if steps_remaining <= 1 || current <= 2 {
+        return 1;
     }
+    let frac = f64::from(steps_remaining - 1) / f64::from(steps_remaining);
+    let next = (f64::from(current).powf(frac)) as u8;
+    next.clamp(1, current - 1)
 }
 
 /// How many re-encodes `max_bytes` may attempt per format before
@@ -7337,12 +7353,90 @@ mod tests {
 
     #[test]
     fn quality_ladder_steps_by_format() {
-        assert_eq!(next_quality(ImageFormat::Jpeg, 80), 56);
-        assert_eq!(next_quality(ImageFormat::Jxl, 80), 56);
-        assert_eq!(next_quality(ImageFormat::Avif, 80), 40);
-        assert_eq!(next_quality(ImageFormat::Avif, 1), 1);
+        // The descent is planned against the steps that
+        // remain: geometric from the current quality, landing
+        // on the floor of 1 at the final step (issue #229).
+        assert_eq!(next_quality(80, 5), 33);
+        assert_eq!(next_quality(80, 1), 1);
+        assert_eq!(next_quality(2, 5), 1);
+        let mut q = 95;
+        for steps_left in (1..=5).rev() {
+            q = next_quality(q, steps_left);
+        }
+        assert_eq!(q, 1, "five planned steps from 95 reach the floor");
+        let mut q = 95;
+        for steps_left in (1..=4).rev() {
+            q = next_quality(q, steps_left);
+        }
+        assert_eq!(q, 1, "four planned steps from 95 reach the floor");
         assert_eq!(max_quality_attempts(ImageFormat::Avif), 4);
         assert!(max_quality_attempts(ImageFormat::Jpeg) > 4);
+    }
+
+    #[test]
+    fn max_bytes_unreachable_budget_returns_the_floor_encode() {
+        // Issue #229: with a budget nothing can meet, the
+        // ladder must still walk to quality 1 and return that
+        // smallest encode, not stop wherever the encode pool
+        // used to run out.
+        let engine = Engine;
+        let src = noise_png();
+        let floor = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Quality(Quality::Value(1)),
+                ])],
+            )
+            .unwrap();
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Quality(Quality::Value(95)),
+                    Filter::MaxBytes(1),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(out.quality, Some(1));
+        assert_eq!(out.bytes, floor.bytes);
+    }
+
+    #[test]
+    fn max_bytes_still_stops_at_the_first_fitting_quality() {
+        // A budget the ladder reaches midway behaves exactly
+        // as before: stop at the first quality that fits.
+        let engine = Engine;
+        let src = noise_png();
+        let at = |q: u8| {
+            engine
+                .process(
+                    &src,
+                    &[Operation::Filters(vec![
+                        Filter::Format(ImageFormat::Jpeg),
+                        Filter::Quality(Quality::Value(q)),
+                    ])],
+                )
+                .unwrap()
+                .bytes
+                .len() as u64
+        };
+        let budget = at(15);
+        assert!(at(38) > budget, "the step above 15 must not fit");
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Quality(Quality::Value(95)),
+                    Filter::MaxBytes(budget),
+                ])],
+            )
+            .unwrap();
+        assert!(out.bytes.len() as u64 <= budget);
+        assert_eq!(out.quality, Some(15));
     }
 
     #[test]
