@@ -166,6 +166,7 @@ mod s3store;
 mod server;
 mod sigv4;
 mod storage;
+mod studio;
 mod svg;
 mod text;
 mod thumbhash;
@@ -671,6 +672,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => Vec::new(),
     };
     let preserve_metadata = metadata_config(|name| env::var(name).ok())?;
+    let brand_color = brand_color_config(|name| env::var(name).ok())?;
+    if let Some(c) = brand_color {
+        println!("brand color: #{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+    }
 
     // The entry MAC key for the persistent tiers (issue
     // #190): derived from the current signing secret, so
@@ -798,6 +803,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         jxl_speed,
         width_step,
         preserve_metadata,
+        brand_color,
         presets,
         only_presets,
         default_ops,
@@ -817,7 +823,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// tuning knobs, the width-hint step, and the file-based
 /// inputs whose contents change results (the AI models,
 /// the CLIP set, the overlay font, the video encoder, and
-/// the detector declarations, hashed by content). The
+/// the detector declarations, hashed by content), plus the
+/// brand color, whose value shapes studio composites. The
 /// fingerprint is embedded in every cache key (see
 /// `serve`), so a restart under changed settings starts a
 /// fresh cache epoch instead of serving the old settings'
@@ -855,6 +862,7 @@ fn config_fingerprint(
     part("jxl_speed", &format!("{jxl_speed:?}"));
     part("width_step", &width_step.to_string());
     for name in [
+        "CRABCROP_BRAND_COLOR",
         "CRABCROP_REMOVEBG_MODEL",
         "CRABCROP_UPSCALE_MODEL",
         "CRABCROP_FACE_MODEL",
@@ -948,6 +956,27 @@ fn clip_config(get: impl Fn(&str) -> Option<String>) -> Result<Option<ClipConfig
         labels: values.next().unwrap().unwrap(),
         threshold,
     }))
+}
+
+/// The operator brand color from `CRABCROP_BRAND_COLOR`
+/// (issue #197): six hex digits, an optional leading `#`
+/// allowed, resolved through `get` so tests can drive it
+/// without the process environment. Unset means studio
+/// backdrops resolve to white; a set but malformed value
+/// is a startup error naming the variable.
+fn brand_color_config(get: impl Fn(&str) -> Option<String>) -> Result<Option<[u8; 3]>, String> {
+    let raw = match get("CRABCROP_BRAND_COLOR") {
+        Some(v) if !v.is_empty() => v,
+        _ => return Ok(None),
+    };
+    let hex = raw.strip_prefix('#').unwrap_or(&raw);
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "CRABCROP_BRAND_COLOR must be a hex color like f5f0e8, got {raw:?}"
+        ));
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap();
+    Ok(Some([byte(0), byte(2), byte(4)]))
 }
 
 /// The metadata policy from `CRABCROP_METADATA`: `strip`
@@ -1533,6 +1562,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn brand_color_config_parses_hex_and_rejects_the_rest() {
+        let none = |_: &str| None;
+        assert_eq!(brand_color_config(none), Ok(None));
+        let plain = |name: &str| (name == "CRABCROP_BRAND_COLOR").then(|| "f5f0e8".to_string());
+        assert_eq!(brand_color_config(plain), Ok(Some([0xf5, 0xf0, 0xe8])));
+        // A leading # and uppercase hex are the same color.
+        let hashed = |name: &str| (name == "CRABCROP_BRAND_COLOR").then(|| "#F5F0E8".to_string());
+        assert_eq!(brand_color_config(hashed), Ok(Some([0xf5, 0xf0, 0xe8])));
+        // Set but malformed is a startup error naming the
+        // variable, never a silent default.
+        for bad in ["f5f0e", "f5f0e81", "zzzzzz", "white"] {
+            let get = |name: &str| (name == "CRABCROP_BRAND_COLOR").then(|| bad.to_string());
+            let err = brand_color_config(get).unwrap_err();
+            assert!(err.contains("CRABCROP_BRAND_COLOR"), "{err}");
+        }
+        // An empty value is unset, like the other settings.
+        let empty = |name: &str| (name == "CRABCROP_BRAND_COLOR").then(String::new);
+        assert_eq!(brand_color_config(empty), Ok(None));
+    }
+
+    #[test]
     fn metadata_config_defaults_to_strip() {
         let none = |_: &str| None;
         assert_eq!(metadata_config(none), Ok(false));
@@ -1717,6 +1767,18 @@ mod tests {
                 100
             ),
             "a swapped model file shapes output"
+        );
+        assert_ne!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_BRAND_COLOR", "f5f0e8")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "a brand color shapes studio output"
         );
         assert_eq!(
             base,

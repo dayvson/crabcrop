@@ -456,6 +456,12 @@ pub struct ProcessedImage {
     /// responses, computed from the final pixels when the caller
     /// asked for it. `None` otherwise.
     pub placeholder: Option<crate::placeholder::Placeholder>,
+    /// The studio record (issue #197) when a `studio(...)`
+    /// filter ran on the still pipeline: the resolved
+    /// parameters, steps, and fallbacks, for meta responses.
+    /// `None` when no studio filter ran (or on the animated
+    /// paths, whose per-frame records are not surfaced).
+    pub studio: Option<crate::studio::StudioRecord>,
     /// The SSIMULACRA2 score of the returned bytes against the
     /// processed source, set when `quality(auto)` verified its
     /// encode (JPEG and JXL). `None` when nothing was scored.
@@ -566,6 +572,11 @@ pub struct ProcessContext<'a> {
     /// copy the source's EXIF/XMP (and IPTC for JPEG) into
     /// JPEG and PNG outputs.
     pub preserve_metadata: bool,
+    /// Operator brand color for `studio(...)` composites
+    /// (issue #197), from `CRABCROP_BRAND_COLOR`. `None`
+    /// means `bg:brand` and an unnamed backdrop resolve to
+    /// white.
+    pub brand_color: Option<[u8; 3]>,
     /// ravif speed tier for AVIF encodes (1 slowest to 10
     /// fastest), from `CRABCROP_AVIF_SPEED`.
     pub avif_speed: u8,
@@ -599,6 +610,7 @@ impl Default for ProcessContext<'_> {
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             save_data: false,
             preserve_metadata: false,
+            brand_color: None,
             avif_speed: DEFAULT_AVIF_SPEED,
             jxl_speed: DEFAULT_JXL_SPEED,
         }
@@ -677,6 +689,17 @@ impl Engine {
                     "removebg is not configured on this server".to_string(),
                 ));
             }
+        }
+        // Studio mode is validated the same way (issue
+        // #197): it runs the same mask model, so without a
+        // provider it fails like removebg does, before any
+        // real work. Its output needs no format check: the
+        // composite is a normal image in the chain, valid
+        // in every output format.
+        if directives.studio && ctx.mask_provider.is_none() {
+            return Err(EngineError::NotConfigured(
+                "studio is not configured on this server (no mask model)".to_string(),
+            ));
         }
         // Shape filters are validated the same way: their
         // output is transparency, so the resolved format must
@@ -894,7 +917,7 @@ impl Engine {
         } else {
             None
         };
-        let (img, encode_opts) = apply_operations(
+        let (img, encode_opts, studio) = apply_operations(
             img,
             ops,
             cap,
@@ -1082,6 +1105,7 @@ impl Engine {
             source_width,
             source_height,
             placeholder,
+            studio,
             ssimulacra2: ssim,
         })
     }
@@ -1118,7 +1142,7 @@ impl Engine {
         for frame in frames {
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
@@ -1155,6 +1179,7 @@ impl Engine {
             source_width,
             source_height,
             placeholder,
+            studio: None,
             ssimulacra2: None,
         })
     }
@@ -1199,7 +1224,7 @@ impl Engine {
         for frame in frames {
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(crate::video::VideoFrame {
                 pixels: img.to_rgba8(),
@@ -1233,6 +1258,7 @@ impl Engine {
             source_width,
             source_height,
             placeholder,
+            studio: None,
             ssimulacra2: None,
         })
     }
@@ -1557,7 +1583,14 @@ fn apply_operations(
     dpr: f32,
     ctx: &ProcessContext<'_>,
     directives: &crate::url::RequestDirectives,
-) -> Result<(DynamicImage, EncodeOptions), EngineError> {
+) -> Result<
+    (
+        DynamicImage,
+        EncodeOptions,
+        Option<crate::studio::StudioRecord>,
+    ),
+    EngineError,
+> {
     check_operation_count(ops)?;
     let mut encode_opts = EncodeOptions::default();
     let mut face_memo: FaceMemo = None;
@@ -1575,6 +1608,10 @@ fn apply_operations(
     // the rendered capture instead of the transform result.
     let mut debug_armed = false;
     let mut debug_capture: Option<crate::debugview::FocalCapture> = None;
+    // The studio record (issue #197): the last `studio(...)`
+    // filter in the chain wins, since its composite is the
+    // look the response carries.
+    let mut studio_record: Option<crate::studio::StudioRecord> = None;
     for op in ops {
         match op {
             Operation::DebugFocal => debug_armed = true,
@@ -1821,6 +1858,31 @@ fn apply_operations(
                             let mask = provider.mask(&img).map_err(EngineError::Inference)?;
                             img = crate::ai::apply_mask(&img, &mask);
                         }
+                        Filter::Studio(spec) => {
+                            // Studio runs the removebg mask
+                            // model, then composites in
+                            // `crate::studio`: mask, defringe,
+                            // backdrop and shadow, pad (issue
+                            // #197). The record rides out with
+                            // the result for meta.
+                            let provider = ctx.mask_provider.ok_or_else(|| {
+                                EngineError::NotConfigured(
+                                    "studio is not configured on this server (no mask model)"
+                                        .to_string(),
+                                )
+                            })?;
+                            let mask = provider.mask(&img).map_err(EngineError::Inference)?;
+                            let confidence = provider.confidence(&img, &mask);
+                            let outcome = crate::studio::composite(
+                                &img,
+                                &mask,
+                                confidence,
+                                spec,
+                                ctx.brand_color,
+                            );
+                            img = outcome.image;
+                            studio_record = Some(outcome.record);
+                        }
                         Filter::BlurFaces => {
                             // A detection failure fails the
                             // request: serving the image
@@ -1955,7 +2017,7 @@ fn apply_operations(
     // image that goes to the encoder is inside the output
     // budget (issue #182, audit R2-12).
     check_output_pixels(img.width(), img.height())?;
-    Ok((img, encode_opts))
+    Ok((img, encode_opts, studio_record))
 }
 
 /// Build the debug capture for a crop that reported a
@@ -4879,7 +4941,7 @@ mod tests {
         // A quarter turn keeps the pixel count and passes.
         let ops = [Operation::Filters(vec![Filter::Rotate(90.0)])];
         let directives = crate::url::RequestDirectives::analyze(&ops);
-        let (out, _) = apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
+        let (out, _, _) = apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
         assert_eq!((out.width(), out.height()), (8000, 8000));
     }
 
@@ -5811,6 +5873,173 @@ mod tests {
             }
             other => panic!("expected NotConfigured, got {other:?}"),
         }
+    }
+
+    /// A mask provider for studio tests: the central square
+    /// is the subject, and it exposes a confidence, so the
+    /// record's plumbing for both is exercised.
+    #[derive(Debug)]
+    struct SquareMask;
+
+    impl crate::ai::MaskProvider for SquareMask {
+        fn mask(&self, img: &DynamicImage) -> Result<image::GrayImage, crate::ai::AiError> {
+            let (w, h) = (img.width(), img.height());
+            Ok(image::GrayImage::from_fn(w, h, |x, y| {
+                let inside = (w / 4..3 * w / 4).contains(&x) && (h / 4..3 * h / 4).contains(&y);
+                image::Luma([if inside { 255 } else { 0 }])
+            }))
+        }
+
+        fn confidence(&self, _img: &DynamicImage, _mask: &image::GrayImage) -> Option<f32> {
+            Some(0.93)
+        }
+    }
+
+    /// A 40x40 "product photo": a red square at 10..30 on
+    /// green, as PNG bytes.
+    fn product_source() -> Vec<u8> {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(40, 40, |x, y| {
+            if (10..30).contains(&x) && (10..30).contains(&y) {
+                image::Rgba([200, 30, 30, 255])
+            } else {
+                image::Rgba([30, 160, 30, 255])
+            }
+        }));
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        bytes
+    }
+
+    fn studio_spec() -> crate::url::StudioSpec {
+        crate::url::StudioSpec {
+            bg: crate::url::StudioBg::White,
+            shadow: crate::url::StudioShadow::None,
+            pad: 10,
+        }
+    }
+
+    #[test]
+    fn studio_without_a_provider_is_a_clean_error() {
+        let engine = Engine;
+        let err = engine
+            .process(
+                &product_source(),
+                &[Operation::Filters(vec![Filter::Studio(studio_spec())])],
+            )
+            .unwrap_err();
+        match &err {
+            EngineError::NotConfigured(msg) => {
+                assert!(msg.contains("studio is not configured"), "{msg}")
+            }
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn studio_composites_and_records_the_run() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &product_source(),
+                &[Operation::Filters(vec![
+                    Filter::Studio(studio_spec()),
+                    Filter::Format(ImageFormat::Png),
+                ])],
+                ProcessContext {
+                    mask_provider: Some(&SquareMask),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        // White backdrop at the corners, the red product in
+        // the middle: the composite, not the green photo.
+        assert_eq!(img.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(img.get_pixel(20, 20).0, [200, 30, 30, 255]);
+        // The record describes the run for meta.
+        let record = out.studio.expect("a studio run records itself");
+        assert_eq!(record.bg, Some([255, 255, 255]));
+        assert_eq!(record.bg_from, "argument");
+        assert_eq!(record.shadow, crate::url::StudioShadow::None);
+        assert_eq!(record.pad, 10);
+        assert_eq!(record.steps, ["mask", "defringe", "backdrop", "pad"]);
+        assert!(record.fallbacks.is_empty());
+        assert_eq!(record.confidence, Some(0.93));
+    }
+
+    #[test]
+    fn studio_output_is_a_normal_image_in_any_format() {
+        // Unlike removebg, whose output is transparency, a
+        // studio composite flattens onto its backdrop, so a
+        // JPEG output is fine.
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &product_source(),
+                &[Operation::Filters(vec![
+                    Filter::Studio(studio_spec()),
+                    Filter::Format(ImageFormat::Jpeg),
+                ])],
+                ProcessContext {
+                    mask_provider: Some(&SquareMask),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Jpeg);
+    }
+
+    #[test]
+    fn studio_resolves_the_brand_color_from_context() {
+        let engine = Engine;
+        let brand = [245, 240, 232];
+        let out = engine
+            .process_preferred(
+                &product_source(),
+                &[Operation::Filters(vec![Filter::Studio(
+                    crate::url::StudioSpec::default(),
+                )])],
+                ProcessContext {
+                    mask_provider: Some(&SquareMask),
+                    brand_color: Some(brand),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(0, 0).0, [brand[0], brand[1], brand[2], 255]);
+        let record = out.studio.unwrap();
+        assert_eq!(record.bg, Some(brand));
+        assert_eq!(record.bg_from, "brand");
+        // The default shadow (soft) ran over the backdrop.
+        assert!(record.steps.contains(&"shadow"));
+    }
+
+    #[test]
+    fn studio_counts_once_against_the_operation_cap() {
+        let engine = Engine;
+        let ctx = || ProcessContext {
+            mask_provider: Some(&SquareMask),
+            ..Default::default()
+        };
+        // Studio plus MAX_OPERATIONS - 1 cheap filters is
+        // exactly at the cap and processes.
+        let mut at_cap = vec![Filter::Studio(studio_spec())];
+        at_cap.extend((0..MAX_OPERATIONS - 1).map(|_| Filter::Invert));
+        let out = engine.process_preferred(&product_source(), &[Operation::Filters(at_cap)], ctx());
+        assert!(out.is_ok(), "{out:?}");
+        // One more filter tips it over.
+        let mut over_cap = vec![Filter::Studio(studio_spec())];
+        over_cap.extend((0..MAX_OPERATIONS).map(|_| Filter::Invert));
+        let err = engine
+            .process_preferred(&product_source(), &[Operation::Filters(over_cap)], ctx())
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("operation limit"), "{err}");
     }
 
     /// A fake upscale provider: a deterministic 2x

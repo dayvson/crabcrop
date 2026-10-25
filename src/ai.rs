@@ -54,6 +54,18 @@ impl std::error::Error for AiError {}
 /// ONNX provider in production and by fakes in tests.
 pub trait MaskProvider: Send + Sync + std::fmt::Debug {
     fn mask(&self, img: &DynamicImage) -> Result<GrayImage, AiError>;
+
+    /// The provider's confidence in the mask it produced for
+    /// this image, as a probability-like score in 0..=1, when
+    /// the provider's output supports one (issue #197: the
+    /// studio record in meta reports it). The default is
+    /// `None`, and the ONNX provider keeps it: its mask field
+    /// is min-max normalized before it is returned, which is
+    /// a contrast stretch, not a probability, so reporting a
+    /// number would overstate what the model said.
+    fn confidence(&self, _img: &DynamicImage, _mask: &GrayImage) -> Option<f32> {
+        None
+    }
 }
 
 /// The process-wide ONNX environment, created on first use:
