@@ -169,6 +169,13 @@ pub struct AppState {
     /// meta `tags`. The composition itself lives in
     /// `compose_annotation` (issue #152).
     pub tag_threshold: f32,
+    /// Moderation provider for meta responses that opt in
+    /// with `moderation=1` (issue #171), preloaded at boot
+    /// when `CRABCROP_MODERATION_MODEL` or the labels
+    /// fallback is configured. `None` means the opt-in
+    /// reports moderation as unavailable. Verdicts are
+    /// annotations only: nothing here alters serving.
+    pub moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
     /// Detection provider for class redaction and meta
     /// detections, preloaded at boot when
     /// `CRABCROP_DETECT_MODEL` is configured. `None` means
@@ -1850,8 +1857,18 @@ async fn serve_miss(
     } else {
         None
     };
+    let moderation = if meta && wants_moderation(accept) {
+        Some(moderate_meta(state, &processed, ai_gated).await)
+    } else {
+        None
+    };
     let mut response = if meta {
-        meta_response(&processed, annotation.as_ref(), detections.as_deref())
+        meta_response(
+            &processed,
+            annotation.as_ref(),
+            detections.as_deref(),
+            moderation.as_ref(),
+        )
     } else {
         respond(
             processed.format,
@@ -1975,6 +1992,13 @@ fn wants_placeholders(accept: Option<&str>) -> bool {
 /// `placeholders`.
 fn wants_detections(accept: Option<&str>) -> bool {
     wants_meta_param(accept, "detections")
+}
+
+/// Whether the accepted `application/json` entry asks for
+/// moderation verdicts: a `moderation` parameter, same
+/// rule as `placeholders`.
+fn wants_moderation(accept: Option<&str>) -> bool {
+    wants_meta_param(accept, "moderation")
 }
 
 /// Whether the accepted `application/json` entry carries
@@ -2196,10 +2220,119 @@ async fn detect_meta(
     any_answered.then_some(aggregated)
 }
 
+/// The moderation field of a meta response that asked
+/// for it (`moderation=1`, issue #171): either the
+/// provider's report, composed for the wire, or the
+/// reason there is none. Like tags and detections, the
+/// field is an annotation, so every failure degrades to
+/// the unavailable form and the meta request still
+/// succeeds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModerationMeta {
+    Report(crate::ai::ModerationScores),
+    Unavailable(&'static str),
+}
+
+/// Compose a moderation report for the response: verdict
+/// scores keep the model's output order and round to 4
+/// decimals (verdicts are consumed programmatically,
+/// and a small probability must not round away);
+/// signals sort best first and round to 3 decimals,
+/// like tag scores.
+fn compose_moderation(report: &crate::ai::ModerationScores) -> crate::ai::ModerationScores {
+    let round_to = |score: f32, places: f32| (score * places).round() / places;
+    let mut signals: Vec<crate::ai::TagScore> = report
+        .signals
+        .iter()
+        .map(|s| crate::ai::TagScore {
+            label: s.label.clone(),
+            score: round_to(s.score, 1000.0),
+        })
+        .collect();
+    // The sort is stable, so equal signals keep their
+    // label-file order.
+    signals.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    crate::ai::ModerationScores {
+        model: report.model.clone(),
+        scores: report
+            .scores
+            .iter()
+            .map(|s| crate::ai::TagScore {
+                label: s.label.clone(),
+                score: round_to(s.score, 10000.0),
+            })
+            .collect(),
+        signals,
+    }
+}
+
+/// Run moderation for a meta response that asked for it.
+/// Same permit rule as `annotate_meta` (a request already
+/// holding an AI permit runs under it, audit R2-29),
+/// but the outcome is explicit rather than an omitted
+/// field: an unconfigured provider, a busy gate, and a
+/// failed inference each report unavailable, with a
+/// reason, because the client asked for the field by
+/// name.
+async fn moderate_meta(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+    ai_gated: bool,
+) -> ModerationMeta {
+    let Some(provider) = state.moderation.as_ref() else {
+        return ModerationMeta::Unavailable("not_configured");
+    };
+    let _permit = if ai_gated {
+        None
+    } else {
+        match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            _ => return ModerationMeta::Unavailable("busy"),
+        }
+    };
+    let img = match crate::engine::decode_image(&processed.bytes) {
+        Ok(img) => img,
+        Err(_) => return ModerationMeta::Unavailable("inference_failed"),
+    };
+    let provider = provider.clone();
+    match tokio::task::spawn_blocking(move || provider.moderate(&img)).await {
+        Ok(Ok(report)) => ModerationMeta::Report(compose_moderation(&report)),
+        Ok(Err(e)) => {
+            eprintln!("moderation error: {e}");
+            ModerationMeta::Unavailable("inference_failed")
+        }
+        Err(e) => {
+            eprintln!("moderation task failed: {e}");
+            ModerationMeta::Unavailable("inference_failed")
+        }
+    }
+}
+
+/// Render a score list the way meta carries it:
+/// `[{"label":...,"score":...}, ...]`.
+fn score_list_json(scores: &[crate::ai::TagScore]) -> String {
+    let items: Vec<String> = scores
+        .iter()
+        .map(|s| {
+            format!(
+                "{{\"label\":{},\"score\":{}}}",
+                serde_json::to_string(&s.label).unwrap_or_default(),
+                s.score
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 fn meta_response(
     processed: &crate::engine::ProcessedImage,
     annotation: Option<&Annotation>,
     detections: Option<&[(String, crate::ai::Detection)]>,
+    moderation: Option<&ModerationMeta>,
 ) -> Response {
     let mut body = format!(
         "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}",
@@ -2249,6 +2382,38 @@ fn meta_response(
             })
             .collect();
         body.push_str(&format!(",\"detections\":[{}]", boxes.join(",")));
+    }
+    if let Some(moderation) = moderation {
+        // The moderation field (issue #171): a report
+        // carries the model identity, the verdict scores
+        // when a classifier ran, and the zero-shot
+        // signals (marked review-only: leads, never
+        // verdicts) when the CLIP fallback ran. An
+        // unavailable moderation is explicit too, since
+        // the client opted in by name.
+        match moderation {
+            ModerationMeta::Report(report) => {
+                body.push_str(&format!(
+                    ",\"moderation\":{{\"model\":{}",
+                    serde_json::to_string(&report.model).unwrap_or_default()
+                ));
+                if !report.scores.is_empty() {
+                    body.push_str(&format!(",\"scores\":{}", score_list_json(&report.scores)));
+                }
+                if !report.signals.is_empty() {
+                    body.push_str(&format!(
+                        ",\"signals\":{{\"review_only\":true,\"scores\":{}}}",
+                        score_list_json(&report.signals)
+                    ));
+                }
+                body.push('}');
+            }
+            ModerationMeta::Unavailable(reason) => {
+                body.push_str(&format!(
+                    ",\"moderation\":{{\"available\":false,\"reason\":\"{reason}\"}}"
+                ));
+            }
+        }
     }
     if let Some(score) = processed.ssimulacra2 {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
@@ -2564,6 +2729,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -2659,6 +2825,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -2818,6 +2985,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -2870,6 +3038,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -2925,6 +3094,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3461,6 +3631,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3785,6 +3956,7 @@ mod tests {
             face: None,
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3848,6 +4020,256 @@ mod tests {
         assert!(meta.get("alt_text").is_none());
     }
 
+    #[derive(Debug)]
+    struct FakeModeration;
+
+    impl crate::ai::ModerationProvider for FakeModeration {
+        fn moderate(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::ModerationScores, crate::ai::AiError> {
+            // Raw probabilities (issue #171): the
+            // composition rounds them for the wire.
+            Ok(crate::ai::ModerationScores {
+                model: "fake-model".to_string(),
+                scores: vec![
+                    crate::ai::TagScore {
+                        label: "normal".to_string(),
+                        score: 0.99876,
+                    },
+                    crate::ai::TagScore {
+                        label: "nsfw".to_string(),
+                        score: 0.00124,
+                    },
+                ],
+                signals: Vec::new(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingModeration;
+
+    impl crate::ai::ModerationProvider for FailingModeration {
+        fn moderate(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::ModerationScores, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference("model exploded".to_string()))
+        }
+    }
+
+    async fn spawn_app_with_moderation(
+        provider: Option<Arc<dyn crate::ai::ModerationProvider>>,
+    ) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: provider,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn meta_includes_moderation_verdicts_only_on_opt_in() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_moderation(Some(Arc::new(FakeModeration))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; moderation=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let moderation = &meta["moderation"];
+        assert_eq!(moderation["model"], "fake-model");
+        let scores = moderation["scores"].as_array().unwrap();
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0]["label"], "normal");
+        // Verdicts round to 4 decimals on the wire.
+        assert!((scores[0]["score"].as_f64().unwrap() - 0.9988).abs() < 1e-9);
+        assert_eq!(scores[1]["label"], "nsfw");
+        assert!((scores[1]["score"].as_f64().unwrap() - 0.0012).abs() < 1e-9);
+        assert!(moderation.get("signals").is_none());
+        // Without the opt-in the field is absent, even
+        // with a provider configured.
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(meta.get("moderation").is_none());
+    }
+
+    #[tokio::test]
+    async fn meta_moderation_signals_are_marked_review_only() {
+        let src = spawn_image_server().await;
+        // The CLIP fallback, wrapped around the fake
+        // tagger: its raw scores become signals.
+        let fallback =
+            crate::ai::ClipModerationProvider::new(Arc::new(FakeTagger), "clip-fake".to_string());
+        let base = spawn_app_with_moderation(Some(Arc::new(fallback))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; moderation=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let moderation = &meta["moderation"];
+        assert_eq!(moderation["model"], "clip-fake");
+        // No verdicts from a signals-only provider.
+        assert!(moderation.get("scores").is_none());
+        let signals = &moderation["signals"];
+        assert_eq!(signals["review_only"], true);
+        let scores = signals["scores"].as_array().unwrap();
+        assert_eq!(scores.len(), 3);
+        // Best first, rounded to 3 decimals.
+        assert_eq!(scores[0]["label"], "ocean");
+        assert!((scores[0]["score"].as_f64().unwrap() - 0.3).abs() < 1e-9);
+        assert_eq!(scores[2]["label"], "mountain");
+    }
+
+    #[tokio::test]
+    async fn meta_moderation_reports_unavailable_without_a_provider() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_moderation(None).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; moderation=1")
+            .send()
+            .await
+            .unwrap();
+        // The meta request still succeeds; only the
+        // field reports its state.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["moderation"]["available"], false);
+        assert_eq!(meta["moderation"]["reason"], "not_configured");
+    }
+
+    #[tokio::test]
+    async fn meta_moderation_failure_reports_unavailable() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_moderation(Some(Arc::new(FailingModeration))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; moderation=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["moderation"]["available"], false);
+        assert_eq!(meta["moderation"]["reason"], "inference_failed");
+    }
+
+    #[test]
+    fn moderation_opt_in_takes_exact_tokens() {
+        // The #151 rule, for the moderation parameter.
+        assert!(wants_moderation(Some("application/json; moderation")));
+        assert!(wants_moderation(Some("application/json; moderation=1")));
+        assert!(wants_moderation(Some("application/json; moderation=TRUE")));
+        assert!(!wants_moderation(Some("application/json")));
+        assert!(!wants_moderation(Some("application/json; moderation=0")));
+        assert!(!wants_moderation(Some("application/json; moderation=yes")));
+        assert!(!wants_moderation(Some("application/json; detections=1")));
+        assert!(!wants_moderation(None));
+    }
+
+    #[test]
+    fn compose_moderation_rounds_and_orders() {
+        let report = crate::ai::ModerationScores {
+            model: "m".to_string(),
+            scores: vec![
+                crate::ai::TagScore {
+                    label: "second".to_string(),
+                    score: 0.123456,
+                },
+                crate::ai::TagScore {
+                    label: "first".to_string(),
+                    score: 0.999949,
+                },
+            ],
+            signals: vec![
+                crate::ai::TagScore {
+                    label: "low".to_string(),
+                    score: 0.11111,
+                },
+                crate::ai::TagScore {
+                    label: "high".to_string(),
+                    score: 0.98765,
+                },
+                crate::ai::TagScore {
+                    label: "mid".to_string(),
+                    score: 0.5,
+                },
+            ],
+        };
+        let composed = compose_moderation(&report);
+        assert_eq!(composed.model, "m");
+        // Verdicts keep the model's output order and
+        // round to 4 decimals.
+        assert_eq!(composed.scores[0].label, "second");
+        assert!((composed.scores[0].score - 0.1235).abs() < 1e-6);
+        assert_eq!(composed.scores[1].label, "first");
+        assert!((composed.scores[1].score - 0.9999).abs() < 1e-6);
+        // Signals sort best first and round to 3.
+        let labels: Vec<&str> = composed.signals.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["high", "mid", "low"]);
+        assert!((composed.signals[0].score - 0.988).abs() < 1e-6);
+        assert!((composed.signals[2].score - 0.111).abs() < 1e-6);
+    }
+
     /// An app whose AI surface is fully faked (mask,
     /// tagger, detector) behind a one-permit AI gate, for
     /// the permit-reuse test below.
@@ -3864,6 +4286,7 @@ mod tests {
             face: None,
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
+            moderation: None,
             detect: Some(Arc::new(FakeDetector)),
             detectors: Vec::new(),
             focal: None,
@@ -3911,6 +4334,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -4144,6 +4568,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect,
             detectors,
             focal: None,
@@ -4196,6 +4621,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -5403,6 +5829,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -5457,6 +5884,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -5824,6 +6252,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -5905,6 +6334,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -6291,6 +6721,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -6686,6 +7117,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -7506,6 +7938,7 @@ mod tests {
             face: None,
             tagger: None,
             tag_threshold: 0.05,
+            moderation: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
