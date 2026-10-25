@@ -213,14 +213,6 @@ pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> 
     )
 }
 
-/// Assemble a signed (or `unsafe`) crabcrop URL.
-///
-/// `operations` is the operation string verbatim (it may hold
-/// several `/`-separated segments, `preset:` references
-/// included). `expires` is a unix-seconds expiry, emitted as a
-/// leading `exp:` segment. A `None` secret produces the
-/// literal `unsafe` signature segment, for servers running
-/// with unsafe or presets-only configurations.
 /// Why a builder input can never produce a verifiable URL:
 /// the remainder travels as a raw URL path, so `?` and `#`
 /// would truncate it at the HTTP layer, and whitespace,
@@ -237,6 +229,14 @@ pub fn validate_url_text(text: &str, what: &'static str) -> Result<(), BuildErro
     Ok(())
 }
 
+/// Assemble a signed (or `unsafe`) crabcrop URL.
+///
+/// `operations` is the operation string verbatim (it may hold
+/// several `/`-separated segments, `preset:` references
+/// included). `expires` is a unix-seconds expiry, emitted as a
+/// leading `exp:` segment. A `None` secret produces the
+/// literal `unsafe` signature segment, for servers running
+/// with unsafe or presets-only configurations.
 pub fn build_url(
     base: &str,
     secret: Option<&[u8]>,
