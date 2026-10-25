@@ -4,6 +4,19 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-25
+
+### Added
+
+- Security policy (PR #221). SECURITY.md documents private vulnerability reporting through GitHub's private advisories, the supported-version line for the pre-1.0 releases (fixes land on the latest `main` and the next release, no backports yet), what a report should include, and the coordinated disclosure process; the README links it from a new Security section.
+
+### Fixed
+
+- Studio renders to WebP took about 51 s at 1000x667 and failed outright at 2000x1334 (issue #220, PR #226). The compositing pipeline was never the problem (about 100 ms end to end); the lossy WebP encoder encoded the studio canvas's alpha plane through its slow VP8L path even when the backdrop made the output fully opaque, and that path panicked on the larger canvas. When the backdrop resolves to a color, the composite now states its alpha as exactly 255, so the encoder skips the alpha plane: 0.95 s at 1000x667 and 1.98 s at 2000x1334, with RGB output bit-identical to before. Per-stage timing for the studio pipeline is available behind the `CRABCROP_STUDIO_TIMING` environment variable.
+- The color filters silently discarded transparency (PR #222). `grayscale`, `contrast`, `sharpen`, `saturation`, `rgb`, and `equalize` normalized the image to RGB8, so a filter chain that later produced alpha (`radius`, `mask`, `removebg`) or an alpha-capable output lost it: grayscale into radius into PNG came out with opaque corners. The six filters now transform the RGB plane and re-attach the source alpha, following the `map_rgb` pattern the other color filters already used; opaque inputs render exactly as before.
+- The Thumbor converter mapped contrast on the wrong scale (PR #223). `convert-thumbor` translated Thumbor `contrast(N)` into a factor (`1 + N/100`), but the server's `contrast` has been a percent on the -100..=100 scale since studio mode (#197), so converted URLs applied almost no contrast. The converter now emits the percent directly, clamping out-of-range inputs with a warning, and the Thumbor, Cloudinary, and imgproxy migration guides document the mapping correctly (imgproxy's `co` is a factor; crabcrop's contrast is a percent).
+- The color management documentation claimed ICC profiles are read from WebP sources (PR #224). `extract_source_meta` reads ICC, EXIF, and XMP from JPEG and PNG only; the README now says so.
+
 ## [0.3.0] - 2026-10-25
 
 ### Added
