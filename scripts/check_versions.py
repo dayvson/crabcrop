@@ -45,6 +45,11 @@ def chart_versions(rel):
     return (version.group(1) if version else None, app.group(1) if app else None)
 
 
+def mcp_server_info_version(rel):
+    match = re.search(r'const SERVER = \{ name: "crabcrop", version: "([^"]+)" \}', read(rel))
+    return match.group(1) if match else None
+
+
 def sites():
     found = {
         "Cargo.toml (server)": cargo_package_version("Cargo.toml"),
@@ -56,6 +61,7 @@ def sites():
         "frameworks/hydrogen/package.json": json_version("frameworks/hydrogen/package.json"),
         "sdks/python/pyproject.toml": pyproject_version("sdks/python/pyproject.toml"),
     }
+    found["sdks/mcp/src/index.ts SERVER.version"] = mcp_server_info_version("sdks/mcp/src/index.ts")
     manifest, manifest_pkg = mcp_manifest_versions("sdks/mcp/server.json")
     found["sdks/mcp/server.json version"] = manifest
     found["sdks/mcp/server.json packages[0].version"] = manifest_pkg

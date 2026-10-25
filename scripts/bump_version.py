@@ -55,6 +55,11 @@ def edits(version):
         rf"\g<1>{version}\g<2>",
         re.S | re.M,
     )
+    out["sdks/mcp/src/index.ts"] = sub_once(
+        "sdks/mcp/src/index.ts",
+        r'(const SERVER = \{ name: "crabcrop", version: ")[^"]+(")',
+        rf"\g<1>{version}\g<2>",
+    )
     # server.json carries the version twice: the manifest
     # itself and its npm package entry. Both must move.
     manifest = read_text("sdks/mcp/server.json")

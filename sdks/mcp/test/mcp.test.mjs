@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -100,6 +100,10 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
       clientInfo: { name: "mcp-test", version: "0" },
     });
     assert.equal(init.serverInfo.name, "crabcrop");
+    // The reported version is a release version site: it must
+    // match the package version (scripts/check_versions.py).
+    const pkg = JSON.parse(readFileSync(`${root}sdks/mcp/package.json`, "utf8"));
+    assert.equal(init.serverInfo.version, pkg.version);
     client.notify("notifications/initialized", {});
 
     const list = await client.request("tools/list", {});
