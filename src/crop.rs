@@ -46,6 +46,17 @@ pub struct CropTrace {
     /// (smart alignment with a face provider); empty
     /// otherwise.
     pub faces: Vec<crate::ai::FaceBox>,
+    /// How many faces the decision detected: the length
+    /// of `faces`, carried as a count so the record
+    /// states the guarantee's denominator directly.
+    pub faces_detected: usize,
+    /// How many of the detected faces the final window
+    /// keeps fully inside (issue #199): smart placement
+    /// keeps faces whole whenever the geometry allows
+    /// it, and this count is that promise made
+    /// inspectable. Equals `faces_detected` whenever
+    /// every face could be kept.
+    pub faces_kept: usize,
 }
 
 /// [`crop_to_aspect`] with an optional face provider: when one
@@ -106,6 +117,8 @@ fn crop_to_aspect_impl(
         return (
             img,
             traced.map(|(point, face_boxes)| CropTrace {
+                faces_detected: face_boxes.len(),
+                faces_kept: faces_inside(&face_boxes, (0, 0, w, h)),
                 window: (0, 0, w, h),
                 focal: point,
                 faces: face_boxes,
@@ -123,7 +136,7 @@ fn crop_to_aspect_impl(
                 let (point, boxes) = crate::focus::focal_point_chained(&img, faces, declared);
                 focal = Some(point);
                 face_boxes = boxes;
-                point_start(point.x, cw, w)
+                smart_start(&face_boxes, false, point_start(point.x, cw, w), cw, w)
             }
             _ => (w.saturating_sub(cw)) / 2,
         };
@@ -138,12 +151,14 @@ fn crop_to_aspect_impl(
                 let (point, boxes) = crate::focus::focal_point_chained(&img, faces, declared);
                 focal = Some(point);
                 face_boxes = boxes;
-                point_start(point.y, ch, h)
+                smart_start(&face_boxes, true, point_start(point.y, ch, h), ch, h)
             }
             _ => (h.saturating_sub(ch)) / 2,
         };
         (0, y, w, ch)
     };
+    let faces_detected = face_boxes.len();
+    let faces_kept = faces_inside(&face_boxes, (x, y, cw, ch));
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
     (
         DynamicImage::ImageRgba8(cropped),
@@ -155,8 +170,43 @@ fn crop_to_aspect_impl(
                 focal
             },
             faces: face_boxes,
+            faces_detected,
+            faces_kept,
         }),
     )
+}
+
+/// The window start for smart alignment: the focal-point
+/// start, adjusted by face-safe placement (issue #199)
+/// when faces fed the decision. With no faces the focal
+/// start stands, exactly as before face-safety.
+fn smart_start(
+    faces: &[crate::ai::FaceBox],
+    vertical: bool,
+    preferred: u32,
+    window: u32,
+    extent: u32,
+) -> u32 {
+    if faces.is_empty() {
+        return preferred;
+    }
+    let spans = crate::focus::face_spans(faces, vertical);
+    crate::focus::face_safe_start(&spans, preferred, window, extent).0
+}
+
+/// How many of `faces` lie fully inside `window`, a
+/// (left, top, width, height) rectangle in source pixels:
+/// the whole box, edges included, on both axes.
+fn faces_inside(faces: &[crate::ai::FaceBox], window: (u32, u32, u32, u32)) -> usize {
+    let (x, y) = (window.0 as u64, window.1 as u64);
+    let (right, bottom) = (x + window.2 as u64, y + window.3 as u64);
+    faces
+        .iter()
+        .filter(|f| {
+            let (fx, fy) = (f.x as u64, f.y as u64);
+            fx >= x && fy >= y && fx + f.w as u64 <= right && fy + f.h as u64 <= bottom
+        })
+        .count()
 }
 
 /// The focal point an alignment positions on, for the
@@ -682,5 +732,174 @@ mod tests {
         assert_eq!((out.width(), out.height()), (100, 60));
         assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
         assert_eq!(rgb(&out, 99, 0), [0, 0, 255]);
+    }
+
+    /// A face provider reporting fixed boxes, the stub
+    /// pattern the focus tests use.
+    #[derive(Debug)]
+    struct StubFaces(Vec<crate::ai::FaceBox>);
+
+    impl crate::ai::FaceProvider for StubFaces {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A face provider that always fails: detection errors
+    /// never fail the crop they enhance.
+    #[derive(Debug)]
+    struct FailingFaces;
+
+    impl crate::ai::FaceProvider for FailingFaces {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference(
+                "detector exploded".to_string(),
+            ))
+        }
+    }
+
+    /// The window the pre-#199 rule cut for a traced smart
+    /// crop: centered on the traced focal point, clamped.
+    /// Recomputed from the trace so a test can show what
+    /// face-safety changed.
+    fn focal_window(trace: &CropTrace, img_w: u32, img_h: u32) -> (u32, u32, u32, u32) {
+        let point = trace.focal.unwrap();
+        let (x, y, cw, ch) = trace.window;
+        if cw < img_w {
+            (point_start(point.x, cw, img_w), y, cw, ch)
+        } else {
+            (x, point_start(point.y, ch, img_h), cw, ch)
+        }
+    }
+
+    #[test]
+    fn face_safe_smart_crop_keeps_an_edge_face_whole() {
+        // 400x200, red block over the face box at the right
+        // edge (x 360..400). A square crop is 200 wide: the
+        // centered window (100..300) misses the face
+        // entirely, while the face-safe smart window shifts
+        // to the edge and keeps it whole.
+        let mut img = DynamicImage::new_rgb8(400, 200);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if (360..400).contains(&x) && (80..120).contains(&y) {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([128, 128, 128])
+            };
+        }
+        let stub = StubFaces(vec![face(360, 80, 40, 40)]);
+        let (out, trace) =
+            crop_to_aspect_traced(img.clone(), 1, 1, Align::Smart, Some(&stub), None);
+        let trace = trace.unwrap();
+        assert_eq!(trace.window, (200, 0, 200, 200));
+        assert_eq!(trace.faces_detected, 1);
+        assert_eq!(trace.faces_kept, 1);
+        assert!(has_pure_red(&out));
+        let centered = crop_to_aspect(img, 1, 1, Align::Center);
+        assert!(!has_pure_red(&centered));
+    }
+
+    #[test]
+    fn face_safe_smart_crop_shifts_to_keep_two_faces_whole() {
+        // Two faces whose spans together exactly fill the
+        // 200-wide window: only start 30 keeps both. The
+        // area-weighted centroid sits at x 84, so the focal
+        // window (start 0) would cut the smaller face.
+        let img = DynamicImage::new_rgb8(400, 200);
+        let boxes = vec![face(30, 80, 40, 40), face(210, 90, 20, 20)];
+        let stub = StubFaces(boxes.clone());
+        let (_, trace) = crop_to_aspect_traced(img, 1, 1, Align::Smart, Some(&stub), None);
+        let trace = trace.unwrap();
+        assert_eq!(trace.window, (30, 0, 200, 200));
+        assert_eq!(trace.faces_detected, 2);
+        assert_eq!(trace.faces_kept, 2);
+        let old = focal_window(&trace, 400, 200);
+        assert_eq!(old, (0, 0, 200, 200));
+        assert_eq!(faces_inside(&boxes, old), 1);
+    }
+
+    #[test]
+    fn face_safe_smart_crop_keeps_the_larger_face_when_both_cannot_fit() {
+        // The spans cover the whole width, so no window
+        // keeps both. The centroid window (start 38) keeps
+        // neither whole; face-safety moves to the larger
+        // face and the record shows 1 of 2 kept.
+        let img = DynamicImage::new_rgb8(400, 200);
+        let boxes = vec![face(0, 80, 60, 60), face(360, 80, 40, 40)];
+        let stub = StubFaces(boxes.clone());
+        let (_, trace) = crop_to_aspect_traced(img, 1, 1, Align::Smart, Some(&stub), None);
+        let trace = trace.unwrap();
+        assert_eq!(trace.window, (0, 0, 200, 200));
+        assert_eq!(trace.faces_detected, 2);
+        assert_eq!(trace.faces_kept, 1);
+        assert_eq!(faces_inside(&boxes, trace.window), 1);
+        assert_eq!(trace.faces[0], boxes[0]);
+        let old = focal_window(&trace, 400, 200);
+        assert_eq!(old, (38, 0, 200, 200));
+        assert_eq!(faces_inside(&boxes, old), 0);
+    }
+
+    #[test]
+    fn face_safe_smart_crop_centers_a_face_larger_than_the_window() {
+        // A 4:1 crop of the 400x200 source is 400x100,
+        // sliding on y. The face is 120 tall: it can never
+        // be whole, so the window centers on it as before,
+        // and the record honestly keeps 0.
+        let img = DynamicImage::new_rgb8(400, 200);
+        let stub = StubFaces(vec![face(150, 40, 100, 120)]);
+        let (_, trace) = crop_to_aspect_traced(img, 4, 1, Align::Smart, Some(&stub), None);
+        let trace = trace.unwrap();
+        assert_eq!(trace.window, (0, 50, 400, 100));
+        assert_eq!(trace.faces_detected, 1);
+        assert_eq!(trace.faces_kept, 0);
+        // Window center == face center on the sliding axis.
+        assert_eq!(trace.window.1 + trace.window.3 / 2, 40 + 120 / 2);
+    }
+
+    #[test]
+    fn smart_crop_without_faces_matches_todays_window() {
+        // Regression pin: no provider, an empty provider,
+        // and a failing provider all produce exactly the
+        // window the saliency rule has always cut on this
+        // fixture, and record no faces.
+        let expected = (100, 0, 100, 100);
+        let (_, trace) = crop_to_aspect_traced(right_block(), 1, 1, Align::Smart, None, None);
+        let trace = trace.unwrap();
+        assert_eq!(trace.window, expected);
+        assert_eq!(trace.faces_detected, 0);
+        assert_eq!(trace.faces_kept, 0);
+        let empty = StubFaces(Vec::new());
+        let (_, trace) =
+            crop_to_aspect_traced(right_block(), 1, 1, Align::Smart, Some(&empty), None);
+        assert_eq!(trace.unwrap().window, expected);
+        let (_, trace) =
+            crop_to_aspect_traced(right_block(), 1, 1, Align::Smart, Some(&FailingFaces), None);
+        assert_eq!(trace.unwrap().window, expected);
+    }
+
+    #[test]
+    fn face_safe_smart_crop_keeps_the_portrait_fixture_face_whole() {
+        // The checked-in portrait (400x499) with a stub
+        // reporting its measured face box (the real-model
+        // test in ai.rs brackets x 130..175, y 15..50,
+        // w 70..110, h 115..165; the stub uses the middle).
+        let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
+        let img = image::load_from_memory(bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (400, 499));
+        let stub = StubFaces(vec![face(150, 30, 90, 140)]);
+        for (tw, th, window) in [(1, 1, (0, 0, 400, 400)), (2, 1, (0, 0, 400, 200))] {
+            let (_, trace) =
+                crop_to_aspect_traced(img.clone(), tw, th, Align::Smart, Some(&stub), None);
+            let trace = trace.unwrap();
+            assert_eq!(trace.window, window, "target {tw}:{th}");
+            assert_eq!(trace.faces_detected, 1);
+            assert_eq!(trace.faces_kept, 1);
+        }
     }
 }
