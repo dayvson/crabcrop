@@ -1,3 +1,16 @@
+# Rust CI. The live workflow is .github/workflows/rust.yml;
+# the API credential cannot push workflow files, so land
+# changes to this mirror there through the GitHub web UI
+# and keep the two in sync (the same route as
+# docs/release-workflow.yml and docs/perf-workflow.yml).
+#
+# Issue #193 hardening, landed at
+# .github/workflows/rust.yml through the web UI as part
+# of the v0.1.1 cut: least-privilege permissions, actions
+# pinned by SHA, every dependency-resolving cargo command
+# run with --locked, and an audit job
+# (rustsec/audit-check) so a RUSTSEC advisory against a
+# locked dependency fails CI.
 name: Rust
 
 on:
@@ -5,6 +18,9 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,28 +31,44 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
       - name: Install libdav1d (AVIF decode)
         run: sudo apt-get update && sudo apt-get install -y libdav1d-dev
       - name: Run tests with AVIF decode
-        run: cargo test --verbose --features avif-decode
+        run: cargo test --locked --verbose --features avif-decode
+
+  audit:
+
+    runs-on: ubuntu-latest
+
+    # audit-check reports through the Checks API.
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   suites:
 
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Run every non-Rust suite
