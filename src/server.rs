@@ -10,6 +10,15 @@
 //! When an upload destination is configured, a signed
 //! `PUT /upload/<signature>/<name>` stores originals in it
 //! (issue #168; see [`crate::upload`]).
+//!
+//! `GET /explain/<signature>/<operations...>/<image-url>`
+//! (issue #196) verifies the remainder exactly as an image
+//! request does and answers with a report on the URL
+//! instead of the image: signature and expiry verdict,
+//! probed source facts, every operation glossed, the
+//! output forecast, and the canonical cache form. It
+//! probes the source through the loader (headers only, no
+//! decode, no gates) and writes nothing anywhere.
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -256,6 +265,7 @@ pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/explain/{*path}", get(explain_handle))
         .route("/purge/{*path}", axum::routing::post(purge_handle))
         .route(
             "/purge-group/{*path}",
@@ -398,6 +408,185 @@ async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
         Some(Fallback::Url(url)) => state.loader.load(url).await.ok(),
         None => None,
     }
+}
+
+/// `GET /explain/<signature>/<operations...>/<image-url>`:
+/// the self-explaining URL report (issue #196; the report
+/// itself is built in [`crate::explain`]).
+///
+/// The checks mirror the image path exactly and run in its
+/// order: signature grammar, signature verification, the
+/// reserved-segment guard, preset expansion, operation
+/// parsing, expiry. Only then is the source touched, once,
+/// through the loader with all of its guards, and the
+/// facts come from header probing (`crate::engine::
+/// probe_source`): no decode, no detection, no process,
+/// AI, or video gate, and nothing written to any cache
+/// tier. A bad signature or an expired URL therefore costs
+/// zero source fetches, and answers with the image path's
+/// own status and body.
+async fn explain_handle(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+) -> Response {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let Some(tail) = uri.path().strip_prefix("/explain/") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected /explain/<signature>/<target>",
+        )
+            .into_response();
+    };
+    let full = format!("/{tail}");
+    let (signature, key_id, rest) = match parse_signature(&full) {
+        Ok(v) => v,
+        Err(e) => return parse_failure(&e, accept.as_deref()),
+    };
+    if !state
+        .keyring
+        .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe)
+    {
+        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+    }
+    // The same domain separation as the image path: a
+    // remainder may not begin with a reserved segment.
+    if matches!(
+        rest.split('/').next(),
+        Some("purge" | "purge-group" | "upload")
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "an image URL may not begin with a purge or upload segment",
+        )
+            .into_response();
+    }
+    let groups = crate::url::preset_names(rest);
+    let expanded;
+    let rest = if state.presets.is_empty() && !state.only_presets {
+        rest
+    } else {
+        match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
+            Ok(text) => {
+                expanded = text;
+                &expanded
+            }
+            Err(e) => return parse_failure(&e, accept.as_deref()),
+        }
+    };
+    let (ops, source_url, expiry, _) = match parse_operations_with_expiry(rest) {
+        Ok(v) => v,
+        Err(e) => return parse_failure(&e, accept.as_deref()),
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(exp) = expiry
+        && now >= exp
+    {
+        return (StatusCode::FORBIDDEN, "signature expired").into_response();
+    }
+
+    // The single bounded source fetch, through the loader
+    // and its policy. Watermark and overlay sources are
+    // operations' inputs, not the explained URL's source,
+    // and are never fetched: no fan-out.
+    let bytes = match state.loader.load(source_url).await {
+        Ok(bytes) => bytes,
+        Err(e) => return explain_load_error(e),
+    };
+    let probe = crate::engine::probe_source(&bytes);
+
+    // Each referenced preset with the operations its
+    // definition expands to. Definitions were validated at
+    // boot; one that no longer parses (it cannot) is listed
+    // by name alone rather than failing the report.
+    let mut presets = Vec::new();
+    for name in &groups {
+        let entry_ops = state
+            .presets
+            .get(name)
+            .and_then(|definition| crate::url::parse_default_ops(definition, &state.presets).ok())
+            .unwrap_or_default();
+        presets.push(crate::explain::preset_entry(name, &entry_ops));
+    }
+
+    // The canonical form is the cache key's path form,
+    // defaults merged exactly as the image path merges
+    // them for its key. The key's config fingerprint
+    // suffix is operator state and stays unreported.
+    let canonical = crate::url::canonical_form(
+        &crate::url::merge_default_ops(&state.default_ops, ops.clone()),
+        source_url,
+    );
+    let report = crate::explain::Report::new(crate::explain::ReportInput {
+        signed: !matches!(signature, crate::url::Signature::Unsafe),
+        key_id,
+        expiry,
+        now,
+        source_url: source_url.to_string(),
+        probe,
+        source_bytes: bytes.len(),
+        ops,
+        presets,
+        canonical,
+        cache_group: groups.into_iter().next(),
+        image_path: full,
+    });
+
+    let (content_type, body) = if crate::explain::wants_json(accept.as_deref()) {
+        (
+            "application/json",
+            serde_json::to_string(&report.to_json()).unwrap_or_default(),
+        )
+    } else {
+        ("text/html; charset=utf-8", report.to_html())
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A probe failure on the explain route: the image path's
+/// statuses, with generic bodies throughout. The detailed
+/// cause goes to the server log only: a policy refusal can
+/// name a resolved address or a bucket, which are the
+/// operator's facts, not the caller's (issue #196,
+/// requirement 3).
+fn explain_load_error(e: LoadError) -> Response {
+    eprintln!("explain load error: {e}");
+    let (status, message) = match e {
+        LoadError::Forbidden(_) => (
+            StatusCode::FORBIDDEN,
+            "source refused by policy".to_string(),
+        ),
+        LoadError::BadStatus(code) => (
+            StatusCode::BAD_GATEWAY,
+            format!("source returned status {code}"),
+        ),
+        LoadError::Network(_) => (StatusCode::BAD_GATEWAY, "source fetch failed".to_string()),
+        LoadError::WrongContentType(_) => (
+            StatusCode::BAD_GATEWAY,
+            "source did not return an image".to_string(),
+        ),
+        LoadError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "source timed out".to_string()),
+        LoadError::TooLarge { limit } => (
+            StatusCode::BAD_GATEWAY,
+            format!("source exceeds {limit} bytes"),
+        ),
+    };
+    (status, message).into_response()
 }
 
 /// `POST /purge/<signature>/<path>`: invalidate every stored
@@ -7128,5 +7317,349 @@ mod tests {
         let resp = client().get(format!("{base}/health")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    /// Sign with an arbitrary secret (the rotation app's
+    /// previous key is not SECRET).
+    fn sign_with(secret: &[u8], remainder: &str) -> String {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(remainder.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// An app with presets and a caller-built loader, for
+    /// the explain tests (preset expansion, object-store
+    /// sources).
+    async fn spawn_explain_app(
+        presets: std::collections::HashMap<String, String>,
+        loader: Loader,
+    ) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader,
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets,
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn explain_bad_signature_fetches_nothing() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("100x50/{src}");
+        // The image path's own refusal, for comparison: the
+        // explain refusal must be the same status and body.
+        let image = client()
+            .get(format!("{base}/deadbeef/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        let image_status = image.status();
+        let image_body = image.text().await.unwrap();
+        let resp = client()
+            .get(format!("{base}/explain/deadbeef/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), image_status);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), image_body);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explain_expired_fetches_nothing() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("exp:{}/100x50/{src}", now_unix() - 60);
+        let sig = sign(&remainder);
+        let image = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(image.status(), StatusCode::FORBIDDEN);
+        assert_eq!(image.text().await.unwrap(), "signature expired");
+        let resp = client()
+            .get(format!("{base}/explain/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "signature expired");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explain_reports_a_signed_url_and_caches_nothing() {
+        let png = test_png();
+        let png_len = png.len();
+        let (src, hits) = spawn_counting_server(200, "image/png", png).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("crop:100x50/filters:format(webp)/{src}");
+        let sig = sign(&remainder);
+        let explain_url = format!("{base}/explain/{sig}/{remainder}");
+
+        let resp = client()
+            .get(&explain_url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        assert_eq!(
+            resp.headers().get("content-security-policy").unwrap(),
+            "default-src 'none'"
+        );
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["signature"]["status"], "valid");
+        assert_eq!(json["signature"]["signed"], true);
+        assert!(json["signature"]["key_id"].is_null());
+        assert_eq!(json["source"]["url"], src);
+        assert_eq!(json["source"]["kind"], "png");
+        assert_eq!(json["source"]["width"], 100);
+        assert_eq!(json["source"]["height"], 60);
+        assert_eq!(json["source"]["bytes"], png_len);
+        let first_segment = json["operations"][0]["segment"].as_str().unwrap();
+        assert!(first_segment.contains("crop:100x50"), "{first_segment}");
+        assert_eq!(json["forecast"]["width"], 100);
+        assert_eq!(json["forecast"]["height"], 50);
+        assert_eq!(json["forecast"]["format"], "webp");
+        assert_eq!(json["forecast"]["format_from"], "operation");
+        assert_eq!(json["forecast"]["pixels"], 5000);
+        assert_eq!(json["links"]["image"], format!("/{sig}/{remainder}"));
+        let debug = json["links"]["debug_focal"].as_str().unwrap();
+        assert!(debug.contains("debug:focal"), "{debug}");
+        assert!(debug.ends_with(&src), "{debug}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The HTML form carries the same facts, under the
+        // same headers.
+        let resp = client()
+            .get(&explain_url)
+            .header("Accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("crabcrop URL report"), "{body}");
+        assert!(body.contains(&src), "{body}");
+        assert!(body.contains("crop to 100x50"), "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // Explain wrote nothing to any cache tier: the
+        // first image request still fetches the source, and
+        // the second is served from the entry the first one
+        // stored.
+        let image_url = format!("{base}/{sig}/{remainder}");
+        let resp = client().get(&image_url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        let resp = client().get(&image_url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn explain_key_id_form_reports_the_key() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_rotating().await;
+        let remainder = format!("100x50/{src}");
+        let sig = sign_with(b"the-old-server-secret", &remainder);
+        let resp = client()
+            .get(format!("{base}/explain/k-old:{sig}/{remainder}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["signature"]["signed"], true);
+        assert_eq!(json["signature"]["key_id"], "k-old");
+    }
+
+    #[tokio::test]
+    async fn explain_unsafe_form_honors_the_policy() {
+        let src = spawn_image_server().await;
+        let remainder = format!("100x50/{src}");
+        let base = spawn_app(true).await;
+        let resp = client()
+            .get(format!("{base}/explain/unsafe/{remainder}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["signature"]["status"], "valid");
+        assert_eq!(json["signature"]["signed"], false);
+
+        let base = spawn_app(false).await;
+        let resp = client()
+            .get(format!("{base}/explain/unsafe/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "bad signature");
+    }
+
+    #[tokio::test]
+    async fn explain_lists_preset_expansions_and_the_group() {
+        let src = spawn_image_server().await;
+        let mut presets = std::collections::HashMap::new();
+        presets.insert("small".to_string(), "100x50/filters:grayscale".to_string());
+        let base = spawn_explain_app(presets, Loader::with_defaults().unwrap()).await;
+        let remainder = format!("preset:small/{src}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/explain/{sig}/{remainder}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["presets"][0]["name"], "small");
+        assert_eq!(json["presets"][0]["operations"][0]["segment"], "100x50");
+        assert_eq!(
+            json["presets"][0]["operations"][1]["segment"],
+            "filters:grayscale"
+        );
+        assert_eq!(json["operations"][0]["segment"], "100x50");
+        assert_eq!(json["operations"][1]["segment"], "filters:grayscale");
+        assert_eq!(json["cache_group"], "small");
+        assert_eq!(json["canonical"], format!("100x50/filters:grayscale/{src}"));
+    }
+
+    #[tokio::test]
+    async fn explain_s3_source_reports_facts_only() {
+        let png = test_png();
+        let png_len = png.len();
+        let (store_url, hits) = spawn_counting_server(200, "image/png", png).await;
+        let endpoint = store_url.strip_suffix("/src.png").unwrap().to_string();
+        let loader = Loader::with_defaults()
+            .unwrap()
+            .with_sources(crate::loader::SourceConfig {
+                s3_endpoint: Some(endpoint.clone()),
+                allowed_buckets: vec!["photos".to_string()],
+                ..Default::default()
+            });
+        let base = spawn_explain_app(std::collections::HashMap::new(), loader).await;
+        let remainder = "100x50/s3://photos/cat.png".to_string();
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/explain/{sig}/{remainder}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        // The store's own URL (the server's endpoint
+        // configuration) is never echoed back.
+        assert!(!body.contains(&endpoint), "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["source"]["url"], "s3://photos/cat.png");
+        assert_eq!(json["source"]["kind"], "png");
+        assert_eq!(json["source"]["width"], 100);
+        assert_eq!(json["source"]["height"], 60);
+        assert_eq!(json["source"]["bytes"], png_len);
+        // Kind, dimensions, and size, and nothing else.
+        assert_eq!(json["source"].as_object().unwrap().len(), 5);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explain_escapes_markup_bearing_strings() {
+        // The full markup cases (script tags in a source, a
+        // preset name, a key id) are covered at the render
+        // layer in the explain module's tests; through HTTP
+        // the URL grammar itself carries entity text in a
+        // source path and an ampersand in a preset name, and
+        // both must come back escaped in HTML and verbatim
+        // in JSON.
+        let raw = spawn_bytes_server(test_png()).await;
+        let src = raw.replace("src.png", "a&lt;b.png");
+        let mut presets = std::collections::HashMap::new();
+        presets.insert("a&b".to_string(), "100x50".to_string());
+        let base = spawn_explain_app(presets, Loader::with_defaults().unwrap()).await;
+        let remainder = format!("preset:a&b/{src}");
+        let sig = sign(&remainder);
+        let url = format!("{base}/explain/{sig}/{remainder}");
+
+        let resp = client()
+            .get(&url)
+            .header("Accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("a&amp;lt;b.png"), "{body}");
+        assert!(!body.contains("a&lt;b.png"), "{body}");
+        assert!(body.contains("preset:a&amp;b"), "{body}");
+
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["source"]["url"], src);
+        assert_eq!(json["presets"][0]["name"], "a&b");
     }
 }

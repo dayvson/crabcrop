@@ -579,6 +579,7 @@ For example, a `removebg` request to a server with no background-removal model r
 | `POST /purge/<signature>/<path>` | Invalidate every stored variant of one result, across all cache tiers. See below. |
 | `POST /purge-group/<signature>/<group>` | Invalidate every stored result in a cache group, across all cache tiers. See below. |
 | `PUT /upload/<signature>/<name>` | Store one original in the configured upload destination. Only exists when uploads are configured. See [Upload an original](#upload-an-original). |
+| `GET /explain/<signature>/...` | A report on the URL instead of the image. See [Self-explaining URLs](#self-explaining-urls). |
 | `GET /<signature>/...` | Image requests, as documented above. |
 
 ### Purge a cached result
@@ -615,6 +616,18 @@ The body must decode as an image this server can serve (the same decode paths a 
 The response body is the exact source reference to embed in transform URLs (`file:///heroes/photo.jpg` for a local destination, `s3://originals/heroes/photo.jpg` for a bucket), also returned in the `X-Crabcrop-Source` header. Serving works through the normal loader: a local destination doubles as the `file://` source root when no `CRABCROP_FILE_ROOT` is configured (and must sit under one that is), so the uploaded original is transformable the moment the `PUT` answers.
 
 One posture note, stated plainly: enabling uploads changes this server from fetch-only to a service that accepts and stores caller-supplied bytes. The mitigations are the ones above (off by default, its own signature domain with an expiring form, decode-before-store, sanitized SVG storage, extension binding, a size cap, no overwrite by default, no listing or delete), and the destination should still be a directory or bucket dedicated to uploads, watched like any other store of user-supplied originals. If you serve the destination directly, serve it as images: the stored bytes are validated images under bound names, not arbitrary content, and a dedicated host keeps even a hypothetical confusion off your main domain.
+
+### Self-explaining URLs
+
+Every crabcrop URL can explain itself. Take any image URL, put `explain/` in front of the signature segment, and the server answers with a report on that URL instead of the image:
+
+```bash
+curl "http://localhost:3000/explain/<signature>/crop:1200x630:smart/filters:format(avif):quality(auto)/https://example.com/photo.jpg"
+```
+
+Browsers get a readable HTML page; send `Accept: application/json` for the same report as JSON. The report carries the signature verdict (valid, which key, when the link expires), the source and its probed facts (media kind, pixel dimensions, encoded size), every operation glossed in plain language in order, the referenced presets with their expansions, a forecast (output dimensions when the chain determines them, the output format, the output pixel count against the aggregate budget), the canonical form that gets cached with its cache group, and links back to the image itself and to the debug focal remainder when the chain contains a crop. The CLI's `explain` verb does the offline half of this (grammar and signature against a secret you pass); the server route adds the live facts only a server can know.
+
+Explain is safe to expose to the same callers who hold signed URLs: the signature and expiry are verified exactly as the image path verifies them, before any source access, so a bad or expired URL is refused with the image path's own response and costs zero source fetches, and the one probe a valid URL pays for is a single bounded fetch through the loader whose facts come from headers alone, with no decode, no detection, and nothing written to any cache tier. The report contains only facts derivable from the URL and the source itself: no secrets or key material, no configuration values, paths, or fingerprints, no redirect or address details, and errors are the usual frozen codes and generic messages.
 
 ### Cache headers and groups
 
