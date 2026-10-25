@@ -568,7 +568,7 @@ Entries in the persistent tiers are authenticated: each stored entry carries an 
 
 ### Color management and metadata
 
-Pixels are decoded in the source profile's space. When the source embeds an ICC profile (JPEG, PNG, and WebP sources are read), crabcrop converts to sRGB with an embedded-profile color transform before any operation runs, so sizes, crops, and filters all work in one known space; a source with no profile is assumed to be sRGB already. `filters:keep_profile` opts out per request: no conversion, and the source profile is embedded into JPEG and PNG outputs instead. CMYK JPEGs decode through the JPEG decoder's own CMYK conversion (embedded CMYK profiles are not honored yet); grayscale profiles are not transformed.
+Pixels are decoded in the source profile's space. When the source embeds an ICC profile (JPEG and PNG sources are read), crabcrop converts to sRGB with an embedded-profile color transform before any operation runs, so sizes, crops, and filters all work in one known space; a source with no profile is assumed to be sRGB already. `filters:keep_profile` opts out per request: no conversion, and the source profile is embedded into JPEG and PNG outputs instead. CMYK JPEGs decode through the JPEG decoder's own CMYK conversion (embedded CMYK profiles are not honored yet); grayscale profiles are not transformed.
 
 Metadata follows an operator policy, `CRABCROP_METADATA`:
 
