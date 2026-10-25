@@ -4,14 +4,13 @@
 # and keep the two in sync (the same route as
 # docs/release-workflow.yml and docs/perf-workflow.yml).
 #
-# Issue #193 hardening, STAGED here and pending the web-UI
-# landing: least-privilege permissions, actions pinned by
-# SHA, every dependency-resolving cargo command run with
-# --locked, and an audit job (rustsec/audit-check) so a
-# RUSTSEC advisory against a locked dependency fails CI.
-# Until it is landed, the live rust.yml is the previous
-# version (tag-pinned actions, no permissions block, no
-# --locked, no audit job).
+# Issue #193 hardening, landed at
+# .github/workflows/rust.yml through the web UI as part
+# of the v0.1.1 cut: least-privilege permissions, actions
+# pinned by SHA, every dependency-resolving cargo command
+# run with --locked, and an audit job
+# (rustsec/audit-check) so a RUSTSEC advisory against a
+# locked dependency fails CI.
 name: Rust
 
 on:

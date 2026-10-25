@@ -4,6 +4,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-24
+
 ### Fixed
 
 - SDK and parity fixes (issue #194). Purge-group signatures now live under their own derived subkey (`crabcrop/purge-group-key`, signing the group name), so a per-target purge signature can no longer be transplanted to `/purge-group`, whatever target string it was minted over; purge-group signatures minted by earlier versions stop verifying and must be re-minted with the updated libraries (audit R2-14). `s3://` and `gs://` source bucket names are validated against the S3 naming rules at parse time, so with the allowlist set to `*` a crafted bucket string can no longer move the signed request off AWS and carry the session token to an attacker's host (R2-20). Video encoder failures now answer the generic `video encoding failed` body; the program path and encoder stderr stay in the server log (R2-30). A video encode timeout now kills the encoder's whole process group, so grandchildren forked by a wrapper script no longer survive the timeout (R2-31). In the TypeScript SDK, `verifyUrlSignature` looks key IDs up as own properties only, so a prototype-named key ID (`constructor`, `toString`, `__proto__`) answers false instead of throwing (R2-32), and the typed builders validate class names by UTF-8 byte length and preset names by the server's charset, so they no longer mint URLs the server always rejects (R2-34). The playground verifier compares MACs in constant time, like the other three verifiers (R2-33). The stale Python signer tracked in git under `sdks/python/build/` is deleted, and that build output is now gitignored (R2-35).
