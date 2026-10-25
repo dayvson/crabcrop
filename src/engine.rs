@@ -1328,6 +1328,14 @@ fn webp_animation_params(bytes: &[u8]) -> Option<(u16, [u8; 4])> {
     oxideav_webp::animation_params(bytes).ok().flatten()
 }
 
+/// Whether the source bytes are an animated WebP (they
+/// carry an ANIM chunk). A container probe, not a decode:
+/// the server uses it to route animated WebP renders to
+/// their own gate (issue #231) before any engine work runs.
+pub(crate) fn is_animated_webp(bytes: &[u8]) -> bool {
+    webp_animation_params(bytes).is_some()
+}
+
 /// Decode all frames of an animated WebP source, under the
 /// same limits as GIF. The in-tree decoder (image-webp)
 /// composites every frame onto the full canvas, honoring

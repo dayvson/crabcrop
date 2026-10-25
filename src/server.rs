@@ -268,6 +268,12 @@ pub struct AppState {
     /// work, so it gets its own small gate (2 permits, like
     /// the AI gate) on top of the process gate.
     pub video_gate: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent animated WebP encodes to one
+    /// (issue #231): the lossless animation encode is the
+    /// slowest work the engine does, minutes for a modest
+    /// file, so it gets a single-permit gate of its own
+    /// instead of holding process permits while it runs.
+    pub anim_gate: Arc<tokio::sync::Semaphore>,
     /// In-flight miss coalescing (audit R2-09): concurrent
     /// misses for one cache key share one fetch and one
     /// encode instead of stampeding the origin and the
@@ -1182,6 +1188,28 @@ const AI_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// queue.
 const VIDEO_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long an animated WebP request may wait for the
+/// single animation encode slot before the server sheds
+/// it with a 503 (issue #231). The AI and video gates'
+/// wait: long enough to absorb a hiccup, far shorter
+/// than queueing behind a minutes-long encode.
+const ANIM_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether this miss will encode an animated WebP and so
+/// must take the animation gate (issue #231): the source
+/// is an animated WebP (a container probe on the loaded
+/// bytes, no decode) and the output resolves to WebP.
+/// The explicit-format half is conservative: an explicit
+/// GIF, still, or video format never reaches the animated
+/// WebP encoder, and with no explicit format negotiation
+/// keeps an animated WebP source at WebP; if some header
+/// combination resolved to a still instead, the permit is
+/// held for one fast render, which is harmless.
+fn wants_animation_gate(bytes: &[u8], directives: &crate::url::RequestDirectives) -> bool {
+    crate::engine::is_animated_webp(bytes)
+        && matches!(directives.explicit_format, None | Some(ImageFormat::WebP))
+}
+
 /// Run the engine under the process gate on a blocking
 /// thread, so CPU-bound work neither stalls the async
 /// workers nor multiplies unboundedly under a burst of
@@ -1736,6 +1764,27 @@ async fn serve_miss(
             _ => {
                 return (
                     busy_response("server busy: video encoding queue is full", 5),
+                    record,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // Animated WebP encodes sit behind a single-permit
+    // gate of their own (issue #231): one encode can run
+    // for minutes, so without this gate duplicate or
+    // distinct animated renders stack encodes until they
+    // hold every process permit and unrelated stills shed.
+    // Behind the gate, a second animated request sheds
+    // here with an explanation instead of stacking, and
+    // the still pool keeps its permits throughout.
+    let _anim_permit = if wants_animation_gate(&bytes, &directives) {
+        match tokio::time::timeout(ANIM_GATE_WAIT, state.anim_gate.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            _ => {
+                return (
+                    busy_response("server busy: animation encoding queue is full", 5),
                     record,
                 );
             }
@@ -3030,6 +3079,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -3063,6 +3113,84 @@ mod tests {
             .encode_frames(frames)
             .unwrap();
         out
+    }
+
+    /// Two-frame animated WebP bytes for the animation
+    /// gate tests (issue #231), built with the oxideav
+    /// encoder like the engine fixtures: the image crate's
+    /// WebP encoder writes stills only.
+    fn animated_webp_bytes() -> Vec<u8> {
+        let frame = |rgb: [u8; 3], delay_ms: u64| {
+            let img =
+                image::RgbaImage::from_pixel(40, 20, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+            let image = oxideav_webp::WebpImage::from_rgba8(40, 20, img.as_raw().clone()).unwrap();
+            oxideav_webp::Frame::new(image, Some(std::time::Duration::from_millis(delay_ms)))
+        };
+        let frames = vec![frame([255, 0, 0], 100), frame([0, 0, 255], 200)];
+        let opts = oxideav_webp::EncodeOptions::default()
+            .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
+        oxideav_webp::encode_animation(&frames, &opts).unwrap()
+    }
+
+    /// Still WebP bytes: the animation probe's negative
+    /// case (issue #231).
+    fn still_webp_bytes() -> Vec<u8> {
+        let img = DynamicImage::new_rgb8(40, 20);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::WebP).unwrap();
+        buf.into_inner()
+    }
+
+    /// An app whose animation gate the test controls
+    /// (issue #231), so the shed and isolation tests can
+    /// hold the single permit themselves.
+    async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate,
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 
     /// An app with a fake video encoder configured (issue
@@ -3128,6 +3256,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: Some(Arc::new(encoder)),
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -3291,6 +3420,7 @@ mod tests {
                 .unwrap(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -3345,6 +3475,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -3403,6 +3534,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -3942,6 +4074,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -4269,6 +4402,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -4389,6 +4523,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -4711,6 +4846,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -4923,6 +5059,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -4973,6 +5110,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -5209,6 +5347,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -5273,6 +5412,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -6481,6 +6621,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -6547,6 +6688,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -6901,6 +7043,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -6985,6 +7128,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -7028,6 +7172,134 @@ mod tests {
             matches!(failure, ProcessFailure::Engine(EngineError::Decode(_))),
             "{failure:?}"
         );
+    }
+
+    #[test]
+    fn animation_gate_predicate_matches_the_encoder_trigger() {
+        // Issue #231: only an animated WebP source rendered
+        // to WebP output reaches the slow lossless animation
+        // encode, so only that combination takes the gate.
+        let anim = animated_webp_bytes();
+        let directives = |ops_str: &str| {
+            let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
+            crate::url::RequestDirectives::analyze(&ops)
+        };
+        assert!(wants_animation_gate(
+            &anim,
+            &directives("example.com/i.webp")
+        ));
+        assert!(wants_animation_gate(
+            &anim,
+            &directives("filters:format(webp)/example.com/i.webp")
+        ));
+        // Explicit non-WebP outputs never reach the
+        // animated WebP encoder: GIF output uses the fast
+        // GIF encoder, still formats take frame 0, and
+        // video takes the video gate instead.
+        for fmt in ["gif", "png", "jpeg", "mp4"] {
+            assert!(
+                !wants_animation_gate(
+                    &anim,
+                    &directives(&format!("filters:format({fmt})/example.com/i.webp"))
+                ),
+                "format({fmt}) must not take the animation gate"
+            );
+        }
+        // Still sources are never gated, whatever their
+        // container: a still WebP carries no ANIM chunk, a
+        // GIF source never reaches the WebP animation path,
+        // and a PNG is not WebP at all.
+        assert!(!wants_animation_gate(
+            &still_webp_bytes(),
+            &directives("example.com/i.webp")
+        ));
+        assert!(!wants_animation_gate(
+            &animated_gif_bytes(),
+            &directives("example.com/i.gif")
+        ));
+        assert!(!wants_animation_gate(
+            &test_png(),
+            &directives("example.com/i.png")
+        ));
+    }
+
+    #[tokio::test]
+    async fn animation_gate_sheds_a_second_animated_render() {
+        // Issue #231: with the single animation permit held
+        // (one long encode already running), an animated
+        // WebP request waits out the gate wait and sheds
+        // with the animation-queue 503 instead of stacking
+        // a second encode behind the first.
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let base = spawn_app_with_anim_gate(gate.clone()).await;
+        let src = spawn_bytes_server(animated_webp_bytes()).await;
+        let _held = gate.acquire_owned().await.unwrap();
+        let sig = sign(&src);
+        let started = Instant::now();
+        let resp = client()
+            .get(format!("{base}/{sig}/{src}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("animation encoding queue is full"), "{body}");
+        assert!(
+            started.elapsed() >= ANIM_GATE_WAIT,
+            "the shed must come only after the gate wait elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn animation_gate_leaves_still_renders_unaffected() {
+        // The #231 regression test: while the animation
+        // gate is saturated (one long encode running), an
+        // unrelated still render still succeeds promptly
+        // instead of shedding behind the animation work.
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let base = spawn_app_with_anim_gate(gate.clone()).await;
+        let _held = gate.acquire_owned().await.unwrap();
+        let src = spawn_image_server().await;
+        let remainder = format!("20x15/{src}");
+        let sig = sign(&remainder);
+        let started = Instant::now();
+        let resp = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            started.elapsed() < ANIM_GATE_WAIT,
+            "a still render must not wait on the animation gate"
+        );
+        let bytes = resp.bytes().await.unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (20, 15));
+    }
+
+    #[tokio::test]
+    async fn animated_webp_renders_through_the_gate_when_free() {
+        // The gated path still delivers the feature: with
+        // the animation permit free, a bare animated WebP
+        // request renders the full animation.
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let base = spawn_app_with_anim_gate(gate).await;
+        let src = spawn_bytes_server(animated_webp_bytes()).await;
+        let sig = sign(&src);
+        let resp = client()
+            .get(format!("{base}/{sig}/{src}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
+        let bytes = resp.bytes().await.unwrap();
+        use image::AnimationDecoder as _;
+        let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&bytes)).unwrap();
+        let frames = decoder.into_frames().collect_frames().unwrap();
+        assert_eq!(frames.len(), 2);
     }
 
     #[tokio::test]
@@ -7378,6 +7650,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };
@@ -7779,6 +8052,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: fingerprint.to_string(),
         };
@@ -8595,6 +8869,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
             config_fingerprint: "test".to_string(),
         };

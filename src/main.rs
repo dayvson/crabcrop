@@ -841,6 +841,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         default_ops,
         video_encoder,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
+        anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         inflight: Arc::new(crate::server::Inflight::default()),
         config_fingerprint,
     };
