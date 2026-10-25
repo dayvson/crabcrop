@@ -477,6 +477,20 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
             width.map(|w| format!(", width {w}")).unwrap_or_default()
         ),
         Filter::RemoveBg => "removebg: remove the background (AI)".into(),
+        Filter::Studio(spec) => {
+            let bg = match spec.bg {
+                crate::url::StudioBg::Default => "the brand color or white".to_string(),
+                crate::url::StudioBg::White => "white".to_string(),
+                crate::url::StudioBg::Color(c) => format!("#{}", hex3(c)),
+                crate::url::StudioBg::Brand => "the brand color".to_string(),
+                crate::url::StudioBg::None => "transparency".to_string(),
+            };
+            format!(
+                "studio(product): composite the subject onto {bg} with a {} shadow and a {}% pad (AI)",
+                spec.shadow.name(),
+                spec.pad
+            )
+        }
         Filter::KeepProfile => "keep_profile: keep the source ICC profile".into(),
         Filter::BlurFaces => "blurfaces: blur detected faces (AI)".into(),
         Filter::PixelateFaces => "pixelatefaces: pixelate detected faces (AI)".into(),

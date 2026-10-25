@@ -348,6 +348,143 @@ impl CurveChannel {
     }
 }
 
+/// The backdrop a `studio(...)` composite is built on,
+/// resolved against operator configuration when the filter
+/// runs (issue #197).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StudioBg {
+    /// Not named in the URL: the operator brand color
+    /// (`CRABCROP_BRAND_COLOR`) when one is configured,
+    /// else white.
+    Default,
+    /// Plain white, named in the URL.
+    White,
+    /// The named color, as RGB.
+    Color([u8; 3]),
+    /// The operator brand color, named in the URL. With no
+    /// brand color configured it resolves to white, and the
+    /// resolution is recorded as a fallback in meta.
+    Brand,
+    /// No backdrop: the subject keeps its transparency and
+    /// no shadow is synthesized.
+    None,
+}
+
+impl StudioBg {
+    /// The canonical spelling inside `studio(...)`, or
+    /// `None` when the value is the default and the
+    /// argument is omitted from the canonical form.
+    fn text(self) -> Option<String> {
+        match self {
+            StudioBg::Default => None,
+            StudioBg::White => Some("white".to_string()),
+            StudioBg::Color(c) => Some(hex3(c)),
+            StudioBg::Brand => Some("brand".to_string()),
+            StudioBg::None => Some("none".to_string()),
+        }
+    }
+
+    fn parse(s: &str) -> Option<StudioBg> {
+        Some(match s {
+            "white" => StudioBg::White,
+            "brand" => StudioBg::Brand,
+            "none" => StudioBg::None,
+            hex if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) => {
+                let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+                StudioBg::Color([byte(0)?, byte(2)?, byte(4)?])
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// The contact shadow a `studio(...)` composite
+/// synthesizes under the subject (issue #197).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StudioShadow {
+    /// No shadow.
+    None,
+    /// A soft, wide, light shadow (the default).
+    Soft,
+    /// A tighter, darker shadow.
+    Strong,
+}
+
+impl StudioShadow {
+    /// The canonical spelling inside `studio(...)`.
+    pub fn name(self) -> &'static str {
+        match self {
+            StudioShadow::None => "none",
+            StudioShadow::Soft => "soft",
+            StudioShadow::Strong => "strong",
+        }
+    }
+
+    fn parse(s: &str) -> Option<StudioShadow> {
+        Some(match s {
+            "none" => StudioShadow::None,
+            "soft" => StudioShadow::Soft,
+            "strong" => StudioShadow::Strong,
+            _ => return None,
+        })
+    }
+}
+
+/// The `studio(product,...)` argument set, with the
+/// defaults already applied: an unnamed backdrop
+/// (`StudioBg::Default`), a soft shadow, and a pad of 10
+/// percent (issue #197).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StudioSpec {
+    pub bg: StudioBg,
+    pub shadow: StudioShadow,
+    pub pad: u8,
+}
+
+impl Default for StudioSpec {
+    fn default() -> Self {
+        StudioSpec {
+            bg: StudioBg::Default,
+            shadow: StudioShadow::Soft,
+            pad: 10,
+        }
+    }
+}
+
+/// Parse the `studio(...)` argument list: the mode
+/// (`product`, the only one) followed by named `key:value`
+/// arguments. Bad arguments fail as the segment-wide
+/// invalid filter error, like every other filter: the
+/// frozen ParseError set does not grow for studio.
+fn parse_studio(p: &str) -> Option<StudioSpec> {
+    let mut spec = StudioSpec::default();
+    let mut seen: Vec<&str> = Vec::new();
+    let mut parts = p.split(',');
+    if parts.next() != Some("product") {
+        return None;
+    }
+    for part in parts {
+        let (key, value) = part.split_once(':')?;
+        if seen.contains(&key) {
+            return None;
+        }
+        seen.push(key);
+        match key {
+            "bg" => spec.bg = StudioBg::parse(value)?,
+            "shadow" => spec.shadow = StudioShadow::parse(value)?,
+            "pad" => {
+                let pad: u8 = value.parse().ok()?;
+                if pad > 40 {
+                    return None;
+                }
+                spec.pad = pad;
+            }
+            _ => return None,
+        }
+    }
+    Some(spec)
+}
+
 /// One filter from a `filters:...` segment.
 ///
 /// `f32` parameters mean `Eq` cannot be derived; `PartialEq` is enough
@@ -435,6 +572,13 @@ pub enum Filter {
     /// model, keeping the subject over transparency. The model
     /// is operator-configured; the engine applies its mask.
     RemoveBg,
+    /// Studio mode (issue #197): composite the subject the
+    /// segmentation model finds onto a backdrop with a
+    /// synthesized contact shadow, scaled and centered to
+    /// a pad margin. A deterministic expansion into mask,
+    /// defringe, backdrop, shadow, and pad steps, reported
+    /// in meta.
+    Studio(StudioSpec),
     /// Keep the source ICC profile instead of converting
     /// to sRGB (`filters:keep_profile`).
     KeepProfile,
@@ -1003,13 +1147,39 @@ pub(crate) fn format_kernel_value(value: f64) -> String {
     }
 }
 
+/// Split a filters segment into its filters on the `:`
+/// separators that sit outside parentheses: an argument
+/// list may itself contain `:` (the `studio(...)` named
+/// arguments are `key:value`), so a naive split would cut
+/// those filters apart. Unbalanced parentheses leave the
+/// tail in one part, which then fails its own parse, as
+/// before.
+fn split_filter_chain(rest: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => {
+                parts.push(&rest[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&rest[start..]);
+    parts
+}
+
 fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidFilters(seg.to_string());
     if rest.is_empty() {
         return Err(invalid());
     }
     let mut filters = Vec::new();
-    for part in rest.split(':') {
+    for part in split_filter_chain(rest) {
         let (name, params) = match part.find('(') {
             Some(i) => {
                 let (n, p) = part.split_at(i);
@@ -1156,6 +1326,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             }
             ("equalize", None) => Filter::Equalize,
             ("removebg", None) => Filter::RemoveBg,
+            ("studio", Some(p)) => Filter::Studio(parse_studio(p).ok_or_else(invalid)?),
             ("keep_profile", None) => Filter::KeepProfile,
             ("blurfaces", None) => Filter::BlurFaces,
             ("pixelatefaces", None) => Filter::PixelateFaces,
@@ -1712,6 +1883,10 @@ pub struct RequestDirectives {
     pub fill: Option<[u8; 3]>,
     /// Any `removebg` filter.
     pub removebg: bool,
+    /// Any `studio(...)` filter (issue #197): it runs the
+    /// mask model, so it takes an AI permit and needs the
+    /// provider preflight, like `removebg`.
+    pub studio: bool,
     /// The first shape filter (`radius` or `mask`), named for
     /// error messages.
     pub shape_filter: Option<&'static str>,
@@ -1758,6 +1933,7 @@ impl RequestDirectives {
             no_upscale: false,
             fill: None,
             removebg: false,
+            studio: false,
             shape_filter: None,
             upscale: false,
             smart_crop: false,
@@ -1796,6 +1972,7 @@ impl RequestDirectives {
                         Filter::NoUpscale => d.no_upscale = true,
                         Filter::Fill(color) => d.fill = Some(*color),
                         Filter::RemoveBg => d.removebg = true,
+                        Filter::Studio(_) => d.studio = true,
                         Filter::Radius(_) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("radius")
                         }
@@ -1834,11 +2011,12 @@ impl RequestDirectives {
     /// Whether the request can run AI inference in the engine.
     /// This is the ONE predicate behind both the server's AI
     /// gate and the engine's expectations: background removal,
-    /// upscale, face operations, and class redaction always
-    /// infer; smart crops infer when a face provider is
-    /// configured, so they are gated too.
+    /// studio mode, upscale, face operations, and class
+    /// redaction always infer; smart crops infer when a face
+    /// provider is configured, so they are gated too.
     pub fn uses_ai(&self) -> bool {
         self.removebg
+            || self.studio
             || self.upscale
             || self.needs_face_model
             || self.smart_crop
@@ -2017,6 +2195,25 @@ fn filter_text(filter: &Filter) -> String {
             )
         }
         Filter::RemoveBg => "removebg".to_string(),
+        Filter::Studio(spec) => {
+            // Only the arguments that differ from the
+            // defaults are spelled out, in grammar order
+            // (bg, shadow, pad), so `studio(product)` and
+            // `studio(product,pad:10)` (the default pad)
+            // share one canonical form.
+            let mut text = "studio(product".to_string();
+            if let Some(bg) = spec.bg.text() {
+                text.push_str(&format!(",bg:{bg}"));
+            }
+            if spec.shadow != StudioShadow::Soft {
+                text.push_str(&format!(",shadow:{}", spec.shadow.name()));
+            }
+            if spec.pad != 10 {
+                text.push_str(&format!(",pad:{}", spec.pad));
+            }
+            text.push(')');
+            text
+        }
         Filter::KeepProfile => "keep_profile".to_string(),
         Filter::BlurFaces => "blurfaces".to_string(),
         Filter::PixelateFaces => "pixelatefaces".to_string(),
@@ -3709,6 +3906,122 @@ mod tests {
         assert_eq!(
             ops,
             vec![Operation::Filters(vec![Filter::Quality(Quality::Auto)])]
+        );
+    }
+
+    #[test]
+    fn parses_studio_defaults_and_arguments() {
+        // Bare `studio(product)` takes every default.
+        let (ops, _) = parse_operations("filters:studio(product)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Studio(StudioSpec {
+                bg: StudioBg::Default,
+                shadow: StudioShadow::Soft,
+                pad: 10,
+            })])]
+        );
+        assert_eq!(
+            canonical_form(&ops, "example.com/img.jpg"),
+            "filters:studio(product)/example.com/img.jpg"
+        );
+        // The full argument set, spelled in any order, parses
+        // to the same spec and canonicalizes in grammar
+        // order (bg, shadow, pad).
+        let (ops, _) = parse_operations(
+            "filters:studio(product,pad:25,shadow:strong,bg:f5f0e8)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Studio(StudioSpec {
+                bg: StudioBg::Color([0xf5, 0xf0, 0xe8]),
+                shadow: StudioShadow::Strong,
+                pad: 25,
+            })])]
+        );
+        assert_eq!(
+            canonical_form(&ops, "example.com/img.jpg"),
+            "filters:studio(product,bg:f5f0e8,shadow:strong,pad:25)/example.com/img.jpg"
+        );
+        // Every backdrop spelling.
+        for (spelling, bg) in [
+            ("white", StudioBg::White),
+            ("brand", StudioBg::Brand),
+            ("none", StudioBg::None),
+        ] {
+            let (ops, _) = parse_operations(&format!(
+                "filters:studio(product,bg:{spelling})/example.com/img.jpg"
+            ))
+            .unwrap();
+            assert_eq!(
+                ops,
+                vec![Operation::Filters(vec![Filter::Studio(StudioSpec {
+                    bg,
+                    ..StudioSpec::default()
+                })])]
+            );
+            assert_eq!(
+                canonical_form(&ops, "example.com/img.jpg"),
+                format!("filters:studio(product,bg:{spelling})/example.com/img.jpg")
+            );
+        }
+        // Arguments spelled at their defaults collapse into
+        // the bare form, so the two spellings share a cache
+        // entry (the values ARE the defaults).
+        let (ops, _) =
+            parse_operations("filters:studio(product,shadow:soft,pad:10)/example.com/img.jpg")
+                .unwrap();
+        assert_eq!(
+            canonical_form(&ops, "example.com/img.jpg"),
+            "filters:studio(product)/example.com/img.jpg"
+        );
+        // But `bg:white` is not the default: with a brand
+        // color configured they resolve differently, so
+        // they key apart.
+        assert_ne!(
+            canonical_key_form("filters:studio(product)/example.com/img.jpg"),
+            canonical_key_form("filters:studio(product,bg:white)/example.com/img.jpg")
+        );
+    }
+
+    #[test]
+    fn rejects_bad_studio_arguments() {
+        for seg in [
+            // The mode is required, and `product` is the
+            // only one (studio(scene) is a separate design).
+            "filters:studio",
+            "filters:studio()",
+            "filters:studio(scene)",
+            "filters:studio(product,bg:blur)",
+            "filters:studio(product,bg:fffff)",
+            "filters:studio(product,bg:fffffff)",
+            "filters:studio(product,shadow:hard)",
+            "filters:studio(product,pad:41)",
+            "filters:studio(product,pad:-1)",
+            "filters:studio(product,pad:1.5)",
+            "filters:studio(product,zoom:2)",
+            // A key may not repeat.
+            "filters:studio(product,pad:5,pad:6)",
+            "filters:studio(product,bg:white,bg:none)",
+        ] {
+            let path = format!("{seg}/example.com/img.jpg");
+            let result = parse_operations(&path);
+            assert!(
+                matches!(result, Err(ParseError::InvalidFilters(_))),
+                "{seg} should fail as invalid filters, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn studio_marks_the_request_as_ai() {
+        let (ops, _) = parse_operations("filters:studio(product)/example.com/img.jpg").unwrap();
+        let d = RequestDirectives::analyze(&ops);
+        assert!(d.studio);
+        assert!(
+            d.uses_ai(),
+            "studio runs the mask model, so it takes an AI permit"
         );
     }
 

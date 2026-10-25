@@ -223,6 +223,11 @@ pub struct AppState {
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
     pub preserve_metadata: bool,
+    /// Operator brand color for `studio(...)` composites
+    /// (issue #197), from `CRABCROP_BRAND_COLOR`. `None`
+    /// means an unnamed or `bg:brand` backdrop resolves to
+    /// white.
+    pub brand_color: Option<[u8; 3]>,
     /// Named operation presets from `CRABCROP_PRESETS_FILE`:
     /// name to operation string, validated at boot.
     pub presets: std::collections::HashMap<String, String>,
@@ -1126,6 +1131,7 @@ struct ProcessJob {
     video_encoder: Option<Arc<crate::video::VideoEncoder>>,
     dpr: Option<f32>,
     ssim_target: f64,
+    brand_color: Option<[u8; 3]>,
     avif_speed: u8,
     jxl_speed: jixel::Speed,
 }
@@ -1215,6 +1221,7 @@ async fn run_process(
                 text_renderer: job.text_renderer.as_deref(),
                 dpr: job.dpr,
                 ssim_target: job.ssim_target,
+                brand_color: job.brand_color,
                 avif_speed: job.avif_speed,
                 jxl_speed: job.jxl_speed,
             };
@@ -1751,6 +1758,7 @@ async fn serve_miss(
         video_encoder: state.video_encoder.clone(),
         dpr: dpr_hint,
         ssim_target: state.ssim_target,
+        brand_color: state.brand_color,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
     };
@@ -2245,6 +2253,36 @@ fn meta_response(
     if let Some(score) = processed.ssimulacra2 {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
     }
+    if let Some(studio) = &processed.studio {
+        // The studio record (issue #197): the resolved
+        // parameters, the steps that ran, the fallbacks
+        // taken, and the mask confidence when the provider
+        // exposed one. The backdrop is spelled like the
+        // placeholder colors (`#rrggbb`), or `none` when the
+        // subject kept its transparency.
+        let bg = match studio.bg {
+            Some(c) => format!("\"#{:02x}{:02x}{:02x}\"", c[0], c[1], c[2]),
+            None => "\"none\"".to_string(),
+        };
+        let steps: Vec<String> = studio.steps.iter().map(|s| format!("\"{s}\"")).collect();
+        let fallbacks: Vec<String> = studio
+            .fallbacks
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect();
+        body.push_str(&format!(
+            ",\"studio\":{{\"bg\":{bg},\"bg_from\":\"{}\",\"shadow\":\"{}\",\"pad\":{},\"steps\":[{}],\"fallbacks\":[{}]",
+            studio.bg_from,
+            studio.shadow.name(),
+            studio.pad,
+            steps.join(","),
+            fallbacks.join(",")
+        ));
+        if let Some(confidence) = studio.confidence {
+            body.push_str(&format!(",\"mask_confidence\":{confidence}"));
+        }
+        body.push('}');
+    }
     if let Some(ph) = &processed.placeholder {
         let palette: Vec<String> = ph.palette.iter().map(|c| format!("\"{c}\"")).collect();
         body.push_str(&format!(
@@ -2541,6 +2579,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -2635,6 +2674,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -2793,6 +2833,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets,
             only_presets,
             default_ops: crate::url::parse_default_ops(defaults, &std::collections::HashMap::new())
@@ -2844,6 +2885,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -2898,6 +2940,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -3433,6 +3476,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets,
             only_presets,
             default_ops: Vec::new(),
@@ -3756,6 +3800,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -3834,6 +3879,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -3848,6 +3894,108 @@ mod tests {
             axum::serve(listener, app(state)).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// An app with the mask fake and a brand color
+    /// configured, for the studio meta test.
+    async fn spawn_app_with_studio() -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: Some(Arc::new(FakeMask)),
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: Some([0xf5, 0xf0, 0xe8]),
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn meta_includes_the_studio_record() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_studio().await;
+        let meta_for = |remainder: String| {
+            let base = base.clone();
+            async move {
+                let resp = client()
+                    .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+                    .header("Accept", "application/json")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                serde_json::from_str::<serde_json::Value>(&resp.text().await.unwrap()).unwrap()
+            }
+        };
+        // Defaults: the unnamed backdrop resolves to the
+        // configured brand color, recorded as such.
+        let meta = meta_for(format!(
+            "filters:studio(product,shadow:none):format(png)/{src}"
+        ))
+        .await;
+        let studio = &meta["studio"];
+        assert_eq!(studio["bg"], "#f5f0e8");
+        assert_eq!(studio["bg_from"], "brand");
+        assert_eq!(studio["shadow"], "none");
+        assert_eq!(studio["pad"], 10);
+        assert_eq!(
+            studio["steps"],
+            serde_json::json!(["mask", "defringe", "backdrop", "pad"])
+        );
+        assert_eq!(studio["fallbacks"], serde_json::json!([]));
+        // The mask fake exposes no confidence, so the field
+        // is absent rather than invented.
+        assert!(studio.get("mask_confidence").is_none());
+        // Named arguments resolve on their own terms.
+        let meta = meta_for(format!(
+            "filters:studio(product,bg:white,shadow:soft,pad:25):format(png)/{src}"
+        ))
+        .await;
+        let studio = &meta["studio"];
+        assert_eq!(studio["bg"], "#ffffff");
+        assert_eq!(studio["bg_from"], "argument");
+        assert_eq!(studio["shadow"], "soft");
+        assert_eq!(studio["pad"], 25);
+        assert_eq!(
+            studio["steps"],
+            serde_json::json!(["mask", "defringe", "backdrop", "shadow", "pad"])
+        );
+        // No studio filter, no studio record.
+        let meta = meta_for(format!("40x24/{src}")).await;
+        assert!(meta.get("studio").is_none());
     }
 
     #[tokio::test]
@@ -4011,6 +4159,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -4071,6 +4220,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets,
             only_presets: false,
             default_ops: Vec::new(),
@@ -5275,6 +5425,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -5337,6 +5488,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -5687,6 +5839,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -5698,6 +5851,7 @@ mod tests {
         let job = ProcessJob {
             save_data: false,
             preserve_metadata: false,
+            brand_color: None,
             ops: Vec::new(),
             preferred: None,
             watermark_sources: Vec::new(),
@@ -5766,6 +5920,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -5777,6 +5932,7 @@ mod tests {
         let job = ProcessJob {
             save_data: false,
             preserve_metadata: false,
+            brand_color: None,
             ops: Vec::new(),
             preferred: None,
             watermark_sources: vec![(
@@ -6154,6 +6310,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -6551,6 +6708,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             default_ops: Vec::new(),
@@ -7363,6 +7521,7 @@ mod tests {
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
             width_step: 100,
             preserve_metadata: false,
+            brand_color: None,
             presets,
             only_presets: false,
             default_ops: Vec::new(),

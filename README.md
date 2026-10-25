@@ -389,6 +389,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 | Filter | Parameters | Description | Example |
 | --- | --- | --- | --- |
 | `removebg` | none | Remove the background, keeping the subject over transparency. Output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:removebg:format(png)` |
+| `studio` | `studio(product,...)`, named arguments: `bg`, `shadow`, `pad` | Studio mode: composite the subject onto a backdrop with a synthesized contact shadow, scaled and centered to a pad margin. See [Studio mode](#studio-mode). Requires the removebg model. | `filters:studio(product,bg:white)` |
 | `keep_profile` | none | Keep the source ICC profile instead of converting to sRGB; the profile is embedded in JPEG and PNG outputs. Other output formats convert to sRGB (pixels labeled as nothing would be wrong colors). | `filters:keep_profile` |
 | `blurfaces` | none | Blur every detected face (privacy redaction). Requires a face model. | `filters:blurfaces` |
 | `pixelatefaces` | none | Pixelate every detected face (privacy redaction). Requires a face model. | `filters:pixelatefaces` |
@@ -400,6 +401,35 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 ```bash
 curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.com/product.jpg"
 ```
+
+#### Studio mode
+
+`studio(product,...)` names an outcome instead of a mechanism: a listing-ready product shot. One filter expands into a fixed pipeline, run at the filter's position in the chain:
+
+1. **Mask**: the subject is cut out with the same segmentation model `removebg` uses (without one configured, `studio` fails with `501`, the same way `removebg` does).
+2. **Defringe**: edge colors are decontaminated against the local background, so no halo of the old backdrop survives the cut.
+3. **Backdrop and shadow**: the canvas (the image box in effect at that point in the chain) is filled with the resolved backdrop, and a contact shadow is synthesized from the subject's alpha, blurred, darkened, and offset down, beneath the subject.
+4. **Pad**: the subject is scaled and centered so the pad margin holds on every side.
+
+```bash
+# The defaults: brand backdrop (white when none is configured), soft shadow, pad 10
+curl "http://localhost:3000/unsafe/filters:studio(product)/https://example.com/shoe.jpg"
+# Every argument named
+curl "http://localhost:3000/unsafe/filters:studio(product,bg:f5f0e8,shadow:strong,pad:25)/https://example.com/shoe.jpg"
+```
+
+| Argument | Values | Default |
+| --- | --- | --- |
+| `bg` | `white`, a six-digit hex color, `brand`, or `none` | the brand color when configured, else `white` |
+| `shadow` | `soft`, `strong`, or `none` | `soft` |
+| `pad` | 0 to 40, percent margin per side | `10` |
+
+The fine print:
+
+- `bg:brand` paints the operator's brand color, set with `CRABCROP_BRAND_COLOR`. With none configured it resolves to white. `bg:none` keeps the subject's transparency and skips the shadow.
+- If the mask finds no subject, the fallback serves the original image centered and padded on the resolved backdrop (no shadow), rather than an empty canvas.
+- The result is a normal image in the chain, valid in every output format (JPEG included): unlike `removebg`, nothing transparent survives a backdrop. Later operations apply on top, so `filters:studio(product)/1200x1200` sizes the composite, and a `pad:` operation after `studio` pads the composite like any image. The encode-time `fill` directive only matters when transparency remains, which after `studio` means `bg:none` chains.
+- Meta responses report the run in a `studio` field: the resolved backdrop and where it came from (`argument`, `brand`, or `default`), the shadow and pad applied, the steps that ran, any fallbacks taken (the brand resolution, the no-subject fallback), and the mask confidence when the provider exposes one. See [Meta responses](#meta-responses).
 
 ## Presets
 
@@ -504,6 +534,7 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 | `bytes` | Size of the processed image in bytes. |
 | `source_width`, `source_height` | Source dimensions in pixels, after EXIF orientation. |
 | `ssimulacra2` | The verified perceptual score of the output, present when `quality(auto)` verified a JPEG or JPEG XL encode. 100 is identical. |
+| `studio` | Present when a `studio(...)` filter ran: the resolved backdrop (`bg`, spelled `#rrggbb`, or `none` for transparency) and its source (`bg_from`: `argument`, `brand`, or `default`), the `shadow` and `pad` applied, the expansion `steps` that ran, the `fallbacks` taken, and `mask_confidence` when the mask provider exposes one. See [Studio mode](#studio-mode). |
 
 Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other.
 
@@ -709,6 +740,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_ALLOWED_BUCKETS` | unset | Comma-separated bucket names the `s3://` and `gs://` schemes may read; `*` allows all. Required when bucket credentials are configured (the server refuses to boot without it); without credentials, unset means all buckets, fetched unsigned. |
 | `CRABCROP_FILE_ROOT` | unset | Directory that `file://` sources must stay under, canonicalized at boot and per request. Unset disables file sources. |
 | `CRABCROP_REMOVEBG_MODEL` | unset | Path to a U²-Net-family ONNX model for the `removebg` filter. See [AI features](#ai-features). |
+| `CRABCROP_BRAND_COLOR` | unset | Brand color for `studio(...)` composites, six hex digits (a leading `#` is allowed). An unnamed backdrop and `bg:brand` resolve to it; unset means white. Changing it starts a fresh cache epoch, like the other output-shaping settings. See [Studio mode](#studio-mode). |
 | `CRABCROP_UPSCALE_MODEL` | unset | Path to a super-resolution ONNX model for the `upscale` filter. See [AI features](#ai-features). |
 | `CRABCROP_FACE_MODEL` | unset | Path to a YuNet ONNX model for face-aware `smart` crops, `crop:...:face`, and the face redaction filters. See [AI features](#ai-features). |
 | `CRABCROP_CLIP_IMAGE_MODEL` / `CRABCROP_CLIP_TEXT_MODEL` | unset | A CLIP ONNX model pair for meta `tags` and `alt_text`. All four CLIP paths are required together. See [AI features](#ai-features). |
@@ -759,7 +791,7 @@ An unknown key ID is indistinguishable from a bad signature, by design: `403`, n
 
 ## AI features
 
-Three features run ONNX models in-process: `removebg` (background removal), `upscale` (super-resolution), and face detection for crops and redaction. The models are files you supply, deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
+The features that run ONNX models in-process: `removebg` (background removal), `studio` (product-shot composites on the same mask model, see [Studio mode](#studio-mode)), `upscale` (super-resolution), and face detection for crops and redaction. The models are files you supply, deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
 
 How configuration works:
 

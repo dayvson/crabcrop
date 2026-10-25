@@ -164,6 +164,10 @@ pub fn apply_filters_filled(
             // Background removal is applied by the engine, which
             // owns the mask provider. (Same routing as above.)
             Filter::RemoveBg => {}
+            // Studio mode is applied by the engine, which owns
+            // the mask provider and the brand color. (Same
+            // routing as above.)
+            Filter::Studio(_) => {}
             // Upscaling is applied by the engine, which owns the
             // upscale provider. (Same routing.)
             Filter::Upscale(_) => {}
