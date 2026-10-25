@@ -890,6 +890,12 @@ Running the server locally takes only a secret:
 CRABCROP_SECRET=local-dev-secret cargo run
 ```
 
+## Security
+
+Found a security vulnerability? Please report it privately — see
+[SECURITY.md](SECURITY.md). Please don't open a public issue, pull request, or
+discussion for security problems.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
