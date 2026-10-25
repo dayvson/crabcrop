@@ -389,13 +389,17 @@ impl StudioBg {
             "white" => StudioBg::White,
             "brand" => StudioBg::Brand,
             "none" => StudioBg::None,
-            hex if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) => {
-                let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-                StudioBg::Color([byte(0)?, byte(2)?, byte(4)?])
-            }
-            _ => return None,
+            _ => StudioBg::Color(parse_hex6(s).ok()?),
         })
     }
+}
+
+fn parse_hex6(s: &str) -> Result<[u8; 3], ()> {
+    if s.len() != 6 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    let byte = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ());
+    Ok([byte(0)?, byte(2)?, byte(4)?])
 }
 
 /// The contact shadow a `studio(...)` composite
@@ -1020,13 +1024,7 @@ fn parse_pad(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let fill = match fill {
         None => PadFill::Directive,
         Some("blur") => PadFill::Blur,
-        Some(p) => {
-            if p.len() != 6 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(invalid());
-            }
-            let byte = |i: usize| u8::from_str_radix(&p[i..i + 2], 16).map_err(|_| invalid());
-            PadFill::Color([byte(0)?, byte(2)?, byte(4)?])
-        }
+        Some(p) => PadFill::Color(parse_hex6(p).map_err(|_| invalid())?),
     };
     let size = parse_size(dims).map_err(|_| invalid())?;
     if !exact_box(&size) {
@@ -1487,11 +1485,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     return Err(invalid());
                 }
                 let hex = parts[1];
-                if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err(invalid());
-                }
-                let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| invalid());
-                Filter::Border(width, [byte(0)?, byte(2)?, byte(4)?])
+                Filter::Border(width, parse_hex6(hex).map_err(|_| invalid())?)
             }
             ("mask", Some(p)) => match p {
                 "circle" => Filter::Mask(MaskShape::Circle),
@@ -1504,23 +1498,12 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 if parts.len() != 2 {
                     return Err(invalid());
                 }
-                let color = |hex: &str| -> Result<[u8; 3], ParseError> {
-                    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                        return Err(invalid());
-                    }
-                    let byte =
-                        |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| invalid());
-                    Ok([byte(0)?, byte(2)?, byte(4)?])
-                };
-                Filter::Duotone(color(parts[0])?, color(parts[1])?)
+                Filter::Duotone(
+                    parse_hex6(parts[0]).map_err(|_| invalid())?,
+                    parse_hex6(parts[1]).map_err(|_| invalid())?,
+                )
             }
-            ("monochrome", Some(p)) => {
-                if p.len() != 6 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err(invalid());
-                }
-                let byte = |i: usize| u8::from_str_radix(&p[i..i + 2], 16).map_err(|_| invalid());
-                Filter::Monochrome([byte(0)?, byte(2)?, byte(4)?])
-            }
+            ("monochrome", Some(p)) => Filter::Monochrome(parse_hex6(p).map_err(|_| invalid())?),
             ("pixelate", Some(p)) => {
                 let block: u32 = p.parse().map_err(|_| invalid())?;
                 if block == 0 || block > MAX_DIMENSION {
@@ -1555,13 +1538,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 "v" => Filter::Flip(FlipDirection::Vertical),
                 _ => return Err(invalid()),
             },
-            ("fill", Some(p)) => {
-                if p.len() != 6 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err(invalid());
-                }
-                let byte = |i: usize| u8::from_str_radix(&p[i..i + 2], 16).map_err(|_| invalid());
-                Filter::Fill([byte(0)?, byte(2)?, byte(4)?])
-            }
+            ("fill", Some(p)) => Filter::Fill(parse_hex6(p).map_err(|_| invalid())?),
             ("max_bytes", Some(p)) => {
                 let n: u64 = p.parse().map_err(|_| invalid())?;
                 if n == 0 {
