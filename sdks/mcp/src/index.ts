@@ -101,6 +101,23 @@ async function readCapped(resp: Response, cap: number): Promise<string | null> {
   return new TextDecoder().decode(merged);
 }
 
+/**
+ * Whether any path component of `path` is a dot segment.
+ * Mirrors has_dot_segment in the Rust loader: a component
+ * exactly `.` or `..`, with dots inside a name (`a.b`,
+ * `c..d`) counting as ordinary content. Because the string
+ * is later parsed as a WHATWG URL, the percent-encoded
+ * spellings (`%2e`, `.%2e`, `%2e.`, `%2e%2e`) count too, and
+ * backslashes are separators for http(s) URLs, so components
+ * are split on both.
+ */
+function hasDotSegment(path: string): boolean {
+  return path.split(/[/\\]/).some((segment) => {
+    const decoded = segment.toLowerCase().replaceAll("%2e", ".");
+    return decoded === "." || decoded === "..";
+  });
+}
+
 const TOOLS = [
   {
     name: "sign_url",
@@ -243,23 +260,61 @@ const TOOLS = [
       "Evict a cached result from a crabcrop server. The path is the cached " +
       "URL's remainder after its signature (operations and source; a preset " +
       "URL works as-is, the server expands it). Requires the signing secret (argument or " +
-      "CRABCROP_SECRET). Returns how many entries were removed.",
+      "CRABCROP_SECRET). Returns how many entries were removed. " +
+      "For safety the request only goes to the configured CRABCROP_BASE " +
+      "origin (a base argument must match it) and paths with dot segments " +
+      "are refused: this tool will not POST to arbitrary endpoints.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Remainder of the cached URL, e.g. \"300x200/https://example.com/a.jpg\"." },
-        base: { type: "string", description: "crabcrop endpoint origin. Defaults to CRABCROP_BASE." },
+        base: { type: "string", description: "crabcrop endpoint origin. Defaults to CRABCROP_BASE; its origin must match CRABCROP_BASE." },
         secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET. Sensitive, deprecated: prefer the CRABCROP_SECRET environment variable; a per-call secret is kept in client transcripts." },
       },
       required: ["path"],
       additionalProperties: false,
     },
     async run(args: Record<string, unknown>) {
+      // The fetch_meta treatment (audit PL-1, extended by
+      // R2-10): the POST may only ever go to the configured
+      // server's origin. Without the check, a caller-chosen
+      // base made the tool an SSRF oracle: it POSTed to
+      // internal endpoints and read the responses back, and
+      // dot segments in the path resolved out of the
+      // /purge/ prefix onto arbitrary paths on that host.
+      // Refusing before any fetch keeps every disallowed or
+      // unreachable target indistinguishable: no request is
+      // sent, so there is no timing, status, or body signal
+      // to tell them apart.
+      if (!envBase) {
+        return textResult(
+          "purge_result requires CRABCROP_BASE to be set: it only purges on the configured server's origin",
+          true,
+        );
+      }
+      const configuredOrigin = new URL(envBase).origin;
       const base = (optionalStringArg(args, "base") ?? envBase).replace(/\/+$/, "");
+      let baseOrigin: string;
+      try {
+        baseOrigin = new URL(base).origin;
+      } catch {
+        return textResult(`purge_result: not a valid base URL: ${base}`, true);
+      }
+      if (baseOrigin !== configuredOrigin) {
+        return textResult(
+          `purge_result: refusing to purge ${baseOrigin}; only the configured server origin (${configuredOrigin}) is allowed`,
+          true,
+        );
+      }
       const secret = optionalStringArg(args, "secret") ?? envSecret;
-      if (!base) throw new Error("no base: pass the base argument or set CRABCROP_BASE");
       if (!secret) throw new Error("purge requires a secret: pass the secret argument or set CRABCROP_SECRET");
       const target = stringArg(args, "path").replace(/^\//, "");
+      if (hasDotSegment(target)) {
+        return textResult(
+          "purge_result: refusing a path with dot segments: they would resolve out of the purge prefix",
+          true,
+        );
+      }
       // The SDK's helper: purge signatures are
       // domain-separated from image signatures (audit P-1),
       // and the derivation lives in exactly one place.
