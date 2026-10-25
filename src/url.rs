@@ -2228,6 +2228,17 @@ pub fn purge_key(secret: &[u8]) -> Vec<u8> {
     crabcrop_url::purge_key(secret)
 }
 
+/// Derive the cache entry MAC key from the server secret
+/// (issue #190). Persistent cache entries are MACed under
+/// this derived key, beside the purge and upload domains:
+/// an entry planted in the disk cache or the shared
+/// bucket by anyone without the secret fails verification
+/// and reads as a miss. The key is server-internal: it
+/// signs stored entries, never URLs.
+pub fn entry_key(secret: &[u8]) -> Vec<u8> {
+    crabcrop_url::entry_key(secret)
+}
+
 /// The purge signature for a target path: HMAC-SHA256 of
 /// the path alone, under the derived purge key. Delegates
 /// to the `crabcrop-url` crate, the one implementation

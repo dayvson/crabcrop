@@ -671,6 +671,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let preserve_metadata = metadata_config(|name| env::var(name).ok())?;
 
+    // The entry MAC key for the persistent tiers (issue
+    // #190): derived from the current signing secret, so
+    // entries planted by anyone without it read as misses,
+    // and a secret rotation invalidates the old entries
+    // rather than serving content authenticated under a
+    // retired key.
+    let entry_key = crate::url::entry_key(&keyring.current);
+    // The configuration fingerprint (audit R2-08): every
+    // cache key carries it, so the persistent tiers never
+    // serve an entry rendered under different
+    // output-shaping settings across a restart.
+    let config_fingerprint = config_fingerprint(
+        |name| env::var(name).ok(),
+        preserve_metadata,
+        ssim_target,
+        avif_speed,
+        jxl_speed,
+        width_step,
+    );
+
     // Disk result storage: configured by directory, bounded
     // by its own budget. Opening indexes whatever a previous
     // run left behind. It opens here, before the AI preload,
@@ -684,7 +704,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let max_bytes = max_mb
                 .checked_mul(1024 * 1024)
                 .ok_or_else(|| "CRABCROP_RESULT_STORAGE_MAX_MB is too large".to_string())?;
-            let store = crate::storage::DiskStore::open(std::path::Path::new(&dir), max_bytes)?;
+            let store = crate::storage::DiskStore::open(
+                std::path::Path::new(&dir),
+                max_bytes,
+                entry_key.clone(),
+            )?;
             let (entries, bytes) = store.stats();
             println!(
                 "result storage at {dir}: {entries} entries, {bytes} bytes, budget {max_mb} MB"
@@ -706,6 +730,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sources.s3_endpoint.clone(),
                 sources.s3_region.clone(),
                 sources.aws_creds.clone(),
+                entry_key.clone(),
             );
             println!("shared result storage: bucket {bucket}");
             Some(Arc::new(store))
@@ -777,10 +802,86 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         default_ops,
         video_encoder,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
+        inflight: Arc::new(crate::server::Inflight::default()),
+        config_fingerprint,
     };
+    println!("configuration fingerprint: {}", state.config_fingerprint);
     println!("crabcrop listening on port {port}");
     axum::serve(listener, app(state)).await?;
     Ok(())
+}
+
+/// Fingerprint the configuration that shapes rendered
+/// output (audit R2-08): the metadata policy, the quality
+/// tuning knobs, the width-hint step, and the file-based
+/// inputs whose contents change results (the AI models,
+/// the CLIP set, the overlay font, the video encoder, and
+/// the detector declarations, hashed by content). The
+/// fingerprint is embedded in every cache key (see
+/// `serve`), so a restart under changed settings starts a
+/// fresh cache epoch instead of serving the old settings'
+/// renders from the persistent tiers. Settings that are
+/// already visible in the key (presets, default ops: both
+/// change the canonical form) are deliberately excluded.
+///
+/// Resolved through `get` (a name to value lookup, so
+/// tests can drive it without the process environment).
+/// An unreadable detectors file contributes its path only:
+/// boot fails on it later, in the AI preload, with the
+/// precise error.
+fn config_fingerprint(
+    get: impl Fn(&str) -> Option<String>,
+    preserve_metadata: bool,
+    ssim_target: f64,
+    avif_speed: u8,
+    jxl_speed: jixel::Speed,
+    width_step: u32,
+) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut part = |label: &str, value: &str| {
+        hasher.update(label.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\n");
+    };
+    part(
+        "preserve_metadata",
+        if preserve_metadata { "1" } else { "0" },
+    );
+    part("ssim_target", &ssim_target.to_string());
+    part("avif_speed", &avif_speed.to_string());
+    part("jxl_speed", &format!("{jxl_speed:?}"));
+    part("width_step", &width_step.to_string());
+    for name in [
+        "CRABCROP_REMOVEBG_MODEL",
+        "CRABCROP_UPSCALE_MODEL",
+        "CRABCROP_FACE_MODEL",
+        "CRABCROP_DETECT_MODEL",
+        "CRABCROP_CLIP_IMAGE_MODEL",
+        "CRABCROP_CLIP_TEXT_MODEL",
+        "CRABCROP_CLIP_TOKENIZER",
+        "CRABCROP_CLIP_LABELS",
+        "CRABCROP_FONT_PATH",
+        "CRABCROP_VIDEO_ENCODER",
+    ] {
+        if let Some(value) = get(name).filter(|v| !v.is_empty()) {
+            part(name, &value);
+        }
+    }
+    if let Some(path) = get("CRABCROP_DETECTORS_FILE").filter(|v| !v.is_empty()) {
+        let digest = std::fs::read(&path)
+            .map(|bytes| {
+                sha2::Sha256::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|_| "unreadable".to_string());
+        part("CRABCROP_DETECTORS_FILE", &format!("{path}:{digest}"));
+    }
+    let digest = hasher.finalize();
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The CLIP annotation configuration from the environment:
@@ -1496,6 +1597,87 @@ mod tests {
             ))
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn config_fingerprint_tracks_output_shaping_settings() {
+        // The fingerprint is a pure function of the
+        // settings (issue #190, audit R2-08): stable for
+        // identical configuration, different the moment an
+        // output-shaping input changes, and blind to
+        // settings that do not shape output.
+        let speed = crate::engine::DEFAULT_JXL_SPEED;
+        let base = config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 100);
+        assert_eq!(base.len(), 16);
+        assert_eq!(
+            base,
+            config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 100),
+            "identical configuration, identical fingerprint"
+        );
+        assert_ne!(
+            base,
+            config_fingerprint(env_of(&[]), true, 90.0, 6, speed, 100),
+            "the metadata policy shapes output"
+        );
+        assert_ne!(
+            base,
+            config_fingerprint(env_of(&[]), false, 80.0, 6, speed, 100),
+            "the SSIM target shapes output"
+        );
+        assert_ne!(
+            base,
+            config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 50),
+            "the width step shapes output"
+        );
+        assert_ne!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_REMOVEBG_MODEL", "/models/u2net.onnx")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "a swapped model file shapes output"
+        );
+        assert_eq!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_PORT", "8080"), ("CRABCROP_CACHE_MAX_MB", "64")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "serving knobs do not shape output"
+        );
+        // The detectors file is hashed by content: editing
+        // a declaration changes the fingerprint, renaming
+        // alone does too (the path is an input), and an
+        // unchanged file is stable.
+        let file = temp_file("fp-detectors", br#"[{"name":"a"}]"#);
+        let fp_file = config_fingerprint(
+            env_of(&[("CRABCROP_DETECTORS_FILE", file.as_str())]),
+            false,
+            90.0,
+            6,
+            speed,
+            100,
+        );
+        assert_ne!(base, fp_file);
+        std::fs::write(&file, br#"[{"name":"b"}]"#).unwrap();
+        let fp_edited = config_fingerprint(
+            env_of(&[("CRABCROP_DETECTORS_FILE", file.as_str())]),
+            false,
+            90.0,
+            6,
+            speed,
+            100,
+        );
+        assert_ne!(fp_file, fp_edited, "edited declarations, new epoch");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

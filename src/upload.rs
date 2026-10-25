@@ -172,7 +172,18 @@ impl UploadStore {
         } else {
             format!("{trimmed}/")
         };
-        let store = S3Store::new(bucket.clone(), prefix.clone(), endpoint, region, creds);
+        // The upload path moves raw objects only (put_raw
+        // and get_raw store bytes verbatim, with no entry
+        // framing), so the entry MAC key is never used
+        // here; an empty one keeps that explicit.
+        let store = S3Store::new(
+            bucket.clone(),
+            prefix.clone(),
+            endpoint,
+            region,
+            creds,
+            Vec::new(),
+        );
         Self {
             backend: Backend::S3 {
                 store: Arc::new(store),
