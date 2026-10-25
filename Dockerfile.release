@@ -1,0 +1,29 @@
+# Release image: the runtime of the repo Dockerfile, packaged around
+# the binary the release already published.
+#
+# The release workflow builds per-architecture binaries with
+# cargo-dist (AVIF decode included, dav1d vendored; see
+# dist-workspace.toml) and attaches them to the GitHub Release. This
+# build stages those exact tarballs, checksum-verified, via
+# scripts/stage_image_binaries.sh into image-bin/<arch>/, so the
+# published image carries the release binary itself instead of a
+# second, slower compile of the same source (issue #219). The repo
+# Dockerfile stays the from-source build for operators.
+#
+# The base is digest-pinned like the repo Dockerfile (audit PL-13);
+# keep the two pins in step.
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+# ca-certificates for HTTPS source fetching, curl for the
+# healthcheck, libgcc-s1 for the binary's libgcc_s dependency. No
+# libdav1d package: the release binary vendors dav1d statically.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH
+COPY image-bin/${TARGETARCH}/crabcrop /usr/local/bin/crabcrop
+ENV PORT=3000
+EXPOSE 3000
+USER nobody
+HEALTHCHECK --interval=30s --timeout=3s \
+    CMD curl -f "http://127.0.0.1:${PORT:-3000}/health" || exit 1
+ENTRYPOINT ["crabcrop"]

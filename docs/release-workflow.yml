@@ -411,7 +411,7 @@ jobs:
 
   build-images:
     name: Build and push container images
-    needs: plan
+    needs: host
     if: ${{ !github.event.pull_request }}
     runs-on: ubuntu-22.04
     permissions:
@@ -424,6 +424,8 @@ jobs:
           submodules: recursive
       - name: Compute version (tag without the leading v)
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Stage release binaries (issue #219)
+        run: bash scripts/stage_image_binaries.sh "$VERSION" image-bin
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -435,7 +437,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |

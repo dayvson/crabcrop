@@ -7,7 +7,7 @@ One version number covers every artifact: the server binaries and container imag
 Pushing a tag like `v0.2.0` runs `.github/workflows/release.yml`:
 
 1. **cargo-dist** builds the server for Linux and macOS on both architectures, plus the shell installer and SHA-256 checksums, and attaches them to a GitHub Release whose notes come from CHANGELOG.md.
-2. **Container images** are built from `Dockerfile` and `Dockerfile.ai` and pushed to GHCR as `ghcr.io/dayvson/crabcrop` and `ghcr.io/dayvson/crabcrop-ai`, tagged with the version and `latest`.
+2. **Container images**: the base image packages the step 1 binaries (`Dockerfile.release`, staged checksum-verified from the release tarballs by `scripts/stage_image_binaries.sh`, so an image ships the exact binary its release published), and the AI variant layers on it from `Dockerfile.ai`. Both are pushed to GHCR as `ghcr.io/dayvson/crabcrop` and `ghcr.io/dayvson/crabcrop-ai`, tagged with the version and `latest`. The repo `Dockerfile` remains the from-source build for operators building their own.
 3. **Registry publishing** (`cargo publish` for the crate, `npm publish` for the SDK, `twine upload` for the Python package) runs as separate jobs gated on the `release` GitHub Environment, so a human approves them in the Actions UI after inspecting the built artifacts. The jobs need the `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, and `PYPI_TOKEN` repository secrets.
 4. **The Homebrew formula** is generated from the release checksums and uploaded to the release as `crabcrop.rb`:
 
