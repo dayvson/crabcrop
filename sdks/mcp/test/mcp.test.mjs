@@ -156,6 +156,130 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
   }
 });
 
+test("purge_result only purges on the configured origin and refuses dot segments", { timeout: 60000 }, async () => {
+  // Recording servers stand in for the configured server
+  // and for an internal target: any request that lands on
+  // one proves the tool actually fetched that origin, so
+  // the oracle question is answered by counting hits, not
+  // by trusting the response text. Before the R2-10 fix,
+  // purge_result POSTed to any caller-chosen base and
+  // returned the body, which made it an SSRF oracle: a
+  // steered caller could probe internal endpoints and read
+  // the responses back.
+  const { createServer } = await import("node:http");
+  const hits = { configured: [], internal: [] };
+  const recorder = (bucket) =>
+    createServer((req, res) => {
+      bucket.push(`${req.method} ${req.url}`);
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("purged 1");
+    });
+  const configuredServer = recorder(hits.configured);
+  const internalServer = recorder(hits.internal);
+  await new Promise((resolve) => configuredServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => internalServer.listen(0, "127.0.0.1", resolve));
+  const configuredOrigin = `http://127.0.0.1:${configuredServer.address().port}`;
+  const internalOrigin = `http://127.0.0.1:${internalServer.address().port}`;
+
+  const spawnMcp = (env) =>
+    spawn(
+      process.execPath,
+      ["--import", `${root}sdks/mcp/test/register.mjs`, `${root}sdks/mcp/src/index.ts`],
+      { env, stdio: ["pipe", "pipe", "inherit"] },
+    );
+  const secretEnv = { ...process.env, CRABCROP_SECRET: "mcp-test-secret-0123456" };
+  const mcp = spawnMcp({ ...secretEnv, CRABCROP_BASE: configuredOrigin });
+  const noBaseEnv = { ...secretEnv };
+  delete noBaseEnv.CRABCROP_BASE;
+  const mcpNoBase = spawnMcp(noBaseEnv);
+  const init = {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "mcp-test", version: "0" },
+  };
+  try {
+    const client = new McpClient(mcp);
+    await client.request("initialize", init);
+    client.notify("notifications/initialized", {});
+
+    const path = "300x200/https://example.com/a.jpg";
+
+    // A legitimate purge still works: the default base is
+    // the configured origin, so the POST goes out and the
+    // server's answer comes back.
+    assert.equal(await client.call("purge_result", { path }), "purged 1");
+    assert.equal(hits.configured.length, 1);
+    assert.match(
+      hits.configured[0],
+      /^POST \/purge\/[0-9a-f]{64}\/300x200\/https:\/\/example\.com\/a\.jpg$/,
+    );
+
+    // A per-call base naming the same origin explicitly is
+    // equally fine.
+    assert.equal(await client.call("purge_result", { path, base: configuredOrigin }), "purged 1");
+    assert.equal(hits.configured.length, 2);
+
+    // Every other origin is refused before any fetch, and
+    // the refusal has the same shape whatever state the
+    // target is in: listening, refusing connections, not
+    // resolving at all, or a link-local metadata address.
+    // No request reaches any of them, so there is no
+    // timing, status, or body signal to tell them apart.
+    const refusal = new RegExp(
+      `^purge_result: refusing to purge .*; only the configured server origin \\(${configuredOrigin.replaceAll(".", "\\.")}\\) is allowed$`,
+    );
+    for (const base of [
+      internalOrigin,
+      "http://127.0.0.1:1",
+      "http://nonexistent.invalid",
+      "http://169.254.169.254",
+    ]) {
+      assert.match(await client.call("purge_result", { path, base }), refusal);
+    }
+    assert.equal(hits.internal.length, 0);
+    assert.equal(hits.configured.length, 2);
+
+    // Dot segments in the path are refused even against
+    // the configured origin: parsed as a URL they resolve
+    // out of the /purge/ prefix onto arbitrary paths, and
+    // in an s3:// target they would traverse past the
+    // bucket the signature was computed for.
+    for (const badPath of [
+      "300x200/../../admin/hook",
+      "300x200/./x.jpg",
+      "300x200/%2e%2e/%2e%2e/admin/hook",
+      "300x200/s3://bucket/../other-bucket/secret.jpg",
+    ]) {
+      const out = await client.call("purge_result", { path: badPath });
+      assert.match(out, /refusing a path with dot segments/);
+    }
+    assert.equal(hits.configured.length, 2);
+
+    // Dots inside a segment name are ordinary content, not
+    // segments: the purge goes through.
+    assert.equal(
+      await client.call("purge_result", { path: "300x200/https://example.com/my.photo..final.jpg" }),
+      "purged 1",
+    );
+    assert.equal(hits.configured.length, 3);
+
+    // With no CRABCROP_BASE configured there is no origin
+    // to check a per-call base against, so the tool refuses
+    // outright instead of trusting the argument.
+    const clientNoBase = new McpClient(mcpNoBase);
+    await clientNoBase.request("initialize", init);
+    clientNoBase.notify("notifications/initialized", {});
+    const out = await clientNoBase.call("purge_result", { path, base: internalOrigin });
+    assert.match(out, /purge_result requires CRABCROP_BASE to be set/);
+    assert.equal(hits.internal.length, 0);
+  } finally {
+    mcp.kill();
+    mcpNoBase.kill();
+    configuredServer.close();
+    internalServer.close();
+  }
+});
+
 test("purge_result gives up on a hung endpoint", { timeout: 60000 }, async () => {
   // An endpoint that accepts the connection and never
   // answers: the purge fetch must time out (10 s) and
