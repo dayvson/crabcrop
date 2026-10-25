@@ -2254,9 +2254,19 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
     crabcrop_url::purge_signature(secret, target)
 }
 
-/// The purge-group signature for a cache group, over the
-/// literal `purge-group/<group>` string. Delegates to the
-/// crate helper so nobody hand-constructs the message.
+/// Derive the purge-group signing key from the server
+/// secret. Purge-group signatures live in their own domain
+/// beside the purge domain (audit R2-14), under this
+/// derived key, so a per-target purge signature can never
+/// be transplanted to the purge-group endpoint.
+pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
+    crabcrop_url::purge_group_key(secret)
+}
+
+/// The purge-group signature for a cache group: HMAC of
+/// the group name under the derived purge-group key.
+/// Delegates to the crate helper so nobody
+/// hand-constructs the message.
 #[allow(dead_code)]
 pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
     crabcrop_url::purge_group_signature(secret, group)
@@ -2271,6 +2281,19 @@ pub fn verify_purge(secret: &[u8], signature: &Signature, target: &str) -> bool 
     match signature {
         Signature::Unsafe => false,
         Signature::Hmac(hex_digest) => crabcrop_url::verify(&purge_key(secret), hex_digest, target),
+    }
+}
+
+/// Verify a purge-group signature: an HMAC of the group
+/// name under the purge-group subkey, a separate domain
+/// from [`verify_purge`] (audit R2-14). Like purges, group
+/// purges never honor `unsafe`.
+pub fn verify_purge_group(secret: &[u8], signature: &Signature, group: &str) -> bool {
+    match signature {
+        Signature::Unsafe => false,
+        Signature::Hmac(hex_digest) => {
+            crabcrop_url::verify(&purge_group_key(secret), hex_digest, group)
+        }
     }
 }
 
@@ -2412,6 +2435,19 @@ impl Keyring {
         self.candidates(key_id)
             .iter()
             .any(|secret| verify_purge(secret, signature, target))
+    }
+
+    /// Verify a purge-group signature against the ring (see
+    /// [`verify_purge_group`]).
+    pub fn verify_purge_group(
+        &self,
+        key_id: Option<&str>,
+        signature: &Signature,
+        group: &str,
+    ) -> bool {
+        self.candidates(key_id)
+            .iter()
+            .any(|secret| verify_purge_group(secret, signature, group))
     }
 
     /// Verify an upload signature against the ring (see

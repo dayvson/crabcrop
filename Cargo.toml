@@ -39,6 +39,13 @@ serde_json = "1"
 image = { version = "0.25", features = ["avif"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "fs", "io-util"] }
 
+# Safe process-group signalling for the video encoder's
+# timeout kill (issue #194, audit R2-31): the crate forbids
+# unsafe code, so the kill goes through rustix rather than
+# a raw libc call.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [features]
 # AVIF source decoding, through the image crate's avif-native
 # decoder (mp4parse + dav1d). Off by default (issue #141,

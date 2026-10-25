@@ -642,7 +642,57 @@ fn split_bucket_key<'a>(rest: &'a str, scheme: &str) -> Result<(&'a str, &'a str
     if bucket.is_empty() || key.is_empty() {
         return Err(invalid());
     }
+    if !is_valid_bucket_name(bucket) {
+        return Err(LoadError::Forbidden(format!(
+            "invalid bucket name: {bucket}"
+        )));
+    }
     Ok((bucket, key))
+}
+
+/// Whether `bucket` is a name the S3 bucket naming rules
+/// allow: 3 to 63 characters of lowercase letters, digits,
+/// dots, and hyphens, starting and ending with a letter or
+/// digit, with no adjacent dots and no dot beside a hyphen,
+/// and not spelled as an IPv4 address. The loader
+/// interpolates the bucket into the request host for AWS,
+/// so a bucket carrying a `?` or another host-breaking
+/// character would move the signed request, and the
+/// credentials and session token on it, to a host the
+/// operator never named (audit R2-20). Enforced at parse
+/// time, whatever the allowlist says (an allowlist of `*`
+/// included); `gs://` sources share the check because they
+/// are served through the same S3-compatible contract.
+fn is_valid_bucket_name(bucket: &str) -> bool {
+    let bytes = bucket.as_bytes();
+    if bytes.len() < 3 || bytes.len() > 63 {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'.')
+    {
+        return false;
+    }
+    let edge_ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if !edge_ok(bytes[0]) || !edge_ok(bytes[bytes.len() - 1]) {
+        return false;
+    }
+    if bucket.contains("..") || bucket.contains(".-") || bucket.contains("-.") {
+        return false;
+    }
+    // Not an IPv4 address spelling: four numeric labels.
+    let labels: Vec<&str> = bucket.split('.').collect();
+    if labels.len() == 4
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.bytes().all(|b| b.is_ascii_digit())
+                && label.parse::<u32>().is_ok_and(|n| n <= 255)
+        })
+    {
+        return false;
+    }
+    true
 }
 
 /// Decode `%XX` escapes in a URL path. A literal `+` stays a
@@ -1315,11 +1365,76 @@ mod tests {
     #[test]
     fn bucket_keys_and_percent_decoding_parse() {
         assert_eq!(
-            split_bucket_key("b/dir/k.jpg", "s3").unwrap(),
-            ("b", "dir/k.jpg")
+            split_bucket_key("bkt/dir/k.jpg", "s3").unwrap(),
+            ("bkt", "dir/k.jpg")
         );
-        assert!(split_bucket_key("b/", "s3").is_err());
+        assert!(split_bucket_key("bkt/", "s3").is_err());
         assert_eq!(percent_decode("/a%20b/%2e%2e/c+d"), "/a b/../c+d");
         assert_eq!(percent_decode("/plain%zz%"), "/plain%zz%");
+    }
+
+    #[test]
+    fn bucket_names_follow_the_s3_rules() {
+        // Valid: ordinary names, dotted names, hyphenated
+        // names, the length bounds.
+        for name in [
+            "photos",
+            "my.bucket-1",
+            "a1b",
+            "a.b",
+            "0abc",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(is_valid_bucket_name(name), "{name}");
+        }
+        // Invalid: host-breaking characters above all (audit
+        // R2-20), then the rest of the naming rules.
+        for name in [
+            "attacker.example?x",
+            "bucket#frag",
+            "bucket/key",
+            "bucket name",
+            "bucket_name",
+            "UPPER",
+            "ab",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "-bucket",
+            "bucket-",
+            ".bucket",
+            "bucket.",
+            "a..b",
+            "a.-b",
+            "a-.b",
+            "192.168.0.1",
+            "1.2.3.4",
+        ] {
+            assert!(!is_valid_bucket_name(name), "{name}");
+        }
+        assert!(split_bucket_key("attacker.example?x/pic.jpg", "s3").is_err());
+    }
+
+    #[tokio::test]
+    async fn crafted_bucket_names_send_no_request() {
+        // Audit R2-20: with the allowlist wide open (`*`) and
+        // credentials carrying a session token, a bucket
+        // string that would move the signed request off AWS
+        // is refused at parse time; the endpoint sees no
+        // request at all.
+        let (base, captured) = spawn_capturing_server().await;
+        let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
+            s3_endpoint: Some(base),
+            allowed_buckets: vec!["*".to_string()],
+            aws_creds: Some(test_creds()),
+            ..Default::default()
+        });
+        for url in [
+            "s3://attacker.example?x/pic.jpg",
+            "s3://UPPER/pic.jpg",
+            "s3://a..b/pic.jpg",
+        ] {
+            let err = loader.load(url).await.unwrap_err();
+            assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
+        }
+        assert!(captured.lock().unwrap().is_empty());
     }
 }

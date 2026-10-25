@@ -497,11 +497,12 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
 
 /// `POST /purge-group/<signature>/<group>`: invalidate every
 /// stored entry in one cache group (RFC 9875), across both
-/// tiers. The signature is verified with the same purge
-/// subkey as `/purge`, over the literal `purge-group/<group>`,
-/// so an image or per-URL purge signature cannot be replayed
-/// here. A bad signature is a 403 and removes nothing; an
-/// unknown group answers 200 with a count of 0.
+/// tiers. The signature is verified under the purge-group
+/// subkey, its own domain beside the purge subkey, over the
+/// group name, so neither an image signature nor a per-URL
+/// purge signature can be replayed here (audit R2-14). A
+/// bad signature is a 403 and removes nothing; an unknown
+/// group answers 200 with a count of 0.
 async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let Some(tail) = uri.path().strip_prefix("/purge-group/") else {
         return (
@@ -521,7 +522,7 @@ async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri)
     let target = format!("purge-group/{group}");
     if !state
         .keyring
-        .verify_purge(key_id.as_deref(), &signature, &target)
+        .verify_purge_group(key_id.as_deref(), &signature, group)
     {
         state.metrics.record_purge();
         purge_log("purge-group", &target, None);
@@ -2217,13 +2218,13 @@ fn engine_error_response(e: EngineError) -> Response {
             "image rendering failed".to_string(),
         ),
         // The encoder is the operator's own program: its
-        // failure is an upstream fault (502), and the body
-        // names it (including its truncated stderr) because
-        // the operator is the one who can fix it.
-        EngineError::Video(cause) => (
-            StatusCode::BAD_GATEWAY,
-            format!("video encoder failed: {cause}"),
-        ),
+        // failure is an upstream fault (502). The body is
+        // generic, like every other class here: the cause
+        // (the configured program path, the encoder's own
+        // stderr) stays in the log line above, where the
+        // operator reads it, and never reaches the client
+        // (audit R2-30).
+        EngineError::Video(_) => (StatusCode::BAD_GATEWAY, "video encoding failed".to_string()),
     };
     (status, message).into_response()
 }
@@ -2490,6 +2491,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn video_encoder_failures_answer_a_generic_body() {
+        // Audit R2-30: the encoder's stderr and the program
+        // path are operator details for the server log. The
+        // client gets the generic 502 body, like every other
+        // engine failure class.
+        let gif = spawn_bytes_server(animated_gif_bytes()).await;
+        let base = spawn_app_with_video(
+            "#!/bin/sh\ncat > /dev/null\necho 'secret encoder detail' >&2\nexit 3\n",
+        )
+        .await;
+        let remainder = format!("filters:format(mp4)/{gif}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "video encoding failed");
+        assert!(!body.contains("secret encoder detail"), "{body}");
+        assert!(!body.contains("encoder.sh"), "{body}");
+    }
+
+    #[tokio::test]
     async fn video_requests_fail_specifically() {
         let gif = spawn_bytes_server(animated_gif_bytes()).await;
         let png = spawn_image_server().await;
@@ -2532,8 +2557,9 @@ mod tests {
             body.contains("meta is not available for video output"),
             "{body}"
         );
-        // A failing encoder: 502 naming the encoder and its
-        // own error output.
+        // A failing encoder: a generic 502. Its stderr goes
+        // to the server log, never to the client (audit
+        // R2-30; the dedicated test above pins the body).
         let base =
             spawn_app_with_video("#!/bin/sh\ncat > /dev/null\necho 'broken encoder' >&2\nexit 1\n")
                 .await;
@@ -2544,8 +2570,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let body = resp.text().await.unwrap();
-        assert!(body.contains("video encoder failed"), "{body}");
-        assert!(body.contains("broken encoder"), "{body}");
+        assert_eq!(body, "video encoding failed");
     }
 
     /// An app with server-wide default operations (issue
@@ -4647,7 +4672,7 @@ mod tests {
         assert_eq!(resp.status(), 403);
         let resp = client().get(&url).send().await.unwrap();
         assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
-        // The real purge: signed over the literal target.
+        // The real purge, signed under the purge-group subkey.
         let sig = crate::url::purge_group_signature(SECRET, "small");
         let resp = client()
             .post(format!("{base}/purge-group/{sig}/small"))
@@ -4668,6 +4693,34 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.text().await.unwrap().contains("purged 0"));
+    }
+
+    #[tokio::test]
+    async fn purge_group_refuses_transplanted_purge_signatures() {
+        // Audit R2-14: purge-group verifies under its own
+        // subkey, so a per-target purge signature, even one
+        // minted over the literal string the endpoint's URL
+        // carries, is a 403 there and removes nothing.
+        let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        let remainder = format!("preset:small/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        for transplanted in [
+            crate::url::purge_signature(SECRET, "purge-group/small"),
+            crate::url::purge_signature(SECRET, "small"),
+        ] {
+            let resp = client()
+                .post(format!("{base}/purge-group/{transplanted}/small"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403);
+        }
+        // Nothing was evicted: the entry still hits.
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
     }
 
     #[tokio::test]

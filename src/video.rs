@@ -14,10 +14,11 @@
 //!
 //! The subprocess is the most heavily bounded path in the
 //! server: a dedicated gate in the server bounds concurrency,
-//! a hard wall-clock timeout kills the encode, and stdout is
-//! capped while it is read, so a runaway encoder cannot fill
-//! memory. The child runs with an empty environment and is
-//! always reaped.
+//! a hard wall-clock timeout kills the encode (the whole
+//! process group, so a wrapper script's children die with
+//! it), and stdout is capped while it is read, so a runaway
+//! encoder cannot fill memory. The child runs with an empty
+//! environment and is always reaped.
 //!
 //! Timing: source frame delays are variable, encoders want a
 //! constant frame rate. The schedule picks the smallest rate
@@ -343,7 +344,8 @@ impl VideoEncoder {
         frames: &[VideoFrame],
         plan: &Plan,
     ) -> Result<Vec<u8>, VideoError> {
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(argv)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -351,14 +353,23 @@ impl VideoEncoder {
             // A minimal environment: the contract needs
             // nothing from the server's, and inheriting it
             // would hand the child the server's secrets.
-            .env_clear()
-            .spawn()
-            .map_err(|e| {
-                VideoError::Failed(format!(
-                    "could not be started ({}): {e}",
-                    self.program.display()
-                ))
-            })?;
+            .env_clear();
+        // The encoder runs in its own process group, so a
+        // timeout or abort can kill the whole tree: when the
+        // configured program is a wrapper script, killing
+        // only the direct child leaves its grandchildren
+        // running past the timeout (audit R2-31).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(|e| {
+            VideoError::Failed(format!(
+                "could not be started ({}): {e}",
+                self.program.display()
+            ))
+        })?;
         let mut stdin = child.stdin.take().expect("stdin is piped");
         let mut stdout = child.stdout.take().expect("stdout is piped");
         let mut stderr = child.stderr.take().expect("stderr is piped");
@@ -456,7 +467,7 @@ impl VideoEncoder {
         // Reap the child in every path: killed on failure,
         // awaited (still under the deadline) on stdout EOF.
         let status = if failure.is_some() {
-            let _ = child.kill();
+            kill_encoder(&mut child);
             child.wait().ok()
         } else {
             loop {
@@ -467,7 +478,7 @@ impl VideoEncoder {
                     }
                     Ok(None) => {
                         failure = Some(timeout_error());
-                        let _ = child.kill();
+                        kill_encoder(&mut child);
                         break child.wait().ok();
                     }
                     Err(_) => break None,
@@ -507,6 +518,22 @@ impl VideoEncoder {
         }
         Ok(output)
     }
+}
+
+/// Kill the encoder on a timeout or abort. On Unix the
+/// child was spawned as the leader of its own process
+/// group, so the group takes the signal too: a wrapper
+/// script's grandchildren die with it instead of running
+/// on, unaccounted for by the video gate (audit R2-31).
+/// The direct kill stays as the fallback (and is the whole
+/// story on platforms without process groups).
+fn kill_encoder(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = rustix::process::Pid::from_child(child);
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
 }
 
 /// The encoder's stderr as an error message keeps it: lossy
@@ -761,6 +788,58 @@ mod tests {
             "the encode was not killed at the timeout: {:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encoder_timeout_kills_the_whole_process_group() {
+        // Audit R2-31: the encoder is a wrapper that forks a
+        // long-lived grandchild and waits on it. Killing only
+        // the direct child would leave the grandchild running
+        // past the timeout; the group kill reaches it.
+        let dir = test_dir("fail-group");
+        let pid_file = dir.join("grandchild.pid");
+        let script = format!(
+            "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+            pid_file.display()
+        );
+        let encoder = VideoEncoder::new(
+            fake_encoder(&dir, &script),
+            Duration::from_millis(300),
+            1024 * 1024,
+        )
+        .unwrap();
+        let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
+        let started = Instant::now();
+        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the encode was not killed at the timeout: {:?}",
+            started.elapsed()
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Signal 0 finds nothing once the grandchild is gone;
+        // give the kill a moment to land before concluding.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {pid} survived the process-group kill"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// Encode two frames with the real FFmpeg and check the

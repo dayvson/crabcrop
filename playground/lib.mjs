@@ -721,6 +721,25 @@ export function explainUrl(input, nowSeconds = Math.floor(Date.now() / 1000)) {
 }
 
 /**
+ * Constant-time string equality for MAC comparison: the
+ * loop always scans the whole tag, so how much of a
+ * guessed tag is right does not leak through timing. The
+ * Rust, TypeScript, and Python verifiers all compare this
+ * way; the playground is the same code in the browser,
+ * where `node:crypto` is unavailable.
+ */
+function macEqual(a, b) {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/**
  * Verify a URL's signature locally against a secret the user
  * pasted. Returns true/false, or null when the URL is unsigned
  * or malformed.
@@ -734,5 +753,5 @@ export async function verifyUrlSignature(secret, input) {
   // No case-folding: the explainer already classifies a
   // non-lowercase tag as invalid, and the SDK verifiers
   // compare the canonical spelling as-is.
-  return expected === signature.value;
+  return macEqual(expected, signature.value);
 }

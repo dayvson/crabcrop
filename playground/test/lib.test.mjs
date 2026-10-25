@@ -82,6 +82,14 @@ test("signature verification round-trips locally", async () => {
   assert.equal(await verifyUrlSignature("s3cr3t", url), true);
   assert.equal(await verifyUrlSignature("wrong", url), false);
   assert.equal(await verifyUrlSignature("s3cr3t", url.replace("300x200", "400x200")), false);
+  // The comparison scans the whole tag (constant time): a
+  // tag differing only in its final character still fails,
+  // as does one differing only in its first.
+  const tag = url.split("/")[3];
+  const lastFlipped = tag.slice(0, -1) + (tag.endsWith("0") ? "1" : "0");
+  assert.equal(await verifyUrlSignature("s3cr3t", url.replace(tag, lastFlipped)), false);
+  const firstFlipped = (tag.startsWith("0") ? "1" : "0") + tag.slice(1);
+  assert.equal(await verifyUrlSignature("s3cr3t", url.replace(tag, firstFlipped)), false);
   const unsigned = await buildPlaygroundUrl({
     base: "https://images.example.com",
     secret: null,

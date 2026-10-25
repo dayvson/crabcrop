@@ -133,12 +133,13 @@ function encodeArg(text: string): string {
 
 function className(what: string, name: string): string {
   const trimmed = name.trim();
-  if (
-    trimmed.length < 1 ||
-    trimmed.length > 64 ||
-    !/^[\p{L}\p{N} _.\-/]+$/u.test(trimmed)
-  ) {
-    fail(what, name, "1 to 64 characters of letters, digits, space, `_`, `.`, `-`, `/`");
+  // The server's bound is on UTF-8 bytes, not UTF-16 code
+  // units: a name of multibyte characters can pass a
+  // length check here and still be rejected there, so
+  // measure the encoded form, as the explainer does.
+  const bytes = new TextEncoder().encode(trimmed).length;
+  if (bytes < 1 || bytes > 64 || !/^[\p{L}\p{N} _.\-/]+$/u.test(trimmed)) {
+    fail(what, name, "1 to 64 UTF-8 bytes of letters, digits, space, `_`, `.`, `-`, `/`");
   }
   return encodeArg(name);
 }
@@ -227,8 +228,12 @@ export const ops = {
 
   /** `preset:thumb`; expands server-side. */
   preset(name: string): string {
-    if (name === "" || name.includes("/") || name.includes(":")) {
-      fail("preset name", name, "a non-empty preset name without `/` or `:`");
+    // The server can only configure names from this
+    // charset (its preset file validation), so anything
+    // outside it is a reference that can only ever answer
+    // unknown_preset; refuse it here instead.
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      fail("preset name", name, "letters, digits, `_`, `-` (the server's preset name charset)");
     }
     return `preset:${name}`;
   },

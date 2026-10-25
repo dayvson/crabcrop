@@ -515,6 +515,7 @@ dependencies = [
  "reqwest",
  "resvg",
  "roxmltree 0.21.1",
+ "rustix",
  "serde_json",
  "sha2",
  "tokio",

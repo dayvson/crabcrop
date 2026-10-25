@@ -36,15 +36,16 @@ remainder = everything after the signature segment, exactly as it appears
 
 ## Purge signatures
 
-The purge endpoints are signed under a derived subkey, never the secret itself:
+The purge endpoints are signed under derived subkeys, never the secret itself, one subkey per endpoint:
 
 ```text
-subkey = HMAC_SHA256( key = secret, message = "crabcrop/purge-key" )   (raw bytes)
-signature for POST /purge/<signature>/<path>        = lowercase_hex( HMAC_SHA256( subkey, path ) )
-signature for POST /purge-group/<signature>/<group> = lowercase_hex( HMAC_SHA256( subkey, "purge-group/" + group ) )
+purge subkey       = HMAC_SHA256( key = secret, message = "crabcrop/purge-key" )        (raw bytes)
+purge-group subkey = HMAC_SHA256( key = secret, message = "crabcrop/purge-group-key" )  (raw bytes)
+signature for POST /purge/<signature>/<path>        = lowercase_hex( HMAC_SHA256( purge subkey, path ) )
+signature for POST /purge-group/<signature>/<group> = lowercase_hex( HMAC_SHA256( purge-group subkey, group ) )
 ```
 
-`path` is the request remainder exactly as presented. The server canonicalizes it before matching entries, so any equivalent spelling signed this way evicts the shared entry. Domain separation is the point: an image signature can never be replayed as a purge signature, and vice versa. Purges never honor `unsafe`: without a secret there is no purge, in every mode. Client libraries expose these as `purge_signature` / `purge_group_signature` helpers so the signed strings are never assembled by hand.
+`path` is the request remainder exactly as presented. The server canonicalizes it before matching entries, so any equivalent spelling signed this way evicts the shared entry. Domain separation is the point: an image signature can never be replayed as a purge signature, and vice versa, and because each purge endpoint has its own subkey, a per-target purge signature can never be transplanted to `/purge-group` (or the reverse), whatever string it was minted over. Purges never honor `unsafe`: without a secret there is no purge, in every mode. Client libraries expose these as `purge_signature` / `purge_group_signature` helpers so the signed strings are never assembled by hand.
 
 ## Upload signatures
 

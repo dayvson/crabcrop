@@ -29,15 +29,19 @@ export function purgeSignature(secret: string, target: string): string {
 }
 
 /**
- * The purge-group signature for a cache group: a purge
- * signature over the literal string `purge-group/<group>`,
- * which appears nowhere in the request URL. The helper
+ * The purge-group signature for a cache group: HMAC-SHA256
+ * of the group name under a subkey derived from the secret
+ * (the raw HMAC of the secret over the label
+ * `crabcrop/purge-group-key`), its own domain beside the
+ * purge subkey, so a per-target purge signature can never
+ * be transplanted to the purge-group endpoint. The helper
  * exists so nobody has to know the signed string. This is
  * the signature segment for
  * `POST /purge-group/<signature>/<group>`.
  */
 export function purgeGroupSignature(secret: string, group: string): string {
-  return purgeSignature(secret, `purge-group/${group}`);
+  const subkey = Buffer.from(sign(secret, "crabcrop/purge-group-key"), "hex");
+  return createHmac("sha256", subkey).update(group, "utf8").digest("hex");
 }
 
 /**
@@ -240,8 +244,14 @@ export function verifyUrlSignature(
     return matches(secret);
   }
   if (signature.keyId !== undefined) {
-    const candidate = secret[signature.keyId];
-    return candidate === undefined ? false : matches(candidate);
+    // Own properties only: key IDs are attacker-shaped text
+    // (`constructor`, `toString`, `__proto__` are all legal
+    // IDs), and an inherited lookup would hand a non-string
+    // to the HMAC and throw instead of answering false.
+    const candidate = Object.hasOwn(secret, signature.keyId)
+      ? secret[signature.keyId]
+      : undefined;
+    return typeof candidate === "string" ? matches(candidate) : false;
   }
   return Object.values(secret).some(matches);
 }
