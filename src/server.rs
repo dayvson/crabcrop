@@ -1099,6 +1099,33 @@ fn attach_cache_headers(response: &mut Response, cache_status: &str, groups: &[S
     }
 }
 
+fn generate_request_id() -> String {
+    use sha2::Digest as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let digest = sha2::Sha256::digest(format!("{nanos}-{n}").as_bytes());
+    hex::encode(&digest[..8])
+}
+
+fn request_id_from(inbound: Option<&str>) -> String {
+    if let Some(value) = inbound {
+        let value = value.trim();
+        if (1..=128).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return value.to_string();
+        }
+    }
+    generate_request_id()
+}
+
 async fn handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -1118,13 +1145,19 @@ async fn handle(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let request_id = request_id_from(headers.get("x-request-id").and_then(|v| v.to_str().ok()));
     let dpr = dpr_hint(&headers);
     let width = width_hint(&headers);
     let save_data = save_data_hint(&headers);
-    let (response, mut record) =
+    let (mut response, mut record) =
         serve(&state, path, accept.as_deref(), dpr, width, save_data).await;
+    record.request_id = request_id.clone();
     record.status = response.status().as_u16();
     record.total = started.elapsed();
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        request_id.parse().unwrap(),
+    );
     state.metrics.record(&record);
     println!("{}", record.to_json());
     response
