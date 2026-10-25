@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- Moderation verdicts in meta (issue #171). Meta requests that opt in with `moderation=1` on the `Accept: application/json` entry gain a `moderation` object. With `CRABCROP_MODERATION_MODEL` pointed at a ViT classifier export (the Falconsai nsfw_image_detection shape, Apache-2.0: a [1, 3, 224, 224] input, one logits row out, softmaxed into per-category probabilities), the object carries the model identity and `scores` in output order, rounded to 4 decimals. `CRABCROP_MODERATION_LABELS` names the outputs (one per line, count checked against the model at boot); without it, a two-output model uses `normal` and `nsfw`, and any other output count is a startup error. With no model set, the labels file instead names zero-shot prompt labels scored by the configured CLIP pair, reported under `signals` with `review_only: true`: review signals, never verdicts, sorted best first. An opt-in that cannot be answered (nothing configured, a busy AI gate, a failed inference) reports `{"available": false, "reason": ...}` and the meta request still succeeds; inference runs behind the AI gate under the same permit rules as tags and detections, and both variables join the configuration fingerprint. Scope, following the spike that de-risked this issue: verdicts only. The serve-time blur policy action is deliberately not built: a blurred and a clean render of one immutable URL are different bytes (the policy would have to join the cache key), inference would sit on every serve, and false positives would land on end users with no appeal path. If enforcement is ever revisited, verdicts should attach to the source and be cached per source, the policy decision should join the cache key, failure should fail closed to blurred, and the action should stay opt-in and off by default.
+
 ## [0.2.0] - 2026-10-25
 
 ### Added
