@@ -1164,6 +1164,17 @@ pub trait TagProvider: Send + Sync + std::fmt::Debug {
     /// callers can tune presentation and debug borderline
     /// labels from the same numbers.
     fn scores(&self, img: &DynamicImage) -> Result<Vec<TagScore>, AiError>;
+
+    /// The image embedding the scores are computed
+    /// from, L2-normalized, when the provider is an
+    /// encoder (issue #172): meta surfaces it to
+    /// clients that opt in with `embeddings=1`. The
+    /// default is `None`: a provider that is not an
+    /// encoder has no embedding to give.
+    fn embedding(&self, img: &DynamicImage) -> Result<Option<Vec<f32>>, AiError> {
+        let _ = img;
+        Ok(None)
+    }
 }
 
 /// Zero-shot tagging backed by a CLIP image/text ONNX model
@@ -1272,6 +1283,10 @@ impl std::fmt::Debug for OnnxClipProvider {
 }
 
 impl TagProvider for OnnxClipProvider {
+    fn embedding(&self, img: &DynamicImage) -> Result<Option<Vec<f32>>, AiError> {
+        Ok(Some(normalize(&self.embed_image(img)?)))
+    }
+
     fn scores(&self, img: &DynamicImage) -> Result<Vec<TagScore>, AiError> {
         let emb = normalize(&self.embed_image(img)?);
         Ok(self
@@ -1929,6 +1944,814 @@ impl ModerationProvider for ClipModerationProvider {
             signals: self.tagger.scores(img)?,
         })
     }
+}
+
+/// The outcome of one embedding run (issue #172): the
+/// configured encoder identity and its L2-normalized
+/// image embedding. Presentation (the f16 packing on
+/// the wire) is the caller's job, like score
+/// composition (issue #152).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageEmbedding {
+    /// The configured encoder identity reported in
+    /// meta: the CLIP image model path. A vector is
+    /// meaningless without the encoder that made it,
+    /// so the identity is part of the value, not
+    /// metadata about it.
+    pub model: String,
+    /// The embedding, L2-normalized (unit length), in
+    /// the encoder's projection space.
+    pub vector: Vec<f32>,
+}
+
+/// Produces image embeddings for meta responses that
+/// opt in with `embeddings=1` (issue #172).
+pub trait EmbeddingProvider: Send + Sync + std::fmt::Debug {
+    fn embed(&self, img: &DynamicImage) -> Result<ImageEmbedding, AiError>;
+}
+
+/// Image embeddings from a CLIP tag provider: the
+/// tagger's image encoder computes this vector on
+/// every annotation (the cosine scores come from it)
+/// and the annotation path discards it; this provider
+/// surfaces it, wrapped with the encoder identity the
+/// meta response reports. Wraps any `TagProvider`,
+/// like the CLIP moderation fallback (issue #171).
+pub struct ClipEmbeddingProvider {
+    tagger: std::sync::Arc<dyn TagProvider>,
+    model: String,
+}
+
+impl ClipEmbeddingProvider {
+    /// Wrap a tag provider; `model` is the identity
+    /// the meta response reports (the CLIP image model
+    /// path).
+    pub fn new(tagger: std::sync::Arc<dyn TagProvider>, model: String) -> Self {
+        Self { tagger, model }
+    }
+}
+
+impl std::fmt::Debug for ClipEmbeddingProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClipEmbeddingProvider")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmbeddingProvider for ClipEmbeddingProvider {
+    fn embed(&self, img: &DynamicImage) -> Result<ImageEmbedding, AiError> {
+        match self.tagger.embedding(img)? {
+            Some(vector) => Ok(ImageEmbedding {
+                model: self.model.clone(),
+                vector,
+            }),
+            None => Err(AiError::Inference(
+                "the configured tag provider does not produce embeddings".to_string(),
+            )),
+        }
+    }
+}
+
+/// A LAION-style linear aesthetic head (issue #172):
+/// one weight per embedding dimension plus a bias,
+/// scored as a dot product against the normalized
+/// embedding. The weights file is the PyTorch save of
+/// the head's state dict (the `sa_0_4_vit_*_linear.pth`
+/// files LAION publishes): a zip archive holding a
+/// small pickle and the raw float storages. Loading
+/// parses exactly that shape and nothing else, so a
+/// configured head fails at boot when malformed,
+/// never at the first scored request. The score is a
+/// descriptive signal only: it is not a quality gate,
+/// and nobody should build one on it.
+pub struct AestheticHead {
+    weights: Vec<f32>,
+    bias: f32,
+    /// The configured path, reported in meta as the
+    /// head's identity.
+    identity: String,
+}
+
+impl AestheticHead {
+    /// Load and validate a head file: unreadable,
+    /// unparseable, or wrongly shaped files are load
+    /// errors naming the file.
+    pub fn load(path: &str) -> Result<Self, AiError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| AiError::Load(format!("cannot read the aesthetic head {path}: {e}")))?;
+        // A linear head is a few kilobytes; the cap
+        // keeps a wrong file (a full model save, say)
+        // from being buffered and parsed as one.
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(AiError::Load(format!(
+                "the aesthetic head {path} is {} bytes: a linear head is a few kilobytes, not a model file",
+                bytes.len()
+            )));
+        }
+        let (weights, bias) = parse_aesthetic_head(&bytes)
+            .map_err(|e| AiError::Load(format!("the aesthetic head {path} is not usable: {e}")))?;
+        Self::from_weights(weights, bias, path.to_string())
+    }
+
+    /// Assemble a head from parsed weights: at least
+    /// one weight, exactly one bias (the bias is a
+    /// scalar by the time parsing is done).
+    pub(crate) fn from_weights(
+        weights: Vec<f32>,
+        bias: f32,
+        identity: String,
+    ) -> Result<Self, AiError> {
+        if weights.is_empty() {
+            return Err(AiError::Load(
+                "the aesthetic head has no weights".to_string(),
+            ));
+        }
+        Ok(Self {
+            weights,
+            bias,
+            identity,
+        })
+    }
+
+    /// The head's identity, reported in meta: the
+    /// configured path it was loaded from.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// The embedding dimension the head expects.
+    pub fn expected_dim(&self) -> usize {
+        self.weights.len()
+    }
+
+    /// Score an embedding, or `None` when its
+    /// dimension does not match the head's: a mismatch
+    /// is a soft failure the caller reports (null
+    /// score, a reason, expected vs got), never a
+    /// wrong number computed from a truncated dot
+    /// product.
+    pub fn score(&self, embedding: &[f32]) -> Option<f32> {
+        if embedding.len() != self.weights.len() {
+            return None;
+        }
+        Some(
+            self.weights
+                .iter()
+                .zip(embedding)
+                .map(|(w, e)| w * e)
+                .sum::<f32>()
+                + self.bias,
+        )
+    }
+}
+
+impl std::fmt::Debug for AestheticHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AestheticHead")
+            .field("dim", &self.weights.len())
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Extract the (weights, bias) pair from a head
+/// file's bytes: the zip entries, the pickle's state
+/// dict, and the float storages it names. Every
+/// deviation from the expected shape is an error
+/// saying what was found instead.
+fn parse_aesthetic_head(bytes: &[u8]) -> Result<(Vec<f32>, f32), String> {
+    let entries = read_zip_entries(bytes)?;
+    let entry = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.data.as_slice())
+    };
+    let pkl = entry("archive/data.pkl")
+        .ok_or("the archive holds no archive/data.pkl: not a PyTorch save")?;
+    let root = unpickle(pkl)?;
+    let PickleValue::Map(pairs) = root else {
+        return Err("the save's root is not a state dict".to_string());
+    };
+    let mut weight: Option<PickleTensor> = None;
+    let mut bias: Option<PickleTensor> = None;
+    for (key, value) in &pairs {
+        let PickleValue::Tensor(tensor) = value else {
+            return Err(format!(
+                "the state dict entry {key:?} is not a tensor: only a single linear head (weight and bias tensors) is supported"
+            ));
+        };
+        match key.as_str() {
+            "weight" => weight = Some(tensor.clone()),
+            "bias" => bias = Some(tensor.clone()),
+            _ => {
+                return Err(format!(
+                    "the state dict holds an unexpected entry {key:?}: only a single linear head (weight and bias tensors) is supported"
+                ));
+            }
+        }
+    }
+    let weight = weight.ok_or("the state dict holds no weight tensor")?;
+    let bias = bias.ok_or("the state dict holds no bias tensor")?;
+    let storage_floats = |tensor: &PickleTensor| -> Result<Vec<f32>, String> {
+        let name = format!("archive/data/{}", tensor.storage);
+        let data = entry(&name).ok_or_else(|| {
+            format!("the archive holds no {name}: the tensor's storage is missing")
+        })?;
+        if data.len() % 4 != 0 {
+            return Err(format!(
+                "the storage {name} is {} bytes, not a whole number of float32 values",
+                data.len()
+            ));
+        }
+        let floats: Vec<f32> = data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let count = tensor.size.iter().product::<usize>();
+        let end = tensor
+            .offset
+            .checked_add(count)
+            .ok_or("the tensor size overflows")?;
+        if end > floats.len() {
+            return Err(format!(
+                "the tensor overruns its storage: offset {} plus {count} values against {} stored",
+                tensor.offset,
+                floats.len()
+            ));
+        }
+        Ok(floats[tensor.offset..end].to_vec())
+    };
+    let weights = storage_floats(&weight)?;
+    if weights.is_empty() {
+        return Err("the weight tensor is empty".to_string());
+    }
+    let bias = storage_floats(&bias)?;
+    if bias.len() != 1 {
+        return Err(format!(
+            "the bias tensor holds {} values: a linear head's bias is a single value",
+            bias.len()
+        ));
+    }
+    Ok((weights, bias[0]))
+}
+
+/// One entry of a zip archive, extracted.
+struct ZipEntry {
+    name: String,
+    data: Vec<u8>,
+}
+
+/// Read every entry of a zip archive held in memory.
+/// Deliberately minimal, sized for the few-kilobyte
+/// saves `torch.save` writes for a linear head:
+/// stored and deflated entries, no encryption, no
+/// zip64, no multi-disk archives; anything else is
+/// an error naming the limitation. Entry payloads are
+/// capped as they inflate, so a hostile archive
+/// cannot expand without bound.
+fn read_zip_entries(bytes: &[u8]) -> Result<Vec<ZipEntry>, String> {
+    let u16_at = |at: usize| -> Result<u16, String> {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .ok_or_else(|| "the archive is truncated".to_string())
+    };
+    let u32_at = |at: usize| -> Result<u32, String> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| "the archive is truncated".to_string())
+    };
+    // The end-of-central-directory record closes the
+    // file; scan the largest window a comment allows,
+    // from the end.
+    let window = bytes.len().saturating_sub(22 + u16::MAX as usize);
+    let mut eocd = None;
+    let mut at = bytes.len();
+    while at > window {
+        at -= 1;
+        if bytes[at..].starts_with(b"PK\x05\x06") {
+            eocd = Some(at);
+            break;
+        }
+    }
+    let eocd = eocd.ok_or("no end-of-central-directory record: not a zip archive")?;
+    if u16_at(eocd + 4)? != 0 || u16_at(eocd + 6)? != 0 {
+        return Err("multi-disk archives are not supported".to_string());
+    }
+    let count = u16_at(eocd + 10)? as usize;
+    if count > 64 {
+        return Err(format!(
+            "the archive holds {count} entries: a head save holds a handful"
+        ));
+    }
+    let mut dir = u32_at(eocd + 16)? as usize;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        if !bytes
+            .get(dir..)
+            .is_some_and(|b| b.starts_with(b"PK\x01\x02"))
+        {
+            return Err("the central directory is malformed".to_string());
+        }
+        let method = u16_at(dir + 10)?;
+        let compressed_len = u32_at(dir + 20)? as usize;
+        let plain_len = u32_at(dir + 24)? as usize;
+        let name_len = u16_at(dir + 28)? as usize;
+        let extra_len = u16_at(dir + 30)? as usize;
+        let comment_len = u16_at(dir + 32)? as usize;
+        let local_at = u32_at(dir + 42)? as usize;
+        if compressed_len == u32::MAX as usize || plain_len == u32::MAX as usize {
+            return Err("zip64 archives are not supported".to_string());
+        }
+        let name_bytes = bytes
+            .get(dir + 46..dir + 46 + name_len)
+            .ok_or("the central directory is truncated")?;
+        let name = String::from_utf8_lossy(name_bytes).into_owned();
+        if !bytes
+            .get(local_at..)
+            .is_some_and(|b| b.starts_with(b"PK\x03\x04"))
+        {
+            return Err(format!("the local header for {name} is malformed"));
+        }
+        let data_at =
+            local_at + 30 + u16_at(local_at + 26)? as usize + u16_at(local_at + 28)? as usize;
+        let raw = bytes
+            .get(data_at..data_at + compressed_len)
+            .ok_or("the archive is truncated")?;
+        let data = match method {
+            0 => raw.to_vec(),
+            8 => {
+                use std::io::Read;
+                let mut out = Vec::new();
+                flate2::read::DeflateDecoder::new(raw)
+                    .take((plain_len + 1) as u64)
+                    .read_to_end(&mut out)
+                    .map_err(|e| format!("the entry {name} does not inflate: {e}"))?;
+                out
+            }
+            _ => {
+                return Err(format!(
+                    "the entry {name} uses unsupported compression method {method}"
+                ));
+            }
+        };
+        if data.len() != plain_len {
+            return Err(format!(
+                "the entry {name} holds {} bytes against the directory's {plain_len}",
+                data.len()
+            ));
+        }
+        entries.push(ZipEntry { name, data });
+        dir += 46 + name_len + extra_len + comment_len;
+    }
+    Ok(entries)
+}
+
+/// A tensor reference out of the pickle machine: the
+/// storage it reads from, the element offset into it,
+/// and its shape. Only the flat element sequence is
+/// consumed (in storage order), so the stride never
+/// matters here.
+#[derive(Debug, Clone, PartialEq)]
+struct PickleTensor {
+    storage: String,
+    offset: usize,
+    size: Vec<usize>,
+}
+
+/// A value on the restricted pickle machine's stack.
+#[derive(Debug, Clone, PartialEq)]
+enum PickleValue {
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    /// A global that has not been called: (module,
+    /// name). Only a small allowlist is callable, and
+    /// only through REDUCE.
+    Global(String, String),
+    Tuple(Vec<PickleValue>),
+    /// A tensor storage, by the archive member key its
+    /// bytes live under (`archive/data/<key>`).
+    Storage(String),
+    Tensor(PickleTensor),
+    /// An insertion-ordered string-keyed map: the
+    /// state dict itself, and plain dicts (the BUILD
+    /// state) share the shape.
+    Map(Vec<(String, PickleValue)>),
+}
+
+/// A restricted pickle interpreter, sized for the
+/// state dicts `torch.save` writes for a linear head:
+/// an ordered dict of tensor rebuilds over float
+/// storages, with memo references. The opcode set is
+/// an allowlist; anything else (a code-carrying
+/// global, a reduce of an unknown callable, an
+/// unexpected structure) is an error, so a hostile or
+/// merely different save fails at load instead of
+/// being half-parsed. This is a data reader, not a
+/// general unpickler: it cannot construct arbitrary
+/// objects and never touches the filesystem.
+struct PickleMachine<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    stack: Vec<PickleValue>,
+    marks: Vec<usize>,
+    memo: Vec<Option<PickleValue>>,
+}
+
+impl<'a> PickleMachine<'a> {
+    fn run(mut self) -> Result<PickleValue, String> {
+        loop {
+            let op = self.byte().ok_or("the pickle ends without a STOP")?;
+            match op {
+                // PROTO: the version byte is advisory;
+                // the opcode allowlist below is the
+                // real gate.
+                0x80 => {
+                    self.byte().ok_or("the pickle ends inside PROTO")?;
+                }
+                // GLOBAL: 'c' module '\n' name '\n'
+                b'c' => {
+                    let module = self.line()?;
+                    let name = self.line()?;
+                    self.stack.push(PickleValue::Global(module, name));
+                }
+                // BINUNICODE / SHORT_BINUNICODE /
+                // SHORT_BINSTRING: length-prefixed
+                // strings (the state dict's keys and the
+                // storage arguments).
+                b'X' => {
+                    let len = self.u32()? as usize;
+                    let raw = self.take(len)?;
+                    self.stack
+                        .push(PickleValue::Str(String::from_utf8(raw.to_vec()).map_err(
+                            |_| "a pickle string is not valid UTF-8".to_string(),
+                        )?));
+                }
+                0x8c => {
+                    let len = self.byte().ok_or("the pickle ends inside a short string")? as usize;
+                    let raw = self.take(len)?;
+                    self.stack
+                        .push(PickleValue::Str(String::from_utf8(raw.to_vec()).map_err(
+                            |_| "a pickle string is not valid UTF-8".to_string(),
+                        )?));
+                }
+                b'U' => {
+                    let len = self.byte().ok_or("the pickle ends inside a short string")? as usize;
+                    let raw = self.take(len)?;
+                    self.stack
+                        .push(PickleValue::Str(String::from_utf8_lossy(raw).into_owned()));
+                }
+                // Integers: BININT1, BININT2, BININT,
+                // LONG (a decimal line), LONG1/LONG4
+                // (little-endian two's complement).
+                b'K' => {
+                    let v = self.byte().ok_or("the pickle ends inside BININT1")?;
+                    self.stack.push(PickleValue::Int(v as i64));
+                }
+                b'M' => {
+                    let v = self.u16()?;
+                    self.stack.push(PickleValue::Int(v as i64));
+                }
+                b'J' => {
+                    let v = self.u32()? as i32;
+                    self.stack.push(PickleValue::Int(v as i64));
+                }
+                b'L' => {
+                    let raw = self.line()?;
+                    let digits = raw.strip_suffix('L').unwrap_or(&raw);
+                    let v: i64 = digits
+                        .parse()
+                        .map_err(|_| format!("a pickle LONG is not a number: {raw:?}"))?;
+                    self.stack.push(PickleValue::Int(v));
+                }
+                0x8a | 0x8b => {
+                    let len = if op == 0x8a {
+                        self.byte().ok_or("the pickle ends inside LONG1")? as usize
+                    } else {
+                        self.u32()? as usize
+                    };
+                    if len > 8 {
+                        return Err("a pickle long is too large for a head file".to_string());
+                    }
+                    let raw = self.take(len)?;
+                    let mut v: i64 = 0;
+                    for (i, b) in raw.iter().enumerate() {
+                        v |= (*b as i64) << (8 * i);
+                    }
+                    if len > 0 && len < 8 && raw[len - 1] & 0x80 != 0 {
+                        v -= 1i64 << (8 * len);
+                    }
+                    self.stack.push(PickleValue::Int(v));
+                }
+                // BINFLOAT: big-endian f64.
+                b'G' => {
+                    let raw = self.take(8)?;
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(raw);
+                    self.stack.push(PickleValue::Float(f64::from_be_bytes(buf)));
+                }
+                b'N' => self.stack.push(PickleValue::None),
+                0x88 => self.stack.push(PickleValue::Bool(false)),
+                0x89 => self.stack.push(PickleValue::Bool(true)),
+                b')' => self.stack.push(PickleValue::Tuple(Vec::new())),
+                b'(' => self.marks.push(self.stack.len()),
+                b't' => {
+                    let from = self.mark()?;
+                    let items: Vec<PickleValue> = self.stack.drain(from..).collect();
+                    self.stack.push(PickleValue::Tuple(items));
+                }
+                0x85..=0x87 => {
+                    let n = (op - 0x84) as usize;
+                    if self.stack.len() < n {
+                        return Err("the pickle's stack underflows at a tuple".to_string());
+                    }
+                    let items: Vec<PickleValue> =
+                        self.stack.drain(self.stack.len() - n..).collect();
+                    self.stack.push(PickleValue::Tuple(items));
+                }
+                // BINPERSID: torch's persistent id for a
+                // storage, a tuple of (the word
+                // "storage", the storage class, the
+                // archive key, the location, the element
+                // count). Only the key is used.
+                b'Q' => {
+                    let value = self.pop()?;
+                    let PickleValue::Tuple(parts) = &value else {
+                        return Err("a pickle persistent id is not a tuple".to_string());
+                    };
+                    let [
+                        PickleValue::Str(kind),
+                        PickleValue::Global(_, class),
+                        PickleValue::Str(key),
+                        ..,
+                    ] = parts.as_slice()
+                    else {
+                        return Err("a pickle persistent id does not name a storage".to_string());
+                    };
+                    if kind.as_str() != "storage" || !class.contains("Storage") {
+                        return Err(format!(
+                            "a pickle persistent id names {kind} {class}, not a storage"
+                        ));
+                    }
+                    self.stack.push(PickleValue::Storage(key.clone()));
+                }
+                // REDUCE: call an allowlisted global.
+                b'R' => {
+                    let args = self.pop()?;
+                    let callable = self.pop()?;
+                    let PickleValue::Global(module, name) = callable else {
+                        return Err("a pickle REDUCE target is not a global".to_string());
+                    };
+                    let PickleValue::Tuple(args) = args else {
+                        return Err("a pickle REDUCE argument is not a tuple".to_string());
+                    };
+                    let value = reduce(&module, &name, args)?;
+                    self.stack.push(value);
+                }
+                b'}' => self.stack.push(PickleValue::Map(Vec::new())),
+                // SETITEM: value, then key, onto the map
+                // below them.
+                b's' => {
+                    let value = self.pop()?;
+                    let key = self.pop()?;
+                    let PickleValue::Str(key) = key else {
+                        return Err("a pickle dict key is not a string".to_string());
+                    };
+                    let Some(PickleValue::Map(pairs)) = self.stack.last_mut() else {
+                        return Err("a pickle SETITEM has no dict under it".to_string());
+                    };
+                    set_map_entry(pairs, key, value);
+                }
+                // SETITEMS: key/value pairs since the
+                // mark, onto the map below it.
+                b'u' => {
+                    let from = self.mark()?;
+                    let items: Vec<PickleValue> = self.stack.drain(from..).collect();
+                    if !items.len().is_multiple_of(2) {
+                        return Err("a pickle SETITEMS holds an odd item count".to_string());
+                    }
+                    let Some(PickleValue::Map(pairs)) = self.stack.last_mut() else {
+                        return Err("a pickle SETITEMS has no dict under it".to_string());
+                    };
+                    let mut iter = items.into_iter();
+                    while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+                        let PickleValue::Str(key) = k else {
+                            return Err("a pickle dict key is not a string".to_string());
+                        };
+                        set_map_entry(pairs, key, v);
+                    }
+                }
+                // BUILD: the state (a metadata dict in
+                // torch saves) is validated as data and
+                // discarded; the built object stays.
+                b'b' => {
+                    let state = self.pop()?;
+                    if !matches!(state, PickleValue::Map(_) | PickleValue::None) {
+                        return Err("a pickle BUILD state is not a dict".to_string());
+                    }
+                    if self.stack.is_empty() {
+                        return Err("a pickle BUILD has no object under it".to_string());
+                    }
+                }
+                // BINPUT / LONG_BINPUT: memoize the
+                // stack top.
+                b'q' => {
+                    let at = self.byte().ok_or("the pickle ends inside BINPUT")? as usize;
+                    self.put_memo(at)?;
+                }
+                b'r' => {
+                    let at = self.u32()? as usize;
+                    self.put_memo(at)?;
+                }
+                // BINGET / LONG_BINGET.
+                b'h' => {
+                    let at = self.byte().ok_or("the pickle ends inside BINGET")? as usize;
+                    self.get_memo(at)?;
+                }
+                b'j' => {
+                    let at = self.u32()? as usize;
+                    self.get_memo(at)?;
+                }
+                b'.' => {
+                    if self.stack.len() != 1 {
+                        return Err(format!(
+                            "the pickle ends with {} values on the stack, not one",
+                            self.stack.len()
+                        ));
+                    }
+                    return Ok(self.stack.pop().unwrap());
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported pickle opcode 0x{op:02x}: not a head state dict shape this loader reads"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.bytes.get(self.at)?;
+        self.at += 1;
+        Some(b)
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let raw = self
+            .bytes
+            .get(self.at..self.at + len)
+            .ok_or("the pickle is truncated")?;
+        self.at += len;
+        Ok(raw)
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        let raw = self.take(2)?;
+        Ok(u16::from_le_bytes([raw[0], raw[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        let raw = self.take(4)?;
+        Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    fn line(&mut self) -> Result<String, String> {
+        let start = self.at;
+        let end = self
+            .bytes
+            .iter()
+            .skip(start)
+            .position(|b| *b == b'\n')
+            .map(|p| start + p)
+            .ok_or("the pickle ends inside a line")?;
+        let raw = &self.bytes[start..end];
+        self.at = end + 1;
+        String::from_utf8(raw.to_vec()).map_err(|_| "a pickle line is not valid UTF-8".to_string())
+    }
+
+    fn pop(&mut self) -> Result<PickleValue, String> {
+        self.stack
+            .pop()
+            .ok_or_else(|| "the pickle's stack underflows".to_string())
+    }
+
+    fn mark(&mut self) -> Result<usize, String> {
+        self.marks
+            .pop()
+            .ok_or_else(|| "the pickle has a tuple or items opcode with no mark".to_string())
+    }
+
+    fn put_memo(&mut self, at: usize) -> Result<(), String> {
+        if at > 4096 {
+            return Err("a pickle memo index is implausibly large".to_string());
+        }
+        let value = self
+            .stack
+            .last()
+            .cloned()
+            .ok_or("a pickle memo stores an empty stack")?;
+        if self.memo.len() <= at {
+            self.memo.resize(at + 1, None);
+        }
+        self.memo[at] = Some(value);
+        Ok(())
+    }
+
+    fn get_memo(&mut self, at: usize) -> Result<(), String> {
+        let value = self
+            .memo
+            .get(at)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| format!("a pickle memo reference to {at} was never stored"))?;
+        self.stack.push(value);
+        Ok(())
+    }
+}
+
+/// The REDUCE allowlist: build an ordered dict, or
+/// rebuild a tensor over a storage. Anything else is
+/// refused by name, so the failure says what the save
+/// tried to do.
+fn reduce(module: &str, name: &str, args: Vec<PickleValue>) -> Result<PickleValue, String> {
+    match (module, name) {
+        ("collections", "OrderedDict") => {
+            if args.is_empty() {
+                Ok(PickleValue::Map(Vec::new()))
+            } else {
+                Err("an OrderedDict reduce with arguments is not a state dict".to_string())
+            }
+        }
+        ("torch._utils", "_rebuild_tensor_v2") | ("torch._utils", "_rebuild_tensor") => {
+            let mut args = args.into_iter();
+            let storage = match args.next() {
+                Some(PickleValue::Storage(key)) => key,
+                _ => return Err("a tensor rebuild does not start from a storage".to_string()),
+            };
+            let offset = match args.next() {
+                Some(PickleValue::Int(v)) if v >= 0 => v as usize,
+                _ => return Err("a tensor rebuild has no valid offset".to_string()),
+            };
+            let size = match args.next() {
+                Some(PickleValue::Tuple(items)) => {
+                    let mut size = Vec::with_capacity(items.len());
+                    for item in items {
+                        match item {
+                            PickleValue::Int(v) if v >= 0 => size.push(v as usize),
+                            _ => return Err("a tensor rebuild has an invalid size".to_string()),
+                        }
+                    }
+                    size
+                }
+                _ => return Err("a tensor rebuild has no size".to_string()),
+            };
+            // The stride, the requires-grad flag, and
+            // any later arguments are validated only
+            // as data: the weights are read flat, in
+            // storage order.
+            Ok(PickleValue::Tensor(PickleTensor {
+                storage,
+                offset,
+                size,
+            }))
+        }
+        _ => Err(format!(
+            "unsupported pickle callable {module}.{name}: not a head state dict shape this loader reads"
+        )),
+    }
+}
+
+/// Insert or replace one entry of a pickle map.
+fn set_map_entry(pairs: &mut Vec<(String, PickleValue)>, key: String, value: PickleValue) {
+    if let Some(slot) = pairs.iter_mut().find(|(k, _)| *k == key) {
+        slot.1 = value;
+    } else {
+        pairs.push((key, value));
+    }
+}
+
+/// Run the restricted pickle machine over a
+/// `data.pkl` payload.
+fn unpickle(bytes: &[u8]) -> Result<PickleValue, String> {
+    if bytes.len() > 1024 * 1024 {
+        return Err("the data.pkl is implausibly large for a head state dict".to_string());
+    }
+    PickleMachine {
+        bytes,
+        at: 0,
+        stack: Vec::new(),
+        marks: Vec::new(),
+        memo: Vec::new(),
+    }
+    .run()
 }
 
 /// Resolve the category names for a moderation model
@@ -3539,5 +4362,415 @@ mod focal_tests {
                 "{dims:?}: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod embedding_tests {
+    use super::*;
+
+    fn solid() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            16,
+            16,
+            image::Rgb([120, 120, 120]),
+        ))
+    }
+
+    fn temp_file(tag: &str, contents: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "crabcrop-embedding-{tag}-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn missing_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "crabcrop-embedding-missing-{tag}-{}.pth",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn expect_load<T>(result: Result<T, AiError>) -> String {
+        match result {
+            Err(AiError::Load(message)) => message,
+            Err(other) => panic!("expected a load error, got {other}"),
+            Ok(_) => panic!("expected a load error, but the load succeeded"),
+        }
+    }
+
+    #[derive(Debug)]
+    struct EmbeddingTagger(Result<Option<Vec<f32>>, AiError>);
+
+    impl TagProvider for EmbeddingTagger {
+        fn scores(&self, _img: &DynamicImage) -> Result<Vec<TagScore>, AiError> {
+            Ok(Vec::new())
+        }
+
+        fn embedding(&self, _img: &DynamicImage) -> Result<Option<Vec<f32>>, AiError> {
+            self.0.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScoresOnlyTagger;
+
+    impl TagProvider for ScoresOnlyTagger {
+        fn scores(&self, _img: &DynamicImage) -> Result<Vec<TagScore>, AiError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn tag_provider_embedding_defaults_to_none() {
+        // A provider that is not an encoder has no
+        // embedding to give; the default says so
+        // instead of failing.
+        assert_eq!(ScoresOnlyTagger.embedding(&solid()).unwrap(), None);
+    }
+
+    #[test]
+    fn clip_embedding_provider_surfaces_the_tagger_vector() {
+        let tagger = EmbeddingTagger(Ok(Some(vec![0.6, 0.8])));
+        let provider =
+            ClipEmbeddingProvider::new(std::sync::Arc::new(tagger), "clip.onnx".to_string());
+        let embedding = provider.embed(&solid()).unwrap();
+        assert_eq!(embedding.model, "clip.onnx");
+        assert_eq!(embedding.vector, vec![0.6, 0.8]);
+    }
+
+    #[test]
+    fn clip_embedding_provider_reports_a_tagger_without_embeddings() {
+        let tagger = EmbeddingTagger(Ok(None));
+        let provider =
+            ClipEmbeddingProvider::new(std::sync::Arc::new(tagger), "clip.onnx".to_string());
+        let err = provider.embed(&solid()).unwrap_err();
+        assert!(matches!(err, AiError::Inference(_)), "{err}");
+        assert!(
+            err.to_string().contains("does not produce embeddings"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn clip_embedding_provider_propagates_tagger_failures() {
+        let tagger = EmbeddingTagger(Err(AiError::Inference("boom".to_string())));
+        let provider =
+            ClipEmbeddingProvider::new(std::sync::Arc::new(tagger), "clip.onnx".to_string());
+        let err = provider.embed(&solid()).unwrap_err();
+        assert!(matches!(err, AiError::Inference(_)), "{err}");
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn aesthetic_head_scores_a_matching_embedding() {
+        let head = AestheticHead::from_weights(vec![0.5, -0.25, 2.0], 0.75, "head.pth".to_string())
+            .unwrap();
+        assert_eq!(head.expected_dim(), 3);
+        assert_eq!(head.identity(), "head.pth");
+        // 0.5*2 + (-0.25)*4 + 2*0.5 + 0.75 = 1.75.
+        let score = head.score(&[2.0, 4.0, 0.5]).unwrap();
+        assert!((score - 1.75).abs() < 1e-6, "score {score}");
+    }
+
+    #[test]
+    fn aesthetic_head_dimension_mismatch_scores_none() {
+        let head = AestheticHead::from_weights(vec![0.5, -0.25, 2.0], 0.75, "head.pth".to_string())
+            .unwrap();
+        assert_eq!(head.score(&[1.0, 2.0]), None);
+        assert_eq!(head.score(&[1.0, 2.0, 3.0, 4.0]), None);
+    }
+
+    /// A pickle string (BINUNICODE) for the synthetic
+    /// head saves below.
+    fn pkl_str(out: &mut Vec<u8>, s: &str) {
+        out.push(b'X');
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// The pickle `torch.save` writes for a linear
+    /// head's state dict, reduced to the shape the
+    /// loader reads: an ordered dict holding a weight
+    /// tensor over storage "0" and a bias tensor over
+    /// storage "1", closed by the metadata BUILD tail.
+    /// Memo indices follow the real files.
+    fn head_pickle(dim: usize, bias_count: usize) -> Vec<u8> {
+        let mut p = Vec::new();
+        let binint2 = |p: &mut Vec<u8>, v: usize| {
+            p.push(b'M');
+            p.extend_from_slice(&(v as u16).to_le_bytes());
+        };
+        // PROTO 2, then the root OrderedDict.
+        p.extend_from_slice(b"\x80\x02");
+        p.extend_from_slice(b"ccollections\nOrderedDict\n");
+        p.extend_from_slice(b"q\x00)Rq\x01");
+        p.push(b'(');
+        // The weight entry.
+        pkl_str(&mut p, "weight");
+        p.extend_from_slice(b"q\x02");
+        p.extend_from_slice(b"ctorch._utils\n_rebuild_tensor_v2\n");
+        p.extend_from_slice(b"q\x03");
+        p.push(b'(');
+        p.push(b'(');
+        pkl_str(&mut p, "storage");
+        p.extend_from_slice(b"q\x04");
+        p.extend_from_slice(b"ctorch\nFloatStorage\n");
+        p.extend_from_slice(b"q\x05");
+        pkl_str(&mut p, "0");
+        p.extend_from_slice(b"q\x06");
+        pkl_str(&mut p, "cpu");
+        p.extend_from_slice(b"q\x07");
+        binint2(&mut p, dim);
+        p.extend_from_slice(b"tq\x08");
+        p.push(b'Q'); // BINPERSID: the storage tuple
+        p.extend_from_slice(b"K\x00"); // offset 0
+        p.extend_from_slice(b"K\x01"); // size (1, dim)
+        binint2(&mut p, dim);
+        p.extend_from_slice(b"\x86q\x09");
+        binint2(&mut p, dim); // stride (dim, 1)
+        p.extend_from_slice(b"K\x01\x86q\x0a");
+        p.extend_from_slice(b"\x89"); // requires_grad: false
+        p.extend_from_slice(b"h\x00)"); // hooks: an empty OrderedDict, reduced next
+        p.extend_from_slice(b"Rq\x0btq\x0cRq\x0d");
+        // The bias entry, reusing the memoized globals.
+        pkl_str(&mut p, "bias");
+        p.extend_from_slice(b"q\x0e");
+        p.extend_from_slice(b"h\x03");
+        p.push(b'(');
+        p.push(b'(');
+        p.extend_from_slice(b"h\x04h\x05");
+        pkl_str(&mut p, "1");
+        p.extend_from_slice(b"q\x0f");
+        p.extend_from_slice(b"h\x07");
+        p.push(b'K');
+        p.push(bias_count as u8);
+        p.extend_from_slice(b"tq\x10");
+        p.push(b'Q');
+        p.extend_from_slice(b"K\x00"); // offset 0
+        p.push(b'K');
+        p.push(bias_count as u8); // size (bias_count,)
+        p.extend_from_slice(b"\x85q\x11");
+        p.extend_from_slice(b"K\x01"); // stride (1,)
+        p.extend_from_slice(b"\x85q\x12");
+        p.extend_from_slice(b"\x89");
+        p.extend_from_slice(b"h\x00)");
+        p.extend_from_slice(b"Rq\x13tq\x14Rq\x15");
+        p.push(b'u'); // SETITEMS into the root dict
+        // The BUILD tail: a state dict whose only
+        // entry is an empty _metadata dict.
+        p.push(b'}');
+        p.extend_from_slice(b"q\x16");
+        pkl_str(&mut p, "_metadata");
+        p.extend_from_slice(b"q\x17");
+        p.extend_from_slice(b"h\x00)Rq\x18");
+        p.push(b's');
+        p.push(b'b');
+        p.push(b'.');
+        p
+    }
+
+    /// Wrap a pickle and its storages in a stored-entry
+    /// zip archive of the shape `torch.save` writes.
+    fn head_archive(pkl: &[u8], storages: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut central: Vec<u8> = Vec::new();
+        let mut entries: Vec<(&str, &[u8])> = vec![("archive/data.pkl", pkl)];
+        entries.extend_from_slice(storages);
+        entries.push(("archive/version", b"3\n"));
+        for (name, data) in &entries {
+            let local_at = out.len() as u32;
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+            out.extend_from_slice(&0u32.to_le_bytes()); // time and date
+            out.extend_from_slice(&0u32.to_le_bytes()); // crc (the reader ignores it)
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&local_at.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_at = out.len() as u32;
+        let cd_len = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_len.to_le_bytes());
+        out.extend_from_slice(&cd_at.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn floats_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn aesthetic_head_loads_a_synthetic_pth() {
+        let weights = [0.5f32, -0.25, 2.0];
+        let archive = head_archive(
+            &head_pickle(3, 1),
+            &[
+                ("archive/data/0", &floats_bytes(&weights)),
+                ("archive/data/1", &floats_bytes(&[0.75])),
+            ],
+        );
+        let path = temp_file("head-ok", &archive);
+        let head = AestheticHead::load(&path).unwrap();
+        assert_eq!(head.expected_dim(), 3);
+        let score = head.score(&[2.0, 4.0, 0.5]).unwrap();
+        assert!((score - 1.75).abs() < 1e-6, "score {score}");
+    }
+
+    #[test]
+    fn aesthetic_head_load_rejects_garbage_and_missing_files() {
+        let path = temp_file("head-garbage", b"this is not a zip archive at all");
+        let err = expect_load(AestheticHead::load(&path));
+        assert!(err.contains("not usable"), "{err}");
+        let err = expect_load(AestheticHead::load(&missing_path("head")));
+        assert!(err.contains("cannot read the aesthetic head"), "{err}");
+    }
+
+    #[test]
+    fn aesthetic_head_rejects_an_archive_without_a_pickle() {
+        let archive = head_archive(b"", &[]);
+        // An empty pickle payload is not a state dict;
+        // the failure must be a load error either way.
+        let path = temp_file("head-empty-pkl", &archive);
+        let err = expect_load(AestheticHead::load(&path));
+        assert!(err.contains("not usable"), "{err}");
+    }
+
+    #[test]
+    fn aesthetic_head_rejects_a_multi_value_bias() {
+        let archive = head_archive(
+            &head_pickle(3, 2),
+            &[
+                ("archive/data/0", &floats_bytes(&[0.5, -0.25, 2.0])),
+                ("archive/data/1", &floats_bytes(&[0.75, 0.5])),
+            ],
+        );
+        let path = temp_file("head-wide-bias", &archive);
+        let err = expect_load(AestheticHead::load(&path));
+        assert!(err.contains("bias is a single value"), "{err}");
+    }
+
+    #[test]
+    fn aesthetic_head_rejects_a_storage_shorter_than_the_tensor() {
+        let archive = head_archive(
+            &head_pickle(3, 1),
+            &[
+                ("archive/data/0", &floats_bytes(&[0.5, -0.25])),
+                ("archive/data/1", &floats_bytes(&[0.75])),
+            ],
+        );
+        let path = temp_file("head-short-storage", &archive);
+        let err = expect_load(AestheticHead::load(&path));
+        assert!(err.contains("overruns its storage"), "{err}");
+    }
+
+    #[test]
+    fn unpickle_refuses_an_unknown_callable_by_name() {
+        // A reduce of os.system is the canonical
+        // hostile pickle; the machine refuses it
+        // before anything runs (nothing here can run:
+        // the machine only builds data).
+        let pkl = b"\x80\x02cos\nsystem\n)R.".to_vec();
+        let err = unpickle(&pkl).unwrap_err();
+        assert!(
+            err.contains("unsupported pickle callable os.system"),
+            "{err}"
+        );
+    }
+
+    /// Real-model verification, run manually with the
+    /// CLIP pair and the LAION B/32 head the spike used:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_CLIP_IMAGE_MODEL=...
+    /// CRABCROP_TEST_CLIP_TEXT_MODEL=... CRABCROP_TEST_CLIP_TOKENIZER=...
+    /// CRABCROP_TEST_CLIP_LABELS=... CRABCROP_TEST_AESTHETIC_HEAD=...
+    /// cargo test -- --ignored embedding_and_aesthetic_with_the_real_models
+    /// Set CRABCROP_TEST_AESTHETIC_IMAGE to also score
+    /// that image (the spike's kite beach photo, 6.84).
+    #[test]
+    #[ignore = "needs the ONNX runtime, CLIP model files, and a head file (env-configured)"]
+    fn embedding_and_aesthetic_with_the_real_models() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let image_model = var("CRABCROP_TEST_CLIP_IMAGE_MODEL");
+        let tagger = OnnxClipProvider::load(
+            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
+            &image_model,
+            &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
+            &var("CRABCROP_TEST_CLIP_TOKENIZER"),
+            &var("CRABCROP_TEST_CLIP_LABELS"),
+        )
+        .unwrap();
+        let provider = ClipEmbeddingProvider::new(std::sync::Arc::new(tagger), image_model.clone());
+        let head = AestheticHead::load(&var("CRABCROP_TEST_AESTHETIC_HEAD")).unwrap();
+        assert_eq!(head.expected_dim(), 512);
+        let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
+        let img = image::load_from_memory(bytes).unwrap();
+        let embedding = provider.embed(&img).unwrap();
+        assert_eq!(embedding.model, image_model);
+        assert_eq!(embedding.vector.len(), 512);
+        let norm: f32 = embedding.vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "norm {norm}");
+        // The spike scored this fixture 7.03 through
+        // the reference pipeline on the B/32 head; the
+        // band leaves room for preprocessing wobble
+        // between the two pipelines.
+        let score = head.score(&embedding.vector).unwrap();
+        assert!((6.5..=7.6).contains(&score), "portrait score {score}");
+        if let Ok(path) = std::env::var("CRABCROP_TEST_AESTHETIC_IMAGE") {
+            let img = image::open(&path).unwrap();
+            let embedding = provider.embed(&img).unwrap();
+            let score = head.score(&embedding.vector).unwrap();
+            // The spike's kite beach score: 6.84.
+            assert!((6.3..=7.4).contains(&score), "image score {score}");
+        }
+    }
+
+    /// A head written for a different encoder loads
+    /// fine: the dimension mismatch is a request-time
+    /// soft failure, not a load error.
+    /// CRABCROP_TEST_AESTHETIC_HEAD_L14=...
+    /// cargo test -- --ignored aesthetic_head_for_another_encoder
+    #[test]
+    #[ignore = "needs a head file for another encoder (env-configured)"]
+    fn aesthetic_head_for_another_encoder_loads_and_scores_none() {
+        let head = AestheticHead::load(&std::env::var("CRABCROP_TEST_AESTHETIC_HEAD_L14").unwrap())
+            .unwrap();
+        assert_eq!(head.expected_dim(), 768);
+        // A 512-dim embedding against the 768 head:
+        // no score, and no panic.
+        assert_eq!(head.score(&vec![0.03; 512]), None);
+        assert!(head.score(&vec![0.03; 768]).is_some());
     }
 }
