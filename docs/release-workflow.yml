@@ -195,13 +195,18 @@ jobs:
           # The meson wheel is platform-independent, so pin
           # its hash too; ninja wheels are per-platform, so
           # there the version pin is what pip can enforce.
+          # pip has no --hash option (v0.1.1's first release
+          # run failed on exactly that); hashes are declared
+          # in a requirements file, so write one and install
+          # from it with --require-hashes.
           if [ "$RUNNER_OS" = "macOS" ]; then
             pip_flags="--user --break-system-packages"
           else
             pip_flags="--user"
           fi
+          printf '%s\n' 'meson==1.12.1 --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02' > meson-requirements.txt
           # shellcheck disable=SC2086
-          python3 -m pip install $pip_flags --require-hashes "meson==1.12.1" --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02
+          python3 -m pip install $pip_flags --require-hashes -r meson-requirements.txt
           # shellcheck disable=SC2086
           python3 -m pip install $pip_flags "ninja==1.13.2"
           if [ "$RUNNER_OS" = "macOS" ]; then
@@ -487,6 +492,12 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # The prepack build needs the locked dev dependencies
+      # (typescript, @types/node); without this install the
+      # build fails on a clean runner (v0.1.1's first run).
+      - name: Install SDK dependencies
+        working-directory: sdks/typescript
+        run: npm ci
       - name: npm publish
         working-directory: sdks/typescript
         run: npm publish --access public
