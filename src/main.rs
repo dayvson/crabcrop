@@ -1177,6 +1177,25 @@ struct DetectorDeclaration {
     threshold: Option<f32>,
 }
 
+/// The detectors file's size cap: declarations are small
+/// JSON, and the file is read whole at boot (audit R2-27).
+const MAX_DETECTORS_FILE_BYTES: usize = 1024 * 1024;
+
+/// The declaration count cap: every declaration loads and
+/// probes a full model at boot, and every declared `boxes`
+/// detector runs under the one AI permit of a meta request,
+/// so the count bounds both the boot cost and the meta
+/// fan-out (audit R2-27).
+const MAX_DETECTOR_DECLARATIONS: usize = 16;
+
+/// The class vocabulary cap per declaration, applied to
+/// inline labels at parse time and to a labels file's
+/// resolved classes at build time (audit R2-27).
+const MAX_DETECTOR_LABELS: usize = 4096;
+
+/// The length cap for one inline class label (audit R2-27).
+const MAX_DETECTOR_LABEL_CHARS: usize = 256;
+
 /// Parse the detectors file's text into declarations,
 /// strictly: this runs before any model is touched, so
 /// every refusal here is raisable (and testable) without
@@ -1188,6 +1207,12 @@ fn parse_detector_declarations(text: &str) -> Result<Vec<DetectorDeclaration>, S
     let entries = value.as_array().ok_or_else(|| {
         "CRABCROP_DETECTORS_FILE must hold a JSON array of detector declarations".to_string()
     })?;
+    if entries.len() > MAX_DETECTOR_DECLARATIONS {
+        return Err(format!(
+            "CRABCROP_DETECTORS_FILE declares {} detectors; the cap is {MAX_DETECTOR_DECLARATIONS}",
+            entries.len()
+        ));
+    }
     let mut declarations: Vec<DetectorDeclaration> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
         let at = format!("detector declaration {}", i + 1);
@@ -1203,6 +1228,15 @@ fn parse_detector_declarations(text: &str) -> Result<Vec<DetectorDeclaration>, S
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
             return Err(format!("invalid detector name: {name:?}"));
+        }
+        // `builtin` is the source name meta detections use
+        // for the built-in detector's boxes: a declaration
+        // taking it would make its boxes indistinguishable
+        // from the built-in's (audit R2-27).
+        if name == "builtin" {
+            return Err(
+                "detector name \"builtin\" is reserved for the built-in detector".to_string(),
+            );
         }
         if declarations.iter().any(|d| d.name == name) {
             return Err(format!("duplicate detector name: {name}"));
@@ -1247,10 +1281,24 @@ fn parse_detector_declarations(text: &str) -> Result<Vec<DetectorDeclaration>, S
                 if items.is_empty() {
                     return Err(format!("{named}: \"labels\" must name at least one class"));
                 }
+                if items.len() > MAX_DETECTOR_LABELS {
+                    return Err(format!(
+                        "{named}: \"labels\" names {} classes; the cap is {MAX_DETECTOR_LABELS}",
+                        items.len()
+                    ));
+                }
                 let mut names = Vec::new();
                 for item in items {
                     match item.as_str() {
-                        Some(class) if !class.trim().is_empty() => names.push(class.to_string()),
+                        Some(class) if !class.trim().is_empty() => {
+                            if class.chars().count() > MAX_DETECTOR_LABEL_CHARS {
+                                return Err(format!(
+                                    "{named}: \"labels\" entries must be at most \
+                                     {MAX_DETECTOR_LABEL_CHARS} characters"
+                                ));
+                            }
+                            names.push(class.to_string());
+                        }
                         _ => {
                             return Err(format!(
                                 "{named}: \"labels\" entries must be non-empty strings"
@@ -1326,8 +1374,25 @@ fn build_declared_detectors(
             });
         }
     };
-    let text = std::fs::read_to_string(&path)
+    // The file is read under a size cap, like the cache
+    // entry parser's: declarations are small JSON, and an
+    // unbounded read at boot is an unbounded allocation
+    // (audit R2-27).
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(&path)
         .map_err(|e| format!("cannot read CRABCROP_DETECTORS_FILE ({path}): {e}"))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_DETECTORS_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read CRABCROP_DETECTORS_FILE ({path}): {e}"))?;
+    if bytes.len() > MAX_DETECTORS_FILE_BYTES {
+        return Err(format!(
+            "CRABCROP_DETECTORS_FILE ({path}) exceeds the {MAX_DETECTORS_FILE_BYTES} byte cap"
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|e| format!("CRABCROP_DETECTORS_FILE ({path}) is not valid UTF-8: {e}"))?;
     let declarations = parse_detector_declarations(&text)?;
     let mut boxes = Vec::new();
     let mut focal: Option<Arc<dyn crate::ai::FocalProvider>> = None;
@@ -1353,6 +1418,17 @@ fn build_declared_detectors(
                     }
                     None => None,
                 };
+                // A labels file's vocabulary is held to the
+                // same cap the parser puts on inline labels
+                // (audit R2-27).
+                let label_count = declared_classes.as_ref().map_or(0, Vec::len);
+                if label_count > MAX_DETECTOR_LABELS {
+                    return Err(format!(
+                        "declared detector {:?}: the labels name {label_count} classes; the cap \
+                         is {MAX_DETECTOR_LABELS}",
+                        decl.name
+                    ));
+                }
                 let threshold = decl.threshold.unwrap_or(0.5);
                 let provider = crate::ai::OnnxDetectionProvider::load_with_classes(
                     ort_dylib,
@@ -2297,6 +2373,75 @@ mod tests {
             r#"[{"name": "crates", "model": "/m.onnx", "kind": "heatmap"}]"#,
         ));
         assert!(err.contains("\"crates\""), "{err}");
+    }
+
+    #[test]
+    fn detector_declarations_enforce_resource_limits() {
+        // The caps from audit R2-27: declaration count,
+        // label count and length, and the reserved name.
+        let decl = |i: usize| format!(r#"{{"name": "d{i}", "model": "/m.onnx", "kind": "focal"}}"#);
+        let many = (0..=MAX_DETECTOR_DECLARATIONS)
+            .map(decl)
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = expect_err(parse_detector_declarations(&format!("[{many}]")));
+        assert!(err.contains("the cap is"), "{err}");
+        // Exactly at the cap parses.
+        let at_cap = (0..MAX_DETECTOR_DECLARATIONS)
+            .map(decl)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_detector_declarations(&format!("[{at_cap}]"))
+                .unwrap()
+                .len(),
+            MAX_DETECTOR_DECLARATIONS
+        );
+        // `builtin` is reserved for the built-in detector's
+        // meta attribution.
+        let err = expect_err(parse_detector_declarations(
+            r#"[{"name": "builtin", "model": "/m.onnx", "kind": "boxes"}]"#,
+        ));
+        assert!(err.contains("reserved"), "{err}");
+        // Inline labels: one over the count cap refuses, at
+        // the cap parses, and an overlong label refuses.
+        let labels = |n: usize| {
+            (0..n)
+                .map(|i| format!("\"c{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let over = format!(
+            r#"[{{"name": "a", "model": "/m.onnx", "kind": "boxes", "labels": [{}]}}]"#,
+            labels(MAX_DETECTOR_LABELS + 1)
+        );
+        let err = expect_err(parse_detector_declarations(&over));
+        assert!(err.contains("the cap is"), "{err}");
+        let at = format!(
+            r#"[{{"name": "a", "model": "/m.onnx", "kind": "boxes", "labels": [{}]}}]"#,
+            labels(MAX_DETECTOR_LABELS)
+        );
+        assert!(parse_detector_declarations(&at).is_ok());
+        let long_label = "x".repeat(MAX_DETECTOR_LABEL_CHARS + 1);
+        let err = expect_err(parse_detector_declarations(&format!(
+            r#"[{{"name": "a", "model": "/m.onnx", "kind": "boxes", "labels": ["{long_label}"]}}]"#
+        )));
+        assert!(err.contains("at most"), "{err}");
+    }
+
+    #[test]
+    fn declared_detectors_refuse_an_oversized_file() {
+        // A declarations file past the byte cap refuses at
+        // the read, before any parsing or load (audit R2-27).
+        let oversized = temp_file(
+            "detectors-oversized",
+            &vec![b' '; MAX_DETECTORS_FILE_BYTES + 1],
+        );
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_DETECTORS_FILE",
+            oversized.as_str(),
+        )])));
+        assert!(err.contains("byte cap"), "{err}");
     }
 
     #[test]

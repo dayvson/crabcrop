@@ -137,13 +137,21 @@ pub struct OnnxMaskProvider {
 
 impl OnnxMaskProvider {
     /// Load a model file against the runtime at `dylib` (or the
-    /// runtime's own search when `None`).
+    /// runtime's own search when `None`). A probe inference on a
+    /// blank image runs at load, like the other providers: a
+    /// model whose output does not fit the mask contract (a
+    /// 320x320 field) is rejected here, at boot, with a Load
+    /// error, not on the first removebg request (audit R2-28).
     pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, AiError> {
         let (session, input_name) = build_session(dylib, model_path)?;
-        Ok(Self {
+        let provider = Self {
             session: Mutex::new(session),
             input_name,
-        })
+        };
+        provider.mask(&DynamicImage::new_rgb8(8, 8)).map_err(|e| {
+            AiError::Load(format!("the model {model_path} failed its mask probe: {e}"))
+        })?;
+        Ok(provider)
     }
 }
 
@@ -172,7 +180,7 @@ impl MaskProvider for OnnxMaskProvider {
         let (_shape, data) = first
             .try_extract_tensor::<f32>()
             .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
-        Ok(postprocess(data, img.width(), img.height()))
+        postprocess(data, img.width(), img.height())
     }
 }
 
@@ -197,8 +205,19 @@ fn preprocess(img: &DynamicImage) -> Vec<f32> {
 
 /// Turn the model's first output into a mask: min-max
 /// normalize to 0..255 (the reference pipeline's behavior),
-/// then resize back to the source dimensions.
-fn postprocess(data: &[f32], w: u32, h: u32) -> GrayImage {
+/// then resize back to the source dimensions. The output is
+/// indexed as a 320x320 field, so its length is checked
+/// first: an export producing fewer values is a BadOutput,
+/// never an indexing panic under the session lock (audit
+/// R2-28).
+fn postprocess(data: &[f32], w: u32, h: u32) -> Result<GrayImage, AiError> {
+    if data.len() < 320 * 320 {
+        return Err(AiError::BadOutput(format!(
+            "the mask model produced {} output values; the contract takes a 320x320 field ({})",
+            data.len(),
+            320 * 320
+        )));
+    }
     let (min, max) = data
         .iter()
         .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
@@ -207,11 +226,11 @@ fn postprocess(data: &[f32], w: u32, h: u32) -> GrayImage {
         let v = data[(y * 320 + x) as usize];
         image::Luma([((v - min) / range * 255.0).round() as u8])
     });
-    if (w, h) == (320, 320) {
+    Ok(if (w, h) == (320, 320) {
         mask
     } else {
         image::imageops::resize(&mask, w, h, FilterType::Triangle)
-    }
+    })
 }
 
 /// Apply a foreground mask: the output alpha is the source
@@ -1070,7 +1089,7 @@ mod tests {
         let mut data = vec![0f32; 320 * 320];
         data[0] = -1.0;
         data[1] = 3.0;
-        let mask = postprocess(&data, 320, 320);
+        let mask = postprocess(&data, 320, 320).unwrap();
         assert_eq!((mask.width(), mask.height()), (320, 320));
         assert_eq!(mask.get_pixel(0, 0)[0], 0);
         assert_eq!(mask.get_pixel(1, 0)[0], 255);
@@ -1083,7 +1102,7 @@ mod tests {
         // makes every (v - min) / range exactly 0, so the
         // whole mask is black.
         let data = vec![2.5f32; 320 * 320];
-        let mask = postprocess(&data, 320, 320);
+        let mask = postprocess(&data, 320, 320).unwrap();
         assert!(mask.pixels().all(|p| p[0] == 0));
     }
 
@@ -1096,10 +1115,22 @@ mod tests {
         for v in &mut data[320 * 160..] {
             *v = 1.0;
         }
-        let mask = postprocess(&data, 160, 160);
+        let mask = postprocess(&data, 160, 160).unwrap();
         assert_eq!((mask.width(), mask.height()), (160, 160));
         assert_eq!(mask.get_pixel(0, 0)[0], 0);
         assert_eq!(mask.get_pixel(0, 159)[0], 255);
+    }
+
+    #[test]
+    fn postprocess_rejects_an_output_shorter_than_the_field() {
+        // An export whose first output is smaller than the
+        // 320x320 field (a 160x160 output, say) is a
+        // BadOutput, not an indexing panic under the session
+        // lock (audit R2-28).
+        let data = vec![0.5f32; 160 * 160];
+        let err = postprocess(&data, 320, 320).unwrap_err();
+        assert!(matches!(err, AiError::BadOutput(_)), "{err}");
+        assert!(err.to_string().contains("320x320"), "{err}");
     }
 }
 
@@ -2169,10 +2200,48 @@ impl FocalProvider for OnnxFocalProvider {
     }
 }
 
+/// The largest declared focal input, in pixels: the
+/// detection provider's fixed 640x640 input is the biggest
+/// of the built-in contracts, so a declared focal frame may
+/// not exceed it. The bound also caps the input tensor's
+/// bytes (at most 3 channels of f32 over the frame, about
+/// 5 MB) and the boot probe's resized copy, which are
+/// allocated from the declared shape (audit R2-26).
+const MAX_FOCAL_INPUT_PIXELS: i64 = 640 * 640;
+
+/// Validate a focal model's declared input dims against the
+/// contract: a fixed `[1, C, H, W]` shape with C 1 (luma) or
+/// 3 (RGB) and at most [`MAX_FOCAL_INPUT_PIXELS`] pixels.
+/// Pure, so the contract is testable without a model.
+fn focal_dims(dims: &[i64], model_path: &str) -> Result<(usize, u32, u32), AiError> {
+    match dims {
+        [1, c, h, w] if (*c == 1 || *c == 3) && *h > 0 && *w > 0 => {
+            let pixels = h.checked_mul(*w).ok_or_else(|| {
+                AiError::Load(format!(
+                    "the focal model {model_path} declares an input shape {dims:?} \
+                     whose pixel count overflows"
+                ))
+            })?;
+            if pixels > MAX_FOCAL_INPUT_PIXELS {
+                return Err(AiError::Load(format!(
+                    "the focal model {model_path} declares a {w}x{h} input ({pixels} pixels), \
+                     over the {MAX_FOCAL_INPUT_PIXELS} pixel cap for declared focal models"
+                )));
+            }
+            Ok((*c as usize, *w as u32, *h as u32))
+        }
+        _ => Err(AiError::Load(format!(
+            "the focal model {model_path} must declare a fixed [1, 1 or 3, H, W] input, got {dims:?}"
+        ))),
+    }
+}
+
 /// The focal model's declared input contract: a fixed
-/// `[1, C, H, W]` tensor shape with C 1 (luma) or 3 (RGB).
-/// A dynamic dimension anywhere, another rank, or another
-/// channel count is a load error naming the actual shape.
+/// `[1, C, H, W]` tensor shape with C 1 (luma) or 3 (RGB),
+/// bounded by [`MAX_FOCAL_INPUT_PIXELS`]. A dynamic
+/// dimension anywhere, another rank, another channel count,
+/// or a frame over the cap is a load error naming the
+/// actual shape.
 fn focal_input_shape(session: &Session, model_path: &str) -> Result<(usize, u32, u32), AiError> {
     let input = session
         .inputs()
@@ -2186,14 +2255,7 @@ fn focal_input_shape(session: &Session, model_path: &str) -> Result<(usize, u32,
             )));
         }
     };
-    match dims.as_slice() {
-        [1, c, h, w] if (*c == 1 || *c == 3) && *h > 0 && *w > 0 => {
-            Ok((*c as usize, *w as u32, *h as u32))
-        }
-        _ => Err(AiError::Load(format!(
-            "the focal model {model_path} must declare a fixed [1, 1 or 3, H, W] input, got {dims:?}"
-        ))),
-    }
+    focal_dims(&dims, model_path)
 }
 
 /// The heatmap behind an output: `[H, W]`, `[1, H, W]`, or
@@ -2901,5 +2963,61 @@ mod focal_tests {
             message.contains("must declare a fixed [1, 1 or 3, H, W] input"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn focal_dims_accept_shapes_within_the_cap() {
+        // The detection provider's fixed frame size is the
+        // cap itself; ordinary saliency shapes sit far
+        // below it.
+        assert_eq!(
+            focal_dims(&[1, 3, 640, 640], "m.onnx").unwrap(),
+            (3, 640, 640)
+        );
+        assert_eq!(
+            focal_dims(&[1, 1, 256, 256], "m.onnx").unwrap(),
+            (1, 256, 256)
+        );
+        assert_eq!(focal_dims(&[1, 3, 1, 1], "m.onnx").unwrap(), (3, 1, 1));
+    }
+
+    #[test]
+    fn focal_dims_reject_shapes_over_the_pixel_cap() {
+        // The audit's shape: a small declared file hiding a
+        // 16384x16384 frame would materialize gigabytes at
+        // the boot probe (audit R2-26).
+        let err = focal_dims(&[1, 3, 16384, 16384], "m.onnx").unwrap_err();
+        assert!(err.to_string().contains("pixel cap"), "{err}");
+        // A 4096x4096 frame boots but would repeat a roughly
+        // 200 MB tensor allocation per smart crop: refused.
+        let err = focal_dims(&[1, 1, 4096, 4096], "m.onnx").unwrap_err();
+        assert!(err.to_string().contains("pixel cap"), "{err}");
+        // One axis over the cap with the other at 1 pixel:
+        // the product is what is bounded.
+        assert!(focal_dims(&[1, 3, 640, 641], "m.onnx").is_err());
+        // Absurd dims refuse cleanly instead of overflowing
+        // the pixel count.
+        assert!(focal_dims(&[1, 3, i64::MAX, i64::MAX], "m.onnx").is_err());
+    }
+
+    #[test]
+    fn focal_dims_keep_the_shape_contract() {
+        // Rank, batch, channels, and zero axes refuse with
+        // the shape message, as before the cap existed.
+        for dims in [
+            vec![3, 224, 224],
+            vec![2, 3, 224, 224],
+            vec![1, 2, 224, 224],
+            vec![1, 3, 0, 224],
+            vec![1, 3, 224, 0],
+            vec![1, 3, -1, 224],
+        ] {
+            let err = focal_dims(&dims, "m.onnx").unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("must declare a fixed [1, 1 or 3, H, W] input"),
+                "{dims:?}: {err}"
+            );
+        }
     }
 }

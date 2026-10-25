@@ -1843,6 +1843,11 @@ impl RequestDirectives {
             || self.needs_face_model
             || self.smart_crop
             || self.has_class_redaction()
+            // `debug:focal` runs the face and focal providers
+            // and bypasses the cache in both directions, so
+            // it takes an AI permit like the work it runs
+            // (audit R2-17).
+            || self.debug_focal
     }
 }
 
@@ -4076,6 +4081,19 @@ mod tests {
             assert!(matches!(err, ParseError::InvalidDebug(_)), "{bad}");
             assert_eq!(err.code(), "invalid_debug");
         }
+    }
+
+    #[test]
+    fn debug_focal_requests_count_as_ai_use() {
+        // `debug:focal` runs the face and focal providers
+        // and is never cached, so the directive analysis
+        // classes it as AI use: the server holds an AI-gate
+        // permit for it (audit R2-17).
+        let (ops, _, _, _) = parse_operations_with_expiry("debug:focal/example.com/i.jpg").unwrap();
+        assert!(RequestDirectives::analyze(&ops).uses_ai());
+        // A plain transform is not AI use.
+        let (ops, _, _, _) = parse_operations_with_expiry("100x100/example.com/i.jpg").unwrap();
+        assert!(!RequestDirectives::analyze(&ops).uses_ai());
     }
 
     fn preset_map() -> std::collections::HashMap<String, String> {
