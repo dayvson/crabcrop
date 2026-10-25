@@ -400,6 +400,18 @@ pub fn composite(
     image::imageops::overlay(&mut canvas, &scaled, dx, dy);
     timing_mark("overlay", t_stage);
     steps.push("pad");
+    // Over an opaque backdrop the composite is opaque by
+    // construction, but the blend arithmetic leaves rim
+    // pixels a rounding step under 255. State the
+    // invariant exactly: an encoder handed a meaningless
+    // alpha plane pays dearly for it (issue #220, the
+    // WebP encode), and a listing shot over a backdrop has
+    // no transparency to keep.
+    if resolved.color.is_some() {
+        for px in canvas.pixels_mut() {
+            px[3] = 255;
+        }
+    }
 
     StudioOutcome {
         image: DynamicImage::ImageRgba8(canvas),
