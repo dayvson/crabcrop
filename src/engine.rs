@@ -278,19 +278,88 @@ pub(crate) fn check_decoded_dimensions(width: u64, height: u64) -> Result<(), En
 /// probed from the header and rejected over budget before any
 /// full decode happens.
 fn check_jxl_dimensions(bytes: &[u8]) -> Result<(), EngineError> {
+    let (width, height) = jxl_dimensions(bytes)
+        .ok_or_else(|| EngineError::Decode("JPEG XL header carried no size".to_string()))?;
+    check_decoded_dimensions(width as u64, height as u64)
+}
+
+/// The dimensions in a JPEG XL header, from the decoder's
+/// basic-info event alone: no frame is decoded. `None` when
+/// the header does not parse or announces no size.
+fn jxl_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     use jxl::api::{Event, JxlDecoder, JxlDecoderOptions};
     let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
     let mut input = std::io::BufReader::new(Cursor::new(bytes));
-    let event = decoder
-        .process(&mut input, None, None)
-        .map_err(|e| EngineError::Decode(e.to_string()))?;
+    let event = decoder.process(&mut input, None, None).ok()?;
     if event != Event::BasicInfo {
-        return Err(EngineError::Decode("truncated JPEG XL image".to_string()));
+        return None;
     }
-    let info = decoder
+    decoder
         .basic_info()
-        .ok_or_else(|| EngineError::Decode("JPEG XL header carried no size".to_string()))?;
-    check_decoded_dimensions(info.size.0 as u64, info.size.1 as u64)
+        .map(|info| (info.size.0 as u32, info.size.1 as u32))
+}
+
+/// The facts the `/explain` report (issue #196) may state
+/// about a source: its media kind and its pixel dimensions,
+/// both read from headers alone. Probing never decodes a
+/// frame, never rasterizes an SVG, and never runs the HEIC
+/// decoder: dimensions come from the image crate's header
+/// probe, the SVG document's intrinsic size, the HEIC item
+/// graph's announced size, or the JPEG XL basic info.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SourceProbe {
+    /// A short lowercase media label: `jpeg`, `png`, `gif`,
+    /// `webp`, `avif`, `jxl`, `heic`, `svg`, one of the image
+    /// crate's long-tail kinds (`bmp`, `tiff`, `ico`), or
+    /// `unknown` when the bytes match nothing the pipeline
+    /// reads.
+    pub kind: &'static str,
+    /// Pixel dimensions when the header announces them.
+    pub dimensions: Option<(u32, u32)>,
+}
+
+/// Probe source bytes for the explain report: kind and
+/// dimensions, headers only (see [`SourceProbe`]).
+pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
+    if crate::svg::is_svg(bytes) {
+        let dimensions = crate::svg::prepare(bytes).ok().and_then(|prepared| {
+            let (w, h) = prepared.intrinsic();
+            let (w, h) = (w.round() as u32, h.round() as u32);
+            if w >= 1 && h >= 1 { Some((w, h)) } else { None }
+        });
+        return SourceProbe {
+            kind: "svg",
+            dimensions,
+        };
+    }
+    if is_heic(bytes) {
+        return SourceProbe {
+            kind: "heic",
+            dimensions: crate::heic::probe_dimensions(bytes),
+        };
+    }
+    if is_jxl(bytes) {
+        return SourceProbe {
+            kind: "jxl",
+            dimensions: jxl_dimensions(bytes),
+        };
+    }
+    let kind = match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Jpeg) => "jpeg",
+        Ok(image::ImageFormat::Png) => "png",
+        Ok(image::ImageFormat::Gif) => "gif",
+        Ok(image::ImageFormat::WebP) => "webp",
+        Ok(image::ImageFormat::Avif) => "avif",
+        Ok(image::ImageFormat::Bmp) => "bmp",
+        Ok(image::ImageFormat::Tiff) => "tiff",
+        Ok(image::ImageFormat::Ico) => "ico",
+        _ => "unknown",
+    };
+    let dimensions = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|probe| probe.into_dimensions().ok());
+    SourceProbe { kind, dimensions }
 }
 
 /// Reject an output size past the shared pixel budget, before

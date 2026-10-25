@@ -283,6 +283,19 @@ fn cap_metadata(bytes: Option<Vec<u8>>, cap: usize) -> Option<Vec<u8>> {
     bytes.filter(|bytes| bytes.len() <= cap)
 }
 
+/// The primary image's announced dimensions, read from the
+/// parsed file structure alone: no item is decoded. The
+/// `/explain` probe (issue #196) reports source facts
+/// without paying a decode, and HEIC dimensions live in the
+/// item graph rather than in any fixed header offset.
+/// `None` when the bytes do not parse or the primary graph
+/// announces no size.
+pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let file = oxideav_heif::HeifFile::parse_borrowed(bytes).ok()?;
+    let node = oxideav_heif::build_primary_graph(&file).ok()?;
+    node.output_size().ok()
+}
+
 /// Decode a HEIC/HEIF source to an upright image plus its source
 /// metadata. Failures are the pipeline's decode class (a 502
 /// upstream), naming HEIC, never a panic: the decoder is pure

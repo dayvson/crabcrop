@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- Self-explaining URLs (issue #196). `GET /explain/<signature>/<operations>/<source>` verifies the remainder exactly as the image path does and answers with a report on the URL instead of the image: the signature verdict (with key ID and expiry), the source with its probed facts (media kind, pixel dimensions, encoded size), every operation glossed in plain language (the CLI explain verb's gloss table, shared so a new filter cannot ship undescribed), referenced presets with their expanded operations, a forecast (output dimensions when the chain determines them, the output format, the output pixel count against the aggregate budget), the canonical cache form and group, and links to the image and to the debug focal remainder when the chain contains a crop. Browsers get an HTML page; `Accept: application/json` gets the same report as JSON. The security posture is part of the feature: signature and expiry are verified before any source access, so a bad or expired explain request answers with the image path's own status and body and performs zero source fetches (test-proven with hit counting, the audit R2 pattern); the probe is one bounded loader fetch read from headers only, with no full decode, no detection or AI, and no process, AI, or video gate, so one explain costs at most one image request; the report carries no secrets or derived key material, no configuration values, file paths, or config fingerprint, and no redirect or resolved-address details, with failures mapped to the frozen codes and generic messages; the HTML page escapes every interpolated string, ships no scripts, and is served with `Content-Security-Policy: default-src 'none'` and `nosniff`; and responses are `no-store` and write nothing to any cache tier.
+
 ## [0.1.1] - 2026-10-24
 
 ### Fixed

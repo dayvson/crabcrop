@@ -360,14 +360,37 @@ fn size_text(size: &crate::url::ImageSize) -> String {
 }
 
 fn describe_operation(segment: &str, op: &Operation) -> Vec<String> {
+    let texts = describe_operation_text(op);
     match op {
-        Operation::Size(size) => vec![format!("  {segment}  resize to {}", size_text(size))],
+        Operation::Filters(_) => {
+            let mut lines = vec![format!("  {segment}")];
+            lines.extend(texts.iter().map(|text| format!("    {text}")));
+            lines
+        }
+        _ => vec![format!(
+            "  {segment}  {}",
+            texts.into_iter().next().unwrap_or_default()
+        )],
+    }
+}
+
+/// The plain-language gloss of one operation, without the
+/// segment it came from: one line per operation, except a
+/// `Filters` operation, which yields one line per filter
+/// (each from [`describe_filter`]). The server's `/explain`
+/// report (issue #196) renders these same lines, so the CLI
+/// and the server can never describe an operation two
+/// different ways, and a new filter cannot ship undescribed:
+/// [`describe_filter`]'s match is exhaustive.
+pub(crate) fn describe_operation_text(op: &Operation) -> Vec<String> {
+    match op {
+        Operation::Size(size) => vec![format!("resize to {}", size_text(size))],
         Operation::Crop { size, align } => vec![format!(
-            "  {segment}  crop to {}, aligned {align:?}",
+            "crop to {}, aligned {align:?}",
             size_text(size)
         )],
         Operation::FitIn { size, adaptive } => vec![format!(
-            "  {segment}  fit inside {}{}",
+            "fit inside {}{}",
             size_text(size),
             if *adaptive {
                 ", swapping the box when the source orientation disagrees"
@@ -375,14 +398,14 @@ fn describe_operation(segment: &str, op: &Operation) -> Vec<String> {
                 ""
             }
         )],
-        Operation::Pad { size, .. } => vec![format!("  {segment}  pad to {}", size_text(size))],
+        Operation::Pad { size, .. } => vec![format!("pad to {}", size_text(size))],
         Operation::CropRect {
             left,
             top,
             right,
             bottom,
         } => vec![format!(
-            "  {segment}  crop the rectangle {left},{top} to {right},{bottom}"
+            "crop the rectangle {left},{top} to {right},{bottom}"
         )],
         Operation::FocalRect {
             left,
@@ -390,18 +413,13 @@ fn describe_operation(segment: &str, op: &Operation) -> Vec<String> {
             right,
             bottom,
         } => vec![format!(
-            "  {segment}  set the focal rectangle {left},{top} to {right},{bottom} for the next crop"
+            "set the focal rectangle {left},{top} to {right},{bottom} for the next crop"
         )],
-        Operation::Filters(filters) => {
-            let mut lines = vec![format!("  {segment}")];
-            for filter in filters {
-                lines.push(format!("    {}", describe_filter(filter)));
-            }
-            lines
-        }
-        Operation::DebugFocal => vec![format!(
-            "  {segment}  render the smart-crop debug view (focal point, focal rectangle, and crop window drawn on the crop's canvas; never cached)"
-        )],
+        Operation::Filters(filters) => filters.iter().map(describe_filter).collect(),
+        Operation::DebugFocal => vec![
+            "render the smart-crop debug view (focal point, focal rectangle, and crop window drawn on the crop's canvas; never cached)"
+                .to_string(),
+        ],
     }
 }
 
@@ -409,7 +427,7 @@ fn hex3(c: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
-fn describe_filter(filter: &Filter) -> String {
+pub(crate) fn describe_filter(filter: &Filter) -> String {
     match filter {
         Filter::Grayscale => "grayscale: convert to grayscale".into(),
         Filter::Invert => "invert: invert the colors".into(),

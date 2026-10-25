@@ -154,6 +154,7 @@ mod color;
 mod crop;
 mod debugview;
 mod engine;
+mod explain;
 mod filters;
 mod focus;
 mod heic;
