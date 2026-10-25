@@ -853,7 +853,10 @@ struct ProcessJob {
     preserve_metadata: bool,
     ops: Vec<crate::url::Operation>,
     preferred: Option<ImageFormat>,
-    watermarks: crate::filters::WatermarkImages,
+    /// Watermark images as (URL, fetched bytes) pairs: the
+    /// decode happens inside the gated blocking job, not in
+    /// the async handler (audit R2-16).
+    watermark_sources: Vec<(String, Vec<u8>)>,
     placeholders: bool,
     mask_provider: Option<Arc<dyn crate::ai::MaskProvider>>,
     upscale_provider: Option<Arc<dyn crate::ai::UpscaleProvider>>,
@@ -925,26 +928,38 @@ async fn run_process(
             .iter()
             .map(|p| p.as_ref())
             .collect();
-        let ctx = crate::engine::ProcessContext {
-            preferred: job.preferred,
-            watermarks: Some(&job.watermarks),
-            placeholders: job.placeholders,
-            mask_provider: job.mask_provider.as_deref(),
-            upscale_provider: job.upscale_provider.as_deref(),
-            face_provider: job.face_provider.as_deref(),
-            detect_provider: job.detect_provider.as_deref(),
-            declared_detect_providers: &declared_refs,
-            focal_provider: job.focal_provider.as_deref(),
-            video_encoder: job.video_encoder.as_deref(),
-            save_data: job.save_data,
-            preserve_metadata: job.preserve_metadata,
-            text_renderer: job.text_renderer.as_deref(),
-            dpr: job.dpr,
-            ssim_target: job.ssim_target,
-            avif_speed: job.avif_speed,
-            jxl_speed: job.jxl_speed,
-        };
+        // Watermark images decode here, inside the gated
+        // blocking job, rather than inline in the async
+        // handler: the decode is CPU work a burst of
+        // watermarked requests must not run ungated on the
+        // runtime workers, and a decoder panic on crafted
+        // watermark bytes is contained by the same
+        // catch_unwind as the engine run (audit R2-16).
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut watermarks = crate::filters::WatermarkImages::new();
+            for (url, wm_bytes) in &job.watermark_sources {
+                let img = crate::engine::decode_image(wm_bytes)?;
+                watermarks.insert(url.clone(), img);
+            }
+            let ctx = crate::engine::ProcessContext {
+                preferred: job.preferred,
+                watermarks: Some(&watermarks),
+                placeholders: job.placeholders,
+                mask_provider: job.mask_provider.as_deref(),
+                upscale_provider: job.upscale_provider.as_deref(),
+                face_provider: job.face_provider.as_deref(),
+                detect_provider: job.detect_provider.as_deref(),
+                declared_detect_providers: &declared_refs,
+                focal_provider: job.focal_provider.as_deref(),
+                video_encoder: job.video_encoder.as_deref(),
+                save_data: job.save_data,
+                preserve_metadata: job.preserve_metadata,
+                text_renderer: job.text_renderer.as_deref(),
+                dpr: job.dpr,
+                ssim_target: job.ssim_target,
+                avif_speed: job.avif_speed,
+                jxl_speed: job.jxl_speed,
+            };
             engine.process_preferred(&bytes, &job.ops, ctx)
         })) {
             Ok(Ok(processed)) => Ok(processed),
@@ -1383,12 +1398,16 @@ async fn serve_miss(
     record.load = load_start.elapsed();
     record.bytes_in = bytes.len();
 
-    // Watermarks are resolved here, before the engine runs: the
-    // engine only ever sees pixels. Each referenced image goes
-    // through the same loader (and its bounds and source policy)
-    // as sources, and a watermark that fails to load or decode
-    // fails the request rather than being silently skipped.
-    let mut watermark_images = crate::filters::WatermarkImages::new();
+    // Watermarks are fetched here, before the engine runs:
+    // each referenced image goes through the same loader (and
+    // its bounds and source policy) as sources, and a
+    // watermark that fails to load fails the request rather
+    // than being silently skipped. Only the bytes travel
+    // with the job: the decode happens inside the gated
+    // blocking job with the rest of the engine work, so a
+    // watermark that does not decode fails the request from
+    // there with the same engine error (audit R2-16).
+    let mut watermark_sources: Vec<(String, Vec<u8>)> = Vec::new();
     for wm_url in &directives.watermark_urls {
         record.load_ran = true;
         let wm_bytes = match state.loader.load(wm_url).await {
@@ -1398,15 +1417,7 @@ async fn serve_miss(
                 return (load_error_response(e), record);
             }
         };
-        match crate::engine::decode_image(&wm_bytes) {
-            Ok(img) => {
-                watermark_images.insert(wm_url.to_string(), img);
-            }
-            Err(e) => {
-                record.fail = FailStage::Engine;
-                return (engine_error_response(e), record);
-            }
-        }
+        watermark_sources.push((wm_url.to_string(), wm_bytes));
     }
 
     record.process_ran = true;
@@ -1470,7 +1481,7 @@ async fn serve_miss(
         preserve_metadata: state.preserve_metadata,
         ops: job_ops,
         preferred,
-        watermarks: watermark_images,
+        watermark_sources,
         placeholders,
         mask_provider: state.removebg.clone(),
         upscale_provider: state.upscale.clone(),
@@ -1557,13 +1568,19 @@ async fn serve_miss(
         }
     }
     record.bytes_out = processed.bytes.len();
+    // When this request already holds an AI permit (an AI
+    // transform that is also a meta request), the annotation
+    // paths run under it instead of queueing for a second
+    // permit that cannot free until this request returns
+    // (audit R2-29).
+    let ai_gated = _ai_permit.is_some();
     let annotation = if meta {
-        annotate_meta(state, &processed).await
+        annotate_meta(state, &processed, ai_gated).await
     } else {
         None
     };
     let detections = if meta && wants_detections(accept) {
-        detect_meta(state, &processed).await
+        detect_meta(state, &processed, ai_gated).await
     } else {
         None
     };
@@ -1818,16 +1835,27 @@ fn compose_annotation(scores: &[crate::ai::TagScore], threshold: f32) -> Annotat
 /// tag provider is configured. Bounded by the AI gate like
 /// every other inference; any failure (gate busy, decode,
 /// inference) omits the annotation rather than failing a
-/// response whose image processed fine.
+/// response whose image processed fine. When `ai_gated` is
+/// set the request already holds an AI permit (an AI
+/// transform answering meta), and the annotation runs
+/// under it rather than acquiring a second permit (audit
+/// R2-29).
 async fn annotate_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
+    ai_gated: bool,
 ) -> Option<Annotation> {
     let tagger = state.tagger.as_ref()?;
-    let _permit = tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
-        .await
-        .ok()?
-        .ok()?;
+    let _permit = if ai_gated {
+        None
+    } else {
+        Some(
+            tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
+                .await
+                .ok()?
+                .ok()?,
+        )
+    };
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
     let tagger = tagger.clone();
     match tokio::task::spawn_blocking(move || tagger.scores(&img)).await {
@@ -1856,6 +1884,7 @@ async fn annotate_meta(
 async fn detect_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
+    ai_gated: bool,
 ) -> Option<Vec<(String, crate::ai::Detection)>> {
     let mut providers: Vec<(String, Arc<dyn crate::ai::DetectionProvider>)> = Vec::new();
     if let Some(detector) = &state.detect {
@@ -1867,10 +1896,19 @@ async fn detect_meta(
     if providers.is_empty() {
         return None;
     }
-    let _permit = tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
-        .await
-        .ok()?
-        .ok()?;
+    // Same permit rule as `annotate_meta`: a request that
+    // already holds an AI permit runs its detections under
+    // it instead of queueing for a second one (audit R2-29).
+    let _permit = if ai_gated {
+        None
+    } else {
+        Some(
+            tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
+                .await
+                .ok()?
+                .ok()?,
+        )
+    };
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
     let mut aggregated: Vec<(String, crate::ai::Detection)> = Vec::new();
     let mut any_answered = false;
@@ -3393,6 +3431,21 @@ mod tests {
         }
     }
 
+    /// A mask fake: everything is foreground, so a removebg
+    /// render keeps the source image.
+    #[derive(Debug)]
+    struct FakeMask;
+
+    impl crate::ai::MaskProvider for FakeMask {
+        fn mask(&self, img: &image::DynamicImage) -> Result<image::GrayImage, crate::ai::AiError> {
+            Ok(image::GrayImage::from_pixel(
+                img.width(),
+                img.height(),
+                image::Luma([255]),
+            ))
+        }
+    }
+
     async fn spawn_app_with_tagger() -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
@@ -3466,6 +3519,79 @@ mod tests {
         let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert!(meta.get("tags").is_none());
         assert!(meta.get("alt_text").is_none());
+    }
+
+    /// An app whose AI surface is fully faked (mask,
+    /// tagger, detector) behind a one-permit AI gate, for
+    /// the permit-reuse test below.
+    async fn spawn_app_with_ai_and_meta() -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: Some(Arc::new(FakeMask)),
+            upscale: None,
+            face: None,
+            tagger: Some(Arc::new(FakeTagger)),
+            tag_threshold: 0.05,
+            detect: Some(Arc::new(FakeDetector)),
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn meta_annotations_reuse_the_requests_ai_permit() {
+        // A removebg request (AI use) answering meta on a
+        // one-permit AI gate: the request holds the only
+        // permit while its annotations run. They must run
+        // under the held permit; queueing for a second one
+        // would wait out the full gate timeout and silently
+        // drop both the tags and the detections (audit
+        // R2-29).
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_ai_and_meta().await;
+        let remainder = format!("filters:removebg:format(png)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json; detections=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["tags"][0]["label"], "ocean");
+        let boxes = meta["detections"].as_array().unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0]["detector"], "builtin");
     }
 
     #[derive(Debug)]
@@ -4777,6 +4903,32 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
+    #[tokio::test]
+    async fn undecodable_watermark_fails_the_request() {
+        let src = spawn_image_server().await;
+        // Non-image bytes under an image content type: the
+        // fetch succeeds, so the failure must come from the
+        // decode, which runs inside the gated engine job
+        // and answers with the decode error mapping (audit
+        // R2-16).
+        let wm = spawn_bytes_server(b"this is not an image".to_vec())
+            .await
+            .replace("src.png", "wm.png");
+        let base = spawn_app(false).await;
+        let encoded = wm.replace(':', "%3A").replace('/', "%2F");
+        let remainder = format!("filters:watermark({encoded},0,0,100)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "source image could not be decoded"
+        );
+    }
+
     /// An app with disk result storage rooted at `dir`.
     async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
         let state = AppState {
@@ -5238,7 +5390,7 @@ mod tests {
             preserve_metadata: false,
             ops: Vec::new(),
             preferred: None,
-            watermarks: crate::filters::WatermarkImages::new(),
+            watermark_sources: Vec::new(),
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,
@@ -5266,6 +5418,91 @@ mod tests {
         drop(held);
         let processed = waiting.await.unwrap();
         assert_eq!((processed.width, processed.height), (100, 60));
+    }
+
+    #[tokio::test]
+    async fn watermark_decode_waits_for_the_process_gate() {
+        // A job carrying an undecodable watermark: the
+        // decode rides inside the gated blocking job, so
+        // the run waits for a process permit like any other
+        // engine work, and the decode failure then surfaces
+        // as the engine's decode error (audit R2-16). The
+        // watermark decoded inline in the async handler
+        // before the fix, outside this seam entirely.
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let job = ProcessJob {
+            save_data: false,
+            preserve_metadata: false,
+            ops: Vec::new(),
+            preferred: None,
+            watermark_sources: vec![(
+                "http://img/wm.png".to_string(),
+                b"this is not an image".to_vec(),
+            )],
+            placeholders: false,
+            mask_provider: None,
+            upscale_provider: None,
+            face_provider: None,
+            detect_provider: None,
+            declared_detect_providers: Vec::new(),
+            focal_provider: None,
+            text_renderer: None,
+            video_encoder: None,
+            dpr: None,
+            ssim_target: state.ssim_target,
+            avif_speed: state.avif_speed,
+            jxl_speed: state.jxl_speed,
+        };
+        let held = state.process_gate.clone().acquire_owned().await.unwrap();
+        let png = test_png();
+        let waiting = run_process(&state, &job, &png);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "the watermark decode must wait behind the process gate"
+        );
+        drop(held);
+        let failure = waiting.await.unwrap_err();
+        assert!(
+            matches!(failure, ProcessFailure::Engine(EngineError::Decode(_))),
+            "{failure:?}"
+        );
     }
 
     #[tokio::test]
