@@ -4,6 +4,15 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-25
+
+### Fixed
+
+- Malformed size segments now return 400 instead of 502 (issue #228). A size segment past the 16383 px axis cap, or garbled like `abcx100`, fell out of the parse and the rest of the URL was treated as a source path, so the request failed as a source fetch error; a segment shaped like a size that fails to parse now returns the `invalid_size` error.
+- The `max_bytes` quality ladder now reaches quality 1 instead of stalling at 15 (issue #229). The ladder spent its encode attempts on fixed steps and ran out before reaching the floor; it now plans its descent against the attempts remaining, so the last attempt lands on quality 1 and tight byte budgets actually shrink the output.
+- `no_upscale` no longer crops a plain resize to the requested aspect (issue #230). A size that would upscale now clamps each axis at the source dimensions, so a 200x150 source asked for 300x200 returns 200x150 instead of a resampled 200x133.
+- Animated WebP encodes no longer starve unrelated renders (issue #231). Animated output encodes through the slow lossless path, and one render could hold the process gate for minutes while other requests shed with 503; animated encodes now run behind a dedicated single-permit gate, so at most one runs at a time and still renders keep the process permits. The encode itself remains slow, and that cost stays tracked on the issue.
+
 ## [0.3.1] - 2026-10-25
 
 ### Added
