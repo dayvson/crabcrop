@@ -2,6 +2,7 @@
 name = "crabcrop-url"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
 description = "URL building and signing for crabcrop image service URLs"
 license = "MIT"
 repository = "https://github.com/dayvson/crabcrop"
