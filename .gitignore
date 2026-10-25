@@ -3,6 +3,7 @@
 node_modules/
 dist/
 __pycache__/
+sdks/python/build/
 fuzz/target/
 fuzz/artifacts/
 fuzz/corpus/parse_request/*

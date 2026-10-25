@@ -55,11 +55,17 @@ class TestPurgeSignatures(unittest.TestCase):
         )
         self.assertEqual(
             purge_group_signature("test-secret", "thumb"),
-            "2f779d54c25154a7528fb334973dd2c92e08b2575ee1359a7d426421b083b5d6",
+            "256634813bd6237179d251ba4526685f05db8a42ae056e4a04566f00042f0439",
         )
-        self.assertEqual(
+        # Purge-group signs under its own subkey: a
+        # per-target purge signature never transplants to it.
+        self.assertNotEqual(
             purge_group_signature("test-secret", "thumb"),
             purge_signature("test-secret", "purge-group/thumb"),
+        )
+        self.assertNotEqual(
+            purge_group_signature("test-secret", "thumb"),
+            purge_signature("test-secret", "thumb"),
         )
 
 

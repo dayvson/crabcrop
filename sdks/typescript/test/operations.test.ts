@@ -26,6 +26,7 @@ test("typed segments match the canonical spellings", () => {
     [ops.pad(100, 100, "FF8800"), "pad:100x100:ff8800"],
     [ops.pad(100, 100, "blur"), "pad:100x100:blur"],
     [ops.preset("thumb"), "preset:thumb"],
+    [ops.preset("thumb-2_large"), "preset:thumb-2_large"],
     [ops.maxage(60), "maxage:60"],
     [ops.maxage(0), "maxage:0"],
     [ops.maxage(31536000), "maxage:31536000"],
@@ -152,6 +153,9 @@ test("typed filters match the canonical spellings", () => {
       "text(Hello%2C%20World%21,32,ff8800ff,center)",
     ],
     [filter.blurClass("person"), "blurclass(person)"],
+    // 32 two-byte characters are exactly the server's
+    // 64-byte bound: accepted, and percent-encoded per byte.
+    [filter.blurClass("é".repeat(32)), `blurclass(${"%C3%A9".repeat(32)})`],
     [filter.pixelateClass("license plate"), "pixelateclass(license%20plate)"],
     [filter.blurRegion(120, 40, 180, 60), "blur_region(120,40,180,60)"],
     [filter.pixelateRegion(120, 40, 180, 60), "pixelate_region(120,40,180,60)"],
@@ -236,6 +240,18 @@ test("typed builders reject what the server would reject", () => {
     () => filter.watermark("", 0, 0, 50),
     () => filter.watermark("https://x/y.png", 0, 0, 101),
     () => filter.blurClass("bad;name"),
+    // 40 two-byte characters are 80 UTF-8 bytes: over the
+    // server's 64-byte bound even though the code-unit
+    // length is 40.
+    () => filter.blurClass("é".repeat(40)),
+    () => filter.pixelateClass("é".repeat(33)),
+    // Preset names outside the server's configurable
+    // charset can only ever answer unknown_preset.
+    () => ops.preset("thumb!"),
+    () => ops.preset(""),
+    () => ops.preset("a/b"),
+    () => ops.preset("a:b"),
+    () => ops.preset("a b"),
     () => filter.maxBytes(0),
     () => filter.radius(-1),
     () => filter.border(0, "000000"),

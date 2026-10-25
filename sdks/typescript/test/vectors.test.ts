@@ -215,11 +215,17 @@ test("purge signatures match the published vectors", () => {
   );
   assert.equal(
     purgeGroupSignature("test-secret", "thumb"),
-    "2f779d54c25154a7528fb334973dd2c92e08b2575ee1359a7d426421b083b5d6",
+    "256634813bd6237179d251ba4526685f05db8a42ae056e4a04566f00042f0439",
   );
-  assert.equal(
+  // Purge-group signs under its own subkey: a per-target
+  // purge signature never transplants to it.
+  assert.notEqual(
     purgeGroupSignature("test-secret", "thumb"),
     purgeSignature("test-secret", "purge-group/thumb"),
+  );
+  assert.notEqual(
+    purgeGroupSignature("test-secret", "thumb"),
+    purgeSignature("test-secret", "thumb"),
   );
 });
 
@@ -284,4 +290,22 @@ test("verifyUrlSignature routes by key ID with a keyring", () => {
   // A bare secret ignores the ID and checks the tag.
   assert.equal(verifyUrlSignature("old-secret", keyed), true);
   assert.equal(verifyUrlSignature("new-secret", keyed), false);
+});
+
+test("verifyUrlSignature answers false for prototype-named key IDs", () => {
+  // Key IDs may be any [A-Za-z0-9_-]{1,32}, so an attacker
+  // can name one `constructor`, `toString`, or `__proto__`.
+  // The keyring lookup must consult own properties only:
+  // an inherited value is not a secret, and verification
+  // must answer false, never throw.
+  const remainder = "300x200/example.com/i.jpg";
+  const ring = { "k-old": "old-secret" };
+  for (const keyId of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    const url = `https://img.example.com/${signWithKeyId("old-secret", keyId, remainder)}/${remainder}`;
+    assert.equal(verifyUrlSignature(ring, url), false, keyId);
+  }
+  // An own property with one of those names is a real key
+  // and verifies as usual.
+  const url = `https://img.example.com/${signWithKeyId("old-secret", "toString", remainder)}/${remainder}`;
+  assert.equal(verifyUrlSignature({ toString: "old-secret" }, url), true);
 });

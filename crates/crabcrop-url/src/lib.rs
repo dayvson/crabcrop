@@ -131,14 +131,26 @@ pub fn purge_signature(secret: &[u8], target: &str) -> String {
     sign(&purge_key(secret), target)
 }
 
-/// The purge-group signature for a cache group: a purge
-/// signature over the literal string `purge-group/<group>`,
-/// which appears nowhere in the request URL. This is the
-/// signature segment for
+/// The purge-group subkey: the raw bytes of the
+/// HMAC-SHA256 of the domain label
+/// `crabcrop/purge-group-key` under the secret.
+/// Purge-group signatures live under this derived key,
+/// beside the purge key, so the two endpoints' message
+/// spaces cannot overlap: a per-target purge signature
+/// can never be transplanted to `/purge-group`, whatever
+/// target string it was minted over (audit R2-14).
+pub fn purge_group_key(secret: &[u8]) -> Vec<u8> {
+    // `sign` returns the hex tag; the key is its raw bytes.
+    hex::decode(sign(secret, "crabcrop/purge-group-key")).expect("sign returns lowercase hex")
+}
+
+/// The purge-group signature for a cache group: HMAC-SHA256
+/// of the group name under the purge-group subkey. This is
+/// the signature segment for
 /// `POST /purge-group/<signature>/<group>`; the helper
 /// exists so nobody has to know the signed string.
 pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
-    purge_signature(secret, &format!("purge-group/{group}"))
+    sign(&purge_group_key(secret), group)
 }
 
 /// The cache entry subkey: the raw bytes of the
@@ -337,7 +349,7 @@ mod tests {
         );
         assert_eq!(
             purge_group_signature(b"test-secret", "thumb"),
-            "2f779d54c25154a7528fb334973dd2c92e08b2575ee1359a7d426421b083b5d6"
+            "256634813bd6237179d251ba4526685f05db8a42ae056e4a04566f00042f0439"
         );
         // Domain separation: neither purge signature is an
         // image signature over a related string.
@@ -345,22 +357,33 @@ mod tests {
             purge_signature(b"test-secret", "300x200/https://example.com/a.jpg"),
             sign(b"test-secret", "300x200/https://example.com/a.jpg")
         );
-        assert_eq!(
+        // Purge-group has its own subkey (audit R2-14): no
+        // per-target purge signature transplants to it, not
+        // even one minted over the string the endpoint's URL
+        // carries, and not one over the bare group name.
+        assert_ne!(
             purge_group_signature(b"test-secret", "thumb"),
             purge_signature(b"test-secret", "purge-group/thumb")
         );
+        assert_ne!(
+            purge_group_signature(b"test-secret", "thumb"),
+            purge_signature(b"test-secret", "thumb")
+        );
+        assert_ne!(purge_group_key(b"test-secret"), purge_key(b"test-secret"));
     }
 
     #[test]
     fn derived_subkeys_are_domain_separated() {
-        // The entry MAC key is a third derivation beside
-        // purge and upload: same secret, three unrelated
-        // keys, none of them the secret itself.
+        // The entry MAC key is a derivation beside purge,
+        // purge-group, and upload: same secret, four
+        // unrelated keys, none of them the secret itself.
         let secret = b"test-secret";
         let entry = entry_key(secret);
         assert_eq!(entry.len(), 32);
         assert_ne!(entry, purge_key(secret));
+        assert_ne!(entry, purge_group_key(secret));
         assert_ne!(entry, upload_key(secret));
+        assert_ne!(purge_group_key(secret), upload_key(secret));
         assert_ne!(entry, secret.to_vec());
         // And it is deterministic: two derivations agree,
         // so every replica holding the secret verifies

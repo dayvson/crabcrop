@@ -69,13 +69,23 @@ def purge_signature(secret: Union[str, bytes], target: str) -> str:
     return hmac.new(key, target.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def purge_group_key(secret: Union[str, bytes]) -> bytes:
+    """The purge-group subkey: the raw bytes of the
+    HMAC-SHA256 of the domain label
+    ``crabcrop/purge-group-key`` under the secret.
+    Purge-group signatures live under this derived key,
+    beside the purge key, so a per-target purge signature
+    can never be transplanted to the purge-group endpoint."""
+    return bytes.fromhex(sign(secret, "crabcrop/purge-group-key"))
+
+
 def purge_group_signature(secret: Union[str, bytes], group: str) -> str:
     """The signature segment for
-    ``POST /purge-group/<signature>/<group>``: a purge
-    signature over the literal string ``purge-group/<group>``,
-    which appears nowhere in the request URL. The helper
-    exists so nobody has to know the signed string."""
-    return purge_signature(secret, f"purge-group/{group}")
+    ``POST /purge-group/<signature>/<group>``: HMAC-SHA256
+    of the group name under the purge-group subkey. The
+    helper exists so nobody has to know the signed string."""
+    key = purge_group_key(secret)
+    return hmac.new(key, group.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def upload_key(secret: Union[str, bytes]) -> bytes:
