@@ -90,7 +90,11 @@
 //!   per line). All four are required together; a partial set
 //!   is a startup error. `CRABCROP_CLIP_THRESHOLD` optionally
 //!   sets the tag score floor (default 0.05). Unset disables
-//!   annotation; meta responses then carry no tags.
+//!   annotation; meta responses then carry no tags. Meta
+//!   requests that opt in with `embeddings=1` also gain the
+//!   image embedding the tagger computes: base64-packed
+//!   float16, with the encoder identity, dimension, and
+//!   encoding named alongside it.
 //! - `CRABCROP_MODERATION_MODEL`: path to a ViT classifier
 //!   ONNX model (the Falconsai nsfw_image_detection shape)
 //!   whose per-category scores meta responses report when
@@ -106,6 +110,16 @@
 //!   review signals, never verdicts. Both unset disables
 //!   moderation. Verdicts only annotate meta; nothing is
 //!   enforced at serve time.
+//! - `CRABCROP_AESTHETIC_HEAD`: path to a LAION-style
+//!   linear aesthetic head (the PyTorch save, e.g.
+//!   `sa_0_4_vit_b_32_linear.pth`) scored against the
+//!   CLIP embedding in meta. Requires the `CRABCROP_CLIP_*`
+//!   set: the head's input is the tagger's embedding. A
+//!   malformed file is a startup error. A dimension
+//!   mismatch between the head and the encoder is not:
+//!   meta reports a null score with a reason and the
+//!   expected and actual dimensions. The score is
+//!   descriptive only, never a gate.
 //! - `CRABCROP_FALLBACK_IMAGE`: a URL or local file path for
 //!   the fallback image served (through the same operations,
 //!   marked `X-Crabcrop-Fallback: 1`) when a source cannot be
@@ -800,6 +814,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tagger: ai.tagger,
         tag_threshold: ai.tag_threshold,
         moderation: ai.moderation,
+        embeddings: ai.embeddings,
+        aesthetic: ai.aesthetic,
         detect: ai.detect,
         detectors: ai.detectors,
         focal: ai.focal,
@@ -889,6 +905,7 @@ fn config_fingerprint(
         "CRABCROP_CLIP_LABELS",
         "CRABCROP_MODERATION_MODEL",
         "CRABCROP_MODERATION_LABELS",
+        "CRABCROP_AESTHETIC_HEAD",
         "CRABCROP_FONT_PATH",
         "CRABCROP_VIDEO_ENCODER",
     ] {
@@ -1023,6 +1040,8 @@ struct AiProviders {
     tagger: Option<Arc<dyn crate::ai::TagProvider>>,
     tag_threshold: f32,
     moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
+    embeddings: Option<Arc<dyn crate::ai::EmbeddingProvider>>,
+    aesthetic: Option<Arc<crate::ai::AestheticHead>>,
     detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
     detectors: Vec<server::NamedDetector>,
     focal: Option<Arc<dyn crate::ai::FocalProvider>>,
@@ -1054,11 +1073,16 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         }
         _ => None,
     };
-    let (tagger, tag_threshold) = match build_tagger(ort_dylib.as_deref(), &get)? {
-        Some(setup) => (Some(setup.provider), setup.threshold),
-        None => (None, 0.05),
+    let (tagger, tag_threshold, embeddings) = match build_tagger(ort_dylib.as_deref(), &get)? {
+        Some(setup) => (
+            Some(setup.provider),
+            setup.threshold,
+            Some(setup.embeddings),
+        ),
+        None => (None, 0.05, None),
     };
     let moderation = build_moderation(ort_dylib.as_deref(), &get)?;
+    let aesthetic = build_aesthetic(&get, tagger.is_some())?;
     let detect = build_detector(ort_dylib.as_deref(), &get)?;
     let declared = build_declared_detectors(ort_dylib.as_deref(), &get)?;
     let face: Option<Arc<dyn crate::ai::FaceProvider>> = match get("CRABCROP_FACE_MODEL") {
@@ -1077,6 +1101,8 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         tagger,
         tag_threshold,
         moderation,
+        embeddings,
+        aesthetic,
         detect,
         detectors: declared.boxes,
         focal: declared.focal,
@@ -1539,10 +1565,12 @@ fn build_declared_detectors(
 /// configured: preloaded like every other model, with a
 /// broken configuration failing startup.
 /// A loaded tag provider plus the threshold its meta
-/// annotations compose with.
+/// annotations compose with, and the embedding
+/// provider built from the same tagger (issue #172).
 struct TaggerSetup {
     provider: Arc<dyn crate::ai::TagProvider>,
     threshold: f32,
+    embeddings: Arc<dyn crate::ai::EmbeddingProvider>,
 }
 
 fn build_tagger(
@@ -1570,9 +1598,19 @@ fn build_tagger(
             // the meta annotation is composed (issue #152),
             // so it travels with the provider to the server
             // state rather than living inside the provider.
+            let provider = Arc::new(provider);
+            // The embedding provider wraps the same
+            // tagger (issue #172): the vector the tag
+            // scores are computed from, surfaced with the
+            // image model's identity.
+            let embeddings = Arc::new(crate::ai::ClipEmbeddingProvider::new(
+                provider.clone(),
+                config.image_model.clone(),
+            ));
             Ok(Some(TaggerSetup {
-                provider: Arc::new(provider),
+                provider,
                 threshold: config.threshold,
+                embeddings,
             }))
         }
     }
@@ -1636,6 +1674,39 @@ fn build_moderation(
     let provider =
         crate::ai::ClipModerationProvider::new(Arc::new(tagger), clip.image_model.clone());
     Ok(Some(Arc::new(provider)))
+}
+
+/// Build the aesthetic head from the environment, when
+/// configured (issue #172): an operator-supplied LAION
+/// linear head, scored against the CLIP tagger's
+/// embedding in meta. The head's input is the tagger's
+/// embedding, so a head without the CLIP set is a
+/// startup error, and a malformed head file fails its
+/// load here, at boot, like every other configured
+/// artifact. A dimension mismatch between the head and
+/// the encoder is NOT an error: meta reports it per
+/// request, fail-soft (see `AestheticHead::score`).
+fn build_aesthetic(
+    get: impl Fn(&str) -> Option<String>,
+    tagger_configured: bool,
+) -> Result<Option<Arc<crate::ai::AestheticHead>>, String> {
+    let path = match get("CRABCROP_AESTHETIC_HEAD").filter(|v| !v.is_empty()) {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+    if !tagger_configured {
+        return Err(
+            "CRABCROP_AESTHETIC_HEAD is set but the CRABCROP_CLIP_* set is not configured: the head scores the CLIP tagger's embedding, so an encoder must be configured"
+                .to_string(),
+        );
+    }
+    let head = crate::ai::AestheticHead::load(&path)
+        .map_err(|e| format!("cannot load the aesthetic head: {e}"))?;
+    println!(
+        "aesthetic head loaded from {path} (expects a {}-dimensional embedding)",
+        head.expected_dim()
+    );
+    Ok(Some(Arc::new(head)))
 }
 
 #[cfg(test)]
@@ -2275,6 +2346,8 @@ mod tests {
         assert!(ai.face.is_none());
         assert!(ai.tagger.is_none());
         assert!(ai.moderation.is_none());
+        assert!(ai.embeddings.is_none());
+        assert!(ai.aesthetic.is_none());
         assert!(ai.detect.is_none());
         assert!(ai.detectors.is_empty());
         assert!(ai.focal.is_none());
@@ -2338,6 +2411,18 @@ mod tests {
             ("CRABCROP_MODERATION_LABELS", labels.as_str()),
         ])));
         assert!(err.contains("cannot read the moderation labels"), "{err}");
+        // An aesthetic head without the CLIP set refuses:
+        // the head scores the tagger's embedding, and
+        // there is no tagger to score with.
+        let head = missing_path("head");
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_AESTHETIC_HEAD",
+            head.as_str(),
+        )])));
+        assert!(
+            err.contains("CRABCROP_AESTHETIC_HEAD is set but the CRABCROP_CLIP_* set"),
+            "{err}"
+        );
     }
 
     /// Configured-but-unloadable models refuse construction
@@ -2427,13 +2512,25 @@ mod tests {
         } else {
             false
         };
+        // The aesthetic head joins the same way
+        // (CRABCROP_TEST_AESTHETIC_HEAD): a pure-Rust
+        // load, on top of the CLIP pair above.
+        let want_aesthetic = if let Ok(head) = std::env::var("CRABCROP_TEST_AESTHETIC_HEAD") {
+            map.insert("CRABCROP_AESTHETIC_HEAD".to_string(), head);
+            true
+        } else {
+            false
+        };
         let ai = build_ai_providers(|name: &str| map.get(name).cloned()).unwrap();
         assert!(ai.removebg.is_some());
         assert!(ai.upscale.is_some());
         assert!(ai.face.is_some());
         assert!(ai.tagger.is_some());
+        // The embedding provider rides the tagger.
+        assert!(ai.embeddings.is_some());
         assert!(ai.detect.is_some());
         assert_eq!(ai.moderation.is_some(), want_moderation);
+        assert_eq!(ai.aesthetic.is_some(), want_aesthetic);
     }
 
     #[test]
