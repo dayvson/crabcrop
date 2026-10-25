@@ -855,6 +855,7 @@ Guides for moving existing URL templates over:
 - [From Thumbor](docs/migrating-from-thumbor.md): concept and operation mapping, plus the `convert-thumbor` verb, which converts and re-signs URLs mechanically.
 - [From imgproxy](docs/migrating-from-imgproxy.md): option-by-option mapping tables.
 - [From Cloudinary](docs/migrating-from-cloudinary.md): transformation mapping, and what changes when assets become origin URLs.
+- [From imgix](docs/migrating-from-imgix.md): parameter-by-parameter mapping tables, including the adjustment scales that change meaning in translation.
 
 ## Deployment
 
