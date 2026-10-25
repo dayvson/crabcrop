@@ -1,0 +1,83 @@
+# crabcrop behind Akamai
+
+An Akamai property in front of a crabcrop origin: origin cache headers put in charge through the Caching behavior, cache groups bridged to cache tags by per-preset rules for group purges, and Image and Video Manager kept off the property.
+
+**Status: doc-verified.** Every Akamai behavior below was checked against Akamai's documentation on 2026-10-25. No live property was used; the checklist at the end is the live test, run it against yours, on the staging network first. Two points are flagged where they bite rather than stated flat: step 3's variant caching combines two behaviors that Akamai's docs describe separately, not together, and step 5 explains why the tag bridge is per-preset rules instead of a copy of crabcrop's `Cache-Group` header.
+
+**The shape.** Give crabcrop its own Akamai property (an Ion property is the natural fit), with `images.example.com` as a hostname on it and the crabcrop origin as its origin over HTTPS. A dedicated property keeps every setting below scoped to image traffic, and it matters twice over below: the property's CP code is the "everything" unit of step 5's purge mapping, and Image and Video Manager attaches inside a property's rule tree (step 2), so keeping it off is a property-wide fact. Give the property its own CP code, so that unit is exactly this hostname's content.
+
+Why the pairing works at all: crabcrop puts the signature and the operations in the URL path, and Akamai's cache key is built from the hostname and the path, so every signed variant is its own cache object with no key configuration. crabcrop also sends `Cache-Control: public, max-age=31536000, immutable` on image responses, so an edge that respects origin headers caches for a year and never revalidates, which matches how crabcrop treats its own tiers.
+
+Do not add Akamai token authentication (or any other edge token check) on this hostname. That is a second token checked against Akamai-side secrets; crabcrop's in-path signatures already do the job, and stacking the two means every client integration carries both.
+
+The behaviors below are also in `property-rules.json` in this directory, as a rule fragment in Property Manager's JSON format: merge the behaviors into your default rule and the child rules under it. It is illustrative of the exact settings named in each step, not a complete property; origin, hostname, and CP code settings are made in Property Manager as usual.
+
+## 1. Let origin headers govern
+
+Akamai's defaults run the other way from the other CDNs in this series: a property caches content indefinitely (evicting least-recently-used objects when full) and does not honor the origin's `Cache-Control` or `Expires` headers at all until the Caching behavior tells it to. Three settings fix that:
+
+- **Caching behavior: honor origin `Cache-Control`, with the per-directive toggles on.** Set the caching option to `CACHE_CONTROL` (Honor origin Cache-Control), turn on Enhanced RFC support, and turn on Honor max-age, Honor no-store, and Honor private. The toggles are the load-bearing part: the year-long image `max-age` is honored, and crabcrop's meta responses (`private, no-store`) and error responses (`no-store`) are never stored. Set the Default max-age fallback to something short (the fragment uses `1d`); it only applies to a response with no valid cache headers, and crabcrop sends explicit headers on every response class, so it never fires here.
+- **Keep query strings out of the cache key.** Akamai's default key includes the full query string, but a crabcrop URL carries everything in its path and the origin never reads a query string, so a junk parameter on a shared link would mint a second cache object for the same image. Set the Cache Key Query Parameters behavior to Exclude all parameters (`IGNORE_ALL`).
+- **Pass the origin's cacheability headers downstream unchanged.** By default the edge sends browsers the lesser of the origin's `max-age` and the object's remaining edge lifetime, so a browser's copy would age along with the edge object and the `immutable` year would shrink day by day. Set the Downstream Cacheability behavior to Pass cacheability headers from origin (`TUNNEL_ORIGIN`) and browsers see crabcrop's exact header. For responses the origin marks `no-store`, the edge sends cache-busting headers downstream either way.
+
+## 2. Keep Image and Video Manager off
+
+Image and Video Manager is the second-optimizer trap on this CDN. It is a separate product that has to be on your contract, and it attaches inside a property: add its Image and Video Manager (Images) behavior to a rule (the behavior requires a file extension match in that rule) and every image the rule serves is reprocessed. If it touched this hostname, crabcrop's render would become what it calls the pristine image, and it would serve its own derivatives instead: breakpoint widths chosen per device, recompression at its policy's quality, and, with Use Best File Type on, format conversion under its own `Accept` rules (its format groupings require the request's `Accept` to list every format in a grouping; wildcards do not count). Its supported-format table lists JPEG XL as neither an input nor an output, so crabcrop's negotiated JPEG XL output has no way through it. Derivatives also live under their own CP codes with their own purge surface, which would split step 5's mapping in two.
+
+- On the crabcrop property: **add the Image and Video Manager behavior to no rule.** Absent the behavior, nothing is transformed; there is no per-hostname opt-out inside a shared property to rely on.
+- If another site on the account needs it, that site gets its own property.
+
+A negotiated response in JPEG XL is the live proof the optimizer is not in the path: step 6 of the checklist uses it.
+
+## 3. Format negotiation: two behaviors, one flagged combination
+
+Without an explicit `filters:format(...)`, crabcrop negotiates the output format from the request's `Accept` header (AVIF, then JPEG XL, then WebP, by q-value) and can vary dimensions by client hints, all under one URL, and it says so in a `Vary` response header (`Accept`, `DPR`, `Sec-CH-Width`, `Sec-CH-DPR`, `Sec-CH-Viewport-Width`). Akamai's default handling of `Vary` is the pitfall of this CDN: a response whose `Vary` names anything other than `Accept-Encoding` (with a matching gzip or Brotli `Content-Encoding`) is not cached on edge servers at all. Left alone, every negotiated request is an origin fill. Three ways to handle it, in order:
+
+1. **Pin the format in the URL** (`filters:format(avif)`). Each format becomes a different signed URL and its own cache object. No edge features involved. This is the recommended default behind any CDN, not just Akamai.
+2. **Variant caching: Cache ID Modification plus Remove Vary Header** (both are in the fragment). Cache ID Modification is how request headers join the Akamai cache key: add an `INCLUDE_HEADERS` rule naming the five headers crabcrop varies on, header values included, optional so a request missing a hint still keys cleanly. The Remove Vary Header behavior then strips the `Vary` header that would otherwise make the response uncacheable, and the variants are told apart by the key instead. The flagged combination: Akamai's documentation describes each of these behaviors on its own (Remove Vary Header is documented as the fix for responses the edge will not cache; Cache ID Modification as how headers enter the key), but no page states the combination end to end. Prove it on the staging network with step 5 of the checklist before relying on it in production; if it does not hold on your property, pin formats. Two costs to know: raw `Accept` values fragment (real clients send dozens of spellings and orderings that mean the same three formats, and each is another object and another fill), and stripping `Vary` also strips it from what clients receive, which is safe in practice because a given client sends a consistent `Accept`. If you pin every format, remove both behaviors and skip the question entirely.
+3. **Do nothing.** Negotiated responses are simply not cached at the edge: correct bytes every time, and the origin takes every request (serving from its own tiers). Only sane if unpinned traffic is trivial.
+
+Collapsing the `Accept` spellings of option 2 into one token per format would take an EdgeWorkers function rewriting the header on the client request, the one job in this recipe that behaviors cannot express. The recipe ships none: plain configuration is correct without it, and a normalizer would have to track the server's negotiation rules forever. Client-hint variants are not collapsed by any of the three options either: build width variants as distinct operations (the SDKs' `build_srcset` does exactly this) instead of relying on client hints behind a CDN.
+
+## 4. Expiring URLs: the edge does not read them
+
+`exp:` expiry lives inside the signed path, and Akamai never looks inside the URL. A response cached before expiry keeps being served until its TTL runs out or it is purged: with step 1 in place, that can be a year. What expiry still guarantees is that the origin refuses the URL, so nothing new gets rendered or re-cached after it passes.
+
+If expiry has to bite at the edge, pick one:
+
+- Cap the edge TTL for expiring paths with a child rule (in the fragment): the path matches `*exp:*`, and its Caching behavior is a fixed TTL (`MAX_AGE`; the fragment's `7d` is an example). Set the cap no higher than the shortest signed lifetime you mint. The cap replaces crabcrop's TTL for those paths only, and the match is on any `exp:` in the path, including one inside the source URL of a non-expiring render. Akamai's docs state that a `no-store` response from the origin overrides the property's caching instructions, so meta and error responses on those paths stay uncached; repeat checklist step 2 against an expiring URL if you install the cap.
+- Purge the URL when it expires, from the same job that tracks the expiry (step 5; one URL purge from a generous budget).
+- Accept it, when expiry is about minting (no new renders) rather than access control. Most signed-URL deployments mean exactly that.
+
+## 5. Purge mapping
+
+Purge both layers, crabcrop first and Akamai second: purge the edge first and a concurrent request re-fills it from crabcrop's still-stale tiers, pinning the old bytes for another year. Akamai's purge system is Fast Purge, through the API (EdgeGrid credentials) or Control Center. It offers two methods: **invalidate** marks objects stale and the next request revalidates with the origin (a conditional `If-Modified-Since` request), while **delete** removes the objects outright. For this origin the two land the same: crabcrop sends no `ETag` or `Last-Modified` and does not answer conditional requests, so a revalidation fetches the full render. Use invalidate as the default and delete when the bytes must be gone (compliance, takedown). Purge responses report an estimated completion of about 5 seconds; treat that as asynchronous and let the checklist verify rather than assume.
+
+| You changed | crabcrop | Akamai Fast Purge |
+| --- | --- | --- |
+| One rendered URL | `POST /purge/<signature>/<url>`, or `crabcrop purge` | `POST /ccu/v3/invalidate/url/production`, objects: the full URL |
+| A preset (a cache group) | `POST /purge-group/<signature>/<name>`, or `crabcrop purge-group` | `POST /ccu/v3/invalidate/tag/production`, objects: the group name as a cache tag |
+| Everything on the property | Per URL or per group, as above | `POST /ccu/v3/invalidate/cpcode/production`, objects: the property's CP code |
+
+Why the group row is a tag and not a URL pattern: Fast Purge by URL takes full URLs only, no wildcards (directory purges live in a separate, slower utility), and every signed URL starts with a different signature segment, so no URL names "every spelling of this preset". Cache tags can. Akamai learns an object's tags from an origin `Edge-Cache-Tag` response header or from the Cache Tag behavior in the property; crabcrop sends its group names in a different header (`Cache-Group`, RFC 9875), and no documented behavior copies one response header into the other: a `Cache-Group` value is a quoted, possibly multi-entry list, while a tag is a single token, and the docs do not describe splitting it. So the bridge is one child rule per preset (in the fragment): the path matches `*/preset:<name>/*`, and a Cache Tag behavior adds the tag `<name>`. A tag is added when the object is first added to the cache. A URL carrying two presets matches both rules and collects both tags, and a render reached under its expanded-operations spelling is a different edge object that carries no tag, so mint preset spellings when you want group purges to reach a render. Tags are case-sensitive, and so are crabcrop group names, so a tag purge names the group byte-for-byte (not true of every CDN's tag system). An object carries at most 128 tags of at most 128 characters each; crabcrop responses carry only their groups, far under both.
+
+Costs and limits, so the mapping stays honest: Fast Purge is rate-limited by an account-wide token bucket shared by all API clients. The request bucket holds 100 tokens and refills at 50 per second; each request's objects draw from a per-type bucket: URLs 10,000 objects refilling at 12,000 per minute, cache tags 5,000 refilling at 500 per minute, CP codes 300 refilling at 30 per minute. One request carries one object type, the request body is capped at 50 KB, and a CP code selection cannot exceed 100 codes. Akamai warns that CP code purges spike origin load, because every object refills at once; the dedicated property is what makes the unit safe to use.
+
+One membership subtlety, mirrored on both sides: tags only attach to responses cached while the per-preset rules were live, and crabcrop groups accumulate the same way. Right after adding the rules, purge the CP code once to re-seed the edge cache with tagged copies.
+
+To see the tags on a cached object while verifying: set the Cache Tag Visibility behavior to `PRAGMA_HEADER` and request the object with a `Pragma: akamai-x-get-cache-tags` request header; the response carries an `Edge-Cache-Tag` header listing its tags. Set visibility back to `NEVER` (the default, which strips the header from responses) when you are done.
+
+## 6. Tiered Distribution (optional)
+
+Tiered Distribution is the origin shield analog: it inserts a tier of parent servers, positioned close to the origin, between the edge servers and crabcrop, so edge servers that miss fetch from a parent instead of the origin and crabcrop sees one fill per object per parent region rather than one per edge server, on top of its own two tiers. Enable the Tiered Distribution behavior (in the fragment); the advanced variant of the behavior lets you pick the parent map, and a narrower map means less origin load and a higher chance a parent already holds the object. Worth it when the origin is far from most viewers or renders are expensive (AI operations); unnecessary when viewers and origin share a region.
+
+## Checklist
+
+Run against your property after setup, on the staging network first and then on production:
+
+1. Request a signed image URL twice and watch the origin (crabcrop's logs, or the response's own `cache-status` header on the fill): the origin sees one fill, and the second response comes from the edge.
+2. Request the same URL as meta (`Accept: application/json`) twice. The origin sees both requests: `private, no-store` is honored, which also proves the Honor private and Honor no-store toggles are on.
+3. Purge one URL in both layers, then request it: an origin fill, then edge hits resume on the next request.
+4. If you use tag purges: set Cache Tag Visibility to `PRAGMA_HEADER`, request a `preset:` URL with a `Pragma: akamai-x-get-cache-tags` request header, and confirm the returned `Edge-Cache-Tag` header carries the preset name. Purge that tag in both layers and request the URL again: an origin fill proves the tags landed. Set visibility back to `NEVER`.
+5. If you left formats unpinned with variant caching on (step 3, option 2): request one negotiated URL with a Chrome `Accept` header and then with a Safari one. Different bytes, each an origin fill once and an edge hit on repeat, prove the variants are keying and caching. Identical bytes across the two, or an origin fill on every repeat, mean the combination is not holding on your property: pin formats instead.
+6. Request a URL with an `Accept` offering JPEG XL and confirm the response is `image/jxl`. Image and Video Manager has no JPEG XL support, so JPEG XL bytes prove it is not in the path; also confirm no rule in the property carries its behavior.
