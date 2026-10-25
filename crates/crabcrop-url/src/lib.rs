@@ -141,6 +141,18 @@ pub fn purge_group_signature(secret: &[u8], group: &str) -> String {
     purge_signature(secret, &format!("purge-group/{group}"))
 }
 
+/// The cache entry subkey: the raw bytes of the
+/// HMAC-SHA256 of the domain label `crabcrop/entry-key`
+/// under the secret. Persistent cache entries are MACed
+/// under this derived key (issue #190), so a forged entry
+/// planted in the disk cache or the shared bucket fails
+/// verification and reads as a miss. The key never
+/// leaves the server: no client signature is ever
+/// computed with it.
+pub fn entry_key(secret: &[u8]) -> Vec<u8> {
+    hex::decode(sign(secret, "crabcrop/entry-key")).expect("sign returns lowercase hex")
+}
+
 /// The upload subkey: the raw bytes of the HMAC-SHA256 of
 /// the domain label `crabcrop/upload-key` under the secret.
 /// Upload signatures live under this derived key, in their
@@ -306,6 +318,23 @@ mod tests {
             purge_group_signature(b"test-secret", "thumb"),
             purge_signature(b"test-secret", "purge-group/thumb")
         );
+    }
+
+    #[test]
+    fn derived_subkeys_are_domain_separated() {
+        // The entry MAC key is a third derivation beside
+        // purge and upload: same secret, three unrelated
+        // keys, none of them the secret itself.
+        let secret = b"test-secret";
+        let entry = entry_key(secret);
+        assert_eq!(entry.len(), 32);
+        assert_ne!(entry, purge_key(secret));
+        assert_ne!(entry, upload_key(secret));
+        assert_ne!(entry, secret.to_vec());
+        // And it is deterministic: two derivations agree,
+        // so every replica holding the secret verifies
+        // the entries any other wrote.
+        assert_eq!(entry, entry_key(secret));
     }
 
     #[test]

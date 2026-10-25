@@ -24,6 +24,32 @@ pub struct CachedImage {
     pub groups: Vec<String>,
 }
 
+/// Whether a cache key's result derives from `source`.
+/// The key is the canonical form (operations, then the
+/// source) plus any `#`-suffixed variant segments
+/// (negotiated class, request hints, the config
+/// fingerprint), and a source string itself never
+/// contains a `#` (it is a URL remainder, where `#` would
+/// start a fragment), so the base is the key up to the
+/// first `#` and the source is its tail segment.
+pub(crate) fn key_belongs_to_source(key: &str, source: &str) -> bool {
+    let base = key.split('#').next().unwrap_or(key);
+    base == source || base.ends_with(&format!("/{source}"))
+}
+
+/// The union of two group sets, sorted so every tier
+/// stores and compares the same canonical set.
+pub(crate) fn union_groups(existing: &[String], extra: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = existing.to_vec();
+    for group in extra {
+        if !out.contains(group) {
+            out.push(group.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     entries: HashMap<String, CachedImage>,
@@ -92,6 +118,48 @@ impl Cache {
             .iter()
             .filter(|(_, image)| image.groups.iter().any(|g| g == group))
             .map(|(key, _)| key.clone())
+            .collect();
+        let mut removed = 0;
+        for key in keys {
+            if let Some(old) = inner.entries.remove(&key) {
+                inner.total_bytes -= old.bytes.len();
+                remove_from_order(&mut inner, &key);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Union `groups` into the stored entry for `key`
+    /// (audit R2-15): provenance is accumulated on every
+    /// hit, so an entry first stored by a group-free
+    /// spelling is still found by a later group purge.
+    /// Returns whether the stored entry changed.
+    pub fn merge_groups(&self, key: &str, groups: &[String]) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(image) = inner.entries.get_mut(key) else {
+            return false;
+        };
+        let merged = union_groups(&image.groups, groups);
+        if merged == image.groups {
+            return false;
+        }
+        image.groups = merged;
+        true
+    }
+
+    /// Remove every entry whose result derives from
+    /// `source`, whatever operations produced it (audit
+    /// R2-07): an upload overwrite calls this so the
+    /// replaced original's derivatives stop serving.
+    /// Returns how many entries were removed.
+    pub fn purge_source(&self, source: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let keys: Vec<String> = inner
+            .entries
+            .keys()
+            .filter(|k| key_belongs_to_source(k, source))
+            .cloned()
             .collect();
         let mut removed = 0;
         for key in keys {
@@ -219,6 +287,38 @@ mod tests {
         assert!(cache.get("d").is_some());
         assert_eq!(cache.purge_group("thumb"), 0);
         assert_eq!(cache.purge_group("missing"), 0);
+    }
+
+    #[test]
+    fn merge_groups_accumulates_provenance() {
+        let cache = Cache::new(1024);
+        cache.put("a".to_string(), grouped(10, &["thumb"]));
+        // A later spelling of the same entry brings its
+        // own group: the stored set is the union, so a
+        // group purge finds the entry either way (R2-15).
+        assert!(cache.merge_groups("a", &["hero".to_string()]));
+        assert!(!cache.merge_groups("a", &["thumb".to_string()]));
+        assert!(!cache.merge_groups("missing", &["hero".to_string()]));
+        assert_eq!(cache.get("a").unwrap().groups, ["hero", "thumb"]);
+        assert_eq!(cache.purge_group("hero"), 1);
+    }
+
+    #[test]
+    fn purge_source_removes_every_derivative_of_the_source() {
+        let cache = Cache::new(4096);
+        cache.put("300x200/file:///heroes/cat.jpg".to_string(), img(10));
+        cache.put(
+            "300x200/file:///heroes/cat.jpg#cfgab12#avif".to_string(),
+            img(10),
+        );
+        cache.put("600x400/file:///heroes/cat.jpg".to_string(), img(10));
+        cache.put("300x200/file:///heroes/cat.jpg2".to_string(), img(10));
+        cache.put("300x200/file:///heroes/dog.jpg".to_string(), img(10));
+        assert_eq!(cache.purge_source("file:///heroes/cat.jpg"), 3);
+        assert!(cache.get("300x200/file:///heroes/cat.jpg").is_none());
+        assert!(cache.get("300x200/file:///heroes/cat.jpg2").is_some());
+        assert!(cache.get("300x200/file:///heroes/dog.jpg").is_some());
+        assert_eq!(cache.purge_source("file:///heroes/cat.jpg"), 0);
     }
 
     #[test]

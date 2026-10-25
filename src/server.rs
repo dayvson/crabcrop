@@ -47,6 +47,82 @@ impl std::fmt::Debug for NamedDetector {
     }
 }
 
+/// In-flight miss coalescing (audit R2-09): the first
+/// request to miss the cache for a key becomes its leader
+/// and runs the fetch and the encode; concurrent requests
+/// for the same key wait on the leader instead of each
+/// fetching and encoding the same image, then re-check
+/// the tiers. The map holds one watch sender per key in
+/// flight; the leader's guard removes the key and wakes
+/// the waiters on drop, so every exit path (success,
+/// error, fallback) releases them exactly once.
+#[derive(Default)]
+pub struct Inflight {
+    leaders:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::watch::Sender<bool>>>>,
+}
+
+impl std::fmt::Debug for Inflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inflight").finish_non_exhaustive()
+    }
+}
+
+/// The caller's role for one cache key.
+enum Flight {
+    /// This request runs the miss path; dropping the
+    /// guard wakes the waiters.
+    Leader(LeaderGuard),
+    /// Another request is already running the miss path
+    /// for this key; wait on the channel, then re-check
+    /// the tiers.
+    Follower(tokio::sync::watch::Receiver<bool>),
+}
+
+/// Removes the key from the in-flight map and wakes its
+/// waiters when dropped, on every exit path alike.
+struct LeaderGuard {
+    inflight: Arc<Inflight>,
+    key: String,
+    sender: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        self.inflight.remove(&self.key, &self.sender);
+        let _ = self.sender.send(true);
+    }
+}
+
+impl Inflight {
+    /// Claim leadership for `key`, or follow the request
+    /// already leading it.
+    fn lead(self: &Arc<Self>, key: &str) -> Flight {
+        let mut leaders = self.leaders.lock().unwrap();
+        if let Some(sender) = leaders.get(key) {
+            return Flight::Follower(sender.subscribe());
+        }
+        let (sender, _) = tokio::sync::watch::channel(false);
+        let sender = Arc::new(sender);
+        leaders.insert(key.to_string(), sender.clone());
+        Flight::Leader(LeaderGuard {
+            inflight: self.clone(),
+            key: key.to_string(),
+            sender,
+        })
+    }
+
+    /// Remove `key` if `sender` is still its leader (a
+    /// waiter that already promoted itself must not lose
+    /// its own claim to the previous leader's cleanup).
+    fn remove(&self, key: &str, sender: &Arc<tokio::sync::watch::Sender<bool>>) {
+        let mut leaders = self.leaders.lock().unwrap();
+        if leaders.get(key).is_some_and(|s| Arc::ptr_eq(s, sender)) {
+            leaders.remove(key);
+        }
+    }
+}
+
 /// Shared state for the handlers.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -160,6 +236,19 @@ pub struct AppState {
     /// work, so it gets its own small gate (2 permits, like
     /// the AI gate) on top of the process gate.
     pub video_gate: Arc<tokio::sync::Semaphore>,
+    /// In-flight miss coalescing (audit R2-09): concurrent
+    /// misses for one cache key share one fetch and one
+    /// encode instead of stampeding the origin and the
+    /// process gate.
+    pub inflight: Arc<Inflight>,
+    /// Fingerprint of the output-shaping configuration
+    /// (audit R2-08), computed at boot in `main`: embedded
+    /// in every cache key, so changing the metadata
+    /// policy, quality tuning, width step, model files,
+    /// font, or video encoder starts a fresh cache epoch
+    /// instead of silently serving entries rendered under
+    /// the old configuration from the persistent tiers.
+    pub config_fingerprint: String,
 }
 
 /// Build the router.
@@ -393,7 +482,13 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         removed += store.purge_matching(&key_form);
     }
     if let Some(shared) = &state.shared_store {
-        removed += shared.purge_matching(&key_form).await;
+        // The shared tier deletes the current epoch's
+        // enumerable variants directly by object name
+        // (audit R2-24); the fingerprint-free form drives
+        // its matching walk, which also reaches older
+        // epochs and hint-variant spellings.
+        let epoch_form = format!("{key_form}#cfg{}", state.config_fingerprint);
+        removed += shared.purge_matching(&key_form, &epoch_form).await;
     }
     state.metrics.record_purge();
     purge_log("purge", target, Some(removed));
@@ -520,6 +615,21 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
 /// is the exact source reference to embed in transform
 /// URLs: `201` for a new object, `200` when an allowed
 /// overwrite replaced one.
+/// Remove every cached derivative of `source` from all
+/// three tiers; returns the total removed. The upload
+/// overwrite path (audit R2-07) shares this with any
+/// future source-replacement flow.
+async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
+    let mut removed = state.cache.purge_source(source);
+    if let Some(store) = &state.store {
+        removed += store.purge_source(source);
+    }
+    if let Some(shared) = &state.shared_store {
+        removed += shared.purge_source(source).await;
+    }
+    removed
+}
+
 async fn upload_handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
     let Some(upload) = &state.upload else {
         return (StatusCode::NOT_FOUND, "uploads are not configured").into_response();
@@ -624,6 +734,18 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         Ok(()) => {
             state.metrics.record_upload();
             upload_log(name, if existed { "replaced" } else { "stored" });
+            if existed {
+                // An overwrite replaces the source every
+                // cached derivative was rendered from: purge
+                // them all, in every tier, so the next
+                // request re-renders from the new original
+                // instead of serving the stale transform
+                // (audit R2-07). A first store has no
+                // derivatives to invalidate.
+                let source = upload.source_ref(name);
+                let removed = purge_source_everywhere(&state, &source).await;
+                purge_log("purge-source", &source, Some(removed));
+            }
             let status = if existed {
                 StatusCode::OK
             } else {
@@ -1013,6 +1135,16 @@ async fn serve(
         );
     }
     let key_base = crate::url::canonical_form(&ops, source_url);
+    // The key also carries the configuration fingerprint
+    // (audit R2-08): entries in the persistent tiers are
+    // keyed under the configuration that produced them, so
+    // a restart with different output-shaping settings
+    // (metadata policy, quality tuning, width step, model
+    // or font or encoder files) starts a fresh epoch
+    // instead of serving the old configuration's renders.
+    // The fingerprint sits inside the base, ahead of the
+    // negotiated-class and hint suffixes.
+    let key_base = format!("{key_base}#cfg{}", state.config_fingerprint);
     let mut cache_key = if directives.explicit_format.is_some() {
         key_base.clone()
     } else {
@@ -1042,61 +1174,184 @@ async fn serve(
     // the diagnostic must never be served from, or stored into,
     // any tier (its key differs from the plain URL's anyway, but
     // the bypass is the rule, not the key's accident).
-    let mut cache_status = "crabcrop; fwd=uri-miss";
-    let hit = if meta || debug {
-        None
-    } else {
+    let bypass = meta || debug;
+    if !bypass {
         record.cache_looked_up = true;
-        state.cache.get(&cache_key)
-    };
-    // Memory first, disk second: a disk hit is promoted into
-    // memory so the next repeat skips the file read.
-    let hit = match hit {
-        Some(h) => {
-            cache_status = "crabcrop; hit";
-            Some(h)
-        }
-        None if meta || debug => None,
-        None => match &state.store {
-            Some(store) => {
-                let found = store.get(&cache_key);
-                if let Some(image) = &found {
-                    cache_status = "crabcrop; hit; detail=\"disk\"";
-                    state.cache.put(cache_key.clone(), image.clone());
-                }
-                found
-            }
-            None => None,
-        },
-    };
-    // Shared tier last (issue #142): a hit is promoted into
-    // both local tiers so the next repeat is local.
-    let hit = match hit {
-        Some(h) => Some(h),
-        None if meta || debug => None,
-        None => match &state.shared_store {
-            Some(shared) => {
-                let found = shared.get(&cache_key).await;
-                if let Some(image) = &found {
-                    cache_status = "crabcrop; hit; detail=\"shared\"";
-                    state.cache.put(cache_key.clone(), image.clone());
-                    if let Some(store) = &state.store {
-                        store.put(&cache_key, image);
-                    }
-                }
-                found
-            }
-            None => None,
-        },
-    };
-    if let Some(hit) = hit {
-        record.cache_hit = true;
-        record.bytes_out = hit.bytes.len();
-        let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
-        attach_cache_headers(&mut response, cache_status, &groups);
-        return (response, record);
     }
+    let work = MissWork {
+        ops,
+        source_url: source_url.to_string(),
+        directives,
+        preferred,
+        meta,
+        debug,
+        placeholders,
+        hinted_width,
+        dpr_hint,
+        save_data,
+        accept: accept.map(str::to_string),
+        groups: groups.clone(),
+        cache_key: cache_key.clone(),
+        max_age,
+    };
+    // Singleflight (audit R2-09): the first miss for a key
+    // leads (one fetch, one encode, under the gates below);
+    // concurrent requests for the same key wait for the
+    // leader, then re-check the tiers and serve its entry.
+    // A leader whose result is not cached (an error, a
+    // fallback) releases its waiters to take the miss path
+    // themselves, one at a time, so a failing origin is
+    // retried by the waiters rather than masked. Waits are
+    // capped: a key whose leaders keep failing sheds its
+    // remaining waiters with the busy response instead of
+    // queueing them forever.
+    let mut waits = 0;
+    loop {
+        if !bypass && let Some((hit, cache_status)) = lookup_tiers(state, &cache_key, &groups).await
+        {
+            record.cache_hit = true;
+            record.bytes_out = hit.bytes.len();
+            let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
+            attach_cache_headers(&mut response, cache_status, &groups);
+            return (response, record);
+        }
+        if bypass {
+            return serve_miss(state, work, record).await;
+        }
+        match state.inflight.lead(&cache_key) {
+            Flight::Leader(guard) => {
+                let result = serve_miss(state, work, record).await;
+                drop(guard);
+                return result;
+            }
+            Flight::Follower(mut changed) => {
+                if waits >= MAX_FLIGHT_WAITS {
+                    return (
+                        busy_response("server busy: too many images processing at once", 1),
+                        record,
+                    );
+                }
+                waits += 1;
+                // The leader always signals on drop; the
+                // timeout is only a backstop against a
+                // wedged leader, after which the waiter
+                // re-checks the tiers and may lead itself.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed())
+                    .await;
+            }
+        }
+    }
+}
 
+/// How many times one request may wait on another
+/// request's in-flight miss for the same key before it
+/// sheds with a 503 (audit R2-09).
+const MAX_FLIGHT_WAITS: u32 = 3;
+
+/// The tier lookup chain for one key: memory, then disk
+/// (a hit promotes into memory), then the shared tier (a
+/// hit promotes into both local tiers). On any hit, the
+/// request's cache groups are unioned into the stored
+/// entry (audit R2-15): provenance accumulates, so an
+/// entry first stored through a group-free spelling is
+/// still removed by a later group purge once any grouped
+/// spelling of the same URL has been served. Returns the
+/// image and the `Cache-Status` value for the tier that
+/// served it.
+async fn lookup_tiers(
+    state: &AppState,
+    cache_key: &str,
+    groups: &[String],
+) -> Option<(CachedImage, &'static str)> {
+    if let Some(hit) = state.cache.get(cache_key) {
+        if !groups.is_empty() {
+            state.cache.merge_groups(cache_key, groups);
+        }
+        return Some((hit, "crabcrop; hit"));
+    }
+    if let Some(store) = &state.store
+        && let Some(mut image) = store.get(cache_key)
+    {
+        if !groups.is_empty() && store.merge_groups(cache_key, groups) {
+            image.groups = crate::cache::union_groups(&image.groups, groups);
+        }
+        state.cache.put(cache_key.to_string(), image.clone());
+        return Some((image, "crabcrop; hit; detail=\"disk\""));
+    }
+    if let Some(shared) = &state.shared_store
+        && let Some(mut image) = shared.get(cache_key).await
+    {
+        if !groups.is_empty() {
+            let merged = crate::cache::union_groups(&image.groups, groups);
+            if merged != image.groups {
+                image.groups = merged;
+                // Best-effort, off the response path, like
+                // the write-through put.
+                let shared = shared.clone();
+                let key = cache_key.to_string();
+                let entry = image.clone();
+                tokio::spawn(async move { shared.put(&key, &entry).await });
+            }
+        }
+        state.cache.put(cache_key.to_string(), image.clone());
+        if let Some(store) = &state.store {
+            store.put(cache_key, &image);
+        }
+        return Some((image, "crabcrop; hit; detail=\"shared\""));
+    }
+    None
+}
+
+/// Everything the cache-miss path needs, bundled so the
+/// singleflight loop in `serve` can hand it to whichever
+/// request leads the miss.
+struct MissWork {
+    ops: Vec<crate::url::Operation>,
+    source_url: String,
+    directives: crate::url::RequestDirectives,
+    preferred: Option<ImageFormat>,
+    meta: bool,
+    debug: bool,
+    placeholders: bool,
+    hinted_width: Option<u32>,
+    dpr_hint: Option<f32>,
+    save_data: bool,
+    accept: Option<String>,
+    groups: Vec<String>,
+    cache_key: String,
+    max_age: Option<u32>,
+}
+
+/// The cache-miss path: load the source, resolve
+/// watermarks, run the engine under the gates, populate
+/// the tiers, and respond (a meta document when asked).
+/// Runs at most once per key at a time, led by one
+/// request while its duplicates wait (see `serve`).
+async fn serve_miss(
+    state: &AppState,
+    work: MissWork,
+    mut record: RequestRecord,
+) -> (Response, RequestRecord) {
+    let MissWork {
+        ops,
+        source_url,
+        directives,
+        preferred,
+        meta,
+        debug,
+        placeholders,
+        hinted_width,
+        dpr_hint,
+        save_data,
+        accept,
+        groups,
+        cache_key,
+        max_age,
+    } = work;
+    let accept = accept.as_deref();
+    let cache_status = "crabcrop; fwd=uri-miss";
+    let source_url = source_url.as_str();
+    let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
     record.load_ran = true;
     let load_start = Instant::now();
     let mut used_fallback = false;
@@ -1995,6 +2250,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2087,6 +2344,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: Some(Arc::new(encoder)),
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2220,6 +2479,8 @@ mod tests {
                 .unwrap(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2268,6 +2529,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2320,6 +2583,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2853,6 +3118,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3159,6 +3426,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3339,6 +3608,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3373,8 +3644,16 @@ mod tests {
             focal: None,
             font: None,
             fallback: None,
-            store: dir
-                .map(|d| Arc::new(crate::storage::DiskStore::open(d, 16 * 1024 * 1024).unwrap())),
+            store: dir.map(|d| {
+                Arc::new(
+                    crate::storage::DiskStore::open(
+                        d,
+                        16 * 1024 * 1024,
+                        crate::url::entry_key(b"disk-key-test"),
+                    )
+                    .unwrap(),
+                )
+            }),
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -3389,6 +3668,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4516,7 +4797,12 @@ mod tests {
             font: None,
             fallback: None,
             store: Some(Arc::new(
-                crate::storage::DiskStore::open(dir, 16 * 1024 * 1024).unwrap(),
+                crate::storage::DiskStore::open(
+                    dir,
+                    16 * 1024 * 1024,
+                    crate::url::entry_key(b"disk-key-test"),
+                )
+                .unwrap(),
             )),
             shared_store: None,
             upload: None,
@@ -4532,6 +4818,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4561,14 +4849,23 @@ mod tests {
             focal: None,
             font: None,
             fallback: None,
-            store: dir
-                .map(|d| Arc::new(crate::storage::DiskStore::open(d, 16 * 1024 * 1024).unwrap())),
+            store: dir.map(|d| {
+                Arc::new(
+                    crate::storage::DiskStore::open(
+                        d,
+                        16 * 1024 * 1024,
+                        crate::url::entry_key(b"disk-key-test"),
+                    )
+                    .unwrap(),
+                )
+            }),
             shared_store: Some(Arc::new(crate::s3store::S3Store::new(
                 "results".into(),
                 String::new(),
                 Some(endpoint.into()),
                 "us-east-1".into(),
                 None,
+                crate::url::entry_key(b"disk-key-test"),
             ))),
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -4583,6 +4880,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4931,6 +5230,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let job = ProcessJob {
             save_data: false,
@@ -5311,6 +5612,8 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5501,6 +5804,265 @@ mod tests {
         assert_eq!(std::fs::read(dir2.join(name)).unwrap(), other);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn upload_overwrite_invalidates_cached_derivatives() {
+        // Audit R2-07: overwriting a source must not leave
+        // its cached derivatives serving the old image.
+        let dir = upload_dir("overwrite-purge");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, true).await;
+        let name = "cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let url = format!("{base}/upload/{sig}/{name}");
+        let resp = client().put(&url).body(test_png()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // Render a derivative and confirm it is cached.
+        let remainder = "50x30/file:///cat.png";
+        let get = format!("{base}/{}/{remainder}", sign(remainder));
+        let first = client()
+            .get(&get)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let resp = client().get(&get).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        // Overwrite the source with a different image.
+        let other = {
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                200,
+                120,
+                image::Rgb([255, 255, 255]),
+            ));
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let resp = client().put(&url).body(other).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The same transform URL re-renders from the new
+        // original instead of serving the stale entry.
+        let resp = client().get(&get).send().await.unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        let rendered = resp.bytes().await.unwrap();
+        assert_ne!(
+            rendered, first,
+            "the derivative is the new image, not the stale one"
+        );
+        let img = image::load_from_memory(&rendered).unwrap();
+        assert_eq!((img.width(), img.height()), (50, 30));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Source server that counts its hits and answers
+    /// slowly, so concurrent requests overlap in flight.
+    async fn spawn_slow_counting_server(
+        body: Vec<u8>,
+        delay_ms: u64,
+    ) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}/src.png"), hits)
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_share_one_origin_fetch() {
+        // Audit R2-09: a burst of identical cache misses
+        // collapses into one fetch and one encode; the
+        // rest wait for the leader, then serve its entry.
+        let (src, hits) = spawn_slow_counting_server(test_png(), 500).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                let resp = client().get(&url).send().await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                resp.bytes().await.unwrap()
+            }));
+        }
+        let mut bodies = Vec::new();
+        for task in tasks {
+            bodies.push(task.await.unwrap());
+        }
+        assert!(
+            bodies.windows(2).all(|w| w[0] == w[1]),
+            "every waiter received the leader's bytes"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "one origin fetch for the whole burst"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_provenance_accumulates_across_spellings() {
+        // Audit R2-15: an entry first stored through a
+        // group-free spelling joins the group when a
+        // grouped spelling of the same URL is served from
+        // it, so the group purge still finds it.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_presets(preset_test_map(), false).await;
+        // The plain spelling stores the entry group-free.
+        let plain = format!("30x20/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{plain}", sign(&plain)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The preset spelling is the same canonical entry:
+        // a hit (no second fetch) that unions the preset's
+        // group into the stored entry.
+        let preset = format!("preset:small/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{preset}", sign(&preset)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The group purge removes the entry even though it
+        // was stored before the group was ever seen.
+        let sig = crate::url::purge_group_signature(SECRET, "small");
+        let resp = client()
+            .post(format!("{base}/purge-group/{sig}/small"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = client()
+            .get(format!("{base}/{}/{plain}", sign(&plain)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    }
+
+    /// An app over a disk tier under a chosen
+    /// configuration fingerprint (the epoch tests).
+    async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &str) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: Some(Arc::new(
+                crate::storage::DiskStore::open(
+                    dir,
+                    16 * 1024 * 1024,
+                    crate::url::entry_key(SECRET),
+                )
+                .unwrap(),
+            )),
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: fingerprint.to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_config_change_starts_a_fresh_cache_epoch() {
+        // Audit R2-08: servers sharing one disk tier under
+        // different configuration fingerprints must not
+        // serve each other's renders; the same fingerprint
+        // across a restart still hits the disk tier.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let dir = upload_dir("epoch");
+        let remainder = format!("50x30/{src}");
+        let path = format!("{}/{remainder}", sign(&remainder));
+        let base_a = spawn_app_with_store_fingerprint(&dir, "epoch-a").await;
+        let resp = client()
+            .get(format!("{base_a}/{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // A different fingerprint over the same directory:
+        // a miss, refetched, not the stored render.
+        let base_b = spawn_app_with_store_fingerprint(&dir, "epoch-b").await;
+        let resp = client()
+            .get(format!("{base_b}/{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // The same fingerprint across a restart: a disk
+        // hit, no third fetch. The epoch is a function of
+        // the configuration, not of the process.
+        let base_a2 = spawn_app_with_store_fingerprint(&dir, "epoch-a").await;
+        let resp = client()
+            .get(format!("{base_a2}/{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            header(&resp, "cache-status"),
+            "crabcrop; hit; detail=\"disk\""
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -3,12 +3,14 @@
 //! one S3 bucket (or an S3-compatible endpoint).
 //!
 //! Entries are the disk store's serialized form (the CRABDISK
-//! bytes: key and cache groups embedded), one object per
-//! entry, named by the SHA-256 of the cache key under a
-//! configurable prefix. Purges list the prefix and read each
-//! entry's stored key and groups, which keeps purge semantics
-//! identical across tiers at the cost of reads an
-//! administrative operation can afford.
+//! bytes: key and cache groups embedded, MACed under a key
+//! derived from the server secret), one object per entry,
+//! named by the SHA-256 of the cache key under a configurable
+//! prefix. Purges match on each entry's stored key and
+//! groups, read from the entry header alone (a ranged read,
+//! never the whole object; audit R2-24), and per-URL purges
+//! additionally delete the target's enumerable key variants
+//! directly by their deterministic object names.
 //!
 //! Like the disk store, every operation is best-effort: a
 //! network or service error degrades to a miss or a dropped
@@ -23,9 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::cache::CachedImage;
+use crate::cache::{CachedImage, key_belongs_to_source};
 use crate::sigv4::{self, Credentials};
-use crate::storage::{MAX_ENTRY_BYTES, key_stem, parse_entry, serialize_entry};
+use crate::storage::{MAX_ENTRY_BYTES, key_stem, parse_entry, parse_entry_header, serialize_entry};
 
 #[derive(Debug)]
 pub struct S3Store {
@@ -36,6 +38,13 @@ pub struct S3Store {
     endpoint: Option<String>,
     region: String,
     creds: Option<Credentials>,
+    /// The cache entry MAC key, derived from the server
+    /// secret (issue #190): entries are written and
+    /// verified under it, so an object planted in the
+    /// bucket by anyone without the secret is a miss.
+    /// Inert for the raw-object path (`put_raw`/`get_raw`
+    /// store uploads verbatim, with no entry framing).
+    entry_key: Vec<u8>,
     /// Largest object an entry read will buffer. Objects in
     /// the shared bucket are operator-adjacent data, not
     /// fully trusted input: a planted oversized object must
@@ -51,6 +60,7 @@ impl S3Store {
         endpoint: Option<String>,
         region: String,
         creds: Option<Credentials>,
+        entry_key: Vec<u8>,
     ) -> Self {
         let trimmed = prefix.trim_matches('/');
         let prefix = if trimmed.is_empty() {
@@ -68,6 +78,7 @@ impl S3Store {
             endpoint,
             region,
             creds,
+            entry_key,
             max_entry_bytes: MAX_ENTRY_BYTES,
         }
     }
@@ -109,6 +120,19 @@ impl S3Store {
         query: &[(&str, &str)],
         body: Vec<u8>,
     ) -> Option<reqwest::Response> {
+        self.request_h(method, object_key, query, body, &[]).await
+    }
+
+    /// [`S3Store::request`] with extra request headers
+    /// (the purge walk's `Range`).
+    async fn request_h(
+        &self,
+        method: &str,
+        object_key: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+        extra_headers: &[(&str, &str)],
+    ) -> Option<reqwest::Response> {
         let path_part = if object_key.is_empty() {
             String::new()
         } else {
@@ -142,6 +166,9 @@ impl S3Store {
             .request(verb, url.clone())
             .header("x-amz-content-sha256", payload_hash.clone())
             .body(body);
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
         if let Some(creds) = &self.creds {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -192,7 +219,7 @@ impl S3Store {
             return None;
         }
         let data = self.read_capped(resp).await?;
-        let (stored_key, image) = parse_entry(&data)?;
+        let (stored_key, image) = parse_entry(&data, &self.entry_key)?;
         if stored_key != key {
             return None;
         }
@@ -203,7 +230,7 @@ impl S3Store {
     /// the local tiers already hold the entry.
     pub async fn put(&self, key: &str, image: &CachedImage) {
         let object = self.object_key(&key_stem(key));
-        let data = serialize_entry(key, image);
+        let data = serialize_entry(key, image, &self.entry_key);
         let _ = self.request("PUT", &object, &[], data).await;
     }
 
@@ -275,47 +302,152 @@ impl S3Store {
         keys
     }
 
-    /// Remove every entry whose stored key is `base` or one of
-    /// its `#`-suffixed variants. Returns how many entries were
-    /// removed.
-    pub async fn purge_matching(&self, base: &str) -> usize {
-        self.purge_where(|stored_key, _| {
-            stored_key == base || stored_key.starts_with(&format!("{base}#"))
-        })
-        .await
+    /// How much of an object the purge walk reads to learn
+    /// its stored key and groups: the header (field lines,
+    /// the key, the groups block) sits at the front of every
+    /// entry, and real keys and group lists are far smaller
+    /// than this. A header that outgrows the probe falls
+    /// back to one full read of that object.
+    const HEADER_PROBE_BYTES: usize = 16 * 1024;
+
+    /// Read one object's stored key and groups from its
+    /// header alone, via a ranged GET (audit R2-24: a purge
+    /// used to download every entry in the tier, image
+    /// bytes included). The header is a match hint, not a
+    /// serving read: it is parsed without MAC verification,
+    /// because verification needs the whole object. A
+    /// forged header can at worst steer a purge; entries
+    /// are only ever SERVED through `get`, which verifies.
+    /// Objects past the entry size ceiling are refused
+    /// outright, exactly as `get` refuses them.
+    async fn read_entry_header(&self, object: &str) -> Option<(String, Vec<String>)> {
+        let range = format!("bytes=0-{}", Self::HEADER_PROBE_BYTES - 1);
+        let resp = self
+            .request_h("GET", object, &[], Vec::new(), &[("range", range.as_str())])
+            .await?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        // The object's real length: from Content-Range on a
+        // partial response, else the response's own length.
+        let total = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| resp.content_length())?;
+        if total > self.max_entry_bytes as u64 {
+            return None;
+        }
+        let data = self.read_capped(resp).await?;
+        if !partial || data.len() as u64 >= total {
+            // The whole object arrived (the store ignored
+            // the range, or the entry fits in the probe).
+            let (key, image) = parse_entry(&data, &self.entry_key)?;
+            return Some((key, image.groups));
+        }
+        match parse_entry_header(&data, total as usize) {
+            Some(found) => Some(found),
+            None => {
+                // The header outgrew the probe: one full
+                // read of this object settles it.
+                let resp = self.request("GET", object, &[], Vec::new()).await?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let data = self.read_capped(resp).await?;
+                let (key, image) = parse_entry(&data, &self.entry_key)?;
+                Some((key, image.groups))
+            }
+        }
     }
 
-    /// Remove every entry belonging to `group`. Returns how
-    /// many entries were removed.
+    /// Whether an object exists (a HEAD, no body read).
+    async fn object_exists(&self, object: &str) -> bool {
+        match self.request("HEAD", object, &[], Vec::new()).await {
+            Some(resp) => resp.status().is_success(),
+            None => false,
+        }
+    }
+
+    /// Delete one object; returns whether the store
+    /// accepted the deletion.
+    async fn delete_object(&self, object: &str) -> bool {
+        match self.request("DELETE", object, &[], Vec::new()).await {
+            Some(resp) => resp.status().is_success(),
+            None => false,
+        }
+    }
+
+    /// Remove every entry whose stored key is `base` or one
+    /// of its `#`-suffixed variants. Returns how many
+    /// entries were removed.
+    ///
+    /// `base` is the purge target's canonical form;
+    /// `epoch_base` is the form entries are actually keyed
+    /// under in the current configuration (the base plus
+    /// the config fingerprint segment, audit R2-08). The
+    /// enumerable variants of the epoch base (itself and
+    /// the four negotiated-class keys) are deleted directly
+    /// by their deterministic object names, with no listing
+    /// and no reads (audit R2-24); a header walk then
+    /// catches any remaining spellings (request-hint
+    /// variants, older epochs) by their stored keys.
+    pub async fn purge_matching(&self, base: &str, epoch_base: &str) -> usize {
+        let mut removed = 0;
+        for candidate in [
+            epoch_base.to_string(),
+            format!("{epoch_base}#avif"),
+            format!("{epoch_base}#jxl"),
+            format!("{epoch_base}#webp"),
+            format!("{epoch_base}#source"),
+        ] {
+            let object = self.object_key(&key_stem(&candidate));
+            if self.object_exists(&object).await && self.delete_object(&object).await {
+                removed += 1;
+            }
+        }
+        removed += self
+            .purge_where(|stored_key, _| {
+                stored_key == base || stored_key.starts_with(&format!("{base}#"))
+            })
+            .await;
+        removed
+    }
+
+    /// Remove every entry belonging to `group`. Returns
+    /// how many entries were removed.
     pub async fn purge_group(&self, group: &str) -> usize {
-        self.purge_where(|_, image| image.groups.iter().any(|g| g == group))
+        self.purge_where(|_, groups| groups.iter().any(|g| g == group))
             .await
     }
 
-    /// The shared purge walk: list, read each entry, delete the
-    /// matches. Reads are full entries (an administrative
-    /// operation; correctness over speed).
-    async fn purge_where(&self, matches: impl Fn(&str, &CachedImage) -> bool) -> usize {
+    /// Remove every entry whose result derives from
+    /// `source`, whatever operations produced it (audit
+    /// R2-07): an upload overwrite calls this so the
+    /// replaced original's derivatives stop serving.
+    /// Returns how many entries were removed.
+    pub async fn purge_source(&self, source: &str) -> usize {
+        self.purge_where(|stored_key, _| key_belongs_to_source(stored_key, source))
+            .await
+    }
+
+    /// The shared purge walk: list, read each entry's
+    /// header, delete the matches. Reads are header-sized
+    /// (see [`S3Store::read_entry_header`]), never whole
+    /// entries.
+    async fn purge_where(&self, matches: impl Fn(&str, &[String]) -> bool) -> usize {
         let mut removed = 0;
         for object in self.list_objects().await {
-            let Some(resp) = self.request("GET", &object, &[], Vec::new()).await else {
+            let Some((stored_key, groups)) = self.read_entry_header(&object).await else {
                 continue;
             };
-            if !resp.status().is_success() {
+            if !matches(&stored_key, &groups) {
                 continue;
             }
-            let Some(data) = self.read_capped(resp).await else {
-                continue;
-            };
-            let Some((stored_key, image)) = parse_entry(&data) else {
-                continue;
-            };
-            if !matches(&stored_key, &image) {
-                continue;
-            }
-            if let Some(resp) = self.request("DELETE", &object, &[], Vec::new()).await
-                && resp.status().is_success()
-            {
+            if self.delete_object(&object).await {
                 removed += 1;
             }
         }
@@ -388,10 +520,17 @@ pub(crate) mod test_support {
                     let mut lines = head.lines();
                     let request_line = lines.next().unwrap_or_default().to_string();
                     let mut content_length: usize = 0;
+                    let mut range_end: Option<usize> = None;
                     for line in lines {
                         let lower = line.to_ascii_lowercase();
                         if let Some(v) = lower.strip_prefix("content-length:") {
                             content_length = v.trim().parse().unwrap_or(0);
+                        }
+                        if let Some(v) = lower.strip_prefix("range:") {
+                            range_end = v
+                                .trim()
+                                .strip_prefix("bytes=0-")
+                                .and_then(|n| n.parse().ok());
                         }
                     }
                     while buf.len() < header_end + content_length {
@@ -405,13 +544,18 @@ pub(crate) mod test_support {
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default().to_string();
                     let target = parts.next().unwrap_or_default().to_string();
-                    let (status, payload) = handle(&objects, &fail, &method, &target, body);
+                    let (status, payload, extra) =
+                        handle(&objects, &fail, &method, &target, body, range_end);
                     let resp = format!(
-                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n",
                         payload.len()
                     );
                     let _ = socket.write_all(resp.as_bytes()).await;
-                    let _ = socket.write_all(&payload).await;
+                    // A HEAD response advertises the object's
+                    // length but carries no body.
+                    if method != "HEAD" {
+                        let _ = socket.write_all(&payload).await;
+                    }
                 });
             }
         });
@@ -451,7 +595,8 @@ pub(crate) mod test_support {
         method: &str,
         target: &str,
         body: Vec<u8>,
-    ) -> (String, Vec<u8>) {
+        range_end: Option<usize>,
+    ) -> (String, Vec<u8>, String) {
         let (path, query) = match target.split_once('?') {
             Some((p, q)) => (p, q),
             None => (target, ""),
@@ -459,12 +604,16 @@ pub(crate) mod test_support {
         let rest = path.trim_start_matches('/');
         let key = percent_decode(rest.split_once('/').map(|(_, k)| k).unwrap_or(""));
         let fail = fail.lock().unwrap();
-        let error = ("500 Internal Server Error".into(), Vec::new());
+        let error = (
+            "500 Internal Server Error".into(),
+            Vec::new(),
+            String::new(),
+        );
         match (method, query.contains("list-type=2")) {
             ("PUT", _) if fail.put => error,
             ("PUT", _) => {
                 objects.lock().unwrap().insert(key, body);
-                ("200 OK".into(), Vec::new())
+                ("200 OK".into(), Vec::new(), String::new())
             }
             ("GET", true) if fail.list => error,
             ("GET", true) => {
@@ -482,19 +631,36 @@ pub(crate) mod test_support {
                     }
                 }
                 xml += "</ListBucketResult>";
-                ("200 OK".into(), xml.into_bytes())
+                ("200 OK".into(), xml.into_bytes(), String::new())
             }
             ("GET", false) if fail.get_object => error,
             ("GET", false) => match objects.lock().unwrap().get(&key) {
-                Some(v) => ("200 OK".into(), v.clone()),
-                None => ("404 Not Found".into(), Vec::new()),
+                Some(v) => match range_end {
+                    Some(end) if end + 1 < v.len() => {
+                        let total = v.len();
+                        (
+                            "206 Partial Content".into(),
+                            v[..=end].to_vec(),
+                            format!("content-range: bytes 0-{end}/{total}\r\n"),
+                        )
+                    }
+                    _ => ("200 OK".into(), v.clone(), String::new()),
+                },
+                None => ("404 Not Found".into(), Vec::new(), String::new()),
+            },
+            ("HEAD", _) if fail.get_object => error,
+            ("HEAD", _) => match objects.lock().unwrap().get(&key) {
+                // The payload stands in for the length; the
+                // connection loop writes none of it.
+                Some(v) => ("200 OK".into(), v.clone(), String::new()),
+                None => ("404 Not Found".into(), Vec::new(), String::new()),
             },
             ("DELETE", _) if fail.delete => error,
             ("DELETE", _) => {
                 objects.lock().unwrap().remove(&key);
-                ("204 No Content".into(), Vec::new())
+                ("204 No Content".into(), Vec::new(), String::new())
             }
-            _ => ("400 Bad Request".into(), Vec::new()),
+            _ => ("400 Bad Request".into(), Vec::new(), String::new()),
         }
     }
 }
@@ -505,6 +671,11 @@ mod tests {
     use super::*;
     use crate::url::ImageFormat;
 
+    /// The entry MAC key the test stores run under.
+    fn test_entry_key() -> Vec<u8> {
+        crate::url::entry_key(b"s3store-test-secret")
+    }
+
     fn store(endpoint: &str) -> S3Store {
         S3Store::new(
             "results".into(),
@@ -512,6 +683,7 @@ mod tests {
             Some(endpoint.into()),
             "us-east-1".into(),
             None,
+            test_entry_key(),
         )
     }
 
@@ -550,7 +722,11 @@ mod tests {
         ] {
             s.put(key, &image(b"x", &[])).await;
         }
-        assert_eq!(s.purge_matching("a/example.com/i.jpg").await, 2);
+        assert_eq!(
+            s.purge_matching("a/example.com/i.jpg", "a/example.com/i.jpg")
+                .await,
+            2
+        );
         assert!(s.get("a/example.com/i.jpg").await.is_none());
         assert!(s.get("ab/example.com/i.jpg").await.is_some());
     }
@@ -574,6 +750,7 @@ mod tests {
             Some(endpoint.into()),
             "us-east-1".into(),
             None,
+            test_entry_key(),
         )
     }
 
@@ -619,9 +796,28 @@ mod tests {
         // sized by the count (R2-13b).
         fake.objects.lock().unwrap().insert(
             format!("cache/{}.bin", key_stem("evil")),
-            b"CRABDISK3\nwebp\n80\n999999999999999999\n4\n1\nevil\nx".to_vec(),
+            b"CRABDISK4\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nwebp\n80\n999999999999999999\n4\n1\nevil\nx".to_vec(),
         );
         assert!(s.get("evil").await.is_none());
+        // A validly framed entry with the wrong MAC (a
+        // plant by someone without the secret, or an object
+        // written under another secret) is a miss too
+        // (R2-13 part a).
+        let forged = {
+            let mut data = crate::storage::serialize_entry(
+                "planted",
+                &image(b"forged", &[]),
+                &test_entry_key(),
+            );
+            let last = data.len() - 1;
+            data[last] ^= 0xFF;
+            data
+        };
+        fake.objects
+            .lock()
+            .unwrap()
+            .insert(format!("cache/{}.bin", key_stem("planted")), forged);
+        assert!(s.get("planted").await.is_none());
     }
 
     #[tokio::test]
@@ -648,7 +844,13 @@ mod tests {
         // read, nothing deleted, count zero.
         fake.fail.lock().unwrap().list = true;
         assert_eq!(s.purge_group("hero").await, 0);
-        assert_eq!(s.purge_matching("one").await, 0);
+        // A per-URL purge no longer depends on the listing
+        // for the enumerable variants: the epoch base
+        // deletes directly even while the walk is
+        // truncated (R2-24).
+        assert_eq!(s.purge_matching("one", "one").await, 1);
+        assert!(s.get("one").await.is_none());
+        s.put("one", &image(b"1", &["hero"])).await;
         fake.fail.lock().unwrap().list = false;
         // Entry reads failing mid-walk skip those entries
         // the same way.
@@ -675,7 +877,7 @@ mod tests {
         assert!(s.get("key").await.is_none());
         s.put("key", &image(b"pixels", &[])).await;
         assert_eq!(s.purge_group("hero").await, 0);
-        assert_eq!(s.purge_matching("key").await, 0);
+        assert_eq!(s.purge_matching("key", "key").await, 0);
     }
 
     #[tokio::test]
@@ -702,7 +904,49 @@ mod tests {
         assert_eq!(a.purge_group("hero").await, 1);
         assert!(a.get("same-key").await.is_none());
         assert_eq!(b.get("same-key").await.unwrap().bytes, b"from-b");
-        assert_eq!(b.purge_matching("same-key").await, 1);
+        assert_eq!(b.purge_matching("same-key", "same-key").await, 1);
         assert!(fake.objects.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn purge_source_removes_every_derivative_of_the_source() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("300x200/file:///heroes/cat.jpg", &image(b"1", &[]))
+            .await;
+        s.put(
+            "300x200/file:///heroes/cat.jpg#cfgab12#avif",
+            &image(b"2", &[]),
+        )
+        .await;
+        s.put("600x400/file:///heroes/cat.jpg", &image(b"3", &[]))
+            .await;
+        s.put("300x200/file:///heroes/cat.jpg2", &image(b"4", &[]))
+            .await;
+        s.put("300x200/file:///heroes/dog.jpg", &image(b"5", &[]))
+            .await;
+        assert_eq!(s.purge_source("file:///heroes/cat.jpg").await, 3);
+        assert!(s.get("300x200/file:///heroes/cat.jpg").await.is_none());
+        assert!(s.get("300x200/file:///heroes/cat.jpg2").await.is_some());
+        assert!(s.get("300x200/file:///heroes/dog.jpg").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn purge_matches_on_the_header_without_the_payload() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        // A payload far past the 16 KB header probe: the
+        // entry is larger than the probe response, so the
+        // walk can only have matched on the header (R2-24).
+        let payload = vec![7u8; 64 * 1024];
+        s.put("300x200/http://x/big.png", &image(&payload, &["hero"]))
+            .await;
+        let object_len = fake.objects.lock().unwrap().values().next().unwrap().len();
+        assert!(
+            object_len > 16 * 1024,
+            "entry outgrows the probe: {object_len}"
+        );
+        assert_eq!(s.purge_group("hero").await, 1);
+        assert!(s.get("300x200/http://x/big.png").await.is_none());
     }
 }
