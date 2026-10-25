@@ -7,7 +7,7 @@ cd deploy/compose
 CRABCROP_SECRET=$(openssl rand -hex 32) docker compose up --build
 ```
 
-Without `CRABCROP_SECRET` in the environment, a clearly marked development secret is used so the trial boots. Never serve real traffic with it: anyone who knows the secret can sign URLs.
+The secret has no default: compose refuses to start when `CRABCROP_SECRET` is unset or empty, rather than booting with a value anyone can read in this repo (audit R2-40). Anyone who knows the secret can sign URLs, so generate a fresh one per deployment.
 
 Check it answers:
 

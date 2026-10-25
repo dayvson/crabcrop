@@ -17,6 +17,12 @@ def main():
     if len(sys.argv) != 3:
         raise SystemExit("usage: release_formula.py X.Y.Z sha256.sum")
     version, sums_path = sys.argv[1], sys.argv[2]
+    # The version and the digests are interpolated into quoted
+    # Ruby strings in the generated formula, so validate both
+    # before they can break out of a string literal (audit
+    # R2-42). The version rule matches bump_version.py.
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise SystemExit(f"version is not strict semver (X.Y.Z): {version!r}")
     sums = {}
     for line in open(sums_path, encoding="utf-8"):
         parts = line.split()
@@ -27,7 +33,10 @@ def main():
         name = f"crabcrop-{target}.tar.xz"
         if name not in sums:
             raise SystemExit(f"{name} not in {sums_path}")
-        return name, sums[name]
+        digest = sums[name]
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise SystemExit(f"digest for {name} is not 64 hex characters: {digest!r}")
+        return name, digest
 
     def block(target, indent="    "):
         name, digest = sha(target)

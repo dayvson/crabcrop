@@ -4,7 +4,7 @@ Deploys the crabcrop image service. The chart is deliberately thin: the server i
 
 ## Install
 
-Nothing is published to a public registry yet. Build the image from the repo and push it somewhere your cluster can pull from:
+Release images are published to GHCR as `ghcr.io/dayvson/crabcrop`, tagged with the release version; the chart defaults point there. To pin the exact image, set `image.digest` (and `ai.image.digest` for the AI variant) to a `sha256:...` digest. To run your own build instead:
 
 ```bash
 docker build -t your-registry/crabcrop:0.1.0 .

@@ -10,7 +10,7 @@ spec:
           # The AI variant image (Dockerfile.ai): the models
           # are a layer in the image or a mounted volume,
           # never kustomize content.
-          image: crabcrop-ai:latest
+          image: ghcr.io/dayvson/crabcrop-ai:0.1.0
           volumeMounts:
             - name: models
               mountPath: /models
