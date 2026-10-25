@@ -58,7 +58,7 @@ Filters whose scale differs:
 
 | Thumbor | crabcrop | Conversion |
 | --- | --- | --- |
-| `contrast(20)` | `contrast(1.2)` | Percent becomes a factor: `1 + n/100` |
+| `contrast(20)` | `contrast(20)` | Both are a -100 to 100 percent |
 | `saturation(-50)` | `saturation(0.5)` | Same conversion |
 | `brightness(20)` | `brighten(51)` | Approximate, and the converter says so: Thumbor scales brightness multiplicatively, crabcrop shifts it additively |
 | `rgb(10,0,-10)` | `rgb(26,0,-26)` | Approximate, same reason: channel scaling becomes additive offsets |
