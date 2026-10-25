@@ -2292,6 +2292,47 @@ pub fn upload_signature(secret: &[u8], name: &str) -> String {
     crabcrop_url::upload_signature(secret, name)
 }
 
+/// The expiring upload signature for an object name
+/// (issue #192): HMAC-SHA256 of `exp:<expires>/<name>`
+/// under the derived upload key. Delegates to the
+/// `crabcrop-url` crate; this mints, for operators and
+/// tests.
+#[allow(dead_code)]
+pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> String {
+    crabcrop_url::upload_signature_with_expiry(secret, name, expires)
+}
+
+/// Split an upload request remainder (what follows the
+/// signature segment) into its optional expiry and the
+/// object name. The plain form is the name alone; the
+/// expiring form leads with an `exp:<unix-seconds>`
+/// segment, the image grammar's spelling, which is
+/// unambiguous here because an upload name can never
+/// contain a `:` (see `crate::upload::validate_upload_name`).
+/// A leading segment that starts with `exp:` but does not
+/// parse is a grammar error, not a name. The signature
+/// covers the remainder exactly as presented, expiry
+/// included, so verification runs on the unsplit string
+/// before this is called.
+pub fn split_upload_remainder(rest: &str) -> Result<(Option<u64>, &str), ParseError> {
+    let Some((first, name)) = rest.split_once('/') else {
+        // No slash: the remainder is one segment. It is a
+        // name, unless it spells an expiry with no name
+        // after it, which is malformed.
+        if rest.starts_with("exp:") {
+            return Err(ParseError::InvalidExpiry(rest.to_string()));
+        }
+        return Ok((None, rest));
+    };
+    let Some(ts) = first.strip_prefix("exp:") else {
+        return Ok((None, rest));
+    };
+    let exp: u64 = ts
+        .parse()
+        .map_err(|_| ParseError::InvalidExpiry(first.to_string()))?;
+    Ok((Some(exp), name))
+}
+
 /// Verify an upload signature. Like purges, uploads are
 /// a write operation and never honor `unsafe`: an HMAC
 /// under the upload subkey is always required, whatever
@@ -2784,6 +2825,77 @@ mod tests {
             &Signature::Hmac(upload_sig),
             "heroes/dog.jpg"
         ));
+    }
+
+    #[test]
+    fn upload_remainders_split_an_optional_expiry() {
+        // The plain form is the name alone.
+        assert_eq!(
+            split_upload_remainder("heroes/cat.jpg").unwrap(),
+            (None, "heroes/cat.jpg")
+        );
+        assert_eq!(
+            split_upload_remainder("cat.jpg").unwrap(),
+            (None, "cat.jpg")
+        );
+        // The expiring form leads with the exp: segment.
+        assert_eq!(
+            split_upload_remainder("exp:1893456000/heroes/cat.jpg").unwrap(),
+            (Some(1893456000), "heroes/cat.jpg")
+        );
+        // A segment that opens with exp: but does not parse
+        // is a grammar error with the frozen code, never a
+        // name (names cannot contain ':' anyway).
+        for bad in [
+            "exp:soon/cat.jpg",
+            "exp:/cat.jpg",
+            "exp:-5/cat.jpg",
+            "exp:99999999999999999999999999/cat.jpg",
+            "exp:1893456000",
+        ] {
+            let err = split_upload_remainder(bad).unwrap_err();
+            assert_eq!(err.code(), "invalid_expiry", "{bad}");
+        }
+        // A name segment merely resembling the prefix
+        // without the colon is an ordinary name.
+        assert_eq!(
+            split_upload_remainder("expedition/cat.jpg").unwrap(),
+            (None, "expedition/cat.jpg")
+        );
+    }
+
+    #[test]
+    fn expiring_upload_signatures_verify_over_the_full_remainder() {
+        let secret = b"test-secret";
+        let name = "heroes/cat.jpg";
+        let exp = 1893456000u64;
+        let sig = upload_signature_with_expiry(secret, name, exp);
+        let remainder = format!("exp:{exp}/{name}");
+        // Verification runs over the remainder exactly as
+        // presented, expiry segment included.
+        assert!(verify_upload(
+            secret,
+            &Signature::Hmac(sig.clone()),
+            &remainder
+        ));
+        // The same token authorizes no other name and no
+        // other expiry: both are inside the signed string.
+        assert!(!verify_upload(
+            secret,
+            &Signature::Hmac(sig.clone()),
+            "exp:1893456000/heroes/dog.jpg"
+        ));
+        assert!(!verify_upload(
+            secret,
+            &Signature::Hmac(sig.clone()),
+            "exp:1893456001/heroes/cat.jpg"
+        ));
+        // Stripping the expiry to replay the token as a
+        // plain one fails, and the plain token gains no
+        // expiry form by presentation.
+        assert!(!verify_upload(secret, &Signature::Hmac(sig), name));
+        let plain = upload_signature(secret, name);
+        assert!(!verify_upload(secret, &Signature::Hmac(plain), &remainder));
     }
 
     #[test]

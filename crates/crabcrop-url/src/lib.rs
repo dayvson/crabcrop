@@ -170,6 +170,37 @@ pub fn upload_signature(secret: &[u8], name: &str) -> String {
     sign(&upload_key(secret), name)
 }
 
+/// The signed string an upload signature covers: the name
+/// alone, or, for the expiring form, an `exp:<unix-seconds>`
+/// segment in front of it, exactly the spelling the request
+/// path carries after the signature segment. Keeping the
+/// assembly in one place means signers and the server can
+/// never drift on it.
+pub fn upload_signed_string(name: &str, expires: Option<u64>) -> String {
+    match expires {
+        Some(exp) => format!("exp:{exp}/{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// The expiring upload signature for an object name:
+/// HMAC-SHA256 of `exp:<expires>/<name>` under the upload
+/// subkey. The request path is
+/// `PUT /upload/<signature>/exp:<expires>/<name>`; the
+/// expiry sits inside the signed string, so it can neither
+/// be stripped nor extended without the secret, and the
+/// server refuses the upload once the expiry second is
+/// reached (issue #192, audit R2-06). Delegated upload
+/// tokens should always use this form: a plain
+/// [`upload_signature`] token replays until the secret
+/// rotates.
+pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> String {
+    sign(
+        &upload_key(secret),
+        &upload_signed_string(name, Some(expires)),
+    )
+}
+
 /// Assemble a signed (or `unsafe`) crabcrop URL.
 ///
 /// `operations` is the operation string verbatim (it may hold
@@ -360,6 +391,36 @@ mod tests {
         assert_ne!(
             upload_signature(b"test-secret", "heroes/cat.jpg"),
             upload_signature(b"test-secret", "heroes/dog.jpg")
+        );
+        // The expiring form: the signed string carries the
+        // `exp:` segment in front of the name, pinned like
+        // every other vector (the SDKs assert the same
+        // value).
+        assert_eq!(
+            upload_signed_string("heroes/cat.jpg", None),
+            "heroes/cat.jpg"
+        );
+        assert_eq!(
+            upload_signed_string("heroes/cat.jpg", Some(1893456000)),
+            "exp:1893456000/heroes/cat.jpg"
+        );
+        assert_eq!(
+            upload_signature_with_expiry(b"test-secret", "heroes/cat.jpg", 1893456000),
+            "391061e9bd262811f9bac647b5ff535f987e2478394675407f895823f45e59d2"
+        );
+        // An expiring token is not the plain token, and is
+        // bound to both its expiry and its name.
+        assert_ne!(
+            upload_signature_with_expiry(b"test-secret", "heroes/cat.jpg", 1893456000),
+            upload_signature(b"test-secret", "heroes/cat.jpg")
+        );
+        assert_ne!(
+            upload_signature_with_expiry(b"test-secret", "heroes/cat.jpg", 1893456000),
+            upload_signature_with_expiry(b"test-secret", "heroes/cat.jpg", 1893456001)
+        );
+        assert_ne!(
+            upload_signature_with_expiry(b"test-secret", "heroes/cat.jpg", 1893456000),
+            upload_signature_with_expiry(b"test-secret", "heroes/dog.jpg", 1893456000)
         );
     }
 

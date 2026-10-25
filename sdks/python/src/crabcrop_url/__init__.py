@@ -87,12 +87,25 @@ def upload_key(secret: Union[str, bytes]) -> bytes:
     return bytes.fromhex(sign(secret, "crabcrop/upload-key"))
 
 
-def upload_signature(secret: Union[str, bytes], name: str) -> str:
+def upload_signature(
+    secret: Union[str, bytes], name: str, expires: Optional[int] = None
+) -> str:
     """The signature segment for
     ``PUT /upload/<signature>/<name>``: HMAC-SHA256 of the
-    object name under the upload subkey."""
+    object name under the upload subkey.
+
+    With ``expires`` (unix seconds), the signature covers
+    ``exp:<expires>/<name>`` and the request path is
+    ``PUT /upload/<signature>/exp:<expires>/<name>``: the
+    expiry sits inside the signed string, so it can
+    neither be stripped nor extended, and the server
+    refuses the upload once that second is reached.
+    Delegated upload tokens should always use the expiring
+    form; without it a token replays until the secret
+    rotates."""
     key = upload_key(secret)
-    return hmac.new(key, name.encode("utf-8"), hashlib.sha256).hexdigest()
+    signed = name if expires is None else f"exp:{expires}/{name}"
+    return hmac.new(key, signed.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:

@@ -376,6 +376,21 @@ pub struct Prepared {
     tree: usvg::Tree,
 }
 
+/// The sanitized form of an SVG document, as bytes: the
+/// exact output of [`sanitize`] on the decoded text. This
+/// is what the upload endpoint stores for an SVG upload
+/// (issue #192, audit R2-22): an active document a caller
+/// uploaded is never what lands in the destination, even
+/// though serving would sanitize it again on the way out.
+/// Callers gate on [`is_svg`] first, and validate with
+/// [`prepare`] as well: this function alone does not
+/// prove the document parses.
+pub fn sanitized_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "SVG source is not valid UTF-8".to_string())?;
+    Ok(sanitize(text)?.into_bytes())
+}
+
 /// Sanitize and parse `bytes`. Callers gate on [`is_svg`]
 /// first; other XML is rejected here as not-an-SVG.
 pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
@@ -482,6 +497,19 @@ mod tests {
         // reference and the data-free fills.
         assert!(clean.contains("#local"));
         assert!(clean.contains("#0000ff"));
+    }
+
+    #[test]
+    fn sanitized_bytes_are_the_sanitizers_output() {
+        // The upload endpoint stores exactly this form: the
+        // active content is gone, the drawing survives.
+        let stored = sanitized_bytes(HOSTILE.as_bytes()).unwrap();
+        let stored = String::from_utf8(stored).unwrap();
+        assert_eq!(stored, sanitize(HOSTILE).unwrap());
+        assert!(!stored.contains("script"), "{stored}");
+        assert!(stored.contains("#0000ff"), "{stored}");
+        // Non-UTF-8 input is refused, like prepare.
+        assert!(sanitized_bytes(&[0xff, 0xfe]).is_err());
     }
 
     #[test]

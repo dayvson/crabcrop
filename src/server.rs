@@ -553,8 +553,11 @@ fn upload_log(name: &str, outcome: &str) {
 /// The outcome of running upload validation under the
 /// process gate.
 enum UploadValidation {
-    /// The bytes decode as an image this server can serve.
-    Valid,
+    /// The bytes decode as an image this server can
+    /// serve; the prepared form (what to store, and the
+    /// media kind it validated as) travels with the
+    /// verdict (issue #192).
+    Valid(crate::engine::PreparedUpload),
     /// The bytes do not decode; the engine's error, kept
     /// for the server log.
     Invalid(EngineError),
@@ -584,11 +587,11 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
     };
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        crate::engine::validate_source_image(&bytes)
+        crate::engine::prepare_upload(&bytes)
     })
     .await
     {
-        Ok(Ok(())) => UploadValidation::Valid,
+        Ok(Ok(prepared)) => UploadValidation::Valid(prepared),
         Ok(Err(e)) => UploadValidation::Invalid(e),
         Err(_) => UploadValidation::Panicked,
     }
@@ -605,16 +608,28 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
 /// [`crate::url::verify_upload`]): only the secret holder
 /// can upload, an image or purge signature can never be
 /// replayed here, and `unsafe` is never honored. The
-/// checks run cheapest first: signature, name shape, body
-/// size (read with the cap as a hard bound, so an
-/// oversize body is never fully buffered), the overwrite
-/// policy (so a refused duplicate never pays a decode),
-/// and image decode through the pipeline's own
-/// validation, run under the process gate like any
-/// transform. On success the body of the response
-/// is the exact source reference to embed in transform
-/// URLs: `201` for a new object, `200` when an allowed
-/// overwrite replaced one.
+/// expiring form (issue #192) signs
+/// `exp:<unix-seconds>/<name>` instead and presents as
+/// `/upload/<signature>/exp:<unix-seconds>/<name>`; the
+/// expiry is inside the signed string, so it can neither
+/// be stripped nor extended, and an expired token is a
+/// 403 like an expired image URL. The checks run cheapest
+/// first: signature, expiry, name shape, body size (read
+/// with the cap as a hard bound, so an oversize body is
+/// never fully buffered), the overwrite policy (so a
+/// refused duplicate never pays a decode), and image
+/// decode through the pipeline's own validation, run
+/// under the process gate like any transform. What is
+/// stored is the prepared form: the sanitized document
+/// for an SVG, the caller's bytes for anything else, and
+/// only when the name's extension matches the media kind
+/// the body validated as. With overwriting off, the
+/// final write is a conditional create, so the 409 the
+/// policy promises holds even against a racing upload.
+/// On success the body of the response is the exact
+/// source reference to embed in transform URLs: `201`
+/// for a new object, `200` when an allowed overwrite
+/// replaced one.
 /// Remove every cached derivative of `source` from all
 /// three tiers; returns the total removed. The upload
 /// overwrite path (audit R2-07) shares this with any
@@ -643,17 +658,40 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             .into_response();
     };
     let full = format!("/{tail}");
-    let (signature, key_id, name) = match parse_signature(&full) {
+    let (signature, key_id, rest) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // Verification runs over the remainder exactly as
+    // presented: for the expiring form the `exp:` segment
+    // is part of the signed string, so a tampered or
+    // stripped expiry already fails here as a bad
+    // signature.
     if !state
         .keyring
-        .verify_upload(key_id.as_deref(), &signature, name)
+        .verify_upload(key_id.as_deref(), &signature, rest)
     {
         state.metrics.record_upload();
-        upload_log(name, "rejected:bad-signature");
+        upload_log(rest, "rejected:bad-signature");
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
+    }
+    let (expiry, name) = match crate::url::split_upload_remainder(rest) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    // Expiry is enforced after verification and before
+    // anything else, like an image URL: the comparison is
+    // exact, the token valid strictly before its second.
+    if let Some(exp) = expiry {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now >= exp {
+            state.metrics.record_upload();
+            upload_log(name, "rejected:expired");
+            return (StatusCode::FORBIDDEN, "signature expired").into_response();
+        }
     }
     if let Err(e) = crate::upload::validate_upload_name(name) {
         state.metrics.record_upload();
@@ -707,8 +745,8 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // the destination never holds an unservable object.
     // The decode runs under the process gate, like every
     // transform (see `run_upload_validation`).
-    match run_upload_validation(&state, bytes.to_vec()).await {
-        UploadValidation::Valid => {}
+    let prepared = match run_upload_validation(&state, bytes.to_vec()).await {
+        UploadValidation::Valid(prepared) => prepared,
         UploadValidation::Invalid(e) => {
             eprintln!("upload rejected: {e}");
             state.metrics.record_upload();
@@ -729,8 +767,29 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             upload_log(name, "rejected:validation-failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "image validation failed").into_response();
         }
+    };
+    // The name must present the body as what it is: a
+    // validated image may not be stored under an
+    // extension belonging to another kind (or to active
+    // content), because the destination may be served
+    // directly (audit R2-22).
+    if let Err(e) = crate::upload::check_upload_media(name, prepared.media) {
+        state.metrics.record_upload();
+        upload_log(name, "rejected:media-mismatch");
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, e).into_response();
     }
-    match upload.put(name, &bytes).await {
+    // What lands is the prepared form, and with
+    // overwriting off the write is a conditional create:
+    // the exists check above is the cheap refusal, this
+    // is the atomic one, so a name claimed between the
+    // two still answers 409 and keeps the winner's bytes
+    // (audit R2-21).
+    let stored = if upload.allow_overwrite {
+        upload.put(name, &prepared.stored).await
+    } else {
+        upload.put_new(name, &prepared.stored).await
+    };
+    match stored {
         Ok(()) => {
             state.metrics.record_upload();
             upload_log(name, if existed { "replaced" } else { "stored" });
@@ -757,6 +816,15 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
                 axum::http::HeaderValue::from_str(&upload.source_ref(name)).unwrap(),
             );
             response
+        }
+        Err(crate::upload::UploadError::AlreadyExists) => {
+            state.metrics.record_upload();
+            upload_log(name, "rejected:exists");
+            (
+                StatusCode::CONFLICT,
+                "an object with this name already exists",
+            )
+                .into_response()
         }
         Err(crate::upload::UploadError::Backend(cause)) => {
             eprintln!("upload failed: {cause}");
@@ -6342,6 +6410,175 @@ mod tests {
         assert_eq!(std::fs::read(dir2.join(name)).unwrap(), test_png());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn upload_expiring_tokens_expire_and_stay_bound() {
+        // The expiring form (issue #192, audit R2-06):
+        // the expiry rides inside the signed string, so a
+        // delegated token dies on schedule and cannot be
+        // reshaped.
+        let dir = upload_dir("expiring");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let name = "cat.png";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // A token inside its window uploads normally.
+        let future = now + 3600;
+        let sig = crate::url::upload_signature_with_expiry(SECRET, name, future);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/exp:{future}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // A token past its second is refused as expired,
+        // before anything is stored.
+        let past = now - 3600;
+        let sig = crate::url::upload_signature_with_expiry(SECRET, "dog.png", past);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/exp:{past}/dog.png"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "signature expired");
+        assert!(!dir.join("dog.png").exists());
+        // The token is bound to its name: replaying it
+        // against another name, expiry and all, fails the
+        // signature.
+        let sig = crate::url::upload_signature_with_expiry(SECRET, name, future);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/exp:{future}/other.png"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Extending the expiry by editing the path fails
+        // the same way: the presented expiry is signed.
+        let later = future + 3600;
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/exp:{later}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // And a plain (non-expiring) token cannot be given
+        // an expiry by presentation, nor an expiring one
+        // stripped of it.
+        let plain = crate::url::upload_signature(SECRET, "plain.png");
+        let resp = client()
+            .put(format!("{base}/upload/{plain}/exp:{future}/plain.png"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn upload_stores_the_sanitized_svg_not_the_callers_bytes() {
+        // What lands in the destination for an SVG is the
+        // sanitized document (issue #192, audit R2-22):
+        // the script is stripped at store time, not only
+        // when crabcrop serves it back.
+        let dir = upload_dir("svg-store");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let name = "icon.svg";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><script>alert(1)</script><rect width="4" height="4" fill="red"/></svg>"#;
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(hostile.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let stored = std::fs::read(dir.join(name)).unwrap();
+        assert_ne!(stored, hostile.to_vec());
+        let stored = String::from_utf8(stored).unwrap();
+        assert!(!stored.contains("script"), "{stored}");
+        assert!(stored.contains("<rect"), "{stored}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_names_that_misstate_the_media() {
+        // The name's extension must match the validated
+        // media kind (issue #192, audit R2-22): a PNG is
+        // refused as .jpg and as .html alike.
+        let dir = upload_dir("media-bind");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        for (name, want) in [
+            ("photo.jpg", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("promo.html", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("photo.png", StatusCode::CREATED),
+            ("photo.PNG", StatusCode::CREATED),
+            ("photo", StatusCode::CREATED),
+        ] {
+            let sig = crate::url::upload_signature(SECRET, name);
+            let resp = client()
+                .put(format!("{base}/upload/{sig}/{name}"))
+                .body(test_png())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), want, "{name}");
+            assert_eq!(
+                dir.join(name).exists(),
+                want == StatusCode::CREATED,
+                "{name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_to_one_new_name_create_exactly_once() {
+        // Two signed PUTs racing for one new name with
+        // overwriting off: exactly one creates, the other
+        // is a 409, whichever the scheduler runs first
+        // (issue #192, audit R2-21). The conditional
+        // create, not the pre-check, is what guarantees
+        // this when both pass the check together.
+        let dir = upload_dir("race");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let name = "cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let url = format!("{base}/upload/{sig}/{name}");
+        let png_of = |w: u32| {
+            let img = DynamicImage::new_rgb8(w, 10);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let (a, b) = tokio::join!(
+            client().put(&url).body(png_of(10)).send(),
+            client().put(&url).body(png_of(20)).send(),
+        );
+        let mut statuses: Vec<StatusCode> =
+            [a, b].into_iter().map(|r| r.unwrap().status()).collect();
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::CREATED, StatusCode::CONFLICT]);
+        // The stored object is one of the two bodies,
+        // whole: never a torn mix.
+        let stored = std::fs::read(dir.join(name)).unwrap();
+        assert!(stored == png_of(10) || stored == png_of(20));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

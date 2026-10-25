@@ -29,6 +29,19 @@ use crate::cache::{CachedImage, key_belongs_to_source};
 use crate::sigv4::{self, Credentials};
 use crate::storage::{MAX_ENTRY_BYTES, key_stem, parse_entry, parse_entry_header, serialize_entry};
 
+/// The outcome of a conditional raw write
+/// ([`S3Store::put_raw_if_absent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawPut {
+    /// The object was stored.
+    Stored,
+    /// An object already existed under the name; nothing
+    /// was written.
+    AlreadyExists,
+    /// The store refused or could not be reached.
+    Failed,
+}
+
 #[derive(Debug)]
 pub struct S3Store {
     client: reqwest::Client,
@@ -251,7 +264,12 @@ impl S3Store {
 
     /// Read the raw bytes stored under `name` (see
     /// [`S3Store::put_raw`]). Any failure (missing object,
-    /// transport error) is `None`.
+    /// transport error) is `None`. The read half of the
+    /// raw pair; the upload existence check no longer uses
+    /// it (it goes through [`S3Store::exists_raw`], a
+    /// HEAD, since issue #192), serving reads of uploaded
+    /// objects go through the loader.
+    #[allow(dead_code)]
     pub async fn get_raw(&self, name: &str) -> Option<Vec<u8>> {
         let object = format!("{}{name}", self.prefix);
         let resp = self.request("GET", &object, &[], Vec::new()).await?;
@@ -259,6 +277,41 @@ impl S3Store {
             return None;
         }
         resp.bytes().await.ok().map(|b| b.to_vec())
+    }
+
+    /// Whether a raw object exists under `name`, answered
+    /// with a HEAD: no body is read (issue #192, audit
+    /// R2-23). The upload endpoint's existence check runs
+    /// on every signed PUT; the object it asks about can
+    /// be arbitrarily large, and downloading it whole to
+    /// answer a boolean made the check a bandwidth and
+    /// memory sink.
+    pub async fn exists_raw(&self, name: &str) -> bool {
+        let object = format!("{}{name}", self.prefix);
+        self.object_exists(&object).await
+    }
+
+    /// Store raw bytes under `name` only if no object is
+    /// there yet (issue #192, audit R2-21): a conditional
+    /// PUT (`If-None-Match: *`), so the existence decision
+    /// and the write are one atomic step instead of a
+    /// check-then-write pair another upload can slip
+    /// between. Stores without conditional-write support
+    /// degrade to an unconditional write; Amazon S3 and
+    /// current S3-compatible stores honor the precondition
+    /// and answer `412` for a name already taken.
+    pub async fn put_raw_if_absent(&self, name: &str, bytes: Vec<u8>) -> RawPut {
+        let object = format!("{}{name}", self.prefix);
+        match self
+            .request_h("PUT", &object, &[], bytes, &[("if-none-match", "*")])
+            .await
+        {
+            Some(resp) if resp.status().is_success() => RawPut::Stored,
+            Some(resp) if resp.status() == reqwest::StatusCode::PRECONDITION_FAILED => {
+                RawPut::AlreadyExists
+            }
+            _ => RawPut::Failed,
+        }
     }
 
     /// Every object key under the store prefix, following
@@ -487,20 +540,28 @@ pub(crate) mod test_support {
     pub struct FakeS3 {
         pub objects: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
         pub fail: Arc<StdMutex<FailFlags>>,
+        /// One line per request served, `"<METHOD> <key>"`
+        /// (plus the conditional-write marker when the
+        /// request carried one), so tests can assert how a
+        /// lookup was answered, not just what it returned.
+        pub requests: Arc<StdMutex<Vec<String>>>,
         pub endpoint: String,
     }
 
     pub async fn start_fake() -> FakeS3 {
         let objects = Arc::new(StdMutex::new(HashMap::new()));
         let fail = Arc::new(StdMutex::new(FailFlags::default()));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = objects.clone();
         let shared_fail = fail.clone();
+        let shared_requests = requests.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let objects = shared.clone();
                 let fail = shared_fail.clone();
+                let requests = shared_requests.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -521,6 +582,7 @@ pub(crate) mod test_support {
                     let request_line = lines.next().unwrap_or_default().to_string();
                     let mut content_length: usize = 0;
                     let mut range_end: Option<usize> = None;
+                    let mut if_none_match: Option<String> = None;
                     for line in lines {
                         let lower = line.to_ascii_lowercase();
                         if let Some(v) = lower.strip_prefix("content-length:") {
@@ -531,6 +593,9 @@ pub(crate) mod test_support {
                                 .trim()
                                 .strip_prefix("bytes=0-")
                                 .and_then(|n| n.parse().ok());
+                        }
+                        if let Some(v) = lower.strip_prefix("if-none-match:") {
+                            if_none_match = Some(v.trim().to_string());
                         }
                     }
                     while buf.len() < header_end + content_length {
@@ -544,8 +609,29 @@ pub(crate) mod test_support {
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default().to_string();
                     let target = parts.next().unwrap_or_default().to_string();
-                    let (status, payload, extra) =
-                        handle(&objects, &fail, &method, &target, body, range_end);
+                    {
+                        let (path, _) = match target.split_once('?') {
+                            Some((p, q)) => (p, q),
+                            None => (target.as_str(), ""),
+                        };
+                        let rest = path.trim_start_matches('/');
+                        let key =
+                            percent_decode(rest.split_once('/').map(|(_, k)| k).unwrap_or(""));
+                        let mut line = format!("{method} {key}");
+                        if if_none_match.is_some() {
+                            line.push_str(" if-none-match");
+                        }
+                        requests.lock().unwrap().push(line);
+                    }
+                    let (status, payload, extra) = handle(
+                        &objects,
+                        &fail,
+                        &method,
+                        &target,
+                        body,
+                        range_end,
+                        if_none_match.as_deref(),
+                    );
                     let resp = format!(
                         "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n",
                         payload.len()
@@ -562,6 +648,7 @@ pub(crate) mod test_support {
         FakeS3 {
             objects,
             fail,
+            requests,
             endpoint: format!("http://127.0.0.1:{port}"),
         }
     }
@@ -596,6 +683,7 @@ pub(crate) mod test_support {
         target: &str,
         body: Vec<u8>,
         range_end: Option<usize>,
+        if_none_match: Option<&str>,
     ) -> (String, Vec<u8>, String) {
         let (path, query) = match target.split_once('?') {
             Some((p, q)) => (p, q),
@@ -611,6 +699,14 @@ pub(crate) mod test_support {
         );
         match (method, query.contains("list-type=2")) {
             ("PUT", _) if fail.put => error,
+            ("PUT", _)
+                if if_none_match == Some("*") && objects.lock().unwrap().contains_key(&key) =>
+            {
+                // The conditional write's precondition: a
+                // name already taken is a 412, nothing is
+                // written.
+                ("412 Precondition Failed".into(), Vec::new(), String::new())
+            }
             ("PUT", _) => {
                 objects.lock().unwrap().insert(key, body);
                 ("200 OK".into(), Vec::new(), String::new())
@@ -948,5 +1044,52 @@ mod tests {
         );
         assert_eq!(s.purge_group("hero").await, 1);
         assert!(s.get("300x200/http://x/big.png").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_existence_is_a_head_and_raw_puts_can_be_conditional() {
+        let fake = start_fake().await;
+        let s = store_with_prefix(&fake.endpoint, "orig/");
+        // Existence is answered with a HEAD, never a GET:
+        // the object behind the name is not downloaded to
+        // answer a boolean (issue #192, audit R2-23).
+        assert!(!s.exists_raw("heroes/cat.jpg").await);
+        assert!(s.put_raw("heroes/cat.jpg", b"pixels".to_vec()).await);
+        assert!(s.exists_raw("heroes/cat.jpg").await);
+        let requests = fake.requests.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.as_str() == "HEAD orig/heroes/cat.jpg")
+                .count()
+                == 2,
+            "{requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.starts_with("GET ")),
+            "{requests:?}"
+        );
+        // A conditional put stores the first writer and
+        // refuses the second without touching its bytes
+        // (audit R2-21).
+        assert_eq!(
+            s.put_raw_if_absent("heroes/dog.jpg", b"one".to_vec()).await,
+            RawPut::Stored
+        );
+        assert_eq!(
+            s.put_raw_if_absent("heroes/dog.jpg", b"two".to_vec()).await,
+            RawPut::AlreadyExists
+        );
+        assert_eq!(
+            s.get_raw("heroes/dog.jpg").await.as_deref(),
+            Some(b"one".as_slice())
+        );
+        // A store failure reads as Failed, not as a store
+        // or a conflict.
+        fake.fail.lock().unwrap().put = true;
+        assert_eq!(
+            s.put_raw_if_absent("heroes/eel.jpg", b"x".to_vec()).await,
+            RawPut::Failed
+        );
     }
 }

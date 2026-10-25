@@ -47,7 +47,10 @@ group = purge_group_signature("your-secret", "thumb")
 
 # Upload signatures for the server's PUT /upload/<signature>/<name>
 # endpoint live in a third domain, under their own derived subkey.
+# Pass an expiry (unix seconds) for a token that stops working
+# then; its path is /upload/<signature>/exp:<expiry>/<name>.
 upload = upload_signature("your-secret", "heroes/photo.jpg")
+expiring = upload_signature("your-secret", "heroes/photo.jpg", 1893456000)
 ```
 
 Pass `None` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode. The secret may be `str` or `bytes`.

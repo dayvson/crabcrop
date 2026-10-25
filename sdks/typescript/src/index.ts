@@ -47,10 +47,20 @@ export function purgeGroupSignature(secret: string, group: string): string {
  * so neither an image signature nor a purge signature can
  * ever be replayed as an upload signature. This is the
  * signature segment for `PUT /upload/<signature>/<name>`.
+ *
+ * With `expires` (unix seconds), the signature covers
+ * `exp:<expires>/<name>` instead, and the request path is
+ * `PUT /upload/<signature>/exp:<expires>/<name>`: the
+ * expiry sits inside the signed string, so it can neither
+ * be stripped nor extended, and the server refuses the
+ * upload once that second is reached. Delegated upload
+ * tokens should always use the expiring form; without it
+ * a token replays until the secret rotates.
  */
-export function uploadSignature(secret: string, name: string): string {
+export function uploadSignature(secret: string, name: string, expires?: number): string {
   const subkey = Buffer.from(sign(secret, "crabcrop/upload-key"), "hex");
-  return createHmac("sha256", subkey).update(name, "utf8").digest("hex");
+  const signed = expires === undefined ? name : `exp:${expires}/${name}`;
+  return createHmac("sha256", subkey).update(signed, "utf8").digest("hex");
 }
 
 export interface BuildOptions {
