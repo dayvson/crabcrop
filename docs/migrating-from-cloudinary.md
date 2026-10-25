@@ -42,7 +42,7 @@ Cloudinary is a hosted media service: assets are uploaded to it, and delivery UR
 | `e_blur:200` | `filters:blur(2)` | Approximate: Cloudinary's 1-2000 strength scale becomes a sigma, roughly value / 100 |
 | `e_sharpen:100` | `filters:sharpen(1)` | Approximate on the same basis |
 | `e_brightness:20` | `filters:brighten(51)` | Approximate: Cloudinary scales brightness, crabcrop shifts it |
-| `e_contrast:20` | `filters:contrast(1.2)` | Percent becomes a factor: `1 + n/100` |
+| `e_contrast:20` | `filters:contrast(20)` | Both are a -100 to 100 percent |
 | `e_saturation:-50` | `filters:saturation(0.5)` | Same conversion |
 | `l_<image>` overlay with `g_`, `x_`, `y_`, `o_` | `filters:overlay(<url>,<x>,<y>,<alpha>,normal)` | Overlay image, position, and opacity; blend modes are available too |
 | `b_rgb:000000` (background) | `filters:fill(000000)`, or `pad:WxH:000000` | Flatten onto a color, or pad onto one |

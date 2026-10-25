@@ -879,10 +879,16 @@ fn convert_thumbor_filter(
             ),
         },
         "contrast" => match args.parse::<i32>() {
-            Ok(n) => Some(format!(
-                "contrast({})",
-                format_factor(1.0 + f64::from(n) / 100.0)
-            )),
+            Ok(n) => {
+                let c = n.clamp(-100, 100);
+                if c != n {
+                    warnings.push(format!(
+                        "contrast({n}) clamped to contrast({c}): crabcrop contrast is a \
+                         percent from -100 to 100"
+                    ));
+                }
+                Some(format!("contrast({c})"))
+            }
             _ => drop_it(
                 warnings,
                 format!("contrast({args}) is not a number; dropped"),
@@ -1633,10 +1639,9 @@ mod tests {
             "{url}"
         );
         assert!(warnings.is_empty(), "{warnings:?}");
-        // Percent scales become factors.
         let (url, _) = conv("unsafe/filters:contrast(20):saturation(-50)/https://e.com/a.jpg");
         assert!(
-            url.contains("contrast(1.2)") && url.contains("saturation(0.5)"),
+            url.contains("contrast(20)") && url.contains("saturation(0.5)"),
             "{url}"
         );
         // Brightness is an approximation, and says so.

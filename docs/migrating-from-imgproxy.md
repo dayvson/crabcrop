@@ -43,7 +43,7 @@ imgproxy and crabcrop sign and shape their URLs differently enough that there is
 | `bl:2` | `filters:blur(2)` | A Gaussian sigma in both |
 | `sh:1` | `filters:sharpen(1)` | |
 | `sa:1.2` | `filters:saturation(1.2)` | A factor in both |
-| `co:1.2` | `filters:contrast(1.2)` | A factor in both |
+| `co:1.2` | `filters:contrast(20)` | imgproxy is a factor (1 = unchanged); crabcrop a percent (0 = unchanged), so 1.2 ≈ +20% |
 | `br:20` | `filters:brighten(51)` | Approximate: imgproxy scales brightness, crabcrop shifts it (the amount is rescaled accordingly) |
 | `bg:ff0000` | `filters:fill(ff0000)` | Flatten onto a color |
 | `wm:...` | `filters:watermark(...)` / `filters:overlay(...)` | imgproxy's watermark is one server-configured image; crabcrop takes the image per URL |
