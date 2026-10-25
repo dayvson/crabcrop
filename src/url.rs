@@ -897,8 +897,43 @@ fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
     }
     match parse_size(seg) {
         Ok(size) => Some(Ok(Operation::Size(size))),
-        Err(_) => None,
+        Err(_) => {
+            // A segment that fails the size grammar but is
+            // shaped like a size (an `x` joining two parts, at
+            // least one of them a dimension spelling, and no
+            // URL punctuation) is a malformed size, not the
+            // start of a source URL: without this, an over-cap
+            // or garbled size silently became a source path and
+            // the request failed downstream as a 502 fetch
+            // error instead of the documented 400 (issue #228).
+            if size_shaped(seg) {
+                Some(Err(ParseError::InvalidSize(seg.to_string())))
+            } else {
+                None
+            }
+        }
     }
+}
+
+/// Whether a segment that failed [`parse_size`] still reads as
+/// a size attempt. At least one side of the `x` must carry a
+/// dimension spelling (digits, `orig`, or empty, with an
+/// optional flip sign), and neither side may carry the `.` or
+/// `:` that mark URL text (a host, a file name, a scheme, a
+/// port), so genuine source segments like `example.com` or
+/// `100x200.jpg` never trip it.
+fn size_shaped(seg: &str) -> bool {
+    let Some((left, right)) = seg.split_once('x') else {
+        return false;
+    };
+    if left.contains('.') || right.contains('.') || seg.contains(':') {
+        return false;
+    }
+    let dimension_spelling = |part: &str| {
+        let digits = part.strip_prefix('-').unwrap_or(part);
+        digits.is_empty() || digits == "orig" || digits.bytes().all(|b| b.is_ascii_digit())
+    };
+    dimension_spelling(left) || dimension_spelling(right)
 }
 
 /// Parse the box after `fit-in:`. Flips make no sense when fitting,
@@ -3161,6 +3196,39 @@ mod tests {
     }
 
     #[test]
+    fn malformed_size_segments_are_parse_errors_not_sources() {
+        // Issue #228: an over-cap or garbled size segment used
+        // to fall out of the parse and be treated as the start
+        // of a source URL, surfacing as a 502 fetch failure.
+        for input in [
+            "16400x100/example.com/img.jpg",
+            "16384x100/example.com/img.jpg",
+            "99999x100/example.com/img.jpg",
+            "abcx100/example.com/img.jpg",
+            "300xabc/example.com/img.jpg",
+        ] {
+            assert_eq!(
+                parse_operations(input),
+                Err(ParseError::InvalidSize(
+                    input.split('/').next().unwrap().to_string()
+                )),
+                "input: {input:?}"
+            );
+        }
+        // Source segments that merely contain an `x` still
+        // start the source: hosts, file names, and schemes are
+        // never size attempts.
+        for (input, source) in [
+            ("example.com/img.jpg", "example.com/img.jpg"),
+            ("300x200/example.com/img.jpg", "example.com/img.jpg"),
+            ("300x200/100x200.jpg", "100x200.jpg"),
+        ] {
+            let (_, parsed_source) = parse_operations(input).unwrap();
+            assert_eq!(parsed_source, source, "input: {input:?}");
+        }
+    }
+
+    #[test]
     fn parses_sizes() {
         use Dimension::{Original, Pixels, Proportional};
 
@@ -4874,10 +4942,12 @@ mod tests {
     #[test]
     fn non_operation_segment_starts_source_url() {
         // A segment is an operation only if it parses as one or carries a
-        // known prefix; otherwise it starts the source URL.
-        let (ops, url) = parse_operations("300xabc/example.com/img.jpg").unwrap();
+        // known prefix; otherwise it starts the source URL. (A segment
+        // shaped like a size is the one exception: it errors instead,
+        // see malformed_size_segments_are_parse_errors_not_sources.)
+        let (ops, url) = parse_operations("photos/img.jpg").unwrap();
         assert!(ops.is_empty());
-        assert_eq!(url, "300xabc/example.com/img.jpg");
+        assert_eq!(url, "photos/img.jpg");
     }
 
     #[test]
