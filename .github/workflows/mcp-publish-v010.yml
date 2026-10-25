@@ -1,0 +1,32 @@
+name: MCP npm publish for v0.1.0 (one-off)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish-mcp-npm:
+    name: Publish @crabcrop/mcp to npm
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Install TypeScript SDK dependencies
+        working-directory: sdks/typescript
+        run: npm install --no-audit --no-fund
+      - name: Install MCP server dependencies
+        working-directory: sdks/mcp
+        run: npm install --no-audit --no-fund
+      - name: npm publish
+        working-directory: sdks/mcp
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
