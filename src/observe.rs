@@ -47,6 +47,7 @@ pub struct RequestRecord {
     pub bytes_in: usize,
     pub bytes_out: usize,
     pub fail: FailStage,
+    pub request_id: String,
 }
 
 impl Default for RequestRecord {
@@ -66,6 +67,7 @@ impl Default for RequestRecord {
             bytes_in: 0,
             bytes_out: 0,
             fail: FailStage::None,
+            request_id: String::new(),
         }
     }
 }
@@ -101,7 +103,8 @@ impl RequestRecord {
         format!(
             "{{\"ts\":{ts},\"method\":\"GET\",\"ops\":\"{}\",\"status\":{},\
              \"verify_ms\":{:.1},\"load_ms\":{:.1},\"process_ms\":{:.1},\"total_ms\":{:.1},\
-             \"cache\":\"{}\",\"fallback\":{},\"bytes_in\":{},\"bytes_out\":{}}}",
+             \"cache\":\"{}\",\"fallback\":{},\"bytes_in\":{},\"bytes_out\":{},\
+             \"request_id\":\"{}\"}}",
             escape_json(&self.ops),
             self.status,
             ms(self.verify),
@@ -112,6 +115,7 @@ impl RequestRecord {
             self.fallback,
             self.bytes_in,
             self.bytes_out,
+            escape_json(&self.request_id),
         )
     }
 }
@@ -334,6 +338,14 @@ mod tests {
         r.ops = "we\"ird\\path".to_string();
         let v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
         assert_eq!(v["ops"], "we\"ird\\path");
+    }
+
+    #[test]
+    fn log_line_includes_request_id() {
+        let mut r = record(200);
+        r.request_id = "req-abc123".to_string();
+        let v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(v["request_id"], "req-abc123");
     }
 
     #[test]
