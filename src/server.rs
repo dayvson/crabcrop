@@ -176,6 +176,17 @@ pub struct AppState {
     /// reports moderation as unavailable. Verdicts are
     /// annotations only: nothing here alters serving.
     pub moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
+    /// Embedding provider for meta responses that opt
+    /// in with `embeddings=1` (issue #172), built from
+    /// the CLIP tagger at boot. `None` means the opt-in
+    /// reports the embedding as unavailable.
+    pub embeddings: Option<Arc<dyn crate::ai::EmbeddingProvider>>,
+    /// Aesthetic head for meta responses (issue #172),
+    /// loaded at boot when `CRABCROP_AESTHETIC_HEAD` is
+    /// configured. `None` means meta carries no
+    /// aesthetic field. The score is descriptive only:
+    /// nothing here alters serving either.
+    pub aesthetic: Option<Arc<crate::ai::AestheticHead>>,
     /// Detection provider for class redaction and meta
     /// detections, preloaded at boot when
     /// `CRABCROP_DETECT_MODEL` is configured. `None` means
@@ -1862,12 +1873,29 @@ async fn serve_miss(
     } else {
         None
     };
+    // The embedding run (issue #172) serves two
+    // fields: the embedding itself, when the client
+    // opted in, and the aesthetic score, whenever a
+    // head is configured. One run feeds both.
+    let want_embedding = meta && wants_embeddings(accept);
+    let embedding_run = if meta && (want_embedding || state.aesthetic.is_some()) {
+        Some(embed_meta(state, &processed, ai_gated).await)
+    } else {
+        None
+    };
+    let aesthetic = compose_aesthetic(state, embedding_run.as_ref());
     let mut response = if meta {
         meta_response(
             &processed,
             annotation.as_ref(),
             detections.as_deref(),
             moderation.as_ref(),
+            if want_embedding {
+                embedding_run.as_ref()
+            } else {
+                None
+            },
+            aesthetic.as_ref(),
         )
     } else {
         respond(
@@ -1999,6 +2027,13 @@ fn wants_detections(accept: Option<&str>) -> bool {
 /// rule as `placeholders`.
 fn wants_moderation(accept: Option<&str>) -> bool {
     wants_meta_param(accept, "moderation")
+}
+
+/// Whether the accepted `application/json` entry asks
+/// for the image embedding: an `embeddings` parameter,
+/// same rule as `placeholders`.
+fn wants_embeddings(accept: Option<&str>) -> bool {
+    wants_meta_param(accept, "embeddings")
 }
 
 /// Whether the accepted `application/json` entry carries
@@ -2328,11 +2363,195 @@ fn score_list_json(scores: &[crate::ai::TagScore]) -> String {
     format!("[{}]", items.join(","))
 }
 
+/// The embedding field of a meta response that asked
+/// for it (`embeddings=1`, issue #172): either the
+/// provider's vector, or the reason there is none.
+/// Like moderation, the field is an annotation, so
+/// every failure degrades to the unavailable form and
+/// the meta request still succeeds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbeddingMeta {
+    Report(crate::ai::ImageEmbedding),
+    Unavailable(&'static str),
+}
+
+/// Run the embedding provider for a meta response.
+/// Same permit rule as `moderate_meta` (a request
+/// already holding an AI permit runs under it, audit
+/// R2-29), and the outcome is explicit rather than an
+/// omitted field: an unconfigured provider, a busy
+/// gate, and a failed inference each report
+/// unavailable, with a reason, because the client
+/// asked for the field by name (directly, or through
+/// the aesthetic head that scores the vector).
+async fn embed_meta(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+    ai_gated: bool,
+) -> EmbeddingMeta {
+    let Some(provider) = state.embeddings.as_ref() else {
+        return EmbeddingMeta::Unavailable("not_configured");
+    };
+    let _permit = if ai_gated {
+        None
+    } else {
+        match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            _ => return EmbeddingMeta::Unavailable("busy"),
+        }
+    };
+    let img = match crate::engine::decode_image(&processed.bytes) {
+        Ok(img) => img,
+        Err(_) => return EmbeddingMeta::Unavailable("inference_failed"),
+    };
+    let provider = provider.clone();
+    match tokio::task::spawn_blocking(move || provider.embed(&img)).await {
+        Ok(Ok(embedding)) => EmbeddingMeta::Report(embedding),
+        Ok(Err(e)) => {
+            eprintln!("embedding error: {e}");
+            EmbeddingMeta::Unavailable("inference_failed")
+        }
+        Err(e) => {
+            eprintln!("embedding task failed: {e}");
+            EmbeddingMeta::Unavailable("inference_failed")
+        }
+    }
+}
+
+/// The aesthetic field of a meta response (issue
+/// #172), present whenever a head is configured: the
+/// head's identity always rides along, and the
+/// encoder's identity whenever a vector was produced,
+/// so a null score stays interpretable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AestheticMeta {
+    pub head: String,
+    pub model: Option<String>,
+    pub outcome: AestheticOutcome,
+}
+
+/// How an aesthetic composition ended: a score, a
+/// dimension mismatch between the head and the
+/// encoder (the fail-soft case the issue names), or
+/// the embedding run's own unavailability.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AestheticOutcome {
+    Score(f32),
+    DimensionMismatch { expected: usize, got: usize },
+    Unavailable(&'static str),
+}
+
+/// Compose the aesthetic field from the embedding
+/// run: the head scores the run's vector, rounded to
+/// 3 decimals like the other composed scores. A
+/// vector of the wrong dimension is a mismatch, not
+/// an error; a run that produced no vector passes its
+/// reason through.
+fn compose_aesthetic(state: &AppState, run: Option<&EmbeddingMeta>) -> Option<AestheticMeta> {
+    let head = state.aesthetic.as_ref()?;
+    let (model, outcome) = match run {
+        Some(EmbeddingMeta::Report(embedding)) => {
+            let outcome = match head.score(&embedding.vector) {
+                Some(score) => AestheticOutcome::Score((score * 1000.0).round() / 1000.0),
+                None => AestheticOutcome::DimensionMismatch {
+                    expected: head.expected_dim(),
+                    got: embedding.vector.len(),
+                },
+            };
+            (Some(embedding.model.clone()), outcome)
+        }
+        Some(EmbeddingMeta::Unavailable(reason)) => (None, AestheticOutcome::Unavailable(reason)),
+        // The handler runs the embedding whenever a
+        // head is configured, so this is unreachable;
+        // report it rather than panic.
+        None => (None, AestheticOutcome::Unavailable("inference_failed")),
+    };
+    Some(AestheticMeta {
+        head: head.identity().to_string(),
+        model,
+        outcome,
+    })
+}
+
+/// Pack an embedding for the wire (issue #172): each
+/// f32 narrows to a float16, little-endian, and the
+/// bytes are base64-encoded (the crate's encoder, the
+/// one placeholder data URIs use). The encoding is
+/// named in the response (`f16le-base64`), so a
+/// future encoding ships as a new value, never a
+/// silent change under this one.
+fn pack_embedding(vector: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(vector.len() * 2);
+    for value in vector {
+        bytes.extend_from_slice(&f32_to_f16_bits(*value).to_le_bytes());
+    }
+    crate::placeholder::base64_encode(&bytes)
+}
+
+/// Narrow an f32 to float16 bits, round to nearest
+/// even, with subnormals, overflow to infinity, and
+/// NaN kept nonzero and quiet. Embeddings are unit
+/// vectors, so the working range is [-1, 1]; the full
+/// conversion keeps the packing honest for any input.
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp_bits = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x7f_ffff;
+    if exp_bits == 0xff {
+        // Infinity stays infinity; a NaN keeps a
+        // nonzero fraction (quieted) so it cannot
+        // collapse into infinity on the wire.
+        let narrowed = (frac >> 13) as u16;
+        return sign
+            | 0x7c00
+            | if frac != 0 && narrowed == 0 {
+                0x0200
+            } else {
+                narrowed
+            };
+    }
+    // The f16 exponent field for a normal result.
+    let exp = exp_bits - 112;
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        // A subnormal f16: shift the significand (with
+        // its implicit bit) into subnormal scale,
+        // rounding to nearest even on the way.
+        let significand = frac | 0x80_0000;
+        let shift = (14 - exp) as u32;
+        let mut half = significand >> shift;
+        let remainder = significand & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        if remainder > halfway || (remainder == halfway && half & 1 == 1) {
+            half += 1;
+        }
+        return sign | half as u16;
+    }
+    // A normal f16: drop the low 13 fraction bits,
+    // rounding to nearest even; a carry out of the
+    // fraction correctly increments the exponent
+    // through the addition.
+    let mut half = sign | ((exp as u16) << 10) | (frac >> 13) as u16;
+    let remainder = frac & 0x1fff;
+    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
+        half += 1;
+    }
+    half
+}
+
 fn meta_response(
     processed: &crate::engine::ProcessedImage,
     annotation: Option<&Annotation>,
     detections: Option<&[(String, crate::ai::Detection)]>,
     moderation: Option<&ModerationMeta>,
+    embedding: Option<&EmbeddingMeta>,
+    aesthetic: Option<&AestheticMeta>,
 ) -> Response {
     let mut body = format!(
         "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}",
@@ -2414,6 +2633,64 @@ fn meta_response(
                 ));
             }
         }
+    }
+    if let Some(embedding) = embedding {
+        // The embedding fields (issue #172): the
+        // vector, base64-packed float16 little-endian,
+        // with the companions that keep it
+        // interpretable across operator
+        // reconfigurations: the encoder identity, the
+        // dimension, the encoding name, and the
+        // normalization guarantee. An opt-in that
+        // cannot be answered reports null plus a
+        // reason instead, like the moderation field.
+        match embedding {
+            EmbeddingMeta::Report(report) => {
+                body.push_str(&format!(
+                    ",\"embedding\":{},\"embedding_model\":{},\"embedding_dim\":{},\"embedding_encoding\":\"f16le-base64\",\"embedding_normalized\":true",
+                    serde_json::to_string(&pack_embedding(&report.vector)).unwrap_or_default(),
+                    serde_json::to_string(&report.model).unwrap_or_default(),
+                    report.vector.len()
+                ));
+            }
+            EmbeddingMeta::Unavailable(reason) => {
+                body.push_str(&format!(
+                    ",\"embedding\":null,\"embedding_reason\":\"{reason}\""
+                ));
+            }
+        }
+    }
+    if let Some(aesthetic) = aesthetic {
+        // The aesthetic field (issue #172): the head's
+        // score of the same embedding, with both
+        // identities, or a null score carrying the
+        // reason (a dimension mismatch names the
+        // expected and actual dimensions). The score
+        // is descriptive only.
+        body.push_str(&format!(
+            ",\"aesthetic\":{{\"head\":{}",
+            serde_json::to_string(&aesthetic.head).unwrap_or_default()
+        ));
+        if let Some(model) = &aesthetic.model {
+            body.push_str(&format!(
+                ",\"model\":{}",
+                serde_json::to_string(model).unwrap_or_default()
+            ));
+        }
+        match &aesthetic.outcome {
+            AestheticOutcome::Score(score) => {
+                body.push_str(&format!(",\"score\":{score}"));
+            }
+            AestheticOutcome::DimensionMismatch { expected, got } => {
+                body.push_str(&format!(
+                    ",\"score\":null,\"reason\":\"dimension_mismatch\",\"expected\":{expected},\"got\":{got}"
+                ));
+            }
+            AestheticOutcome::Unavailable(reason) => {
+                body.push_str(&format!(",\"score\":null,\"reason\":\"{reason}\""));
+            }
+        }
+        body.push('}');
     }
     if let Some(score) = processed.ssimulacra2 {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
@@ -2730,6 +3007,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -2826,6 +3105,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -2986,6 +3267,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3039,6 +3322,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3095,6 +3380,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3632,6 +3919,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3957,6 +4246,8 @@ mod tests {
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -4075,6 +4366,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: provider,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -4227,6 +4520,326 @@ mod tests {
     }
 
     #[test]
+    fn embeddings_opt_in_takes_exact_tokens() {
+        // The #151 option rule, same as placeholders and
+        // moderation: a bare token or `=1` opts in,
+        // `=TRUE` (any case) also counts, nothing else
+        // does.
+        assert!(wants_embeddings(Some("application/json; embeddings")));
+        assert!(wants_embeddings(Some("application/json; embeddings=1")));
+        assert!(wants_embeddings(Some("application/json; embeddings=TRUE")));
+        assert!(!wants_embeddings(Some("application/json; embeddings=0")));
+        assert!(!wants_embeddings(Some("application/json; embeddings=yes")));
+        assert!(!wants_embeddings(Some("application/json; moderation=1")));
+        assert!(!wants_embeddings(None));
+    }
+
+    #[test]
+    fn f16_packing_matches_known_vectors() {
+        // IEEE 754 half values, round to nearest even:
+        // signs, normals, the largest finite, the
+        // overflow tie, subnormals and their ties,
+        // infinities, and NaN.
+        let cases: &[(f32, u16)] = &[
+            (0.0, 0x0000),
+            (-0.0, 0x8000),
+            (1.0, 0x3c00),
+            (-1.0, 0xbc00),
+            (2.0, 0x4000),
+            (0.5, 0x3800),
+            (0.1, 0x2e66),
+            (std::f32::consts::PI, 0x4248),
+            (65504.0, 0x7bff),
+            (65520.0, 0x7c00),
+            (f32::INFINITY, 0x7c00),
+            (f32::NEG_INFINITY, 0xfc00),
+            (6.103_515_6e-5, 0x0400), // 2^-14, smallest normal
+            (5.960_464_5e-8, 0x0001), // 2^-24, smallest subnormal
+            (2.980_232_2e-8, 0x0000), // 2^-25, ties to zero
+            (8.940_697e-8, 0x0002),   // 3 * 2^-25, ties up to even
+            (f32::NAN, 0x7e00),
+        ];
+        for (value, want) in cases {
+            assert_eq!(f32_to_f16_bits(*value), *want, "f16({value})");
+        }
+        // The full packing: little-endian halves,
+        // base64 over the bytes.
+        assert_eq!(pack_embedding(&[1.0, -1.0, 0.5]), "ADwAvAA4");
+        assert_eq!(pack_embedding(&[]), "");
+    }
+
+    #[test]
+    fn f16_packing_round_trips_unit_vectors() {
+        // A test-local decoder: widen an f16 back to
+        // f32 exactly (every f16 is representable).
+        fn widen(half: u16) -> f32 {
+            let sign = if half & 0x8000 != 0 { -1.0 } else { 1.0 };
+            let exp = (half >> 10) & 0x1f;
+            let frac = (half & 0x3ff) as f32;
+            let magnitude = match exp {
+                0 => frac * 2f32.powi(-24),
+                31 => {
+                    if frac == 0.0 {
+                        f32::INFINITY
+                    } else {
+                        f32::NAN
+                    }
+                }
+                e => (1.0 + frac / 1024.0) * 2f32.powi(e as i32 - 15),
+            };
+            sign * magnitude
+        }
+        let vector = [
+            0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.25,
+            0.1,
+            0.9995,
+            -std::f32::consts::FRAC_1_SQRT_2,
+        ];
+        let packed = pack_embedding(&vector);
+        // Decode the base64 by hand: the packing test
+        // above pins the encoder against known vectors,
+        // so here a small decoder keeps the round trip
+        // independent of it.
+        let bytes = {
+            let mut out = Vec::new();
+            let mut acc: u32 = 0;
+            let mut nbits = 0;
+            for c in packed.bytes() {
+                let v = match c {
+                    b'A'..=b'Z' => (c - b'A') as u32,
+                    b'a'..=b'z' => (c - b'a' + 26) as u32,
+                    b'0'..=b'9' => (c - b'0' + 52) as u32,
+                    b'+' => 62,
+                    b'/' => 63,
+                    b'=' => break,
+                    other => panic!("unexpected base64 byte {other}"),
+                };
+                acc = (acc << 6) | v;
+                nbits += 6;
+                if nbits >= 8 {
+                    nbits -= 8;
+                    out.push((acc >> nbits) as u8);
+                }
+            }
+            out
+        };
+        assert_eq!(bytes.len(), vector.len() * 2);
+        for (chunk, want) in bytes.as_chunks::<2>().0.iter().zip(vector.iter()) {
+            let back = widen(u16::from_le_bytes(*chunk));
+            // f16 keeps about 3 decimal digits: the
+            // round trip must land within half an ulp
+            // of the original's magnitude class.
+            assert!((back - want).abs() <= 0.001, "{want} -> {back}");
+        }
+    }
+
+    /// An embedding provider double (issue #172): a
+    /// fixed unit vector under a fixed model identity.
+    #[derive(Debug)]
+    struct FakeEmbedding;
+
+    impl crate::ai::EmbeddingProvider for FakeEmbedding {
+        fn embed(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::ImageEmbedding, crate::ai::AiError> {
+            Ok(crate::ai::ImageEmbedding {
+                model: "fake-encoder".to_string(),
+                vector: vec![0.5; 4],
+            })
+        }
+    }
+
+    /// An embedding provider double that always fails.
+    #[derive(Debug)]
+    struct FailingEmbedding;
+
+    impl crate::ai::EmbeddingProvider for FailingEmbedding {
+        fn embed(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::ImageEmbedding, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference("no vector today".to_string()))
+        }
+    }
+
+    /// Spawn the app with an embedding provider and,
+    /// optionally, an aesthetic head, for the meta
+    /// tests (issue #172). Mirrors
+    /// `spawn_app_with_moderation`.
+    async fn spawn_app_with_embeddings(
+        provider: Option<Arc<dyn crate::ai::EmbeddingProvider>>,
+        aesthetic: Option<Arc<crate::ai::AestheticHead>>,
+    ) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: provider,
+            aesthetic,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            default_ops: Vec::new(),
+            video_encoder: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Fetch a signed meta response as JSON with the
+    /// given Accept value.
+    async fn meta_with(base: &str, src: &str, accept: &str) -> serde_json::Value {
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", accept)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_str(&resp.text().await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn meta_embedding_only_on_opt_in() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_embeddings(Some(Arc::new(FakeEmbedding)), None).await;
+        // Without the opt-in, no embedding fields at
+        // all: the provider is not even consulted.
+        let plain = meta_with(&base, &src, "application/json").await;
+        assert!(plain.get("embedding").is_none(), "{plain}");
+        assert!(plain.get("aesthetic").is_none(), "{plain}");
+        // With it, the packed vector and every
+        // mandatory companion.
+        let meta = meta_with(&base, &src, "application/json; embeddings=1").await;
+        assert_eq!(meta["embedding"], pack_embedding(&[0.5; 4]), "{meta}");
+        assert_eq!(meta["embedding_model"], "fake-encoder", "{meta}");
+        assert_eq!(meta["embedding_dim"], 4, "{meta}");
+        assert_eq!(meta["embedding_encoding"], "f16le-base64", "{meta}");
+        assert_eq!(meta["embedding_normalized"], true, "{meta}");
+    }
+
+    #[tokio::test]
+    async fn meta_embedding_without_a_provider_reports_unavailable() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_embeddings(None, None).await;
+        let meta = meta_with(&base, &src, "application/json; embeddings=1").await;
+        assert!(meta["embedding"].is_null(), "{meta}");
+        assert_eq!(meta["embedding_reason"], "not_configured", "{meta}");
+    }
+
+    #[tokio::test]
+    async fn meta_embedding_failure_reports_unavailable() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_embeddings(Some(Arc::new(FailingEmbedding)), None).await;
+        let meta = meta_with(&base, &src, "application/json; embeddings=1").await;
+        assert!(meta["embedding"].is_null(), "{meta}");
+        assert_eq!(meta["embedding_reason"], "inference_failed", "{meta}");
+    }
+
+    #[tokio::test]
+    async fn meta_aesthetic_scores_when_a_head_is_configured() {
+        // A head reading only the first component,
+        // plus a 0.5 bias: the fake vector is all
+        // 0.5, so the score is exactly 1.0. The field
+        // rides the plain meta request: no embeddings
+        // opt-in needed, and no embedding fields
+        // appear without one.
+        let head = crate::ai::AestheticHead::from_weights(
+            vec![1.0, 0.0, 0.0, 0.0],
+            0.5,
+            "fake-head".to_string(),
+        )
+        .unwrap();
+        let src = spawn_image_server().await;
+        let base =
+            spawn_app_with_embeddings(Some(Arc::new(FakeEmbedding)), Some(Arc::new(head))).await;
+        let meta = meta_with(&base, &src, "application/json").await;
+        assert_eq!(meta["aesthetic"]["head"], "fake-head", "{meta}");
+        assert_eq!(meta["aesthetic"]["model"], "fake-encoder", "{meta}");
+        assert_eq!(meta["aesthetic"]["score"], 1.0, "{meta}");
+        assert!(meta.get("embedding").is_none(), "{meta}");
+    }
+
+    #[tokio::test]
+    async fn meta_aesthetic_dimension_mismatch_reports_expected_and_got() {
+        // A 3-wide head against the 4-wide fake
+        // encoder: the fail-soft case. Null score, the
+        // reason, and both dimensions; the request
+        // still succeeds.
+        let head = crate::ai::AestheticHead::from_weights(
+            vec![1.0, 0.0, 0.0],
+            0.5,
+            "l14-head".to_string(),
+        )
+        .unwrap();
+        let src = spawn_image_server().await;
+        let base =
+            spawn_app_with_embeddings(Some(Arc::new(FakeEmbedding)), Some(Arc::new(head))).await;
+        let meta = meta_with(&base, &src, "application/json").await;
+        let aesthetic = &meta["aesthetic"];
+        assert!(aesthetic["score"].is_null(), "{meta}");
+        assert_eq!(aesthetic["reason"], "dimension_mismatch", "{meta}");
+        assert_eq!(aesthetic["expected"], 3, "{meta}");
+        assert_eq!(aesthetic["got"], 4, "{meta}");
+        assert_eq!(aesthetic["model"], "fake-encoder", "{meta}");
+    }
+
+    #[tokio::test]
+    async fn meta_aesthetic_without_a_vector_reports_the_reason() {
+        let head =
+            crate::ai::AestheticHead::from_weights(vec![1.0, 0.0, 0.0, 0.0], 0.5, "h".to_string())
+                .unwrap();
+        let src = spawn_image_server().await;
+        let base =
+            spawn_app_with_embeddings(Some(Arc::new(FailingEmbedding)), Some(Arc::new(head))).await;
+        let meta = meta_with(&base, &src, "application/json").await;
+        let aesthetic = &meta["aesthetic"];
+        assert_eq!(aesthetic["head"], "h", "{meta}");
+        assert!(aesthetic["score"].is_null(), "{meta}");
+        assert_eq!(aesthetic["reason"], "inference_failed", "{meta}");
+        // No vector, so no encoder identity either.
+        assert!(aesthetic.get("model").is_none(), "{meta}");
+    }
+
+    #[test]
     fn compose_moderation_rounds_and_orders() {
         let report = crate::ai::ModerationScores {
             model: "m".to_string(),
@@ -4287,6 +4900,8 @@ mod tests {
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: Some(Arc::new(FakeDetector)),
             detectors: Vec::new(),
             focal: None,
@@ -4335,6 +4950,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -4569,6 +5186,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect,
             detectors,
             focal: None,
@@ -4622,6 +5241,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -5830,6 +6451,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -5885,6 +6508,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -6253,6 +6878,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -6335,6 +6962,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -6722,6 +7351,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -7118,6 +7749,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -7939,6 +8572,8 @@ mod tests {
             tagger: None,
             tag_threshold: 0.05,
             moderation: None,
+            embeddings: None,
+            aesthetic: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
