@@ -16,11 +16,13 @@ one of those, or at your own build of the repo Dockerfile.
 
 - `base/`: the workload as the chart's default values
   render it. Deployment (one replica, `/health` probes,
-  `PORT`, the secret reference), Service, and a Secret with
-  a **placeholder** value for local evaluation. For anything
-  real, manage the Secret yourself (a Secret named
-  `crabcrop` with the key `CRABCROP_SECRET`, 16+ bytes) and
-  drop `secret.yaml` from the base's resources.
+  `PORT`, the secret reference) and Service. The base
+  ships no Secret on purpose (audit R2-40): create one
+  named `crabcrop` with the key `CRABCROP_SECRET`
+  (16+ bytes) with kubectl or your own secret tooling
+  before applying; until it exists, the pod cannot
+  start. The Helm chart's equivalent is its
+  `existingSecret` value.
 - `components/`: the chart's toggles, as kustomize
   components an overlay composes in:
   - `presets`: the presets ConfigMap plus its mount and

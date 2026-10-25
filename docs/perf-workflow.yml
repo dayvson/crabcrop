@@ -6,12 +6,20 @@
 # makes per-PR numbers noise. The gate step starts
 # non-blocking (continue-on-error) while the baseline earns
 # trust; remove that line to make regressions fail the run.
+#
+# Issue #193 hardening, STAGED here and pending the same
+# web-UI landing at .github/workflows/perf.yml:
+# least-privilege permissions, the checkout action pinned
+# by SHA, and the release build run with --locked.
 name: Perf gate
 
 on:
   schedule:
     - cron: "17 7 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,9 +30,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Run the performance gate
         continue-on-error: true
         run: python3 scripts/bench_gate.py

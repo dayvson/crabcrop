@@ -7,9 +7,10 @@
 #     env CRABCROP_BASE=http://localhost:3000 crabcrop sign \
 #     "300x200/https://example.com/photo.jpg"
 #
-# Without CRABCROP_SECRET set, a clearly marked development
-# secret is used so the trial boots; never serve traffic
-# with it.
+# CRABCROP_SECRET must be set in the environment: compose
+# refuses to start without it. There is no default secret
+# (audit R2-40): a booted-by-default value printed in a
+# public repo would be a working signing secret for anyone.
 services:
   crabcrop:
     build:
@@ -19,7 +20,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      CRABCROP_SECRET: "${CRABCROP_SECRET:-crabcrop-dev-secret-do-not-use-in-production}"
+      CRABCROP_SECRET: "${CRABCROP_SECRET:?CRABCROP_SECRET must be set to a signing secret of 16+ bytes (see README.md)}"
       CRABCROP_CACHE_MAX_MB: "256"
     # Presets: drop a presets file next to this compose file
     # and wire it in:

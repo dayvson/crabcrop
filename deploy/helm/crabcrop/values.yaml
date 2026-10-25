@@ -5,11 +5,13 @@
 replicaCount: 1
 
 image:
-  # Nothing is published to a public registry yet: build the
-  # image from the repo Dockerfile and push it somewhere your
-  # cluster can pull from, then point this at it.
-  repository: crabcrop
-  tag: latest
+  # Release images are published to GHCR, tagged with the
+  # release version. Set digest to pin the exact image (a
+  # digest takes precedence over the tag), or point the
+  # repository at your own build of the repo Dockerfile.
+  repository: ghcr.io/dayvson/crabcrop
+  tag: "0.1.0"
+  digest: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -62,8 +64,9 @@ resultStorage:
 ai:
   enabled: false
   image:
-    repository: crabcrop-ai
-    tag: latest
+    repository: ghcr.io/dayvson/crabcrop-ai
+    tag: "0.1.0"
+    digest: ""
   models:
     existingClaim: ""
     mountPath: /models

@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
         - name: crabcrop
-          image: crabcrop:latest
+          image: ghcr.io/dayvson/crabcrop:0.1.0
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
