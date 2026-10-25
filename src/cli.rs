@@ -27,6 +27,8 @@ CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_
   crabcrop upload <file> [<name>]     Upload an original to the server's upload store
                                       (name defaults to the file's basename); prints the
                                       source reference to use in transform URLs.
+                                      (--expires <unix-seconds> mints an upload token
+                                      that stops working at that second.)
   crabcrop convert-thumbor <url>      Convert a Thumbor URL to a crabcrop URL.";
 
 struct Config {
@@ -40,6 +42,10 @@ struct Config {
     /// verb accepts them.
     placeholders: bool,
     detections: bool,
+    /// Upload token expiry (issue #192): a unix-seconds
+    /// second at which the minted upload token stops
+    /// working. Only the `upload` verb accepts it.
+    expires: Option<u64>,
 }
 
 fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
@@ -48,6 +54,7 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
     let mut key_id: Option<String> = None;
     let mut placeholders = false;
     let mut detections = false;
+    let mut expires: Option<u64> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -57,7 +64,7 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
             _ => (arg.as_str(), None),
         };
         match flag {
-            "--base" | "--secret" | "--key-id" => {
+            "--base" | "--secret" | "--key-id" | "--expires" => {
                 let value = match inline_value {
                     Some(v) => v,
                     None => {
@@ -71,6 +78,10 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
                     base = Some(value);
                 } else if flag == "--key-id" {
                     key_id = Some(value);
+                } else if flag == "--expires" {
+                    expires = Some(value.parse().map_err(|_| {
+                        format!("--expires needs a unix-seconds timestamp, got {value:?}")
+                    })?);
                 } else {
                     secret = Some(value);
                 }
@@ -113,6 +124,7 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
             key_id,
             placeholders,
             detections,
+            expires,
         },
         positional,
     ))
@@ -209,6 +221,11 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
     if verb != "meta" && (config.placeholders || config.detections) {
         return Err(format!(
             "--placeholders and --detections only apply to the meta verb\n\n{USAGE}"
+        ));
+    }
+    if verb != "upload" && config.expires.is_some() {
+        return Err(format!(
+            "--expires only applies to the upload verb\n\n{USAGE}"
         ));
     }
     match verb {
@@ -608,13 +625,23 @@ async fn upload(config: &Config, positional: &[String]) -> Result<String, String
     crate::upload::validate_upload_name(&name)?;
     let secret = require_secret(config)?;
     let bytes = std::fs::read(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
-    let sig = crate::url::upload_signature(secret, &name);
+    // With --expires the token is the expiring form: the
+    // signature covers `exp:<ts>/<name>` and the path
+    // carries the segment, so the token dies at that
+    // second and cannot be reshaped (issue #192).
+    let (sig, tail) = match config.expires {
+        Some(ts) => (
+            crate::url::upload_signature_with_expiry(secret, &name, ts),
+            format!("exp:{ts}/{name}"),
+        ),
+        None => (crate::url::upload_signature(secret, &name), name.clone()),
+    };
     let segment = match &config.key_id {
         Some(kid) => format!("{kid}:{sig}"),
         None => sig,
     };
     let response = http_client()?
-        .put(format!("{}/upload/{segment}/{name}", config.base))
+        .put(format!("{}/upload/{segment}/{tail}", config.base))
         .body(bytes)
         .send()
         .await
@@ -1290,6 +1317,30 @@ mod tests {
             ]))
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn expires_applies_to_the_upload_verb_only() {
+        // --expires on any other verb is a usage error,
+        // like the meta-only flags, and a non-numeric
+        // value never parses.
+        assert!(
+            exec(&args(&[
+                "sign",
+                "--secret",
+                "test-secret",
+                "--expires",
+                "1893456000",
+                "300x200/https://example.com/a.jpg",
+            ]))
+            .await
+            .is_err()
+        );
+        assert!(
+            exec(&args(&["upload", "--expires", "soon", "whatever.png",]))
+                .await
+                .is_err()
         );
     }
 

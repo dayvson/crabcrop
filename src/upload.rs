@@ -87,11 +87,14 @@ pub fn validate_upload_name(name: &str) -> Result<(), String> {
 }
 
 /// Why storing an upload failed, once its bytes were
-/// accepted. The handler maps these: a backend that is
-/// unreachable is an upstream fault (502), a local IO
-/// failure is a server fault (500).
+/// accepted. The handler maps these: a name already taken
+/// is a conflict (409), a backend that is unreachable is
+/// an upstream fault (502), a local IO failure is a
+/// server fault (500).
 #[derive(Debug)]
 pub enum UploadError {
+    /// A conditional create found the name already taken.
+    AlreadyExists,
     /// The S3 backend refused or could not be reached.
     Backend(String),
     /// The local directory could not be written.
@@ -101,6 +104,9 @@ pub enum UploadError {
 impl std::fmt::Display for UploadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            UploadError::AlreadyExists => {
+                write!(f, "an object with this name already exists")
+            }
             UploadError::Backend(cause) => write!(f, "upload store failed: {cause}"),
             UploadError::Io(cause) => write!(f, "cannot write the upload: {cause}"),
         }
@@ -223,10 +229,12 @@ impl UploadStore {
     /// Backend errors read as "does not exist" for S3
     /// (its store contract degrades failures to misses);
     /// the write that follows surfaces a real failure.
+    /// The S3 answer is a HEAD, never a download of the
+    /// existing object (issue #192, audit R2-23).
     pub async fn exists(&self, name: &str) -> bool {
         match &self.backend {
             Backend::Local(dir) => dir.join(name).is_file(),
-            Backend::S3 { store, .. } => store.get_raw(name).await.is_some(),
+            Backend::S3 { store, .. } => store.exists_raw(name).await,
         }
     }
 
@@ -241,7 +249,7 @@ impl UploadStore {
                 let dir = dir.clone();
                 let name = name.to_string();
                 let bytes = bytes.to_vec();
-                tokio::task::spawn_blocking(move || put_local(&dir, &name, &bytes))
+                tokio::task::spawn_blocking(move || put_local(&dir, &name, &bytes, true))
                     .await
                     .map_err(|e| UploadError::Io(format!("upload write task failed: {e}")))?
             }
@@ -256,6 +264,76 @@ impl UploadStore {
             }
         }
     }
+
+    /// Store `bytes` under `name` only if the name is
+    /// still free, atomically (issue #192, audit R2-21):
+    /// the existence decision and the write are one step,
+    /// so two uploads racing for one new name cannot both
+    /// succeed, and the loser is answered
+    /// [`UploadError::AlreadyExists`] with the winner's
+    /// bytes untouched. This is the write the handler
+    /// uses whenever overwriting is not allowed; the
+    /// earlier [`UploadStore::exists`] check is only the
+    /// cheap refusal that keeps a doomed upload from
+    /// paying for a validation decode.
+    pub async fn put_new(&self, name: &str, bytes: &[u8]) -> Result<(), UploadError> {
+        match &self.backend {
+            Backend::Local(dir) => {
+                let dir = dir.clone();
+                let name = name.to_string();
+                let bytes = bytes.to_vec();
+                tokio::task::spawn_blocking(move || put_local(&dir, &name, &bytes, false))
+                    .await
+                    .map_err(|e| UploadError::Io(format!("upload write task failed: {e}")))?
+            }
+            Backend::S3 { store, .. } => {
+                match store.put_raw_if_absent(name, bytes.to_vec()).await {
+                    crate::s3store::RawPut::Stored => Ok(()),
+                    crate::s3store::RawPut::AlreadyExists => Err(UploadError::AlreadyExists),
+                    crate::s3store::RawPut::Failed => Err(UploadError::Backend(
+                        "the object store did not accept the upload".to_string(),
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// Bind the object name to the media kind the body
+/// validated as (issue #192, audit R2-22): when the
+/// name's final segment carries an extension, the
+/// extension must be one of the decoded kind's spellings.
+/// Uploads store originals that an operator may serve
+/// straight from the destination, so a name is not free
+/// to present the bytes as something they are not: a PNG
+/// cannot land as `promo.html`, and a JPEG cannot land as
+/// `photo.png`. A name with no extension has nothing to
+/// bind and is accepted; media kinds outside the binding
+/// table ([`UploadMedia::Other`]) are likewise unbound.
+pub fn check_upload_media(name: &str, media: crate::engine::UploadMedia) -> Result<(), String> {
+    let Some(allowed) = media.allowed_extensions() else {
+        return Ok(());
+    };
+    let last = name.rsplit('/').next().unwrap_or(name);
+    let Some((_, ext)) = last.rsplit_once('.') else {
+        return Ok(());
+    };
+    if ext.is_empty() {
+        return Ok(());
+    }
+    let ext = ext.to_ascii_lowercase();
+    if allowed.contains(&ext.as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "upload is a {} image but the name ends in .{ext}; rename it to match its content ({})",
+        media.label(),
+        allowed
+            .iter()
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// The temp file a local `put` writes before renaming
@@ -268,22 +346,70 @@ fn tmp_name() -> String {
     format!(".upload-tmp-{}-{n}", std::process::id())
 }
 
-fn put_local(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<(), UploadError> {
+/// Write one local object. With `overwrite`, the temp
+/// file is renamed over the target; without it, the temp
+/// file is hard-linked into place, which fails if the
+/// target already exists: the create is atomic, the local
+/// half of the conditional-create guarantee (issue #192,
+/// audit R2-21).
+///
+/// Both shapes first prove the write stays inside the
+/// upload directory (audit R2-25): the name itself cannot
+/// traverse (it is validated), but a pre-existing
+/// directory component can be a symlink planted in the
+/// tree, and a write would follow it out. The parent is
+/// canonicalized after creation and must sit under the
+/// (canonicalized) upload root, mirroring the loader's
+/// read-side check in `load_file`.
+fn put_local(
+    dir: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+    overwrite: bool,
+) -> Result<(), UploadError> {
     let target = dir.join(name);
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| UploadError::Io(format!("cannot create the upload directory: {e}")))?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| UploadError::Io("the upload path has no parent".to_string()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| UploadError::Io(format!("cannot create the upload directory: {e}")))?;
+    let root = std::fs::canonicalize(dir)
+        .map_err(|e| UploadError::Io(format!("cannot resolve the upload directory: {e}")))?;
+    let real_parent = std::fs::canonicalize(parent)
+        .map_err(|e| UploadError::Io(format!("cannot resolve the upload directory: {e}")))?;
+    if !real_parent.starts_with(&root) {
+        return Err(UploadError::Io(format!(
+            "the upload path for {name:?} escapes the upload directory"
+        )));
     }
     let tmp = target.with_file_name(tmp_name());
     std::fs::write(&tmp, bytes)
         .map_err(|e| UploadError::Io(format!("cannot write the upload: {e}")))?;
-    if std::fs::rename(&tmp, &target).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(UploadError::Io(
-            "cannot move the upload into place".to_string(),
-        ));
+    if overwrite {
+        if std::fs::rename(&tmp, &target).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(UploadError::Io(
+                "cannot move the upload into place".to_string(),
+            ));
+        }
+        return Ok(());
     }
-    Ok(())
+    match std::fs::hard_link(&tmp, &target) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(UploadError::AlreadyExists)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(UploadError::Io(format!(
+                "cannot move the upload into place: {e}"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +477,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_put_new_creates_exactly_once() {
+        let dir = temp_dir("local-new");
+        let store = UploadStore::local(dir.clone(), 1024, false);
+        store.put_new("heroes/cat.jpg", b"first").await.unwrap();
+        // The conditional create refuses the second writer
+        // and leaves the winner's bytes untouched: the
+        // check-then-write race is closed (audit R2-21).
+        let err = store.put_new("heroes/cat.jpg", b"second").await;
+        assert!(matches!(err, Err(UploadError::AlreadyExists)), "{err:?}");
+        assert_eq!(std::fs::read(dir.join("heroes/cat.jpg")).unwrap(), b"first");
+        // No temp files are left behind by either attempt.
+        let names: Vec<String> = std::fs::read_dir(dir.join("heroes"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, ["cat.jpg"]);
+        // The unconditional write still replaces.
+        store.put("heroes/cat.jpg", b"replaced").await.unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("heroes/cat.jpg")).unwrap(),
+            b"replaced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_writes_refuse_a_symlinked_escape() {
+        // A directory component inside the upload tree is
+        // a symlink to a directory outside it: a write for
+        // a name under it must be refused, and nothing may
+        // land outside (audit R2-25).
+        let dir = temp_dir("local-escape");
+        let outside = temp_dir("local-outside");
+        std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap();
+        let store = UploadStore::local(dir.clone(), 1024, true);
+        let err = store.put("linked/evil.jpg", b"pixels").await;
+        assert!(matches!(err, Err(UploadError::Io(_))), "{err:?}");
+        assert!(!outside.join("evil.jpg").exists());
+        let err = store.put_new("linked/evil.jpg", b"pixels").await;
+        assert!(matches!(err, Err(UploadError::Io(_))), "{err:?}");
+        assert!(!outside.join("evil.jpg").exists());
+        // A name that stays inside still writes.
+        store.put("plain/ok.jpg", b"pixels").await.unwrap();
+        assert!(dir.join("plain/ok.jpg").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn names_are_bound_to_the_validated_media() {
+        use crate::engine::UploadMedia::*;
+        // Matching spellings, case-insensitively, including
+        // the multi-spelling kinds.
+        for (name, media) in [
+            ("cat.jpg", Jpeg),
+            ("cat.JPEG", Jpeg),
+            ("cat.png", Png),
+            ("a/b/icon.svg", Svg),
+            ("photo.heic", Heic),
+            ("photo.heif", Heic),
+            ("scan.tiff", Tiff),
+            ("scan.tif", Tiff),
+            ("anim.webp", WebP),
+        ] {
+            assert!(check_upload_media(name, media).is_ok(), "{name}");
+        }
+        // Mismatches are refused, including the active
+        // content spellings the audit names.
+        for (name, media) in [
+            ("promo.html", Png),
+            ("icon.svg", Png),
+            ("photo.png", Jpeg),
+            ("photo.jpg", Svg),
+            ("page.xml", Gif),
+            ("pic.bmp", Png),
+        ] {
+            assert!(check_upload_media(name, media).is_err(), "{name}");
+        }
+        // No extension, nothing to bind; unlisted media
+        // kinds are unbound.
+        assert!(check_upload_media("cat", Png).is_ok());
+        assert!(check_upload_media("cat.", Png).is_ok());
+        assert!(check_upload_media("odd.html", Other).is_ok());
+    }
+
+    #[tokio::test]
     async fn s3_store_round_trips_through_the_fake() {
         let fake = crate::s3store::test_support::start_fake().await;
         let store = UploadStore::s3(
@@ -375,6 +588,52 @@ mod tests {
         assert_eq!(
             objects.get("orig/heroes/cat.jpg").map(Vec::as_slice),
             Some(b"pixels".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_put_new_creates_exactly_once_and_exists_is_a_head() {
+        let fake = crate::s3store::test_support::start_fake().await;
+        let store = UploadStore::s3(
+            "uploads".to_string(),
+            String::new(),
+            Some(fake.endpoint.clone()),
+            "us-east-1".to_string(),
+            None,
+            1024,
+            false,
+        );
+        assert!(!store.exists("heroes/cat.jpg").await);
+        store.put_new("heroes/cat.jpg", b"first").await.unwrap();
+        assert!(store.exists("heroes/cat.jpg").await);
+        // The conditional create refuses the second writer
+        // atomically; the winner's bytes are untouched.
+        let err = store.put_new("heroes/cat.jpg", b"second").await;
+        assert!(matches!(err, Err(UploadError::AlreadyExists)), "{err:?}");
+        {
+            let objects = fake.objects.lock().unwrap();
+            assert_eq!(
+                objects.get("heroes/cat.jpg").map(Vec::as_slice),
+                Some(b"first".as_slice())
+            );
+        }
+        // Existence was answered with HEADs and the writes
+        // were conditional PUTs: no GET ever downloaded the
+        // existing object (audits R2-21, R2-23).
+        let requests = fake.requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|r| r == "HEAD heroes/cat.jpg"),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r == "PUT heroes/cat.jpg if-none-match"),
+            "{requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.starts_with("GET ")),
+            "{requests:?}"
         );
     }
 }

@@ -48,7 +48,10 @@ const group = purgeGroupSignature("your-secret", "thumb");
 
 // Upload signatures for the server's PUT /upload/<signature>/<name>
 // endpoint live in a third domain, under their own derived subkey.
+// Pass an expiry (unix seconds) for a token that stops working
+// then; its path is /upload/<signature>/exp:<expiry>/<name>.
 const upload = uploadSignature("your-secret", "heroes/photo.jpg");
+const expiring = uploadSignature("your-secret", "heroes/photo.jpg", 1893456000);
 ```
 
 Pass `null` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode.

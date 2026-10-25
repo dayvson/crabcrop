@@ -57,6 +57,14 @@ signature for PUT /upload/<signature>/<name> = lowercase_hex( HMAC_SHA256( subke
 
 `name` is the object name exactly as presented after the signature segment (it may contain `/`-separated segments). Domain separation is the point, as with purges: an image signature or a purge signature can never be replayed as an upload signature, and an upload signature authorizes nothing else. Uploads never honor `unsafe`. Signature segments accept the same `<key-id>:` prefix and routing as purge segments. Client libraries expose this as an `upload_signature` / `uploadSignature` helper so the signed string is never assembled by hand.
 
+An upload signature may carry an expiry, the grammar's `exp:` segment in its upload spelling (issue #192):
+
+```text
+signature for PUT /upload/<signature>/exp:<unix-seconds>/<name> = lowercase_hex( HMAC_SHA256( subkey, "exp:<unix-seconds>/" + name ) )
+```
+
+The expiry is part of the signed string, so it can neither be stripped (the remainder no longer matches) nor extended (ditto), and the name stays bound exactly as in the plain form. The server refuses the upload with `403` once the current second reaches the expiry, the same comparison image URLs use. A leading remainder segment that opens with `exp:` but does not parse is a grammar error (`invalid_expiry`), never a name; upload names cannot contain `:` in any case. Delegated upload tokens should always be minted in the expiring form: a plain token authorizes its name until the secret rotates.
+
 ## Building URLs
 
 A builder assembles, in order:

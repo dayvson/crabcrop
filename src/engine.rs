@@ -104,6 +104,81 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
         .map_err(|e| EngineError::Decode(e.to_string()))
 }
 
+/// The media kind an upload validated as (issue #192):
+/// what the endpoint binds the object name's extension
+/// against, so a validated image cannot be stored under
+/// a name that presents it as something else. `Other` is
+/// a format the generic decoder accepts but the binding
+/// table does not enumerate (the PNM/TGA/QOI long tail);
+/// those carry no extension binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadMedia {
+    Svg,
+    Heic,
+    Jpeg,
+    Png,
+    Gif,
+    WebP,
+    Avif,
+    Jxl,
+    Bmp,
+    Tiff,
+    Ico,
+    Other,
+}
+
+impl UploadMedia {
+    /// The name extensions this media kind may be stored
+    /// under (lowercase, no dot), or `None` when the kind
+    /// carries no binding.
+    pub(crate) fn allowed_extensions(self) -> Option<&'static [&'static str]> {
+        match self {
+            UploadMedia::Svg => Some(&["svg"]),
+            UploadMedia::Heic => Some(&["heic", "heif"]),
+            UploadMedia::Jpeg => Some(&["jpg", "jpeg"]),
+            UploadMedia::Png => Some(&["png"]),
+            UploadMedia::Gif => Some(&["gif"]),
+            UploadMedia::WebP => Some(&["webp"]),
+            UploadMedia::Avif => Some(&["avif"]),
+            UploadMedia::Jxl => Some(&["jxl"]),
+            UploadMedia::Bmp => Some(&["bmp"]),
+            UploadMedia::Tiff => Some(&["tif", "tiff"]),
+            UploadMedia::Ico => Some(&["ico"]),
+            UploadMedia::Other => None,
+        }
+    }
+
+    /// A short lowercase label for messages.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            UploadMedia::Svg => "svg",
+            UploadMedia::Heic => "heic",
+            UploadMedia::Jpeg => "jpeg",
+            UploadMedia::Png => "png",
+            UploadMedia::Gif => "gif",
+            UploadMedia::WebP => "webp",
+            UploadMedia::Avif => "avif",
+            UploadMedia::Jxl => "jpeg xl",
+            UploadMedia::Bmp => "bmp",
+            UploadMedia::Tiff => "tiff",
+            UploadMedia::Ico => "ico",
+            UploadMedia::Other => "image",
+        }
+    }
+}
+
+/// An upload that passed validation (issue #192): the
+/// bytes to store and the media kind they validated as.
+/// For SVG the stored bytes are the sanitized document,
+/// never the caller's original (audit R2-22); for every
+/// other kind they are the caller's bytes verbatim, an
+/// original being the point of the endpoint.
+#[derive(Debug)]
+pub(crate) struct PreparedUpload {
+    pub stored: Vec<u8>,
+    pub media: UploadMedia,
+}
+
 /// Validate that `bytes` are an image this server can
 /// actually serve (issue #168): the upload endpoint's
 /// acceptance test. This walks the same decode branches
@@ -115,31 +190,78 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
 /// bytes a transform request can process, and bytes the
 /// pipeline would reject are rejected here, before they
 /// are stored. The decoded pixels are discarded; only
-/// decodability is the question.
+/// decodability is the question. The upload handler
+/// calls [`prepare_upload`] (it also needs the prepared
+/// form); this predicate stays as the acceptance test's
+/// own spelling.
+#[allow(dead_code)]
 pub(crate) fn validate_source_image(bytes: &[u8]) -> Result<(), EngineError> {
+    prepare_upload(bytes).map(|_| ())
+}
+
+/// [`validate_source_image`] that also reports what to
+/// store and what the bytes are (issue #192): the upload
+/// handler stores the prepared bytes and binds the
+/// object name's extension to the media kind.
+pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError> {
     ensure_jxl_decoder();
     if crate::svg::is_svg(bytes) {
         crate::svg::prepare(bytes).map_err(EngineError::Decode)?;
-        return Ok(());
+        let stored = crate::svg::sanitized_bytes(bytes).map_err(EngineError::Decode)?;
+        return Ok(PreparedUpload {
+            stored,
+            media: UploadMedia::Svg,
+        });
     }
     if is_heic(bytes) {
         crate::heic::decode_heic(bytes)?;
-        return Ok(());
+        return Ok(PreparedUpload {
+            stored: bytes.to_vec(),
+            media: UploadMedia::Heic,
+        });
     }
     let detected = detect_format(bytes);
     if detected == ImageFormat::Gif {
         decode_gif_frames(bytes)?;
-        return Ok(());
+        return Ok(PreparedUpload {
+            stored: bytes.to_vec(),
+            media: UploadMedia::Gif,
+        });
     }
     if detected == ImageFormat::WebP && webp_animation_params(bytes).is_some() {
         decode_webp_frames(bytes)?;
-        return Ok(());
+        return Ok(PreparedUpload {
+            stored: bytes.to_vec(),
+            media: UploadMedia::WebP,
+        });
     }
     if detected == ImageFormat::Jxl {
         check_jxl_dimensions(bytes)?;
     }
     decode_image(bytes)?;
-    Ok(())
+    // The generic decode accepted the bytes; name what it
+    // accepted. The guess mirrors the decoder's own, with
+    // JPEG XL (which the image crate does not know) taken
+    // from the branch detection above.
+    let media = if detected == ImageFormat::Jxl {
+        UploadMedia::Jxl
+    } else {
+        match image::guess_format(bytes) {
+            Ok(image::ImageFormat::Jpeg) => UploadMedia::Jpeg,
+            Ok(image::ImageFormat::Png) => UploadMedia::Png,
+            Ok(image::ImageFormat::Gif) => UploadMedia::Gif,
+            Ok(image::ImageFormat::WebP) => UploadMedia::WebP,
+            Ok(image::ImageFormat::Avif) => UploadMedia::Avif,
+            Ok(image::ImageFormat::Bmp) => UploadMedia::Bmp,
+            Ok(image::ImageFormat::Tiff) => UploadMedia::Tiff,
+            Ok(image::ImageFormat::Ico) => UploadMedia::Ico,
+            _ => UploadMedia::Other,
+        }
+    };
+    Ok(PreparedUpload {
+        stored: bytes.to_vec(),
+        media,
+    })
 }
 
 pub(crate) fn check_decoded_dimensions(width: u64, height: u64) -> Result<(), EngineError> {
@@ -2601,6 +2723,30 @@ mod tests {
         // any other SVG source would.
         let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><script>alert(1)</script><rect width="4" height="4"/></svg>"#;
         assert!(validate_source_image(hostile).is_ok());
+    }
+
+    #[test]
+    fn prepare_upload_reports_media_and_stores_the_sanitized_svg() {
+        // Raster uploads store the caller's bytes verbatim
+        // and report their kind.
+        let png = solid_png(20, 10, [1, 2, 3]);
+        let prepared = prepare_upload(&png).unwrap();
+        assert_eq!(prepared.media, UploadMedia::Png);
+        assert_eq!(prepared.stored, png);
+        // An SVG upload validates, and what would be
+        // stored is the sanitized document: the script is
+        // gone, the drawing survives (audit R2-22).
+        let hostile = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><script>alert(1)</script><rect width="4" height="4"/></svg>"#;
+        let prepared = prepare_upload(hostile).unwrap();
+        assert_eq!(prepared.media, UploadMedia::Svg);
+        let stored = String::from_utf8(prepared.stored).unwrap();
+        assert!(!stored.contains("script"), "{stored}");
+        assert!(stored.contains("<rect"), "{stored}");
+        // The stored form is itself a valid upload.
+        assert_eq!(
+            prepare_upload(stored.as_bytes()).unwrap().media,
+            UploadMedia::Svg
+        );
     }
 
     #[test]

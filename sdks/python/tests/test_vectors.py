@@ -76,6 +76,23 @@ class TestUploadSignatures(unittest.TestCase):
             purge_signature("test-secret", "heroes/cat.jpg"),
         )
 
+    def test_expiring_form_vector(self):
+        # The expiring form signs ``exp:<expires>/<name>``:
+        # the same pinned value the Rust crate asserts,
+        # bound to both the expiry and the name.
+        self.assertEqual(
+            upload_signature("test-secret", "heroes/cat.jpg", 1893456000),
+            "391061e9bd262811f9bac647b5ff535f987e2478394675407f895823f45e59d2",
+        )
+        self.assertNotEqual(
+            upload_signature("test-secret", "heroes/cat.jpg", 1893456000),
+            upload_signature("test-secret", "heroes/cat.jpg"),
+        )
+        self.assertNotEqual(
+            upload_signature("test-secret", "heroes/cat.jpg", 1893456000),
+            upload_signature("test-secret", "heroes/dog.jpg", 1893456000),
+        )
+
 
 class TestBuilders(unittest.TestCase):
     def test_spec_worked_example(self):

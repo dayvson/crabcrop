@@ -236,6 +236,21 @@ test("upload signatures match the published vectors", () => {
     uploadSignature("test-secret", "heroes/cat.jpg"),
     purgeSignature("test-secret", "heroes/cat.jpg"),
   );
+  // The expiring form signs `exp:<expires>/<name>`: the
+  // same pinned value the Rust crate asserts, bound to
+  // both the expiry and the name.
+  assert.equal(
+    uploadSignature("test-secret", "heroes/cat.jpg", 1893456000),
+    "391061e9bd262811f9bac647b5ff535f987e2478394675407f895823f45e59d2",
+  );
+  assert.notEqual(
+    uploadSignature("test-secret", "heroes/cat.jpg", 1893456000),
+    uploadSignature("test-secret", "heroes/cat.jpg"),
+  );
+  assert.notEqual(
+    uploadSignature("test-secret", "heroes/cat.jpg", 1893456000),
+    uploadSignature("test-secret", "heroes/dog.jpg", 1893456000),
+  );
 });
 
 test("signWithKeyId stamps the segment and buildURL uses it", () => {
