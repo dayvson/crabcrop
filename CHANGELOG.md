@@ -4,6 +4,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-25
+
 ### Added
 
 - Face-safe smart crops (issue #199). When a face model is configured, smart alignment no longer places its window on the detected faces' area-weighted centroid alone: window placement treats the face boxes as keep-whole constraints. A position keeping every detected face fully inside wins, at the point nearest the focal-point window, so behavior changes only when the focal window would have cut a face; when no position keeps every face, the window keeps the most face area whole (larger faces win, and a face counts only kept whole, never partially); a face larger than the window on the cropped axis stays centered, as before. Placement is deterministic, with fixed tie-breaking, and runs off the same single detection pass as before. With no face model configured, no faces found, or a detection failure, the window is exactly the saliency window of before (regression-pinned in tests). Literal alignments, caller focal points and rectangles, and `crop-rect` are unchanged, and there is no new operation or grammar. The crop decision record behind `debug:focal` now counts the faces detected and the faces the final window keeps whole, so the guarantee is inspectable.

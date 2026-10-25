@@ -21,7 +21,7 @@
     "test": "node --test"
   },
   "type": "module",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "devDependencies": {
     "@types/node": "^26.6.5",
     "typescript": "^5.9.3"
