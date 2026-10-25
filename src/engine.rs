@@ -1053,8 +1053,8 @@ impl Engine {
                 && attempts < max_quality_attempts(format)
                 && encode_budget > 0
             {
-                let steps_remaining = (max_quality_attempts(format) - attempts)
-                    .min(encode_budget as u32);
+                let steps_remaining =
+                    (max_quality_attempts(format) - attempts).min(encode_budget as u32);
                 current = next_quality(current, steps_remaining);
                 bytes = encode(
                     &enc_src,
@@ -1633,12 +1633,7 @@ fn apply_operations(
         match op {
             Operation::DebugFocal => debug_armed = true,
             Operation::Size(size) => {
-                img = apply_size(
-                    img,
-                    size,
-                    cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
-                    dpr,
-                )?
+                img = apply_size(img, size, cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)), dpr)?
             }
             Operation::FitIn { size, adaptive } => {
                 img = apply_fit_in(img, size, *adaptive, cap, dpr)?
