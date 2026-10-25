@@ -14,9 +14,9 @@
 # title/body based on your changelogs.
 
 # crabcrop note (issue #193): this mirror carries hardening
-# that must be landed at .github/workflows/release.yml
-# through the GitHub web UI (the automation credential
-# cannot push workflow files): least-privilege per-job
+# landed at .github/workflows/release.yml through the
+# GitHub web UI as part of the v0.1.1 cut (the automation
+# credential cannot push workflow files): least-privilege per-job
 # permissions, SHA-pinned actions, the release tag passed
 # to run steps only through environment variables,
 # checksum-pinned cargo-dist and rustup installs, and

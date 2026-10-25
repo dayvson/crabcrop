@@ -7,10 +7,11 @@
 # non-blocking (continue-on-error) while the baseline earns
 # trust; remove that line to make regressions fail the run.
 #
-# Issue #193 hardening, STAGED here and pending the same
-# web-UI landing at .github/workflows/perf.yml:
-# least-privilege permissions, the checkout action pinned
-# by SHA, and the release build run with --locked.
+# Issue #193 hardening, landed at
+# .github/workflows/perf.yml through the same web-UI
+# route as part of the v0.1.1 cut: least-privilege
+# permissions, the checkout action pinned by SHA, and
+# the release build run with --locked.
 name: Perf gate
 
 on:
