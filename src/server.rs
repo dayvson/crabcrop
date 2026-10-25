@@ -455,6 +455,50 @@ fn upload_log(name: &str, outcome: &str) {
     println!("{{\"event\":\"upload\",\"target\":\"{hash}\",\"outcome\":\"{outcome}\"}}");
 }
 
+/// The outcome of running upload validation under the
+/// process gate.
+enum UploadValidation {
+    /// The bytes decode as an image this server can serve.
+    Valid,
+    /// The bytes do not decode; the engine's error, kept
+    /// for the server log.
+    Invalid(EngineError),
+    /// The process gate stayed saturated past its wait:
+    /// the upload is shed with a 503, like a transform.
+    Busy,
+    /// Validation panicked on its blocking thread.
+    Panicked,
+}
+
+/// Validate uploaded bytes under the process gate on a
+/// blocking thread (issue #187). Validation is a real
+/// decode (animated formats frame by frame, HEIC through
+/// oxideav), so it is budgeted exactly like transform
+/// work: without the gate, a burst of signed uploads
+/// would multiply decode load past the concurrency bound
+/// the rest of the server runs under (audit R2-06).
+async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValidation {
+    let permit = match tokio::time::timeout(
+        PROCESS_GATE_WAIT,
+        state.process_gate.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return UploadValidation::Busy,
+    };
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::engine::validate_source_image(&bytes)
+    })
+    .await
+    {
+        Ok(Ok(())) => UploadValidation::Valid,
+        Ok(Err(e)) => UploadValidation::Invalid(e),
+        Err(_) => UploadValidation::Panicked,
+    }
+}
+
 /// `PUT /upload/<signature>/<name>`: store one original
 /// (issue #168). The route is registered only when a
 /// destination is configured, so `upload` here is always
@@ -468,9 +512,11 @@ fn upload_log(name: &str, outcome: &str) {
 /// replayed here, and `unsafe` is never honored. The
 /// checks run cheapest first: signature, name shape, body
 /// size (read with the cap as a hard bound, so an
-/// oversize body is never fully buffered), image decode
-/// through the pipeline's own validation, and the
-/// overwrite policy. On success the body of the response
+/// oversize body is never fully buffered), the overwrite
+/// policy (so a refused duplicate never pays a decode),
+/// and image decode through the pipeline's own
+/// validation, run under the process gate like any
+/// transform. On success the body of the response
 /// is the exact source reference to embed in transform
 /// URLs: `201` for a new object, `200` when an allowed
 /// overwrite replaced one.
@@ -530,32 +576,11 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         )
             .into_response();
     }
-    // The bytes must decode as an image this server can
-    // serve, through the pipeline's own decode branches:
-    // anything else is refused before it is stored, so
-    // the destination never holds an unservable object.
-    let check = {
-        let bytes = bytes.clone();
-        tokio::task::spawn_blocking(move || crate::engine::validate_source_image(&bytes)).await
-    };
-    match check {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            eprintln!("upload rejected: {e}");
-            state.metrics.record_upload();
-            upload_log(name, "rejected:not-an-image");
-            return (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "upload is not an image this server can decode",
-            )
-                .into_response();
-        }
-        Err(_) => {
-            state.metrics.record_upload();
-            upload_log(name, "rejected:validation-failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "image validation failed").into_response();
-        }
-    }
+    // The existence check runs before validation, so an
+    // upload that will be refused as a duplicate never
+    // pays a full decode first (audit R2-06). The value
+    // is reused after the store to pick 200 vs 201 and
+    // the log outcome.
     let existed = upload.exists(name).await;
     if existed && !upload.allow_overwrite {
         state.metrics.record_upload();
@@ -565,6 +590,35 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             "an object with this name already exists",
         )
             .into_response();
+    }
+    // The bytes must decode as an image this server can
+    // serve, through the pipeline's own decode branches:
+    // anything else is refused before it is stored, so
+    // the destination never holds an unservable object.
+    // The decode runs under the process gate, like every
+    // transform (see `run_upload_validation`).
+    match run_upload_validation(&state, bytes.to_vec()).await {
+        UploadValidation::Valid => {}
+        UploadValidation::Invalid(e) => {
+            eprintln!("upload rejected: {e}");
+            state.metrics.record_upload();
+            upload_log(name, "rejected:not-an-image");
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "upload is not an image this server can decode",
+            )
+                .into_response();
+        }
+        UploadValidation::Busy => {
+            state.metrics.record_upload();
+            upload_log(name, "rejected:busy");
+            return busy_response("server busy: too many images processing at once", 1);
+        }
+        UploadValidation::Panicked => {
+            state.metrics.record_upload();
+            upload_log(name, "rejected:validation-failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "image validation failed").into_response();
+        }
     }
     match upload.put(name, &bytes).await {
         Ok(()) => {
@@ -5199,6 +5253,21 @@ mod tests {
         max_bytes: u64,
         allow_overwrite: bool,
     ) -> String {
+        spawn_app_with_upload_gate(
+            dir,
+            max_bytes,
+            allow_overwrite,
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        )
+        .await
+    }
+
+    async fn spawn_app_with_upload_gate(
+        dir: &std::path::Path,
+        max_bytes: u64,
+        allow_overwrite: bool,
+        process_gate: Arc<tokio::sync::Semaphore>,
+    ) -> String {
         std::fs::create_dir_all(dir).unwrap();
         let dir = std::fs::canonicalize(dir).unwrap();
         let state = AppState {
@@ -5231,7 +5300,7 @@ mod tests {
                 allow_overwrite,
             ))),
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -5432,6 +5501,105 @@ mod tests {
         assert_eq!(std::fs::read(dir2.join(name)).unwrap(), other);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn upload_conflict_is_answered_before_validation() {
+        // The existence check runs before the validation
+        // decode (issue #187): a duplicate upload whose
+        // body would fail validation is still answered
+        // 409, not 415, and the stored object is
+        // untouched.
+        let dir = upload_dir("exists-first");
+        let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+        let name = "cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let url = format!("{base}/upload/{sig}/{name}");
+        let resp = client().put(&url).body(test_png()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = client()
+            .put(&url)
+            .body(b"this is not an image".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), test_png());
+        // With overwrite allowed, the same invalid body
+        // still reaches validation and is refused there,
+        // and the stored object is still untouched.
+        let dir2 = upload_dir("exists-first-ok");
+        let base = spawn_app_with_upload(&dir2, 10 * 1024 * 1024, true).await;
+        let url = format!("{base}/upload/{sig}/{name}");
+        let resp = client().put(&url).body(test_png()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = client()
+            .put(&url)
+            .body(b"this is not an image".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(std::fs::read(dir2.join(name)).unwrap(), test_png());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn upload_validation_waits_behind_the_process_gate() {
+        // Validation decodes run under the process gate
+        // (issue #187): while the test holds the only
+        // permit, a valid upload cannot complete; once
+        // the permit is released it stores normally. The
+        // `processing_gate_bounds_concurrency` pattern, at
+        // the HTTP seam.
+        let dir = upload_dir("gated");
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let base = spawn_app_with_upload_gate(&dir, 10 * 1024 * 1024, false, gate.clone()).await;
+        let name = "cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let held = gate.acquire_owned().await.unwrap();
+        let pending = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(test_png())
+            .send();
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut pending)
+                .await
+                .is_err(),
+            "the upload must wait while the only process permit is held"
+        );
+        assert!(!dir.join(name).exists());
+        drop(held);
+        let resp = pending.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), test_png());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn upload_validation_is_shed_when_the_gate_stays_saturated() {
+        // A gate that never drains sheds the upload with
+        // the gate's own 503 and Retry-After once the
+        // wait elapses, instead of decoding ungated, and
+        // nothing is stored (issue #187).
+        let dir = upload_dir("shed");
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let base = spawn_app_with_upload_gate(&dir, 10 * 1024 * 1024, false, gate.clone()).await;
+        let name = "cat.png";
+        let sig = crate::url::upload_signature(SECRET, name);
+        let _held = gate.acquire_owned().await.unwrap();
+        let resp = client()
+            .put(format!("{base}/upload/{sig}/{name}"))
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "1");
+        assert!(!dir.join(name).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
