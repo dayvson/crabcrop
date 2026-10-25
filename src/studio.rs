@@ -18,6 +18,25 @@ use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage, imageops::FilterType
 
 use crate::url::{StudioBg, StudioShadow, StudioSpec};
 
+/// Whether studio stage timing is printed (issue #220): on
+/// when `CRABCROP_STUDIO_TIMING` is set to any value.
+/// Diagnostics go to stderr, never to the response path,
+/// and the flag is read once per process.
+pub(crate) fn timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRABCROP_STUDIO_TIMING").is_some())
+}
+
+/// Print one stage's elapsed time when timing is on.
+pub(crate) fn timing_mark(stage: &str, start: std::time::Instant) {
+    if timing_on() {
+        eprintln!(
+            "[studio-timing] {stage}: {:.1} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 /// The mask value at or above which a pixel counts as
 /// subject: the geometry (bounding box, subject presence)
 /// is settled on this threshold, while compositing uses the
@@ -316,6 +335,7 @@ pub fn composite(
 
     // Fit the mask to the image, exactly as `apply_mask`
     // does: the provider answers at its own resolution.
+    let t_stage = std::time::Instant::now();
     let fitted;
     let mask = if mask.width() == w && mask.height() == h {
         mask
@@ -325,11 +345,14 @@ pub fn composite(
     };
 
     let subject = mask_bbox(mask, SUBJECT_THRESHOLD);
+    timing_mark("mask_prep", t_stage);
     let (piece, subject_in_piece, shadow_ok) = match subject {
         Some(bbox) => {
             steps.push("defringe");
+            let t_stage = std::time::Instant::now();
             let masked = crate::ai::apply_mask(img, mask);
             let clean = defringe(&masked, mask).to_rgba8();
+            timing_mark("defringe", t_stage);
             // Crop to the covered region: nothing outside
             // it contributes pixels, and the crop keeps the
             // pad scaling cheap. The subject box is
@@ -353,7 +376,9 @@ pub fn composite(
     };
     steps.push("backdrop");
 
+    let t_stage = std::time::Instant::now();
     let (scaled, dx, dy) = place(&piece, subject_in_piece, (w, h), spec.pad);
+    timing_mark("place", t_stage);
     let mut canvas = match resolved.color {
         Some(c) => RgbaImage::from_pixel(w, h, Rgba([c[0], c[1], c[2], 255])),
         None => RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0])),
@@ -362,14 +387,18 @@ pub fn composite(
     // backdrop: over transparency there is nothing for it
     // to darken.
     if shadow_ok && resolved.color.is_some() {
+        let t_stage = std::time::Instant::now();
         let alpha = GrayImage::from_fn(scaled.width(), scaled.height(), |x, y| {
             Luma([scaled.get_pixel(x, y)[3]])
         });
         let layer = shadow_layer(&alpha, (dx, dy), (w, h), spec.shadow);
         image::imageops::overlay(&mut canvas, &layer, 0, 0);
+        timing_mark("shadow", t_stage);
         steps.push("shadow");
     }
+    let t_stage = std::time::Instant::now();
     image::imageops::overlay(&mut canvas, &scaled, dx, dy);
+    timing_mark("overlay", t_stage);
     steps.push("pad");
 
     StudioOutcome {

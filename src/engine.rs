@@ -1014,6 +1014,7 @@ impl Engine {
             ssim = scored.score;
             scored.bytes
         } else {
+            let t_timing = std::time::Instant::now();
             let bytes = encode(
                 &enc_src,
                 format,
@@ -1022,6 +1023,7 @@ impl Engine {
                 ctx.avif_speed,
                 ctx.jxl_speed,
             )?;
+            crate::studio::timing_mark("encode", t_timing);
             encode_budget -= 1;
             bytes
         };
@@ -1871,8 +1873,10 @@ fn apply_operations(
                                         .to_string(),
                                 )
                             })?;
+                            let t_timing = std::time::Instant::now();
                             let mask = provider.mask(&img).map_err(EngineError::Inference)?;
                             let confidence = provider.confidence(&img, &mask);
+                            crate::studio::timing_mark("inference", t_timing);
                             let outcome = crate::studio::composite(
                                 &img,
                                 &mask,
