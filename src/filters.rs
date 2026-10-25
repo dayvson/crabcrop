@@ -91,15 +91,17 @@ pub fn apply_filters_filled(
     let mut options = EncodeOptions::default();
     for filter in filters {
         match filter {
-            // Normalize to RGB8: encoders universally accept it, and the
-            // gray values are preserved (r == g == b).
-            Filter::Grayscale => img = DynamicImage::ImageRgb8(img.grayscale().to_rgb8()),
+            Filter::Grayscale => {
+                img = map_rgb(&img, |r, g, b| {
+                    let y = luma(r, g, b).round().clamp(0.0, 255.0) as u8;
+                    [y, y, y]
+                });
+            }
             Filter::Invert => img.invert(),
             Filter::Blur(sigma) => img = img.blur(blur_sigma(*sigma)),
             Filter::Brighten(amount) => img = img.brighten(*amount),
             Filter::Contrast(amount) => {
-                let rgb = image::imageops::contrast(&img.into_rgb8(), *amount);
-                img = DynamicImage::ImageRgb8(rgb);
+                img = map_rgb_image(&img, |rgb| image::imageops::contrast(rgb, *amount));
             }
             Filter::HueRotate(degrees) => img = img.huerotate(*degrees),
             Filter::Sharpen(amount) => {
@@ -107,20 +109,19 @@ pub fn apply_filters_filled(
                 // boosted, the cross neighbors subtracted.
                 let a = *amount;
                 let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
-                let rgb = image::imageops::filter3x3(&img.into_rgb8(), &kernel);
-                img = DynamicImage::ImageRgb8(rgb);
+                img = map_rgb_image(&img, |rgb| image::imageops::filter3x3(rgb, &kernel));
             }
             Filter::Saturation(amount) => {
-                img = DynamicImage::ImageRgb8(saturate(&img.into_rgb8(), *amount));
+                img = map_rgb_image(&img, |rgb| saturate(rgb, *amount));
             }
             Filter::Rgb(r, g, b) => {
-                let mut rgb = img.into_rgb8();
-                for p in rgb.pixels_mut() {
-                    p[0] = (p[0] as i32 + r).clamp(0, 255) as u8;
-                    p[1] = (p[1] as i32 + g).clamp(0, 255) as u8;
-                    p[2] = (p[2] as i32 + b).clamp(0, 255) as u8;
-                }
-                img = DynamicImage::ImageRgb8(rgb);
+                img = map_rgb(&img, |pr, pg, pb| {
+                    [
+                        (pr as i32 + r).clamp(0, 255) as u8,
+                        (pg as i32 + g).clamp(0, 255) as u8,
+                        (pb as i32 + b).clamp(0, 255) as u8,
+                    ]
+                });
             }
             Filter::Curve(channel, points) => {
                 img = tone_curve(&img, *channel, points);
@@ -132,7 +133,7 @@ pub fn apply_filters_filled(
                 img = add_noise(&img, *amount);
             }
             Filter::Equalize => {
-                img = DynamicImage::ImageRgb8(equalize(&img.into_rgb8()));
+                img = map_rgb_image(&img, equalize);
             }
             Filter::Rotate(degrees) => {
                 let normalized = ((degrees % 360.0) + 360.0) % 360.0;
@@ -337,6 +338,24 @@ fn map_rgb(img: &DynamicImage, f: impl Fn(u8, u8, u8) -> [u8; 3]) -> DynamicImag
             p[2] = b;
         }
         DynamicImage::ImageRgb8(rgb)
+    }
+}
+
+fn map_rgb_image(
+    img: &DynamicImage,
+    f: impl FnOnce(&image::RgbImage) -> image::RgbImage,
+) -> DynamicImage {
+    let mapped = f(&img.to_rgb8());
+    if img.color().has_alpha() {
+        let mut out = img.to_rgba8();
+        for (o, m) in out.pixels_mut().zip(mapped.pixels()) {
+            o[0] = m[0];
+            o[1] = m[1];
+            o[2] = m[2];
+        }
+        DynamicImage::ImageRgba8(out)
+    } else {
+        DynamicImage::ImageRgb8(mapped)
     }
 }
 
@@ -1957,6 +1976,53 @@ mod tests {
             assert_eq!(p[0], p[1]);
             assert_eq!(p[1], p[2]);
         }
+    }
+
+    fn rgba_mixed() -> DynamicImage {
+        let mut img = DynamicImage::new_rgba8(4, 4);
+        for (x, y, p) in img.as_mut_rgba8().unwrap().enumerate_pixels_mut() {
+            let a = if x == 0 && y == 0 { 0 } else { 200 };
+            *p = image::Rgba([180, 110, 50, a]);
+        }
+        img
+    }
+
+    #[test]
+    fn color_filters_preserve_alpha() {
+        let cases: [(&str, Filter); 6] = [
+            ("grayscale", Filter::Grayscale),
+            ("contrast", Filter::Contrast(2.0)),
+            ("sharpen", Filter::Sharpen(1.0)),
+            ("saturation", Filter::Saturation(0.5)),
+            ("rgb", Filter::Rgb(10, -10, 20)),
+            ("equalize", Filter::Equalize),
+        ];
+        for (name, filter) in cases {
+            let (out, _) = apply_filters(rgba_mixed(), std::slice::from_ref(&filter));
+            assert!(out.color().has_alpha(), "{name} dropped the alpha channel");
+            assert_eq!(
+                alpha_at(&out, 0, 0),
+                0,
+                "{name} changed a transparent pixel"
+            );
+            assert_eq!(alpha_at(&out, 3, 3), 200, "{name} changed an opaque pixel");
+        }
+    }
+
+    #[test]
+    fn grayscale_then_radius_keeps_alpha_and_gray() {
+        let mut img = DynamicImage::new_rgba8(20, 20);
+        for p in img.as_mut_rgba8().unwrap().pixels_mut() {
+            *p = image::Rgba([200, 120, 60, 255]);
+        }
+        let (out, _) = apply_filters(img, &[Filter::Grayscale, Filter::Radius([8, 8, 8, 8])]);
+        assert!(out.color().has_alpha());
+        assert_eq!(alpha_at(&out, 0, 0), 0);
+        let rgba = out.to_rgba8();
+        let c = *rgba.get_pixel(10, 10);
+        assert_eq!(c[3], 255);
+        assert_eq!(c[0], c[1]);
+        assert_eq!(c[1], c[2]);
     }
 
     #[test]
