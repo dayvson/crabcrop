@@ -4202,8 +4202,7 @@ mod tests {
     #[tokio::test]
     async fn preset_segment_without_presets_configured_is_unknown_preset() {
         let src = spawn_image_server().await;
-        let base =
-            spawn_app_with_presets(std::collections::HashMap::new(), false).await;
+        let base = spawn_app_with_presets(std::collections::HashMap::new(), false).await;
         let remainder = format!("preset:thumb/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
         let resp = client()
@@ -4213,8 +4212,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body: serde_json::Value =
-            serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert_eq!(body["error"]["code"], "unknown_preset");
         // Plain (non-preset) requests on the same server are
         // unaffected by the always-on expansion.
