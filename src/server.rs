@@ -494,17 +494,16 @@ async fn explain_handle(
             .into_response();
     }
     let groups = crate::url::preset_names(rest);
+    // Expansion always runs, even with no presets loaded:
+    // a `preset:` segment is a grammar error
+    // (`unknown_preset`) on every server, never source text.
     let expanded;
-    let rest = if state.presets.is_empty() && !state.only_presets {
-        rest
-    } else {
-        match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
-            Ok(text) => {
-                expanded = text;
-                &expanded
-            }
-            Err(e) => return parse_failure(&e, accept.as_deref()),
+    let rest = match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
+        Ok(text) => {
+            expanded = text;
+            &expanded
         }
+        Err(e) => return parse_failure(&e, accept.as_deref()),
     };
     let (ops, source_url, expiry, _) = match parse_operations_with_expiry(rest) {
         Ok(v) => v,
@@ -669,16 +668,12 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
     // A target that does not expand (a directly expanded
     // path, an unknown preset) falls back to itself.
     let expanded;
-    let target = if state.presets.is_empty() && !state.only_presets {
-        target
-    } else {
-        match crate::url::expand_presets(target, &state.presets, state.only_presets) {
-            Ok(text) => {
-                expanded = text;
-                &expanded
-            }
-            Err(_) => target,
+    let target = match crate::url::expand_presets(target, &state.presets, state.only_presets) {
+        Ok(text) => {
+            expanded = text;
+            &expanded
         }
+        Err(_) => target,
     };
     // Entries are keyed post-merge (issue #145): with
     // defaults configured, the purge target's key form is
@@ -1386,18 +1381,17 @@ async fn serve(
     // and before everything else: parsing, the cache key, and
     // the ops summary all see the expanded remainder, so
     // editing a preset produces fresh cache entries naturally.
+    // Expansion always runs, even with no presets loaded:
+    // a `preset:` segment is a grammar error
+    // (`unknown_preset`) on every server, never source text.
     let expanded;
-    let rest = if state.presets.is_empty() && !state.only_presets {
-        rest
-    } else {
-        match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
-            Ok(text) => {
-                expanded = text;
-                &expanded
-            }
-            Err(e) => {
-                return (parse_failure(&e, accept), record);
-            }
+    let rest = match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
+        Ok(text) => {
+            expanded = text;
+            &expanded
+        }
+        Err(e) => {
+            return (parse_failure(&e, accept), record);
         }
     };
     let (ops, source_url, expiry, max_age) = match parse_operations_with_expiry(rest) {
@@ -4198,6 +4192,34 @@ mod tests {
         let base = spawn_app_with_presets(preset_test_map(), false).await;
         let resp = get_signed(&base, &format!("preset:nope/{src}")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Issue #247: with NO presets configured, a `preset:`
+    /// segment used to skip expansion entirely and reach the
+    /// loader as the source (502 `source fetch failed`). Every
+    /// name is unknown to such a server, so the answer is the
+    /// same 400 `unknown_preset` a configured server gives.
+    #[tokio::test]
+    async fn preset_segment_without_presets_configured_is_unknown_preset() {
+        let src = spawn_image_server().await;
+        let base =
+            spawn_app_with_presets(std::collections::HashMap::new(), false).await;
+        let remainder = format!("preset:thumb/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "unknown_preset");
+        // Plain (non-preset) requests on the same server are
+        // unaffected by the always-on expansion.
+        let resp = get_signed(&base, &format!("30x20/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// An image server that counts how many times it was hit:
