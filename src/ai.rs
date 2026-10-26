@@ -391,6 +391,270 @@ impl UpscaleProvider for OnnxUpscaleProvider {
     }
 }
 
+/// The LaMa export's fixed input size: image and mask are
+/// both fed at this square resolution, whatever the crop
+/// window's shape (issue #176).
+pub const INPAINT_INPUT_SIZE: u32 = 512;
+
+/// A white-on-black mask of one rectangle, at the image's
+/// own resolution: the mask `remove_region` hands to the
+/// inpainting provider (white is the hole to fill).
+pub fn region_mask(width: u32, height: u32, x: u32, y: u32, w: u32, h: u32) -> GrayImage {
+    let mut mask = GrayImage::new(width, height);
+    for py in y..y.saturating_add(h).min(height) {
+        for px in x..x.saturating_add(w).min(width) {
+            mask.put_pixel(px, py, image::Luma([255]));
+        }
+    }
+    mask
+}
+
+/// The bounding box of the mask's nonzero pixels, as
+/// (x, y, w, h); `None` when the mask removes nothing.
+fn mask_bbox(mask: &GrayImage) -> Option<(u32, u32, u32, u32)> {
+    let (mut min_x, mut min_y) = (u32::MAX, u32::MAX);
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    for (x, y, p) in mask.enumerate_pixels() {
+        if p[0] > 0 {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if min_x == u32::MAX {
+        return None;
+    }
+    Some((min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+}
+
+/// The crop window an inpainting run works on: a square
+/// centered on the mask's bounding box, with a side of
+/// twice the box's larger axis so the model sees as much
+/// surrounding context as hole, clamped into the image (a
+/// window axis stops at the image edge, so an image
+/// smaller than the square on one axis makes the window
+/// non-square there; the resize to the model's square
+/// input absorbs the difference). Pure, so the geometry
+/// is testable without the runtime.
+fn inpaint_window(img_w: u32, img_h: u32, bbox: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    let (bx, by, bw, bh) = bbox;
+    let side = bw
+        .max(bh)
+        .saturating_mul(2)
+        .min(img_w.max(img_h))
+        .max(bw.max(bh));
+    let (w, h) = (side.min(img_w), side.min(img_h));
+    let (cx, cy) = (bx + bw / 2, by + bh / 2);
+    let x = cx.saturating_sub(w / 2).min(img_w - w);
+    let y = cy.saturating_sub(h / 2).min(img_h - h);
+    (x, y, w, h)
+}
+
+/// Composite a filled crop window back into the image:
+/// pixels under the mask (at the image's own resolution)
+/// come from the filled window, every other pixel is the
+/// original, bit for bit. The model's output is a
+/// regeneration of the whole window, plausible everywhere
+/// but faithful nowhere, so only the hole may be taken
+/// from it. The source's alpha, when it has one, is kept:
+/// the model sees RGB only, and inpainting fills color,
+/// not transparency.
+pub fn composite_inpaint(
+    img: &DynamicImage,
+    mask: &GrayImage,
+    window: (u32, u32, u32, u32),
+    filled: &image::RgbImage,
+) -> DynamicImage {
+    let (wx, wy, ww, wh) = window;
+    let mut rgb = img.to_rgb8();
+    let fitted;
+    let filled = if filled.width() == ww && filled.height() == wh {
+        filled
+    } else {
+        fitted = image::imageops::resize(filled, ww, wh, FilterType::Triangle);
+        &fitted
+    };
+    for ly in 0..wh {
+        for lx in 0..ww {
+            let (gx, gy) = (wx + lx, wy + ly);
+            if mask.get_pixel(gx, gy)[0] > 0 {
+                *rgb.get_pixel_mut(gx, gy) = *filled.get_pixel(lx, ly);
+            }
+        }
+    }
+    let out = DynamicImage::ImageRgb8(rgb);
+    if matches!(
+        img,
+        DynamicImage::ImageRgba8(_) | DynamicImage::ImageLumaA8(_)
+    ) {
+        let src = img.to_rgba8();
+        let mut rgba = out.to_rgba8();
+        for (px, s) in rgba.pixels_mut().zip(src.pixels()) {
+            px[3] = s[3];
+        }
+        return DynamicImage::ImageRgba8(rgba);
+    }
+    out
+}
+
+/// Erases the masked part of an image and inpaints it from
+/// the surrounding pixels. Implemented by the ONNX provider
+/// in production and by fakes in tests.
+pub trait InpaintProvider: Send + Sync + std::fmt::Debug {
+    /// Fill the mask's nonzero region of `img`. The mask is
+    /// the image's size; nonzero is the hole. Pixels outside
+    /// the hole come back unchanged.
+    fn inpaint(&self, img: &DynamicImage, mask: &GrayImage) -> Result<DynamicImage, AiError>;
+}
+
+/// Region removal backed by a LaMa-family ONNX model
+/// (issue #176): a two-input session (image plus mask) at
+/// a fixed 512x512 working resolution, e.g. the OpenCV zoo
+/// export of big-lama. The export's contract, verified
+/// against the artifact: the image goes in as RGB in
+/// 0..1, the mask as 0..1 with 1 the hole, and the output
+/// comes back in 0..255 (the asymmetry is the export's,
+/// not a typo).
+pub struct OnnxInpaintProvider {
+    session: Mutex<Session>,
+    image_input: String,
+    mask_input: String,
+}
+
+impl OnnxInpaintProvider {
+    /// Load a model file. The two inputs are found by
+    /// their conventional names (`image`, `mask`), falling
+    /// back to declaration order; a model without two
+    /// inputs is rejected here. The load probes the model
+    /// with a small removal, like the upscale load probes
+    /// its factor: a model that cannot run it at all has
+    /// failed to load, not failed an inference.
+    pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, AiError> {
+        let (session, _) = build_session(dylib, model_path)?;
+        let names: Vec<String> = session
+            .inputs()
+            .iter()
+            .map(|i| i.name().to_string())
+            .collect();
+        if names.len() < 2 {
+            return Err(AiError::Load(format!(
+                "the model {model_path} has {} input(s); an inpainting model \
+                 takes an image and a mask",
+                names.len()
+            )));
+        }
+        let pick = |want: &str, fallback: usize| -> String {
+            names
+                .iter()
+                .find(|n| n.eq_ignore_ascii_case(want))
+                .cloned()
+                .unwrap_or_else(|| names[fallback].clone())
+        };
+        let probe = Self {
+            session: Mutex::new(session),
+            image_input: pick("image", 0),
+            mask_input: pick("mask", 1),
+        };
+        let img = DynamicImage::new_rgb8(64, 64);
+        let mask = region_mask(64, 64, 24, 24, 16, 16);
+        probe.inpaint(&img, &mask).map_err(|e| {
+            AiError::Load(format!(
+                "the model {model_path} failed its inpainting probe: {e}"
+            ))
+        })?;
+        Ok(probe)
+    }
+}
+
+impl std::fmt::Debug for OnnxInpaintProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxInpaintProvider")
+            .field("image_input", &self.image_input)
+            .field("mask_input", &self.mask_input)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InpaintProvider for OnnxInpaintProvider {
+    fn inpaint(&self, img: &DynamicImage, mask: &GrayImage) -> Result<DynamicImage, AiError> {
+        let fitted;
+        let mask = if mask.width() == img.width() && mask.height() == img.height() {
+            mask
+        } else {
+            fitted = image::imageops::resize(mask, img.width(), img.height(), FilterType::Triangle);
+            &fitted
+        };
+        let Some(bbox) = mask_bbox(mask) else {
+            return Ok(img.clone());
+        };
+        let window = inpaint_window(img.width(), img.height(), bbox);
+        let (wx, wy, ww, wh) = window;
+        let size = INPAINT_INPUT_SIZE as usize;
+        let crop = img.crop_imm(wx, wy, ww, wh).to_rgb8();
+        let crop = image::imageops::resize(
+            &crop,
+            INPAINT_INPUT_SIZE,
+            INPAINT_INPUT_SIZE,
+            FilterType::Triangle,
+        );
+        let mask_crop = image::imageops::crop_imm(mask, wx, wy, ww, wh).to_image();
+        let mask_crop = image::imageops::resize(
+            &mask_crop,
+            INPAINT_INPUT_SIZE,
+            INPAINT_INPUT_SIZE,
+            FilterType::Triangle,
+        );
+        let mut image_input = vec![0f32; 3 * size * size];
+        for (i, px) in crop.pixels().enumerate() {
+            for c in 0..3 {
+                image_input[c * size * size + i] = px[c] as f32 / 255.0;
+            }
+        }
+        let mut mask_input = vec![0f32; size * size];
+        for (i, px) in mask_crop.pixels().enumerate() {
+            mask_input[i] = px[0] as f32 / 255.0;
+        }
+        let image_tensor =
+            ort::value::Tensor::from_array(([1, 3, size, size], image_input.into_boxed_slice()))
+                .map_err(|e| AiError::Inference(format!("cannot build the image tensor: {e}")))?;
+        let mask_tensor =
+            ort::value::Tensor::from_array(([1, 1, size, size], mask_input.into_boxed_slice()))
+                .map_err(|e| AiError::Inference(format!("cannot build the mask tensor: {e}")))?;
+        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+        let outputs = session
+            .run(ort::inputs![
+                self.image_input.as_str() => image_tensor,
+                self.mask_input.as_str() => mask_tensor
+            ])
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+        let (_, first) = outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
+        let (shape, data) = first
+            .try_extract_tensor::<f32>()
+            .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
+        if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
+            return Err(AiError::BadOutput(format!(
+                "unexpected model output shape: {shape:?}"
+            )));
+        }
+        let (ow, oh) = (shape[3] as u32, shape[2] as u32);
+        // The export answers in 0..255 (see the type's
+        // contract note), so the values clamp there, not
+        // at 1.
+        let mut filled = image::RgbImage::new(ow, oh);
+        for (i, px) in filled.pixels_mut().enumerate() {
+            for c in 0..3 {
+                let v = data[c * (ow * oh) as usize + i];
+                px[c] = v.clamp(0.0, 255.0).round() as u8;
+            }
+        }
+        Ok(composite_inpaint(img, mask, window, &filled))
+    }
+}
+
 /// A detected face, in source-image pixels, with the
 /// detector's confidence in 0.0..=1.0.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -744,6 +1008,157 @@ mod tests {
             Err(other) => panic!("expected a load error, got {other}"),
             Ok(_) => panic!("expected a load error, but the load succeeded"),
         }
+    }
+
+    #[test]
+    fn region_mask_marks_only_the_rectangle() {
+        let mask = region_mask(10, 8, 2, 3, 4, 2);
+        assert_eq!(mask.get_pixel(2, 3)[0], 255);
+        assert_eq!(mask.get_pixel(5, 4)[0], 255);
+        assert_eq!(mask.get_pixel(1, 3)[0], 0);
+        assert_eq!(mask.get_pixel(6, 3)[0], 0);
+        assert_eq!(mask.get_pixel(2, 5)[0], 0);
+        // A rectangle hanging off the edge clamps instead of
+        // panicking: the engine bounds-checks first, but the
+        // mask builder does not trust it to.
+        let mask = region_mask(10, 8, 8, 6, 40, 40);
+        assert_eq!(mask.get_pixel(9, 7)[0], 255);
+    }
+
+    #[test]
+    fn mask_bbox_finds_the_marked_box() {
+        assert_eq!(mask_bbox(&GrayImage::new(10, 10)), None);
+        let mask = region_mask(40, 30, 7, 9, 5, 3);
+        assert_eq!(mask_bbox(&mask), Some((7, 9, 5, 3)));
+    }
+
+    #[test]
+    fn inpaint_window_centers_on_the_box_with_context() {
+        // Twice the box's larger axis of context, centered.
+        assert_eq!(inpaint_window(100, 80, (40, 30, 20, 20)), (30, 20, 40, 40));
+        // A corner box: the window clamps to the edges.
+        assert_eq!(inpaint_window(100, 80, (0, 0, 10, 10)), (0, 0, 20, 20));
+        // A box against the far edges: the window slides
+        // back inside.
+        assert_eq!(inpaint_window(100, 80, (90, 70, 10, 10)), (80, 60, 20, 20));
+        // A box covering the whole image: the window is the
+        // image.
+        assert_eq!(inpaint_window(100, 80, (0, 0, 100, 80)), (0, 0, 100, 80));
+        // An image smaller than the square on one axis: the
+        // window takes that whole axis.
+        assert_eq!(inpaint_window(30, 20, (10, 5, 10, 10)), (5, 0, 20, 20));
+    }
+
+    #[test]
+    fn composite_inpaint_takes_only_the_hole_from_the_fill() {
+        let img = solid(200, 30, 30, 40, 30);
+        let mask = region_mask(40, 30, 10, 10, 10, 10);
+        let window = inpaint_window(40, 30, (10, 10, 10, 10));
+        let filled = image::RgbImage::from_pixel(window.2, window.3, image::Rgb([30, 30, 200]));
+        let out = composite_inpaint(&img, &mask, window, &filled).to_rgb8();
+        // Inside the hole: the fill.
+        assert_eq!(*out.get_pixel(15, 15), image::Rgb([30, 30, 200]));
+        // Inside the window but outside the hole: the
+        // original, bit for bit (the model regenerates the
+        // whole window; only the hole may be believed).
+        assert_eq!(*out.get_pixel(9, 9), image::Rgb([200, 30, 30]));
+        // Outside the window: untouched.
+        assert_eq!(*out.get_pixel(35, 25), image::Rgb([200, 30, 30]));
+    }
+
+    #[test]
+    fn composite_inpaint_keeps_the_source_alpha() {
+        let mut rgba = image::RgbaImage::new(20, 20);
+        for p in rgba.pixels_mut() {
+            *p = image::Rgba([10, 20, 30, 200]);
+        }
+        let img = DynamicImage::ImageRgba8(rgba);
+        let mask = region_mask(20, 20, 5, 5, 10, 10);
+        let window = inpaint_window(20, 20, (5, 5, 10, 10));
+        let filled = image::RgbImage::from_pixel(window.2, window.3, image::Rgb([99, 99, 99]));
+        let out = composite_inpaint(&img, &mask, window, &filled).to_rgba8();
+        assert_eq!(*out.get_pixel(10, 10), image::Rgba([99, 99, 99, 200]));
+        assert_eq!(*out.get_pixel(0, 0), image::Rgba([10, 20, 30, 200]));
+    }
+
+    /// Real-model verification, run manually with the deployment
+    /// artifacts in place:
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_INPAINT_MODEL=...
+    /// cargo test -- --ignored inpaint_with_the_real_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn inpaint_with_the_real_model() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_INPAINT_MODEL").unwrap();
+        let provider = OnnxInpaintProvider::load(Some(&dylib), &model).unwrap();
+        // A smooth gradient with a solid red square pasted
+        // in the middle: the model's one plausible answer
+        // is the gradient, continued.
+        let mut rgb = image::RgbImage::new(256, 256);
+        for (x, y, p) in rgb.enumerate_pixels_mut() {
+            *p = if (88..168).contains(&x) && (88..168).contains(&y) {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([x as u8, y as u8, 102])
+            };
+        }
+        let img = DynamicImage::ImageRgb8(rgb);
+        let mask = region_mask(256, 256, 88, 88, 80, 80);
+        let out = provider.inpaint(&img, &mask).unwrap().to_rgb8();
+        assert_eq!((out.width(), out.height()), (256, 256));
+        let center = out.get_pixel(128, 128);
+        // The fill on this geometry (the hole is half the
+        // crop window, upscaled to the model's 512) measures
+        // (97, 86, 79) against the true gradient's
+        // (128, 128, 102): murkier than the ideal, but the
+        // square is unambiguously gone and the fill is in
+        // the gradient's family. The strict half of this
+        // test is the bit-identity outside, below.
+        assert!(
+            (60..=180).contains(&center[0])
+                && (60..=180).contains(&center[1])
+                && (50..=150).contains(&center[2])
+                && center[0] - center[1] < 45,
+            "the red square should be gone, filled with the gradient: {center:?}"
+        );
+        // Outside the removal: the original, bit for bit.
+        assert_eq!(*out.get_pixel(4, 4), image::Rgb([4, 4, 102]));
+        assert_eq!(*out.get_pixel(250, 200), image::Rgb([250, 200, 102]));
+        // An empty mask removes nothing and runs no fill.
+        let out = provider
+            .inpaint(&img, &GrayImage::new(256, 256))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(*out.get_pixel(128, 128), image::Rgb([255, 0, 0]));
+    }
+
+    /// A one-input model is not an inpainting model: the
+    /// load rejects it as Load, at boot, before any request
+    /// can discover it. Ignored like the other load tests:
+    /// load() initializes the runtime first.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_IDENTITY_MODEL=...
+    /// cargo test -- --ignored inpaint_load_rejects
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn inpaint_load_rejects_a_single_input_model() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_IDENTITY_MODEL").unwrap();
+        let message = expect_load(OnnxInpaintProvider::load(Some(&dylib), &model));
+        assert!(message.contains("takes an image and a mask"), "{message}");
+    }
+
+    /// A missing inpainting model file fails as Load, the
+    /// same boot story as the other providers.
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored inpaint_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn inpaint_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let message = expect_load(OnnxInpaintProvider::load(
+            Some(&dylib),
+            &missing_path("inpaint"),
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
     }
 
     /// Load-failure coverage (#179, item 2): a missing model

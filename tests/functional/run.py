@@ -180,6 +180,7 @@ def ai_instance_env(models, ort):
               CRABCROP_DETECT_MODEL=f"{models}/yolo.onnx",
               CRABCROP_DETECTORS_FILE=f"{models}/detectors.json",
               CRABCROP_UPSCALE_MODEL=f"{models}/upscale_swin2sr.onnx",
+              CRABCROP_INPAINT_MODEL=f"{models}/lama.onnx",
               CRABCROP_BRAND_COLOR="0E7C7B", CRABCROP_STUDIO_TIMING="1",
               ORT_DISABLE_TELEMETRY="1")
     aic = dict(common,

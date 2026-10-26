@@ -83,6 +83,9 @@
 //!   the filter (requests fail cleanly).
 //! - `CRABCROP_UPSCALE_MODEL`: path to a super-resolution ONNX
 //!   model for the `upscale` filter. Same preload rule.
+//! - `CRABCROP_INPAINT_MODEL`: path to a LaMa-family ONNX
+//!   model (two inputs, image plus mask, at a fixed 512x512)
+//!   for the `remove_region` filter. Same preload rule.
 //! - `CRABCROP_FACE_MODEL`: path to a YuNet ONNX model for
 //!   face-aware smart crops. Same preload rule; unset means
 //!   smart crops use the saliency estimate.
@@ -934,6 +937,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         cache: Arc::new(Cache::new(cache_bytes)),
         removebg: ai.removebg,
         upscale: ai.upscale,
+        inpaint: ai.inpaint,
         face: ai.face,
         tagger: ai.tagger,
         tag_threshold: ai.tag_threshold,
@@ -1048,6 +1052,7 @@ fn config_fingerprint(
         "CRABCROP_BRAND_COLOR",
         "CRABCROP_REMOVEBG_MODEL",
         "CRABCROP_UPSCALE_MODEL",
+        "CRABCROP_INPAINT_MODEL",
         "CRABCROP_FACE_MODEL",
         "CRABCROP_DETECT_MODEL",
         "CRABCROP_CLIP_IMAGE_MODEL",
@@ -1189,6 +1194,7 @@ fn metadata_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, String>
 struct AiProviders {
     removebg: Option<Arc<dyn crate::ai::MaskProvider>>,
     upscale: Option<Arc<dyn crate::ai::UpscaleProvider>>,
+    inpaint: Option<Arc<dyn crate::ai::InpaintProvider>>,
     face: Option<Arc<dyn crate::ai::FaceProvider>>,
     tagger: Option<Arc<dyn crate::ai::TagProvider>>,
     tag_threshold: f32,
@@ -1226,6 +1232,15 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         }
         _ => None,
     };
+    let inpaint: Option<Arc<dyn crate::ai::InpaintProvider>> = match get("CRABCROP_INPAINT_MODEL") {
+        Some(path) if !path.is_empty() => {
+            let provider = crate::ai::OnnxInpaintProvider::load(ort_dylib.as_deref(), &path)
+                .map_err(|e| format!("cannot load the inpainting model: {e}"))?;
+            println!("inpainting model loaded from {path}");
+            Some(Arc::new(provider))
+        }
+        _ => None,
+    };
     let (tagger, tag_threshold, embeddings) = match build_tagger(ort_dylib.as_deref(), &get)? {
         Some(setup) => (
             Some(setup.provider),
@@ -1250,6 +1265,7 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
     Ok(AiProviders {
         removebg,
         upscale,
+        inpaint,
         face,
         tagger,
         tag_threshold,
@@ -2834,6 +2850,7 @@ mod tests {
                 "cannot load the background-removal model",
             ),
             ("CRABCROP_UPSCALE_MODEL", "cannot load the upscale model"),
+            ("CRABCROP_INPAINT_MODEL", "cannot load the inpainting model"),
             (
                 "CRABCROP_FACE_MODEL",
                 "cannot load the face detection model",
@@ -2910,9 +2927,18 @@ mod tests {
         } else {
             false
         };
+        // Inpainting joins the same way
+        // (CRABCROP_TEST_INPAINT_MODEL).
+        let want_inpaint = if let Ok(model) = std::env::var("CRABCROP_TEST_INPAINT_MODEL") {
+            map.insert("CRABCROP_INPAINT_MODEL".to_string(), model);
+            true
+        } else {
+            false
+        };
         let ai = build_ai_providers(|name: &str| map.get(name).cloned()).unwrap();
         assert!(ai.removebg.is_some());
         assert!(ai.upscale.is_some());
+        assert_eq!(ai.inpaint.is_some(), want_inpaint);
         assert!(ai.face.is_some());
         assert!(ai.tagger.is_some());
         // The embedding provider rides the tagger.

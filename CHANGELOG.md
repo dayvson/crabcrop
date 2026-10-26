@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- Region removal with LaMa (issue #176). A new `remove_region(x,y,w,h)` filter erases a rectangle and inpaints it from the surrounding pixels, mirroring `blur_region`/`pixelate_region` exactly, including the bounds discipline (a rectangle that overflows the image in effect at that point in the chain is a `400`). The model is operator-supplied through `CRABCROP_INPAINT_MODEL`: a LaMa-family ONNX export with two inputs (image plus mask) at a fixed 512×512, preloaded and probed at boot like the other models; the OpenCV zoo export of big-lama follows the contract. Each removal runs the model once on a square crop window around the rectangle and takes only the rectangle's pixels from the result, so everything outside it is bit-identical; unconfigured servers answer `501`, inference runs behind the shared AI gate, and meta responses carry an `inpaint` object listing the erased rectangles. The TypeScript SDK gains a `removeRegion` builder. The docs call out the known failure mode plainly: the fill is fabricated, plausible on smooth surroundings and visibly wrong on structured content (text, faces, repeating patterns).
+
 ## [0.6.0] - 2026-10-26
 
 ### Added

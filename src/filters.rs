@@ -158,6 +158,10 @@ pub fn apply_filters_filled(
             // validates the rectangle against the image size
             // in effect at that point. (Same routing.)
             Filter::BlurRegion { .. } | Filter::PixelateRegion { .. } => {}
+            // Region removal runs in the engine, which owns
+            // the inpainting provider. (Same routing as the
+            // other region filters.)
+            Filter::RemoveRegion { .. } => {}
             Filter::Watermark { .. } => {}
             // Overlays are applied by the engine, which owns
             // the resolved images. (Same routing as above.)
