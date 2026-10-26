@@ -45,7 +45,18 @@ jobs:
       - name: Run tests with AVIF decode
         run: cargo test --locked --verbose --features avif-decode
 
-  audit:
+  msrv:
+  
+      runs-on: ubuntu-latest
+      
+          steps:
+                - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+                      - name: Install the crate's MSRV toolchain
+                              run: rustup toolchain install 1.88.0 --profile minimal
+                                    - name: Check crabcrop-url at its declared MSRV
+                                            run: cargo +1.88.0 check --locked -p crabcrop-url
+                                            
+                                            audit:
 
     runs-on: ubuntu-latest
 
