@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Fixed
+
+- `studio()` no longer aborts the server when the mask's subject box is a speck (issue #243). A mask that barely crosses the subject threshold in a few pixels while carrying faint coverage across a large region now takes the documented `no_subject` fallback instead of scaling the whole covered region by the speck's ratio (the reproduction attempted an 87 GB allocation and killed the process). The placement scale is also bounded outright: the scaled piece never exceeds twice the canvas per axis or the platform's aggregate output pixel budget.
+
 ## [0.4.0] - 2026-10-25
 
 ### Added

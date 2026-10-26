@@ -156,6 +156,24 @@ fn mask_bbox(mask: &GrayImage, threshold: u8) -> Option<(u32, u32, u32, u32)> {
     any.then(|| (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
 }
 
+/// Whether a subject box is a degenerate speck rather
+/// than a subject: its area against the covered region's
+/// box. A mask that barely crosses the subject threshold
+/// in a few pixels while carrying faint coverage across a
+/// large region is the model saying it found nothing in
+/// particular; believing the speck would scale the whole
+/// covered region by the speck's ratio (issue #243). Such
+/// a mask takes the no-subject fallback instead. The line
+/// is 1 percent of the region's box area: real subjects,
+/// even small ones in frame, sit far above it, because a
+/// subject the model actually found carries coverage of
+/// its own extent.
+fn degenerate_subject(subject: (u32, u32, u32, u32), region: (u32, u32, u32, u32)) -> bool {
+    let subject_area = subject.2 as u64 * subject.3 as u64;
+    let region_area = region.2 as u64 * region.3 as u64;
+    subject_area * 100 < region_area
+}
+
 /// Decontaminate edge colors (pipeline step 2). A photo's
 /// edge pixels are blends of subject and background; once
 /// the mask cuts the subject out, those blends would ride
@@ -263,7 +281,25 @@ fn place(
     // so this never inverts.
     let keep = (100.0 - 2.0 * pad as f32) / 100.0;
     let (iw, ih) = (w as f32 * keep, h as f32 * keep);
-    let scale = (iw / sw as f32).min(ih / sh as f32);
+    let fit = (iw / sw as f32).min(ih / sh as f32);
+    // The fit alone is an unbounded promise: it derives
+    // from the subject box only, so a small box inside a
+    // large piece asks for a scaled piece many times the
+    // canvas, and the resize allocates it before the
+    // overlay clips it away (issue #243: a 3x2 box scaled
+    // an 800x600 piece by 213x, an 87 GB allocation that
+    // aborted the process). Bound the scale twice over.
+    // Per axis, the scaled piece stops at twice the
+    // canvas: the subject box lands centered, so piece
+    // content further out than that can only fall off the
+    // canvas's far side. And the scaled area never
+    // exceeds the platform's aggregate output budget, the
+    // same cap every rendered output already obeys.
+    let by_axis =
+        (2.0 * w as f32 / piece.width() as f32).min(2.0 * h as f32 / piece.height() as f32);
+    let piece_area = piece.width() as f32 * piece.height() as f32;
+    let by_area = (crate::engine::MAX_OUTPUT_PIXELS as f32 / piece_area).sqrt();
+    let scale = fit.min(by_axis).min(by_area);
     let scaled = image::imageops::resize(
         piece,
         ((piece.width() as f32 * scale).round() as u32).max(1),
@@ -344,10 +380,18 @@ pub fn composite(
         &fitted
     };
 
-    let subject = mask_bbox(mask, SUBJECT_THRESHOLD);
+    // The subject counts only when it is a subject: a
+    // formal subject box that is a degenerate speck inside
+    // the covered region takes the no-subject fallback
+    // below, exactly as a mask with no subject at all
+    // does (issue #243).
+    let subject = match (mask_bbox(mask, SUBJECT_THRESHOLD), mask_bbox(mask, 1)) {
+        (Some(bbox), Some(region)) if !degenerate_subject(bbox, region) => Some((bbox, region)),
+        _ => None,
+    };
     timing_mark("mask_prep", t_stage);
     let (piece, subject_in_piece, shadow_ok) = match subject {
-        Some(bbox) => {
+        Some((bbox, region)) => {
             steps.push("defringe");
             let t_stage = std::time::Instant::now();
             let masked = crate::ai::apply_mask(img, mask);
@@ -357,7 +401,6 @@ pub fn composite(
             // it contributes pixels, and the crop keeps the
             // pad scaling cheap. The subject box is
             // re-based into the crop's coordinates.
-            let region = mask_bbox(mask, 1).expect("a subject implies covered pixels");
             let (rx, ry, rw, rh) = region;
             let crop = image::imageops::crop_imm(&clean, rx, ry, rw, rh).to_image();
             (
@@ -749,5 +792,90 @@ mod tests {
         assert_eq!(px(&out.image, 0, 0), [255, 255, 255, 255]);
         assert_eq!(px(&out.image, 99, 79)[3], 255);
         assert!(out.record.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn a_speck_subject_in_a_faint_frame_takes_the_no_subject_fallback() {
+        // The issue #243 reproduction's mask shape, at its
+        // real size: faint coverage (64) across the whole
+        // 800x600 frame and exactly six threshold-crossing
+        // pixels in a 3x2 corner box. Before the fix this
+        // aborted the process inside place() with an 87 GB
+        // allocation; now the speck is no subject, and the
+        // documented fallback serves the padded original.
+        let img = DynamicImage::ImageRgba8(ImageBuffer::from_fn(800, 600, |x, y| {
+            Rgba([x as u8, y as u8, 128, 255])
+        }));
+        let mask = GrayImage::from_fn(800, 600, |x, y| {
+            Luma([if x < 3 && y < 2 { 255 } else { 64 }])
+        });
+        let out = composite(
+            &img,
+            &mask,
+            None,
+            &spec(StudioBg::White, StudioShadow::Soft, 10),
+            None,
+        );
+        assert_eq!(out.record.fallbacks, ["no_subject"]);
+        assert_eq!(
+            out.record.steps,
+            ["mask", "fallback", "backdrop", "pad"],
+            "the degenerate path is the fallback path"
+        );
+        assert_eq!((out.image.width(), out.image.height()), (800, 600));
+    }
+
+    #[test]
+    fn the_degenerate_line_is_one_percent_of_the_covered_region() {
+        // A 100x80 frame fully covered at faint strength:
+        // the region box is 8000 px. A 10x8 subject box is
+        // exactly 1 percent of it and counts as a subject;
+        // an 8x9 box is under the line and falls back.
+        let (img, _) = product_photo();
+        let mask_with_subject = |sw: u32, sh: u32| {
+            GrayImage::from_fn(100, 80, |x, y| {
+                Luma([if x < sw && y < sh { 255 } else { 64 }])
+            })
+        };
+        let at_line = composite(
+            &img,
+            &mask_with_subject(10, 8),
+            None,
+            &spec(StudioBg::White, StudioShadow::None, 10),
+            None,
+        );
+        assert!(
+            at_line.record.fallbacks.is_empty(),
+            "a subject at exactly 1 percent is a subject: {:?}",
+            at_line.record.fallbacks
+        );
+        let under_line = composite(
+            &img,
+            &mask_with_subject(8, 9),
+            None,
+            &spec(StudioBg::White, StudioShadow::None, 10),
+            None,
+        );
+        assert_eq!(under_line.record.fallbacks, ["no_subject"]);
+    }
+
+    #[test]
+    fn place_never_scales_a_piece_past_the_canvas_bound() {
+        // The bounding logic on its own, with the issue
+        // #243 box shape at small scale: a 3x2 subject box
+        // in an 80x60 piece on an 80x60 canvas. The raw fit
+        // is 21x (a 1707x1280 intermediate); the clamped
+        // scale keeps the scaled piece within twice the
+        // canvas per axis, a small multiple of the canvas.
+        let piece = ImageBuffer::from_pixel(80, 60, Rgba([10, 20, 30, 255]));
+        let (scaled, _, _) = place(&piece, (0, 0, 3, 2), (80, 60), 10);
+        assert!(scaled.width() <= 160, "width {}", scaled.width());
+        assert!(scaled.height() <= 120, "height {}", scaled.height());
+        assert!(
+            (scaled.width() as u64 * scaled.height() as u64) <= 4 * 80 * 60,
+            "scaled area {} vs canvas {}",
+            scaled.width() * scaled.height(),
+            80 * 60
+        );
     }
 }
