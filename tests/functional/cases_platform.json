@@ -454,5 +454,35 @@
   "group": "roots",
   "kind": "scripted",
   "tier": "full"
+ },
+ {
+  "id": "frames-poster-and-timestamps",
+  "group": "frames",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "frames-percent-and-clamp",
+  "group": "frames",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "frames-meta",
+  "group": "frames",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "frames-refusals",
+  "group": "frames",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "frames-cache-and-purge",
+  "group": "frames",
+  "kind": "scripted",
+  "tier": "full"
  }
 ]

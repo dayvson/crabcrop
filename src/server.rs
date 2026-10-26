@@ -272,6 +272,15 @@ pub struct AppState {
     /// server; `format(mp4)` and `format(webm)` then fail
     /// with the specific not-configured error.
     pub video_encoder: Option<Arc<crate::video::VideoEncoder>>,
+    /// Frame extractor for `frame:` segments on video
+    /// sources (issue #214), built at boot when
+    /// `CRABCROP_VIDEO_DECODER` is configured. `None` means
+    /// frame selection does not exist on this server; a
+    /// `frame:` request then fails with the specific
+    /// not-configured error. Extraction shares the video
+    /// gate below: it is the same class of subprocess
+    /// work as an encode.
+    pub frame_extractor: Option<Arc<crate::frames::VideoFrameExtractor>>,
     /// Bounds concurrent video encodes: the subprocess is
     /// the server's most expensive and least predictable
     /// work, so it gets its own small gate (2 permits, like
@@ -540,8 +549,13 @@ async fn explain_handle(
     // The single bounded source fetch, through the loader
     // and its policy. Watermark and overlay sources are
     // operations' inputs, not the explained URL's source,
-    // and are never fetched: no fan-out.
-    let bytes = match state.loader.load(&fetch_url).await {
+    // and are never fetched: no fan-out. A `frame:`
+    // segment makes the source a video, so the loader may
+    // accept a `video/*` Content-Type for it (issue #214).
+    let allow_video = ops
+        .iter()
+        .any(|op| matches!(op, crate::url::Operation::Frame(_)));
+    let bytes = match state.loader.load_media(&fetch_url, allow_video).await {
         Ok(bytes) => bytes,
         Err(e) => return explain_load_error(e),
     };
@@ -1227,6 +1241,7 @@ struct ProcessJob {
     focal_provider: Option<Arc<dyn crate::ai::FocalProvider>>,
     text_renderer: Option<Arc<dyn crate::text::TextRenderer>>,
     video_encoder: Option<Arc<crate::video::VideoEncoder>>,
+    frame_extractor: Option<Arc<crate::frames::VideoFrameExtractor>>,
     dpr: Option<f32>,
     ssim_target: f64,
     brand_color: Option<[u8; 3]>,
@@ -1336,6 +1351,7 @@ async fn run_process(
                 declared_detect_providers: &declared_refs,
                 focal_provider: job.focal_provider.as_deref(),
                 video_encoder: job.video_encoder.as_deref(),
+                frame_extractor: job.frame_extractor.as_deref(),
                 save_data: job.save_data,
                 preserve_metadata: job.preserve_metadata,
                 text_renderer: job.text_renderer.as_deref(),
@@ -1772,10 +1788,14 @@ async fn serve_miss(
     let cache_status = "crabcrop; fwd=uri-miss";
     let source_url = source_url.as_str();
     let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
+    // A `frame:` segment makes the source a video (issue
+    // #214): only then may the loader accept a `video/*`
+    // Content-Type for it.
+    let wants_frame = directives.frame.is_some();
     record.load_ran = true;
     let load_start = Instant::now();
     let mut used_fallback = false;
-    let bytes = match state.loader.load(source_url).await {
+    let bytes = match state.loader.load_media(source_url, wants_frame).await {
         Ok(b) => b,
         Err(e) => {
             record.load = load_start.elapsed();
@@ -1845,19 +1865,21 @@ async fn serve_miss(
     } else {
         None
     };
-    // Video encodes sit behind their own gate, on top of
-    // the process gate inside `run_process`: the external
+    // Video work sits behind its own gate, on top of the
+    // process gate inside `run_process`: the external
     // encoder is the server's most expensive and least
     // predictable work (seconds per job, a subprocess), so
     // a burst of video requests sheds here instead of
     // queueing unboundedly behind the transform pipeline.
-    let _video_permit = if wants_video {
+    // Frame extraction (issue #214) takes the same gate:
+    // it runs the same class of subprocess.
+    let _video_permit = if wants_video || wants_frame {
         match tokio::time::timeout(VIDEO_GATE_WAIT, state.video_gate.clone().acquire_owned()).await
         {
             Ok(Ok(permit)) => Some(permit),
             _ => {
                 return (
-                    busy_response("server busy: video encoding queue is full", 5),
+                    busy_response("server busy: video processing queue is full", 5),
                     record,
                 );
             }
@@ -1917,6 +1939,7 @@ async fn serve_miss(
         focal_provider: state.focal.clone(),
         text_renderer: state.font.clone(),
         video_encoder: state.video_encoder.clone(),
+        frame_extractor: state.frame_extractor.clone(),
         dpr: dpr_hint,
         ssim_target: state.ssim_target,
         brand_color: state.brand_color,
@@ -2838,6 +2861,33 @@ fn meta_response(
     if let Some(score) = processed.ssimulacra2 {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
     }
+    if let Some(video) = &processed.video {
+        // The video record (issue #214): the probed facts
+        // of the video source and the resolved timestamp
+        // the frame was selected at. The duration is
+        // omitted when the container reports none. Numbers
+        // print at millisecond precision, the same
+        // rounding the extractor seeks with.
+        let seconds = |v: f64| {
+            let rounded = (v * 1000.0).round() / 1000.0;
+            if rounded == rounded.trunc() {
+                format!("{}", rounded as i64)
+            } else {
+                format!("{rounded}")
+            }
+        };
+        let duration = match video.duration_seconds {
+            Some(d) => format!(",\"duration\":{}", seconds(d)),
+            None => String::new(),
+        };
+        body.push_str(&format!(
+            ",\"video\":{{\"width\":{},\"height\":{},\"frame_timestamp\":{}{}}}",
+            video.width,
+            video.height,
+            seconds(video.frame_seconds),
+            duration
+        ));
+    }
     if let Some(studio) = &processed.studio {
         // The studio record (issue #197): the resolved
         // parameters, the steps that ran, the fallbacks
@@ -3074,6 +3124,10 @@ fn engine_error_response(e: EngineError) -> Response {
         // operator reads it, and never reaches the client
         // (audit R2-30).
         EngineError::Video(_) => (StatusCode::BAD_GATEWAY, "video encoding failed".to_string()),
+        EngineError::Frame(_) => (
+            StatusCode::BAD_GATEWAY,
+            "video frame extraction failed".to_string(),
+        ),
     };
     (status, message).into_response()
 }
@@ -3210,6 +3264,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3313,6 +3368,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate,
             inflight: Arc::new(Inflight::default()),
@@ -3389,6 +3445,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: Some(Arc::new(encoder)),
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3400,6 +3457,222 @@ mod tests {
             axum::serve(listener, app(state)).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// An app with a fake video decoder configured
+    /// (issue #214): its probe prints `report` (printf
+    /// arguments, already quoted) on stderr, and its
+    /// extraction answers with the test PNG, so the whole
+    /// frame path runs without a real decoder.
+    async fn spawn_app_with_frame_decoder(report: &str) -> String {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("crabcrop-server-frames-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("frame.png"), test_png()).unwrap();
+        let frame_path = dir.join("frame.png").display().to_string();
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\ndone\nprintf '%s\\n' {report} >&2\nexit 1\n"
+        );
+        let path = dir.join("decoder.sh");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let extractor =
+            crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30))
+                .unwrap();
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: Some(Arc::new(extractor)),
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The fake decoder's probe report for a good video:
+    /// 3 seconds, 100x60 (the test PNG's size), 10 fps.
+    const FAKE_VIDEO_REPORT: &str = "'  Duration: 00:00:03.00, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 100x60, 10 fps'";
+
+    /// Bytes that sniff as no image: an ISO-BMFF header
+    /// fragment stands in for a video file.
+    const FAKE_VIDEO_SOURCE: &[u8] = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2avc1";
+
+    #[tokio::test]
+    async fn frame_urls_render_the_frame_and_cache_it() {
+        let (src, hits) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+        let base = spawn_app_with_frame_decoder(FAKE_VIDEO_REPORT).await;
+        let remainder = format!("frame:1.5/40x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let first = client().get(&url).send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(header(&first, "cache-status"), "crabcrop; fwd=uri-miss");
+        let bytes = first.bytes().await.unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (40, 30));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The repeat is a cache hit: neither the origin
+        // nor the decoder runs again.
+        let second = client().get(&url).send().await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(header(&second, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The meta form carries the video record.
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["video"]["duration"], 3.0, "{meta}");
+        assert_eq!(meta["video"]["width"], 100, "{meta}");
+        assert_eq!(meta["video"]["height"], 60, "{meta}");
+        assert_eq!(meta["video"]["frame_timestamp"], 1.5, "{meta}");
+        assert_eq!(meta["source_width"], 100, "{meta}");
+        assert_eq!(meta["source_height"], 60, "{meta}");
+    }
+
+    #[tokio::test]
+    async fn frame_urls_without_a_decoder_answer_501() {
+        let (src, _hits) =
+            spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("frame:poster/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("CRABCROP_VIDEO_DECODER"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn frame_urls_refuse_image_and_streamless_sources() {
+        let base = spawn_app_with_frame_decoder(FAKE_VIDEO_REPORT).await;
+        // An image source with a frame segment: the
+        // loader serves it (it is an image), and the
+        // engine refuses it as a bad source.
+        let (img, _h) = spawn_counting_server(200, "image/png", test_png()).await;
+        let remainder = format!("frame:poster/{img}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // A video the decoder finds no stream in fails
+        // the same way.
+        let base = spawn_app_with_frame_decoder("'no streams in here at all'").await;
+        let (vid, _h) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+        let remainder = format!("frame:poster/{vid}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn a_video_content_type_needs_a_frame_segment() {
+        // The same video source, fetched by a URL with no
+        // frame segment: the loader's image-only rule
+        // refuses it, exactly as before issue #214.
+        let (src, _hits) =
+            spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+        let base = spawn_app_with_frame_decoder(FAKE_VIDEO_REPORT).await;
+        let remainder = format!("40x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("did not return an image"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn frame_grammar_errors_cost_no_fetch() {
+        let (src, hits) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+        let base = spawn_app_with_frame_decoder(FAKE_VIDEO_REPORT).await;
+        let remainder = format!("frame:banana/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["error"]["code"], "invalid_frame");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explain_labels_a_video_source() {
+        let (src, hits) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("frame:1.5/{src}");
+        let url = format!("{base}/explain/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["source"]["kind"], "video");
+        assert!(json["source"]["width"].is_null());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let segment = json["operations"][0]["segment"].as_str().unwrap();
+        assert_eq!(segment, "frame:1.5");
+        let gloss = json["operations"][0]["descriptions"][0].as_str().unwrap();
+        assert!(gloss.contains("video frame at that timestamp"), "{gloss}");
     }
 
     #[tokio::test]
@@ -3554,6 +3827,7 @@ mod tests {
             default_ops: crate::url::parse_default_ops(defaults, &std::collections::HashMap::new())
                 .unwrap(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3610,6 +3884,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3670,6 +3945,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -4231,6 +4507,7 @@ mod tests {
             source_roots,
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -4997,6 +5274,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5119,6 +5397,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5443,6 +5722,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5657,6 +5937,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5709,6 +5990,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5947,6 +6229,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -6013,6 +6296,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -7293,6 +7577,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -7361,6 +7646,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -7717,6 +8003,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -7738,6 +8025,7 @@ mod tests {
             focal_provider: None,
             text_renderer: None,
             video_encoder: None,
+            frame_extractor: None,
             dpr: None,
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
@@ -7803,6 +8091,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -7827,6 +8116,7 @@ mod tests {
             focal_provider: None,
             text_renderer: None,
             video_encoder: None,
+            frame_extractor: None,
             dpr: None,
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
@@ -8326,6 +8616,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -8729,6 +9020,7 @@ mod tests {
             source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -9555,6 +9847,7 @@ mod tests {
             source_roots,
             default_ops: Vec::new(),
             video_encoder: None,
+            frame_extractor: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),

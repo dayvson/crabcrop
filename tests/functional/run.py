@@ -35,7 +35,7 @@ observations.jsonl after every case, so a crashed run keeps its data.
 Timings are collected as trend data in the summary; they never gate.
 Exit code is 1 when any case verdict is FAIL or ERROR, else 0.
 """
-import argparse, csv, json, os, statistics, subprocess, sys, time
+import argparse, csv, json, os, shutil, statistics, subprocess, sys, time
 import urllib.parse
 
 FUNC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -280,6 +280,13 @@ def main():
                 break
             if args.tier == "smoke":
                 need &= {"A", "P", "U"}
+            # The frames cells (issue #214) need the V
+            # instance (decoder configured from PATH's
+            # ffmpeg); it joins whichever tier selected a
+            # frames row, smoke included.
+            if any(c["group"] == "frames" for c in platform_rows) \
+                    and shutil.which("ffmpeg"):
+                need.add("V")
             ok = hz.start_instances(sorted(need))
             bad = [k for k, v in ok.items() if not v]
             if bad:

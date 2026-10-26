@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Added
+
+- Video frames as an image source (issue #214). A new `frame:` operation segment selects one frame of a video source: `frame:poster` (the first frame), `frame:<seconds>` (a timestamp), or `frame:<percent>%` (a share of the duration). The extracted frame becomes the source image the rest of the URL operates on, so crops, filters, studio mode, presets, and purge all apply unchanged. Selections past the end clamp to the last frame; a malformed selector is a 400 with a new frozen `invalid_frame` code; a `frame:` segment on an image source fails as a bad source. Extraction runs through a new `CRABCROP_VIDEO_DECODER` external program (FFmpeg the reference) under the encode side's bounds: the path is validated at boot, runs share the video gate and the `CRABCROP_VIDEO_TIMEOUT_SECS` wall clock, and output is capped. Only a request carrying a `frame:` segment may fetch a `video/*` Content-Type. Meta responses for frame renders carry a `video` object (duration, stream dimensions, and the selected timestamp), and `explain` labels video sources as kind `video`.
+
 ## [0.5.0] - 2026-10-26
 
 ### Added

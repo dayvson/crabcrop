@@ -10,7 +10,7 @@ Imports harness after harness.configure() has run (run.py does this),
 so the runtime paths (BIN, OUT, UPLOAD_DIR, HITS_PATH, FRESH_BIN) are
 already set when this module binds them.
 """
-import argparse, io, json, os, re, subprocess, sys, time
+import argparse, io, json, os, re, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PIL import Image
 from harness import (FUNC_DIR, REPO, CORPUS, OUT, BIN, SECRET, PORTS,
@@ -1387,3 +1387,159 @@ def parity_vectors_py():
         "PASS" if ok else "FAIL", None,
         "python SDK matches spec/test-vectors.json on every vector"
         if ok else " | ".join(diffs)[:600])
+
+
+# ---------------------------------------------------------------- video frames
+CLIP = f"{SRC127}/clip.mp4"
+AUDIO = f"{SRC127}/audio.mp4"
+BROKEN = f"{SRC127}/broken.mp4"
+
+
+def _frame_note(cell_id, ops, src):
+    note(cell_id, "frames", ops, src, None,
+         "no ffmpeg on PATH: the V instance has no decoder configured, "
+         "so frame cells record instead of asserting")
+
+
+def _center_pixel(fact):
+    im = Image.open(fact["path"]).convert("RGB")
+    return im.getpixel((im.width // 2, im.height // 2))
+
+
+def _is_red(px):
+    return px[0] > 200 and px[1] < 60 and px[2] < 60
+
+
+def _is_green(px):
+    return px[1] > 100 and px[0] < 60 and px[2] < 60
+
+
+def _is_blue(px):
+    return px[2] > 200 and px[0] < 60 and px[1] < 60
+
+
+@cell
+def frames_poster_and_timestamps():
+    # The corpus clip is a solid color per second (red,
+    # green, blue at 64x48), so the selected frame is
+    # provable from its center pixel (issue #214).
+    if not shutil.which("ffmpeg"):
+        return _frame_note("frames-poster-and-timestamps", "frame:*", "clip.mp4")
+    cases = [("frame:poster", _is_red, "red"),
+             ("frame:0.5", _is_red, "red"),
+             ("frame:1.5", _is_green, "green"),
+             ("frame:2.5", _is_blue, "blue")]
+    facts = []
+    ok = True
+    for seg, pred, name in cases:
+        f = render_signed("frames-poster-and-timestamps", "V", f"{seg}/{CLIP}")
+        px = _center_pixel(f) if f["status"] == 200 else None
+        facts.append(f"{seg}: status={f['status']} px={px} ({name})")
+        ok = ok and f["status"] == 200 and dims(f) == (64, 48) \
+            and px is not None and pred(px)
+    # An operation chain runs on the frame like any source.
+    f = render_signed("frames-poster-and-timestamps", "V",
+                      f"frame:1.5/32x24/filters:format(webp)/{CLIP}")
+    facts.append(f"chain: status={f['status']} dims={dims(f)} ct={f['ct']}")
+    ok = ok and f["status"] == 200 and dims(f) == (32, 24) \
+        and f["ct"].startswith("image/webp")
+    check("frames-poster-and-timestamps", "frames",
+          "frame:poster|frame:<seconds>", "clip.mp4", ok, f, " | ".join(facts))
+
+
+@cell
+def frames_percent_and_clamp():
+    if not shutil.which("ffmpeg"):
+        return _frame_note("frames-percent-and-clamp", "frame:<percent>%", "clip.mp4")
+    mid = render_signed("frames-percent-and-clamp", "V", f"frame:50%/{CLIP}")
+    mid_px = _center_pixel(mid) if mid["status"] == 200 else None
+    end = render_signed("frames-percent-and-clamp", "V", f"frame:100%/{CLIP}")
+    end_px = _center_pixel(end) if end["status"] == 200 else None
+    past = render_signed("frames-percent-and-clamp", "V", f"frame:999/{CLIP}")
+    past_px = _center_pixel(past) if past["status"] == 200 else None
+    ok = (mid["status"] == 200 and mid_px is not None and _is_green(mid_px)
+          and end["status"] == 200 and end_px is not None and _is_blue(end_px)
+          and past["status"] == 200 and past_px is not None and _is_blue(past_px))
+    check("frames-percent-and-clamp", "frames", "frame:50%|frame:100%|frame:999",
+          "clip.mp4", ok, past,
+          f"50%: status={mid['status']} px={mid_px} (green) | "
+          f"100%: status={end['status']} px={end_px} (blue, clamped) | "
+          f"999s: status={past['status']} px={past_px} (blue, clamped)")
+
+
+@cell
+def frames_meta():
+    if not shutil.which("ffmpeg"):
+        return _frame_note("frames-meta", "frame:1.5 + meta", "clip.mp4")
+    rem = f"frame:1.5/{CLIP}"
+    st, h, payload, ms = get("V", signed_path(rem),
+                             {"Accept": "application/json"})
+    meta = json.loads(payload) if st == 200 else {}
+    video = meta.get("video") or {}
+    ok = (st == 200 and video.get("duration") == 3.0
+          and video.get("width") == 64 and video.get("height") == 48
+          and video.get("frame_timestamp") == 1.5
+          and meta.get("source_width") == 64
+          and meta.get("source_height") == 48)
+    check("frames-meta", "frames", "frame:1.5 (meta)", "clip.mp4", ok,
+          {"status": st},
+          f"status={st} video={video} source={meta.get('source_width')}x"
+          f"{meta.get('source_height')}")
+
+
+@cell
+def frames_refusals():
+    if not shutil.which("ffmpeg"):
+        return _frame_note("frames-refusals", "frame:*", "clip.mp4 et al")
+    results = []
+    # A frame segment on an image source: 502, video-only.
+    f = timed_render("frames-refusals", "V", signed_path(f"frame:poster/{DOG}"))
+    results.append(f"image-source: {f['status']} (want 502)")
+    ok = f["status"] == 502
+    # An audio-only file and a truncated container: no
+    # video stream, the bad-source 502.
+    for src, label in ((AUDIO, "audio-only"), (BROKEN, "broken")):
+        f = timed_render("frames-refusals", "V", signed_path(f"frame:poster/{src}"))
+        results.append(f"{label}: {f['status']} (want 502)")
+        ok = ok and f["status"] == 502
+    # A malformed selector is a grammar 400 with the
+    # frozen code, and costs no origin fetch.
+    hits0 = origin_hits("clip.mp4")
+    st, h, payload, ms = get("V", signed_path(f"frame:banana/{CLIP}"),
+                             {"Accept": "application/json"})
+    code = (json.loads(payload).get("error") or {}).get("code")
+    results.append(f"malformed: {st} code={code} "
+                   f"new_hits={origin_hits('clip.mp4') - hits0} (want 400 invalid_frame 0)")
+    ok = ok and st == 400 and code == "invalid_frame" \
+        and origin_hits("clip.mp4") == hits0
+    # No decoder configured (instance A): 501.
+    f = timed_render("frames-refusals", "A", signed_path(f"frame:poster/{CLIP}"))
+    results.append(f"no-decoder: {f['status']} (want 501)")
+    ok = ok and f["status"] == 501
+    check("frames-refusals", "frames", "frame:poster|frame:banana",
+          "dog.jpg|audio.mp4|broken.mp4|clip.mp4", ok, f, " | ".join(results))
+
+
+@cell
+def frames_cache_and_purge():
+    if not shutil.which("ffmpeg"):
+        return _frame_note("frames-cache-and-purge", "frame:2.5", "clip.mp4")
+    rem = f"frame:2.5/32x24/{CLIP}"
+    purge_cli(rem, "V")
+    hits0 = origin_hits("clip.mp4")
+    f1 = timed_render("frames-cache-and-purge", "V", signed_path(rem))
+    hits1 = origin_hits("clip.mp4")
+    f2 = timed_render("frames-cache-and-purge", "V", signed_path(rem))
+    hits2 = origin_hits("clip.mp4")
+    st, body, _h = purge_http(rem, purge_sig(rem), base="V")
+    f3 = timed_render("frames-cache-and-purge", "V", signed_path(rem))
+    hits3 = origin_hits("clip.mp4")
+    ok = (f1["status"] == 200 and hits1 - hits0 == 1
+          and f2["status"] == 200 and hits2 == hits1
+          and f2["cache"] == "hit"
+          and st == 200 and f3["status"] == 200 and hits3 - hits2 == 1)
+    check("frames-cache-and-purge", "frames", "frame:2.5/32x24", "clip.mp4",
+          ok, f3,
+          f"miss: hits+{hits1 - hits0} cache={f1['cache']} | "
+          f"repeat: hits+{hits2 - hits1} cache={f2['cache']} | "
+          f"purge: {st} {body} | after: hits+{hits3 - hits2}")

@@ -122,7 +122,7 @@ The loader fetches the source under fixed limits, for every source kind:
 
 - 10 seconds total per fetch, including redirects.
 - 10 MiB maximum body; larger sources fail with `502` (the request was fine; the origin object is too big).
-- If an HTTP response carries a `Content-Type` header, it must start with `image/`.
+- If an HTTP response carries a `Content-Type` header, it must start with `image/`. The one exception is a [video frame](#video-frames) request: when the URL carries a `frame:` segment, a `video/*` Content-Type is accepted too.
 
 Decoding is bounded too, so a small file cannot expand into gigabytes: at most 16384 px per axis and 256 MiB of decoder allocations, and animated GIF and WebP sources at most 200 frames and 100 million decoded pixels in total. Sources past the bounds fail with `502`.
 
@@ -253,6 +253,28 @@ Debug responses are never stored in, or served from, any cache tier, and are ser
 
 ```bash
 curl "http://localhost:3000/unsafe/debug:focal/crop:800x600:smart/https://example.com/photo.jpg"
+```
+
+### Video frame
+
+```text
+frame:poster
+frame:<seconds>
+frame:<percent>%
+```
+
+Selects one frame of a video source, which becomes the source image the rest of the URL operates on: the poster frame (`frame:poster`, the video's first frame), the frame at a timestamp in seconds (`frame:1.5`), or the frame at a percentage of the duration (`frame:50%`). The selection applies at decode, wherever the segment sits in the path, and the extracted frame then flows through crops (including face-safe smart crops), filters, studio mode, and the format negotiation like any other source image. When a URL carries several `frame:` segments, the last one wins.
+
+The semantics are strict about the edges:
+
+- Frame selection is video-only. A `frame:` segment on a still image or an animated GIF or WebP source fails with `502`, the way a bad source fails; animated sources keep their existing behavior whenever no `frame:` segment is present.
+- A timestamp past the end of the video clamps to the last frame, as does `frame:100%`; nothing about the request is an error. A percentage needs the video's duration: a container that reports none fails the percentage form with `400`.
+- A malformed selector (a sign, an exponent, a percentage over 100, a timestamp over 86400) fails with `400` and the `invalid_frame` code.
+
+Frame extraction is an operator feature: it runs through the external decoder configured with `CRABCROP_VIDEO_DECODER`, and a server without one answers `501`. See [Video frames](#video-frames) for the decoder contract and the failure table.
+
+```bash
+curl "http://localhost:3000/unsafe/frame:50%/800x450/filters:format(webp)/https://example.com/clip.mp4"
 ```
 
 ### Filters
@@ -544,6 +566,35 @@ Details an encoder setup has to match:
 
 Video results cache like any other response, under the video content type (`video/mp4` or `video/webm`), and every operation in the URL (resize, crop, filters) applies per frame before the encode. A meta request (`Accept: application/json`) on a video URL answers `400`: meta describes images, and a video result is not one.
 
+## Video frames
+
+A video the server can fetch is also an image source: a `frame:` segment in the URL selects one frame (see [Video frame](#video-frame) in the operations), and from there the request is an ordinary image request. The frame is the poster's first frame, the frame at a timestamp, or the frame at a share of the duration; out-of-range selections clamp to the last frame. Extraction happens once per unique URL, on a cache miss, and the result caches (and purges) like any other render, under the same key rules as every spelling of the URL.
+
+Crabcrop ships no video decoder either. Extraction runs in an external program you configure, `CRABCROP_VIDEO_DECODER`: the path to a decoder executable, with FFmpeg as the reference. The path is validated at startup (it must exist and be executable, or the server refuses to boot). With the variable unset, frame selection is off and a `frame:` URL answers `501`. The contract between crabcrop and the program is fixed, and crabcrop builds every argument itself; the program never sees a shell:
+
+- **Probe**: argv is `ffmpeg -nostdin -v info -i pipe:0`, with the source bytes on stdin and no output target. The program reports the input on stderr (duration, stream list); crabcrop reads the duration, the first video stream's dimensions, and its frame rate from that report. A source whose report holds no video stream (a non-video, an audio-only file, a corrupt container) is a bad source.
+- **Extract**: argv is `ffmpeg -nostdin -v info -i pipe:0 -ss <seconds> -frames:v 1 -f image2pipe -vcodec png pipe:1`, again with the source bytes on stdin. One PNG frame comes back on stdout and becomes the source image, so every decode and output budget applies to it unchanged.
+
+The bounds mirror the encoder's, because the work is the same class:
+
+- At most two extractions run at a time behind the video gate (shared with encodes), on top of the process gate; a request that waits more than 10 s for a slot sheds with `503`.
+- Each run (probe and extraction alike) is bounded by the same wall-clock timeout as encodes (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a frame whose PNG passes 256 MiB, the decode allocation budget, is refused).
+- The source itself flows through the ordinary loader first, with the same allowlist, size cap, and redirect rules as any source. Only a URL carrying a `frame:` segment may fetch a `video/*` Content-Type; every other request keeps the image-only rule.
+
+### Errors
+
+| Situation | Answer |
+| --- | --- |
+| No decoder configured | `501`: `frame extraction is not configured on this server` |
+| Source is an image (still or animated) | `502`: frame selection needs a video source |
+| Source has no video stream, or is not a readable video | `502`: the bad-source failure every undecodable source gets |
+| Percentage selection on a video that reports no duration | `400` |
+| Malformed `frame:` selector | `400` with the `invalid_frame` code, before any fetch |
+| Decoder exits nonzero, produces no frame, exceeds the cap, or times out | `502`: `video frame extraction failed` (the cause, including the decoder's stderr excerpt, is in the server log) |
+| Video queue full (both slots busy past a 10 s wait) | `503` |
+
+A frame render's [meta response](#meta-responses) carries a `video` object: the source's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. The explain endpoint labels a video source's kind as `video`; its dimensions stay unknown there, because explain never runs the decoder.
+
 ## Meta responses
 
 Send `Accept: application/json` with any image URL to get metadata about the processed image instead of the image bytes:
@@ -564,6 +615,7 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 | `source_width`, `source_height` | Source dimensions in pixels, after EXIF orientation. |
 | `ssimulacra2` | The verified perceptual score of the output, present when `quality(auto)` verified a JPEG or JPEG XL encode. 100 is identical. |
 | `studio` | Present when a `studio(...)` filter ran: the resolved backdrop (`bg`, spelled `#rrggbb`, or `none` for transparency) and its source (`bg_from`: `argument`, `brand`, or `default`), the `shadow` and `pad` applied, the expansion `steps` that ran, the `fallbacks` taken, and `mask_confidence` when the mask provider exposes one. See [Studio mode](#studio-mode). |
+| `video` | Present when the source was a video and a `frame:` segment selected the frame: the video stream's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. See [Video frames](#video-frames). |
 
 Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other.
 
@@ -614,7 +666,7 @@ With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at sta
 
 ## Errors
 
-Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`. The statuses you can get:
+Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`, `invalid_frame`. The statuses you can get:
 
 | Status | Meaning |
 | --- | --- |
@@ -787,7 +839,8 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_ORT_DYLIB` | unset | Path to the ONNX Runtime shared library, when it is not on the library search path. |
 | `CRABCROP_FONT_PATH` | unset | Path to a TTF/OTF font for the `text(...)` overlay filter, loaded at startup. Unset disables the filter. |
 | `CRABCROP_VIDEO_ENCODER` | unset | Path to the external video encoder program for `format(mp4)` / `format(webm)`, validated at startup. Unset disables video output. See [Video output](#video-output). |
-| `CRABCROP_VIDEO_TIMEOUT_SECS` | `30` | Hard wall-clock limit per video encode, 1 to 600 seconds. |
+| `CRABCROP_VIDEO_DECODER` | unset | Path to the external video decoder program for `frame:` extraction from video sources, validated at startup. Unset disables frame selection. See [Video frames](#video-frames). |
+| `CRABCROP_VIDEO_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external video tool run (one encode, or one frame probe/extraction), 1 to 600 seconds. |
 | `CRABCROP_VIDEO_MAX_MB` | `64` | Output cap per video encode in megabytes, 1 to 1024. The encode aborts the moment it is crossed. |
 | `CRABCROP_FALLBACK_IMAGE` | unset | URL or local file path of the fallback image served when a source cannot be fetched or decoded. See [Fallback image](#fallback-image). |
 | `CRABCROP_RESULT_STORAGE_DIR` | unset | Directory for the disk-backed result store. Unset disables the second cache tier. |

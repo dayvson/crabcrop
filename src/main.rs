@@ -175,9 +175,18 @@
 //!   video out on stdout). Validated at boot: a set but
 //!   unusable path is a startup error. Unset disables
 //!   video output (requests fail cleanly with 501).
-//!   `CRABCROP_VIDEO_TIMEOUT_SECS` bounds one encode
-//!   (default 30, 1 to 600) and `CRABCROP_VIDEO_MAX_MB`
-//!   caps its output (default 64, 1 to 1024).
+//!   `CRABCROP_VIDEO_TIMEOUT_SECS` bounds one external
+//!   video tool run (default 30, 1 to 600) and
+//!   `CRABCROP_VIDEO_MAX_MB` caps the encoder's output
+//!   (default 64, 1 to 1024).
+//! - `CRABCROP_VIDEO_DECODER`: path to an external video
+//!   decoder program (FFmpeg is the reference) that a
+//!   `frame:` segment on a video source extracts its
+//!   still through, under the fixed probe-and-extract
+//!   contract (source bytes in on stdin, one PNG frame
+//!   out on stdout). Validated at boot the same way.
+//!   Unset disables frame selection (requests fail
+//!   cleanly with 501).
 //! - `PORT`: listen port, default 3000.
 
 #![forbid(unsafe_code)]
@@ -192,6 +201,7 @@ mod engine;
 mod explain;
 mod filters;
 mod focus;
+mod frames;
 mod heic;
 mod loader;
 mod observe;
@@ -897,6 +907,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // them. Both builders read through the env lookup.
     let fallback = build_fallback(|name| env::var(name).ok())?;
     let video_encoder = build_video_encoder(|name| env::var(name).ok())?;
+    let frame_extractor = build_video_decoder(|name| env::var(name).ok())?;
 
     let state = AppState {
         keyring,
@@ -941,6 +952,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         source_roots,
         default_ops,
         video_encoder,
+        frame_extractor,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         inflight: Arc::new(crate::server::Inflight::default()),
@@ -1033,6 +1045,7 @@ fn config_fingerprint(
         "CRABCROP_AESTHETIC_HEAD",
         "CRABCROP_FONT_PATH",
         "CRABCROP_VIDEO_ENCODER",
+        "CRABCROP_VIDEO_DECODER",
     ] {
         if let Some(value) = get(name).filter(|v| !v.is_empty()) {
             part(name, &value);
@@ -1268,16 +1281,7 @@ fn build_fallback(
 fn build_video_encoder(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Arc<crate::video::VideoEncoder>>, String> {
-    let video_timeout_secs: u64 = parse_env_value(
-        "CRABCROP_VIDEO_TIMEOUT_SECS",
-        get("CRABCROP_VIDEO_TIMEOUT_SECS"),
-        crate::video::DEFAULT_TIMEOUT_SECS,
-    )?;
-    if !(1..=600).contains(&video_timeout_secs) {
-        return Err(format!(
-            "CRABCROP_VIDEO_TIMEOUT_SECS must be between 1 and 600, got {video_timeout_secs}"
-        ));
-    }
+    let video_timeout_secs = video_timeout_secs(&get)?;
     let video_max_mb: usize = parse_env_value(
         "CRABCROP_VIDEO_MAX_MB",
         get("CRABCROP_VIDEO_MAX_MB"),
@@ -1303,6 +1307,48 @@ fn build_video_encoder(
                 "video encoder: {path} (timeout {video_timeout_secs}s, output cap {video_max_mb} MB)"
             );
             Ok(Some(Arc::new(encoder)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The shared wall-clock limit for one external video
+/// tool run, encode or frame extraction (issue #214):
+/// `CRABCROP_VIDEO_TIMEOUT_SECS`, validated the same way
+/// whichever tool ends up configured.
+fn video_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String> {
+    let secs: u64 = parse_env_value(
+        "CRABCROP_VIDEO_TIMEOUT_SECS",
+        get("CRABCROP_VIDEO_TIMEOUT_SECS"),
+        crate::video::DEFAULT_TIMEOUT_SECS,
+    )?;
+    if !(1..=600).contains(&secs) {
+        return Err(format!(
+            "CRABCROP_VIDEO_TIMEOUT_SECS must be between 1 and 600, got {secs}"
+        ));
+    }
+    Ok(secs)
+}
+
+/// Build the video frame extractor (issue #214) from
+/// `CRABCROP_VIDEO_DECODER`: the source-side counterpart
+/// of the encoder. Same boot rule: a set path that is
+/// not a usable executable is fatal here, not on the
+/// first `frame:` request. The timeout is the shared
+/// video tool budget.
+fn build_video_decoder(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<crate::frames::VideoFrameExtractor>>, String> {
+    let timeout_secs = video_timeout_secs(&get)?;
+    match get("CRABCROP_VIDEO_DECODER") {
+        Some(path) if !path.is_empty() => {
+            let extractor = crate::frames::VideoFrameExtractor::new(
+                std::path::PathBuf::from(&path),
+                std::time::Duration::from_secs(timeout_secs),
+            )
+            .map_err(|e| format!("cannot use CRABCROP_VIDEO_DECODER ({path}): {e}"))?;
+            println!("video decoder: {path} (timeout {timeout_secs}s)");
+            Ok(Some(Arc::new(extractor)))
         }
         _ => Ok(None),
     }
@@ -2517,6 +2563,49 @@ mod tests {
         ]))
         .unwrap();
         assert!(encoder.is_some());
+    }
+
+    #[test]
+    fn video_decoder_construction_follows_the_encoder_rules() {
+        // Unset disables frame selection (issue #214).
+        assert!(build_video_decoder(env_of(&[])).unwrap().is_none());
+        // The shared timeout validates even when only the
+        // decoder is configured.
+        let err = expect_err(build_video_decoder(env_of(&[(
+            "CRABCROP_VIDEO_TIMEOUT_SECS",
+            "0",
+        )])));
+        assert!(err.contains("CRABCROP_VIDEO_TIMEOUT_SECS"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_decoder_construction_validates_the_program() {
+        // A missing program is a boot error naming the
+        // variable, like the encoder's.
+        let missing = missing_path("decoder");
+        let err = expect_err(build_video_decoder(env_of(&[(
+            "CRABCROP_VIDEO_DECODER",
+            missing.as_str(),
+        )])));
+        assert!(err.contains("cannot use CRABCROP_VIDEO_DECODER"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+        // A non-executable file is refused, and the same
+        // file with the executable bit constructs.
+        let plain = temp_file("decoder-plain", b"#!/bin/sh\n");
+        let err = expect_err(build_video_decoder(env_of(&[(
+            "CRABCROP_VIDEO_DECODER",
+            plain.as_str(),
+        )])));
+        assert!(err.contains("is not executable"), "{err}");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let decoder = build_video_decoder(env_of(&[
+            ("CRABCROP_VIDEO_DECODER", plain.as_str()),
+            ("CRABCROP_VIDEO_TIMEOUT_SECS", "45"),
+        ]))
+        .unwrap();
+        assert!(decoder.is_some());
     }
 
     #[test]

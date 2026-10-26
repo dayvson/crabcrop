@@ -391,5 +391,35 @@
   "bytes": 281,
   "frames": 1,
   "sha256": "9aef6d4ac30e40bc"
+ },
+ {
+  "file": "clip.mp4",
+  "origin": "Generated with ffmpeg lavfi: three 1 s solid-color segments (red, green, blue) at 64x48, 10 fps, concatenated; libx264, yuv420p",
+  "format": "MP4",
+  "width": 64,
+  "height": 48,
+  "bytes": 2523,
+  "frames": 30,
+  "sha256": "670ead8c19f10b4f"
+ },
+ {
+  "file": "audio.mp4",
+  "origin": "Generated with ffmpeg lavfi: a 2 s 440 Hz sine tone, AAC, no video stream",
+  "format": "MP4",
+  "width": 0,
+  "height": 0,
+  "bytes": 18806,
+  "frames": 0,
+  "sha256": "0e9794c9a96c4403"
+ },
+ {
+  "file": "broken.mp4",
+  "origin": "The first 60 bytes of clip.mp4: a truncated container no decoder can open",
+  "format": "MP4",
+  "width": 0,
+  "height": 0,
+  "bytes": 60,
+  "frames": 0,
+  "sha256": "19ec39ed82a1f64b"
  }
 ]

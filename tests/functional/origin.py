@@ -34,7 +34,8 @@ HITS = open(os.environ["FUNC_HITS"], "a", buffering=1)
 LOCK = threading.Lock()
 
 CT = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-      ".svg": "image/svg+xml", ".webp": "image/webp", ".gif": "image/gif"}
+      ".svg": "image/svg+xml", ".webp": "image/webp", ".gif": "image/gif",
+      ".mp4": "video/mp4"}
 
 
 class H(BaseHTTPRequestHandler):

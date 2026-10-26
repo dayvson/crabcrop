@@ -60,6 +60,10 @@ pub enum ParseError {
     /// does not have: the only one is `debug:focal`. Carries
     /// the offending segment.
     InvalidDebug(String),
+    /// A `frame:...` segment did not match the frame
+    /// selector grammar: `frame:poster`, `frame:<seconds>`,
+    /// or `frame:<percent>%`. Carries the offending segment.
+    InvalidFrame(String),
     /// A `preset:<name>` segment named a preset the server has
     /// not configured. Carries the name.
     UnknownPreset(String),
@@ -120,6 +124,7 @@ impl ParseError {
             ParseError::InvalidExpiry(_) => "invalid_expiry",
             ParseError::InvalidMaxAge(_) => "invalid_maxage",
             ParseError::InvalidDebug(_) => "invalid_debug",
+            ParseError::InvalidFrame(_) => "invalid_frame",
             ParseError::UnknownPreset(_) => "unknown_preset",
             ParseError::UnknownRoot(_) => "unknown_root",
             ParseError::InvalidRoot(_) => "invalid_root",
@@ -152,6 +157,7 @@ impl std::fmt::Display for ParseError {
             ParseError::InvalidExpiry(seg) => write!(f, "invalid expiry segment: {seg}"),
             ParseError::InvalidMaxAge(seg) => write!(f, "invalid maxage segment: {seg}"),
             ParseError::InvalidDebug(seg) => write!(f, "invalid debug segment: {seg}"),
+            ParseError::InvalidFrame(seg) => write!(f, "invalid frame segment: {seg}"),
             ParseError::UnknownPreset(name) => write!(f, "unknown preset: {name}"),
             ParseError::UnknownRoot(name) => write!(f, "unknown source root: {name}"),
             ParseError::InvalidRoot(source) => {
@@ -711,6 +717,35 @@ pub enum MaskShape {
     Ellipse,
 }
 
+/// Which frame of a video source a `frame:` segment
+/// selects (issue #214). The selection is resolved against
+/// the probed duration at decode time: seconds and poster
+/// need no duration, a percentage does. Out-of-range
+/// selections clamp to the last frame there, never here:
+/// the grammar accepts any value inside its own bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FrameSelection {
+    /// `frame:poster`: the poster frame, the video's first
+    /// frame.
+    Poster,
+    /// `frame:<seconds>`: the frame at this timestamp, in
+    /// seconds from the start.
+    Seconds(f64),
+    /// `frame:<percent>%`: the frame at this percentage of
+    /// the duration, 0 to 100.
+    Percent(f64),
+}
+
+/// The largest timestamp a `frame:` segment may name, in
+/// seconds: 24 hours. Real sources the loader will fetch
+/// (10 MiB, bounded decode) run far shorter; the cap keeps
+/// the grammar's numbers finite and small, and anything
+/// past a real duration clamps to the last frame anyway.
+pub const MAX_FRAME_SECONDS: f64 = 86_400.0;
+
+/// The largest percentage a `frame:` segment may name.
+pub const MAX_FRAME_PERCENT: f64 = 100.0;
+
 /// One operation from the request path, in path order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
@@ -752,6 +787,17 @@ pub enum Operation {
     /// it changes the response, so it stays in the canonical
     /// form (and therefore the cache key form) in place.
     DebugFocal,
+    /// Select one frame of a video source (`frame:poster`,
+    /// `frame:<seconds>`, `frame:<percent>%`; issue #214).
+    /// The selection is applied at decode, before every
+    /// other operation, wherever the segment sits in the
+    /// path: the extracted frame becomes the source image
+    /// the rest of the chain runs on. It is an operation,
+    /// not metadata, because it changes the response, so
+    /// it stays in the canonical form in place. When a
+    /// request carries several, the last one wins (the
+    /// directives analysis settles it, like `exp:`).
+    Frame(FrameSelection),
     /// Filters applied in order after resize.
     Filters(Vec<Filter>),
 }
@@ -896,6 +942,9 @@ fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
             _ => Err(ParseError::InvalidDebug(seg.to_string())),
         });
     }
+    if let Some(rest) = seg.strip_prefix("frame:") {
+        return Some(parse_frame(rest, seg));
+    }
     if let Some(rest) = seg.strip_prefix("crop-rect:") {
         return Some(parse_crop_rect(rest, seg));
     }
@@ -953,6 +1002,69 @@ fn size_shaped(seg: &str) -> bool {
         digits.is_empty() || digits == "orig" || digits.bytes().all(|b| b.is_ascii_digit())
     };
     dimension_spelling(left) || dimension_spelling(right)
+}
+
+/// Parse a strict decimal for the `frame:` grammar: an
+/// unsigned whole part, an optional fraction, no sign, no
+/// exponent, no leading dot, the same discipline as the
+/// `rotate` angle and the `convolution` kernel values, so
+/// every implementation of the grammar reads the same
+/// strings. Bounded by `max` (inclusive).
+fn parse_frame_decimal(text: &str, max: f64) -> Result<f64, ()> {
+    let (whole, fraction) = match text.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (text, None),
+    };
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    if let Some(f) = fraction
+        && (f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(());
+    }
+    let value: f64 = text.parse().map_err(|_| ())?;
+    if !value.is_finite() || value < 0.0 || value > max {
+        return Err(());
+    }
+    Ok(value)
+}
+
+/// Parse the selector after `frame:`: `poster`, a seconds
+/// timestamp, or a percentage with its `%` suffix.
+fn parse_frame(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let invalid = || ParseError::InvalidFrame(seg.to_string());
+    if rest == "poster" {
+        return Ok(Operation::Frame(FrameSelection::Poster));
+    }
+    if let Some(pct) = rest.strip_suffix('%') {
+        let value = parse_frame_decimal(pct, MAX_FRAME_PERCENT).map_err(|_| invalid())?;
+        return Ok(Operation::Frame(FrameSelection::Percent(value)));
+    }
+    let value = parse_frame_decimal(rest, MAX_FRAME_SECONDS).map_err(|_| invalid())?;
+    Ok(Operation::Frame(FrameSelection::Seconds(value)))
+}
+
+/// The canonical spelling of a frame timestamp or
+/// percentage: whole values print as integers, fractions
+/// use the shortest round-trip form, matching the rotate
+/// angle's canonicalization, so `frame:1.50` and
+/// `frame:1.5` are one request with one cache entry.
+pub(crate) fn format_frame_value(value: f64) -> String {
+    if value == value.trunc() {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+/// The canonical segment text of a frame selection.
+fn frame_text(selection: &FrameSelection) -> String {
+    match selection {
+        FrameSelection::Poster => "frame:poster".to_string(),
+        FrameSelection::Seconds(s) => format!("frame:{}", format_frame_value(*s)),
+        FrameSelection::Percent(p) => format!("frame:{}%", format_frame_value(*p)),
+    }
 }
 
 /// Parse the box after `fit-in:`. Flips make no sense when fitting,
@@ -2059,6 +2171,10 @@ pub struct RequestDirectives {
     /// Any `debug:focal` segment: the response is the focal
     /// debug view, never a cached transform result.
     pub debug_focal: bool,
+    /// The frame selection (issue #214) when the request
+    /// carries a `frame:` segment: the last one in path
+    /// order wins, the same rule as the `exp:` expiry.
+    pub frame: Option<FrameSelection>,
 }
 
 impl RequestDirectives {
@@ -2083,6 +2199,7 @@ impl RequestDirectives {
             face_padding: 0.5,
             watermark_urls: Vec::new(),
             debug_focal: false,
+            frame: None,
         };
         for op in ops {
             match op {
@@ -2092,6 +2209,7 @@ impl RequestDirectives {
                 | Operation::Pad { .. }
                 | Operation::CropRect { .. } => d.has_size_operation = true,
                 Operation::DebugFocal => d.debug_focal = true,
+                Operation::Frame(selection) => d.frame = Some(*selection),
                 _ => {}
             }
             if let Operation::Crop { align, .. } = op {
@@ -2439,6 +2557,7 @@ fn operation_text(op: &Operation) -> String {
             bottom,
         } => format!("focal:{left}x{top}:{right}x{bottom}"),
         Operation::DebugFocal => "debug:focal".to_string(),
+        Operation::Frame(selection) => frame_text(selection),
         Operation::Filters(_) => unreachable!("filters are merged by canonical_form"),
     }
 }
@@ -3006,6 +3125,7 @@ mod tests {
                 "invalid_convolution",
             ),
             (ParseError::InvalidNoise("x".into()), "invalid_noise"),
+            (ParseError::InvalidFrame("x".into()), "invalid_frame"),
             (ParseError::MissingSourceUrl, "missing_source_url"),
         ];
         let mut seen = std::collections::HashSet::new();
@@ -4723,6 +4843,87 @@ mod tests {
             let err = parse_operations_with_expiry(bad).unwrap_err();
             assert!(matches!(err, ParseError::InvalidDebug(_)), "{bad}");
             assert_eq!(err.code(), "invalid_debug");
+        }
+    }
+
+    #[test]
+    fn frame_segments_parse_and_canonicalize() {
+        // The three selector forms (issue #214).
+        let (ops, src, _, _) =
+            parse_operations_with_expiry("frame:poster/example.com/v.mp4").unwrap();
+        assert_eq!(ops, vec![Operation::Frame(FrameSelection::Poster)]);
+        assert_eq!(src, "example.com/v.mp4");
+        let (ops, ..) = parse_operations_with_expiry("frame:12.5/example.com/v.mp4").unwrap();
+        assert_eq!(ops, vec![Operation::Frame(FrameSelection::Seconds(12.5))]);
+        let (ops, ..) = parse_operations_with_expiry("frame:50%/example.com/v.mp4").unwrap();
+        assert_eq!(ops, vec![Operation::Frame(FrameSelection::Percent(50.0))]);
+        // Bounds are inclusive: zero, the full duration, and
+        // the 24 h cap itself all parse.
+        for (seg, want) in [
+            ("frame:0", FrameSelection::Seconds(0.0)),
+            ("frame:100%", FrameSelection::Percent(100.0)),
+            ("frame:0%", FrameSelection::Percent(0.0)),
+            ("frame:86400", FrameSelection::Seconds(86_400.0)),
+            ("frame:33.333%", FrameSelection::Percent(33.333)),
+        ] {
+            let (ops, ..) = parse_operations_with_expiry(&format!("{seg}/example.com/v.mp4"))
+                .unwrap_or_else(|e| panic!("{seg}: {e}"));
+            assert_eq!(ops, vec![Operation::Frame(want)], "{seg}");
+        }
+        // Canonical spelling: whole values print as integers,
+        // fractions shorten, so spelling variants are one
+        // request with one cache entry.
+        assert_eq!(
+            canonical_key_form("frame:1.50/300x200/example.com/v.mp4"),
+            "frame:1.5/300x200/example.com/v.mp4"
+        );
+        assert_eq!(
+            canonical_key_form("frame:2.0/example.com/v.mp4"),
+            "frame:2/example.com/v.mp4"
+        );
+        assert_eq!(
+            canonical_key_form("frame:050%/example.com/v.mp4"),
+            "frame:50%/example.com/v.mp4"
+        );
+        // The directive analysis sees the selection, and the
+        // last segment wins when a request carries several.
+        let (ops, ..) =
+            parse_operations_with_expiry("frame:1/frame:poster/example.com/v.mp4").unwrap();
+        assert_eq!(
+            RequestDirectives::analyze(&ops).frame,
+            Some(FrameSelection::Poster)
+        );
+        let (ops, ..) = parse_operations_with_expiry("300x200/example.com/v.mp4").unwrap();
+        assert_eq!(RequestDirectives::analyze(&ops).frame, None);
+        // A frame segment inside the source is URL text.
+        let (ops, src, _, _) = parse_operations_with_expiry("example.com/frame:1/v.mp4").unwrap();
+        assert!(ops.is_empty());
+        assert_eq!(src, "example.com/frame:1/v.mp4");
+    }
+
+    #[test]
+    fn frame_segments_refuse_malformed_selectors() {
+        for bad in [
+            "frame:/example.com/v.mp4",
+            "frame:banana/example.com/v.mp4",
+            "frame:-1/example.com/v.mp4",
+            "frame:+1/example.com/v.mp4",
+            "frame:.5/example.com/v.mp4",
+            "frame:1./example.com/v.mp4",
+            "frame:1.2.3/example.com/v.mp4",
+            "frame:1e3/example.com/v.mp4",
+            "frame:86401/example.com/v.mp4",
+            "frame:86400.5/example.com/v.mp4",
+            "frame:101%/example.com/v.mp4",
+            "frame:100.1%/example.com/v.mp4",
+            "frame:%/example.com/v.mp4",
+            "frame:50%%/example.com/v.mp4",
+            "frame:poster%/example.com/v.mp4",
+            "frame:Poster/example.com/v.mp4",
+        ] {
+            let err = parse_operations_with_expiry(bad).unwrap_err();
+            assert!(matches!(err, ParseError::InvalidFrame(_)), "{bad}: {err:?}");
+            assert_eq!(err.code(), "invalid_frame", "{bad}");
         }
     }
 

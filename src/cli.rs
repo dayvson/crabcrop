@@ -420,6 +420,19 @@ pub(crate) fn describe_operation_text(op: &Operation) -> Vec<String> {
             "render the smart-crop debug view (focal point, focal rectangle, and crop window drawn on the crop's canvas; never cached)"
                 .to_string(),
         ],
+        Operation::Frame(selection) => vec![match selection {
+            crate::url::FrameSelection::Poster => {
+                "frame:poster (use the video source's poster frame, its first frame)".to_string()
+            }
+            crate::url::FrameSelection::Seconds(s) => format!(
+                "frame:{} (use the video frame at that timestamp, in seconds)",
+                crate::url::format_frame_value(*s)
+            ),
+            crate::url::FrameSelection::Percent(p) => format!(
+                "frame:{}% (use the video frame at that percentage of its duration)",
+                crate::url::format_frame_value(*p)
+            ),
+        }],
     }
 }
 

@@ -232,21 +232,38 @@ impl Loader {
     /// Fetch `url` and return the body bytes, dispatching on
     /// the source scheme.
     pub async fn load(&self, url: &str) -> Result<Vec<u8>, LoadError> {
+        self.load_media(url, false).await
+    }
+
+    /// Fetch `url` like [`Loader::load`], optionally
+    /// accepting a `video/*` Content-Type. Only a request
+    /// whose operations carry a `frame:` segment (issue
+    /// #214) passes `allow_video`: a video is a source
+    /// type of its own, and every other request keeps the
+    /// image-only rule. All other guards (allowlist, dot
+    /// segments, size cap, redirects, SSRF checks) are
+    /// identical either way, and file sources never had a
+    /// Content-Type to check.
+    pub async fn load_media(&self, url: &str, allow_video: bool) -> Result<Vec<u8>, LoadError> {
         if let Some(rest) = url.strip_prefix("s3://") {
             let (bucket, key) = split_bucket_key(rest, "s3")?;
-            return self.load_object(StoreKind::S3, bucket, key).await;
+            return self
+                .load_object(StoreKind::S3, bucket, key, allow_video)
+                .await;
         }
         if let Some(rest) = url.strip_prefix("gs://") {
             let (bucket, key) = split_bucket_key(rest, "gs")?;
-            return self.load_object(StoreKind::Gcs, bucket, key).await;
+            return self
+                .load_object(StoreKind::Gcs, bucket, key, allow_video)
+                .await;
         }
         if url.starts_with("file://") {
             return self.load_file(url).await;
         }
-        self.load_http(url).await
+        self.load_http(url, allow_video).await
     }
 
-    async fn load_http(&self, url: &str) -> Result<Vec<u8>, LoadError> {
+    async fn load_http(&self, url: &str, allow_video: bool) -> Result<Vec<u8>, LoadError> {
         let mut parsed =
             Url::parse(url).map_err(|e| LoadError::Network(format!("invalid url: {e}")))?;
         let mut hops = 0;
@@ -283,23 +300,30 @@ impl Loader {
                     .map_err(|e| LoadError::Network(format!("invalid redirect: {e}")))?;
                 continue;
             }
-            return self.read_checked_body(resp).await;
+            return self.read_checked_body(resp, allow_video).await;
         }
     }
 
     /// Status, content-type, and bounded-body handling shared by
     /// the HTTP path and the object stores. A non-2xx status
     /// (including a store redirect, which is not followed) is an
-    /// error.
-    async fn read_checked_body(&self, mut resp: reqwest::Response) -> Result<Vec<u8>, LoadError> {
+    /// error. The Content-Type must be `image/*`, or (only for
+    /// a frame request) `video/*`.
+    async fn read_checked_body(
+        &self,
+        mut resp: reqwest::Response,
+        allow_video: bool,
+    ) -> Result<Vec<u8>, LoadError> {
         let status = resp.status();
         if !status.is_success() {
             return Err(LoadError::BadStatus(status.as_u16()));
         }
         if let Some(value) = resp.headers().get(header::CONTENT_TYPE) {
             let content_type = value.to_str().ok();
-            let is_image = content_type.is_some_and(|ct| ct.starts_with("image/"));
-            if !is_image {
+            let accepted = content_type.is_some_and(|ct| {
+                ct.starts_with("image/") || (allow_video && ct.starts_with("video/"))
+            });
+            if !accepted {
                 return Err(LoadError::WrongContentType(
                     content_type.map(str::to_string),
                 ));
@@ -326,6 +350,7 @@ impl Loader {
         kind: StoreKind,
         bucket: &str,
         key: &str,
+        allow_video: bool,
     ) -> Result<Vec<u8>, LoadError> {
         // The request URL places the key after the bucket, and
         // URL parsing collapses dot segments, so a key carrying
@@ -414,7 +439,7 @@ impl Loader {
             }
         }
         let resp = request.send().await.map_err(map_request_error)?;
-        self.read_checked_body(resp).await
+        self.read_checked_body(resp, allow_video).await
     }
 
     /// Fetch a local file under the configured root. The
@@ -856,6 +881,40 @@ mod tests {
         let loader = Loader::with_defaults().unwrap();
         assert_eq!(
             fetch(&loader, &base).await,
+            Err(LoadError::WrongContentType(Some("text/html".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn video_content_type_needs_the_media_opt_in() {
+        // Issue #214: a `video/*` Content-Type is refused
+        // by the plain load and accepted by the media load
+        // a frame request uses; the opt-in widens nothing
+        // else.
+        let body = b"video";
+        let video_response = || {
+            response(
+                "200 OK",
+                "Content-Type: video/mp4\r\nContent-Length: 5\r\n",
+                body,
+            )
+        };
+        let loader = Loader::with_defaults().unwrap();
+        let base = spawn_server(Respond::Bytes(video_response())).await;
+        assert_eq!(
+            fetch(&loader, &base).await,
+            Err(LoadError::WrongContentType(Some("video/mp4".to_string())))
+        );
+        let base = spawn_server(Respond::Bytes(video_response())).await;
+        assert_eq!(loader.load_media(&base, true).await.unwrap(), b"video");
+        let resp = response(
+            "200 OK",
+            "Content-Type: text/html\r\nContent-Length: 5\r\n",
+            body,
+        );
+        let base = spawn_server(Respond::Bytes(resp)).await;
+        assert_eq!(
+            loader.load_media(&base, true).await,
             Err(LoadError::WrongContentType(Some("text/html".to_string())))
         );
     }

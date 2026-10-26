@@ -353,6 +353,14 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
         Ok(image::ImageFormat::Bmp) => "bmp",
         Ok(image::ImageFormat::Tiff) => "tiff",
         Ok(image::ImageFormat::Ico) => "ico",
+        // Not an image: a video container (issue #214)
+        // gets its own kind. An AVIF still shares the
+        // ISO-BMFF box but matched above, so it never
+        // lands here. A video's dimensions live behind
+        // the decoder's probe, which explain never runs,
+        // so they stay unknown (the reader below cannot
+        // read them either).
+        _ if is_video_container(bytes) => "video",
         _ => "unknown",
     };
     let dimensions = image::ImageReader::new(Cursor::new(bytes))
@@ -466,6 +474,28 @@ pub struct ProcessedImage {
     /// processed source, set when `quality(auto)` verified its
     /// encode (JPEG and JXL). `None` when nothing was scored.
     pub ssimulacra2: Option<f64>,
+    /// The video record (issue #214) when the source was a
+    /// video and a `frame:` segment selected the still this
+    /// response was rendered from: the probed facts and the
+    /// resolved timestamp, for meta responses. `None` for
+    /// every image source.
+    pub video: Option<VideoSourceMeta>,
+}
+
+/// Facts about a video source, probed at frame
+/// extraction (issue #214), reported in meta responses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoSourceMeta {
+    /// Container duration in seconds, when the container
+    /// reports one.
+    pub duration_seconds: Option<f64>,
+    /// The video stream's coded width.
+    pub width: u32,
+    /// The video stream's coded height.
+    pub height: u32,
+    /// The resolved timestamp the frame was selected at,
+    /// in seconds (after clamping to the last frame).
+    pub frame_seconds: f64,
 }
 
 /// What went wrong while processing an image.
@@ -491,6 +521,12 @@ pub enum EngineError {
     /// the cap, or no output. The server maps it to 502:
     /// the URL was fine, the operator's encoder was not.
     Video(String),
+    /// The external video decoder failed while extracting
+    /// a frame (issue #214): spawn failure, non-zero exit,
+    /// timeout, output past the cap, or no frame produced.
+    /// The server maps it to 502, like the encode side:
+    /// the URL was fine, the operator's decoder was not.
+    Frame(String),
     /// A text overlay could not be rendered. Carries the cause.
     Render(String),
 }
@@ -515,6 +551,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::Video(cause) => {
                 write!(f, "video encoder failed: {cause}")
+            }
+            EngineError::Frame(cause) => {
+                write!(f, "video frame extraction failed: {cause}")
             }
             EngineError::Render(cause) => {
                 write!(f, "cannot render text overlay: {cause}")
@@ -559,6 +598,11 @@ pub struct ProcessContext<'a> {
     /// Video encoder, when the deployment configured an
     /// external encoder program (`CRABCROP_VIDEO_ENCODER`).
     pub video_encoder: Option<&'a crate::video::VideoEncoder>,
+    /// Frame extractor, when the deployment configured an
+    /// external decoder program (`CRABCROP_VIDEO_DECODER`):
+    /// a `frame:` segment on a video source pulls its
+    /// still through this (issue #214).
+    pub frame_extractor: Option<&'a crate::frames::VideoFrameExtractor>,
     /// DPR fallback from the request's client hint, used when
     /// the URL carries no explicit `dpr` directive.
     pub dpr: Option<f32>,
@@ -606,6 +650,7 @@ impl Default for ProcessContext<'_> {
             focal_provider: None,
             text_renderer: None,
             video_encoder: None,
+            frame_extractor: None,
             dpr: None,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             save_data: false,
@@ -651,6 +696,54 @@ impl Engine {
         // the pipeline reads (issue #136); nothing below
         // re-walks the list looking for them.
         let directives = crate::url::RequestDirectives::analyze(ops);
+        // Frame selection (issue #214): a `frame:` segment
+        // makes the source a video whose selected frame
+        // becomes the source image for everything below.
+        // The extractor is required (a deployment without
+        // one answers NotConfigured, like video output
+        // without an encoder); an image source is refused
+        // as a bad source, because frame selection is
+        // video-only and animated GIF and WebP sources keep
+        // their own handling; and the extracted PNG
+        // replaces the bytes, so the format detection, the
+        // validation preflights, the source metadata, and
+        // the decode chain below all see the frame.
+        let frame_png;
+        let mut video_meta: Option<VideoSourceMeta> = None;
+        let bytes = if let Some(selection) = directives.frame {
+            let extractor = ctx.frame_extractor.ok_or_else(|| {
+                EngineError::NotConfigured(
+                    "frame extraction is not configured on this server (no CRABCROP_VIDEO_DECODER)"
+                        .to_string(),
+                )
+            })?;
+            if image::guess_format(bytes).is_ok()
+                || is_jxl(bytes)
+                || is_heic(bytes)
+                || crate::svg::is_svg(bytes)
+            {
+                return Err(EngineError::Decode(
+                    "frame selection needs a video source, but this source is an image".to_string(),
+                ));
+            }
+            let frame = extractor
+                .extract_frame(bytes, selection)
+                .map_err(|err| match err {
+                    crate::frames::FrameError::NotVideo(why) => EngineError::Decode(why),
+                    crate::frames::FrameError::Unsupported(why) => EngineError::Unsupported(why),
+                    crate::frames::FrameError::Failed(why) => EngineError::Frame(why),
+                })?;
+            video_meta = Some(VideoSourceMeta {
+                duration_seconds: frame.duration,
+                width: frame.width,
+                height: frame.height,
+                frame_seconds: frame.timestamp,
+            });
+            frame_png = frame.png;
+            &frame_png
+        } else {
+            bytes
+        };
         // HEIC/HEIF sources are detected explicitly: they decode
         // through the pure-Rust oxideav stack (issue #163), in the
         // decode chain below, so the format gets its own metadata
@@ -1116,6 +1209,7 @@ impl Engine {
             placeholder,
             studio,
             ssimulacra2: ssim,
+            video: video_meta,
         })
     }
 
@@ -1190,6 +1284,7 @@ impl Engine {
             placeholder,
             studio: None,
             ssimulacra2: None,
+            video: None,
         })
     }
 
@@ -1269,6 +1364,7 @@ impl Engine {
             placeholder,
             studio: None,
             ssimulacra2: None,
+            video: None,
         })
     }
 }
@@ -1665,6 +1761,11 @@ fn apply_operations(
     for op in ops {
         match op {
             Operation::DebugFocal => debug_armed = true,
+            // Frame selection already happened at decode
+            // (issue #214): the frame is the source image
+            // this chain runs on, so there is nothing left
+            // to apply here.
+            Operation::Frame(_) => {}
             Operation::Size(size) => {
                 img = apply_size(img, size, cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)), dpr)?
             }
@@ -2271,6 +2372,23 @@ fn is_heic(bytes: &[u8]) -> bool {
             | b"mif2"
             | b"msf1"
     )
+}
+
+/// Whether `bytes` open as a video container: an
+/// ISO-BMFF `ftyp` box whose major brand is not one of
+/// the still-image brands `is_heic` claims (MP4, MOV,
+/// and their kin), or a Matroska/WebM EBML header. The
+/// one caller (`probe_source`) consults this only after
+/// the image formats have had their claim, so an AVIF
+/// still, which shares the box, is never mislabeled. A
+/// container sniff only: whether it holds a readable
+/// video stream is the decoder probe's call (issue
+/// #214).
+fn is_video_container(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return true;
+    }
+    bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && !is_heic(bytes)
 }
 
 /// One step down the `max_bytes` quality ladder, planned
@@ -5239,6 +5357,173 @@ mod tests {
     }
 
     const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDEO'\n";
+
+    /// A fake frame extractor (issue #214): its probe
+    /// prints `report` on stderr, its extraction prints a
+    /// real 8x6 PNG. Returns the extractor (the script
+    /// lives in a temp dir keyed by `name`).
+    fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameExtractor {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "crabcrop-engine-frame-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("frame.png"),
+            png_bytes(&DynamicImage::new_rgb8(8, 6)),
+        )
+        .unwrap();
+        let frame_path = dir.join("frame.png").display().to_string();
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\ndone\nprintf '%s\\n' {report} >&2\nexit 1\n"
+        );
+        let path = dir.join("decoder.sh");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap()
+    }
+
+    /// Bytes that sniff as no image: an ISO-BMFF header
+    /// fragment is enough (the extractor is fake; the
+    /// container is never really parsed in these tests).
+    const FAKE_VIDEO_BYTES: &[u8] = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2avc1";
+
+    const FAKE_PROBE_REPORT: &str = "'  Duration: 00:00:03.00, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 8x6, 10 fps'";
+
+    #[test]
+    fn frame_segment_without_a_decoder_is_not_configured() {
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                FAKE_VIDEO_BYTES,
+                &[Operation::Frame(crate::url::FrameSelection::Poster)],
+                ProcessContext::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+        assert!(err.to_string().contains("CRABCROP_VIDEO_DECODER"), "{err}");
+    }
+
+    #[test]
+    fn frame_segment_on_an_image_source_is_a_decode_failure() {
+        let engine = Engine;
+        let extractor = frame_test_extractor("image-source", FAKE_PROBE_REPORT);
+        let ctx = ProcessContext {
+            frame_extractor: Some(&extractor),
+            ..Default::default()
+        };
+        // A still PNG and an animated GIF: frame selection
+        // is video-only, and animated image sources keep
+        // their own handling, so both refuse as bad
+        // sources rather than yielding a frame.
+        let sources = [
+            png_bytes(&DynamicImage::new_rgb8(20, 12)),
+            animated_gif_bytes(),
+        ];
+        for src in sources {
+            let err = engine
+                .process_preferred(
+                    &src,
+                    &[Operation::Frame(crate::url::FrameSelection::Poster)],
+                    ctx.clone(),
+                )
+                .unwrap_err();
+            assert!(matches!(err, EngineError::Decode(_)), "{err:?}");
+            assert!(err.to_string().contains("needs a video source"), "{err}");
+        }
+    }
+
+    #[test]
+    fn frame_segment_extracts_and_processes_the_frame() {
+        let engine = Engine;
+        let extractor = frame_test_extractor("extract", FAKE_PROBE_REPORT);
+        let out = engine
+            .process_preferred(
+                FAKE_VIDEO_BYTES,
+                &[
+                    Operation::Frame(crate::url::FrameSelection::Seconds(1.5)),
+                    size_op(Dimension::Pixels(4), Dimension::Pixels(3)),
+                ],
+                ProcessContext {
+                    frame_extractor: Some(&extractor),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The operation chain ran on the extracted frame.
+        assert_eq!((out.width, out.height), (4, 3));
+        assert_eq!((out.source_width, out.source_height), (8, 6));
+        // And the video record rides along for meta.
+        let video = out.video.expect("a frame render carries the video record");
+        assert_eq!(video.duration_seconds, Some(3.0));
+        assert_eq!((video.width, video.height), (8, 6));
+        assert_eq!(video.frame_seconds, 1.5);
+    }
+
+    #[test]
+    fn frame_segment_on_a_streamless_source_is_a_decode_failure() {
+        let engine = Engine;
+        let extractor = frame_test_extractor("streamless", "'no streams in here at all'");
+        let err = engine
+            .process_preferred(
+                FAKE_VIDEO_BYTES,
+                &[Operation::Frame(crate::url::FrameSelection::Poster)],
+                ProcessContext {
+                    frame_extractor: Some(&extractor),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Decode(_)), "{err:?}");
+        assert!(err.to_string().contains("no video stream"), "{err}");
+    }
+
+    #[test]
+    fn probe_source_labels_videos_and_never_mislabels_avif() {
+        // The explain probe (issue #214): a video
+        // container is kind "video" with unknown
+        // dimensions; an AVIF still shares the ISO-BMFF
+        // box and must keep its own kind.
+        let probe = probe_source(FAKE_VIDEO_BYTES);
+        assert_eq!(probe.kind, "video");
+        assert_eq!(probe.dimensions, None);
+        let webm = [0x1A, 0x45, 0xDF, 0xA3, 1, 2, 3, 4];
+        assert_eq!(probe_source(&webm).kind, "video");
+        let mut avif = Vec::new();
+        avif.extend_from_slice(&24u32.to_be_bytes());
+        avif.extend_from_slice(b"ftypavif");
+        avif.extend_from_slice(&[0, 0, 0, 0]);
+        avif.extend_from_slice(b"avifmif1");
+        assert_eq!(probe_source(&avif).kind, "avif");
+    }
+
+    #[test]
+    fn frame_percentage_without_a_duration_is_unsupported() {
+        let engine = Engine;
+        let extractor = frame_test_extractor(
+            "no-duration",
+            "'  Duration: N/A, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 8x6, 10 fps'",
+        );
+        let err = engine
+            .process_preferred(
+                FAKE_VIDEO_BYTES,
+                &[Operation::Frame(crate::url::FrameSelection::Percent(50.0))],
+                ProcessContext {
+                    frame_extractor: Some(&extractor),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("duration"), "{err}");
+    }
 
     #[test]
     fn animated_gif_to_mp4_uses_the_configured_encoder() {

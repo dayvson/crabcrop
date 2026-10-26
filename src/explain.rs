@@ -178,7 +178,12 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
                 right,
                 bottom,
             } => Some(((*right - *left) as u64, (*bottom - *top) as u64)),
-            Operation::FocalRect { .. } | Operation::DebugFocal => cur,
+            // A frame selection (issue #214) keeps the
+            // source's dimensions: the frame is the video
+            // at full size. From headers alone those are
+            // unknown for a video, so `cur` is already None
+            // and stays that way.
+            Operation::FocalRect { .. } | Operation::DebugFocal | Operation::Frame(_) => cur,
             Operation::Filters(filters) => {
                 let mut cur = cur;
                 for filter in filters {
