@@ -5612,6 +5612,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn etag_for_is_a_stable_quoted_digest_of_the_cache_key() {
+        let etag = etag_for("some-cache-key");
+        assert!(etag.starts_with('"') && etag.ends_with('"'));
+        assert_eq!(etag.len(), 34);
+        assert_eq!(etag, etag_for("some-cache-key"));
+        assert_ne!(etag, etag_for("another-cache-key"));
+    }
+
+    #[test]
+    fn if_none_match_matching_rules() {
+        let etag = "\"abc123\"";
+        assert!(if_none_match_matches("\"abc123\"", etag));
+        assert!(if_none_match_matches("W/\"abc123\"", etag));
+        assert!(if_none_match_matches("*", etag));
+        assert!(if_none_match_matches("\"other\", \"abc123\"", etag));
+        assert!(if_none_match_matches(" \"other\" , W/\"abc123\" ", etag));
+        assert!(!if_none_match_matches("\"other\"", etag));
+        assert!(!if_none_match_matches("", etag));
+    }
+
+    #[tokio::test]
+    async fn validators_attach_the_etag_and_answer_304_on_a_match() {
+        let etag = etag_for("key");
+        // No conditional header: the ETag is attached and the
+        // response is otherwise untouched.
+        let mut resp = respond(ImageFormat::Png, None, vec![1, 2, 3], None);
+        finalize_validators(&mut resp, &etag, None);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::ETAG).unwrap(), etag.as_str());
+        // A matching If-None-Match: 304, empty body, and the
+        // content headers are gone.
+        let mut resp = respond(ImageFormat::Png, None, vec![1, 2, 3], None);
+        finalize_validators(&mut resp, &etag, Some(etag.as_str()));
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert!(resp.headers().get(header::CONTENT_TYPE).is_none());
+        assert!(resp.headers().get(header::CONTENT_LENGTH).is_none());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+        // A non-matching value: the full 200 goes out, ETag on.
+        let mut resp = respond(ImageFormat::Png, None, vec![1, 2, 3], None);
+        finalize_validators(&mut resp, &etag, Some("\"other\""));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn validators_skip_meta_and_error_responses() {
+        let etag = etag_for("key");
+        // Meta responses are private, no-store: no ETag is
+        // attached and a matching conditional never 304s them.
+        let mut resp = respond(ImageFormat::Png, None, vec![1], None);
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
+        finalize_validators(&mut resp, &etag, Some(etag.as_str()));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::ETAG).is_none());
+        // An error status is left alone too, public or not.
+        let mut resp = respond(ImageFormat::Png, None, vec![1], None);
+        *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        finalize_validators(&mut resp, &etag, Some(etag.as_str()));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(header::ETAG).is_none());
+    }
+
     #[tokio::test]
     async fn width_hint_sizes_an_unsized_url_and_separates_the_cache() {
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;

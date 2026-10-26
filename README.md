@@ -112,6 +112,10 @@ The directive changes the response header only. It never enters the cache key, s
 
 Like `exp`, the segment sits inside the signed remainder and repeated segments resolve to the last one. A malformed or out-of-range value is a `400`, never a silent fallback to the default. Presets stay immutable by default; putting `maxage` on a preset URL is the caller's explicit choice for that response, and preset definitions cannot contain it (it is per-request metadata, like `exp`).
 
+### Revalidation
+
+Every cacheable image response also carries a strong `ETag`, derived from the response's canonical cache key, so it identifies the exact bytes of the variant that key selects. A client or CDN holding a copy can revalidate with `If-None-Match`: when the value matches (an exact match, a weak `W/` spelling, one entry of a comma list, or `*`), the answer is `304 Not Modified` with no body, on cache hits and fresh renders alike; anything else gets the full `200`. The validator applies only to public `200` image responses: meta responses (`private, no-store`), fallbacks, and errors carry no `ETag` and are never answered with a `304`. It pairs with `maxage:0` for URLs whose copies should be checked before every reuse.
+
 ### Source images
 
 The loader fetches the source under fixed limits, for every source kind:
