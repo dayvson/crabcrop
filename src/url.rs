@@ -1971,9 +1971,7 @@ fn normalize_root_path(path: &str) -> Option<String> {
         match decoded.as_str() {
             "." => {}
             ".." => {
-                if out.pop().is_none() {
-                    return None;
-                }
+                out.pop()?;
             }
             _ => out.push(seg),
         }
