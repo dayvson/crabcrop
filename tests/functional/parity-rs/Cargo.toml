@@ -1,0 +1,10 @@
+[package]
+name = "functional-parity-rs"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+crabcrop-url = { path = "../../../crates/crabcrop-url" }
+serde_json = "1"
+
+[workspace]

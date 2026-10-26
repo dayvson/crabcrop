@@ -1,0 +1,2509 @@
+[
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": [
+     300,
+     200
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-exact",
+  "ops": "300x200",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": [
+     300,
+     225
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-w-only",
+  "ops": "300x0",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": [
+     267,
+     200
+    ],
+    "t": "dims",
+    "tol": 1
+   }
+  ],
+  "group": "sizing",
+  "id": "size-h-only",
+  "ops": "0x200",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     1000,
+     100
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-orig-axis",
+  "ops": "origx100",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     1000,
+     750
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-0x0",
+  "ops": "0x0",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   }
+  ],
+  "group": "sizing",
+  "id": "flip-ref",
+  "ops": "300x200/filters:flip(h):format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     300,
+     200
+    ],
+    "t": "dims"
+   },
+   {
+    "lt": 2,
+    "t": "diff_mean",
+    "vs": "flip-ref"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-flip-neg",
+  "ops": "-300x200/filters:format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-cap-edge",
+  "ops": "16383x100",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-overcap",
+  "ops": "16400x100",
+  "src": "dog.jpg",
+  "why": "README: outputs capped at 16383 px per axis, a request past the bound fails with 400",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-overcap-16384",
+  "ops": "16384x100",
+  "src": "dog.jpg",
+  "why": "first value past the per-axis cap",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-overmp",
+  "ops": "10000x10001",
+  "src": "dog.jpg",
+  "why": "100 MP aggregate cap, clean 400 expected",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "sizing",
+  "id": "size-garbage",
+  "ops": "abcx100",
+  "src": "dog.jpg",
+  "why": "size-shaped garbage segment: grammar failure should be a 400, not a loader 502",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     800,
+     600
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "fit-in",
+  "id": "fitin-box",
+  "ops": "fit-in:800x600",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     400,
+     300
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "fit-in",
+  "id": "fitin-tall",
+  "ops": "fit-in:400x400",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     500,
+     375
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "fit-in",
+  "id": "fitin-unbounded",
+  "ops": "fit-in:500x0",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     533,
+     800
+    ],
+    "t": "dims",
+    "tol": 1
+   }
+  ],
+  "group": "fit-in",
+  "id": "fitin-adaptive",
+  "ops": "fit-in:800x600:adaptive",
+  "src": "person-portrait.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     400,
+     600
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "fit-in",
+  "id": "fitin-noadaptive",
+  "ops": "fit-in:800x600",
+  "src": "person-portrait.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     1200,
+     630
+    ],
+    "t": "dims"
+   },
+   {
+    "rgb": [
+     0,
+     255,
+     0
+    ],
+    "t": "pixel_eq",
+    "tol": 10,
+    "xy": [
+     5,
+     5
+    ]
+   }
+  ],
+  "group": "pad",
+  "id": "pad-fill",
+  "ops": "pad:1200x630:00ff00/filters:format(png)",
+  "src": "person-portrait.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     1200,
+     630
+    ],
+    "t": "dims"
+   },
+   {
+    "box": [
+     0,
+     0,
+     200,
+     630
+    ],
+    "ch": 0,
+    "gt": 3,
+    "t": "region_std"
+   }
+  ],
+  "group": "pad",
+  "id": "pad-blur",
+  "ops": "pad:1200x630:blur",
+  "src": "person-portrait.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     1000,
+     1000
+    ],
+    "t": "dims"
+   },
+   {
+    "rgb": [
+     0,
+     0,
+     0
+    ],
+    "t": "pixel_eq",
+    "tol": 6,
+    "xy": [
+     5,
+     5
+    ]
+   }
+  ],
+  "group": "pad",
+  "id": "pad-default",
+  "ops": "pad:1000x1000/filters:format(png)",
+  "src": "dog.jpg",
+  "why": "docs: unnamed fill falls back to the fill() color, else black",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     400,
+     400
+    ],
+    "t": "dims"
+   },
+   {
+    "pred": "r_dom",
+    "t": "pixel",
+    "xy": [
+     100,
+     100
+    ]
+   },
+   {
+    "pred": "g_dom",
+    "t": "pixel",
+    "xy": [
+     300,
+     100
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-center",
+  "ops": "crop:400x400",
+  "src": "quadrant.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "pred": "r_dom",
+    "t": "pixel",
+    "xy": [
+     30,
+     30
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-top-left",
+  "ops": "crop:400x400:top-left",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "yellow",
+    "t": "pixel",
+    "xy": [
+     370,
+     370
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-bottom-right",
+  "ops": "crop:400x400:bottom-right",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "r_dom",
+    "t": "pixel",
+    "xy": [
+     30,
+     30
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-top",
+  "ops": "crop:400x400:top",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "b_dom",
+    "t": "pixel",
+    "xy": [
+     30,
+     370
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-left",
+  "ops": "crop:400x400:left",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "g_dom",
+    "t": "pixel",
+    "xy": [
+     370,
+     30
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-top-right",
+  "ops": "crop:400x400:top-right",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "g_dom",
+    "t": "pixel",
+    "xy": [
+     370,
+     30
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-right",
+  "ops": "crop:400x400:right",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "yellow",
+    "t": "pixel",
+    "xy": [
+     370,
+     370
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-bottom",
+  "ops": "crop:400x400:bottom",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "b_dom",
+    "t": "pixel",
+    "xy": [
+     30,
+     370
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-bottom-left",
+  "ops": "crop:400x400:bottom-left",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     200,
+     150
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "sizing",
+  "id": "no-upscale",
+  "ops": "300x200/filters:no_upscale",
+  "src": "small.jpg",
+  "why": "a 200x150 source asked for 300x200 stays at the source size with no_upscale",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "rgb": [
+     0,
+     0,
+     255
+    ],
+    "t": "pixel_eq",
+    "tol": 12,
+    "xy": [
+     4,
+     4
+    ]
+   }
+  ],
+  "group": "pad",
+  "id": "fill-bg",
+  "ops": "400x0/filters:fill(0000ff):format(jpeg)",
+  "src": "logo.png",
+  "why": "fill() supplies the background that shows through transparency when flattening to JPEG",
+  "tier": "full"
+ },
+ {
+  "group": "crop",
+  "id": "crop-smart-nomodel",
+  "observe": true,
+  "ops": "crop:700x700:smart",
+  "src": "dog.jpg",
+  "why": "no face model configured on this server: saliency fallback expected",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 501,
+    "t": "status"
+   },
+   {
+    "s": "face operations are not configured",
+    "t": "body_contains"
+   }
+  ],
+  "group": "crop",
+  "id": "crop-face-nomodel",
+  "ops": "crop:300x300:face",
+  "src": "person-portrait.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     600,
+     400
+    ],
+    "t": "dims"
+   },
+   {
+    "pred": "r_dom",
+    "t": "pixel",
+    "xy": [
+     10,
+     10
+    ]
+   },
+   {
+    "pred": "yellow",
+    "t": "pixel",
+    "xy": [
+     589,
+     389
+    ]
+   }
+  ],
+  "group": "crop",
+  "id": "crop-rect",
+  "ops": "crop-rect:100x50:700x450/filters:format(png)",
+  "src": "quadrant.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "crop",
+  "id": "crop-rect-oob",
+  "ops": "crop-rect:900x50:1200x450",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   }
+  ],
+  "group": "crop",
+  "id": "crop-center-nofocal",
+  "ops": "crop:400x400:center/filters:format(png)",
+  "src": "quadrant.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "r_dom",
+    "t": "pixel",
+    "xy": [
+     60,
+     60
+    ]
+   },
+   {
+    "gt": 5,
+    "t": "diff_mean",
+    "vs": "crop-center-nofocal"
+   }
+  ],
+  "group": "crop",
+  "id": "focal-center",
+  "ops": "focal:0x0:400x300/crop:400x400:center/filters:format(png)",
+  "src": "quadrant.jpg",
+  "why": "focal rect must pull the center-crop window onto the named rectangle",
+  "tier": "full"
+ },
+ {
+  "group": "crop",
+  "id": "crop-smart-debug",
+  "observe": true,
+  "ops": "debug:focal/crop:700x700:smart",
+  "src": "dog.jpg",
+  "why": "debug view renders without AI models (saliency drives it)",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     600,
+     400
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "dpr",
+  "id": "dpr2",
+  "ops": "300x200/filters:dpr(2)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     450,
+     300
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "dpr",
+  "id": "dpr15",
+  "ops": "300x200/filters:dpr(1.5)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     600,
+     400
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "dpr",
+  "headers": {
+   "DPR": "2"
+  },
+  "id": "dpr-header",
+  "ops": "300x200",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     300,
+     200
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "dpr",
+  "headers": {
+   "DPR": "7"
+  },
+  "id": "dpr-header-bad",
+  "ops": "300x200",
+  "src": "dog.jpg",
+  "why": "invalid DPR hint is ignored per docs",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     100,
+     100
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "dpr",
+  "id": "dpr-croprect-noscale",
+  "ops": "crop-rect:0x0:100x100/filters:dpr(2)",
+  "src": "quadrant.jpg",
+  "why": "crop-rect coordinates address source pixels and are not scaled by dpr",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 1000,
+    "field": "source_width",
+    "t": "meta"
+   },
+   {
+    "eq": 750,
+    "field": "source_height",
+    "t": "meta"
+   }
+  ],
+  "group": "exif",
+  "id": "exif-meta",
+  "kind": "meta",
+  "ops": "0x0",
+  "src": "exif-orient.jpg",
+  "why": "meta source dims are reported after EXIF orientation (stored 750x1000, tag 6)",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     1000,
+     750
+    ],
+    "t": "dims"
+   },
+   {
+    "file": "dog.jpg",
+    "lt": 6,
+    "t": "diff_file"
+   }
+  ],
+  "group": "exif",
+  "id": "exif-render",
+  "ops": "0x0/filters:format(png)",
+  "src": "exif-orient.jpg",
+  "why": "orientation honored at decode: output is the upright dog, not the stored sideways pixels",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     500,
+     375
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "hints",
+  "headers": {
+   "Sec-CH-Width": "500"
+  },
+  "id": "width-hint",
+  "ops": "",
+  "src": "dog.jpg",
+  "why": "bare source URL plus width hint resizes as if the URL carried the width",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": "image/jpeg",
+    "t": "ct"
+   },
+   {
+    "fmt": "jpeg",
+    "t": "magic"
+   },
+   {
+    "eq": "jpeg",
+    "field": "format",
+    "t": "meta"
+   },
+   {
+    "t": "meta_bytes_match"
+   }
+  ],
+  "group": "format",
+  "id": "format-jpeg",
+  "ops": "800x0/filters:format(jpeg)",
+  "src": "car.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": "image/png",
+    "t": "ct"
+   },
+   {
+    "fmt": "png",
+    "t": "magic"
+   },
+   {
+    "eq": "png",
+    "field": "format",
+    "t": "meta"
+   },
+   {
+    "t": "meta_bytes_match"
+   }
+  ],
+  "group": "format",
+  "id": "format-png",
+  "ops": "800x0/filters:format(png)",
+  "src": "car.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": "image/webp",
+    "t": "ct"
+   },
+   {
+    "fmt": "webp",
+    "t": "magic"
+   },
+   {
+    "eq": "webp",
+    "field": "format",
+    "t": "meta"
+   },
+   {
+    "t": "meta_bytes_match"
+   }
+  ],
+  "group": "format",
+  "id": "format-webp",
+  "ops": "800x0/filters:format(webp)",
+  "src": "car.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": "image/jxl",
+    "t": "ct"
+   },
+   {
+    "fmt": "jxl",
+    "t": "magic"
+   },
+   {
+    "eq": "jxl",
+    "field": "format",
+    "t": "meta"
+   },
+   {
+    "t": "meta_bytes_match"
+   }
+  ],
+  "group": "format",
+  "id": "format-jxl",
+  "ops": "800x0/filters:format(jxl)",
+  "src": "car.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": "image/avif",
+    "t": "ct"
+   },
+   {
+    "fmt": "avif",
+    "t": "magic"
+   },
+   {
+    "eq": "avif",
+    "field": "format",
+    "t": "meta"
+   },
+   {
+    "t": "meta_bytes_match"
+   }
+  ],
+  "group": "format",
+  "id": "format-avif",
+  "ops": "800x0/filters:format(avif)",
+  "src": "car.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": "image/gif",
+    "t": "ct"
+   },
+   {
+    "fmt": "gif",
+    "t": "magic"
+   },
+   {
+    "eq": "gif",
+    "field": "format",
+    "t": "meta"
+   },
+   {
+    "t": "meta_bytes_match"
+   }
+  ],
+  "group": "format",
+  "id": "format-gif",
+  "ops": "800x0/filters:format(gif)",
+  "src": "car.jpg",
+  "tier": "full"
+ },
+ {
+  "group": "format",
+  "id": "format-jpeg-native",
+  "observe": true,
+  "ops": "0x0/filters:format(jpeg):quality(80)",
+  "src": "car.jpg",
+  "why": "compression table: native-size q80 re-encode vs the 121706B source",
+  "tier": "full"
+ },
+ {
+  "accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+  "assert": [
+   {
+    "eq": "image/avif",
+    "t": "ct"
+   }
+  ],
+  "group": "negotiation",
+  "id": "neg-chrome",
+  "ops": "800x0",
+  "src": "car.jpg",
+  "tier": "smoke"
+ },
+ {
+  "accept": "image/webp",
+  "assert": [
+   {
+    "eq": "image/webp",
+    "t": "ct"
+   }
+  ],
+  "group": "negotiation",
+  "id": "neg-webp-only",
+  "ops": "800x0",
+  "src": "car.jpg",
+  "tier": "full"
+ },
+ {
+  "accept": "image/avif;q=0, image/webp",
+  "assert": [
+   {
+    "eq": "image/webp",
+    "t": "ct"
+   }
+  ],
+  "group": "negotiation",
+  "id": "neg-avif-refused",
+  "ops": "800x0",
+  "src": "car.jpg",
+  "why": "a format refused with q=0 is never picked",
+  "tier": "full"
+ },
+ {
+  "accept": "image/avif;q=0.4, image/jxl;q=0.9, image/webp;q=0.8",
+  "assert": [
+   {
+    "eq": "image/jxl",
+    "t": "ct"
+   }
+  ],
+  "group": "negotiation",
+  "id": "neg-jxl-best",
+  "ops": "800x0",
+  "src": "car.jpg",
+  "why": "highest q wins over server preference",
+  "tier": "full"
+ },
+ {
+  "accept": "image/png,*/*;q=0.8",
+  "assert": [
+   {
+    "eq": "image/jpeg",
+    "t": "ct"
+   }
+  ],
+  "group": "negotiation",
+  "id": "neg-none-offered",
+  "ops": "800x0",
+  "src": "car.jpg",
+  "why": "no negotiable format offered (wildcards do not count): source format kept",
+  "tier": "full"
+ },
+ {
+  "accept": "image/jxl",
+  "assert": [
+   {
+    "eq": "image/gif",
+    "t": "ct"
+   },
+   {
+    "eq": 12,
+    "t": "frames"
+   }
+  ],
+  "group": "negotiation",
+  "id": "neg-gif-jxl",
+  "ops": "",
+  "src": "anim.gif",
+  "why": "animated GIF never negotiates to JXL, which would drop its frames",
+  "tier": "full"
+ },
+ {
+  "accept": "image/jxl",
+  "assert": [
+   {
+    "eq": "image/jxl",
+    "t": "ct"
+   }
+  ],
+  "group": "negotiation",
+  "id": "neg-webp-src-jxl",
+  "ops": "800x0",
+  "src": "night.webp",
+  "why": "still WebP source: the documented keep-WebP exception covers ANIMATED sources only (README format negotiation), so a still converts to the negotiated format",
+  "tier": "full"
+ },
+ {
+  "accept": "image/jxl",
+  "assert": [
+   {
+    "eq": "image/webp",
+    "t": "ct"
+   }
+  ],
+  "group": "negotiation",
+  "id": "neg-animwebp-jxl",
+  "ops": "",
+  "src": "anim.webp",
+  "timeout": 1500,
+  "why": "animated WebP source: same documented exception as GIF",
+  "tier": "full"
+ },
+ {
+  "accept": "image/avif",
+  "group": "negotiation",
+  "id": "neg-gif-avif",
+  "observe": true,
+  "ops": "",
+  "samples_brand": true,
+  "src": "anim.gif",
+  "why": "docs carve out only JXL by name for animated sources; record the AVIF brand (avif still vs avis sequence) and bytes",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   }
+  ],
+  "group": "quality",
+  "id": "quality-30",
+  "ops": "1000x0/filters:format(jpeg):quality(30)",
+  "src": "screenshot.png",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "cell": "quality-30",
+    "t": "bytes_gt_cell"
+   }
+  ],
+  "group": "quality",
+  "id": "quality-95",
+  "ops": "1000x0/filters:format(jpeg):quality(95)",
+  "src": "screenshot.png",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "k": "x-crabcrop-quality",
+    "t": "header_present"
+   },
+   {
+    "field": "ssimulacra2",
+    "t": "meta_field_present"
+   }
+  ],
+  "group": "quality",
+  "id": "quality-auto",
+  "ops": "1000x0/filters:format(jpeg):quality(auto)",
+  "src": "screenshot.png",
+  "why": "auto quality is reported in the header and verified with ssimulacra2 in meta",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   }
+  ],
+  "group": "quality",
+  "id": "quality-webp-80",
+  "ops": "600x0/filters:format(webp):quality(80)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "cell": "quality-webp-80",
+    "t": "bytes_gt_cell"
+   }
+  ],
+  "group": "quality",
+  "id": "quality-webp-lossless",
+  "ops": "600x0/filters:format(webp):quality(100)",
+  "src": "dog.jpg",
+  "why": "quality(100) selects the lossless WebP encode per docs",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": "70",
+    "k": "x-crabcrop-quality",
+    "t": "header"
+   }
+  ],
+  "group": "quality",
+  "headers": {
+   "Save-Data": "on"
+  },
+  "id": "savedata",
+  "ops": "800x0/filters:format(jpeg)",
+  "src": "dog.jpg",
+  "why": "Save-Data steps the default quality from 80 to 70",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "t": "bytes_lte",
+    "v": 30000
+   },
+   {
+    "k": "x-crabcrop-quality",
+    "t": "header_present"
+   }
+  ],
+  "group": "quality",
+  "id": "maxbytes-30k",
+  "ops": "1200x0/filters:format(jpeg):quality(95):max_bytes(30000)",
+  "src": "car.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "t": "bytes_lte",
+    "v": 20000
+   },
+   {
+    "k": "x-crabcrop-quality",
+    "t": "header_present"
+   }
+  ],
+  "group": "quality",
+  "id": "maxbytes-20k",
+  "ops": "1200x0/filters:format(jpeg):quality(95):max_bytes(20000)",
+  "src": "car.jpg",
+  "why": "a tighter budget must step quality below the 30000B result (28570B at q15 in probing)",
+  "tier": "full"
+ },
+ {
+  "group": "quality",
+  "id": "maxbytes-tiny",
+  "observe": true,
+  "ops": "1200x0/filters:format(jpeg):quality(95):max_bytes(800)",
+  "src": "car.jpg",
+  "why": "unreachable budget: docs promise the smallest encode rather than an error; record bytes and quality used",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": [
+     400,
+     300
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "adjust",
+  "id": "adj-base",
+  "ops": "400x0/filters:format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   }
+  ],
+  "group": "adjust",
+  "id": "adj-base-shot",
+  "ops": "400x0/filters:format(png)",
+  "src": "screenshot.png",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "ch": 0,
+    "dir": "up",
+    "min": 15,
+    "t": "mean_shift",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "adjust",
+  "id": "brighten-pos",
+  "ops": "400x0/filters:brighten(40):format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "ch": 0,
+    "dir": "down",
+    "min": 15,
+    "t": "mean_shift",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "adjust",
+  "id": "brighten-neg",
+  "ops": "400x0/filters:brighten(-40):format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "dir": "gt",
+    "t": "std_cmp",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "adjust",
+  "id": "contrast-pos",
+  "ops": "400x0/filters:contrast(25):format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "t": "std_lte",
+    "v": 2
+   },
+   {
+    "max_spread": 8,
+    "t": "gray"
+   }
+  ],
+  "group": "adjust",
+  "id": "contrast-flat",
+  "ops": "400x0/filters:contrast(-100):format(png)",
+  "src": "dog.jpg",
+  "why": "docs: contrast -100 is flat gray",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "max_spread": 4,
+    "t": "gray"
+   }
+  ],
+  "group": "adjust",
+  "id": "saturation-0",
+  "ops": "400x0/filters:saturation(0):format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "dir": "gt",
+    "t": "sat_cmp",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "adjust",
+  "id": "saturation-2",
+  "ops": "400x0/filters:saturation(2):format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "dir": "lt",
+    "t": "sat_cmp",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "adjust",
+  "id": "saturation-half",
+  "ops": "400x0/filters:saturation(0.5):format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "between": [
+     5,
+     15
+    ],
+    "ch": 0,
+    "t": "mean_shift",
+    "vs": "adj-base"
+   },
+   {
+    "between": [
+     -10,
+     0
+    ],
+    "ch": 1,
+    "t": "mean_shift",
+    "vs": "adj-base"
+   },
+   {
+    "between": [
+     -3,
+     3
+    ],
+    "ch": 2,
+    "t": "mean_shift",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "adjust",
+  "id": "rgb-shift",
+  "ops": "400x0/filters:rgb(10,-5,0):format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "deg": [
+     65,
+     115
+    ],
+    "t": "hue_shift",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "adjust",
+  "id": "huerotate-90",
+  "ops": "400x0/filters:huerotate(90):format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "lt": 2,
+    "t": "diff_mean",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "adjust",
+  "id": "curve-id",
+  "ops": "400x0/filters:curve(rgb,0,0,255,255):format(png)",
+  "src": "dog.jpg",
+  "why": "the identity curve changes nothing",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "ch": 0,
+    "dir": "up",
+    "min": 8,
+    "t": "mean_shift",
+    "vs": "adj-base-shot"
+   },
+   {
+    "between": [
+     -3,
+     3
+    ],
+    "ch": 1,
+    "t": "mean_shift",
+    "vs": "adj-base-shot"
+   },
+   {
+    "between": [
+     -3,
+     3
+    ],
+    "ch": 2,
+    "t": "mean_shift",
+    "vs": "adj-base-shot"
+   }
+  ],
+  "group": "adjust",
+  "id": "curve-red-lift",
+  "ops": "400x0/filters:curve(r,0,64,255,255):format(png)",
+  "src": "screenshot.png",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "max_spread": 4,
+    "t": "gray"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-grayscale",
+  "ops": "400x0/filters:grayscale:format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "cell": "adj-base",
+    "t": "invert_of"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-invert",
+  "ops": "400x0/filters:invert:format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "order": "rgb_desc",
+    "t": "channel_order"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-sepia",
+  "ops": "400x0/filters:sepia:format(png)",
+  "src": "dog.jpg",
+  "why": "sepia casts warm: channel means run R > G > B",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "rgb": [
+     26,
+     26,
+     64
+    ],
+    "t": "extreme_near",
+    "tol": 34,
+    "which": "min"
+   },
+   {
+    "rgb": [
+     255,
+     217,
+     160
+    ],
+    "t": "extreme_near",
+    "tol": 34,
+    "which": "max"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-duotone",
+  "ops": "400x0/filters:duotone(1a1a40,ffd9a0):format(png)",
+  "src": "screenshot.png",
+  "why": "shadows map to the first color, highlights to the second",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "rgb": [
+     255,
+     128,
+     0
+    ],
+    "t": "extreme_near",
+    "tol": 30,
+    "which": "max"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-monochrome",
+  "ops": "400x0/filters:monochrome(ff8000):format(png)",
+  "src": "screenshot.png",
+  "why": "full luminance renders exactly the named color",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": [
+     800,
+     1200
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "effects",
+  "id": "night-base",
+  "ops": "800x0/filters:format(png)",
+  "src": "night.webp",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "dir": "gt",
+    "t": "std_cmp",
+    "vs": "night-base"
+   },
+   {
+    "ch": 0,
+    "dir": "up",
+    "min": 4,
+    "t": "mean_shift",
+    "vs": "night-base"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-equalize",
+  "ops": "800x0/filters:equalize:format(png)",
+  "src": "night.webp",
+  "why": "equalizing a low-light frame spreads the histogram and lifts the mean",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "dir": "lt",
+    "t": "local_var_cmp",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-blur",
+  "ops": "400x0/filters:blur(3):format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "dir": "gt",
+    "t": "local_var_cmp",
+    "vs": "adj-base-shot"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-sharpen",
+  "ops": "400x0/filters:sharpen(2):format(png)",
+  "src": "screenshot.png",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "t": "deterministic"
+   },
+   {
+    "dir": "gt",
+    "t": "local_var_cmp",
+    "vs": "night-base"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-noise",
+  "ops": "800x0/filters:noise(30):format(png)",
+  "src": "night.webp",
+  "why": "noise is seeded from content: the same request must return the same bytes after a purge",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "lte": 1600,
+    "t": "unique_colors"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-pixelate",
+  "ops": "400x0/filters:pixelate(10):format(png)",
+  "src": "dog.jpg",
+  "why": "10 px blocks over 400x300 give at most 1200 block colors",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "lt": 2,
+    "t": "diff_mean",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-convolution-id",
+  "ops": "400x0/filters:convolution(0,0,0,0,1,0,0,0,0,0):format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "dir": "lt",
+    "t": "local_var_cmp",
+    "vs": "adj-base"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-convolution-box",
+  "ops": "400x0/filters:convolution(1,1,1,1,1,1,1,1,1,1):format(png)",
+  "src": "dog.jpg",
+  "why": "all-ones kernel with the normalize flag is a box average",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": [
+     1440,
+     900
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "effects",
+  "id": "shot-base",
+  "ops": "0x0/filters:format(png)",
+  "src": "screenshot.png",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "box": [
+     340,
+     140,
+     840,
+     180
+    ],
+    "dir": "lt",
+    "t": "region_local_var",
+    "vs": "shot-base"
+   },
+   {
+    "box": [
+     0,
+     600,
+     300,
+     900
+    ],
+    "lt": 2,
+    "t": "region_diff",
+    "vs": "shot-base"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-blur-region",
+  "ops": "filters:blur_region(340,140,500,40):format(png)",
+  "src": "screenshot.png",
+  "why": "only the named rectangle blurs; pixels outside it are untouched",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "box": [
+     340,
+     140,
+     840,
+     180
+    ],
+    "gt": 2,
+    "t": "region_diff",
+    "vs": "shot-base"
+   },
+   {
+    "box": [
+     340,
+     140,
+     840,
+     180
+    ],
+    "dir": "lt",
+    "t": "region_local_var",
+    "vs": "shot-base"
+   }
+  ],
+  "group": "effects",
+  "id": "fx-pixelate-region",
+  "ops": "filters:pixelate_region(340,140,500,40):format(png)",
+  "src": "screenshot.png",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     300,
+     400
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "rotate",
+  "id": "rot-90",
+  "ops": "400x0/filters:rotate(90):format(png)",
+  "src": "dog.jpg",
+  "why": "400x300 canvas quarter-turns to 300x400",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     400,
+     300
+    ],
+    "t": "dims_gt"
+   },
+   {
+    "pred": "white",
+    "t": "pixel",
+    "xy": [
+     3,
+     3
+    ]
+   }
+  ],
+  "group": "rotate",
+  "id": "rot-45",
+  "ops": "400x0/filters:rotate(45)",
+  "src": "dog.jpg",
+  "why": "non-quarter angles expand the canvas; uncovered corners take the fill color (white by default)",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     300,
+     400
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "rotate",
+  "id": "rot-neg90",
+  "ops": "400x0/filters:rotate(-90):format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "group": "rotate",
+  "id": "rot-quadrant-90",
+  "observe": true,
+  "ops": "filters:rotate(90):format(png)",
+  "samples": [
+   [
+    60,
+    60
+   ],
+   [
+    540,
+    60
+   ],
+   [
+    60,
+    740
+   ],
+   [
+    540,
+    740
+   ]
+  ],
+  "src": "quadrant.jpg",
+  "why": "record which quadrant lands in each corner for a +90 rotation (output is 600x800)",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "pred": "g_dom",
+    "t": "pixel",
+    "xy": [
+     60,
+     60
+    ]
+   },
+   {
+    "pred": "b_dom",
+    "t": "pixel",
+    "xy": [
+     740,
+     540
+    ]
+   }
+  ],
+  "group": "rotate",
+  "id": "flip-quadrant-h",
+  "ops": "filters:flip(h):format(png)",
+  "src": "quadrant.jpg",
+  "why": "horizontal flip swaps the left and right quadrants",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     1000,
+     688
+    ],
+    "t": "dims",
+    "tol": 6
+   }
+  ],
+  "group": "trim",
+  "id": "trim-photo",
+  "ops": "filters:trim:format(jpeg)",
+  "src": "bordered.jpg",
+  "why": "the 90 px white border comes off, leaving the cat photo",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     400,
+     466
+    ],
+    "t": "dims",
+    "tol": 16
+   }
+  ],
+  "group": "trim",
+  "id": "trim-logo",
+  "ops": "filters:trim:format(png)",
+  "src": "logo.png",
+  "why": "transparent margins trim to the drawn content bounding box",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     400,
+     300
+    ],
+    "t": "dims"
+   },
+   {
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "t": "pixel_eq",
+    "tol": 10,
+    "xy": [
+     2,
+     2
+    ]
+   }
+  ],
+  "group": "border-radius-mask",
+  "id": "border-red",
+  "ops": "400x0/filters:border(10,ff0000):format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 0,
+    "t": "pixel_alpha",
+    "tol": 12,
+    "xy": [
+     0,
+     0
+    ]
+   },
+   {
+    "eq": 255,
+    "t": "pixel_alpha",
+    "tol": 4,
+    "xy": [
+     200,
+     150
+    ]
+   }
+  ],
+  "group": "border-radius-mask",
+  "id": "radius-png",
+  "ops": "400x0/filters:radius(40):format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   },
+   {
+    "s": "radius needs an alpha-capable output format",
+    "t": "body_contains"
+   }
+  ],
+  "group": "border-radius-mask",
+  "id": "radius-jpeg",
+  "ops": "400x0/filters:radius(40):format(jpeg)",
+  "src": "dog.jpg",
+  "why": "docs: radius output must carry alpha; an explicit jpeg request answers 400",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 0,
+    "t": "pixel_alpha",
+    "tol": 12,
+    "xy": [
+     0,
+     0
+    ]
+   },
+   {
+    "eq": 255,
+    "t": "pixel_alpha",
+    "tol": 4,
+    "xy": [
+     200,
+     150
+    ]
+   }
+  ],
+  "group": "border-radius-mask",
+  "id": "mask-circle",
+  "ops": "400x0/filters:mask(circle):format(png)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   },
+   {
+    "s": "mask needs an alpha-capable output format",
+    "t": "body_contains"
+   }
+  ],
+  "group": "border-radius-mask",
+  "id": "mask-jpeg",
+  "ops": "400x0/filters:mask(circle):format(jpeg)",
+  "src": "dog.jpg",
+  "why": "same alpha-format rule as radius",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": [
+     1200,
+     900
+    ],
+    "t": "dims"
+   },
+   {
+    "pred": "r_dom",
+    "t": "pixel",
+    "xy": [
+     740,
+     610
+    ]
+   }
+  ],
+  "group": "overlay",
+  "id": "watermark-logo",
+  "ops": "1200x0/filters:watermark({ORIGIN_ENC}%2Flogo.png,-10,-10,80):format(png)",
+  "src": "dog.jpg",
+  "why": "logo bottom-right at 80 percent: its red core lands at (740,610) of the 1200x900 frame",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "box": [
+     150,
+     150,
+     550,
+     350
+    ],
+    "gt": 3,
+    "t": "region_diff",
+    "vs": "shot-base"
+   }
+  ],
+  "group": "overlay",
+  "id": "overlay-multiply",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Flogo.png,0,0,100,multiply,50):format(png)",
+  "src": "screenshot.png",
+  "why": "multiply blend of the logo over the screenshot's top-left changes that region",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 501,
+    "t": "status"
+   }
+  ],
+  "group": "overlay",
+  "id": "text-nofont",
+  "ops": "800x0/filters:text(Hello,32,ffffff,center)",
+  "src": "dog.jpg",
+  "why": "no font configured on this server: text answers 501 per docs",
+  "tier": "full",
+  "profile": "nofont"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": "image/gif",
+    "t": "ct"
+   },
+   {
+    "eq": 12,
+    "t": "frames"
+   },
+   {
+    "eq": [
+     480,
+     320
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "animation",
+  "id": "anim-bare",
+  "ops": "",
+  "src": "anim.gif",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 12,
+    "t": "frames"
+   },
+   {
+    "eq": [
+     240,
+     160
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "animation",
+  "id": "anim-resize",
+  "ops": "240x160/filters:format(gif)",
+  "src": "anim.gif",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 12,
+    "t": "frames"
+   },
+   {
+    "max_spread": 6,
+    "t": "gray"
+   }
+  ],
+  "group": "animation",
+  "id": "anim-gray",
+  "ops": "filters:grayscale:format(gif)",
+  "src": "anim.gif",
+  "why": "filters apply per frame on animated sources",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 501,
+    "t": "status"
+   }
+  ],
+  "group": "animation",
+  "id": "anim-mp4",
+  "ops": "filters:format(mp4)",
+  "src": "anim.gif",
+  "why": "no video encoder configured: 501 per docs",
+  "tier": "full"
+ },
+ {
+  "group": "animation",
+  "id": "animwebp-resize",
+  "observe": true,
+  "ops": "240x160/filters:format(webp)",
+  "src": "anim.webp",
+  "timeout": 1500,
+  "why": "animated WebP source re-encoded at small size: record duration and bytes (suspected VP8L pathology, see neg-animwebp-jxl)",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "t": "exif_absent"
+   }
+  ],
+  "group": "metadata",
+  "id": "meta-strip-exif",
+  "ops": "0x0/filters:format(jpeg)",
+  "src": "exif-orient.jpg",
+  "why": "default metadata policy is strip",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "t": "icc_ne_source"
+   }
+  ],
+  "group": "metadata",
+  "id": "icc-default",
+  "ops": "0x0/filters:format(jpeg)",
+  "src": "icc.jpg",
+  "why": "default pipeline converts to sRGB instead of embedding the source profile",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "t": "icc_eq_source"
+   }
+  ],
+  "group": "metadata",
+  "id": "icc-keep",
+  "ops": "0x0/filters:keep_profile:format(jpeg)",
+  "src": "icc.jpg",
+  "why": "keep_profile embeds the source ICC profile in JPEG output",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 1,
+    "t": "exif_orientation"
+   },
+   {
+    "eq": "Wave1Cam",
+    "t": "exif_field",
+    "tag": 271
+   }
+  ],
+  "group": "metadata",
+  "id": "meta-preserve-exif",
+  "ops": "0x0/filters:format(jpeg)",
+  "profile": "preserve",
+  "src": "exif-orient.jpg",
+  "why": "preserve copies source EXIF with the orientation rewritten to 1",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 1,
+    "t": "exif_orientation"
+   }
+  ],
+  "group": "metadata",
+  "id": "meta-preserve-png",
+  "ops": "0x0/filters:format(png)",
+  "profile": "preserve",
+  "src": "exif-orient.jpg",
+  "why": "preserve also carries EXIF into PNG outputs",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 300,
+    "field": "width",
+    "t": "meta"
+   },
+   {
+    "eq": 200,
+    "field": "height",
+    "t": "meta"
+   },
+   {
+    "eq": "jpeg",
+    "field": "format",
+    "t": "meta"
+   },
+   {
+    "eq": 1000,
+    "field": "source_width",
+    "t": "meta"
+   },
+   {
+    "eq": 750,
+    "field": "source_height",
+    "t": "meta"
+   },
+   {
+    "t": "meta_bytes_match"
+   }
+  ],
+  "group": "meta",
+  "id": "meta-basic",
+  "kind": "meta",
+  "ops": "300x200",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "accept": "application/json; placeholders=1",
+  "assert": [
+   {
+    "field": "dominant_color",
+    "t": "meta_field_present"
+   },
+   {
+    "field": "placeholder",
+    "t": "meta_field_present"
+   },
+   {
+    "field": "thumbhash",
+    "t": "meta_field_present"
+   },
+   {
+    "eq": 5,
+    "field": "palette",
+    "t": "meta_field_len"
+   }
+  ],
+  "group": "meta",
+  "id": "meta-placeholders",
+  "kind": "meta",
+  "ops": "300x200",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": "avif",
+    "field": "format",
+    "t": "meta"
+   },
+   {
+    "eq": 800,
+    "field": "width",
+    "t": "meta"
+   }
+  ],
+  "group": "meta",
+  "id": "meta-avif",
+  "kind": "meta",
+  "ops": "800x0/filters:format(avif)",
+  "src": "car.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 501,
+    "t": "status"
+   },
+   {
+    "s": "removebg is not configured",
+    "t": "body_contains"
+   }
+  ],
+  "group": "unconfigured",
+  "id": "removebg-nomodel",
+  "ops": "filters:removebg:format(png)",
+  "src": "dog.jpg",
+  "tier": "smoke"
+ },
+ {
+  "assert": [
+   {
+    "eq": 501,
+    "t": "status"
+   }
+  ],
+  "group": "unconfigured",
+  "id": "studio-nomodel",
+  "ops": "filters:studio(product)",
+  "src": "product-shoe.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 501,
+    "t": "status"
+   }
+  ],
+  "group": "unconfigured",
+  "id": "upscale-nomodel",
+  "ops": "filters:upscale(2)",
+  "src": "dog.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     800,
+     533
+    ],
+    "t": "dims",
+    "tol": 1
+   }
+  ],
+  "group": "large",
+  "id": "large-resize",
+  "ops": "800x0",
+  "src": "large.jpg",
+  "timeout": 240,
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     4000,
+     2667
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "large",
+  "id": "large-native",
+  "ops": "0x0/filters:format(jpeg):quality(80)",
+  "src": "large.jpg",
+  "timeout": 240,
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     800,
+     360
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "panorama",
+  "id": "pano-fitin",
+  "ops": "fit-in:800x800",
+  "src": "panorama.jpg",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": [
+     800,
+     800
+    ],
+    "t": "dims"
+   }
+  ],
+  "group": "panorama",
+  "id": "pano-crop",
+  "ops": "crop:800x800",
+  "src": "panorama.jpg",
+  "tier": "full"
+ }
+]

@@ -1,0 +1,2 @@
+badnest = preset:thumb
+thumb = 300x200

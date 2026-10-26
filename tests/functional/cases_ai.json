@@ -1,0 +1,392 @@
+[
+ {
+  "id": "rb-png-portrait",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-png-dog",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-webp-lossless",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-webp-lossy-small",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-jpeg",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-avif",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-chain-resize-after",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-chain-resize-before",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-chain-grayscale",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-2000-webp-known227",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-health-after-227",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rb-then-studio",
+  "group": "removebg",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-default-brand",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-bg-white",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-bg-hex",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-bg-brand-arg",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-bg-none-png",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-bg-none-webp",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-opaque-webp-fast",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-shadow-variants",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-pad-variants",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-chain-size",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-jpeg",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-nosubject-gradient",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-logo-alpha-src",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-meta-fields",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "st-meta-default-brand",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-debug-portrait",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-debug-group",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-debug-fullbody",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-debug-dog-noface",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-crop-face",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-crop-face-noface",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-facepad",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-blur",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-pixelate",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-blur-group",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-blur-noface",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "face-chain-shared",
+  "group": "face",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-tags-dog",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-tags-car",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-tags-screenshot",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-tags-processed",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-embeddings",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-aesthetic-score",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-aesthetic-mismatch",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-moderation-benign",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-detections-dog",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-detections-car-person",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "meta-detections-declared",
+  "group": "meta-ai",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "nc-meta-surfaces",
+  "group": "not-configured",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "nc-redaction-501s",
+  "group": "not-configured",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "sig-moderation-signals",
+  "group": "moderation-signals",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "det-blurclass-person",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "det-pixelateclass-car",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "det-blurclass-unknown",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "det-blurclass-nomatch",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "det-blurclass-case",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "gate-ai-concurrent",
+  "group": "gate",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "upscale-x2",
+  "group": "upscale",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "upscale-alpha-carry",
+  "group": "upscale",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "upscale-x4-compose",
+  "group": "upscale",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "upscale-factor3",
+  "group": "upscale",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "upscale-oom-probe",
+  "group": "upscale",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "studio-timing-log",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ }
+]

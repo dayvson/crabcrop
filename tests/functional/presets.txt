@@ -1,0 +1,5 @@
+# wave 4 presets
+thumb = 300x200
+card = crop:800x450/filters:format(webp):quality(80)
+gray = filters:grayscale
+small = 100x0/filters:format(png)

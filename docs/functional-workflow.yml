@@ -1,0 +1,132 @@
+# Functional tests. This file is the complete workflow as it is
+# to be landed at .github/workflows/functional.yml (through the
+# GitHub web UI; the API credential cannot push workflow files).
+# Keep the two in sync. The mirror convention matches
+# docs/rust-workflow.yml, docs/release-workflow.yml and
+# docs/perf-workflow.yml.
+#
+# Issue #232: the feature-campaign harness, productized. The
+# smoke tier runs on pull requests inside a hard budget of
+# about 4 minutes of harness wall clock (an overrun is a bug
+# in the suite: cut cells or shrink corpus images, never raise
+# the budget). The full tier runs nightly, on release tags,
+# and on pull requests whose diff touches the dependency
+# lockfile or the encode pipeline (the paths listed in the
+# tier step below). Results publish as the job summary and an
+# artifact beside the existing suite output. Timings are
+# trend data only; they never gate.
+name: Functional tests
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    tags: [ "v*" ]
+  schedule:
+    - cron: "43 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Tier to run"
+        type: choice
+        options: [ full, smoke ]
+        default: full
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  functional:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide the tier
+        id: tier
+        run: |
+          tier=smoke
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            tier=full
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            tier=full
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tier="${{ inputs.tier }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Full tier when the diff touches the lockfile, the
+            # manifests, the encode pipeline (decode, transform
+            # and encode modules under src/), or this harness.
+            files=$(git diff --name-only \
+              "origin/${{ github.base_ref }}...HEAD")
+            while IFS= read -r f; do
+              case "$f" in
+                Cargo.lock|Cargo.toml|crates/*/Cargo.toml) tier=full ;;
+                src/engine.rs|src/filters.rs|src/quality.rs) tier=full ;;
+                src/color.rs|src/crop.rs|src/heic.rs|src/svg.rs) tier=full ;;
+                src/text.rs|src/video.rs|src/studio.rs|src/ai.rs) tier=full ;;
+                tests/functional/*) tier=full ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          echo "Running the $tier tier"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Pillow (the harness verifies with PIL)
+        run: python3 -m pip install --quiet pillow
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.tier.outputs.tier == 'full'
+        with:
+          node-version: "22"
+
+      - name: Build the TypeScript SDK and the MCP server (full tier)
+        if: steps.tier.outputs.tier == 'full'
+        run: |
+          npm --prefix sdks/typescript ci
+          npm --prefix sdks/typescript run build
+          npm --prefix sdks/mcp ci
+          npm --prefix sdks/mcp run build
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Run the functional tier
+        run: |
+          budget=""
+          if [ "${{ steps.tier.outputs.tier }}" = "smoke" ]; then
+            budget="--enforce-budget"
+          fi
+          python3 tests/functional/run.py \
+            --tier "${{ steps.tier.outputs.tier }}" \
+            --bin target/release/crabcrop --no-build \
+            --out functional-out $budget
+
+      - name: Publish the matrix as the job summary
+        if: always()
+        run: |
+          if [ -f functional-out/summary.md ]; then
+            cat functional-out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the run results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: functional-${{ steps.tier.outputs.tier }}-${{ github.run_id }}
+          path: |
+            functional-out/results.json
+            functional-out/results.csv
+            functional-out/summary.md
+            functional-out/observations.jsonl
+            functional-out/logs/
+          if-no-files-found: ignore

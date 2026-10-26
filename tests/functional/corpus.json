@@ -1,0 +1,395 @@
+[
+ {
+  "file": "alpha-base.png",
+  "origin": "Synthesized locally with PIL: half-opaque test base",
+  "format": "PNG",
+  "width": 400,
+  "height": 300,
+  "bytes": 1147,
+  "frames": 1,
+  "sha256": "c21ffa84e38fb6ce"
+ },
+ {
+  "file": "anim.gif",
+  "origin": "Synthesized locally with PIL: 12-frame animation",
+  "format": "GIF",
+  "width": 480,
+  "height": 320,
+  "bytes": 1032939,
+  "frames": 12,
+  "sha256": "2ac67979060e8798",
+  "note": "re-encoded with a shared adaptive palette at native 480x320 for the frozen corpus"
+ },
+ {
+  "file": "anim.webp",
+  "origin": "Synthesized locally with PIL: 12-frame animation",
+  "format": "WEBP",
+  "width": 320,
+  "height": 213,
+  "bytes": 135296,
+  "frames": 12,
+  "sha256": "4e136d94d63f69ae",
+  "note": "downscaled to 320x213 for the frozen corpus; cases assert frame count and content type only"
+ },
+ {
+  "file": "base-black.png",
+  "origin": "Synthesized locally with PIL: solid black",
+  "format": "PNG",
+  "width": 800,
+  "height": 600,
+  "bytes": 1476,
+  "frames": 1,
+  "sha256": "0e78e1e00e1b64ef"
+ },
+ {
+  "file": "base-dark.png",
+  "origin": "Synthesized locally with PIL: dark gray",
+  "format": "PNG",
+  "width": 800,
+  "height": 600,
+  "bytes": 2789,
+  "frames": 1,
+  "sha256": "08db26fd86b62a7d"
+ },
+ {
+  "file": "base-gray64.png",
+  "origin": "Synthesized locally with PIL: gray 64",
+  "format": "PNG",
+  "width": 400,
+  "height": 300,
+  "bytes": 1063,
+  "frames": 1,
+  "sha256": "5c1ab1a41d989752"
+ },
+ {
+  "file": "base-mid.png",
+  "origin": "Synthesized locally with PIL: mid gray",
+  "format": "PNG",
+  "width": 400,
+  "height": 300,
+  "bytes": 1062,
+  "frames": 1,
+  "sha256": "2248a4466315ec98"
+ },
+ {
+  "file": "base-rgb.png",
+  "origin": "Synthesized locally with PIL: RGB quadrant base",
+  "format": "PNG",
+  "width": 400,
+  "height": 300,
+  "bytes": 1089,
+  "frames": 1,
+  "sha256": "45698b623dc0d9b0"
+ },
+ {
+  "file": "blue.jpg",
+  "origin": "Synthesized locally with PIL: blue photo",
+  "format": "JPEG",
+  "width": 640,
+  "height": 480,
+  "bytes": 5430,
+  "frames": 1,
+  "sha256": "90c25f5ba98b0699"
+ },
+ {
+  "file": "bordered.jpg",
+  "origin": "Synthesized locally with PIL: photo with a drawn border",
+  "format": "JPEG",
+  "width": 1180,
+  "height": 868,
+  "bytes": 141409,
+  "frames": 1,
+  "sha256": "c88db1f9e091983e"
+ },
+ {
+  "file": "car.jpg",
+  "origin": "Unsplash photo-1503376780353-7e6692767b70 (via removebg-test corpus)",
+  "format": "JPEG",
+  "width": 1100,
+  "height": 733,
+  "bytes": 121706,
+  "frames": 1,
+  "sha256": "0166127799e567c7"
+ },
+ {
+  "file": "cat.jpg",
+  "origin": "Unsplash photo-1514888286974-6c03e2ca1dba (via removebg-test corpus)",
+  "format": "JPEG",
+  "width": 1000,
+  "height": 688,
+  "bytes": 78055,
+  "frames": 1,
+  "sha256": "0e96284f19ff5616"
+ },
+ {
+  "file": "crab-cutout.png",
+  "origin": "Removebg cutout of crab-photo.jpg, kept at native size: overlay cases sample its pixels",
+  "format": "PNG",
+  "width": 1000,
+  "height": 667,
+  "bytes": 1162981,
+  "frames": 1,
+  "sha256": "99e6cc895f17fdf0"
+ },
+ {
+  "file": "crab-photo.jpg",
+  "origin": "crabcrop website asset ai-skate-before.jpg (Snap the crab photo)",
+  "format": "JPEG",
+  "width": 1000,
+  "height": 667,
+  "bytes": 153598,
+  "frames": 1,
+  "sha256": "c847eb3a60fd4aa1"
+ },
+ {
+  "file": "crab-small.png",
+  "origin": "Downscale of crab-cutout.png (200x133)",
+  "format": "PNG",
+  "width": 200,
+  "height": 133,
+  "bytes": 28237,
+  "frames": 1,
+  "sha256": "7f500c04df5a5210"
+ },
+ {
+  "file": "dog-200.jpg",
+  "origin": "Downscale of dog.jpg (200x150)",
+  "format": "JPEG",
+  "width": 200,
+  "height": 150,
+  "bytes": 8876,
+  "frames": 1,
+  "sha256": "71143eb908be9fd1"
+ },
+ {
+  "file": "dog-256.jpg",
+  "origin": "Downscale of dog.jpg (256x192)",
+  "format": "JPEG",
+  "width": 256,
+  "height": 192,
+  "bytes": 12284,
+  "frames": 1,
+  "sha256": "d549bd39bf70b5e2"
+ },
+ {
+  "file": "dog-480.jpg",
+  "origin": "Downscale of dog.jpg (480x360)",
+  "format": "JPEG",
+  "width": 480,
+  "height": 360,
+  "bytes": 30625,
+  "frames": 1,
+  "sha256": "3f0fa539f0789eb9"
+ },
+ {
+  "file": "dog.jpg",
+  "origin": "Unsplash photo-1543466835-00a7907e9de1 (via removebg-test corpus)",
+  "format": "JPEG",
+  "width": 1000,
+  "height": 750,
+  "bytes": 89497,
+  "frames": 1,
+  "sha256": "4691c3e58c0dfe2f"
+ },
+ {
+  "file": "exif-orient.jpg",
+  "origin": "Synthesized locally with PIL: JPEG with EXIF orientation 6 and Make tag",
+  "format": "JPEG",
+  "width": 750,
+  "height": 1000,
+  "bytes": 95434,
+  "frames": 1,
+  "sha256": "4c025b43207dc1bf"
+ },
+ {
+  "file": "gradient.png",
+  "origin": "Synthesized locally with PIL: smooth color gradient, no subject",
+  "format": "PNG",
+  "width": 800,
+  "height": 600,
+  "bytes": 2873,
+  "frames": 1,
+  "sha256": "1d9ce5dd7e7e6540"
+ },
+ {
+  "file": "group-faces.jpg",
+  "origin": "Synthesized locally with PIL: two frontal faces (portrait + mirror) on one canvas",
+  "format": "JPEG",
+  "width": 1400,
+  "height": 700,
+  "bytes": 111996,
+  "frames": 1,
+  "sha256": "7950afd0d688411c"
+ },
+ {
+  "file": "icc.jpg",
+  "origin": "Synthesized locally with PIL: JPEG carrying an ICC profile",
+  "format": "JPEG",
+  "width": 1000,
+  "height": 750,
+  "bytes": 93975,
+  "frames": 1,
+  "sha256": "14d326e10953781c"
+ },
+ {
+  "file": "large.jpg",
+  "origin": "Unsplash photo-1503376780353-7e6692767b70 at w=5472 (via wave1 corpus)",
+  "format": "JPEG",
+  "width": 4000,
+  "height": 2667,
+  "bytes": 1152785,
+  "frames": 1,
+  "sha256": "ef77f147b1623f42",
+  "note": "downscaled to 4000x2667 for the frozen corpus; large-native case asserts the new dimensions"
+ },
+ {
+  "file": "logo-256.png",
+  "origin": "Downscale of logo.png (256x160)",
+  "format": "PNG",
+  "width": 256,
+  "height": 160,
+  "bytes": 8730,
+  "frames": 1,
+  "sha256": "40e5299f7ed8714f"
+ },
+ {
+  "file": "logo.png",
+  "origin": "Synthesized locally with PIL: transparent PNG logo",
+  "format": "PNG",
+  "width": 900,
+  "height": 560,
+  "bytes": 10497,
+  "frames": 1,
+  "sha256": "a08e075b931d7b91"
+ },
+ {
+  "file": "night.webp",
+  "origin": "Squarespace CDN blog asset",
+  "format": "WEBP",
+  "width": 2500,
+  "height": 3750,
+  "bytes": 375778,
+  "frames": 1,
+  "sha256": "f2ab1ea7b76d945c"
+ },
+ {
+  "file": "ov-half-green.png",
+  "origin": "Synthesized locally with PIL: half green overlay swatch",
+  "format": "PNG",
+  "width": 100,
+  "height": 100,
+  "bytes": 314,
+  "frames": 1,
+  "sha256": "e9754b2ee0caefcf"
+ },
+ {
+  "file": "ov-marker.png",
+  "origin": "Synthesized locally with PIL: marker overlay swatch",
+  "format": "PNG",
+  "width": 100,
+  "height": 100,
+  "bytes": 303,
+  "frames": 1,
+  "sha256": "ad26b7fe9f1e65b0"
+ },
+ {
+  "file": "ov-red.png",
+  "origin": "Synthesized locally with PIL: red overlay swatch",
+  "format": "PNG",
+  "width": 400,
+  "height": 300,
+  "bytes": 1061,
+  "frames": 1,
+  "sha256": "17ee412014e456fb"
+ },
+ {
+  "file": "panorama.jpg",
+  "origin": "Pexels photo 803224",
+  "format": "JPEG",
+  "width": 1600,
+  "height": 720,
+  "bytes": 182941,
+  "frames": 1,
+  "sha256": "52fe4300a7aabfab"
+ },
+ {
+  "file": "person-fullbody.jpg",
+  "origin": "Unsplash photo-1509631179647-0177331693ae (via removebg-test corpus)",
+  "format": "JPEG",
+  "width": 800,
+  "height": 1198,
+  "bytes": 142926,
+  "frames": 1,
+  "sha256": "961693202d7d9399"
+ },
+ {
+  "file": "person-portrait.jpg",
+  "origin": "Unsplash photo-1494790108377-be9c29b29330 (via removebg-test corpus)",
+  "format": "JPEG",
+  "width": 800,
+  "height": 1200,
+  "bytes": 96391,
+  "frames": 1,
+  "sha256": "f7b1be0768e0bae8"
+ },
+ {
+  "file": "probe.svg",
+  "origin": "Synthesized locally: SVG carrying a script tag and an onclick handler",
+  "format": "SVG",
+  "width": 200,
+  "height": 100,
+  "bytes": 212,
+  "frames": 1,
+  "sha256": "d9e3d80a79d827ab"
+ },
+ {
+  "file": "product-shoe.jpg",
+  "origin": "Unsplash photo-1542291026-7eec264c27ff (via removebg-test corpus)",
+  "format": "JPEG",
+  "width": 1100,
+  "height": 733,
+  "bytes": 114262,
+  "frames": 1,
+  "sha256": "c9e7f80f4457e115"
+ },
+ {
+  "file": "quadrant.jpg",
+  "origin": "Synthesized locally with PIL: four-quadrant test pattern",
+  "format": "JPEG",
+  "width": 800,
+  "height": 600,
+  "bytes": 18207,
+  "frames": 1,
+  "sha256": "822f820ab465c584"
+ },
+ {
+  "file": "screenshot.png",
+  "origin": "Synthesized locally with PIL: UI screenshot with sharp text",
+  "format": "PNG",
+  "width": 1440,
+  "height": 900,
+  "bytes": 42566,
+  "frames": 1,
+  "sha256": "cc743d38550df468"
+ },
+ {
+  "file": "small.jpg",
+  "origin": "Downscaled crop of dog.jpg (200x150)",
+  "format": "JPEG",
+  "width": 200,
+  "height": 150,
+  "bytes": 9628,
+  "frames": 1,
+  "sha256": "8df56acef43e9fa5"
+ },
+ {
+  "file": "tiny.png",
+  "origin": "Synthesized locally with PIL: tiny PNG swatch",
+  "format": "PNG",
+  "width": 120,
+  "height": 90,
+  "bytes": 281,
+  "frames": 1,
+  "sha256": "9aef6d4ac30e40bc"
+ }
+]

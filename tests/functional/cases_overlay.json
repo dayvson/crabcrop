@@ -1,0 +1,4057 @@
+[
+ {
+  "id": "base-dog-png",
+  "group": "base",
+  "ops": "filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     1000,
+     750
+    ],
+    "tol": 0
+   }
+  ],
+  "why": "Reference render of the dog photo.",
+  "tier": "smoke"
+ },
+ {
+  "id": "base-dog-400",
+  "group": "base",
+  "ops": "400x0/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   }
+  ],
+  "why": "Reference render at 400x300.",
+  "tier": "smoke"
+ },
+ {
+  "id": "base-car-png",
+  "group": "base",
+  "ops": "filters:format(png)",
+  "src": "car.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     1100,
+     733
+    ],
+    "tol": 0
+   }
+  ],
+  "why": "Reference render of the car photo.",
+  "tier": "full"
+ },
+ {
+  "id": "base-quadrant-png",
+  "group": "base",
+  "ops": "filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     800,
+     600
+    ],
+    "tol": 0
+   }
+  ],
+  "why": "Reference render of the quadrant pattern.",
+  "tier": "full"
+ },
+ {
+  "id": "base-small-png",
+  "group": "base",
+  "ops": "filters:format(png)",
+  "src": "small.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     200,
+     150
+    ],
+    "tol": 0
+   }
+  ],
+  "why": "Reference render of the 200x150 photo.",
+  "tier": "full"
+ },
+ {
+  "id": "base-rgb-png-ref",
+  "group": "base",
+  "ops": "filters:format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   }
+  ],
+  "why": "Reference render of the synthetic quadrant base.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-crab-br",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fcrab-small.png,-10,-10,100):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     1000,
+     750
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq_file",
+    "xy": [
+     836,
+     683
+    ],
+    "file": "crab-small.png",
+    "oxy": [
+     46,
+     76
+    ],
+    "tol": 10
+   },
+   {
+    "t": "region_diff",
+    "box": [
+     0,
+     0,
+     400,
+     300
+    ],
+    "vs": "base-dog-png",
+    "lt": 2
+   },
+   {
+    "t": "region_diff",
+    "box": [
+     790,
+     607,
+     990,
+     740
+    ],
+    "vs": "base-dog-png",
+    "gt": 10
+   }
+  ],
+  "why": "Crab cutout watermark, bottom-right via negative anchor, full opacity: crab pixels land at base minus 10 minus overlay size; the far corner is untouched.",
+  "tier": "smoke"
+ },
+ {
+  "id": "wm-crab-opacity50",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fcrab-small.png,-10,-10,50):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_blend_file",
+    "xy": [
+     836,
+     683
+    ],
+    "cell": "base-dog-png",
+    "file": "crab-small.png",
+    "oxy": [
+     46,
+     76
+    ],
+    "alpha": 50,
+    "tol": 12
+   }
+  ],
+  "why": "Same placement at alpha 50: the composited pixel is the midpoint of base and crab.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-crab-demo",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fcrab-small.png,-10,-10,70):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_blend_file",
+    "xy": [
+     836,
+     683
+    ],
+    "cell": "base-dog-png",
+    "file": "crab-small.png",
+    "oxy": [
+     46,
+     76
+    ],
+    "alpha": 70,
+    "tol": 12
+   }
+  ],
+  "why": "Demo render for the contact sheet: crab watermark bottom-right at 70 percent on the dog photo.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-alpha0",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fcrab-small.png,-10,-10,0):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-dog-png",
+    "lt": 1.0
+   }
+  ],
+  "why": "Alpha 0 is documented as invisible: output matches the bare render.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-marker-tl",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fov-marker.png,0,0,100):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     25,
+     25
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     75,
+     25
+    ],
+    "rgb": [
+     0,
+     255,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     25,
+     75
+    ],
+    "rgb": [
+     0,
+     0,
+     255
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     75,
+     75
+    ],
+    "rgb": [
+     255,
+     255,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     150,
+     150
+    ],
+    "rgb": [
+     30,
+     30,
+     200
+    ],
+    "tol": 6
+   }
+  ],
+  "why": "Marker at the top-left: each marker quadrant lands at its documented offset, the rest of the base is untouched.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-marker-abs",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fov-marker.png,150,100,100):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     175,
+     125
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     225,
+     175
+    ],
+    "rgb": [
+     255,
+     255,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     149,
+     100
+    ],
+    "rgb": [
+     200,
+     30,
+     30
+    ],
+    "tol": 6
+   }
+  ],
+  "why": "Absolute positive coordinates place the marker's top-left exactly there.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-marker-neg",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fov-marker.png,-10,-10,100):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     315,
+     215
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     365,
+     265
+    ],
+    "rgb": [
+     255,
+     255,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     289,
+     240
+    ],
+    "rgb": [
+     240,
+     240,
+     240
+    ],
+    "tol": 6
+   }
+  ],
+  "why": "Negative x,y anchor from the right and bottom edges: the marker occupies (290,190) to (390,290) on a 400x300 base.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-marker-partial",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fov-marker.png,350,250,100):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     375,
+     275
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 6
+   }
+  ],
+  "why": "A marker hanging off the right and bottom edges is clipped, not an error (docs are silent; clipping is the only sane reading).",
+  "tier": "full"
+ },
+ {
+  "id": "wm-marker-off",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fov-marker.png,10000,10000,100):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   }
+  ],
+  "why": "A marker placed entirely off-canvas: observed (docs silent).",
+  "observe": true,
+  "tier": "full"
+ },
+ {
+  "id": "wm-bad-source",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fmissing.png,0,0,100):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 502
+   }
+  ],
+  "why": "Docs: a watermark that fails to load fails the request with 502.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-refused",
+  "group": "watermark",
+  "ops": "filters:watermark(http%3A%2F%2F127.0.0.1%3A9%2Fx.png,0,0,100):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 502
+   }
+  ],
+  "why": "A watermark URL that cannot be fetched fails the request with 502.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-crab-photo",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fcrab-photo.jpg,0,0,100):format(png)",
+  "src": "car.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     1100,
+     733
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq_file",
+    "xy": [
+     220,
+     380
+    ],
+    "file": "crab-photo.jpg",
+    "oxy": [
+     220,
+     380
+    ],
+    "tol": 8
+   },
+   {
+    "t": "region_diff",
+    "box": [
+     1000,
+     667,
+     1100,
+     733
+    ],
+    "vs": "base-car-png",
+    "lt": 2
+   }
+  ],
+  "why": "The raw crab photo as an opaque watermark covers the top-left exactly; below its bottom edge the base is untouched.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-bigger-than-base",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fcrab-photo.jpg,0,0,100):format(png)",
+  "src": "small.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     200,
+     150
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq_file",
+    "xy": [
+     100,
+     75
+    ],
+    "file": "crab-photo.jpg",
+    "oxy": [
+     100,
+     75
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "An overlay larger than the base is clipped to the canvas.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-own-alpha",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fov-half-green.png,0,0,100):format(png)",
+  "src": "base-mid.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     50,
+     50
+    ],
+    "rgb": [
+     64,
+     192,
+     64
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "The watermark's own alpha is honored: alpha-128 green over mid gray composites at about half strength.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-own-alpha-50",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fov-half-green.png,0,0,50):format(png)",
+  "src": "base-mid.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     50,
+     50
+    ],
+    "rgb": [
+     96,
+     160,
+     96
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "Own alpha times the alpha parameter: 128/255 at 50 percent lands at about quarter strength.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-alpha101",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fcrab-small.png,0,0,101):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Alpha is documented as 0 to 100; 101 is a grammar error.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-missing-arg",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fcrab-small.png,0,0):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Watermark takes four parameters; three is a grammar error.",
+  "tier": "full"
+ },
+ {
+  "id": "wm-on-alpha-base",
+  "group": "watermark",
+  "ops": "filters:watermark({ORIGIN_ENC}%2Fov-marker.png,0,0,100):format(png)",
+  "src": "alpha-base.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     300,
+     150
+    ],
+    "eq": 128,
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     25,
+     25
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 6
+   }
+  ],
+  "why": "Watermark over a base that carries alpha: the untouched half keeps its alpha (observed; docs promise this only for overlay).",
+  "observe": true,
+  "tier": "full"
+ },
+ {
+  "id": "ov-normal",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-red.png,0,0,100,normal):format(png)",
+  "src": "base-mid.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     200,
+     150
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 3
+   }
+  ],
+  "why": "Normal blend at full opacity replaces the base with the overlay color.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-multiply",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-red.png,0,0,100,multiply):format(png)",
+  "src": "base-mid.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     200,
+     150
+    ],
+    "rgb": [
+     128,
+     0,
+     0
+    ],
+    "tol": 4
+   }
+  ],
+  "why": "CSS multiply of (128,128,128) by (255,0,0) is (128,0,0).",
+  "tier": "smoke"
+ },
+ {
+  "id": "ov-screen",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-red.png,0,0,100,screen):format(png)",
+  "src": "base-mid.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     200,
+     150
+    ],
+    "rgb": [
+     255,
+     128,
+     128
+    ],
+    "tol": 4
+   }
+  ],
+  "why": "CSS screen of mid gray by red is (255,128,128).",
+  "tier": "smoke"
+ },
+ {
+  "id": "ov-blendmode",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-red.png,0,0,100,overlay):format(png)",
+  "src": "base-mid.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     200,
+     150
+    ],
+    "rgb": [
+     255,
+     1,
+     1
+    ],
+    "tol": 5
+   }
+  ],
+  "why": "CSS overlay blend with a base just above 0.5 takes the screen branch: (255,1,1).",
+  "tier": "full"
+ },
+ {
+  "id": "ov-blend-dark",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-red.png,0,0,100,overlay):format(png)",
+  "src": "base-gray64.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     200,
+     150
+    ],
+    "rgb": [
+     128,
+     0,
+     0
+    ],
+    "tol": 5
+   }
+  ],
+  "why": "CSS overlay blend with a base below 0.5 takes the multiply branch: (128,0,0).",
+  "tier": "full"
+ },
+ {
+  "id": "ov-alpha50",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-red.png,0,0,50,normal):format(png)",
+  "src": "base-mid.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     200,
+     150
+    ],
+    "rgb": [
+     192,
+     64,
+     64
+    ],
+    "tol": 4
+   }
+  ],
+  "why": "Normal blend at alpha 50 is the midpoint of base and overlay.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-multiply60",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-red.png,0,0,60,multiply):format(png)",
+  "src": "base-mid.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     200,
+     150
+    ],
+    "rgb": [
+     128,
+     51,
+     51
+    ],
+    "tol": 5
+   }
+  ],
+  "why": "The blend mix is composited at the effective alpha: base plus 0.6 of the way to the multiply result.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-width50",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100,normal,50):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     50,
+     50
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     150,
+     50
+    ],
+    "rgb": [
+     0,
+     255,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     50,
+     150
+    ],
+    "rgb": [
+     0,
+     0,
+     255
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     150,
+     150
+    ],
+    "rgb": [
+     255,
+     255,
+     0
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     250,
+     250
+    ],
+    "rgb": [
+     240,
+     240,
+     240
+    ],
+    "tol": 6
+   }
+  ],
+  "why": "Width 50 scales the marker to 50 percent of the base width (200 px), aspect preserved.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-width400",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100,normal,400):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     200,
+     150
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 6
+   }
+  ],
+  "why": "Width 400 scales the marker to 1600 px; the visible canvas shows its top-left quadrant, clipped.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-width1",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100,normal,1):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "region_diff",
+    "box": [
+     0,
+     0,
+     4,
+     4
+    ],
+    "vs": "base-rgb-png-ref",
+    "gt": 3
+   },
+   {
+    "t": "region_diff",
+    "box": [
+     200,
+     150,
+     400,
+     300
+    ],
+    "vs": "base-rgb-png-ref",
+    "lt": 1
+   }
+  ],
+  "why": "Width 1 scales the marker to 4 px in the corner and touches nothing else.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-bigger",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fcrab-cutout.png,0,0,100,normal,400):format(png)",
+  "src": "small.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     200,
+     150
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq_file",
+    "xy": [
+     160,
+     140
+    ],
+    "file": "crab-cutout.png",
+    "oxy": [
+     200,
+     175
+    ],
+    "tol": 14
+   }
+  ],
+  "why": "The crab cutout scaled to 400 percent of a 200 px base (800 px wide) covers and clips correctly; the sampled crab pixel survives scaling.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-width0",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100,normal,0):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Width is documented as 1 to 400; 0 is a grammar error.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-width401",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100,normal,401):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Width 401 is past the documented range.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-missing-blend",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Overlay's documented forms always carry a blend mode; four arguments is a grammar error.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-bad-blend",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100,vivid):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Blend must be one of normal, multiply, screen, overlay.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-alpha101",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,101,normal):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Alpha past 100 is a grammar error.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-base-alpha",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-red.png,0,0,100,normal):format(png)",
+  "src": "alpha-base.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_rgba",
+    "xy": [
+     100,
+     150
+    ],
+    "rgba": [
+     255,
+     0,
+     0,
+     255
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_rgba",
+    "xy": [
+     300,
+     150
+    ],
+    "rgba": [
+     255,
+     0,
+     0,
+     128
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "Docs: the base image's alpha channel is preserved under overlay; the semi-transparent half keeps alpha 128 while its color is composited.",
+  "tier": "full"
+ },
+ {
+  "id": "ov-crab-screen",
+  "group": "overlay",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fcrab-small.png,-10,-10,80,screen):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "region_diff",
+    "box": [
+     790,
+     607,
+     990,
+     740
+    ],
+    "vs": "base-dog-png",
+    "gt": 5
+   },
+   {
+    "t": "region_diff",
+    "box": [
+     0,
+     0,
+     400,
+     300
+    ],
+    "vs": "base-dog-png",
+    "lt": 2
+   }
+  ],
+  "why": "The crab cutout composited with the screen blend at 80 percent changes only its own region.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-basic",
+  "group": "text",
+  "ops": "filters:text(Hello%20World,48,ffffff,bottom-right):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     800,
+     600
+    ],
+    "tol": 0
+   },
+   {
+    "t": "bright_count",
+    "box": [
+     400,
+     450,
+     800,
+     600
+    ],
+    "thresh": 200,
+    "gte": 150
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "minx": [
+     380,
+     620
+    ],
+    "maxx": [
+     740,
+     782
+    ],
+    "maxy": [
+     540,
+     584
+    ]
+   }
+  ],
+  "why": "White 48 px text at bottom-right: glyphs sit inside the corner, inset by half the font size (24 px).",
+  "tier": "smoke"
+ },
+ {
+  "id": "tx-color",
+  "group": "text",
+  "ops": "filters:text(Hello,48,ff0000,top-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_mean_pred",
+    "box": [
+     0,
+     0,
+     420,
+     130
+    ],
+    "thresh": 120,
+    "pred": "r_dom"
+   }
+  ],
+  "why": "Red text renders red-dominant glyphs at the top-left.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-alpha",
+  "group": "text",
+  "ops": "filters:text(Hello,64,ffffff80,center):format(png)",
+  "src": "base-black.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_mean_val",
+    "box": [
+     150,
+     200,
+     650,
+     400
+    ],
+    "thresh": 60,
+    "between": [
+     95,
+     165
+    ]
+   }
+  ],
+  "why": "An rrggbbaa color at alpha 0x80 draws at about half strength over black.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-anchor-top-left",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,top-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "minx": [
+     14,
+     30
+    ],
+    "miny": [
+     16,
+     40
+    ]
+   }
+  ],
+  "why": "Anchor top-left: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-anchor-top-center",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,top-center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "minx": [
+     355,
+     400
+    ],
+    "miny": [
+     16,
+     40
+    ]
+   }
+  ],
+  "why": "Anchor top-center: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-anchor-top-right",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,top-right):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "maxx": [
+     748,
+     782
+    ],
+    "miny": [
+     16,
+     40
+    ]
+   }
+  ],
+  "why": "Anchor top-right: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-anchor-center-left",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,center-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "minx": [
+     14,
+     30
+    ],
+    "miny": [
+     255,
+     310
+    ]
+   }
+  ],
+  "why": "Anchor center-left: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-anchor-center",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "minx": [
+     355,
+     400
+    ],
+    "miny": [
+     255,
+     310
+    ]
+   }
+  ],
+  "why": "Anchor center: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "smoke"
+ },
+ {
+  "id": "tx-anchor-center-right",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,center-right):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "maxx": [
+     748,
+     782
+    ],
+    "miny": [
+     255,
+     310
+    ]
+   }
+  ],
+  "why": "Anchor center-right: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-anchor-bottom-left",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,bottom-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "minx": [
+     14,
+     30
+    ],
+    "maxy": [
+     540,
+     586
+    ]
+   }
+  ],
+  "why": "Anchor bottom-left: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-anchor-bottom-center",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,bottom-center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "minx": [
+     355,
+     400
+    ],
+    "maxy": [
+     540,
+     586
+    ]
+   }
+  ],
+  "why": "Anchor bottom-center: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-anchor-bottom-right",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,bottom-right):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "maxx": [
+     748,
+     782
+    ],
+    "maxy": [
+     540,
+     586
+    ]
+   }
+  ],
+  "why": "Anchor bottom-right: the glyph box lands on that grid point, padded by half the font size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-spaces",
+  "group": "text",
+  "ops": "filters:text(Sale%20ends%20soon,40,ffffff,top-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "maxx": [
+     250,
+     420
+    ]
+   }
+  ],
+  "why": "Percent-encoded spaces render as spaces; the three-word label is wide.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-sale",
+  "group": "text",
+  "ops": "filters:text(Sale,40,ffffff,top-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "maxx": [
+     80,
+     175
+    ]
+   }
+  ],
+  "why": "The single word is much narrower than the three-word label at the same size.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-unicode",
+  "group": "text",
+  "ops": "filters:text(Caf%C3%A9,40,ffffff,top-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_count",
+    "box": [
+     0,
+     0,
+     320,
+     120
+    ],
+    "thresh": 200,
+    "gte": 80
+   }
+  ],
+  "why": "Percent-encoded UTF-8 (Caf\u00e9) renders, accent included.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-emoji",
+  "group": "text",
+  "ops": "filters:text(%F0%9F%A6%80,64,ffffff,center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   }
+  ],
+  "why": "A crab emoji in the label: observed. DejaVu has no color emoji; a tofu box or an empty render are both plausible.",
+  "observe": true,
+  "tier": "full"
+ },
+ {
+  "id": "tx-comma",
+  "group": "text",
+  "ops": "filters:text(Hello%2C%20world,40,ffffff,top-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "bright_count",
+    "box": [
+     0,
+     0,
+     520,
+     120
+    ],
+    "thresh": 200,
+    "gte": 120
+   }
+  ],
+  "why": "An encoded comma lives inside the label instead of splitting the parameter list.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-wide",
+  "group": "text",
+  "ops": "filters:text(This%20is%20a%20very%20long%20label,48,ffffff,top-left):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "bright_count",
+    "box": [
+     0,
+     0,
+     400,
+     110
+    ],
+    "thresh": 200,
+    "gte": 60
+   }
+  ],
+  "why": "A label wider than the canvas: drawn and clipped, canvas size unchanged (docs silent; clipping expected).",
+  "tier": "full"
+ },
+ {
+  "id": "tx-huge",
+  "group": "text",
+  "ops": "filters:text(Huge,1000,ffffff,center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     800,
+     600
+    ],
+    "tol": 0
+   }
+  ],
+  "why": "Size 1000 is the documented maximum; on an 800x600 canvas the glyphs clip but the request succeeds.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-size1",
+  "group": "text",
+  "ops": "filters:text(A,1,ffffff,center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     800,
+     600
+    ],
+    "tol": 0
+   }
+  ],
+  "why": "Size 1 is the documented minimum.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-size0",
+  "group": "text",
+  "ops": "filters:text(A,0,ffffff,center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Size 0 is below the documented 1 to 1000 range.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-size1001",
+  "group": "text",
+  "ops": "filters:text(A,1001,ffffff,center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Size 1001 is past the documented range.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-bad-anchor",
+  "group": "text",
+  "ops": "filters:text(A,40,ffffff,middle):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Anchor must be one of the nine grid points.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-bad-color",
+  "group": "text",
+  "ops": "filters:text(A,40,fffff,center):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Color must be rrggbb or rrggbbaa; five digits is a grammar error.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-jpeg",
+  "group": "text",
+  "ops": "filters:text(Hello,40,ffffff,center):format(jpeg)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "ct",
+    "eq": "image/jpeg"
+   },
+   {
+    "t": "bright_count",
+    "box": [
+     250,
+     250,
+     550,
+     350
+    ],
+    "thresh": 180,
+    "gte": 100
+   }
+  ],
+  "why": "Text needs no alpha format; it renders into a JPEG too.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-order-after",
+  "group": "text",
+  "ops": "400x300/filters:text(Hi,40,ffffff,top-left):format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "bright_bbox",
+    "thresh": 200,
+    "miny": [
+     14,
+     38
+    ]
+   }
+  ],
+  "why": "Text drawn after the resize is drawn at the resized resolution (full 40 px glyphs).",
+  "tier": "full"
+ },
+ {
+  "id": "tx-order-before",
+  "group": "text",
+  "ops": "filters:text(Hi,40,ffffff,top-left)/400x300/filters:format(png)",
+  "src": "base-dark.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "bbox_height_ratio",
+    "cell": "tx-order-after",
+    "thresh": 200,
+    "between": [
+     0.38,
+     0.68
+    ]
+   }
+  ],
+  "why": "Text drawn before the resize is scaled with the image: glyph height lands near half of the after-resize cell.",
+  "tier": "full"
+ },
+ {
+  "id": "tx-nofont",
+  "group": "text",
+  "ops": "filters:text(Hello,32,ffffff,center)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 501
+   },
+   {
+    "t": "body_contains",
+    "s": "no font"
+   }
+  ],
+  "why": "With no CRABCROP_FONT_PATH the text filter fails 501 with the configuration message.",
+  "profile": "nofont",
+  "tier": "full"
+ },
+ {
+  "id": "rot-30",
+  "group": "rotate",
+  "ops": "400x0/filters:rotate(30):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     497,
+     460
+    ],
+    "tol": 2
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     2,
+     2
+    ],
+    "rgb": [
+     255,
+     255,
+     255
+    ],
+    "tol": 12
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     494,
+     2
+    ],
+    "rgb": [
+     255,
+     255,
+     255
+    ],
+    "tol": 12
+   }
+  ],
+  "why": "Rotate 30 expands the canvas to the rotated bounding box (497x460) and fills the corners with the default white.",
+  "tier": "smoke"
+ },
+ {
+  "id": "rot-fill-green",
+  "group": "rotate",
+  "ops": "400x0/filters:fill(00ff00):rotate(30):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     2,
+     2
+    ],
+    "rgb": [
+     0,
+     255,
+     0
+    ],
+    "tol": 12
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     494,
+     457
+    ],
+    "rgb": [
+     0,
+     255,
+     0
+    ],
+    "tol": 12
+   }
+  ],
+  "why": "With a fill color set, the uncovered corners take the fill color instead of white.",
+  "tier": "full"
+ },
+ {
+  "id": "rot-alpha-corners",
+  "group": "rotate",
+  "ops": "filters:rotate(30):format(png)",
+  "src": "alpha-base.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     497,
+     460
+    ],
+    "tol": 2
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     2,
+     2
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_rgba",
+    "xy": [
+     150,
+     230
+    ],
+    "rgba": [
+     255,
+     0,
+     0,
+     255
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "An image carrying alpha gets transparent corners instead of a fill color. The interior probe sits inside the opaque red half (the exact center lands on the half-and-half seam and blends, verified separately).",
+  "tier": "full"
+ },
+ {
+  "id": "rot-180-quadrant",
+  "group": "rotate",
+  "ops": "filters:rotate(180):format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     800,
+     600
+    ],
+    "tol": 0
+   },
+   {
+    "t": "region_mean",
+    "box": [
+     190,
+     140,
+     211,
+     161
+    ],
+    "rgb": [
+     239,
+     228,
+     125
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     600,
+     450
+    ],
+    "pred": "r_dom"
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     600,
+     150
+    ],
+    "pred": "b_dom"
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     200,
+     450
+    ],
+    "pred": "g_dom"
+   }
+  ],
+  "why": "Rotate 180 swaps every quadrant with the opposite one. The near-white quadrant carries a yellow label, so its probe is a patch mean (measured identical in the source patch and the rotated output).",
+  "tier": "full"
+ },
+ {
+  "id": "rot-360",
+  "group": "rotate",
+  "ops": "filters:rotate(360):format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     800,
+     600
+    ],
+    "tol": 0
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-quadrant-png",
+    "lt": 1.0
+   }
+  ],
+  "why": "Rotate 360 is four exact quarter turns: pixel-identical to the bare render.",
+  "tier": "full"
+ },
+ {
+  "id": "rot-decimal",
+  "group": "rotate",
+  "ops": "400x0/filters:rotate(45.5):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     494,
+     496
+    ],
+    "tol": 3
+   }
+  ],
+  "why": "Decimal angles are documented; the canvas fits the rotated box.",
+  "tier": "full"
+ },
+ {
+  "id": "rot-neg45",
+  "group": "rotate",
+  "ops": "400x0/filters:rotate(-45):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     495,
+     495
+    ],
+    "tol": 2
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     2,
+     2
+    ],
+    "rgb": [
+     255,
+     255,
+     255
+    ],
+    "tol": 12
+   }
+  ],
+  "why": "Negative angles rotate the other way onto the same expanded canvas.",
+  "tier": "full"
+ },
+ {
+  "id": "rot-chain-4x90",
+  "group": "rotate",
+  "ops": "filters:rotate(90):rotate(90):rotate(90):rotate(90):format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-quadrant-png",
+    "lt": 1.0
+   }
+  ],
+  "why": "Four chained quarter turns return the original pixels.",
+  "tier": "full"
+ },
+ {
+  "id": "flip-v-quadrant",
+  "group": "flip",
+  "ops": "filters:flip(v):format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     200,
+     150
+    ],
+    "pred": "b_dom"
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     200,
+     450
+    ],
+    "pred": "r_dom"
+   },
+   {
+    "t": "region_mean",
+    "box": [
+     590,
+     140,
+     611,
+     161
+    ],
+    "rgb": [
+     239,
+     228,
+     125
+    ],
+    "tol": 6
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     600,
+     450
+    ],
+    "pred": "g_dom"
+   }
+  ],
+  "why": "flip(v) mirrors vertically: top and bottom quadrants swap. The near-white quadrant's probe is a patch mean (it carries a yellow label; source and flipped patch means agree to about a unit).",
+  "tier": "smoke"
+ },
+ {
+  "id": "flip-hv-eq-rot180",
+  "group": "flip",
+  "ops": "filters:flip(h):flip(v):format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "rot-180-quadrant",
+    "lt": 2
+   }
+  ],
+  "why": "flip(h) then flip(v) equals rotate(180).",
+  "tier": "full"
+ },
+ {
+  "id": "flip-pos-after",
+  "group": "flip",
+  "ops": "crop:300x300:bottom-right/filters:flip(h):format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     300,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     75,
+     75
+    ],
+    "pred": "g_dom"
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     140,
+     75
+    ],
+    "pred": "g_dom"
+   }
+  ],
+  "why": "Crop first (the square bottom-right window is 600x600, full height), then flip at that point in the chain: the top-right quadrant lands at the probes. A PIL composite of the documented ops matches the server output to 0.07 mean diff.",
+  "tier": "full"
+ },
+ {
+  "id": "flip-pos-before",
+  "group": "flip",
+  "ops": "filters:flip(h)/crop:300x300:bottom-right/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     300,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     75,
+     75
+    ],
+    "pred": "g_dom"
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     140,
+     75
+    ],
+    "pred": "r_dom"
+   },
+   {
+    "t": "md5_diff_cell",
+    "cell": "flip-pos-after"
+   }
+  ],
+  "why": "Flip first, then crop the same named window of the mirrored image: at (140,75) it shows the red quadrant where the crop-first chain shows green. A PIL composite matches the server output to 0.09 mean diff. Chain position matters.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-fillfilter",
+  "group": "pad",
+  "ops": "pad:1000x1000/filters:fill(ff0000):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     1000,
+     1000
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     500,
+     10
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     500,
+     990
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_eq_cell",
+    "xy": [
+     500,
+     500
+    ],
+    "cell": "base-dog-png",
+    "oxy": [
+     500,
+     375
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "Pad with no fill named uses the request's fill(...) color for the bands; the photo sits centered.",
+  "tier": "smoke"
+ },
+ {
+  "id": "pad-default-black",
+  "group": "pad",
+  "ops": "pad:1000x1000/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     500,
+     10
+    ],
+    "rgb": [
+     0,
+     0,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_eq_cell",
+    "xy": [
+     500,
+     500
+    ],
+    "cell": "base-dog-png",
+    "oxy": [
+     500,
+     375
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "With neither a pad fill nor a fill(...) color, the bands are black.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-8digit",
+  "group": "pad",
+  "ops": "pad:1000x1000:ff000080/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "The pad fill is documented as a 6-digit hex color; eight digits is a grammar error.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-noupscale",
+  "group": "pad",
+  "ops": "pad:800x600:0000ff/filters:no_upscale:format(png)",
+  "src": "small.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     800,
+     600
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     10,
+     10
+    ],
+    "rgb": [
+     0,
+     0,
+     255
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_eq_cell",
+    "xy": [
+     400,
+     300
+    ],
+    "cell": "base-small-png",
+    "oxy": [
+     100,
+     75
+    ],
+    "tol": 10
+   }
+  ],
+  "why": "Pad honors no_upscale (fit-in rules): the 200x150 source is centered unscaled in a sea of blue.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-exact",
+  "group": "pad",
+  "ops": "pad:1000x750:00ff00/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-dog-png",
+    "lt": 1.5
+   }
+  ],
+  "why": "Pad to the source's own size adds no bands at all.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-portrait",
+  "group": "pad",
+  "ops": "pad:1200x630:ffffff/filters:format(png)",
+  "src": "person-portrait.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     1200,
+     630
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     10,
+     315
+    ],
+    "rgb": [
+     255,
+     255,
+     255
+    ],
+    "tol": 10
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     1190,
+     315
+    ],
+    "rgb": [
+     255,
+     255,
+     255
+    ],
+    "tol": 10
+   }
+  ],
+  "why": "A portrait photo padded into a landscape canvas gets white pillarbox bands.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-blur-content",
+  "group": "pad",
+  "ops": "pad:1200x630:blur/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     1200,
+     630
+    ],
+    "tol": 0
+   },
+   {
+    "t": "region_std",
+    "box": [
+     0,
+     0,
+     180,
+     630
+    ],
+    "ch": 0,
+    "gt": 3
+   }
+  ],
+  "why": "Blur bands are a blurred copy of the image, not a flat color: the band region varies.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-reject-zero",
+  "group": "pad",
+  "ops": "pad:0x600/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "A proportional (0) axis is rejected by the exact-box contract.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-reject-orig",
+  "group": "pad",
+  "ops": "pad:origx600/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "An orig axis is rejected by the exact-box contract.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-reject-flip",
+  "group": "pad",
+  "ops": "pad:-800x600/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Flipped sizes are rejected by the exact-box contract.",
+  "tier": "full"
+ },
+ {
+  "id": "pad-after-crop",
+  "group": "pad",
+  "ops": "crop:600x300:top/pad:900x300:000000/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     900,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     10,
+     150
+    ],
+    "rgb": [
+     0,
+     0,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     200,
+     75
+    ],
+    "pred": "r_dom"
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     700,
+     75
+    ],
+    "pred": "g_dom"
+   }
+  ],
+  "why": "Crop to a top strip, then pad it: the strip sits centered between black bands.",
+  "tier": "full"
+ },
+ {
+  "id": "rad-tl-only",
+  "group": "radius",
+  "ops": "400x0/filters:radius(60,0,0,0):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     2,
+     2
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     398,
+     2
+    ],
+    "eq": 255,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     2,
+     298
+    ],
+    "eq": 255,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     398,
+     298
+    ],
+    "eq": 255,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     60,
+     5
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     10,
+     10
+    ],
+    "eq": 0,
+    "tol": 4
+   }
+  ],
+  "why": "Four-value radius in CSS order: only the top-left corner rounds.",
+  "tier": "smoke"
+ },
+ {
+  "id": "rad-br-only",
+  "group": "radius",
+  "ops": "400x0/filters:radius(0,0,60,0):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     398,
+     298
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     2,
+     298
+    ],
+    "eq": 255,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     2,
+     2
+    ],
+    "eq": 255,
+    "tol": 4
+   }
+  ],
+  "why": "The third value rounds the bottom-right corner (CSS order), not the bottom-left.",
+  "tier": "full"
+ },
+ {
+  "id": "rad-bl-only",
+  "group": "radius",
+  "ops": "400x0/filters:radius(0,0,0,60):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     2,
+     298
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     398,
+     298
+    ],
+    "eq": 255,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     398,
+     2
+    ],
+    "eq": 255,
+    "tol": 4
+   }
+  ],
+  "why": "The fourth value rounds the bottom-left corner.",
+  "tier": "full"
+ },
+ {
+  "id": "rad-oversize",
+  "group": "radius",
+  "ops": "400x0/filters:radius(1000):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     0,
+     0
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     200,
+     0
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     0,
+     150
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     200,
+     150
+    ],
+    "eq": 255,
+    "tol": 4
+   }
+  ],
+  "why": "A radius larger than the frame shrinks proportionally: corners round, edge midpoints and center stay opaque.",
+  "tier": "full"
+ },
+ {
+  "id": "rad-zero",
+  "group": "radius",
+  "ops": "400x0/filters:radius(0):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     0,
+     0
+    ],
+    "eq": 255,
+    "tol": 4
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-dog-400",
+    "lt": 1.5
+   }
+  ],
+  "why": "Radius 0 changes nothing.",
+  "tier": "full"
+ },
+ {
+  "id": "rad-aa",
+  "group": "radius",
+  "ops": "400x0/filters:radius(60):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "alpha_partial",
+    "box": [
+     0,
+     0,
+     90,
+     90
+    ]
+   }
+  ],
+  "why": "Corner rounding is antialiased: partial-alpha pixels exist along the arc.",
+  "tier": "full"
+ },
+ {
+  "id": "rad-webp-alpha",
+  "group": "radius",
+  "ops": "200x0/filters:radius(40):format(webp)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "magic",
+    "fmt": "webp"
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     2,
+     2
+    ],
+    "eq": 0,
+    "tol": 10
+   }
+  ],
+  "why": "Radius into lossy WebP with alpha. Observed for timing: this is the known #227 encoder path; the verdict is a note, the seconds are the data.",
+  "observe": true,
+  "timeout": 600,
+  "tier": "full"
+ },
+ {
+  "id": "rad-negative",
+  "group": "radius",
+  "ops": "400x0/filters:radius(-5):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "A negative radius is a grammar error.",
+  "tier": "full"
+ },
+ {
+  "id": "mask-ellipse-land",
+  "group": "mask",
+  "ops": "400x0/filters:mask(ellipse):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     0,
+     0
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     399,
+     0
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     0,
+     299
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     399,
+     299
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     2,
+     150
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     397,
+     150
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     200,
+     0
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     200,
+     299
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     200,
+     150
+    ],
+    "eq": 255,
+    "tol": 4
+   },
+   {
+    "t": "alpha_partial",
+    "box": [
+     0,
+     0,
+     80,
+     80
+    ]
+   }
+  ],
+  "why": "Ellipse inscribed in the frame: corners transparent, edge midpoints and the center opaque, antialiased edge. The side-midpoint probes sit 2 px inside: the exact boundary pixel carries partial coverage (alpha 223), which is the antialiasing working.",
+  "tier": "full"
+ },
+ {
+  "id": "mask-circle-portrait",
+  "group": "mask",
+  "ops": "300x0/filters:mask(circle):format(png)",
+  "src": "person-portrait.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     300,
+     450
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     0,
+     0
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     150,
+     0
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     150,
+     80
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     5,
+     225
+    ],
+    "eq": 255,
+    "tol": 6
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     150,
+     225
+    ],
+    "eq": 255,
+    "tol": 4
+   }
+  ],
+  "why": "Circle on a portrait frame: diameter is the smaller dimension (300), so the top midpoint is outside the circle while the side midpoints touch it.",
+  "tier": "full"
+ },
+ {
+  "id": "mask-circle-square",
+  "group": "mask",
+  "ops": "300x300/filters:mask(circle):format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     300,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     0,
+     0
+    ],
+    "eq": 0,
+    "tol": 4
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     150,
+     3
+    ],
+    "eq": 255,
+    "tol": 10
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     3,
+     150
+    ],
+    "eq": 255,
+    "tol": 10
+   },
+   {
+    "t": "pixel_alpha",
+    "xy": [
+     150,
+     150
+    ],
+    "eq": 255,
+    "tol": 4
+   }
+  ],
+  "why": "Circle on a square frame touches all four edge midpoints.",
+  "tier": "smoke"
+ },
+ {
+  "id": "mask-bad",
+  "group": "mask",
+  "ops": "400x0/filters:mask(triangle):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "Mask shapes are circle and ellipse only.",
+  "tier": "full"
+ },
+ {
+  "id": "border-band",
+  "group": "border",
+  "ops": "400x0/filters:border(10,ff0000):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     400,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     5,
+     150
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 5
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     0,
+     0
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 5
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     399,
+     299
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 5
+   },
+   {
+    "t": "pixel_eq_cell",
+    "xy": [
+     15,
+     150
+    ],
+    "cell": "base-dog-400",
+    "oxy": [
+     15,
+     150
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "A 10 px opaque band is painted inside the frame; the pixel just inside the band is the original.",
+  "tier": "smoke"
+ },
+ {
+  "id": "border-huge",
+  "group": "border",
+  "ops": "400x0/filters:border(200,00ff00):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   }
+  ],
+  "why": "A band wider than half the frame: observed (docs silent on overlap).",
+  "observe": true,
+  "samples": [
+   [
+    200,
+    150
+   ],
+   [
+    0,
+    0
+   ],
+   [
+    399,
+    299
+   ]
+  ],
+  "tier": "full"
+ },
+ {
+  "id": "border-zero",
+  "group": "border",
+  "ops": "400x0/filters:border(0,ff0000):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-dog-400",
+    "lt": 1.5
+   }
+  ],
+  "why": "Border width 0 changes nothing.",
+  "tier": "full"
+ },
+ {
+  "id": "border-jpeg",
+  "group": "border",
+  "ops": "400x0/filters:border(10,0000ff):format(jpeg)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "ct",
+    "eq": "image/jpeg"
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     5,
+     150
+    ],
+    "pred": "b_dom"
+   }
+  ],
+  "why": "Border works on any format, JPEG included.",
+  "tier": "full"
+ },
+ {
+  "id": "crop-center-w2",
+  "group": "crop",
+  "ops": "crop:200x400:center/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     200,
+     400
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     90,
+     100
+    ],
+    "pred": "r_dom"
+   }
+  ],
+  "why": "Center crop with a portrait window: the window sits mid-frame (top-left quadrant color at the probe point).",
+  "tier": "smoke"
+ },
+ {
+  "id": "focal-smart-br",
+  "group": "crop",
+  "ops": "focal:600x400:800x600/crop:200x400:smart/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     200,
+     400
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     90,
+     100
+    ],
+    "pred": "g_dom"
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     150,
+     300
+    ],
+    "rgb": [
+     230,
+     209,
+     30
+    ],
+    "tol": 25
+   },
+   {
+    "t": "diff_mean",
+    "vs": "crop-center-w2",
+    "gt": 8
+   }
+  ],
+  "why": "A focal rectangle in the bottom-right pulls the smart window onto it: the probes land on the top-right quadrant and on the bottom-right quadrant's yellow label patch (230,209,30, the same value Wave 1 sampled there).",
+  "tier": "full"
+ },
+ {
+  "id": "focal-ignored-left",
+  "group": "crop",
+  "ops": "focal:600x400:800x600/crop:200x400:left/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     90,
+     100
+    ],
+    "pred": "r_dom"
+   }
+  ],
+  "why": "Directional alignments ignore the focal rectangle: left keeps the left edge (top-left quadrant at the probe).",
+  "tier": "full"
+ },
+ {
+  "id": "focal-oob",
+  "group": "crop",
+  "ops": "focal:700x500:900x700/crop:400x400/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "A focal rectangle outside the source fails with 400.",
+  "tier": "full"
+ },
+ {
+  "id": "focal-inverted",
+  "group": "crop",
+  "ops": "focal:500x100:400x300/crop:400x400/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "A focal rectangle with right <= left fails with 400.",
+  "tier": "full"
+ },
+ {
+  "id": "croprect-partial-oob",
+  "group": "crop",
+  "ops": "crop-rect:700x50:900x450/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "A crop rectangle that falls partly outside the source fails with 400.",
+  "tier": "full"
+ },
+ {
+  "id": "croprect-full",
+  "group": "crop",
+  "ops": "crop-rect:0x0:800x600/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-quadrant-png",
+    "lt": 1.5
+   }
+  ],
+  "why": "A crop rectangle spanning the whole frame returns the image unchanged.",
+  "tier": "full"
+ },
+ {
+  "id": "croprect-negative",
+  "group": "crop",
+  "ops": "crop-rect:-10x0:100x100/filters:format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 400
+   }
+  ],
+  "why": "A negative crop-rectangle corner is outside the source: 400.",
+  "tier": "full"
+ },
+ {
+  "id": "crop-same-aspect",
+  "group": "crop",
+  "ops": "crop:400x300/filters:format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-dog-400",
+    "lt": 2
+   }
+  ],
+  "why": "Cropping to the source's own aspect ratio keeps the whole frame.",
+  "tier": "full"
+ },
+ {
+  "id": "facepad-alone",
+  "group": "crop",
+  "ops": "filters:facepad(1):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "base-dog-png",
+    "lt": 1.5
+   }
+  ],
+  "why": "facepad without a face crop is inert.",
+  "tier": "full"
+ },
+ {
+  "id": "facepad-face-nomodel",
+  "group": "crop",
+  "ops": "crop:200x200:face/filters:facepad(1)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 501
+   }
+  ],
+  "why": "A face crop still requires the face model; facepad does not change that.",
+  "tier": "full"
+ },
+ {
+  "id": "chain-sink-nomark",
+  "group": "chains",
+  "ops": "800x0/filters:rotate(10):text(Sale,32,ffffff,bottom-left):format(webp)",
+  "src": "car.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     880,
+     664
+    ],
+    "tol": 3
+   }
+  ],
+  "why": "The same chain without the watermark, as the diff reference.",
+  "tier": "full"
+ },
+ {
+  "id": "chain-sink",
+  "group": "chains",
+  "ops": "800x0/filters:rotate(10):watermark({ORIGIN_ENC}%2Fcrab-small.png,-10,-10,70):text(Sale,32,ffffff,bottom-left):format(webp)",
+  "src": "car.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "ct",
+    "eq": "image/webp"
+   },
+   {
+    "t": "dims",
+    "eq": [
+     880,
+     664
+    ],
+    "tol": 3
+   },
+   {
+    "t": "bright_count",
+    "box": [
+     0,
+     500,
+     300,
+     664
+    ],
+    "thresh": 200,
+    "gte": 30
+   },
+   {
+    "t": "region_diff",
+    "box": [
+     670,
+     521,
+     870,
+     654
+    ],
+    "vs": "chain-sink-nomark",
+    "gt": 5
+   }
+  ],
+  "why": "Kitchen sink: resize, rotate, crab watermark, text, WebP. Each stage applies in path order on the rotated canvas.",
+  "tier": "full"
+ },
+ {
+  "id": "chain-order-a",
+  "group": "chains",
+  "ops": "filters:overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100,normal):rotate(90):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     300,
+     400
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     274,
+     25
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     274,
+     75
+    ],
+    "rgb": [
+     0,
+     255,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     224,
+     25
+    ],
+    "rgb": [
+     0,
+     0,
+     255
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     224,
+     75
+    ],
+    "rgb": [
+     255,
+     255,
+     0
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "Overlay then rotate 90 (clockwise): the marker's quadrants rotate with the image.",
+  "tier": "smoke"
+ },
+ {
+  "id": "chain-order-b",
+  "group": "chains",
+  "ops": "filters:rotate(90):overlay({ORIGIN_ENC}%2Fov-marker.png,0,0,100,normal):format(png)",
+  "src": "base-rgb.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     300,
+     400
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     25,
+     25
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     75,
+     75
+    ],
+    "rgb": [
+     255,
+     255,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "md5_diff_cell",
+    "cell": "chain-order-a"
+   }
+  ],
+  "why": "Rotate then overlay: the marker lands unrotated at the new top-left, a different image from overlay-first.",
+  "tier": "smoke"
+ },
+ {
+  "id": "chain-format-last",
+  "group": "chains",
+  "ops": "filters:format(png):format(jpeg)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "ct",
+    "eq": "image/jpeg"
+   }
+  ],
+  "why": "A repeated directive resolves to the last one: JPEG wins.",
+  "tier": "full"
+ },
+ {
+  "id": "chain-one-segment",
+  "group": "chains",
+  "ops": "filters:grayscale:invert:format(png)",
+  "src": "screenshot.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "gray",
+    "max_spread": 10
+   }
+  ],
+  "why": "The same chain in a single segment, as the reference.",
+  "tier": "full"
+ },
+ {
+  "id": "chain-two-segments",
+  "group": "chains",
+  "ops": "filters:grayscale/filters:invert:format(png)",
+  "src": "screenshot.png",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "diff_mean",
+    "vs": "chain-one-segment",
+    "lt": 1.5
+   }
+  ],
+  "why": "Two filters: segments in one path apply both, same as one segment.",
+  "tier": "full"
+ },
+ {
+  "id": "cache-distinct-a",
+  "group": "chains",
+  "ops": "400x0/filters:watermark({ORIGIN_ENC}%2Fcrab-small.png,-10,-10,100):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "second_hit"
+   },
+   {
+    "t": "second_same"
+   }
+  ],
+  "why": "A repeat request for the same chain is a cache hit with identical bytes.",
+  "tier": "full"
+ },
+ {
+  "id": "cache-distinct-b",
+  "group": "chains",
+  "ops": "400x0/filters:watermark({ORIGIN_ENC}%2Fcrab-small.png,-10,-10,50):format(png)",
+  "src": "dog.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "md5_diff_cell",
+    "cell": "cache-distinct-a"
+   }
+  ],
+  "why": "A chain differing only in watermark opacity keys a different cache entry.",
+  "tier": "full"
+ },
+ {
+  "id": "chain-crop-pad-mark",
+  "group": "chains",
+  "ops": "crop:600x300:top/pad:900x300:000000/filters:watermark({ORIGIN_ENC}%2Fov-marker.png,-5,-5,100):format(png)",
+  "src": "quadrant.jpg",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "dims",
+    "eq": [
+     900,
+     300
+    ],
+    "tol": 0
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     10,
+     150
+    ],
+    "rgb": [
+     0,
+     0,
+     0
+    ],
+    "tol": 8
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     200,
+     75
+    ],
+    "pred": "r_dom"
+   },
+   {
+    "t": "pixel",
+    "xy": [
+     700,
+     75
+    ],
+    "pred": "g_dom"
+   },
+   {
+    "t": "pixel_eq",
+    "xy": [
+     820,
+     220
+    ],
+    "rgb": [
+     255,
+     0,
+     0
+    ],
+    "tol": 8
+   }
+  ],
+  "why": "Crop, pad, then watermark: the marker anchors to the padded canvas's bottom-right.",
+  "tier": "full"
+ },
+ {
+  "id": "animwebp-gate",
+  "group": "regression",
+  "ops": "",
+  "src": "anim.webp",
+  "assert": [
+   {
+    "t": "status",
+    "eq": 200
+   },
+   {
+    "t": "ct",
+    "eq": "image/webp"
+   },
+   {
+    "t": "frames",
+    "eq": 12
+   }
+  ],
+  "why": "v0.3.2 regression spot-check: a bare animated WebP request still succeeds through the new single-permit animation gate (the render is minutes-slow by #231; the gate is what changed).",
+  "timeout": 1500,
+  "tier": "full"
+ }
+]

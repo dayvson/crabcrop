@@ -1,0 +1,1 @@
+badfilter = filters:bogus(1)

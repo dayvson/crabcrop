@@ -1,0 +1,1 @@
+badmax = maxage:60/300x200

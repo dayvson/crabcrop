@@ -1,0 +1,416 @@
+[
+ {
+  "id": "preset-basic",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "preset-cache-expanded-first",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-cache-preset-first",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-compose-inline",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-unknown",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "preset-contexts",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-exp",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-maxage",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-boot-exp",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-boot-nested",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-boot-source",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-boot-maxage",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-boot-malformed",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "preset-boot-badfilter",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "only-presets-freeform",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "only-presets-allowed-forms",
+  "group": "presets",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-basic",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "purge-cli-verb",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-never-rendered",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "purge-bad-sig",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-wrong-kind",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-preset-spelling",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-equivalent-spelling",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-exp-variants",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-group-basic",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-group-unknown-and-badsig",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-freshness",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "purge-unsafe-mode-still-signed",
+  "group": "purge",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "explain-valid-json",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "explain-valid-html",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "explain-bad-sig",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "explain-expired",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "explain-malformed",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "explain-nonallowlisted-no-fetch",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "explain-no-private-leak",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "explain-preset-report",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "explain-unsafe-form",
+  "group": "explain",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "upload-basic",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "upload-cli-verb",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "upload-wrong-sig-and-replays",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "upload-disabled-404",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "upload-oversized",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "upload-traversal",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "upload-nonimage-and-ext-mismatch",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "upload-duplicate-409",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "upload-expired-token",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "upload-svg-sanitized",
+  "group": "upload",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-localhost-and-127",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "src-query-string",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-encoded-remainder",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-redirect-within",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-redirect-beyond-and-loop",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-redirect-out-denied",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-origin-errors",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "src-slow-timeout",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-allowlist-mismatch",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-unsafe-with-secret",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-userinfo-refused",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-file-traversal",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "src-svg-source",
+  "group": "sources",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "parity-build-url-and-srcset",
+  "group": "parity",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "parity-signatures-and-vectors",
+  "group": "parity",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "parity-cli-sign",
+  "group": "parity",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "parity-vectors-py",
+  "group": "parity",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "mcp-tools-and-sign",
+  "group": "mcp",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "mcp-explain-and-meta",
+  "group": "mcp",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "mcp-purge-result",
+  "group": "mcp",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "framework-parity",
+  "group": "frameworks",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "timing-families",
+  "group": "timing",
+  "kind": "scripted",
+  "tier": "full"
+ }
+]
