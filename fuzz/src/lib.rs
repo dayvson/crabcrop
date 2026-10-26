@@ -49,4 +49,30 @@ pub fn check(input: &str) {
     let _ = url::parse_signature(input);
     let _ = url::expand_presets(input, &std::collections::HashMap::new(), false);
     let _ = url::preset_names(input);
+    // Root expansion (issue #250): total over untrusted
+    // text, and a successful expansion stays under the
+    // named root's base by construction. The map is a
+    // fixed stand-in for operator configuration.
+    let roots: std::collections::HashMap<String, String> = [
+        (
+            "photos".to_string(),
+            "https://cdn.example.com/photos".to_string(),
+        ),
+        ("media".to_string(), "https://assets.example.com".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let _ = url::expand_source_root(input, &roots);
+    let _ = url::expand_source_root_in_remainder(input, &roots);
+    if let Ok((_, _, request)) = url::parse_request(input) {
+        if let Ok((expanded, Some(reference))) =
+            url::expand_source_root(request.source_url, &roots)
+        {
+            let base = &roots[&reference.name];
+            assert!(
+                expanded.starts_with(&format!("{base}/")),
+                "root expansion escaped its base: {expanded}"
+            );
+        }
+    }
 }

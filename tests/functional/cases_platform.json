@@ -412,5 +412,47 @@
   "group": "timing",
   "kind": "scripted",
   "tier": "full"
+ },
+ {
+  "id": "roots-valid-render",
+  "group": "roots",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "roots-cache-and-purge",
+  "group": "roots",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "roots-refusals-no-fetch",
+  "group": "roots",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "roots-explain",
+  "group": "roots",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "roots-boot-duplicate",
+  "group": "roots",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "roots-boot-bad-name",
+  "group": "roots",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "roots-boot-bad-base",
+  "group": "roots",
+  "kind": "scripted",
+  "tier": "full"
  }
 ]

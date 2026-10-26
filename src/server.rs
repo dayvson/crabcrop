@@ -4443,6 +4443,189 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    /// Issue #250: the adversarial barrage. Every invalid
+    /// root spelling is refused with its frozen code, none
+    /// of them reaches the origin, no response carries
+    /// operator configuration, and the same process answers
+    /// valid requests afterwards: an invalid root is never
+    /// a vulnerability and never a crash.
+    #[tokio::test]
+    async fn invalid_root_barrage_never_fetches_and_the_server_survives() {
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        let origin = src.strip_suffix("/src.png").unwrap().to_string();
+        let long_name = "a".repeat(10_000);
+        for remainder in [
+            "30x20/root:nope/src.png".to_string(),
+            "30x20/root:PHOTOS/src.png".to_string(),
+            "30x20/root:photo/src.png".to_string(),
+            "30x20/root:photoss/src.png".to_string(),
+            format!("30x20/root:{long_name}/src.png"),
+        ] {
+            let (status, body) =
+                get_raw(&base, &format!("/{}/{remainder}", sign(&remainder))).await;
+            assert_eq!(status, 400, "{remainder}: {body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["error"]["code"], "unknown_root", "{remainder}");
+            assert!(!body.contains(&origin), "{remainder}: {body}");
+        }
+        for remainder in [
+            "30x20/root:/src.png",
+            "30x20/root:photos",
+            "30x20/root:photos/..%5csecret.png",
+            "30x20/root:photos/%2e%2e%5csecret.png",
+            "30x20/root:photos/%/src.png",
+            "30x20/root:photos/%ff/src.png",
+        ] {
+            let (status, body) = get_raw(&base, &format!("/{}/{remainder}", sign(remainder))).await;
+            assert_eq!(status, 400, "{remainder}: {body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["error"]["code"], "invalid_root", "{remainder}");
+            assert!(!body.contains(&origin), "{remainder}: {body}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no refusal was fetched");
+        // The process is unharmed: a valid root request and
+        // a valid full-URL request both render (one shared
+        // cache entry, one fetch), and health answers.
+        let resp = get_signed(&base, "30x20/root:photos/src.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get_signed(&base, &format!("30x20/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let resp = client().get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Issue #250: a double-encoded traversal expands to a
+    /// literal percent-named file under the root. Decoding
+    /// happens exactly once, so the fetch is addressed
+    /// under the root's base, like any other file name,
+    /// and reaches exactly the origin the root names.
+    #[tokio::test]
+    async fn root_double_encoded_segments_fetch_under_the_root() {
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        let resp = get_signed(&base, "30x20/root:photos/%252e%252e/src.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Issue #250: explain and meta refuse invalid roots
+    /// the same way serve does, before any fetch: neither
+    /// surface is a side door around the expansion checks.
+    #[tokio::test]
+    async fn explain_and_meta_refuse_invalid_roots_without_fetching() {
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_explain_app_with_roots(
+            std::collections::HashMap::new(),
+            Loader::with_defaults().unwrap(),
+            root_test_map(&src),
+        )
+        .await;
+        // Raw requests: a normalizing client would rewrite
+        // the traversal spelling before the server saw it.
+        for (remainder, code) in [
+            ("30x20/root:nope/src.png", "unknown_root"),
+            ("30x20/root:photos/../secret.png", "invalid_root"),
+        ] {
+            let (status, body) =
+                get_raw(&base, &format!("/explain/{}/{remainder}", sign(remainder))).await;
+            assert_eq!(status, 400, "{remainder}: {body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["error"]["code"], code, "{remainder}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "explain fetched nothing");
+        // Meta rides the image path under an
+        // application/json Accept: same refusal, same code.
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        let remainder = "30x20/root:nope/src.png";
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "unknown_root");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "meta fetched nothing");
+    }
+
+    /// POST with the path bytes exactly as given, the
+    /// purge twin of get_raw: purge targets with traversal
+    /// spellings must reach the server unaltered, which a
+    /// URL-normalizing client would prevent.
+    async fn post_raw(base: &str, path: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let addr = base.strip_prefix("http://").unwrap();
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        socket.read_to_string(&mut raw).await.unwrap();
+        let status: u16 = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = raw
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    /// Issue #250: purge is fail-safe against invalid root
+    /// spellings. A purge signature is cheap for an
+    /// operator to mint over any text; a bad spelling must
+    /// evict nothing and disturb nothing.
+    #[tokio::test]
+    async fn purge_with_an_invalid_root_spelling_evicts_nothing() {
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        let short = "30x20/root:photos/src.png";
+        let resp = get_signed(&base, short).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        for target in [
+            "30x20/root:nope/src.png",
+            "30x20/root:photos/../src.png",
+            "30x20/root:photos/%2e%2e/src.png",
+            "30x20/root:photos/a/../../src.png",
+        ] {
+            let purge_sig = crate::url::purge_signature(SECRET, target);
+            let (status, body) = post_raw(&base, &format!("/purge/{purge_sig}/{target}")).await;
+            assert_eq!(status, 200, "{target}: {body}");
+            assert!(body.contains("purged 0"), "{target}: {body}");
+        }
+        // The cached entry survived every bad spelling.
+        let resp = get_signed(&base, short).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "still a cache hit");
+    }
+
     #[tokio::test]
     async fn purging_either_spelling_evicts_the_shared_root_entry() {
         // Render via the short spelling, purge by it, and

@@ -1,0 +1,3 @@
+# Functional tier roots (issue #250): the harness origin is
+# a fixed address, so the base can be written literally.
+photos = http://127.0.0.1:8971

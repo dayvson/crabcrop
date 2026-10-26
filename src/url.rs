@@ -4948,6 +4948,240 @@ mod tests {
         );
     }
 
+    /// Issue #250: any name that is not exactly a configured
+    /// key is `unknown_root`, however it is spelled. Names
+    /// are never decoded, normalized, or case-folded before
+    /// the lookup, so lookalikes cannot reach a configured
+    /// root.
+    #[test]
+    fn root_names_that_are_not_the_configured_key_are_unknown_root() {
+        let map = root_map();
+        for (source, name) in [
+            ("root:Photos/cat.jpg", "Photos"),
+            ("root:PHOTOS/cat.jpg", "PHOTOS"),
+            ("root:photo/cat.jpg", "photo"),
+            ("root:photoss/cat.jpg", "photoss"),
+            ("root:photos./cat.jpg", "photos."),
+            ("root:photos name/cat.jpg", "photos name"),
+            ("root: photos/cat.jpg", " photos"),
+            ("root:photos%2f/cat.jpg", "photos%2f"),
+            ("root:photos:80/cat.jpg", "photos:80"),
+            ("root:root:photos/cat.jpg", "root:photos"),
+            ("root:fötös/cat.jpg", "fötös"),
+            ("root:🦀/cat.jpg", "🦀"),
+        ] {
+            let err = expand_source_root(source, &map).unwrap_err();
+            assert_eq!(err, ParseError::UnknownRoot(name.to_string()), "{source}");
+            assert_eq!(err.code(), "unknown_root", "{source}");
+        }
+        // A name of arbitrary length is a lookup miss, not a
+        // failure mode of its own.
+        let long_name = "a".repeat(10_000);
+        let source = format!("root:{long_name}/cat.jpg");
+        assert_eq!(
+            expand_source_root(&source, &map),
+            Err(ParseError::UnknownRoot(long_name))
+        );
+    }
+
+    /// Issue #250: short forms that cannot name a root plus
+    /// a path under it are `invalid_root`: the shape check
+    /// runs before the name lookup, so even a configured
+    /// name cannot rescue a malformed spelling.
+    #[test]
+    fn root_short_forms_without_a_usable_path_are_invalid_root() {
+        let map = root_map();
+        for source in [
+            "root:",                   // nothing after the prefix
+            "root:/",                  // a slash and nothing else
+            "root://cat.jpg",          // empty name
+            "root:photos//",           // path is one empty segment
+            "root:photos///",          // path is only empty segments
+            "root:photos/.",           // path normalizes to nothing
+            "root:photos/%2e",         // an encoded dot, the same
+            "root:photos/%2e/",        // dot and an empty segment
+            "root:photos/%",           // malformed percent escape
+            "root:photos/%zz/cat.jpg", // malformed percent escape
+            "root:photos/cat.jpg%",    // truncated escape at the end
+            "root:photos/%ff/cat.jpg", // escape to invalid UTF-8
+        ] {
+            let err = expand_source_root(source, &map).unwrap_err();
+            assert_eq!(err, ParseError::InvalidRoot(source.to_string()), "{source}");
+            assert_eq!(err.code(), "invalid_root", "{source}");
+        }
+    }
+
+    /// Issue #250: traversal and host-change tricks. What
+    /// can be refused is refused; what cannot be refused
+    /// (it is a legal path under the root) still expands
+    /// to a URL under the root's base, byte for byte.
+    #[test]
+    fn root_paths_cannot_escape_by_encoding_or_host_tricks() {
+        let map = root_map();
+        for bad in [
+            "root:photos/..%5csecret.jpg",      // encoded backslash climb
+            "root:photos/%2e%2e%5csecret.jpg",  // encoded dots, encoded backslash
+            "root:photos/a/%5c..%5csecret.jpg", // separators inside one segment
+            "root:photos/.%2e/secret.jpg",      // mixed-encoding dotdot
+        ] {
+            assert_eq!(
+                expand_source_root(bad, &map),
+                Err(ParseError::InvalidRoot(bad.to_string())),
+                "{bad}"
+            );
+        }
+        for (source, expanded) in [
+            // Decoding happens exactly once, like every URL
+            // layer: a double-encoded dot segment expands
+            // to a literal `%2e%2e` file name under the
+            // root, not to a dot segment anywhere.
+            (
+                "root:photos/%252e%252e/secret.jpg",
+                "https://cdn.example.com/photos/%252e%252e/secret.jpg",
+            ),
+            // Three dots are a file name, not a dot segment.
+            (
+                "root:photos/%2e%2e./secret.jpg",
+                "https://cdn.example.com/photos/%2e%2e./secret.jpg",
+            ),
+            // An `@`, `?`, or `#` inside the path is path
+            // text: the base already fixed the scheme, host,
+            // and prefix, so none of them can re-target the
+            // fetch.
+            (
+                "root:photos/@evil.example/cat.jpg",
+                "https://cdn.example.com/photos/@evil.example/cat.jpg",
+            ),
+            (
+                "root:photos/cat.jpg?x=1",
+                "https://cdn.example.com/photos/cat.jpg?x=1",
+            ),
+            (
+                "root:photos/cat.jpg#frag",
+                "https://cdn.example.com/photos/cat.jpg#frag",
+            ),
+            (
+                "root:photos//evil.example/cat.jpg",
+                "https://cdn.example.com/photos//evil.example/cat.jpg",
+            ),
+            // Trailing-dot segments are file names, not
+            // dot segments.
+            (
+                "root:photos/cat.jpg.",
+                "https://cdn.example.com/photos/cat.jpg.",
+            ),
+            (
+                "root:photos/a./cat.jpg",
+                "https://cdn.example.com/photos/a./cat.jpg",
+            ),
+            // A `..` that stays inside the root is a normal
+            // path, however it is spelled.
+            (
+                "root:photos/a/b/../../cat.jpg",
+                "https://cdn.example.com/photos/cat.jpg",
+            ),
+        ] {
+            let (got, _) = expand_source_root(source, &map).unwrap();
+            assert_eq!(got, expanded, "{source}");
+            assert!(
+                got.starts_with("https://cdn.example.com/photos/"),
+                "{source}"
+            );
+        }
+    }
+
+    /// Issue #250: depth does not change the rules, and no
+    /// input in the adversarial space expands outside its
+    /// root's base or fails with anything but the two
+    /// frozen root codes.
+    #[test]
+    fn root_expansion_holds_its_invariants_at_any_depth() {
+        let map = root_map();
+        // Ten thousand segments deep, served fine...
+        let deep = format!("root:photos/{}/cat.jpg", "a/".repeat(9_999));
+        let (expanded, _) = expand_source_root(&deep, &map).unwrap();
+        assert!(expanded.starts_with("https://cdn.example.com/photos/a/"));
+        assert!(expanded.ends_with("/cat.jpg"));
+        // ...and ten thousand climbs are refused by the
+        // second one already.
+        let climbs = format!("root:photos/a/{}/cat.jpg", "../".repeat(9_999));
+        assert_eq!(
+            expand_source_root(&climbs, &map),
+            Err(ParseError::InvalidRoot(climbs.clone()))
+        );
+        // The sweep: every combination of an adversarial
+        // name and an adversarial path either refuses with
+        // a frozen root code or expands under the base of
+        // the root it named.
+        let names = ["photos", "media", "nope", "Photos", "", "🦀", "a b"];
+        let paths = [
+            "cat.jpg",
+            "../cat.jpg",
+            "%2e%2e/cat.jpg",
+            "..%5ccat.jpg",
+            "%252e%252e/cat.jpg",
+            "@evil.example/cat.jpg",
+            "a//b.jpg",
+            ".",
+            "..",
+            "%",
+            "a/./b/../cat.jpg",
+            "cat.jpg?x",
+            "cat.jpg#x",
+        ];
+        for name in names {
+            for path in paths {
+                let source = format!("root:{name}/{path}");
+                match expand_source_root(&source, &map) {
+                    Ok((expanded, reference)) => {
+                        let reference = reference.expect("a root source names its root");
+                        let base = &map[&reference.name];
+                        assert!(
+                            expanded.starts_with(&format!("{base}/")),
+                            "{source} expanded to {expanded}"
+                        );
+                    }
+                    Err(e) => assert!(
+                        matches!(e.code(), "unknown_root" | "invalid_root"),
+                        "{source}: {e}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Issue #250: `root:` only has meaning as the very
+    /// start of the source. Inside a full source it is path
+    /// text, and a remainder whose source position holds a
+    /// malformed short form fails the same way the serve
+    /// path's own expansion fails.
+    #[test]
+    fn root_prefix_only_counts_at_the_source_start() {
+        let map = root_map();
+        assert_eq!(
+            expand_source_root_in_remainder(
+                "300x200/https://example.com/root:photos/cat.jpg",
+                &map
+            )
+            .unwrap(),
+            "300x200/https://example.com/root:photos/cat.jpg"
+        );
+        assert_eq!(
+            expand_source_root_in_remainder("300x200/root:photos", &map),
+            Err(ParseError::InvalidRoot("root:photos".to_string()))
+        );
+        assert_eq!(
+            expand_source_root_in_remainder("300x200/root:/cat.jpg", &map),
+            Err(ParseError::InvalidRoot("root:/cat.jpg".to_string()))
+        );
+        assert_eq!(
+            expand_source_root_in_remainder("300x200/root:photos/%2e%2e/secret.jpg", &map),
+            Err(ParseError::InvalidRoot(
+                "root:photos/%2e%2e/secret.jpg".to_string()
+            ))
+        );
+    }
+
     #[test]
     fn presets_only_mode_rejects_free_form_operations() {
         let map = preset_map();

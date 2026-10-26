@@ -33,7 +33,7 @@ SECRET = "functional-test-secret-0123456789"
 # (8909/8912/3321) or a developer's own server (default 8904 family).
 PORTS = {"origin": 8971, "A": 8972, "AN": 8973, "AP": 8974, "P": 8975,
          "N": 8976, "U": 8977, "OP": 8978, "E": 8979, "BOOT": 8980,
-         "AI": 8981, "AIN": 8982, "AIC": 8983}
+         "AI": 8981, "AIN": 8982, "AIC": 8983, "R": 8984}
 BASES = {k: f"http://127.0.0.1:{p}" for k, p in PORTS.items() if k != "origin"}
 ORIGIN = f"http://127.0.0.1:{PORTS['origin']}"
 SRC127 = ORIGIN
@@ -158,6 +158,9 @@ INSTANCE_ENV = {
                CRABCROP_ONLY_PRESETS="1", **ALLOW),
     "E": dict(CRABCROP_ALLOW_UNSAFE="1",
               CRABCROP_ALLOWED_SOURCES="localhost"),
+    "R": dict(CRABCROP_ALLOW_UNSAFE="1",
+              CRABCROP_SOURCE_ROOTS_FILE=os.path.join(FUNC_DIR, "roots.txt"),
+              **ALLOW),
 }
 # U needs the runtime upload dir; filled in by start_instances().
 def start_instances(names):

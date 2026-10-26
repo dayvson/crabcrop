@@ -2399,6 +2399,14 @@ mod tests {
             ("roots-userinfo", "a = https://user:pass@cdn.example.com\n"),
             ("roots-query", "a = https://cdn.example.com/?v=1\n"),
             ("roots-fragment", "a = https://cdn.example.com/#top\n"),
+            // Issue #250: the name charset and the base
+            // shape admit no lookalikes either.
+            ("roots-dotname", "my.photos = https://cdn.example.com\n"),
+            ("roots-uniname", "fötös = https://cdn.example.com\n"),
+            ("roots-emptyname", "= https://cdn.example.com\n"),
+            ("roots-ftp", "a = ftp://cdn.example.com\n"),
+            ("roots-useronly", "a = https://user@cdn.example.com\n"),
+            ("roots-nohost", "a = https://\n"),
         ] {
             let path = temp_file(tag, text.as_bytes());
             assert!(

@@ -265,6 +265,149 @@ def only_presets_allowed_forms():
           f"preset={fp['status']} bare={fb['status']} exp={fe['status']} unsafe={fu['status']}")
 
 
+# ---------------------------------------------------------------- roots
+@cell
+def roots_valid_render():
+    rem = "30x20/root:photos/dog.jpg"
+    f = render_signed("roots-valid-render", "R", rem)
+    ok = f["status"] == 200 and dims(f) == (30, 20)
+    check("roots-valid-render", "roots", "30x20/root:photos/dog.jpg",
+          "dog.jpg", ok, f,
+          f"status={f['status']} dims={dims(f)} server_ms={f['server_ms']}")
+
+
+@cell
+def roots_cache_and_purge():
+    short = "300x200/root:photos/cat.jpg"
+    full = f"300x200/{CAT}"
+    purge_cli(short, "R")
+    hits0 = origin_hits("/cat.jpg")
+    f1 = timed_render("roots-cache-and-purge", "R", signed_path(short))
+    f2 = timed_render("roots-cache-and-purge", "R", signed_path(full))
+    hits1 = origin_hits("/cat.jpg")
+    st, txt, _ = purge_http(short, purge_sig(short), base="R")
+    f3 = timed_render("roots-cache-and-purge", "R", signed_path(full))
+    hits2 = origin_hits("/cat.jpg")
+    ok = (f1["status"] == 200 and f2["status"] == 200
+          and f1["md5"] == f2["md5"] and hits1 - hits0 == 1
+          and "purged 1" in txt and f3["status"] == 200
+          and hits2 - hits1 == 1)
+    check("roots-cache-and-purge", "roots",
+          "300x200 short + full spellings", "cat.jpg", ok, f1,
+          f"short={f1['status']} full={f2['status']} bytes_equal={f1['md5'] == f2['md5']} "
+          f"fetches_for_both={hits1 - hits0} purge={txt!r} "
+          f"after_purge={f3['status']} refetch={hits2 - hits1}")
+
+
+@cell
+def roots_refusals_no_fetch():
+    """Issue #250: adversarial root spellings against the real
+    binary. Every one is its documented 400, none reaches the
+    origin, and the same process renders afterwards."""
+    cases = [
+        ("30x20/root:nope/dog.jpg", "unknown_root"),
+        ("30x20/root:PHOTOS/dog.jpg", "unknown_root"),
+        ("30x20/root:photo/dog.jpg", "unknown_root"),
+        ("30x20/root:/dog.jpg", "invalid_root"),
+        ("30x20/root:photos/../secret.jpg", "invalid_root"),
+        ("30x20/root:photos/%2e%2e/secret.jpg", "invalid_root"),
+        ("30x20/root:photos/..%5csecret.jpg", "invalid_root"),
+    ]
+    hits0 = origin_hits()
+    results = []
+    for rem, want in cases:
+        st, h, payload, ms = get("R", signed_path(rem),
+                                 {"Accept": "application/json"})
+        code = None
+        try:
+            code = json.loads(payload)["error"]["code"]
+        except Exception:
+            pass
+        results.append((rem, st, code, want))
+    hits1 = origin_hits()
+    bad = [r for r in results if r[1] != 400 or r[2] != r[3]]
+    f = render_signed("roots-refusals-no-fetch", "R",
+                      "30x20/root:photos/dog.jpg")
+    ok = not bad and hits1 == hits0 and f["status"] == 200
+    check("roots-refusals-no-fetch", "roots", "adversarial root spellings",
+          "dog.jpg", ok, f,
+          " | ".join(f"{r[0]} -> {r[1]}/{r[2]}" for r in results)[:420]
+          + f" origin_hits_delta={hits1 - hits0} render_after={f['status']}")
+
+
+@cell
+def roots_explain():
+    rem = "400x300/root:photos/dog.jpg"
+    st, h, payload, ms = explain_get(rem, base="R")
+    f = fact_of("roots-explain", "R", "GET", f"/explain/{rem}",
+                st, h, payload, ms)
+    text = payload.decode("utf-8", "replace")
+    j = {}
+    try:
+        j = json.loads(payload)
+    except Exception:
+        pass
+    srcj = j.get("source") or {}
+    hits0 = origin_hits("/dog.jpg")
+    rem2 = "400x300/root:nope/dog.jpg"
+    st2, h2, p2, _ = explain_get(rem2, base="R")
+    code2 = None
+    try:
+        code2 = json.loads(p2)["error"]["code"]
+    except Exception:
+        pass
+    hits1 = origin_hits("/dog.jpg")
+    ok = (st == 200 and srcj.get("url") == "root:photos/dog.jpg"
+          and srcj.get("root") == "photos" and "8971" not in text
+          and st2 == 400 and code2 == "unknown_root" and hits1 == hits0)
+    check("roots-explain", "roots", "400x300/root:photos/dog.jpg",
+          "dog.jpg", ok, f,
+          f"status={st} source_url={srcj.get('url')} root={srcj.get('root')} "
+          f"base_leaked={'8971' in text} unknown: status={st2} "
+          f"code={code2} fetches={hits1 - hits0}")
+
+
+def boot_with_roots(fname):
+    env = dict(os.environ, CRABCROP_SECRET=SECRET, CRABCROP_PORT=str(PORTS["BOOT"]),
+               CRABCROP_SOURCE_ROOTS_FILE=os.path.join(FUNC_DIR, "badroots", fname),
+               NO_PROXY="127.0.0.1,localhost")
+    logf = open(os.path.join(OUT, "logs", f"boot-roots-{fname}.log"), "w")
+    p = subprocess.Popen([BIN], env=env, stdout=logf, stderr=subprocess.STDOUT)
+    try:
+        rc = p.wait(timeout=6)
+        out = open(os.path.join(OUT, "logs", f"boot-roots-{fname}.log")).read()
+        return rc, out
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        return None, "SERVER BOOTED AND KEPT RUNNING"
+
+
+def _roots_boot_cell(cell_id, fname, label):
+    rc, out = boot_with_roots(fname)
+    ok = rc is not None and rc != 0 and "root" in out.lower()
+    rec(cell_id, "roots", label, "-", "PASS" if ok else "FAIL", None,
+        f"exit={rc} log_tail={out.strip()[-160:]!r}")
+
+
+@cell
+def roots_boot_duplicate():
+    _roots_boot_cell("roots-boot-duplicate", "duplicate.txt",
+                     "roots file with a duplicate name")
+
+
+@cell
+def roots_boot_bad_name():
+    _roots_boot_cell("roots-boot-bad-name", "badname.txt",
+                     "roots file with a dotted name")
+
+
+@cell
+def roots_boot_bad_base():
+    _roots_boot_cell("roots-boot-bad-base", "badbase.txt",
+                     "roots file with a non-http base")
+
+
 # ---------------------------------------------------------------- purge
 @cell
 def purge_basic():

@@ -276,7 +276,7 @@ def main():
             for c in dsl_cases:
                 need.add(hz.instance_of(c))
             for c in platform_rows:
-                need |= {"P", "N", "U", "OP", "E"}
+                need |= {"P", "N", "U", "OP", "E", "R"}
                 break
             if args.tier == "smoke":
                 need &= {"A", "P", "U"}

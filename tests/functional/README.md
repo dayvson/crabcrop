@@ -37,7 +37,7 @@ this suite exists to catch stand out in the trend table anyway.
 | `cases_core.json` | data-driven cases: core imaging (wave 1 of the campaign) |
 | `cases_overlay.json` | data-driven cases: overlays, text, geometry (wave 2) |
 | `cases_platform.json` | index of the scripted platform cases (wave 4) |
-| `platform_cases.py` | the scripted cells: presets, purge, explain, upload, source kinds, SDK/MCP/framework parity |
+| `platform_cases.py` | the scripted cells: presets, roots, purge, explain, upload, source kinds, SDK/MCP/framework parity |
 | `cases_ai.json` | index of the AI cases (wave 3), local tier only |
 | `ai_cases.py` | the scripted AI cells |
 | `corpus/` + `corpus.json` | the frozen corpus and its manifest (origin, format, dimensions, bytes, frames per file) |
@@ -78,12 +78,12 @@ python3 tests/functional/run.py --tier full --ids preset-basic,fx-grayscale
 python3 tests/functional/run.py --tier full --groups purge,explain
 ```
 
-`run.py` boots everything it needs on scratch ports (8971 to 8983)
+`run.py` boots everything it needs on scratch ports (8971 to 8984)
 and stops it at the end: an origin server over `corpus/`, and
 crabcrop instances per configuration profile (default with a font,
 no-font, metadata-preserve, presets, bare, uploads, only-presets,
-localhost-only allowlist). Nothing is fetched from the network; the
-corpus is the only fixture source.
+localhost-only allowlist, source roots). Nothing is fetched from
+the network; the corpus is the only fixture source.
 
 Results land in the out directory after every case, so a crashed
 run keeps its data: `results.json`, `results.csv`, `summary.md`
