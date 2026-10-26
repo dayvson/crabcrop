@@ -550,6 +550,9 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         Filter::PixelateRegion { x, y, w, h } => {
             format!("pixelate_region({x},{y},{w},{h}): pixelate one rectangle")
         }
+        Filter::RemoveRegion { x, y, w, h } => {
+            format!("remove_region({x},{y},{w},{h}): erase one rectangle and inpaint it")
+        }
         Filter::MaxBytes(v) => format!("max_bytes({v}): cap the output size in bytes"),
         Filter::Quality(q) => match q {
             Quality::Auto => "quality(auto): encode quality".into(),

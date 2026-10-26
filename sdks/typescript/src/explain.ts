@@ -73,6 +73,7 @@ export const FILTER_DESCRIPTIONS: Record<string, string> = {
   blur_region: "gaussian-blur the rectangle (x,y,w,h) in pixels at this point in the chain (redaction)",
   overlay: "composite another image over the result: (url,x,y,alpha,blend[,width %]) with blend normal, multiply, screen, or overlay",
   pixelate_region: "pixelate the rectangle (x,y,w,h) in pixels at this point in the chain (redaction)",
+  remove_region: "erase the rectangle (x,y,w,h) in pixels at this point in the chain and inpaint it from the surrounding pixels (AI region removal)",
 };
 
 const MAX_DIMENSION = 16383;
@@ -342,7 +343,8 @@ function validateFilter(name: string, args: string | null): string | null {
         : bad;
     }
     case "blur_region":
-    case "pixelate_region": {
+    case "pixelate_region":
+    case "remove_region": {
       if (args === null) return bad;
       const parts = args.split(",");
       return parts.length === 4 &&

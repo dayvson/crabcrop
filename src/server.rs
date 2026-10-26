@@ -155,6 +155,11 @@ pub struct AppState {
     /// `CRABCROP_UPSCALE_MODEL` is configured. `None` means the
     /// feature is off; `upscale` requests then fail cleanly.
     pub upscale: Option<Arc<dyn crate::ai::UpscaleProvider>>,
+    /// Inpainting provider, preloaded at boot when
+    /// `CRABCROP_INPAINT_MODEL` is configured. `None` means
+    /// the feature is off; `remove_region` requests then
+    /// fail cleanly.
+    pub inpaint: Option<Arc<dyn crate::ai::InpaintProvider>>,
     /// Face provider for smart crops, preloaded at boot when
     /// `CRABCROP_FACE_MODEL` is configured. `None` means smart
     /// crops use the saliency estimate.
@@ -1253,6 +1258,7 @@ struct ProcessJob {
     placeholders: bool,
     mask_provider: Option<Arc<dyn crate::ai::MaskProvider>>,
     upscale_provider: Option<Arc<dyn crate::ai::UpscaleProvider>>,
+    inpaint_provider: Option<Arc<dyn crate::ai::InpaintProvider>>,
     face_provider: Option<Arc<dyn crate::ai::FaceProvider>>,
     detect_provider: Option<Arc<dyn crate::ai::DetectionProvider>>,
     declared_detect_providers: Vec<Arc<dyn crate::ai::DetectionProvider>>,
@@ -1365,6 +1371,7 @@ async fn run_process(
                 placeholders: job.placeholders,
                 mask_provider: job.mask_provider.as_deref(),
                 upscale_provider: job.upscale_provider.as_deref(),
+                inpaint_provider: job.inpaint_provider.as_deref(),
                 face_provider: job.face_provider.as_deref(),
                 detect_provider: job.detect_provider.as_deref(),
                 declared_detect_providers: &declared_refs,
@@ -1963,6 +1970,7 @@ async fn serve_miss(
         placeholders,
         mask_provider: state.removebg.clone(),
         upscale_provider: state.upscale.clone(),
+        inpaint_provider: state.inpaint.clone(),
         face_provider: state.face.clone(),
         detect_provider: state.detect.clone(),
         declared_detect_providers: state.detectors.iter().map(|d| d.provider.clone()).collect(),
@@ -2971,6 +2979,21 @@ fn meta_response(
         }
         body.push('}');
     }
+    if let Some(inpaint) = &processed.inpaint {
+        // The region-removal record (issue #176): the
+        // rectangles the inpainting model erased, in chain
+        // order, each [x, y, w, h] in the pixel coordinates
+        // in effect where its filter ran.
+        let regions: Vec<String> = inpaint
+            .regions
+            .iter()
+            .map(|(x, y, w, h)| format!("[{x},{y},{w},{h}]"))
+            .collect();
+        body.push_str(&format!(
+            ",\"inpaint\":{{\"regions\":[{}]}}",
+            regions.join(",")
+        ));
+    }
     if let Some(ph) = &processed.placeholder {
         let palette: Vec<String> = ph.palette.iter().map(|c| format!("\"{c}\"")).collect();
         body.push_str(&format!(
@@ -3291,6 +3314,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -3396,6 +3420,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -3474,6 +3499,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -3555,6 +3581,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -3782,6 +3809,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -4133,6 +4161,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -4192,6 +4221,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -4254,6 +4284,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -4817,6 +4848,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -5418,6 +5450,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_region_without_a_configured_model_is_a_clean_501() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:remove_region(0,0,10,10):format(png)/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("remove_region is not configured"),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_region_out_of_bounds_is_a_400() {
+        // The image server fixture is 100x60: a rectangle
+        // overflowing it fails with the region filters'
+        // shared bounds error, a 400, not a partial erase.
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_inpaint().await;
+        let remainder = format!("filters:remove_region(95,55,10,10):format(png)/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("exceeds image bounds"), "body: {body}");
+    }
+
+    #[tokio::test]
     async fn serves_optimized_image() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;
@@ -5575,6 +5637,28 @@ mod tests {
         }
     }
 
+    /// A fake inpainting provider: fills the masked pixels
+    /// with one flat color, the deterministic stand-in for
+    /// the model's fill.
+    #[derive(Debug)]
+    struct FakeInpaint;
+
+    impl crate::ai::InpaintProvider for FakeInpaint {
+        fn inpaint(
+            &self,
+            img: &image::DynamicImage,
+            mask: &image::GrayImage,
+        ) -> Result<image::DynamicImage, crate::ai::AiError> {
+            let mut rgb = img.to_rgb8();
+            for (x, y, m) in mask.enumerate_pixels() {
+                if m[0] > 0 {
+                    *rgb.get_pixel_mut(x, y) = image::Rgb([30, 30, 200]);
+                }
+            }
+            Ok(image::DynamicImage::ImageRgb8(rgb))
+        }
+    }
+
     async fn spawn_app_with_tagger() -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
@@ -5585,6 +5669,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
@@ -5709,6 +5794,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6035,6 +6121,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6251,6 +6338,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: Some(Arc::new(FakeMask)),
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
@@ -6305,6 +6393,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: Some(Arc::new(FakeMask)),
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6327,6 +6416,61 @@ mod tests {
             width_step: 100,
             preserve_metadata: false,
             brand_color: Some([0xf5, 0xf0, 0xe8]),
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// An app with the inpainting fake configured, for
+    /// the remove_region tests.
+    async fn spawn_app_with_inpaint() -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: Some(Arc::new(FakeInpaint)),
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
             source_roots: std::collections::HashMap::new(),
@@ -6400,6 +6544,43 @@ mod tests {
         // No studio filter, no studio record.
         let meta = meta_for(format!("40x24/{src}")).await;
         assert!(meta.get("studio").is_none());
+    }
+
+    #[tokio::test]
+    async fn meta_includes_the_inpaint_record() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_inpaint().await;
+        let meta_for = |remainder: String| {
+            let base = base.clone();
+            async move {
+                let resp = client()
+                    .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+                    .header("Accept", "application/json")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                serde_json::from_str::<serde_json::Value>(&resp.text().await.unwrap()).unwrap()
+            }
+        };
+        // One removal: the record names its rectangle.
+        let meta = meta_for(format!("filters:remove_region(4,4,10,8):format(png)/{src}")).await;
+        assert_eq!(
+            meta["inpaint"]["regions"],
+            serde_json::json!([[4, 4, 10, 8]])
+        );
+        // Two removals: both, in chain order.
+        let meta = meta_for(format!(
+            "filters:remove_region(4,4,10,8):remove_region(20,20,5,5):format(png)/{src}"
+        ))
+        .await;
+        assert_eq!(
+            meta["inpaint"]["regions"],
+            serde_json::json!([[4, 4, 10, 8], [20, 20, 5, 5]])
+        );
+        // No removal, no inpaint record.
+        let meta = meta_for(format!("40x24/{src}")).await;
+        assert!(meta.get("inpaint").is_none());
     }
 
     #[tokio::test]
@@ -6545,6 +6726,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6604,6 +6786,7 @@ mod tests {
             cache: Arc::new(Cache::new(cache_bytes)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -7888,6 +8071,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -7949,6 +8133,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -8323,6 +8508,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -8367,6 +8553,7 @@ mod tests {
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,
+            inpaint_provider: None,
             face_provider: None,
             detect_provider: None,
             declared_detect_providers: Vec::new(),
@@ -8413,6 +8600,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -8460,6 +8648,7 @@ mod tests {
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,
+            inpaint_provider: None,
             face_provider: None,
             detect_provider: None,
             declared_detect_providers: Vec::new(),
@@ -8936,6 +9125,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -9338,6 +9528,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -10173,6 +10364,7 @@ mod tests {
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
+            inpaint: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,

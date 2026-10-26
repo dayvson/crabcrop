@@ -679,6 +679,11 @@ pub enum Filter {
     /// Pixelate the rectangle (x, y, w, h), same coordinate
     /// convention as `BlurRegion`.
     PixelateRegion { x: u32, y: u32, w: u32, h: u32 },
+    /// Erase the rectangle (x, y, w, h) and inpaint it from
+    /// the surrounding pixels, same coordinate convention
+    /// and bounds discipline as `BlurRegion`. Backed by the
+    /// server's inpainting model (issue #176).
+    RemoveRegion { x: u32, y: u32, w: u32, h: u32 },
     /// Encoding directive: re-encode at lower quality until the
     /// output fits this many bytes, quality permitting.
     MaxBytes(u64),
@@ -1733,7 +1738,9 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 }
                 Filter::Pixelate(block)
             }
-            ("blur_region", Some(p)) | ("pixelate_region", Some(p)) => {
+            ("blur_region", Some(p))
+            | ("pixelate_region", Some(p))
+            | ("remove_region", Some(p)) => {
                 let parts: Vec<&str> = p.split(',').collect();
                 if parts.len() != 4 {
                     return Err(invalid());
@@ -1751,8 +1758,10 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 let (x, y, w, h) = (v[0], v[1], v[2], v[3]);
                 if name == "blur_region" {
                     Filter::BlurRegion { x, y, w, h }
-                } else {
+                } else if name == "pixelate_region" {
                     Filter::PixelateRegion { x, y, w, h }
+                } else {
+                    Filter::RemoveRegion { x, y, w, h }
                 }
             }
             ("flip", Some(p)) => match p {
@@ -2195,6 +2204,10 @@ pub struct RequestDirectives {
     /// mask model, so it takes an AI permit and needs the
     /// provider preflight, like `removebg`.
     pub studio: bool,
+    /// Any `remove_region(...)` filter (issue #176): it
+    /// runs the inpainting model, so it takes an AI permit
+    /// and needs the provider preflight, like `upscale`.
+    pub remove_region: bool,
     /// The first shape filter (`radius` or `mask`), named for
     /// error messages.
     pub shape_filter: Option<&'static str>,
@@ -2250,6 +2263,7 @@ impl RequestDirectives {
             fill: None,
             removebg: false,
             studio: false,
+            remove_region: false,
             shape_filter: None,
             upscale: false,
             smart_crop: false,
@@ -2293,6 +2307,7 @@ impl RequestDirectives {
                         Filter::Fill(color) => d.fill = Some(*color),
                         Filter::RemoveBg => d.removebg = true,
                         Filter::Studio(_) => d.studio = true,
+                        Filter::RemoveRegion { .. } => d.remove_region = true,
                         Filter::Radius(_) if d.shape_filter.is_none() => {
                             d.shape_filter = Some("radius")
                         }
@@ -2331,12 +2346,14 @@ impl RequestDirectives {
     /// Whether the request can run AI inference in the engine.
     /// This is the ONE predicate behind both the server's AI
     /// gate and the engine's expectations: background removal,
-    /// studio mode, upscale, face operations, and class
-    /// redaction always infer; smart crops infer when a face
-    /// provider is configured, so they are gated too.
+    /// studio mode, region removal, upscale, face operations,
+    /// and class redaction always infer; smart crops infer
+    /// when a face provider is configured, so they are gated
+    /// too.
     pub fn uses_ai(&self) -> bool {
         self.removebg
             || self.studio
+            || self.remove_region
             || self.upscale
             || self.needs_face_model
             || self.smart_crop
@@ -2580,6 +2597,9 @@ fn filter_text(filter: &Filter) -> String {
         Filter::BlurRegion { x, y, w, h } => format!("blur_region({x},{y},{w},{h})"),
         Filter::PixelateRegion { x, y, w, h } => {
             format!("pixelate_region({x},{y},{w},{h})")
+        }
+        Filter::RemoveRegion { x, y, w, h } => {
+            format!("remove_region({x},{y},{w},{h})")
         }
         Filter::MaxBytes(v) => format!("max_bytes({v})"),
         Filter::Quality(q) => match q {
@@ -4393,6 +4413,67 @@ mod tests {
             d.uses_ai(),
             "studio runs the mask model, so it takes an AI permit"
         );
+    }
+
+    #[test]
+    fn remove_region_parses_like_the_other_region_filters() {
+        // The grammar mirrors `blur_region`/`pixelate_region`
+        // exactly (issue #176): four pixel values, w and h
+        // at least 1, in a `filters:` list, canonicalized
+        // back to the same spelling.
+        let (ops, _) = parse_operations(
+            "filters:blur_region(1,2,30,40):remove_region(5,6,70,80)/example.com/img.jpg",
+        )
+        .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![
+                Filter::BlurRegion {
+                    x: 1,
+                    y: 2,
+                    w: 30,
+                    h: 40
+                },
+                Filter::RemoveRegion {
+                    x: 5,
+                    y: 6,
+                    w: 70,
+                    h: 80
+                },
+            ])]
+        );
+        assert_eq!(
+            canonical_key_form("filters:remove_region(5,6,70,80)/example.com/img.jpg"),
+            "filters:remove_region(5,6,70,80)/example.com/img.jpg"
+        );
+        let d = RequestDirectives::analyze(&ops);
+        assert!(d.remove_region);
+        assert!(
+            d.uses_ai(),
+            "remove_region runs the inpainting model, so it takes an AI permit"
+        );
+    }
+
+    #[test]
+    fn remove_region_rejects_malformed_rectangles() {
+        for seg in [
+            "filters:remove_region(1,2,0,40)",
+            "filters:remove_region(1,2,30,0)",
+            "filters:remove_region(1,2,3)",
+            "filters:remove_region(1,2,3,4,5)",
+            "filters:remove_region(-1,0,10,10)",
+            "filters:remove_region(0,0,10,16384)",
+            "filters:remove_region(0,0,10)",
+            "filters:remove_region()",
+            "filters:remove_region(1.5,2,3,4)",
+        ] {
+            let path = format!("{seg}/example.com/img.jpg");
+            let result = parse_operations(&path);
+            assert!(
+                matches!(result, Err(ParseError::InvalidFilters(_))),
+                "{seg} should fail as invalid filters, got {result:?}"
+            );
+        }
     }
 
     #[test]

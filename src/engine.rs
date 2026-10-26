@@ -475,6 +475,12 @@ pub struct ProcessedImage {
     /// `None` when no studio filter ran (or on the animated
     /// paths, whose per-frame records are not surfaced).
     pub studio: Option<crate::studio::StudioRecord>,
+    /// The region-removal record (issue #176) when a
+    /// `remove_region(...)` filter ran on the still
+    /// pipeline: the rectangles the inpainting model
+    /// erased, for meta responses. `None` when no removal
+    /// ran (or on the animated paths).
+    pub inpaint: Option<InpaintRecord>,
     /// The SSIMULACRA2 score of the returned bytes against the
     /// processed source, set when `quality(auto)` verified its
     /// encode (JPEG and JXL). `None` when nothing was scored.
@@ -507,6 +513,19 @@ pub struct VideoSourceMeta {
     /// The resolved timestamp the frame was selected at,
     /// in seconds (after clamping to the last frame).
     pub frame_seconds: f64,
+}
+
+/// The region-removal record (issue #176) when one or
+/// more `remove_region(...)` filters ran on the still
+/// pipeline: the rectangles erased, in chain order, in
+/// the pixel coordinates in effect where each filter ran,
+/// for meta responses. `None` when no removal ran (or on
+/// the animated paths, whose per-frame records are not
+/// surfaced, like the studio record).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InpaintRecord {
+    /// The erased rectangles, each (x, y, w, h).
+    pub regions: Vec<(u32, u32, u32, u32)>,
 }
 
 /// Facts about a PDF source, probed at page rendering
@@ -616,6 +635,9 @@ pub struct ProcessContext<'a> {
     pub mask_provider: Option<&'a dyn crate::ai::MaskProvider>,
     /// Upscale provider, when the deployment configured a model.
     pub upscale_provider: Option<&'a dyn crate::ai::UpscaleProvider>,
+    /// Inpainting provider for `remove_region`, when the
+    /// deployment configured a model.
+    pub inpaint_provider: Option<&'a dyn crate::ai::InpaintProvider>,
     /// Face provider for smart crops, when configured.
     pub face_provider: Option<&'a dyn crate::ai::FaceProvider>,
     /// Detection provider for class redaction, when
@@ -685,6 +707,7 @@ impl Default for ProcessContext<'_> {
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,
+            inpaint_provider: None,
             face_provider: None,
             detect_provider: None,
             declared_detect_providers: &[],
@@ -903,6 +926,14 @@ impl Engine {
                 "upscale is not configured on this server".to_string(),
             ));
         }
+        // Region removal is validated the same way (issue
+        // #176): the URL is fine, the deployment has no
+        // inpainting model, so it fails before any work.
+        if directives.remove_region && ctx.inpaint_provider.is_none() {
+            return Err(EngineError::NotConfigured(
+                "remove_region is not configured on this server".to_string(),
+            ));
+        }
         // Video output is validated like the AI features:
         // before any real work, and distinctly. The URL is
         // fine but the deployment cannot do it (no encoder
@@ -1100,7 +1131,7 @@ impl Engine {
         } else {
             None
         };
-        let (img, encode_opts, studio) = apply_operations(
+        let (img, encode_opts, studio, inpaint) = apply_operations(
             img,
             ops,
             cap,
@@ -1298,6 +1329,7 @@ impl Engine {
             source_height,
             placeholder,
             studio,
+            inpaint,
             ssimulacra2: ssim,
             video: video_meta,
             pdf: pdf_meta,
@@ -1336,7 +1368,7 @@ impl Engine {
         for frame in frames {
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
@@ -1374,6 +1406,7 @@ impl Engine {
             source_height,
             placeholder,
             studio: None,
+            inpaint: None,
             ssimulacra2: None,
             video: None,
             pdf: None,
@@ -1420,7 +1453,7 @@ impl Engine {
         for frame in frames {
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(crate::video::VideoFrame {
                 pixels: img.to_rgba8(),
@@ -1455,6 +1488,7 @@ impl Engine {
             source_height,
             placeholder,
             studio: None,
+            inpaint: None,
             ssimulacra2: None,
             video: None,
             pdf: None,
@@ -1827,6 +1861,7 @@ fn apply_operations(
         DynamicImage,
         EncodeOptions,
         Option<crate::studio::StudioRecord>,
+        Option<InpaintRecord>,
     ),
     EngineError,
 > {
@@ -1851,6 +1886,9 @@ fn apply_operations(
     // filter in the chain wins, since its composite is the
     // look the response carries.
     let mut studio_record: Option<crate::studio::StudioRecord> = None;
+    // The region-removal record (issue #176): every
+    // `remove_region(...)` in the chain, in order.
+    let mut inpaint_regions: Vec<(u32, u32, u32, u32)> = Vec::new();
     for op in ops {
         match op {
             Operation::DebugFocal => debug_armed = true,
@@ -2188,6 +2226,26 @@ fn apply_operations(
                             check_region("pixelate_region", *x, *y, *w, *h, &img)?;
                             img = crate::filters::pixelate_region(&img, *x, *y, *w, *h);
                         }
+                        Filter::RemoveRegion { x, y, w, h } => {
+                            // Same bounds discipline as the
+                            // other region filters: a rectangle
+                            // that overflows the image in
+                            // effect here fails the request
+                            // rather than erasing less than
+                            // the caller named (issue #176).
+                            check_region("remove_region", *x, *y, *w, *h, &img)?;
+                            let provider = ctx.inpaint_provider.ok_or_else(|| {
+                                EngineError::NotConfigured(
+                                    "remove_region is not configured on this server".to_string(),
+                                )
+                            })?;
+                            let mask =
+                                crate::ai::region_mask(img.width(), img.height(), *x, *y, *w, *h);
+                            img = provider
+                                .inpaint(&img, &mask)
+                                .map_err(EngineError::Inference)?;
+                            inpaint_regions.push((*x, *y, *w, *h));
+                        }
                         Filter::Text {
                             text,
                             size,
@@ -2269,7 +2327,14 @@ fn apply_operations(
     // image that goes to the encoder is inside the output
     // budget (issue #182, audit R2-12).
     check_output_pixels(img.width(), img.height())?;
-    Ok((img, encode_opts, studio_record))
+    let inpaint_record = if inpaint_regions.is_empty() {
+        None
+    } else {
+        Some(InpaintRecord {
+            regions: inpaint_regions,
+        })
+    };
+    Ok((img, encode_opts, studio_record, inpaint_record))
 }
 
 /// Build the debug capture for a crop that reported a
@@ -5270,7 +5335,7 @@ mod tests {
         // A quarter turn keeps the pixel count and passes.
         let ops = [Operation::Filters(vec![Filter::Rotate(90.0)])];
         let directives = crate::url::RequestDirectives::analyze(&ops);
-        let (out, _, _) = apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
+        let (out, _, _, _) = apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
         assert_eq!((out.width(), out.height()), (8000, 8000));
     }
 
@@ -6683,6 +6748,229 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
         assert!(err.to_string().contains("operation limit"), "{err}");
+    }
+
+    /// A fake inpainting provider: fills the masked pixels
+    /// with one flat color, the deterministic stand-in for
+    /// the model's fill.
+    #[derive(Debug)]
+    struct FlatInpaint;
+
+    impl crate::ai::InpaintProvider for FlatInpaint {
+        fn inpaint(
+            &self,
+            img: &DynamicImage,
+            mask: &image::GrayImage,
+        ) -> Result<DynamicImage, crate::ai::AiError> {
+            let mut rgb = img.to_rgb8();
+            for (x, y, m) in mask.enumerate_pixels() {
+                if m[0] > 0 {
+                    *rgb.get_pixel_mut(x, y) = image::Rgb([30, 30, 200]);
+                }
+            }
+            Ok(DynamicImage::ImageRgb8(rgb))
+        }
+    }
+
+    /// A fake inpainting provider whose inference fails.
+    #[derive(Debug)]
+    struct FailingInpaint;
+
+    impl crate::ai::InpaintProvider for FailingInpaint {
+        fn inpaint(
+            &self,
+            _img: &DynamicImage,
+            _mask: &image::GrayImage,
+        ) -> Result<DynamicImage, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference(
+                "the model fell over".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn remove_region_fills_the_rectangle_and_records_it() {
+        let engine = Engine;
+        let src = solid_png(100, 80, [200, 30, 30]);
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::RemoveRegion {
+                    x: 10,
+                    y: 10,
+                    w: 20,
+                    h: 20,
+                }])],
+                ProcessContext {
+                    inpaint_provider: Some(&FlatInpaint),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // Inside the rectangle: the fill. Outside: original.
+        assert_eq!(*img.get_pixel(20, 20), image::Rgb([30, 30, 200]));
+        assert_eq!(*img.get_pixel(9, 9), image::Rgb([200, 30, 30]));
+        assert_eq!(*img.get_pixel(30, 30), image::Rgb([200, 30, 30]));
+        // The meta record carries the rectangle.
+        let record = out.inpaint.unwrap();
+        assert_eq!(record.regions, vec![(10, 10, 20, 20)]);
+    }
+
+    #[test]
+    fn remove_region_records_every_removal_in_chain_order() {
+        let engine = Engine;
+        let src = solid_png(100, 80, [200, 30, 30]);
+        let out = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::RemoveRegion {
+                        x: 0,
+                        y: 0,
+                        w: 10,
+                        h: 10,
+                    },
+                    Filter::RemoveRegion {
+                        x: 50,
+                        y: 50,
+                        w: 10,
+                        h: 10,
+                    },
+                ])],
+                ProcessContext {
+                    inpaint_provider: Some(&FlatInpaint),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let record = out.inpaint.unwrap();
+        assert_eq!(record.regions, vec![(0, 0, 10, 10), (50, 50, 10, 10)]);
+    }
+
+    #[test]
+    fn remove_region_without_a_provider_is_not_configured() {
+        let engine = Engine;
+        let src = solid_png(100, 80, [200, 30, 30]);
+        let err = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::RemoveRegion {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 10,
+                }])],
+                ProcessContext::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("remove_region is not configured on this server"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn remove_region_beyond_bounds_fails_like_the_other_region_filters() {
+        let engine = Engine;
+        let src = solid_png(100, 80, [200, 30, 30]);
+        let err = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::RemoveRegion {
+                    x: 90,
+                    y: 70,
+                    w: 20,
+                    h: 20,
+                }])],
+                ProcessContext {
+                    inpaint_provider: Some(&FlatInpaint),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("remove_region(90,70,20,20) exceeds image bounds 100x80"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn remove_region_addresses_the_image_at_its_point_in_the_chain() {
+        // After a resize to 50x40, a rectangle legal on the
+        // 100x80 source overflows the image in effect, and
+        // one fitted to the resized image succeeds: the
+        // region filters' shared coordinate rule.
+        let engine = Engine;
+        let src = solid_png(100, 80, [200, 30, 30]);
+        let ctx = || ProcessContext {
+            inpaint_provider: Some(&FlatInpaint),
+            ..Default::default()
+        };
+        let err = engine
+            .process_preferred(
+                &src,
+                &[
+                    size_op(Dimension::Pixels(50), Dimension::Pixels(40)),
+                    Operation::Filters(vec![Filter::RemoveRegion {
+                        x: 40,
+                        y: 30,
+                        w: 20,
+                        h: 20,
+                    }]),
+                ],
+                ctx(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("remove_region(40,30,20,20) exceeds image bounds 50x40"),
+            "{err}"
+        );
+        let out = engine
+            .process_preferred(
+                &src,
+                &[
+                    size_op(Dimension::Pixels(50), Dimension::Pixels(40)),
+                    Operation::Filters(vec![Filter::RemoveRegion {
+                        x: 0,
+                        y: 0,
+                        w: 50,
+                        h: 40,
+                    }]),
+                ],
+                ctx(),
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (50, 40));
+        assert_eq!(out.inpaint.unwrap().regions, vec![(0, 0, 50, 40)]);
+    }
+
+    #[test]
+    fn remove_region_provider_failure_is_an_inference_error() {
+        let engine = Engine;
+        let src = solid_png(100, 80, [200, 30, 30]);
+        let err = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![Filter::RemoveRegion {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 10,
+                }])],
+                ProcessContext {
+                    inpaint_provider: Some(&FailingInpaint),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Inference(_)), "{err:?}");
+        assert!(err.to_string().contains("the model fell over"), "{err}");
     }
 
     /// A fake upscale provider: a deterministic 2x

@@ -552,6 +552,10 @@ export const filter = {
   pixelateRegion(x: number, y: number, w: number, h: number): string {
     return `pixelate_region(${region(x, y, w, h)})`;
   },
+  /** Erase the rectangle (x, y, w, h) in pixels and inpaint it (AI). */
+  removeRegion(x: number, y: number, w: number, h: number): string {
+    return `remove_region(${region(x, y, w, h)})`;
+  },
 };
 
 function region(x: number, y: number, w: number, h: number): string {

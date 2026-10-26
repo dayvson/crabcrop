@@ -791,6 +791,65 @@ def upscale_oom_probe():
           f"status={f['status']} (expect the #244 budget 400, pre-inference) "
           f"followup_render={alive['status']} body={f['body'][:110]}")
 
+# ---------------------------------------------------------------- remove_region
+@cell
+def rr_erases_region():
+    ops = "600x0/filters:remove_region(60,60,180,120):format(png)"
+    base = render("rr-base", "600x0/filters:format(png)", "product-shoe.jpg")
+    f = render("rr-erases-region", ops, "product-shoe.jpg")
+    s, j = meta(ops, "product-shoe.jpg")
+    ok = (f["status"] == 200 and base["status"] == 200 and s == 200
+          and (j.get("inpaint") or {}).get("regions") == [[60, 60, 180, 120]])
+    evidence = (f"status={f['status']} server_ms={f['server_ms']} "
+                f"meta_inpaint={j.get('inpaint')}")
+    if ok:
+        # Outside the rectangle the pixels are bit-identical
+        # to the plain render (PNG is lossless); inside, the
+        # fill differs measurably from what was there.
+        outside_same = (pixel(f["path"], 10, 10) == pixel(base["path"], 10, 10)
+                        and pixel(f["path"], 590, 390)
+                        == pixel(base["path"], 590, 390))
+        inside = region_mean(f["path"], (60, 60, 240, 180))
+        inside_base = region_mean(base["path"], (60, 60, 240, 180))
+        changed = sum(abs(a - b) for a, b in zip(inside, inside_base)) > 12
+        ok = outside_same and changed
+        evidence += (f" outside_bit_identical={outside_same} "
+                     f"region_mean base={inside_base} removed={inside}")
+    check("rr-erases-region", "remove-region", ops, "product-shoe.jpg",
+          ok, f, evidence)
+
+
+@cell
+def rr_out_of_bounds():
+    f = render("rr-out-of-bounds",
+               "600x0/filters:remove_region(500,300,200,200):format(png)",
+               "product-shoe.jpg")
+    check("rr-out-of-bounds", "remove-region",
+          "filters:remove_region(500,300,200,200)", "product-shoe.jpg",
+          f["status"] == 400 and "exceeds image bounds" in f["body"], f,
+          f"status={f['status']} body={f['body'][:110]}")
+
+
+@cell
+def rr_malformed():
+    f = render("rr-malformed", "filters:remove_region(1,2,3):format(png)",
+               "product-shoe.jpg")
+    check("rr-malformed", "remove-region", "filters:remove_region(1,2,3)",
+          "product-shoe.jpg", f["status"] == 400, f,
+          f"status={f['status']} body={f['body'][:110]}")
+
+
+@cell
+def rr_unconfigured_501():
+    f = render("rr-unconfigured-501",
+               "filters:remove_region(10,10,50,50):format(png)", "dog.jpg",
+               base="B")
+    check("rr-unconfigured-501", "remove-region",
+          "filters:remove_region(10,10,50,50)", "dog.jpg",
+          f["status"] == 501 and "remove_region is not configured" in f["body"],
+          f, f"status={f['status']} body={f['body'][:110]}")
+
+
 # ---------------------------------------------------------------- studio timing log
 @cell
 def studio_timing_log():

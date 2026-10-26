@@ -388,5 +388,29 @@
   "group": "studio",
   "kind": "scripted",
   "tier": "local"
+ },
+ {
+  "id": "rr-erases-region",
+  "group": "remove-region",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rr-out-of-bounds",
+  "group": "remove-region",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rr-malformed",
+  "group": "remove-region",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "rr-unconfigured-501",
+  "group": "remove-region",
+  "kind": "scripted",
+  "tier": "local"
  }
 ]
