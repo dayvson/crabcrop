@@ -63,6 +63,15 @@ pub enum ParseError {
     /// A `preset:<name>` segment named a preset the server has
     /// not configured. Carries the name.
     UnknownPreset(String),
+    /// A `root:<name>` source named a source root the server
+    /// has not configured. Carries the name.
+    UnknownRoot(String),
+    /// A `root:<name>/<path>` source is malformed: no path,
+    /// a path that normalizes to nothing, or a path that
+    /// climbs above the root (including by percent-encoded
+    /// dot segments or encoded separators). Carries the
+    /// offending source.
+    InvalidRoot(String),
     /// A preset definition (or a `preset:` segment itself) is
     /// malformed. Carries the offending text.
     InvalidPreset(String),
@@ -112,6 +121,8 @@ impl ParseError {
             ParseError::InvalidMaxAge(_) => "invalid_maxage",
             ParseError::InvalidDebug(_) => "invalid_debug",
             ParseError::UnknownPreset(_) => "unknown_preset",
+            ParseError::UnknownRoot(_) => "unknown_root",
+            ParseError::InvalidRoot(_) => "invalid_root",
             ParseError::InvalidPreset(_) => "invalid_preset",
             ParseError::PresetsOnly(_) => "presets_only",
             ParseError::InvalidFilters(_) => "invalid_filters",
@@ -142,6 +153,10 @@ impl std::fmt::Display for ParseError {
             ParseError::InvalidMaxAge(seg) => write!(f, "invalid maxage segment: {seg}"),
             ParseError::InvalidDebug(seg) => write!(f, "invalid debug segment: {seg}"),
             ParseError::UnknownPreset(name) => write!(f, "unknown preset: {name}"),
+            ParseError::UnknownRoot(name) => write!(f, "unknown source root: {name}"),
+            ParseError::InvalidRoot(source) => {
+                write!(f, "invalid root source: {source}")
+            }
             ParseError::InvalidPreset(text) => write!(f, "invalid preset: {text}"),
             ParseError::PresetsOnly(seg) => {
                 write!(f, "free-form operations are disabled (presets only): {seg}")
@@ -1856,6 +1871,117 @@ pub fn expand_presets(
         out.push('/');
         tail = remaining;
     }
+}
+
+/// A source root reference as written in a URL: the root
+/// name and the path after it, exactly as presented. The
+/// expansion a reference resolves to is server state; the
+/// reference itself is all a report may ever show (see
+/// [`expand_source_root`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootRef {
+    pub name: String,
+    pub path: String,
+}
+
+/// Expand a `root:<name>/<path>` short source against the
+/// server's named source roots (issue #248), returning the
+/// expanded source and the reference as written. A source
+/// that is not a root reference passes through untouched
+/// with a `None` reference.
+///
+/// The signature covers the short form exactly as written;
+/// expansion is deterministic and server-side, and it runs
+/// after verification and before cache keying, so a short
+/// source and the full source it expands to are one render:
+/// one cache entry, one purge target. The expanded URL goes
+/// through every loader check unchanged, the allowlist
+/// included: the allowlist is evaluated against the
+/// expansion, never against the short form.
+///
+/// The path must stay under the root. Dot segments are
+/// normalized (`.` drops, `..` pops one segment); a `..`
+/// that would climb above the root is rejected. Segments
+/// are percent-decoded for this check, so `%2e%2e` is a
+/// `..`; a segment whose decoded form carries a `/` or `\`
+/// separator is refused outright, as an encoded separator
+/// is never a legitimate path segment here.
+pub fn expand_source_root(
+    source: &str,
+    roots: &std::collections::HashMap<String, String>,
+) -> Result<(String, Option<RootRef>), ParseError> {
+    let Some(body) = source.strip_prefix("root:") else {
+        return Ok((source.to_string(), None));
+    };
+    let invalid = || ParseError::InvalidRoot(source.to_string());
+    let Some((name, path)) = body.split_once('/') else {
+        return Err(invalid());
+    };
+    if name.is_empty() || path.is_empty() {
+        return Err(invalid());
+    }
+    let base = roots
+        .get(name)
+        .ok_or_else(|| ParseError::UnknownRoot(name.to_string()))?;
+    let normalized = normalize_root_path(path).ok_or_else(invalid)?;
+    Ok((
+        format!("{base}/{normalized}"),
+        Some(RootRef {
+            name: name.to_string(),
+            path: path.to_string(),
+        }),
+    ))
+}
+
+/// Expand the root source inside a whole remainder, for the
+/// paths that work on remainders rather than parsed sources
+/// (purge): the remainder's source is located with the same
+/// parse the serve path uses, and the returned remainder
+/// carries the expansion in its place, so it canonicalizes
+/// exactly like the entry the serve path stored. A remainder
+/// that does not parse, or whose source is not a root
+/// reference, comes back unchanged.
+pub fn expand_source_root_in_remainder(
+    rest: &str,
+    roots: &std::collections::HashMap<String, String>,
+) -> Result<String, ParseError> {
+    let Ok((_, source, _, _)) = parse_operations_with_expiry(rest) else {
+        return Ok(rest.to_string());
+    };
+    let (expanded, reference) = expand_source_root(source, roots)?;
+    if reference.is_none() {
+        return Ok(rest.to_string());
+    }
+    Ok(format!("{}{expanded}", &rest[..rest.len() - source.len()]))
+}
+
+/// Normalize a root-relative path for joining under a root:
+/// returns the path with dot segments resolved, or `None`
+/// when the path is not usable under the root (it climbs
+/// above the root, carries an encoded separator, or
+/// resolves to no object at all). Non-dot segments keep
+/// their exact written bytes; only the dot check decodes.
+fn normalize_root_path(path: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        let decoded = percent_decode(seg)?;
+        if decoded.contains('/') || decoded.contains('\\') {
+            return None;
+        }
+        match decoded.as_str() {
+            "." => {}
+            ".." => {
+                if out.pop().is_none() {
+                    return None;
+                }
+            }
+            _ => out.push(seg),
+        }
+    }
+    if !out.iter().any(|seg| !seg.is_empty()) {
+        return None;
+    }
+    Some(out.join("/"))
 }
 
 /// The `text(...)` color field: `rrggbb` (opaque) or
@@ -4691,6 +4817,136 @@ mod tests {
         assert_eq!(
             expand_presets("preset:nope/example.com/img.jpg", &map, false),
             Err(ParseError::UnknownPreset("nope".to_string()))
+        );
+    }
+
+    fn root_map() -> std::collections::HashMap<String, String> {
+        [
+            (
+                "photos".to_string(),
+                "https://cdn.example.com/photos".to_string(),
+            ),
+            (
+                "media".to_string(),
+                "https://assets.example.com".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn root_sources_expand_against_the_named_root() {
+        let map = root_map();
+        let (expanded, reference) = expand_source_root("root:photos/cat.jpg", &map).unwrap();
+        assert_eq!(expanded, "https://cdn.example.com/photos/cat.jpg");
+        assert_eq!(
+            reference,
+            Some(RootRef {
+                name: "photos".to_string(),
+                path: "cat.jpg".to_string(),
+            })
+        );
+        // A root with no path prefix joins at the host root.
+        let (expanded, _) = expand_source_root("root:media/a/b.png", &map).unwrap();
+        assert_eq!(expanded, "https://assets.example.com/a/b.png");
+        // Non-root sources pass through untouched.
+        for source in [
+            "https://example.com/cat.jpg",
+            "s3://media/cat.jpg",
+            "file:///srv/cat.jpg",
+            "example.com/cat.jpg",
+            "https://example.com/root:photos/cat.jpg",
+        ] {
+            assert_eq!(
+                expand_source_root(source, &map).unwrap(),
+                (source.to_string(), None),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_sources_answer_unknown_root_for_any_unconfigured_name() {
+        let map = root_map();
+        assert_eq!(
+            expand_source_root("root:nope/cat.jpg", &map),
+            Err(ParseError::UnknownRoot("nope".to_string()))
+        );
+        // With no roots configured every name is unknown, the
+        // same rule presets follow.
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            expand_source_root("root:photos/cat.jpg", &empty),
+            Err(ParseError::UnknownRoot("photos".to_string()))
+        );
+        assert_eq!(
+            ParseError::UnknownRoot("x".to_string()).code(),
+            "unknown_root"
+        );
+        assert_eq!(
+            ParseError::InvalidRoot("x".to_string()).code(),
+            "invalid_root"
+        );
+    }
+
+    #[test]
+    fn root_paths_normalize_dots_but_never_escape_the_root() {
+        let map = root_map();
+        for (path, joined) in [
+            ("a/./cat.jpg", "a/cat.jpg"),
+            ("a/b/../cat.jpg", "a/cat.jpg"),
+            ("./cat.jpg", "cat.jpg"),
+            ("a//cat.jpg", "a//cat.jpg"),
+        ] {
+            let (expanded, _) = expand_source_root(&format!("root:photos/{path}"), &map).unwrap();
+            assert_eq!(expanded, format!("https://cdn.example.com/photos/{joined}"));
+        }
+        for bad in [
+            "root:photos",
+            "root:photos/",
+            "root:/cat.jpg",
+            "root:photos/../secret.jpg",
+            "root:photos/a/../../secret.jpg",
+            "root:photos/%2e%2e/secret.jpg",
+            "root:photos/%2E./secret.jpg",
+            "root:photos/a/%2e%2e/%2e%2e/secret.jpg",
+            "root:photos/..%2fsecret.jpg",
+            "root:photos/a%2fb.jpg",
+            "root:photos/..\\secret.jpg",
+            "root:photos/a/..",
+        ] {
+            assert_eq!(
+                expand_source_root(bad, &map),
+                Err(ParseError::InvalidRoot(bad.to_string())),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_expansion_inside_a_remainder_matches_the_serve_parse() {
+        let map = root_map();
+        assert_eq!(
+            expand_source_root_in_remainder("300x200/root:photos/cat.jpg", &map).unwrap(),
+            "300x200/https://cdn.example.com/photos/cat.jpg"
+        );
+        // exp: metadata in front of the source does not
+        // disturb the rewrite, and the source's own text
+        // after the root segment stays intact.
+        assert_eq!(
+            expand_source_root_in_remainder("exp:999/root:media/a/root:b.jpg", &map).unwrap(),
+            "exp:999/https://assets.example.com/a/root:b.jpg"
+        );
+        // Full sources and unparseable remainders pass
+        // through unchanged.
+        assert_eq!(
+            expand_source_root_in_remainder("300x200/https://example.com/cat.jpg", &map).unwrap(),
+            "300x200/https://example.com/cat.jpg"
+        );
+        assert_eq!(
+            expand_source_root_in_remainder("root:nope/cat.jpg", &map),
+            Err(ParseError::UnknownRoot("nope".to_string()))
         );
     }
 

@@ -252,6 +252,15 @@ pub struct AppState {
     /// Presets-only mode, from `CRABCROP_ONLY_PRESETS`: reject
     /// free-form operations in requests.
     pub only_presets: bool,
+    /// Named source roots from `CRABCROP_SOURCE_ROOTS_FILE`
+    /// (issue #248): name to base URL, validated at boot. A
+    /// request whose source is `root:<name>/<path>` is
+    /// fetched from the base URL with the path joined under
+    /// it; expansion runs after verification, before cache
+    /// keying, so the short and full spellings are one
+    /// render. The bases are operator configuration: no
+    /// response ever prints one.
+    pub source_roots: std::collections::HashMap<String, String>,
     /// Server-wide default operations (issue #145), parsed at
     /// boot from `CRABCROP_DEFAULT_OPS` and prepended to every
     /// request's operations before analysis, processing, and
@@ -509,6 +518,15 @@ async fn explain_handle(
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
     };
+    // A root source expands for the probe fetch only: the
+    // report below carries the source exactly as written
+    // and the root's name, never the base URL the reference
+    // resolves to (operator configuration, issue #248).
+    let (fetch_url, root_ref) =
+        match crate::url::expand_source_root(source_url, &state.source_roots) {
+            Ok(v) => v,
+            Err(e) => return parse_failure(&e, accept.as_deref()),
+        };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -523,7 +541,7 @@ async fn explain_handle(
     // and its policy. Watermark and overlay sources are
     // operations' inputs, not the explained URL's source,
     // and are never fetched: no fan-out.
-    let bytes = match state.loader.load(source_url).await {
+    let bytes = match state.loader.load(&fetch_url).await {
         Ok(bytes) => bytes,
         Err(e) => return explain_load_error(e),
     };
@@ -546,7 +564,11 @@ async fn explain_handle(
     // The canonical form is the cache key's path form,
     // defaults merged exactly as the image path merges
     // them for its key. The key's config fingerprint
-    // suffix is operator state and stays unreported.
+    // suffix is operator state and stays unreported. For a
+    // root source the form is built from the source as
+    // written: the key itself is keyed on the expansion,
+    // but printing that here would publish the root's
+    // base URL into the report.
     let canonical = crate::url::canonical_form(
         &crate::url::merge_default_ops(&state.default_ops, ops.clone()),
         source_url,
@@ -557,6 +579,7 @@ async fn explain_handle(
         expiry,
         now,
         source_url: source_url.to_string(),
+        source_root: root_ref.map(|r| r.name),
         probe,
         source_bytes: bytes.len(),
         ops,
@@ -672,6 +695,17 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         Ok(text) => {
             expanded = text;
             &expanded
+        }
+        Err(_) => target,
+    };
+    // Root sources expand the same way (issue #248): the
+    // entry is keyed on the expansion, so a purge naming
+    // the short spelling must reach it.
+    let root_expanded;
+    let target = match crate::url::expand_source_root_in_remainder(target, &state.source_roots) {
+        Ok(text) => {
+            root_expanded = text;
+            &root_expanded
         }
         Err(_) => target,
     };
@@ -1404,6 +1438,23 @@ async fn serve(
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
         .to_string();
+    // A root source expands here (issue #248): after
+    // verification and the ops summary (which reads the
+    // source as written), before the cache key and the
+    // fetch, so the short and full spellings of one source
+    // are one render, sharing a cache entry and a purge
+    // target. The loader's checks evaluate the expanded
+    // URL unchanged, the allowlist included.
+    let expanded_url;
+    let source_url = match crate::url::expand_source_root(source_url, &state.source_roots) {
+        Ok((expanded, _)) => {
+            expanded_url = expanded;
+            expanded_url.as_str()
+        }
+        Err(e) => {
+            return (parse_failure(&e, accept), record);
+        }
+    };
     // Server-wide defaults (issue #145) merge here: prepended
     // to the request's own operations, so the directive
     // analysis below, the engine, and the cache key all see
@@ -3156,6 +3207,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -3258,6 +3310,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -3333,6 +3386,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: Some(Arc::new(encoder)),
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -3496,6 +3550,7 @@ mod tests {
             brand_color: None,
             presets,
             only_presets,
+            source_roots: std::collections::HashMap::new(),
             default_ops: crate::url::parse_default_ops(defaults, &std::collections::HashMap::new())
                 .unwrap(),
             video_encoder: None,
@@ -3552,6 +3607,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -3611,6 +3667,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -4118,6 +4175,26 @@ mod tests {
         presets: std::collections::HashMap<String, String>,
         only_presets: bool,
     ) -> String {
+        spawn_app_with_presets_and_roots(presets, only_presets, std::collections::HashMap::new())
+            .await
+    }
+
+    /// The root test map points the `photos` root at a test
+    /// origin: the base is the origin with `/src.png`
+    /// stripped, so `root:photos/src.png` expands to the
+    /// origin's own URL.
+    fn root_test_map(origin: &str) -> std::collections::HashMap<String, String> {
+        let base = origin.strip_suffix("/src.png").unwrap_or(origin);
+        [("photos".to_string(), base.to_string())]
+            .into_iter()
+            .collect()
+    }
+
+    async fn spawn_app_with_presets_and_roots(
+        presets: std::collections::HashMap<String, String>,
+        only_presets: bool,
+        source_roots: std::collections::HashMap<String, String>,
+    ) -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
@@ -4151,6 +4228,7 @@ mod tests {
             brand_color: None,
             presets,
             only_presets,
+            source_roots,
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -4218,6 +4296,234 @@ mod tests {
         // unaffected by the always-on expansion.
         let resp = get_signed(&base, &format!("30x20/{src}")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn root_sources_serve_the_expanded_origin() {
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        // The source is 100x60; the request resizes to 30x20.
+        let resp = get_signed(&base, "30x20/root:photos/src.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.bytes().await.unwrap();
+        let img = image::load_from_memory(&body).unwrap();
+        assert_eq!((img.width(), img.height()), (30, 20));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn root_and_full_sources_share_one_cache_entry() {
+        // Short form first, then the full spelling is a hit.
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        let resp = get_signed(&base, "30x20/root:photos/src.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get_signed(&base, &format!("30x20/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the full spelling must hit the short spelling's entry"
+        );
+        // And the reverse, on a fresh app: full first, short hits.
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        let resp = get_signed(&base, &format!("30x20/{src}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get_signed(&base, "30x20/root:photos/src.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the short spelling must hit the full spelling's entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_roots_are_a_bad_request() {
+        let (src, _hits) = spawn_counting_image_server().await;
+        // A name the server has not configured...
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        let remainder = "30x20/root:nope/src.png";
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "unknown_root");
+        // ...and every name on a server with no roots at all.
+        let base = spawn_app(false).await;
+        let remainder = "30x20/root:photos/src.png";
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "unknown_root");
+    }
+
+    /// Send one GET with the path bytes exactly as given:
+    /// traversal spellings must reach the server unaltered,
+    /// which a URL-normalizing client would prevent.
+    async fn get_raw(base: &str, path: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let addr = base.strip_prefix("http://").unwrap();
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        socket.read_to_string(&mut raw).await.unwrap();
+        let status: u16 = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = raw
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn root_paths_that_escape_the_root_are_a_bad_request() {
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        for remainder in [
+            "30x20/root:photos/../secret.png",
+            "30x20/root:photos/%2e%2e/secret.png",
+            "30x20/root:photos/a/%2f..%2fsecret.png",
+            "30x20/root:photos/..%5csecret.png",
+        ] {
+            let (status, body) = get_raw(&base, &format!("/{}/{remainder}", sign(remainder))).await;
+            assert_eq!(status, 400, "{remainder}: {body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["error"]["code"], "invalid_root", "{remainder}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing was fetched");
+        // Dot segments that stay inside the root normalize
+        // and serve (raw again: a client would collapse
+        // this path before the server ever saw it).
+        let remainder = "30x20/root:photos/a/../src.png";
+        let (status, _body) = get_raw(&base, &format!("/{}/{remainder}", sign(remainder))).await;
+        assert_eq!(status, 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn purging_either_spelling_evicts_the_shared_root_entry() {
+        // Render via the short spelling, purge by it, and
+        // the full spelling misses afterwards.
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_app_with_presets_and_roots(
+            std::collections::HashMap::new(),
+            false,
+            root_test_map(&src),
+        )
+        .await;
+        let short = "30x20/root:photos/src.png";
+        let full = format!("30x20/{src}");
+        let resp = get_signed(&base, short).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get_signed(&base, short).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "second fetch is a hit");
+        let purge_sig = crate::url::purge_signature(SECRET, short);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{short}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = get_signed(&base, &full).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "the entry was evicted");
+        // The other direction: purge by the full spelling
+        // evicts the entry the short spelling reads.
+        let purge_sig = crate::url::purge_signature(SECRET, &full);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{full}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = get_signed(&base, short).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "the entry was evicted");
+    }
+
+    #[tokio::test]
+    async fn explain_reports_the_root_name_and_never_the_base() {
+        let (src, hits) = spawn_counting_image_server().await;
+        let base = spawn_explain_app_with_roots(
+            std::collections::HashMap::new(),
+            Loader::with_defaults().unwrap(),
+            root_test_map(&src),
+        )
+        .await;
+        let origin = src.strip_suffix("/src.png").unwrap().to_string();
+        let remainder = "100x50/root:photos/src.png";
+        let resp = client()
+            .get(format!("{base}/explain/{}/{remainder}", sign(remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        // The root's base URL is operator configuration:
+        // the origin it points at appears nowhere.
+        assert!(!body.contains(&origin), "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["source"]["url"], "root:photos/src.png");
+        assert_eq!(json["source"]["root"], "photos");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "one probe fetch");
+        // The HTML form names the root too, and leaks the
+        // same nothing.
+        let resp = client()
+            .get(format!("{base}/explain/{}/{remainder}", sign(remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Source root: photos"), "{body}");
+        assert!(!body.contains(&origin), "{body}");
     }
 
     /// An image server that counts how many times it was hit:
@@ -4505,6 +4811,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -4626,6 +4933,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -4949,6 +5257,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -5162,6 +5471,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -5213,6 +5523,7 @@ mod tests {
             brand_color: Some([0xf5, 0xf0, 0xe8]),
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -5450,6 +5761,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -5515,6 +5827,7 @@ mod tests {
             brand_color: None,
             presets,
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -6794,6 +7107,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -6861,6 +7175,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -7216,6 +7531,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -7301,6 +7617,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -7823,6 +8140,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -8225,6 +8543,7 @@ mod tests {
             brand_color: None,
             presets: std::collections::HashMap::new(),
             only_presets: false,
+            source_roots: std::collections::HashMap::new(),
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -9009,6 +9328,14 @@ mod tests {
         presets: std::collections::HashMap<String, String>,
         loader: Loader,
     ) -> String {
+        spawn_explain_app_with_roots(presets, loader, std::collections::HashMap::new()).await
+    }
+
+    async fn spawn_explain_app_with_roots(
+        presets: std::collections::HashMap<String, String>,
+        loader: Loader,
+        source_roots: std::collections::HashMap<String, String>,
+    ) -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
@@ -9042,6 +9369,7 @@ mod tests {
             brand_color: None,
             presets,
             only_presets: false,
+            source_roots,
             default_ops: Vec::new(),
             video_encoder: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),

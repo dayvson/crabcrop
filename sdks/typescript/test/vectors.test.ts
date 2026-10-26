@@ -45,6 +45,20 @@ test("buildURL with expiry and a null secret", () => {
   );
 });
 
+test("buildURL signs a root source exactly as written", () => {
+  // A short source (issue #248) is signed as written; the
+  // signature is the spec's canonical vector for this
+  // remainder.
+  assert.equal(
+    buildURL("https://img.example.com", "s3cr3t", "300x200", "root:photos/cat.jpg"),
+    "https://img.example.com/47e002f609cfbfc252eb1357bbee780bbbaf4c336847610caf44617b06453824/300x200/root:photos/cat.jpg",
+  );
+  // The character refusals still bite a short source.
+  assert.throws(() =>
+    buildURL("https://img.example.com", "k", "300x200", "root:photos/cat.jpg?w=1"),
+  );
+});
+
 test("buildSrcSet formats entries", () => {
   assert.equal(
     buildSrcSet("https://img.example.com", null, "https://example.com/a.jpg", [320, 640]),

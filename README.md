@@ -69,7 +69,7 @@ GET /<signature>/<operations>/<source-url>
 | --- | --- |
 | `signature` | An HMAC-SHA256 (hex) of everything after it, or the literal `unsafe`. |
 | `operations` | Zero or more operation segments, applied in path order. |
-| `source-url` | The full URL of the source image, scheme included. It may contain slashes; the first segment that is not an operation starts it. |
+| `source-url` | The source locator: a full URL with its scheme, a bucket or file locator, or a `root:<name>/<path>` short source naming a [source root](#source-roots). It may contain slashes; the first segment that is not an operation starts it. |
 
 ```text
 /unsafe/crop:1200x630:smart/filters:grayscale:quality(80)/https://example.com/photo.jpg
@@ -455,6 +455,31 @@ The signature covers the preset reference; the server expands it deterministical
 
 With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: requests may use preset references, `exp:` and `maxage:` metadata, and bare sources only. The mode does not change signature rules. Combined with `CRABCROP_ALLOW_UNSAFE=1` it makes a public deployment where browsers and CMSs can build URLs from preset names alone, with no secret to hold and no way to invent a transform.
 
+## Source roots
+
+A source root names an origin on the server, so a URL can carry a short source instead of spelling out the full source URL: the origin layout stays off the URL, and URLs get shorter. Define roots in a file, one per line:
+
+```text
+# /etc/crabcrop/roots.txt
+photos = https://cdn.example.com/photos
+media = https://assets.example.com
+```
+
+Point `CRABCROP_SOURCE_ROOTS_FILE` at it, and a request can use `root:<name>/<path>` as its source:
+
+```bash
+curl "http://localhost:3000/<signature>/300x200/root:photos/cat.jpg"
+```
+
+That request fetches `https://cdn.example.com/photos/cat.jpg`. The signature covers the short form exactly as written; the server expands it after verification and before cache keying, so the short spelling and the full URL it expands to are one render: they share a cache entry, and purging either spelling evicts it. Root definitions are validated at startup: names are letters, digits, `_`, or `-`, a duplicate name refuses the boot, and a base must be an absolute http(s) URL with no userinfo, query, or fragment.
+
+The safety rules:
+
+- The source allowlist (`CRABCROP_ALLOWED_SOURCES`) and every other loader check apply to the expanded URL, exactly as if the client had spelled it out. A root never widens what the server will fetch.
+- The path must stay under the root. Dot segments are normalized, and a path that climbs above the root, plainly or percent-encoded, is a `400` (`invalid_root`).
+- An unknown root name is a `400` (`unknown_root`), including on a server with no roots configured.
+- Root base URLs are operator configuration and stay private: `explain` reports the source as written plus the root's name, and never prints a base URL.
+
 ## Client libraries
 
 The URL grammar and signing scheme are specified in [`spec/url-signing.md`](spec/url-signing.md), with a canonical set of test vectors in [`spec/test-vectors.json`](spec/test-vectors.json) that every implementation runs as its test suite. Builders on top of the spec:
@@ -589,7 +614,7 @@ With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at sta
 
 ## Errors
 
-Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`. The statuses you can get:
+Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`. The statuses you can get:
 
 | Status | Meaning |
 | --- | --- |
@@ -737,6 +762,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_JXL_SPEED` | `fast` | jixel speed tier for JPEG XL encodes: `ultrafast`, `fastest`, `fast`, `medium`, `slow`, or `extraslow`. Slower tiers shrink output with steep latency costs (`slow` is about 8x the latency of `fast` for about 18% fewer bytes at 800w). |
 | `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](#presets). |
 | `CRABCROP_ONLY_PRESETS` | off | Rejects free-form operations in requests; only preset references (and `exp:` / `maxage:` metadata) are allowed. Requires at least one preset. |
+| `CRABCROP_SOURCE_ROOTS_FILE` | unset | Path to a source roots file. See [Source roots](#source-roots). |
 | `CRABCROP_ALLOWED_SOURCES` | unset (all hosts allowed) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
 | `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | Refuses sources whose host is, or resolves to, a non-public address: loopback, private, link-local, unspecified, shared (CGNAT), reserved, multicast, broadcast, documentation, benchmarking, and the other special-purpose ranges, including IPv4-mapped, IPv4-compatible, and 6to4 spellings of them. Checked before connecting and again on every redirect hop. |
 | `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |

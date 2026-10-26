@@ -11,12 +11,13 @@ Version 1. This document is the contract between a crabcrop server and anything 
 - `base` is the deployment origin, e.g. `https://images.example.com`, with no trailing slash.
 - `signature` is either the lowercase hex HMAC described below, or the literal `unsafe` (honored only when the server runs with `CRABCROP_ALLOW_UNSAFE`; in presets-only deployments it is the normal form).
 - `operations` is zero or more operation segments separated by `/`, in the grammar the README documents, plus the two metadata segment kinds below.
-- `source` is the source locator with its slashes intact: an `http(s)://` URL, an `s3://bucket/key`, a `gs://bucket/key`, or a `file://` path. The first segment that is not an operation starts the source; everything from there on is source text, even segments that look like operations.
+- `source` is the source locator with its slashes intact: an `http(s)://` URL, an `s3://bucket/key`, a `gs://bucket/key`, a `file://` path, or the short form `root:<name>/<path>` naming a server-configured source root. The first segment that is not an operation starts the source; everything from there on is source text, even segments that look like operations.
 
 ### Metadata segments
 
 - `exp:<unix-seconds>` may appear anywhere among the operations. It is not an operation. The URL is valid strictly before that second; at or past it the server answers `403`. The segment is inside the signed region, so it cannot be extended without the secret.
 - `preset:<name>` may appear anywhere an operation fits. The server expands it to the preset's operation string after verification. The signature covers the reference, not the expansion.
+- `root:<name>/<path>` is a source, not an operation: it is valid only as the whole source. The server expands it against the named root's base URL after verification, the same way a preset reference expands; the signature covers the short form exactly as written, and a short source and the full source it expands to are one render (one cache entry, one purge target). A name the server has not configured is a `400` (`unknown_root`); a path that climbs above the root is a `400` (`invalid_root`).
 
 ## Signing
 
@@ -32,7 +33,7 @@ remainder = everything after the signature segment, exactly as it appears
 - Signatures have one canonical spelling: lowercase hex. Servers reject a signature segment that is not lowercase hex at parse time (`400`); builders always emit lowercase.
 - A signature segment may carry a key ID: `<key-id>:<hex>`, where the ID is 1 to 32 characters of `[A-Za-z0-9_-]`. The ID is routing metadata, not secret material: it names which of the server's keys must verify the tag, which is what makes secret rotation possible without invalidating outstanding URLs. A server verifies a keyed segment against the named key only (an unknown ID fails as a bad signature, `403`), and an unkeyed segment against every key it holds. Purge signature segments accept the same prefix and routing. Builders stamp an ID only when asked; verifiers that hold a single secret ignore the ID and check the tag.
 - The signature covers the path only. A query string is not signed, is ignored by the server, and must not be relied on for anything.
-- Verification failure is `403` with the body `bad signature`. An expired URL is `403` with the body `signature expired`. An unknown preset, a malformed segment, or free-form operations in presets-only mode is a `400`.
+- Verification failure is `403` with the body `bad signature`. An expired URL is `403` with the body `signature expired`. An unknown preset, an unknown or invalid source root, a malformed segment, or free-form operations in presets-only mode is a `400`.
 
 ## Purge signatures
 

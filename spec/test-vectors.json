@@ -82,5 +82,11 @@
     "secret": "s3cr3t",
     "remainder": "fit-in:300x200:adaptive/https://example.com/photo.jpg",
     "signature": "97e32c2d061c022cf8738f376087b61d56a56e301b885f3fe3d822efe50591f6"
+  },
+  {
+    "description": "Named source root (short source form, signed as written)",
+    "secret": "s3cr3t",
+    "remainder": "300x200/root:photos/cat.jpg",
+    "signature": "47e002f609cfbfc252eb1357bbee780bbbaf4c336847610caf44617b06453824"
   }
 ]

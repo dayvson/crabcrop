@@ -523,6 +523,35 @@ mod tests {
     }
 
     #[test]
+    fn builds_root_source_urls_signed_as_written() {
+        // A short source (issue #248) is signed exactly as
+        // written; the signature is the spec's canonical
+        // vector for this remainder.
+        assert_eq!(
+            build_url(
+                "https://img.example.com",
+                Some(b"s3cr3t"),
+                "300x200",
+                "root:photos/cat.jpg",
+                None,
+            )
+            .unwrap(),
+            "https://img.example.com/47e002f609cfbfc252eb1357bbee780bbbaf4c336847610caf44617b06453824/300x200/root:photos/cat.jpg"
+        );
+        // The character refusals still bite a short source.
+        assert!(
+            build_url(
+                "https://img.example.com",
+                Some(b"k"),
+                "300x200",
+                "root:photos/cat.jpg?w=1",
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn builders_reject_unbuildable_urls() {
         // Audit P-4: these can never verify, so building fails.
         for source in [

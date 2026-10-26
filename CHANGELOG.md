@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Added
+
+- Named source roots (issue #248). An operator can name origins in a roots file (`CRABCROP_SOURCE_ROOTS_FILE`, one `name = base-url` entry per line, validated at boot), and a request can then use `root:<name>/<path>` as its source. The signature covers the short form exactly as written; the server expands it after verification and before cache keying, so the short spelling and the full URL it expands to share one cache entry and purge treats them as the same render. The allowlist and every loader check apply to the expanded URL, a path that climbs above the root is a `400` (`invalid_root`), an unknown name is a `400` (`unknown_root`), and `explain` reports the root's name without ever printing a base URL. The signing spec names the short form and carries a canonical test vector for it, which the Rust crate and both SDKs run.
+
 ## [0.4.2] - 2026-10-26
 
 ### Fixed

@@ -71,6 +71,12 @@ pub struct ReportInput {
     pub now: u64,
     /// The source exactly as written in the URL.
     pub source_url: String,
+    /// The source root's name when the source was written
+    /// in the `root:<name>/<path>` short form (issue #248).
+    /// The name is request content and safe to report; the
+    /// base URL it expands against is operator
+    /// configuration and is never part of the report.
+    pub source_root: Option<String>,
     /// Header facts about the probed source.
     pub probe: SourceProbe,
     /// The probed body's encoded size in bytes.
@@ -300,6 +306,25 @@ fn fit_in_forecast(
     ))
 }
 
+/// The source object: the source as written, the facts
+/// the probe read off it, and, for a root source, the
+/// root's name. The key appears only for a root source:
+/// the object carries no more than the facts that apply,
+/// and the root's base URL is never one of them.
+fn source_json(input: &ReportInput) -> serde_json::Value {
+    let mut source = serde_json::json!({
+        "url": input.source_url,
+        "kind": input.probe.kind,
+        "width": input.probe.dimensions.map(|(w, _)| w),
+        "height": input.probe.dimensions.map(|(_, h)| h),
+        "bytes": input.source_bytes,
+    });
+    if let Some(root) = &input.source_root {
+        source["root"] = serde_json::json!(root);
+    }
+    source
+}
+
 impl Report {
     pub fn new(input: ReportInput) -> Self {
         let forecast = forecast(&input.ops, &input.probe);
@@ -338,13 +363,7 @@ impl Report {
                 "expires_at": exp,
                 "expired": input.now >= exp,
             })),
-            "source": {
-                "url": input.source_url,
-                "kind": input.probe.kind,
-                "width": input.probe.dimensions.map(|(w, _)| w),
-                "height": input.probe.dimensions.map(|(_, h)| h),
-                "bytes": input.source_bytes,
-            },
+            "source": source_json(input),
             "operations": ops_json(&op_entries(&input.ops)),
             "presets": input.presets.iter().map(|preset| serde_json::json!({
                 "name": preset.name,
@@ -399,6 +418,9 @@ impl Report {
 
         out.push_str("<h2>Source</h2>\n<ul>\n");
         out.push_str(&format!("<li>{}</li>\n", escape_html(&input.source_url)));
+        if let Some(root) = &input.source_root {
+            out.push_str(&format!("<li>Source root: {}</li>\n", escape_html(root)));
+        }
         let dims = match input.probe.dimensions {
             Some((w, h)) => format!(", {w}x{h}"),
             None => String::new(),
@@ -563,6 +585,7 @@ mod tests {
             expiry,
             now: 1_700_000_000,
             source_url: source.to_string(),
+            source_root: None,
             probe,
             source_bytes: 412_000,
             presets: Vec::new(),
@@ -647,6 +670,36 @@ mod tests {
     }
 
     #[test]
+    fn a_root_source_reports_its_name_and_never_a_base() {
+        let (ops, source, expiry, _) =
+            parse_operations_with_expiry("100x50/root:photos/cat.jpg").unwrap();
+        let report = Report::new(ReportInput {
+            signed: true,
+            key_id: None,
+            expiry,
+            now: 1_700_000_000,
+            source_url: source.to_string(),
+            source_root: Some("photos".to_string()),
+            probe: png_probe(),
+            source_bytes: 10,
+            presets: Vec::new(),
+            canonical: crate::url::canonical_form(&ops, source),
+            cache_group: None,
+            image_path: "/sig/100x50/root:photos/cat.jpg".to_string(),
+            ops,
+        });
+        let json = report.to_json();
+        assert_eq!(json["source"]["url"], "root:photos/cat.jpg");
+        assert_eq!(json["source"]["root"], "photos");
+        let html = report.to_html();
+        assert!(html.contains("Source root: photos"), "{html}");
+        // A plain source carries no root key at all.
+        let plain = report_for("100x50/https://example.com/photo.jpg", png_probe());
+        assert!(plain.to_json()["source"].get("root").is_none());
+        assert!(!plain.to_html().contains("Source root"));
+    }
+
+    #[test]
     fn hostile_strings_escape_in_html_and_stay_verbatim_in_json() {
         let (ops, source, expiry, _) =
             parse_operations_with_expiry("100x50/https://example.com/a&lt;b.png").unwrap();
@@ -656,6 +709,7 @@ mod tests {
             expiry,
             now: 1_700_000_000,
             source_url: source.to_string(),
+            source_root: None,
             probe: png_probe(),
             source_bytes: 10,
             presets: vec![PresetEntry {

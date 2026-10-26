@@ -71,6 +71,12 @@
 //!   free-form operations in requests; only preset references
 //!   (and `exp:` metadata) are allowed. Requires a presets
 //!   file with at least one entry.
+//! - `CRABCROP_SOURCE_ROOTS_FILE`: path to a source roots
+//!   file, one `name = base-url` entry per line (`#` comments
+//!   and blank lines skipped), validated at boot. Requests
+//!   may then use `root:<name>/<path>` as the source, which
+//!   the server expands against the named base URL after
+//!   signature verification.
 //! - `CRABCROP_REMOVEBG_MODEL`: path to a U²-Net-family ONNX
 //!   model for the `removebg` filter. Preloaded at boot; a set
 //!   but unloadable model is a startup error. Unset disables
@@ -307,6 +313,87 @@ fn parse_presets(text: &str) -> Result<std::collections::HashMap<String, String>
         crate::url::parse_preset_operations(ops)
             .map_err(|e| format!("invalid operations for preset {name}: {e}"))?;
         map.insert(name.to_string(), ops.to_string());
+    }
+    Ok(map)
+}
+
+/// Load the source root configuration (issue #248): the
+/// roots file (one `name = base-url` entry per line),
+/// validated strictly. A root binds a name to the base URL
+/// that `root:<name>/<path>` request sources expand
+/// against; the file shape and validation habits mirror the
+/// presets file because the job is the same: a named
+/// reference the server expands after verification.
+fn build_source_roots(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    match get("CRABCROP_SOURCE_ROOTS_FILE") {
+        Some(path) if !path.is_empty() => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read CRABCROP_SOURCE_ROOTS_FILE ({path}): {e}"))?;
+            parse_source_roots(&text)
+        }
+        _ => Ok(std::collections::HashMap::new()),
+    }
+}
+
+/// Parse source root definitions: one `name = base-url`
+/// entry per line, blank lines and `#` comments skipped.
+/// Names follow the preset charset (letters, digits, `_`,
+/// `-`); a base must be an absolute http(s) URL with no
+/// userinfo, query, or fragment: it is a prefix request
+/// paths join onto, and the loader refuses userinfo sources
+/// in any case. Bases are stored in their parsed form with
+/// trailing slashes trimmed, ready for `base + "/" + path`.
+fn parse_source_roots(text: &str) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut map = std::collections::HashMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, base) = line
+            .split_once('=')
+            .ok_or_else(|| format!("source root line {} is not `name = base-url`", i + 1))?;
+        let name = name.trim();
+        let base = base.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(format!(
+                "invalid source root name on line {}: {name:?}",
+                i + 1
+            ));
+        }
+        if map.contains_key(name) {
+            return Err(format!("duplicate source root name: {name}"));
+        }
+        let parsed = reqwest::Url::parse(base)
+            .map_err(|e| format!("invalid base URL for source root {name}: {e}"))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(format!(
+                "base URL for source root {name} must be an http(s) URL: {base:?}"
+            ));
+        }
+        if parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(format!(
+                "base URL for source root {name} must not carry userinfo: {base:?}"
+            ));
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(format!(
+                "base URL for source root {name} must not carry a query or fragment: {base:?}"
+            ));
+        }
+        map.insert(
+            name.to_string(),
+            parsed.to_string().trim_end_matches('/').to_string(),
+        );
     }
     Ok(map)
 }
@@ -688,6 +775,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         sources.file_root = Some(dir.to_path_buf());
     }
     let (presets, only_presets) = build_presets(|name| env::var(name).ok())?;
+    let source_roots = build_source_roots(|name| env::var(name).ok())?;
+    if !source_roots.is_empty() {
+        let mut names: Vec<&String> = source_roots.keys().collect();
+        names.sort();
+        println!(
+            "source roots: {}",
+            names
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     // Server-wide default operations (issue #145): parsed
     // and validated now, so a bad string is a boot error
     // naming the variable, not a per-request surprise.
@@ -838,6 +938,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         brand_color,
         presets,
         only_presets,
+        source_roots,
         default_ops,
         video_encoder,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
@@ -2258,6 +2359,54 @@ mod tests {
         // A typo'd flag is an error, not a silent false.
         let err = expect_err(build_presets(env_of(&[("CRABCROP_ONLY_PRESETS", "ture")])));
         assert!(err.contains("CRABCROP_ONLY_PRESETS"), "{err}");
+    }
+
+    #[test]
+    fn source_roots_construction_reads_and_validates_the_file() {
+        // Nothing configured: no roots.
+        assert!(build_source_roots(env_of(&[])).unwrap().is_empty());
+        // A missing file is a startup error naming the variable.
+        let missing = missing_path("roots");
+        let err = expect_err(build_source_roots(env_of(&[(
+            "CRABCROP_SOURCE_ROOTS_FILE",
+            missing.as_str(),
+        )])));
+        assert!(
+            err.contains("cannot read CRABCROP_SOURCE_ROOTS_FILE"),
+            "{err}"
+        );
+        // A valid file loads, comments and blank lines
+        // skipped, bases stored in parsed form with the
+        // trailing slash trimmed.
+        let good = temp_file(
+            "roots-good",
+            b"# origins\n\nphotos = https://cdn.example.com/photos/\nmedia = http://assets.example.com:8080\n",
+        );
+        let roots =
+            build_source_roots(env_of(&[("CRABCROP_SOURCE_ROOTS_FILE", good.as_str())])).unwrap();
+        assert_eq!(roots["photos"], "https://cdn.example.com/photos");
+        assert_eq!(roots["media"], "http://assets.example.com:8080");
+        // Malformed content is refused at boot, line by line.
+        for (tag, text) in [
+            ("roots-noeq", "photos https://cdn.example.com\n"),
+            ("roots-badname", "my photos = https://cdn.example.com\n"),
+            (
+                "roots-dup",
+                "a = https://x.example.com\na = https://y.example.com\n",
+            ),
+            ("roots-noturl", "a = cdn.example.com/photos\n"),
+            ("roots-scheme", "a = s3://bucket/key\n"),
+            ("roots-userinfo", "a = https://user:pass@cdn.example.com\n"),
+            ("roots-query", "a = https://cdn.example.com/?v=1\n"),
+            ("roots-fragment", "a = https://cdn.example.com/#top\n"),
+        ] {
+            let path = temp_file(tag, text.as_bytes());
+            assert!(
+                build_source_roots(env_of(&[("CRABCROP_SOURCE_ROOTS_FILE", path.as_str())]))
+                    .is_err(),
+                "{tag}"
+            );
+        }
     }
 
     #[test]

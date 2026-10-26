@@ -126,6 +126,27 @@ class TestBuilders(unittest.TestCase):
             "https://img.example.com/unsafe/exp:1893456000/preset:thumb/s3://media/a.jpg",
         )
 
+    def test_root_source_builds_signed_as_written(self):
+        # A short source (issue #248) is signed exactly as
+        # written; the signature is the spec's canonical
+        # vector for this remainder.
+        self.assertEqual(
+            build_url(
+                "https://img.example.com",
+                "s3cr3t",
+                "300x200",
+                "root:photos/cat.jpg",
+            ),
+            "https://img.example.com/"
+            "47e002f609cfbfc252eb1357bbee780bbbaf4c336847610caf44617b06453824"
+            "/300x200/root:photos/cat.jpg",
+        )
+        # The character refusals still bite a short source.
+        with self.assertRaises(ValueError):
+            build_url(
+                "https://img.example.com", b"k", "300x200", "root:photos/cat.jpg?w=1"
+            )
+
     def test_srcset(self):
         self.assertEqual(
             build_srcset(
