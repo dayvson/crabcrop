@@ -88,5 +88,17 @@
     "secret": "s3cr3t",
     "remainder": "300x200/root:photos/cat.jpg",
     "signature": "47e002f609cfbfc252eb1357bbee780bbbaf4c336847610caf44617b06453824"
+  },
+  {
+    "description": "PDF page selection",
+    "remainder": "page:2/https://example.com/doc.pdf",
+    "secret": "s3cr3t",
+    "signature": "18080068798bd8f761b55414e1d859dccf613aaefd1e795997a4f537c6dc2169"
+  },
+  {
+    "description": "PDF page selection, zero-padded spelling (canonicalizes to page:2; signed as written)",
+    "remainder": "page:007/https://example.com/doc.pdf",
+    "secret": "s3cr3t",
+    "signature": "ae2b8fde68f8098f52b9fe980078f7576a54d09b7d21b2d5ba191c6952047769"
   }
 ]

@@ -70,7 +70,7 @@ jobs:
                 src/engine.rs|src/filters.rs|src/quality.rs) tier=full ;;
                 src/color.rs|src/crop.rs|src/heic.rs|src/svg.rs) tier=full ;;
                 src/text.rs|src/video.rs|src/studio.rs|src/ai.rs) tier=full ;;
-                src/frames.rs|src/loader.rs|src/url.rs) tier=full ;;
+                src/frames.rs|src/pdf.rs|src/loader.rs|src/url.rs) tier=full ;;
                 tests/functional/*) tier=full ;;
               esac
             done <<< "$files"
@@ -87,6 +87,9 @@ jobs:
 
       - name: Install ffmpeg (the frames cells' decoder, issue #214)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Poppler (the pages cells' renderer, issue #215)
+        run: sudo apt-get install -y -qq poppler-utils
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: steps.tier.outputs.tier == 'full'

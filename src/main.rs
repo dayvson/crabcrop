@@ -187,6 +187,17 @@
 //!   out on stdout). Validated at boot the same way.
 //!   Unset disables frame selection (requests fail
 //!   cleanly with 501).
+//! - `CRABCROP_PDF_RENDERER`: path to an external PDF
+//!   renderer program (Poppler's pdftocairo is the
+//!   reference) that a `page:` segment on a PDF source
+//!   renders its page through, under the fixed
+//!   probe-and-render contract (PDF bytes in on stdin,
+//!   one PNG page out on stdout; the probe side is the
+//!   derived `pdfinfo` sibling). Both validated at boot
+//!   the same way. Unset disables page selection
+//!   (requests fail cleanly with 501).
+//!   `CRABCROP_PDF_TIMEOUT_SECS` bounds one renderer
+//!   run (default 30, 1 to 600).
 //! - `PORT`: listen port, default 3000.
 
 #![forbid(unsafe_code)]
@@ -205,6 +216,7 @@ mod frames;
 mod heic;
 mod loader;
 mod observe;
+mod pdf;
 mod placeholder;
 mod quality;
 mod s3store;
@@ -908,6 +920,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let fallback = build_fallback(|name| env::var(name).ok())?;
     let video_encoder = build_video_encoder(|name| env::var(name).ok())?;
     let frame_extractor = build_video_decoder(|name| env::var(name).ok())?;
+    let pdf_renderer = build_pdf_renderer(|name| env::var(name).ok())?;
 
     let state = AppState {
         keyring,
@@ -953,6 +966,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         default_ops,
         video_encoder,
         frame_extractor,
+        pdf_renderer,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         inflight: Arc::new(crate::server::Inflight::default()),
@@ -1046,6 +1060,7 @@ fn config_fingerprint(
         "CRABCROP_FONT_PATH",
         "CRABCROP_VIDEO_ENCODER",
         "CRABCROP_VIDEO_DECODER",
+        "CRABCROP_PDF_RENDERER",
     ] {
         if let Some(value) = get(name).filter(|v| !v.is_empty()) {
             part(name, &value);
@@ -1349,6 +1364,50 @@ fn build_video_decoder(
             .map_err(|e| format!("cannot use CRABCROP_VIDEO_DECODER ({path}): {e}"))?;
             println!("video decoder: {path} (timeout {timeout_secs}s)");
             Ok(Some(Arc::new(extractor)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The wall-clock limit for one PDF renderer run
+/// (issue #215): `CRABCROP_PDF_TIMEOUT_SECS`, its own
+/// budget rather than the video tools', because a page
+/// render's cost profile differs from a frame
+/// extraction's. Validated even when no renderer is
+/// configured, like the video bounds.
+fn pdf_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String> {
+    let secs: u64 = parse_env_value(
+        "CRABCROP_PDF_TIMEOUT_SECS",
+        get("CRABCROP_PDF_TIMEOUT_SECS"),
+        crate::video::DEFAULT_TIMEOUT_SECS,
+    )?;
+    if !(1..=600).contains(&secs) {
+        return Err(format!(
+            "CRABCROP_PDF_TIMEOUT_SECS must be between 1 and 600, got {secs}"
+        ));
+    }
+    Ok(secs)
+}
+
+/// Build the PDF renderer (issue #215) from
+/// `CRABCROP_PDF_RENDERER`: the document-side
+/// counterpart of the frame extractor. Same boot rule:
+/// a set path that is not a usable renderer, or one
+/// whose `pdfinfo` sibling is missing, is fatal here,
+/// not on the first `page:` request.
+fn build_pdf_renderer(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<crate::pdf::PdfRenderer>>, String> {
+    let timeout_secs = pdf_timeout_secs(&get)?;
+    match get("CRABCROP_PDF_RENDERER") {
+        Some(path) if !path.is_empty() => {
+            let renderer = crate::pdf::PdfRenderer::new(
+                std::path::PathBuf::from(&path),
+                std::time::Duration::from_secs(timeout_secs),
+            )
+            .map_err(|e| format!("cannot use CRABCROP_PDF_RENDERER ({path}): {e}"))?;
+            println!("PDF renderer: {path} (timeout {timeout_secs}s)");
+            Ok(Some(Arc::new(renderer)))
         }
         _ => Ok(None),
     }
@@ -2606,6 +2665,66 @@ mod tests {
         ]))
         .unwrap();
         assert!(decoder.is_some());
+    }
+
+    #[test]
+    fn pdf_renderer_construction_follows_the_decoder_rules() {
+        // Unset disables page selection (issue #215).
+        assert!(build_pdf_renderer(env_of(&[])).unwrap().is_none());
+        // Its own timeout validates even with no renderer
+        // configured.
+        for value in ["0", "601", "soon"] {
+            let err = expect_err(build_pdf_renderer(env_of(&[(
+                "CRABCROP_PDF_TIMEOUT_SECS",
+                value,
+            )])));
+            assert!(err.contains("CRABCROP_PDF_TIMEOUT_SECS"), "{value}: {err}");
+        }
+        assert!(
+            build_pdf_renderer(env_of(&[("CRABCROP_PDF_TIMEOUT_SECS", "600")]))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pdf_renderer_construction_validates_both_programs() {
+        use std::os::unix::fs::PermissionsExt;
+        // A missing renderer is a boot error naming the
+        // variable, like the decoder's.
+        let missing = missing_path("renderer");
+        let err = expect_err(build_pdf_renderer(env_of(&[(
+            "CRABCROP_PDF_RENDERER",
+            missing.as_str(),
+        )])));
+        assert!(err.contains("cannot use CRABCROP_PDF_RENDERER"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+        // An executable renderer whose pdfinfo sibling is
+        // missing is refused at boot too: the pair is the
+        // contract.
+        let dir = std::env::temp_dir().join(format!("crabcrop-boot-pdf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let renderer_path = dir.join("pdftocairo");
+        std::fs::write(&renderer_path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&renderer_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let renderer_str = renderer_path.to_string_lossy().into_owned();
+        let err = expect_err(build_pdf_renderer(env_of(&[(
+            "CRABCROP_PDF_RENDERER",
+            renderer_str.as_str(),
+        )])));
+        assert!(err.contains("cannot use CRABCROP_PDF_RENDERER"), "{err}");
+        assert!(err.contains("pdfinfo"), "{err}");
+        // The pair in place constructs.
+        let info_path = dir.join("pdfinfo");
+        std::fs::write(&info_path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&info_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let renderer = build_pdf_renderer(env_of(&[
+            ("CRABCROP_PDF_RENDERER", renderer_str.as_str()),
+            ("CRABCROP_PDF_TIMEOUT_SECS", "45"),
+        ]))
+        .unwrap();
+        assert!(renderer.is_some());
     }
 
     #[test]

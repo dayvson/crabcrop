@@ -122,7 +122,7 @@ The loader fetches the source under fixed limits, for every source kind:
 
 - 10 seconds total per fetch, including redirects.
 - 10 MiB maximum body; larger sources fail with `502` (the request was fine; the origin object is too big).
-- If an HTTP response carries a `Content-Type` header, it must start with `image/`. The one exception is a [video frame](#video-frames) request: when the URL carries a `frame:` segment, a `video/*` Content-Type is accepted too.
+- If an HTTP response carries a `Content-Type` header, it must start with `image/`. The exceptions are the media selections: when the URL carries a `frame:` segment, a `video/*` Content-Type is accepted too (see [Video frames](#video-frames)), and when it carries a `page:` segment, `application/pdf` is accepted (see [PDF pages](#pdf-pages)). Both admissions belong to the request, never to the response alone.
 
 Decoding is bounded too, so a small file cannot expand into gigabytes: at most 16384 px per axis and 256 MiB of decoder allocations, and animated GIF and WebP sources at most 200 frames and 100 million decoded pixels in total. Sources past the bounds fail with `502`.
 
@@ -275,6 +275,27 @@ Frame extraction is an operator feature: it runs through the external decoder co
 
 ```bash
 curl "http://localhost:3000/unsafe/frame:50%/800x450/filters:format(webp)/https://example.com/clip.mp4"
+```
+
+### PDF page
+
+```text
+page:<n>
+```
+
+Selects one page of a PDF source, rendered as the source image the rest of the URL operates on: `page:1` is the document's first page. The selection applies at decode, wherever the segment sits in the path, and the rendered page then flows through crops, filters, studio mode, and the format negotiation like any other source image. When a URL carries several `page:` segments, the last one wins. One page per request: there are no ranges and no contact sheets.
+
+The semantics are strict about the edges:
+
+- Page selection is PDF-only. A `page:` segment on an image, a video, or any other source fails with `502`, the way a bad source fails.
+- Pages are 1-based and the number is exact: `page:9` on a three-page document fails with `400`. It never clamps to the last page, the deliberate difference from `frame:` timestamps: a frame is a position inside a stream, while a page is a numbered object a caller picks by identity, so a wrong number is a wrong request, not a position past the end.
+- A malformed selector (zero, a sign, letters, more than six digits) fails with `400` and the `invalid_page` code. Leading zeros are fine: `page:007` is `page:7`, and both spellings share one cache entry.
+- A document that needs a password to open fails with `400`. A document that is merely permission-encrypted and opens without a password renders normally.
+
+Page rendering is an operator feature: it runs through the external renderer configured with `CRABCROP_PDF_RENDERER`, and a server without one answers `501`. See [PDF pages](#pdf-pages) for the renderer contract and the failure table.
+
+```bash
+curl "http://localhost:3000/unsafe/page:2/800x1000/filters:format(webp)/https://example.com/report.pdf"
 ```
 
 ### Filters
@@ -595,6 +616,38 @@ The bounds mirror the encoder's, because the work is the same class:
 
 A frame render's [meta response](#meta-responses) carries a `video` object: the source's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. The explain endpoint labels a video source's kind as `video`; its dimensions stay unknown there, because explain never runs the decoder.
 
+## PDF pages
+
+A PDF the server can fetch is also an image source: a `page:` segment in the URL selects one page (see [PDF page](#pdf-page) in the operations), and from there the request is an ordinary image request. The page renders at a fixed scale of 2 (a 144 dpi raster), clamped down for very large pages so neither raster axis passes the 16384 px decode cap; the rendered PNG re-enters the pipeline, so every decode budget, filter, and output rule applies to it unchanged. Rendering happens once per unique URL, on a cache miss, and the result caches (and purges) like any other render, under the same key rules as every spelling of the URL: `page:7` and `page:07` are one entry.
+
+Crabcrop ships no PDF renderer. Rendering runs in an external program you configure, `CRABCROP_PDF_RENDERER`: the path to a renderer executable, with Poppler's `pdftocairo` as the reference. The renderer does not come alone: crabcrop derives the `pdfinfo` program next to it (same directory, same extension) and uses it to probe documents. Both paths are validated at startup (they must exist and be executable, or the server refuses to boot). With the variable unset, page selection is off and a `page:` URL answers `501`. The contract between crabcrop and the programs is fixed, and crabcrop builds every argument itself; the programs never see a shell, a file path, or the source URL:
+
+- **Probe**: argv is `pdfinfo -f <page> -l <page> -`, with the PDF bytes on stdin. Crabcrop reads the page count, the encryption state, and the selected page's size in points from the report. When the probe refuses the range itself, which it does past the end of the document, a whole-document probe confirms the count for the refusal.
+- **Render**: argv is `pdftocairo -png -singlefile -f <page> -l <page> -r <dpi> - -`, again with the PDF bytes on stdin. One PNG page comes back on stdout and becomes the source image.
+
+Because the tools receive only bytes over stdin, nothing inside a document has anything to resolve: external references, embedded files, and document actions or scripts have no target and no effect. The source itself flows through the ordinary loader first, with the same allowlist and redirect rules as any source and the same 10 MiB fetch cap; only a URL carrying a `page:` segment may fetch an `application/pdf` Content-Type. Documents over 1000 pages are refused.
+
+The bounds mirror the frame extractor's, because the work is the same class:
+
+- Page work takes the video gate (at most two runs at a time, shared with encodes and frame extractions), on top of the process gate; a request that waits more than 10 s for a slot sheds with `503`.
+- Each run is bounded by `CRABCROP_PDF_TIMEOUT_SECS` (default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a page whose PNG passes 256 MiB, the decode allocation budget, is refused).
+
+### Errors
+
+| Situation | Answer |
+| --- | --- |
+| No renderer configured | `501`: `page rendering is not configured on this server` |
+| Source is an image, a video, or anything else that is not a PDF | `502`: page selection needs a PDF source |
+| Source is not a readable PDF (junk bytes, a corrupt or truncated document) | `502`: the bad-source failure every undecodable source gets |
+| Document over the 1000-page cap | `502`, naming the count and the cap |
+| Page past the end of the document | `400`, naming the page and the document's page count |
+| Document needs a password to open | `400`: the document is password-protected |
+| Malformed `page:` selector | `400` with the `invalid_page` code, before any fetch |
+| Renderer or probe exits nonzero, produces no page, exceeds the cap, or times out | `502`: `PDF rendering failed` (the cause, including the tool's stderr excerpt, is in the server log) |
+| Video queue full (both slots busy past a 10 s wait) | `503` |
+
+A page render's [meta response](#meta-responses) carries a `pdf` object: the document's `pages` count, the `page` rendered, and the page's `page_width` and `page_height` in points. The explain endpoint labels a PDF source's kind as `pdf`; its dimensions stay unknown there, because explain never runs the renderer.
+
 ## Meta responses
 
 Send `Accept: application/json` with any image URL to get metadata about the processed image instead of the image bytes:
@@ -616,6 +669,7 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 | `ssimulacra2` | The verified perceptual score of the output, present when `quality(auto)` verified a JPEG or JPEG XL encode. 100 is identical. |
 | `studio` | Present when a `studio(...)` filter ran: the resolved backdrop (`bg`, spelled `#rrggbb`, or `none` for transparency) and its source (`bg_from`: `argument`, `brand`, or `default`), the `shadow` and `pad` applied, the expansion `steps` that ran, the `fallbacks` taken, and `mask_confidence` when the mask provider exposes one. See [Studio mode](#studio-mode). |
 | `video` | Present when the source was a video and a `frame:` segment selected the frame: the video stream's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. See [Video frames](#video-frames). |
+| `pdf` | Present when the source was a PDF and a `page:` segment selected the page: the document's `pages` count, the `page` rendered, and the page size as `page_width` and `page_height` in points. See [PDF pages](#pdf-pages). |
 
 Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other.
 
@@ -666,7 +720,7 @@ With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at sta
 
 ## Errors
 
-Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`, `invalid_frame`. The statuses you can get:
+Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`, `invalid_frame`, `invalid_page`. The statuses you can get:
 
 | Status | Meaning |
 | --- | --- |
@@ -841,6 +895,8 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_VIDEO_ENCODER` | unset | Path to the external video encoder program for `format(mp4)` / `format(webm)`, validated at startup. Unset disables video output. See [Video output](#video-output). |
 | `CRABCROP_VIDEO_DECODER` | unset | Path to the external video decoder program for `frame:` extraction from video sources, validated at startup. Unset disables frame selection. See [Video frames](#video-frames). |
 | `CRABCROP_VIDEO_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external video tool run (one encode, or one frame probe/extraction), 1 to 600 seconds. |
+| `CRABCROP_PDF_RENDERER` | unset | Path to the external PDF renderer program for `page:` rendering from PDF sources (its `pdfinfo` sibling is derived and validated alongside), validated at startup. Unset disables page selection. See [PDF pages](#pdf-pages). |
+| `CRABCROP_PDF_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external PDF tool run (one probe or one page render), 1 to 600 seconds. |
 | `CRABCROP_VIDEO_MAX_MB` | `64` | Output cap per video encode in megabytes, 1 to 1024. The encode aborts the moment it is crossed. |
 | `CRABCROP_FALLBACK_IMAGE` | unset | URL or local file path of the fallback image served when a source cannot be fetched or decoded. See [Fallback image](#fallback-image). |
 | `CRABCROP_RESULT_STORAGE_DIR` | unset | Directory for the disk-backed result store. Unset disables the second cache tier. |

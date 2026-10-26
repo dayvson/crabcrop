@@ -281,6 +281,15 @@ pub struct AppState {
     /// gate below: it is the same class of subprocess
     /// work as an encode.
     pub frame_extractor: Option<Arc<crate::frames::VideoFrameExtractor>>,
+    /// PDF renderer for `page:` segments on PDF sources
+    /// (issue #215), built at boot when
+    /// `CRABCROP_PDF_RENDERER` is configured. `None` means
+    /// page selection does not exist on this server; a
+    /// `page:` request then fails with the specific
+    /// not-configured error. Rendering shares the video
+    /// gate below: it is the same class of subprocess
+    /// work as frame extraction.
+    pub pdf_renderer: Option<Arc<crate::pdf::PdfRenderer>>,
     /// Bounds concurrent video encodes: the subprocess is
     /// the server's most expensive and least predictable
     /// work, so it gets its own small gate (2 permits, like
@@ -551,11 +560,20 @@ async fn explain_handle(
     // operations' inputs, not the explained URL's source,
     // and are never fetched: no fan-out. A `frame:`
     // segment makes the source a video, so the loader may
-    // accept a `video/*` Content-Type for it (issue #214).
-    let allow_video = ops
-        .iter()
-        .any(|op| matches!(op, crate::url::Operation::Frame(_)));
-    let bytes = match state.loader.load_media(&fetch_url, allow_video).await {
+    // accept a `video/*` Content-Type for it (issue #214);
+    // a `page:` segment does the same for
+    // `application/pdf` (issue #215). Explain never runs
+    // either tool: the fetch is admitted, the probe stays
+    // the raw-bytes probe.
+    let admission = crate::loader::MediaAdmission {
+        video: ops
+            .iter()
+            .any(|op| matches!(op, crate::url::Operation::Frame(_))),
+        pdf: ops
+            .iter()
+            .any(|op| matches!(op, crate::url::Operation::Page(_))),
+    };
+    let bytes = match state.loader.load_media(&fetch_url, admission).await {
         Ok(bytes) => bytes,
         Err(e) => return explain_load_error(e),
     };
@@ -1242,6 +1260,7 @@ struct ProcessJob {
     text_renderer: Option<Arc<dyn crate::text::TextRenderer>>,
     video_encoder: Option<Arc<crate::video::VideoEncoder>>,
     frame_extractor: Option<Arc<crate::frames::VideoFrameExtractor>>,
+    pdf_renderer: Option<Arc<crate::pdf::PdfRenderer>>,
     dpr: Option<f32>,
     ssim_target: f64,
     brand_color: Option<[u8; 3]>,
@@ -1352,6 +1371,7 @@ async fn run_process(
                 focal_provider: job.focal_provider.as_deref(),
                 video_encoder: job.video_encoder.as_deref(),
                 frame_extractor: job.frame_extractor.as_deref(),
+                pdf_renderer: job.pdf_renderer.as_deref(),
                 save_data: job.save_data,
                 preserve_metadata: job.preserve_metadata,
                 text_renderer: job.text_renderer.as_deref(),
@@ -1790,12 +1810,18 @@ async fn serve_miss(
     let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
     // A `frame:` segment makes the source a video (issue
     // #214): only then may the loader accept a `video/*`
-    // Content-Type for it.
+    // Content-Type for it. A `page:` segment does the
+    // same for `application/pdf` (issue #215).
     let wants_frame = directives.frame.is_some();
+    let wants_page = directives.page.is_some();
     record.load_ran = true;
     let load_start = Instant::now();
     let mut used_fallback = false;
-    let bytes = match state.loader.load_media(source_url, wants_frame).await {
+    let admission = crate::loader::MediaAdmission {
+        video: wants_frame,
+        pdf: wants_page,
+    };
+    let bytes = match state.loader.load_media(source_url, admission).await {
         Ok(b) => b,
         Err(e) => {
             record.load = load_start.elapsed();
@@ -1872,8 +1898,12 @@ async fn serve_miss(
     // a burst of video requests sheds here instead of
     // queueing unboundedly behind the transform pipeline.
     // Frame extraction (issue #214) takes the same gate:
-    // it runs the same class of subprocess.
-    let _video_permit = if wants_video || wants_frame {
+    // it runs the same class of subprocess. Page
+    // rendering (issue #215) takes it too: it is the
+    // external-tool gate in everything but name, and a
+    // second gate for the same class of work would only
+    // split the protection.
+    let _video_permit = if wants_video || wants_frame || wants_page {
         match tokio::time::timeout(VIDEO_GATE_WAIT, state.video_gate.clone().acquire_owned()).await
         {
             Ok(Ok(permit)) => Some(permit),
@@ -1940,6 +1970,7 @@ async fn serve_miss(
         text_renderer: state.font.clone(),
         video_encoder: state.video_encoder.clone(),
         frame_extractor: state.frame_extractor.clone(),
+        pdf_renderer: state.pdf_renderer.clone(),
         dpr: dpr_hint,
         ssim_target: state.ssim_target,
         brand_color: state.brand_color,
@@ -2888,6 +2919,28 @@ fn meta_response(
             duration
         ));
     }
+    if let Some(pdf) = &processed.pdf {
+        // The PDF record (issue #215): the document's page
+        // count, the page this response rendered (after
+        // canonicalization), and the page size in points.
+        // Points print the way the probe reports them:
+        // whole values bare, fractions at two decimals.
+        let points = |v: f64| {
+            let rounded = (v * 100.0).round() / 100.0;
+            if rounded == rounded.trunc() {
+                format!("{}", rounded as i64)
+            } else {
+                format!("{rounded}")
+            }
+        };
+        body.push_str(&format!(
+            ",\"pdf\":{{\"pages\":{},\"page\":{},\"page_width\":{},\"page_height\":{}}}",
+            pdf.pages,
+            pdf.page,
+            points(pdf.page_width),
+            points(pdf.page_height)
+        ));
+    }
     if let Some(studio) = &processed.studio {
         // The studio record (issue #197): the resolved
         // parameters, the steps that ran, the fallbacks
@@ -3128,6 +3181,7 @@ fn engine_error_response(e: EngineError) -> Response {
             StatusCode::BAD_GATEWAY,
             "video frame extraction failed".to_string(),
         ),
+        EngineError::Pdf(_) => (StatusCode::BAD_GATEWAY, "PDF rendering failed".to_string()),
     };
     (status, message).into_response()
 }
@@ -3265,6 +3319,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3369,6 +3424,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate,
             inflight: Arc::new(Inflight::default()),
@@ -3446,6 +3502,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: Some(Arc::new(encoder)),
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3526,6 +3583,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: Some(Arc::new(extractor)),
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3673,6 +3731,282 @@ mod tests {
         assert_eq!(segment, "frame:1.5");
         let gloss = json["operations"][0]["descriptions"][0].as_str().unwrap();
         assert!(gloss.contains("video frame at that timestamp"), "{gloss}");
+    }
+
+    /// An app with a fake PDF renderer configured
+    /// (issue #215): the probe prints a fixed 3-page
+    /// report and the renderer answers with the test
+    /// PNG, so the whole page path runs without a real
+    /// renderer. The probe script refuses the way the
+    /// real oned does for marked sources: PASSWORD in
+    /// the bytes is a password refusal, CORRUPT is
+    /// unreadable.
+    async fn spawn_app_with_pdf_renderer() -> String {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("crabcrop-server-pages-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("page.png"), test_png()).unwrap();
+        let page_path = dir.join("page.png").display().to_string();
+        let write_tool = |name: &str, script: String| {
+            let path = dir.join(name);
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(script.as_bytes()).unwrap();
+            drop(file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+        write_tool(
+            "pdfinfo",
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *PASSWORD*) printf '%s\\n' 'Command Line Error: Incorrect password' >&2; exit 1 ;;\n  *CORRUPT*) printf '%s\\n' 'Syntax Error: unreadable' >&2; exit 1 ;;\nesac\nprintf '%s\\n' 'Pages:           3' 'Encrypted:       no' 'Page size:       612 x 792 pts (letter)'\nexit 0\n".to_string(),
+        );
+        let program = write_tool(
+            "pdftocairo",
+            format!("#!/bin/sh\ncat > /dev/null\ncat \"{page_path}\"\nexit 0\n"),
+        );
+        let renderer =
+            crate::pdf::PdfRenderer::new(program, std::time::Duration::from_secs(30)).unwrap();
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: Some(Arc::new(renderer)),
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Bytes that carry the PDF header (the tools are
+    /// fake; the document is never really parsed).
+    const FAKE_PDF_SOURCE: &[u8] = b"%PDF-1.4\nfake document bytes for the server tests";
+
+    #[tokio::test]
+    async fn page_urls_render_the_page_and_cache_it() {
+        let (src, hits) =
+            spawn_counting_server(200, "application/pdf", FAKE_PDF_SOURCE.to_vec()).await;
+        let base = spawn_app_with_pdf_renderer().await;
+        let remainder = format!("page:2/40x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let first = client().get(&url).send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(header(&first, "cache-status"), "crabcrop; fwd=uri-miss");
+        let bytes = first.bytes().await.unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (40, 30));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The repeat is a cache hit: neither the origin
+        // nor the renderer runs again.
+        let second = client().get(&url).send().await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(header(&second, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The other spelling of the same page shares the
+        // entry: canonicalization happens before the
+        // cache key is built.
+        let remainder = format!("page:02/40x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The meta form carries the PDF record.
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["pdf"]["pages"], 3, "{meta}");
+        assert_eq!(meta["pdf"]["page"], 2, "{meta}");
+        assert_eq!(meta["pdf"]["page_width"], 612, "{meta}");
+        assert_eq!(meta["pdf"]["page_height"], 792, "{meta}");
+        assert_eq!(meta["source_width"], 100, "{meta}");
+        assert_eq!(meta["source_height"], 60, "{meta}");
+        assert!(meta["video"].is_null(), "{meta}");
+    }
+
+    #[tokio::test]
+    async fn page_urls_without_a_renderer_answer_501() {
+        let (src, _hits) =
+            spawn_counting_server(200, "application/pdf", FAKE_PDF_SOURCE.to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("page:1/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("CRABCROP_PDF_RENDERER"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn page_urls_refuse_image_and_corrupt_sources() {
+        let base = spawn_app_with_pdf_renderer().await;
+        // An image source with a page segment: the
+        // loader serves it (it is an image), and the
+        // engine refuses it as a bad source.
+        let (img, _h) = spawn_counting_server(200, "image/png", test_png()).await;
+        let remainder = format!("page:1/{img}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // A PDF the probe cannot read fails the same
+        // way, with the generic decode body...
+        let (bad, _h) =
+            spawn_counting_server(200, "application/pdf", b"%PDF-1.4 CORRUPT junk".to_vec()).await;
+        let remainder = format!("page:1/{bad}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("could not be decoded"), "{body}");
+        // ...and the server is unharmed: a good page
+        // renders right after.
+        let (src, _h) =
+            spawn_counting_server(200, "application/pdf", FAKE_PDF_SOURCE.to_vec()).await;
+        let remainder = format!("page:1/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn page_urls_answer_the_document_refusals_as_400() {
+        let base = spawn_app_with_pdf_renderer().await;
+        // Out of range refuses; it never serves the last
+        // page under the asked number.
+        let (src, _h) =
+            spawn_counting_server(200, "application/pdf", FAKE_PDF_SOURCE.to_vec()).await;
+        let remainder = format!("page:9/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("page 9"), "{body}");
+        assert!(body.contains("3 pages"), "{body}");
+        // A document that needs a password is its own
+        // refusal, naming the password.
+        let (locked, _h) = spawn_counting_server(
+            200,
+            "application/pdf",
+            b"%PDF-1.4 PASSWORD protected".to_vec(),
+        )
+        .await;
+        let remainder = format!("page:1/{locked}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("password-protected"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_pdf_content_type_needs_a_page_segment() {
+        // The same PDF source, fetched by a URL with no
+        // page segment: the loader's image-only rule
+        // refuses it, exactly as before issue #215.
+        let (src, _hits) =
+            spawn_counting_server(200, "application/pdf", FAKE_PDF_SOURCE.to_vec()).await;
+        let base = spawn_app_with_pdf_renderer().await;
+        let remainder = format!("40x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("did not return an image"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn page_grammar_errors_cost_no_fetch() {
+        let (src, hits) =
+            spawn_counting_server(200, "application/pdf", FAKE_PDF_SOURCE.to_vec()).await;
+        let base = spawn_app_with_pdf_renderer().await;
+        let remainder = format!("page:banana/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["error"]["code"], "invalid_page");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explain_labels_a_pdf_source() {
+        let (src, hits) =
+            spawn_counting_server(200, "application/pdf", FAKE_PDF_SOURCE.to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("page:2/{src}");
+        let url = format!("{base}/explain/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["source"]["kind"], "pdf");
+        assert!(json["source"]["width"].is_null());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let segment = json["operations"][0]["segment"].as_str().unwrap();
+        assert_eq!(segment, "page:2");
+        let gloss = json["operations"][0]["descriptions"][0].as_str().unwrap();
+        assert!(gloss.contains("of the PDF source"), "{gloss}");
     }
 
     #[tokio::test]
@@ -3828,6 +4162,7 @@ mod tests {
                 .unwrap(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3885,6 +4220,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -3946,6 +4282,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -4508,6 +4845,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5275,6 +5613,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5398,6 +5737,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5723,6 +6063,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5938,6 +6279,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -5991,6 +6333,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -6230,6 +6573,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -6297,6 +6641,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -7578,6 +7923,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -7647,6 +7993,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -8004,6 +8351,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -8026,6 +8374,7 @@ mod tests {
             text_renderer: None,
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             dpr: None,
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
@@ -8092,6 +8441,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -8117,6 +8467,7 @@ mod tests {
             text_renderer: None,
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             dpr: None,
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
@@ -8617,6 +8968,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -9021,6 +9373,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
@@ -9848,6 +10201,7 @@ mod tests {
             default_ops: Vec::new(),
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),

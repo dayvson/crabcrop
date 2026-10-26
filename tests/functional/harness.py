@@ -33,7 +33,8 @@ SECRET = "functional-test-secret-0123456789"
 # (8909/8912/3321) or a developer's own server (default 8904 family).
 PORTS = {"origin": 8971, "A": 8972, "AN": 8973, "AP": 8974, "P": 8975,
          "N": 8976, "U": 8977, "OP": 8978, "E": 8979, "BOOT": 8980,
-         "AI": 8981, "AIN": 8982, "AIC": 8983, "R": 8984, "V": 8985}
+         "AI": 8981, "AIN": 8982, "AIC": 8983, "R": 8984, "V": 8985,
+         "D": 8986}
 BASES = {k: f"http://127.0.0.1:{p}" for k, p in PORTS.items() if k != "origin"}
 ORIGIN = f"http://127.0.0.1:{PORTS['origin']}"
 SRC127 = ORIGIN
@@ -167,6 +168,16 @@ INSTANCE_ENV = {
     # the frames cells record NOTEs instead of asserting.
     "V": dict(CRABCROP_ALLOW_UNSAFE="1",
               CRABCROP_VIDEO_DECODER=shutil.which("ffmpeg") or "",
+              **ALLOW),
+    # D carries the PDF renderer (issue #215): the
+    # pdftocairo on PATH, resolved here, with a short
+    # renderer timeout so a pathological document sheds
+    # fast. Without one the env value is empty, the
+    # instance boots renderer-less, and the pages cells
+    # record NOTEs instead of asserting.
+    "D": dict(CRABCROP_ALLOW_UNSAFE="1",
+              CRABCROP_PDF_RENDERER=shutil.which("pdftocairo") or "",
+              CRABCROP_PDF_TIMEOUT_SECS="5",
               **ALLOW),
 }
 # U needs the runtime upload dir; filled in by start_instances().

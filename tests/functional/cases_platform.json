@@ -484,5 +484,29 @@
   "group": "frames",
   "kind": "scripted",
   "tier": "full"
+ },
+ {
+  "id": "pages-render-and-chain",
+  "group": "pages",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "pages-meta",
+  "group": "pages",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "pages-refusals",
+  "group": "pages",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "pages-cache-and-purge",
+  "group": "pages",
+  "kind": "scripted",
+  "tier": "full"
  }
 ]

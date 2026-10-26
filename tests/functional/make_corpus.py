@@ -126,6 +126,83 @@ frames[0].save(os.path.join(DEST, "anim.webp"), save_all=True,
 record("anim.webp", "Synthesized locally with PIL: 12-frame animation",
        "downscaled to 320x213 for the frozen corpus; cases assert frame count and content type only")
 
+# --- PDF fixtures (issue #215): hand-written minimal PDFs ---
+def _pdf_doc(page_contents):
+    """Assemble a deterministic minimal PDF: Letter pages,
+    one Helvetica font object, one content stream per page.
+    No timestamps or IDs, so the bytes are stable."""
+    kids = []
+    bodies = []
+    n = 4
+    for content in page_contents:
+        kids.append(f"{n} 0 R")
+        bodies.append((n, n + 1, content))
+        n += 2
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(page_contents)} >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    for page_n, content_n, content in bodies:
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Contents {content_n} 0 R /Resources << /Font << /F1 3 0 R >> >> >>")
+        objects.append(f"<< /Length {len(content)} >>\nstream\n{content}endstream")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objects):
+        offsets.append(len(out))
+        out += f"{i + 1} 0 obj\n{body}\nendobj\n".encode()
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += (f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref}\n%%EOF\n").encode()
+    return bytes(out)
+
+
+def _band_page(i, total):
+    """One page: a hue band unique to the page (the spike
+    formula) plus its label, so a render proves which
+    page was selected from the band's center pixel."""
+    r = ((i * 37) % 100) / 100
+    g = ((i * 53) % 100) / 100
+    b = ((i * 91) % 100) / 100
+    return (f"{r:.2f} {g:.2f} {b:.2f} rg\n72 560 468 60 re\nf\n"
+            f"0 0 0 rg\nBT /F1 24 Tf 72 700 Td (Page {i} of {total}) Tj ET\n")
+
+
+def record_pdf(name, origin, pages, note=None):
+    p = os.path.join(DEST, name)
+    e = {"file": name, "origin": origin, "format": "PDF",
+         "width": 612, "height": 792,
+         "bytes": os.path.getsize(p), "frames": pages,
+         "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]}
+    if note:
+        e["note"] = note
+    manifest.append(e)
+    print(f"{name}: PDF pages={pages} {e['bytes']}B")
+
+
+pages_data = _pdf_doc([_band_page(i, 5) for i in range(1, 6)])
+open(os.path.join(DEST, "pages.pdf"), "wb").write(pages_data)
+record_pdf("pages.pdf",
+           "Hand-written minimal PDF: 5 Letter pages, per-page hue band and page label",
+           5, "width/height are the page size in points; frames is the page count")
+open(os.path.join(DEST, "truncated.pdf"), "wb").write(pages_data[:400])
+record_pdf("truncated.pdf",
+           "The first 400 bytes of pages.pdf: a truncated document no probe can read",
+           0)
+# locked.pdf is generated once with pypdf (AES-256 user
+# password over a 2-page text document) and frozen into
+# the corpus; it is recorded when present, never
+# regenerated here.
+if os.path.exists(os.path.join(DEST, "locked.pdf")):
+    record_pdf("locked.pdf",
+               "Generated with pypdf: 2 Letter pages, AES-256 user-password encryption",
+               2)
+
 manifest.sort(key=lambda e: e["file"])
 json.dump(manifest, open(os.path.join(DEST, "..", "corpus.json"), "w"), indent=1)
 total = sum(e["bytes"] for e in manifest)

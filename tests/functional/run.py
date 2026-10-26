@@ -287,6 +287,12 @@ def main():
             if any(c["group"] == "frames" for c in platform_rows) \
                     and shutil.which("ffmpeg"):
                 need.add("V")
+            # The pages cells (issue #215) need the D
+            # instance (renderer configured from PATH's
+            # pdftocairo); same rule as frames.
+            if any(c["group"] == "pages" for c in platform_rows) \
+                    and shutil.which("pdftocairo"):
+                need.add("D")
             ok = hz.start_instances(sorted(need))
             bad = [k for k, v in ok.items() if not v]
             if bad:

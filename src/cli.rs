@@ -433,6 +433,9 @@ pub(crate) fn describe_operation_text(op: &Operation) -> Vec<String> {
                 crate::url::format_frame_value(*p)
             ),
         }],
+        Operation::Page(page) => vec![format!(
+            "page:{page} (use page {page} of the PDF source, rendered as the source image)"
+        )],
     }
 }
 

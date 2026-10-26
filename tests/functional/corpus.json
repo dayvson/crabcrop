@@ -421,5 +421,36 @@
   "bytes": 60,
   "frames": 0,
   "sha256": "19ec39ed82a1f64b"
+ },
+ {
+  "file": "pages.pdf",
+  "origin": "Hand-written minimal PDF: 5 Letter pages, per-page hue band and page label",
+  "format": "PDF",
+  "width": 612,
+  "height": 792,
+  "bytes": 1883,
+  "frames": 5,
+  "sha256": "e7f4b85b2a36430a",
+  "note": "width/height are the page size in points; frames is the page count"
+ },
+ {
+  "file": "locked.pdf",
+  "origin": "Generated with pypdf: 2 Letter pages, AES-256 user-password encryption",
+  "format": "PDF",
+  "width": 612,
+  "height": 792,
+  "bytes": 3000,
+  "frames": 2,
+  "sha256": "2aad68f066b2a734"
+ },
+ {
+  "file": "truncated.pdf",
+  "origin": "The first 400 bytes of pages.pdf: a truncated document no probe can read",
+  "format": "PDF",
+  "width": 612,
+  "height": 792,
+  "bytes": 400,
+  "frames": 0,
+  "sha256": "1342001e27baa969"
  }
 ]

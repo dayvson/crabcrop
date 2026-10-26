@@ -35,7 +35,7 @@ LOCK = threading.Lock()
 
 CT = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
       ".svg": "image/svg+xml", ".webp": "image/webp", ".gif": "image/gif",
-      ".mp4": "video/mp4"}
+      ".mp4": "video/mp4", ".pdf": "application/pdf"}
 
 
 class H(BaseHTTPRequestHandler):

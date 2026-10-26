@@ -98,6 +98,36 @@ impl std::fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// The non-image source types one fetch may admit, on
+/// top of the image-only rule every fetch keeps. Each
+/// admission is a property of the request, never of the
+/// response alone: a `video/*` Content-Type is accepted
+/// only for a request whose operations carry a `frame:`
+/// segment (issue #214), and an `application/pdf`
+/// Content-Type only for one carrying a `page:` segment
+/// (issue #215). Content type by itself admits nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaAdmission {
+    /// Accept `video/*` (a frame request).
+    pub video: bool,
+    /// Accept `application/pdf` (a page request).
+    pub pdf: bool,
+}
+
+impl MediaAdmission {
+    /// Whether this response's Content-Type is admitted:
+    /// `image/*` always, the rest per the flags.
+    fn accepts(&self, content_type: &str) -> bool {
+        content_type.starts_with("image/")
+            || (self.video && content_type.starts_with("video/"))
+            || (self.pdf
+                && content_type
+                    .split(';')
+                    .next()
+                    .is_some_and(|ct| ct.trim() == "application/pdf"))
+    }
+}
+
 /// Which sources the loader may fetch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourcePolicy {
@@ -232,38 +262,39 @@ impl Loader {
     /// Fetch `url` and return the body bytes, dispatching on
     /// the source scheme.
     pub async fn load(&self, url: &str) -> Result<Vec<u8>, LoadError> {
-        self.load_media(url, false).await
+        self.load_media(url, MediaAdmission::default()).await
     }
 
-    /// Fetch `url` like [`Loader::load`], optionally
-    /// accepting a `video/*` Content-Type. Only a request
-    /// whose operations carry a `frame:` segment (issue
-    /// #214) passes `allow_video`: a video is a source
-    /// type of its own, and every other request keeps the
-    /// image-only rule. All other guards (allowlist, dot
-    /// segments, size cap, redirects, SSRF checks) are
+    /// Fetch `url` like [`Loader::load`], with the
+    /// non-image source types this request may admit (see
+    /// [`MediaAdmission`]). All other guards (allowlist,
+    /// dot segments, size cap, redirects, SSRF checks) are
     /// identical either way, and file sources never had a
     /// Content-Type to check.
-    pub async fn load_media(&self, url: &str, allow_video: bool) -> Result<Vec<u8>, LoadError> {
+    pub async fn load_media(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+    ) -> Result<Vec<u8>, LoadError> {
         if let Some(rest) = url.strip_prefix("s3://") {
             let (bucket, key) = split_bucket_key(rest, "s3")?;
             return self
-                .load_object(StoreKind::S3, bucket, key, allow_video)
+                .load_object(StoreKind::S3, bucket, key, admission)
                 .await;
         }
         if let Some(rest) = url.strip_prefix("gs://") {
             let (bucket, key) = split_bucket_key(rest, "gs")?;
             return self
-                .load_object(StoreKind::Gcs, bucket, key, allow_video)
+                .load_object(StoreKind::Gcs, bucket, key, admission)
                 .await;
         }
         if url.starts_with("file://") {
             return self.load_file(url).await;
         }
-        self.load_http(url, allow_video).await
+        self.load_http(url, admission).await
     }
 
-    async fn load_http(&self, url: &str, allow_video: bool) -> Result<Vec<u8>, LoadError> {
+    async fn load_http(&self, url: &str, admission: MediaAdmission) -> Result<Vec<u8>, LoadError> {
         let mut parsed =
             Url::parse(url).map_err(|e| LoadError::Network(format!("invalid url: {e}")))?;
         let mut hops = 0;
@@ -300,19 +331,20 @@ impl Loader {
                     .map_err(|e| LoadError::Network(format!("invalid redirect: {e}")))?;
                 continue;
             }
-            return self.read_checked_body(resp, allow_video).await;
+            return self.read_checked_body(resp, admission).await;
         }
     }
 
     /// Status, content-type, and bounded-body handling shared by
     /// the HTTP path and the object stores. A non-2xx status
     /// (including a store redirect, which is not followed) is an
-    /// error. The Content-Type must be `image/*`, or (only for
-    /// a frame request) `video/*`.
+    /// error. The Content-Type must be `image/*`, or one of the
+    /// non-image types this request admits (see
+    /// [`MediaAdmission`]).
     async fn read_checked_body(
         &self,
         mut resp: reqwest::Response,
-        allow_video: bool,
+        admission: MediaAdmission,
     ) -> Result<Vec<u8>, LoadError> {
         let status = resp.status();
         if !status.is_success() {
@@ -320,9 +352,7 @@ impl Loader {
         }
         if let Some(value) = resp.headers().get(header::CONTENT_TYPE) {
             let content_type = value.to_str().ok();
-            let accepted = content_type.is_some_and(|ct| {
-                ct.starts_with("image/") || (allow_video && ct.starts_with("video/"))
-            });
+            let accepted = content_type.is_some_and(|ct| admission.accepts(ct));
             if !accepted {
                 return Err(LoadError::WrongContentType(
                     content_type.map(str::to_string),
@@ -350,7 +380,7 @@ impl Loader {
         kind: StoreKind,
         bucket: &str,
         key: &str,
-        allow_video: bool,
+        admission: MediaAdmission,
     ) -> Result<Vec<u8>, LoadError> {
         // The request URL places the key after the bucket, and
         // URL parsing collapses dot segments, so a key carrying
@@ -439,7 +469,7 @@ impl Loader {
             }
         }
         let resp = request.send().await.map_err(map_request_error)?;
-        self.read_checked_body(resp, allow_video).await
+        self.read_checked_body(resp, admission).await
     }
 
     /// Fetch a local file under the configured root. The
@@ -906,7 +936,11 @@ mod tests {
             Err(LoadError::WrongContentType(Some("video/mp4".to_string())))
         );
         let base = spawn_server(Respond::Bytes(video_response())).await;
-        assert_eq!(loader.load_media(&base, true).await.unwrap(), b"video");
+        let video = MediaAdmission {
+            video: true,
+            pdf: false,
+        };
+        assert_eq!(loader.load_media(&base, video).await.unwrap(), b"video");
         let resp = response(
             "200 OK",
             "Content-Type: text/html\r\nContent-Length: 5\r\n",
@@ -914,8 +948,64 @@ mod tests {
         );
         let base = spawn_server(Respond::Bytes(resp)).await;
         assert_eq!(
-            loader.load_media(&base, true).await,
+            loader.load_media(&base, video).await,
             Err(LoadError::WrongContentType(Some("text/html".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn pdf_content_type_needs_the_media_opt_in() {
+        // Issue #215: an `application/pdf` Content-Type is
+        // refused by the plain load and accepted by the
+        // media load a page request uses; the video
+        // admission does not cover it, and it widens
+        // nothing else.
+        let body = b"%PDF-";
+        let pdf_response = || {
+            response(
+                "200 OK",
+                "Content-Type: application/pdf\r\nContent-Length: 5\r\n",
+                body,
+            )
+        };
+        let loader = Loader::with_defaults().unwrap();
+        let base = spawn_server(Respond::Bytes(pdf_response())).await;
+        assert_eq!(
+            fetch(&loader, &base).await,
+            Err(LoadError::WrongContentType(Some(
+                "application/pdf".to_string()
+            )))
+        );
+        let pdf = MediaAdmission {
+            video: false,
+            pdf: true,
+        };
+        let base = spawn_server(Respond::Bytes(pdf_response())).await;
+        assert_eq!(loader.load_media(&base, pdf).await.unwrap(), b"%PDF-");
+        // The video admission alone does not admit a PDF.
+        let video_only = MediaAdmission {
+            video: true,
+            pdf: false,
+        };
+        let base = spawn_server(Respond::Bytes(pdf_response())).await;
+        assert_eq!(
+            loader.load_media(&base, video_only).await,
+            Err(LoadError::WrongContentType(Some(
+                "application/pdf".to_string()
+            )))
+        );
+        // A lookalike type is not the PDF type.
+        let resp = response(
+            "200 OK",
+            "Content-Type: application/pdfx\r\nContent-Length: 5\r\n",
+            body,
+        );
+        let base = spawn_server(Respond::Bytes(resp)).await;
+        assert_eq!(
+            loader.load_media(&base, pdf).await,
+            Err(LoadError::WrongContentType(Some(
+                "application/pdfx".to_string()
+            )))
         );
     }
 

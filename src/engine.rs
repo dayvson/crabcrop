@@ -361,6 +361,11 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
         // so they stay unknown (the reader below cannot
         // read them either).
         _ if is_video_container(bytes) => "video",
+        // Not an image either: a PDF document (issue
+        // #215) gets its own kind. A page's dimensions
+        // live behind the renderer's probe, which
+        // explain never runs, so they stay unknown.
+        _ if crate::pdf::sniff_pdf(bytes) => "pdf",
         _ => "unknown",
     };
     let dimensions = image::ImageReader::new(Cursor::new(bytes))
@@ -480,6 +485,12 @@ pub struct ProcessedImage {
     /// resolved timestamp, for meta responses. `None` for
     /// every image source.
     pub video: Option<VideoSourceMeta>,
+    /// The PDF record (issue #215) when the source was a
+    /// PDF and a `page:` segment selected the page this
+    /// response was rendered from: the probed page count,
+    /// the selected page, and the page size, for meta
+    /// responses. `None` for every non-PDF source.
+    pub pdf: Option<PdfSourceMeta>,
 }
 
 /// Facts about a video source, probed at frame
@@ -496,6 +507,21 @@ pub struct VideoSourceMeta {
     /// The resolved timestamp the frame was selected at,
     /// in seconds (after clamping to the last frame).
     pub frame_seconds: f64,
+}
+
+/// Facts about a PDF source, probed at page rendering
+/// (issue #215), reported in meta responses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfSourceMeta {
+    /// The document's total page count.
+    pub pages: u32,
+    /// The selected page, 1-based (after the grammar's
+    /// canonicalization).
+    pub page: u32,
+    /// The page's width in points.
+    pub page_width: f64,
+    /// The page's height in points.
+    pub page_height: f64,
 }
 
 /// What went wrong while processing an image.
@@ -527,6 +553,13 @@ pub enum EngineError {
     /// The server maps it to 502, like the encode side:
     /// the URL was fine, the operator's decoder was not.
     Frame(String),
+    /// The external PDF renderer failed while rendering
+    /// a page (issue #215): spawn failure, non-zero exit,
+    /// timeout, output past the cap, or output that is
+    /// not a PNG. The server maps it to 502, exactly like
+    /// the frame side: the URL was fine, the operator's
+    /// renderer was not.
+    Pdf(String),
     /// A text overlay could not be rendered. Carries the cause.
     Render(String),
 }
@@ -554,6 +587,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::Frame(cause) => {
                 write!(f, "video frame extraction failed: {cause}")
+            }
+            EngineError::Pdf(cause) => {
+                write!(f, "PDF rendering failed: {cause}")
             }
             EngineError::Render(cause) => {
                 write!(f, "cannot render text overlay: {cause}")
@@ -603,6 +639,11 @@ pub struct ProcessContext<'a> {
     /// a `frame:` segment on a video source pulls its
     /// still through this (issue #214).
     pub frame_extractor: Option<&'a crate::frames::VideoFrameExtractor>,
+    /// PDF renderer, when the deployment configured an
+    /// external renderer program (`CRABCROP_PDF_RENDERER`):
+    /// a `page:` segment on a PDF source renders its page
+    /// through this (issue #215).
+    pub pdf_renderer: Option<&'a crate::pdf::PdfRenderer>,
     /// DPR fallback from the request's client hint, used when
     /// the URL carries no explicit `dpr` directive.
     pub dpr: Option<f32>,
@@ -651,6 +692,7 @@ impl Default for ProcessContext<'_> {
             text_renderer: None,
             video_encoder: None,
             frame_extractor: None,
+            pdf_renderer: None,
             dpr: None,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             save_data: false,
@@ -741,6 +783,54 @@ impl Engine {
             });
             frame_png = frame.png;
             &frame_png
+        } else {
+            bytes
+        };
+        // Page selection (issue #215): a `page:` segment
+        // makes the source a PDF whose selected page
+        // becomes the source image for everything below,
+        // the frame branch's shape exactly. The renderer
+        // is required (a deployment without one answers
+        // NotConfigured, like frame extraction without a
+        // decoder); the engine sniffs before the renderer
+        // spawns anything, so image bytes and non-PDF
+        // bytes are refused as a bad source here and never
+        // reach the tool; and the rendered PNG replaces
+        // the bytes, so the format detection, the
+        // validation preflights, and the decode chain
+        // below all see the page.
+        let page_png;
+        let mut pdf_meta: Option<PdfSourceMeta> = None;
+        let bytes = if let Some(page) = directives.page {
+            let renderer = ctx.pdf_renderer.ok_or_else(|| {
+                EngineError::NotConfigured(
+                    "page rendering is not configured on this server (no CRABCROP_PDF_RENDERER)"
+                        .to_string(),
+                )
+            })?;
+            if image::guess_format(bytes).is_ok()
+                || is_jxl(bytes)
+                || is_heic(bytes)
+                || crate::svg::is_svg(bytes)
+                || !crate::pdf::sniff_pdf(bytes)
+            {
+                return Err(EngineError::Decode(
+                    "page selection needs a PDF source, but this source is not a PDF".to_string(),
+                ));
+            }
+            let rendered = renderer.render_page(bytes, page).map_err(|err| match err {
+                crate::pdf::PdfError::NotPdf(why) => EngineError::Decode(why),
+                crate::pdf::PdfError::Unsupported(why) => EngineError::Unsupported(why),
+                crate::pdf::PdfError::Failed(why) => EngineError::Pdf(why),
+            })?;
+            pdf_meta = Some(PdfSourceMeta {
+                pages: rendered.pages,
+                page: rendered.page,
+                page_width: rendered.page_width,
+                page_height: rendered.page_height,
+            });
+            page_png = rendered.png;
+            &page_png
         } else {
             bytes
         };
@@ -1210,6 +1300,7 @@ impl Engine {
             studio,
             ssimulacra2: ssim,
             video: video_meta,
+            pdf: pdf_meta,
         })
     }
 
@@ -1285,6 +1376,7 @@ impl Engine {
             studio: None,
             ssimulacra2: None,
             video: None,
+            pdf: None,
         })
     }
 
@@ -1365,6 +1457,7 @@ impl Engine {
             studio: None,
             ssimulacra2: None,
             video: None,
+            pdf: None,
         })
     }
 }
@@ -1766,6 +1859,10 @@ fn apply_operations(
             // this chain runs on, so there is nothing left
             // to apply here.
             Operation::Frame(_) => {}
+            // Page selection likewise (issue #215): the
+            // rendered page is the source image this chain
+            // runs on.
+            Operation::Page(_) => {}
             Operation::Size(size) => {
                 img = apply_size(img, size, cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)), dpr)?
             }
@@ -5523,6 +5620,153 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
         assert!(err.to_string().contains("duration"), "{err}");
+    }
+
+    /// A fake PDF renderer pair (issue #215): the probe
+    /// prints a report naming `pages` pages, the renderer
+    /// prints a real 8x6 PNG. Returns the renderer (the
+    /// scripts live in a temp dir keyed by `name`).
+    fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
+        use std::io::Write as _;
+        let dir =
+            std::env::temp_dir().join(format!("crabcrop-engine-pdf-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("page.png"),
+            png_bytes(&DynamicImage::new_rgb8(8, 6)),
+        )
+        .unwrap();
+        let page_path = dir.join("page.png").display().to_string();
+        let write = |file: &str, script: String| {
+            let path = dir.join(file);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(script.as_bytes()).unwrap();
+            drop(f);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+        write(
+            "pdfinfo",
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Pages:           {pages}' 'Encrypted:       no' 'Page size:       612 x 792 pts (letter)'\nexit 0\n"
+            ),
+        );
+        let renderer = write(
+            "pdftocairo",
+            format!("#!/bin/sh\ncat > /dev/null\ncat \"{page_path}\"\nexit 0\n"),
+        );
+        crate::pdf::PdfRenderer::new(renderer, std::time::Duration::from_secs(30)).unwrap()
+    }
+
+    /// Bytes that carry the PDF header and sniff as no
+    /// image (the tools are fake; the document is never
+    /// really parsed in these tests).
+    const FAKE_PDF_BYTES: &[u8] = b"%PDF-1.4\nfake document bytes for the engine tests";
+
+    #[test]
+    fn page_segment_without_a_renderer_is_not_configured() {
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                FAKE_PDF_BYTES,
+                &[Operation::Page(1)],
+                ProcessContext::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+        assert!(err.to_string().contains("CRABCROP_PDF_RENDERER"), "{err}");
+    }
+
+    #[test]
+    fn page_segment_on_a_non_pdf_source_is_a_decode_failure() {
+        let engine = Engine;
+        let renderer = pdf_test_renderer("non-pdf", 3);
+        let ctx = ProcessContext {
+            pdf_renderer: Some(&renderer),
+            ..Default::default()
+        };
+        // A still PNG and a video fragment: page selection
+        // is PDF-only, and both refuse as bad sources
+        // before any tool spawns.
+        let sources: [&[u8]; 2] = [
+            &png_bytes(&DynamicImage::new_rgb8(20, 12)),
+            FAKE_VIDEO_BYTES,
+        ];
+        for src in sources {
+            let err = engine
+                .process_preferred(src, &[Operation::Page(1)], ctx.clone())
+                .unwrap_err();
+            assert!(matches!(err, EngineError::Decode(_)), "{err:?}");
+            assert!(err.to_string().contains("needs a PDF source"), "{err}");
+        }
+    }
+
+    #[test]
+    fn page_segment_renders_and_processes_the_page() {
+        let engine = Engine;
+        let renderer = pdf_test_renderer("render", 3);
+        let out = engine
+            .process_preferred(
+                FAKE_PDF_BYTES,
+                &[
+                    Operation::Page(2),
+                    size_op(Dimension::Pixels(4), Dimension::Pixels(3)),
+                ],
+                ProcessContext {
+                    pdf_renderer: Some(&renderer),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The operation chain ran on the rendered page.
+        assert_eq!((out.width, out.height), (4, 3));
+        assert_eq!((out.source_width, out.source_height), (8, 6));
+        // And the PDF record rides along for meta.
+        let pdf = out.pdf.expect("a page render carries the PDF record");
+        assert_eq!(pdf.pages, 3);
+        assert_eq!(pdf.page, 2);
+        assert_eq!((pdf.page_width, pdf.page_height), (612.0, 792.0));
+        // No video record on a PDF render.
+        assert!(out.video.is_none());
+    }
+
+    #[test]
+    fn probe_source_labels_pdfs() {
+        // The explain probe (issue #215): a PDF document
+        // is kind "pdf" with unknown dimensions; the
+        // header sniff keeps its window, so junk with a
+        // late header is not a PDF.
+        let probe = probe_source(FAKE_PDF_BYTES);
+        assert_eq!(probe.kind, "pdf");
+        assert_eq!(probe.dimensions, None);
+        let mut late = vec![b' '; 2000];
+        late.extend_from_slice(b"%PDF-1.4");
+        assert_eq!(probe_source(&late).kind, "unknown");
+    }
+
+    #[test]
+    fn page_segment_out_of_range_is_unsupported() {
+        let engine = Engine;
+        let renderer = pdf_test_renderer("range", 3);
+        let err = engine
+            .process_preferred(
+                FAKE_PDF_BYTES,
+                &[Operation::Page(9)],
+                ProcessContext {
+                    pdf_renderer: Some(&renderer),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        // Out of range refuses; it never clamps to the
+        // last page the way a frame timestamp clamps.
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("page 9"), "{err}");
+        assert!(err.to_string().contains("3 pages"), "{err}");
     }
 
     #[test]

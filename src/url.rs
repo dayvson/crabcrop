@@ -64,6 +64,11 @@ pub enum ParseError {
     /// selector grammar: `frame:poster`, `frame:<seconds>`,
     /// or `frame:<percent>%`. Carries the offending segment.
     InvalidFrame(String),
+    /// A `page:...` segment did not match the page
+    /// selector grammar: `page:<n>` with `n` a 1-based
+    /// page number of ASCII digits within the grammar
+    /// bound. Carries the offending segment.
+    InvalidPage(String),
     /// A `preset:<name>` segment named a preset the server has
     /// not configured. Carries the name.
     UnknownPreset(String),
@@ -125,6 +130,7 @@ impl ParseError {
             ParseError::InvalidMaxAge(_) => "invalid_maxage",
             ParseError::InvalidDebug(_) => "invalid_debug",
             ParseError::InvalidFrame(_) => "invalid_frame",
+            ParseError::InvalidPage(_) => "invalid_page",
             ParseError::UnknownPreset(_) => "unknown_preset",
             ParseError::UnknownRoot(_) => "unknown_root",
             ParseError::InvalidRoot(_) => "invalid_root",
@@ -158,6 +164,7 @@ impl std::fmt::Display for ParseError {
             ParseError::InvalidMaxAge(seg) => write!(f, "invalid maxage segment: {seg}"),
             ParseError::InvalidDebug(seg) => write!(f, "invalid debug segment: {seg}"),
             ParseError::InvalidFrame(seg) => write!(f, "invalid frame segment: {seg}"),
+            ParseError::InvalidPage(seg) => write!(f, "invalid page segment: {seg}"),
             ParseError::UnknownPreset(name) => write!(f, "unknown preset: {name}"),
             ParseError::UnknownRoot(name) => write!(f, "unknown source root: {name}"),
             ParseError::InvalidRoot(source) => {
@@ -746,6 +753,15 @@ pub const MAX_FRAME_SECONDS: f64 = 86_400.0;
 /// The largest percentage a `frame:` segment may name.
 pub const MAX_FRAME_PERCENT: f64 = 100.0;
 
+/// The largest page number a `page:` segment may name
+/// (issue #215). Pages are 1-based ordinals, so zero is a
+/// grammar error, not a clamp to the first page. The bound
+/// keeps the grammar's numbers finite and small in the
+/// `MAX_FRAME_SECONDS` spirit; the probed page count of a
+/// real document enforces the rest, and documents cap at
+/// far fewer pages than this (see the PDF extractor).
+pub const MAX_PAGE_NUMBER: u32 = 999_999;
+
 /// One operation from the request path, in path order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
@@ -798,6 +814,21 @@ pub enum Operation {
     /// request carries several, the last one wins (the
     /// directives analysis settles it, like `exp:`).
     Frame(FrameSelection),
+    /// Select one page of a PDF source (`page:<n>`, 1-based;
+    /// issue #215). The selection is applied at source
+    /// preparation, before every other operation, wherever
+    /// the segment sits in the path: the rendered page
+    /// becomes the source image the rest of the chain runs
+    /// on. It is an operation, not metadata, because it
+    /// changes the response, so it stays in the canonical
+    /// form in place. When a request carries several, the
+    /// last one wins (the directives analysis settles it,
+    /// like `frame:`). Unlike a frame timestamp, an
+    /// out-of-range page never clamps: a page number names
+    /// a discrete page, and serving a different one under
+    /// this URL would be a wrong answer, so the engine
+    /// refuses it against the probed page count.
+    Page(u32),
     /// Filters applied in order after resize.
     Filters(Vec<Filter>),
 }
@@ -945,6 +976,9 @@ fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
     if let Some(rest) = seg.strip_prefix("frame:") {
         return Some(parse_frame(rest, seg));
     }
+    if let Some(rest) = seg.strip_prefix("page:") {
+        return Some(parse_page(rest, seg));
+    }
     if let Some(rest) = seg.strip_prefix("crop-rect:") {
         return Some(parse_crop_rect(rest, seg));
     }
@@ -1043,6 +1077,32 @@ fn parse_frame(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     }
     let value = parse_frame_decimal(rest, MAX_FRAME_SECONDS).map_err(|_| invalid())?;
     Ok(Operation::Frame(FrameSelection::Seconds(value)))
+}
+
+/// Parse the number after `page:`: ASCII digits only, no
+/// sign, no fraction, no exponent, the strictness the
+/// `frame:` grammar applies to its own numbers. Leading
+/// zeros are accepted and canonicalized away (`page:007`
+/// is `page:7`), so the two spellings are one request with
+/// one cache entry, the `frame:1.50` rule. Zero is outside
+/// the grammar: pages count from 1.
+fn parse_page(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let invalid = || ParseError::InvalidPage(seg.to_string());
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    // Strip leading zeros before parsing, so a long run of
+    // them cannot overflow the integer parse on its way to
+    // the bound check; what remains is the number itself.
+    let digits = rest.trim_start_matches('0');
+    if digits.is_empty() || digits.len() > 6 {
+        return Err(invalid());
+    }
+    let page: u32 = digits.parse().map_err(|_| invalid())?;
+    if page == 0 || page > MAX_PAGE_NUMBER {
+        return Err(invalid());
+    }
+    Ok(Operation::Page(page))
 }
 
 /// The canonical spelling of a frame timestamp or
@@ -2175,6 +2235,10 @@ pub struct RequestDirectives {
     /// carries a `frame:` segment: the last one in path
     /// order wins, the same rule as the `exp:` expiry.
     pub frame: Option<FrameSelection>,
+    /// The page selection (issue #215) when the request
+    /// carries a `page:` segment: the last one in path
+    /// order wins, the same rule as the frame selection.
+    pub page: Option<u32>,
 }
 
 impl RequestDirectives {
@@ -2200,6 +2264,7 @@ impl RequestDirectives {
             watermark_urls: Vec::new(),
             debug_focal: false,
             frame: None,
+            page: None,
         };
         for op in ops {
             match op {
@@ -2210,6 +2275,7 @@ impl RequestDirectives {
                 | Operation::CropRect { .. } => d.has_size_operation = true,
                 Operation::DebugFocal => d.debug_focal = true,
                 Operation::Frame(selection) => d.frame = Some(*selection),
+                Operation::Page(page) => d.page = Some(*page),
                 _ => {}
             }
             if let Operation::Crop { align, .. } = op {
@@ -2558,6 +2624,7 @@ fn operation_text(op: &Operation) -> String {
         } => format!("focal:{left}x{top}:{right}x{bottom}"),
         Operation::DebugFocal => "debug:focal".to_string(),
         Operation::Frame(selection) => frame_text(selection),
+        Operation::Page(page) => format!("page:{page}"),
         Operation::Filters(_) => unreachable!("filters are merged by canonical_form"),
     }
 }
@@ -3126,6 +3193,7 @@ mod tests {
             ),
             (ParseError::InvalidNoise("x".into()), "invalid_noise"),
             (ParseError::InvalidFrame("x".into()), "invalid_frame"),
+            (ParseError::InvalidPage("x".into()), "invalid_page"),
             (ParseError::MissingSourceUrl, "missing_source_url"),
         ];
         let mut seen = std::collections::HashSet::new();
@@ -4924,6 +4992,66 @@ mod tests {
             let err = parse_operations_with_expiry(bad).unwrap_err();
             assert!(matches!(err, ParseError::InvalidFrame(_)), "{bad}: {err:?}");
             assert_eq!(err.code(), "invalid_frame", "{bad}");
+        }
+    }
+
+    #[test]
+    fn page_segments_parse_and_canonicalize() {
+        // The selector form (issue #215): 1-based digits.
+        let (ops, src, _, _) = parse_operations_with_expiry("page:1/example.com/doc.pdf").unwrap();
+        assert_eq!(ops, vec![Operation::Page(1)]);
+        assert_eq!(src, "example.com/doc.pdf");
+        // Bounds are inclusive: the first page and the
+        // grammar bound itself both parse.
+        for (seg, want) in [("page:1", 1), ("page:999999", 999_999), ("page:42", 42)] {
+            let (ops, ..) = parse_operations_with_expiry(&format!("{seg}/example.com/doc.pdf"))
+                .unwrap_or_else(|e| panic!("{seg}: {e}"));
+            assert_eq!(ops, vec![Operation::Page(want)], "{seg}");
+        }
+        // Canonical spelling: leading zeros are spelling,
+        // not meaning, so page:007 and page:7 are one
+        // request with one cache entry.
+        assert_eq!(
+            canonical_key_form("page:007/300x200/example.com/doc.pdf"),
+            "page:7/300x200/example.com/doc.pdf"
+        );
+        assert_eq!(
+            canonical_key_form("page:000001/example.com/doc.pdf"),
+            "page:1/example.com/doc.pdf"
+        );
+        // The directive analysis sees the selection, and the
+        // last segment wins when a request carries several.
+        let (ops, ..) = parse_operations_with_expiry("page:2/page:5/example.com/doc.pdf").unwrap();
+        assert_eq!(RequestDirectives::analyze(&ops).page, Some(5));
+        let (ops, ..) = parse_operations_with_expiry("300x200/example.com/doc.pdf").unwrap();
+        assert_eq!(RequestDirectives::analyze(&ops).page, None);
+        // A page segment inside the source is URL text.
+        let (ops, src, _, _) = parse_operations_with_expiry("example.com/page:2/doc.pdf").unwrap();
+        assert!(ops.is_empty());
+        assert_eq!(src, "example.com/page:2/doc.pdf");
+    }
+
+    #[test]
+    fn page_segments_refuse_malformed_selectors() {
+        for bad in [
+            "page:/example.com/doc.pdf",
+            "page:0/example.com/doc.pdf",
+            "page:00/example.com/doc.pdf",
+            "page:-1/example.com/doc.pdf",
+            "page:+1/example.com/doc.pdf",
+            "page:1.5/example.com/doc.pdf",
+            "page:1./example.com/doc.pdf",
+            "page:.5/example.com/doc.pdf",
+            "page:1e3/example.com/doc.pdf",
+            "page:abc/example.com/doc.pdf",
+            "page:1000000/example.com/doc.pdf",
+            "page:9999999/example.com/doc.pdf",
+            "page: 1/example.com/doc.pdf",
+            "page:1 /example.com/doc.pdf",
+        ] {
+            let err = parse_operations_with_expiry(bad).unwrap_err();
+            assert!(matches!(err, ParseError::InvalidPage(_)), "{bad}: {err:?}");
+            assert_eq!(err.code(), "invalid_page", "{bad}");
         }
     }
 

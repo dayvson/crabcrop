@@ -182,8 +182,14 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
             // source's dimensions: the frame is the video
             // at full size. From headers alone those are
             // unknown for a video, so `cur` is already None
-            // and stays that way.
-            Operation::FocalRect { .. } | Operation::DebugFocal | Operation::Frame(_) => cur,
+            // and stays that way. A page selection (issue
+            // #215) is the same shape: the rendered page is
+            // the source at its render scale, which the
+            // raw-bytes probe does not know.
+            Operation::FocalRect { .. }
+            | Operation::DebugFocal
+            | Operation::Frame(_)
+            | Operation::Page(_) => cur,
             Operation::Filters(filters) => {
                 let mut cur = cur;
                 for filter in filters {

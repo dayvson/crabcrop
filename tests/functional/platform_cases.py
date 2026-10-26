@@ -1543,3 +1543,160 @@ def frames_cache_and_purge():
           f"miss: hits+{hits1 - hits0} cache={f1['cache']} | "
           f"repeat: hits+{hits2 - hits1} cache={f2['cache']} | "
           f"purge: {st} {body} | after: hits+{hits3 - hits2}")
+
+
+# ---------------------------------------------------------------- PDF pages
+PAGES = f"{SRC127}/pages.pdf"
+LOCKED = f"{SRC127}/locked.pdf"
+TRUNCATED = f"{SRC127}/truncated.pdf"
+
+
+def _page_note(cell_id, ops, src):
+    note(cell_id, "pages", ops, src, None,
+         "no pdftocairo on PATH: the D instance has no renderer "
+         "configured, so pages cells record instead of asserting")
+
+
+def _band_color(i):
+    """The corpus band color of page i (the generator's
+    formula), as an RGB triple."""
+    return tuple(round(c * 255) for c in
+                 (((i * 37) % 100) / 100, ((i * 53) % 100) / 100,
+                  ((i * 91) % 100) / 100))
+
+
+def _band_pixel(fact):
+    # The band sits at (72..540, 560..620) points; at the
+    # fixed render scale its center lands at (612, 404)
+    # of the 1224x1584 page raster.
+    im = Image.open(fact["path"]).convert("RGB")
+    return im.getpixel((612, 404))
+
+
+def _near(px, want, tol=14):
+    return all(abs(a - b) <= tol for a, b in zip(px, want))
+
+
+@cell
+def pages_render_and_chain():
+    # The corpus document carries a per-page hue band,
+    # so the selected page is provable from the band's
+    # center pixel (issue #215).
+    if not shutil.which("pdftocairo"):
+        return _page_note("pages-render-and-chain", "page:*", "pages.pdf")
+    cases = [(1, _band_color(1)), (3, _band_color(3)), (5, _band_color(5))]
+    facts = []
+    ok = True
+    for page, want in cases:
+        f = render_signed("pages-render-and-chain", "D", f"page:{page}/{PAGES}")
+        px = _band_pixel(f) if f["status"] == 200 else None
+        facts.append(f"page:{page}: status={f['status']} px={px} (want {want})")
+        ok = ok and f["status"] == 200 and dims(f) == (1224, 1584) \
+            and px is not None and _near(px, want)
+    # An operation chain runs on the page like any source.
+    f = render_signed("pages-render-and-chain", "D",
+                      f"page:2/306x396/filters:format(webp)/{PAGES}")
+    facts.append(f"chain: status={f['status']} dims={dims(f)} ct={f['ct']}")
+    ok = ok and f["status"] == 200 and dims(f) == (306, 396) \
+        and f["ct"].startswith("image/webp")
+    check("pages-render-and-chain", "pages",
+          "page:1|page:3|page:5", "pages.pdf", ok, f, " | ".join(facts))
+
+
+@cell
+def pages_meta():
+    if not shutil.which("pdftocairo"):
+        return _page_note("pages-meta", "page:3 + meta", "pages.pdf")
+    rem = f"page:3/{PAGES}"
+    st, h, payload, ms = get("D", signed_path(rem),
+                             {"Accept": "application/json"})
+    meta = json.loads(payload) if st == 200 else {}
+    pdf = meta.get("pdf") or {}
+    ok = (st == 200 and pdf.get("pages") == 5
+          and pdf.get("page") == 3
+          and pdf.get("page_width") == 612
+          and pdf.get("page_height") == 792
+          and meta.get("source_width") == 1224
+          and meta.get("source_height") == 1584)
+    check("pages-meta", "pages", "page:3 (meta)", "pages.pdf", ok,
+          {"status": st},
+          f"status={st} pdf={pdf} source={meta.get('source_width')}x"
+          f"{meta.get('source_height')}")
+
+
+@cell
+def pages_refusals():
+    if not shutil.which("pdftocairo"):
+        return _page_note("pages-refusals", "page:*", "pages.pdf et al")
+    results = []
+    ok = True
+    # Out of range: a 400 refusal, never the last page
+    # served under the asked number.
+    st, h, payload, ms = get("D", signed_path(f"page:6/{PAGES}"), {})
+    results.append(f"out-of-range: {st} (want 400)")
+    ok = ok and st == 400 and b"page 6" in payload
+    # A password-protected document: its own 400.
+    st, h, payload, ms = get("D", signed_path(f"page:1/{LOCKED}"), {})
+    results.append(f"locked: {st} (want 400)")
+    ok = ok and st == 400 and b"password" in payload
+    # A page segment on an image source: 502, PDF-only.
+    f = timed_render("pages-refusals", "D", signed_path(f"page:1/{DOG}"))
+    results.append(f"image-source: {f['status']} (want 502)")
+    ok = ok and f["status"] == 502
+    # A truncated document the probe cannot read, and a
+    # video source (not a PDF at all): the bad-source 502.
+    for src, label in ((TRUNCATED, "truncated"), (CLIP, "video-source")):
+        f = timed_render("pages-refusals", "D", signed_path(f"page:1/{src}"))
+        results.append(f"{label}: {f['status']} (want 502)")
+        ok = ok and f["status"] == 502
+    # A malformed selector is a grammar 400 with the
+    # frozen code, and costs no origin fetch.
+    hits0 = origin_hits("pages.pdf")
+    st, h, payload, ms = get("D", signed_path(f"page:banana/{PAGES}"),
+                             {"Accept": "application/json"})
+    code = (json.loads(payload).get("error") or {}).get("code")
+    results.append(f"malformed: {st} code={code} "
+                   f"new_hits={origin_hits('pages.pdf') - hits0} "
+                   f"(want 400 invalid_page 0)")
+    ok = ok and st == 400 and code == "invalid_page" \
+        and origin_hits("pages.pdf") == hits0
+    # No renderer configured (instance A): 501.
+    f = timed_render("pages-refusals", "A", signed_path(f"page:1/{PAGES}"))
+    results.append(f"no-renderer: {f['status']} (want 501)")
+    ok = ok and f["status"] == 501
+    check("pages-refusals", "pages", "page:6|page:banana|page:1",
+          "pages.pdf|locked.pdf|truncated.pdf|dog.jpg|clip.mp4", ok, f,
+          " | ".join(results))
+
+
+@cell
+def pages_cache_and_purge():
+    if not shutil.which("pdftocairo"):
+        return _page_note("pages-cache-and-purge", "page:2", "pages.pdf")
+    rem = f"page:2/306x396/{PAGES}"
+    purge_cli(rem, "D")
+    hits0 = origin_hits("pages.pdf")
+    f1 = timed_render("pages-cache-and-purge", "D", signed_path(rem))
+    hits1 = origin_hits("pages.pdf")
+    f2 = timed_render("pages-cache-and-purge", "D", signed_path(rem))
+    hits2 = origin_hits("pages.pdf")
+    # The zero-padded spelling is the same request after
+    # canonicalization: same entry, no new fetch.
+    alt = f"page:02/306x396/{PAGES}"
+    f2b = timed_render("pages-cache-and-purge", "D", signed_path(alt))
+    hits2b = origin_hits("pages.pdf")
+    st, body, _h = purge_http(rem, purge_sig(rem), base="D")
+    f3 = timed_render("pages-cache-and-purge", "D", signed_path(rem))
+    hits3 = origin_hits("pages.pdf")
+    ok = (f1["status"] == 200 and hits1 - hits0 == 1
+          and f2["status"] == 200 and hits2 == hits1
+          and f2["cache"] == "hit"
+          and f2b["status"] == 200 and f2b["cache"] == "hit"
+          and hits2b == hits1
+          and st == 200 and f3["status"] == 200 and hits3 - hits2 == 1)
+    check("pages-cache-and-purge", "pages", "page:2/306x396", "pages.pdf",
+          ok, f3,
+          f"miss: hits+{hits1 - hits0} cache={f1['cache']} | "
+          f"repeat: hits+{hits2 - hits1} cache={f2['cache']} | "
+          f"page:02: cache={f2b['cache']} hits+{hits2b - hits1} | "
+          f"purge: {st} {body} | after: hits+{hits3 - hits2}")
