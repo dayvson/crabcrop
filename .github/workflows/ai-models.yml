@@ -25,13 +25,13 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set the asset directory
         run: echo "AI_ASSETS=$RUNNER_TEMP/ai-assets" >> "$GITHUB_ENV"
 
       - name: Cache the pinned AI test assets
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.AI_ASSETS }}
           # Bump the trailing version when any pin below changes.
