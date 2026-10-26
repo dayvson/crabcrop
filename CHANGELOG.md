@@ -6,6 +6,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Fixed
 
+- `upscale()` now budgets its input (issue #244). A dynamic-size super-resolution model spends activation memory in proportion to its input pixels, and the 4096 px output cap did not bind that: a 900x560 request OOM-killed the server. A single model run now takes at most 262,144 input pixels (the request image, or the intermediate between composed runs), checked before any inference runs, and a larger input fails with a documented 400.
 - `studio()` no longer aborts the server when the mask's subject box is a speck (issue #243). A mask that barely crosses the subject threshold in a few pixels while carrying faint coverage across a large region now takes the documented `no_subject` fallback instead of scaling the whole covered region by the speck's ratio (the reproduction attempted an 87 GB allocation and killed the process). The placement scale is also bounded outright: the scaled piece never exceeds twice the canvas per axis or the platform's aggregate output pixel budget.
 
 ## [0.4.0] - 2026-10-25

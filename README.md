@@ -400,7 +400,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 | `blurclass` | `blurclass(person)` | Blur every detected object of the class (privacy redaction). Repeat for more classes. Requires a detection model. | `filters:blurclass(person)` |
 | `pixelateclass` | `pixelateclass(car)` | Pixelate every detected object of the class (privacy redaction). Repeat for more classes. Requires a detection model. | `filters:pixelateclass(car)` |
 | `facepad` | `facepad(0.5)`, 0 to 3 | Padding for `crop:...:face`: that fraction of the face's size added on every side of the crop window. Default 0.5. | `crop:200x200:face/filters:facepad(1)` |
-| `upscale` | `upscale(2)` or `upscale(4)` | AI super-resolution by that factor. Output is capped at 4096 px per dimension. | `filters:upscale(2)` |
+| `upscale` | `upscale(2)` or `upscale(4)` | AI super-resolution by that factor. Output is capped at 4096 px per dimension. One model run takes at most 262,144 input pixels (the image itself, or the intermediate between the composed runs of an `upscale(4)`); a larger input is a `400`, so resize the source first. | `filters:upscale(2)` |
 
 ```bash
 curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.com/product.jpg"
@@ -593,7 +593,7 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 
 | Status | Meaning |
 | --- | --- |
-| `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px cap, a `crop-rect` outside the image, a video format asked of a still source. |
+| `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px output cap or the 262,144 px per-run input budget, a `crop-rect` outside the image, a video format asked of a still source. |
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
 | `404` | A `PUT` to `/upload/...` when uploads are not configured, or a `PUT` to any path that is not the upload route. |
 | `413` | An upload body larger than the `CRABCROP_UPLOAD_MAX_MB` cap. |

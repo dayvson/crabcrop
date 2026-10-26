@@ -1394,6 +1394,17 @@ fn encode_animated_webp(
 /// squared; this keeps the result inside a sane memory envelope.
 const MAX_UPSCALE_DIM: u64 = 4096;
 
+/// The largest input, in pixels, one AI upscale run may
+/// take. A dynamic-size model's activation memory grows
+/// with its input pixels, which the output cap above does
+/// not bind at all: the campaign's Swin2SR x2 export ran a
+/// 196,608-pixel composed run (the second half of an
+/// `upscale(4)`) and a 172,800-pixel run fine, and
+/// OOM-killed the whole process on a 504,000-pixel input
+/// (issue #244). The budget sits at about half that kill
+/// size, above every measured working run.
+const MAX_UPSCALE_INPUT_PIXELS: u64 = 262_144;
+
 /// AI-upscale `img` to `factor`x its current dimensions. The
 /// provider's model runs at its native factor as many times as
 /// needed; a final Lanczos pass lands the exact requested size
@@ -1412,6 +1423,28 @@ fn upscale_image(
             "upscale({factor}) would produce {tw}x{th}, over the {MAX_UPSCALE_DIM}px limit; \
              resize the source first"
         )));
+    }
+    // Budget every run's input before any inference
+    // happens (issue #244): a composed factor feeds each
+    // run the previous run's output, so the projection
+    // walks the same arithmetic the loop below will. A
+    // run over the budget is a clean error here, never an
+    // out-of-memory kill inside the model.
+    let native = provider.factor().max(2) as u64;
+    let mut run_pixels = img.width() as u64 * img.height() as u64;
+    let mut projected = 1u64;
+    while projected < factor as u64 {
+        if run_pixels > MAX_UPSCALE_INPUT_PIXELS {
+            return Err(EngineError::Unsupported(format!(
+                "upscale({factor}) on a {}x{} image would feed a model run {run_pixels} \
+                 pixels, over the {MAX_UPSCALE_INPUT_PIXELS} pixel input budget; \
+                 resize the source first",
+                img.width(),
+                img.height()
+            )));
+        }
+        run_pixels *= native * native;
+        projected *= native;
     }
     let (target_w, target_h) = (tw as u32, th as u32);
     let mut img = img;
@@ -6184,6 +6217,114 @@ mod tests {
             EngineError::Unsupported(msg) => assert!(msg.contains("4096"), "{msg}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// A 2x provider that counts its runs, so the budget
+    /// tests can prove a rejection lands before any
+    /// inference happens.
+    #[derive(Debug, Default)]
+    struct CountingUpscale {
+        runs: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingUpscale {
+        fn runs(&self) -> usize {
+            self.runs.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::ai::UpscaleProvider for CountingUpscale {
+        fn factor(&self) -> u32 {
+            2
+        }
+
+        fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, crate::ai::AiError> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(DynamicImage::ImageRgba8(image::imageops::resize(
+                &img.to_rgba8(),
+                img.width() * 2,
+                img.height() * 2,
+                image::imageops::FilterType::Nearest,
+            )))
+        }
+    }
+
+    fn upscale_attempt(
+        provider: &CountingUpscale,
+        w: u32,
+        h: u32,
+        factor: u32,
+    ) -> Result<ProcessedImage, EngineError> {
+        let src = png_bytes(&DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            w,
+            h,
+            image::Rgb([9, 9, 9]),
+        )));
+        Engine.process_preferred(
+            &src,
+            &[Operation::Filters(vec![Filter::Upscale(factor)])],
+            ProcessContext {
+                upscale_provider: Some(provider),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn upscale_rejects_an_input_over_the_budget_before_any_inference() {
+        // The issue #244 reproduction's shape: 900x560 in,
+        // 504,000 pixels, which OOM-killed the server when
+        // nothing stood between the request and the model.
+        let provider = CountingUpscale::default();
+        let err = upscale_attempt(&provider, 900, 560, 2).unwrap_err();
+        match &err {
+            EngineError::Unsupported(msg) => {
+                assert!(msg.contains("504000"), "{msg}");
+                assert!(msg.contains("262144"), "{msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert_eq!(provider.runs(), 0, "no model run may start");
+    }
+
+    #[test]
+    fn upscale_budget_is_inclusive_at_the_cap() {
+        // Exactly at the budget (512x512 = 262,144 pixels)
+        // runs, like every cap in the engine; one row over
+        // it does not. The campaign's working 480x360 run
+        // (172,800 pixels) sits comfortably under it.
+        let provider = CountingUpscale::default();
+        let out = upscale_attempt(&provider, 512, 512, 2).unwrap();
+        assert_eq!((out.width, out.height), (1024, 1024));
+        assert_eq!(provider.runs(), 1);
+        let provider = CountingUpscale::default();
+        let out = upscale_attempt(&provider, 480, 360, 2).unwrap();
+        assert_eq!((out.width, out.height), (960, 720));
+        let provider = CountingUpscale::default();
+        assert!(upscale_attempt(&provider, 512, 513, 2).is_err());
+        assert_eq!(provider.runs(), 0);
+    }
+
+    #[test]
+    fn upscale_budgets_every_composed_run_upfront() {
+        // The campaign's composed upscale(4): 256x192 in,
+        // runs of 49,152 and 196,608 pixels, both under
+        // the budget, landing exactly 1024x768.
+        let provider = CountingUpscale::default();
+        let out = upscale_attempt(&provider, 256, 192, 4).unwrap();
+        assert_eq!((out.width, out.height), (1024, 768));
+        assert_eq!(provider.runs(), 2);
+        // A 300x300 upscale(4) passes a lone x2 budget
+        // check (90,000 pixels) but its second run would
+        // take 360,000: the projection refuses it before
+        // the first run starts.
+        let provider = CountingUpscale::default();
+        let err = upscale_attempt(&provider, 300, 300, 4).unwrap_err();
+        match &err {
+            EngineError::Unsupported(msg) => assert!(msg.contains("360000"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert_eq!(provider.runs(), 0);
     }
 
     #[test]
