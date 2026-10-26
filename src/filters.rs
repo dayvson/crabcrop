@@ -1069,6 +1069,13 @@ mod tests {
     }
 
     #[test]
+    fn border_of_zero_width_is_the_identity() {
+        let img = opaque(10, 8, [10, 20, 30]);
+        let out = draw_border(&img, 0, [255, 0, 0]);
+        assert_eq!(out.to_rgba8(), img.to_rgba8());
+    }
+
+    #[test]
     fn radius_cuts_corners_and_antialiases() {
         let img = rounded_corners(&opaque(100, 100, [255, 0, 0]), [20, 20, 20, 20]);
         assert_eq!(alpha_at(&img, 0, 0), 0);

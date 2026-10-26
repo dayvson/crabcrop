@@ -1516,7 +1516,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     return Err(invalid());
                 }
                 let width: u32 = parts[0].parse().map_err(|_| invalid())?;
-                if width == 0 || width > MAX_DIMENSION {
+                if width > MAX_DIMENSION {
                     return Err(invalid());
                 }
                 let hex = parts[1];
@@ -3571,6 +3571,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_border_filter() {
+        // The ends of the range parse: 0 (a no-op, like
+        // radius) and the dimension cap; one past the cap is
+        // pinned in rejects_bad_filters.
+        let (ops, _) = parse_operations("filters:border(0,FF0000)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Border(0, [255, 0, 0])])]
+        );
+        assert!(parse_operations("filters:border(16383,FF0000)/example.com/img.jpg").is_ok());
+    }
+
+    #[test]
     fn rejects_bad_filters() {
         for seg in [
             "filters:",
@@ -3593,7 +3606,7 @@ mod tests {
             "filters:radius(1,2,3)",
             "filters:radius(16384)",
             "filters:radius(-1)",
-            "filters:border(0,FF0000)",
+            "filters:border(16384,FF0000)",
             "filters:border(2,FFF)",
             "filters:border(2)",
             "filters:border(2,FF0000,1)",
