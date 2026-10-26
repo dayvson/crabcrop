@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.4.2] - 2026-10-26
+
+### Fixed
+
+- A `preset:` segment in a URL is now parsed even when no presets file is configured (issue #247). Before, the segment was never recognized as part of the operations on a server without presets configured, so it was treated as the source and the request failed with a 502 source error; an unknown preset name now returns the documented 400 `unknown_preset` error, and a configured server behaves exactly as before.
+
 ## [0.4.1] - 2026-10-25
 
 ### Fixed
