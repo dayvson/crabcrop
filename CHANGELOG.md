@@ -4,6 +4,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-26
+
 ### Added
 
 - PDF pages as an image source (issue #215). A new `page:` operation segment selects one page of a PDF source: `page:1` is the first page, pages are 1-based, the last segment wins, and leading zeros canonicalize (`page:007` is `page:7`, one shared cache entry). The rendered page becomes the source image the rest of the URL operates on, so crops, filters, studio mode, presets, and purge all apply unchanged. The number is exact, never clamped: a page past the end of the document is a 400 naming the page and the count, a document that needs a password to open is a 400 of its own class, and a malformed selector is a 400 with a new frozen `invalid_page` code; a `page:` segment on a non-PDF source fails as a bad source. Rendering runs through a new `CRABCROP_PDF_RENDERER` external program (Poppler's `pdftocairo` the reference, its `pdfinfo` sibling derived and used for probing) under the frame side's bounds: both paths are validated at boot, runs share the video gate under their own `CRABCROP_PDF_TIMEOUT_SECS` wall clock, output is capped, and the tools receive only the document bytes on stdin, so embedded references and actions have nothing to resolve. Only a request carrying a `page:` segment may fetch an `application/pdf` Content-Type, and documents over 1000 pages are refused. Meta responses for page renders carry a `pdf` object (page count, selected page, and the page size in points), and `explain` labels PDF sources as kind `pdf`.
