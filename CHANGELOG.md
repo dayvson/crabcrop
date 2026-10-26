@@ -4,6 +4,24 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-25
+
+### Added
+
+- Graceful shutdown on SIGTERM (PR #235). The server now drains instead of dropping work when it is stopped: on SIGTERM it stops accepting new connections and lets in-flight requests finish before exiting, so a redeploy or container stop no longer kills a render mid-flight.
+- ETag and If-None-Match revalidation (PR #236). Image responses carry an `ETag`, and a request whose `If-None-Match` matches is answered `304 Not Modified` with no body, so clients and CDNs can revalidate a cached render cheaply instead of downloading it again.
+- Request ids in log lines and responses (PR #237). Every request gets an id that is recorded in its log line and returned in the `x-request-id` response header; a caller-supplied `x-request-id` is honored when it is a valid token, so a response can be matched to the log entry that produced it.
+- Community-health files (PR #233). CONTRIBUTING.md documents how to build, test, and propose changes; CODE_OF_CONDUCT.md adopts the Contributor Covenant with a filled-in enforcement contact; issue and pull request templates and a CODEOWNERS file round out the set.
+- A declared minimum Rust version and Dependabot (PR #234). The `crabcrop-url` crate declares `rust-version = "1.88"`, CI checks that floor in a new msrv job, `rust-toolchain.toml` pins the development toolchain, and Dependabot opens weekly grouped update pull requests across the Cargo, npm, pip, and GitHub Actions ecosystems.
+
+### Changed
+
+- The six-hex-digit color parser is deduplicated (PR #238). The URL grammar open-coded the same hex color parse at six sites (studio background, pad, border, duotone, monochrome, fill); one shared helper now serves all six, with no behavior change.
+
+### Fixed
+
+- `border(0)` is accepted as a no-op (issue #239). A zero-width border parses and renders nothing, matching `radius(0)`, instead of failing as an invalid filter; the README documents the border width range as 0 to 16383 pixels.
+
 ## [0.3.2] - 2026-10-25
 
 ### Fixed
