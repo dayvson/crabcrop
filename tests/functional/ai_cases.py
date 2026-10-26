@@ -16,9 +16,10 @@ AIC (CLIP B/32 encoder with the mismatched L/14 aesthetic head and
 label-only moderation signals). See README.md for the model file
 list. Two cells encode known-defect probes from the campaign and are
 expected to pass on current builds: rb-2000-webp and st-bg-none-webp
-record #227 sightings as NOTEs; st-nosubject and upscale-oom assert
-the #243 and #244 fixes hold (a process kill fails the cell and the
-rest of the AI instance's cells with connection errors).
+record #227 sightings as NOTEs; st-nosubject-gradient and
+upscale-oom-probe assert the #243 and #244 fixes hold (a process
+kill fails the cell and the rest of the AI instance's cells with
+connection errors).
 """
 import json, os, sys, threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -778,12 +779,17 @@ def upscale_factor3():
 
 @cell
 def upscale_oom_probe():
-    # Issue #244: at 900x560 this export's activation memory OOM-kills the server.
-    # RUN LAST among server-A cells: the process is expected to die.
-    f = render("upscale-oom", "filters:upscale(2):format(png)", "logo.png", timeout=300)
-    check("upscale-oom", "upscale", "filters:upscale(2):format(png)", "logo.png",
-          f["status"] == 200, f,
-          f"status={f['status']} (defect #244: on v0.4.0 the process is OOM-killed mid-request; status 0 = connection died with the server)")
+    # Issue #244: at 900x560 (504,000 px) this export's activation
+    # memory OOM-killed the server on v0.4.0. The fix (v0.4.1) caps
+    # upscale input at 262,144 px, checked before inference: the
+    # request now answers a clean 400 and the server stays alive,
+    # which the follow-up render proves.
+    f = render("upscale-oom", "filters:upscale(2):format(png)", "logo.png", timeout=60)
+    alive = render("upscale-oom-alive", "300x200/filters:format(jpeg)", "dog.jpg", timeout=60)
+    check("upscale-oom-probe", "upscale", "filters:upscale(2):format(png)", "logo.png",
+          f["status"] == 400 and alive["status"] == 200, f,
+          f"status={f['status']} (expect the #244 budget 400, pre-inference) "
+          f"followup_render={alive['status']} body={f['body'][:110]}")
 
 # ---------------------------------------------------------------- studio timing log
 @cell
