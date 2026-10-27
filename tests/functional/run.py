@@ -183,6 +183,10 @@ def ai_instance_env(models, ort):
               CRABCROP_INPAINT_MODEL=f"{models}/lama.onnx",
               CRABCROP_SEGMENT_ENCODER_MODEL=f"{models}/mobile_sam_encoder.onnx",
               CRABCROP_SEGMENT_DECODER_MODEL=f"{models}/mobile_sam_decoder.onnx",
+              CRABCROP_OCR_DETECT_MODEL=f"{models}/PP-OCRv6_det_small.onnx",
+              CRABCROP_OCR_RECOGNIZE_MODEL=f"{models}/PP-OCRv6_rec_small.onnx",
+              CRABCROP_OCR_DICT=f"{models}/ppocrv6_dict.txt",
+              CRABCROP_OCR_LANGUAGE="en",
               CRABCROP_BRAND_COLOR="0E7C7B", CRABCROP_STUDIO_TIMING="1",
               ORT_DISABLE_TELEMETRY="1")
     aic = dict(common,

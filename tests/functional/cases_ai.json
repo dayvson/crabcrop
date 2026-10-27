@@ -436,5 +436,29 @@
   "group": "segment",
   "kind": "scripted",
   "tier": "local"
+ },
+ {
+  "id": "oc-meta-text",
+  "group": "ocr",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "oc-notext",
+  "group": "ocr",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "oc-unconfigured",
+  "group": "ocr",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "oc-bytes-stable",
+  "group": "ocr",
+  "kind": "scripted",
+  "tier": "local"
  }
 ]

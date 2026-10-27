@@ -135,6 +135,22 @@
 //!   meta reports a null score with a reason and the
 //!   expected and actual dimensions. The score is
 //!   descriptive only, never a gate.
+//! - `CRABCROP_OCR_DETECT_MODEL` /
+//!   `CRABCROP_OCR_RECOGNIZE_MODEL`: a PP-OCR-family
+//!   ONNX model pair (DB detection plus CTC recognition)
+//!   whose extracted text meta responses report when
+//!   they opt in with `ocr=1`, with
+//!   `CRABCROP_OCR_DICT` (the recognition model's
+//!   character dictionary, one character per line, in
+//!   class order). All three are required together; a
+//!   partial set is a startup error. Preloaded and
+//!   probed at boot like every model; the probe also
+//!   checks the dictionary against the recognition
+//!   model's output width. `CRABCROP_OCR_LANGUAGE`
+//!   optionally declares the language the recognition
+//!   model serves (default `und`), echoed in meta so
+//!   the response describes itself. Text only annotates
+//!   meta; nothing is enforced at serve time.
 //! - `CRABCROP_FALLBACK_IMAGE`: a URL or local file path for
 //!   the fallback image served (through the same operations,
 //!   marked `X-Crabcrop-Fallback: 1`) when a source cannot be
@@ -951,6 +967,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         moderation: ai.moderation,
         embeddings: ai.embeddings,
         aesthetic: ai.aesthetic,
+        ocr: ai.ocr,
         detect: ai.detect,
         detectors: ai.detectors,
         focal: ai.focal,
@@ -1071,6 +1088,10 @@ fn config_fingerprint(
         "CRABCROP_MODERATION_MODEL",
         "CRABCROP_MODERATION_LABELS",
         "CRABCROP_AESTHETIC_HEAD",
+        "CRABCROP_OCR_DETECT_MODEL",
+        "CRABCROP_OCR_RECOGNIZE_MODEL",
+        "CRABCROP_OCR_DICT",
+        "CRABCROP_OCR_LANGUAGE",
         "CRABCROP_FONT_PATH",
         "CRABCROP_VIDEO_ENCODER",
         "CRABCROP_VIDEO_DECODER",
@@ -1211,6 +1232,7 @@ struct AiProviders {
     moderation: Option<Arc<dyn crate::ai::ModerationProvider>>,
     embeddings: Option<Arc<dyn crate::ai::EmbeddingProvider>>,
     aesthetic: Option<Arc<crate::ai::AestheticHead>>,
+    ocr: Option<Arc<dyn crate::ai::OcrProvider>>,
     detect: Option<Arc<dyn crate::ai::DetectionProvider>>,
     detectors: Vec<server::NamedDetector>,
     focal: Option<Arc<dyn crate::ai::FocalProvider>>,
@@ -1262,6 +1284,7 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
     };
     let moderation = build_moderation(ort_dylib.as_deref(), &get)?;
     let aesthetic = build_aesthetic(&get, tagger.is_some())?;
+    let ocr = build_ocr(ort_dylib.as_deref(), &get)?;
     let detect = build_detector(ort_dylib.as_deref(), &get)?;
     let declared = build_declared_detectors(ort_dylib.as_deref(), &get)?;
     let face: Option<Arc<dyn crate::ai::FaceProvider>> = match get("CRABCROP_FACE_MODEL") {
@@ -1284,6 +1307,7 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         moderation,
         embeddings,
         aesthetic,
+        ocr,
         detect,
         detectors: declared.boxes,
         focal: declared.focal,
@@ -1995,6 +2019,59 @@ fn build_aesthetic(
         head.expected_dim()
     );
     Ok(Some(Arc::new(head)))
+}
+
+/// Build the OCR provider from the environment, when
+/// configured (issue #177): a PP-OCR-family detection
+/// and recognition model pair plus the recognition
+/// model's character dictionary. The three paths are
+/// all-or-nothing, the segment pair's rule: a partial
+/// set is a startup error naming what is missing,
+/// because half a pipeline reads nothing and a
+/// dictionary without its model aligns with nothing.
+/// `CRABCROP_OCR_LANGUAGE` optionally declares the
+/// language the recognition model serves (a BCP-47
+/// tag), echoed in meta so the response describes
+/// itself; unset reports `und`. Preloaded and probed
+/// like every other provider.
+fn build_ocr(
+    ort_dylib: Option<&str>,
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<dyn crate::ai::OcrProvider>>, String> {
+    let detect = get("CRABCROP_OCR_DETECT_MODEL").filter(|v| !v.is_empty());
+    let recognize = get("CRABCROP_OCR_RECOGNIZE_MODEL").filter(|v| !v.is_empty());
+    let dict = get("CRABCROP_OCR_DICT").filter(|v| !v.is_empty());
+    let missing: Vec<&str> = [
+        ("CRABCROP_OCR_DETECT_MODEL", detect.is_none()),
+        ("CRABCROP_OCR_RECOGNIZE_MODEL", recognize.is_none()),
+        ("CRABCROP_OCR_DICT", dict.is_none()),
+    ]
+    .iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(name, _)| *name)
+    .collect();
+    if missing.len() == 3 {
+        return Ok(None);
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "OCR is partially configured: missing {}",
+            missing.join(", ")
+        ));
+    }
+    let (detect, recognize, dict) = (detect.unwrap(), recognize.unwrap(), dict.unwrap());
+    let language = get("CRABCROP_OCR_LANGUAGE")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "und".to_string());
+    let provider =
+        crate::ai::OnnxOcrProvider::load(ort_dylib, &detect, &recognize, &dict, &language)
+            .map_err(|e| format!("cannot load the OCR models: {e}"))?;
+    println!(
+        "OCR loaded from {detect} (detection) and {recognize} (recognition), \
+         dictionary {dict} ({} characters), language {language}",
+        provider.dict_len()
+    );
+    Ok(Some(Arc::new(provider)))
 }
 
 #[cfg(test)]
@@ -2795,6 +2872,7 @@ mod tests {
         assert!(ai.moderation.is_none());
         assert!(ai.embeddings.is_none());
         assert!(ai.aesthetic.is_none());
+        assert!(ai.ocr.is_none());
         assert!(ai.detect.is_none());
         assert!(ai.detectors.is_empty());
         assert!(ai.focal.is_none());
@@ -2895,6 +2973,30 @@ mod tests {
             ),
             "{err}"
         );
+        // A partial OCR set refuses the same way (issue
+        // #177): the pipeline is a detection model, a
+        // recognition model, and its dictionary, and the
+        // refusal names every missing piece.
+        let model = missing_path("ocr");
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_OCR_DETECT_MODEL",
+            model.as_str(),
+        )])));
+        assert!(
+            err.contains("OCR is partially configured: missing CRABCROP_OCR_RECOGNIZE_MODEL, CRABCROP_OCR_DICT"),
+            "{err}"
+        );
+        let err = expect_err(build_ai_providers(env_of(&[
+            ("CRABCROP_OCR_DETECT_MODEL", model.as_str()),
+            ("CRABCROP_OCR_RECOGNIZE_MODEL", model.as_str()),
+        ])));
+        assert!(
+            err.contains("OCR is partially configured: missing CRABCROP_OCR_DICT"),
+            "{err}"
+        );
+        // The language tag alone configures nothing.
+        let ai = build_ai_providers(env_of(&[("CRABCROP_OCR_LANGUAGE", "en")])).unwrap();
+        assert!(ai.ocr.is_none());
     }
 
     /// Configured-but-unloadable models refuse construction
@@ -2947,6 +3049,15 @@ mod tests {
             ("CRABCROP_SEGMENT_DECODER_MODEL", missing.as_str()),
         ])));
         assert!(err.contains("cannot load the segment model pair"), "{err}");
+        // A full OCR set whose files do not exist refuses
+        // too (issue #177).
+        let err = expect_err(build_ai_providers(env_of(&[
+            ("CRABCROP_ORT_DYLIB", dylib.as_str()),
+            ("CRABCROP_OCR_DETECT_MODEL", missing.as_str()),
+            ("CRABCROP_OCR_RECOGNIZE_MODEL", missing.as_str()),
+            ("CRABCROP_OCR_DICT", missing.as_str()),
+        ])));
+        assert!(err.contains("cannot load the OCR models"), "{err}");
     }
 
     /// Full AI construction with real models: every
@@ -3024,11 +3135,29 @@ mod tests {
             }
             _ => false,
         };
+        // OCR joins the same way, as a set of three paths
+        // (CRABCROP_TEST_OCR_DETECT_MODEL,
+        // CRABCROP_TEST_OCR_RECOGNIZE_MODEL,
+        // CRABCROP_TEST_OCR_DICT).
+        let want_ocr = match (
+            std::env::var("CRABCROP_TEST_OCR_DETECT_MODEL"),
+            std::env::var("CRABCROP_TEST_OCR_RECOGNIZE_MODEL"),
+            std::env::var("CRABCROP_TEST_OCR_DICT"),
+        ) {
+            (Ok(detect), Ok(recognize), Ok(dict)) => {
+                map.insert("CRABCROP_OCR_DETECT_MODEL".to_string(), detect);
+                map.insert("CRABCROP_OCR_RECOGNIZE_MODEL".to_string(), recognize);
+                map.insert("CRABCROP_OCR_DICT".to_string(), dict);
+                true
+            }
+            _ => false,
+        };
         let ai = build_ai_providers(|name: &str| map.get(name).cloned()).unwrap();
         assert!(ai.removebg.is_some());
         assert!(ai.upscale.is_some());
         assert_eq!(ai.inpaint.is_some(), want_inpaint);
         assert_eq!(ai.segment.is_some(), want_segment);
+        assert_eq!(ai.ocr.is_some(), want_ocr);
         assert!(ai.face.is_some());
         assert!(ai.tagger.is_some());
         // The embedding provider rides the tagger.
