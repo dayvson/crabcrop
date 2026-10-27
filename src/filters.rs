@@ -184,9 +184,10 @@ pub fn apply_filters_filled(
             // padding is a directive the face crop reads from
             // the request as a whole. (Same routing.)
             Filter::BlurFaces | Filter::PixelateFaces | Filter::FacePad(_) => {}
-            // Class redaction is engine-routed (it needs the
-            // detection provider), like the face filters above.
-            Filter::BlurClass(_) | Filter::PixelateClass(_) => {}
+            // Class operations are engine-routed (they need
+            // the detection provider), like the face filters
+            // above.
+            Filter::BlurClass(_) | Filter::PixelateClass(_) | Filter::RecolorClass(..) => {}
             // DPR scales size targets in the engine, which
             // resolves it against the request as a whole (with
             // the client-hint fallback). (Same routing.)
@@ -927,6 +928,189 @@ fn redact_detections(
         out = redact(&out, x, y, w, h);
     }
     out
+}
+
+/// Clamp a detection's box to the image, the redaction
+/// helpers' shared rule; `None` when nothing of the box
+/// is in frame.
+fn clamped_box(img: &DynamicImage, det: &crate::ai::Detection) -> Option<(u32, u32, u32, u32)> {
+    let x = det.x.min(img.width());
+    let y = det.y.min(img.height());
+    let w = det.w.min(img.width() - x);
+    let h = det.h.min(img.height() - y);
+    if w == 0 || h == 0 {
+        None
+    } else {
+        Some((x, y, w, h))
+    }
+}
+
+/// Blend `over` into `base` inside one box, weighted per
+/// pixel by a soft mask at the box's own resolution (issue
+/// #175): strength 255 takes the pixel from `over`, 0
+/// keeps `base`, and the values between antialias the
+/// silhouette's edge. All four channels blend, so the
+/// result matches what the unmasked region operation
+/// would have produced inside the shape. The mask is
+/// resized to the box when an export answered at another
+/// resolution.
+fn blend_masked(
+    base: &DynamicImage,
+    over: &DynamicImage,
+    mask: &image::GrayImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> DynamicImage {
+    let fitted;
+    let mask = if (mask.width(), mask.height()) == (w, h) {
+        mask
+    } else {
+        fitted = image::imageops::resize(mask, w, h, image::imageops::FilterType::Triangle);
+        &fitted
+    };
+    let mut out = base.to_rgba8();
+    let over = over.to_rgba8();
+    for ly in 0..h {
+        for lx in 0..w {
+            let m = mask.get_pixel(lx, ly)[0] as u32;
+            if m == 0 {
+                continue;
+            }
+            let (gx, gy) = (x + lx, y + ly);
+            let dst = out.get_pixel_mut(gx, gy);
+            if m == 255 {
+                *dst = *over.get_pixel(gx, gy);
+            } else {
+                let src = over.get_pixel(gx, gy);
+                for c in 0..4 {
+                    dst[c] = ((dst[c] as u32 * (255 - m) + src[c] as u32 * m) / 255) as u8;
+                }
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(out)
+}
+
+/// Blur every detection's silhouette in `img` (issue
+/// #175): the mask-tight form of [`blur_detections`], used
+/// when a segment provider is configured. Each mask is at
+/// its box's resolution; the blur itself is the region
+/// blur, so strength matches the rectangle form exactly
+/// and only the shape changes. Pixels outside every
+/// silhouette are untouched, including the parts of a
+/// detection's rectangle the object does not fill.
+pub fn blur_detections_masked(img: &DynamicImage, masked: &[MaskedDetection]) -> DynamicImage {
+    redact_masked(img, masked, blur_region)
+}
+
+/// Pixelate every detection's silhouette in `img`: the
+/// mask-tight form of [`pixelate_detections`].
+pub fn pixelate_detections_masked(img: &DynamicImage, masked: &[MaskedDetection]) -> DynamicImage {
+    redact_masked(img, masked, pixelate_region)
+}
+
+fn redact_masked(
+    img: &DynamicImage,
+    masked: &[MaskedDetection],
+    redact: fn(&DynamicImage, u32, u32, u32, u32) -> DynamicImage,
+) -> DynamicImage {
+    let mut out = img.clone();
+    for item in masked {
+        let Some((x, y, w, h)) = clamped_box(&out, &item.detection) else {
+            continue;
+        };
+        let done = redact(&out, x, y, w, h);
+        out = blend_masked(&out, &done, &item.mask, x, y, w, h);
+    }
+    out
+}
+
+/// One detection with its segmentation mask, the unit the
+/// mask-tight class operations work on (issue #175). The
+/// mask is at the detection box's resolution.
+pub struct MaskedDetection {
+    pub detection: crate::ai::Detection,
+    pub mask: image::GrayImage,
+}
+
+/// Recolor every detection's box in `img`: the object's
+/// pixels take `color`, their alpha untouched (the paint
+/// is a tint of the object, not a cutout). Without a
+/// segment provider this is the rectangle form.
+pub fn recolor_detections(
+    img: &DynamicImage,
+    detections: &[crate::ai::Detection],
+    color: [u8; 3],
+) -> DynamicImage {
+    let mut out = img.clone();
+    for det in detections {
+        let Some((x, y, w, h)) = clamped_box(&out, det) else {
+            continue;
+        };
+        out = paint_box(&out, x, y, w, h, None, color);
+    }
+    out
+}
+
+/// Recolor every detection's silhouette in `img` (issue
+/// #175): the mask-tight form of [`recolor_detections`],
+/// the silhouette's edge antialiased by the soft mask.
+pub fn recolor_detections_masked(
+    img: &DynamicImage,
+    masked: &[MaskedDetection],
+    color: [u8; 3],
+) -> DynamicImage {
+    let mut out = img.clone();
+    for item in masked {
+        let Some((x, y, w, h)) = clamped_box(&out, &item.detection) else {
+            continue;
+        };
+        out = paint_box(&out, x, y, w, h, Some(&item.mask), color);
+    }
+    out
+}
+
+/// Paint `color` over one box of `img`, optionally through
+/// a soft mask at the box's resolution; alpha is preserved.
+fn paint_box(
+    img: &DynamicImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    mask: Option<&image::GrayImage>,
+    color: [u8; 3],
+) -> DynamicImage {
+    let fitted;
+    let mask = match mask {
+        Some(m) if (m.width(), m.height()) != (w, h) => {
+            fitted = image::imageops::resize(m, w, h, image::imageops::FilterType::Triangle);
+            Some(&fitted)
+        }
+        other => other,
+    };
+    let mut out = img.to_rgba8();
+    for ly in 0..h {
+        for lx in 0..w {
+            let m = mask.map_or(255, |mk| mk.get_pixel(lx, ly)[0] as u32);
+            if m == 0 {
+                continue;
+            }
+            let px = out.get_pixel_mut(x + lx, y + ly);
+            if m == 255 {
+                px[0] = color[0];
+                px[1] = color[1];
+                px[2] = color[2];
+            } else {
+                for c in 0..3 {
+                    px[c] = ((px[c] as u32 * (255 - m) + color[c] as u32 * m) / 255) as u8;
+                }
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(out)
 }
 
 /// Apply `redact` to each face region of `img` and composite
@@ -2153,5 +2337,96 @@ mod tests {
         let (img, _) = apply_filters(solid(77, 77, 77), &[Filter::Trim(10)]);
         assert_eq!((img.width(), img.height()), (4, 4));
         assert_eq!(first_pixel(&img), [77, 77, 77]);
+    }
+
+    fn detection(x: u32, y: u32, w: u32, h: u32) -> crate::ai::Detection {
+        crate::ai::Detection {
+            label: "thing".to_string(),
+            score: 0.9,
+            x,
+            y,
+            w,
+            h,
+        }
+    }
+
+    #[test]
+    fn recolor_detections_paints_the_box_and_keeps_alpha() {
+        // A translucent red image: the paint replaces RGB
+        // inside the box and leaves alpha (and everything
+        // outside the box) alone.
+        let mut rgba = image::RgbaImage::new(20, 10);
+        for p in rgba.pixels_mut() {
+            *p = image::Rgba([200, 30, 30, 128]);
+        }
+        let img = DynamicImage::ImageRgba8(rgba);
+        let out = recolor_detections(&img, &[detection(5, 2, 10, 6)], [0, 0, 255]);
+        let out = out.to_rgba8();
+        assert_eq!(out.get_pixel(10, 5), &image::Rgba([0, 0, 255, 128]));
+        assert_eq!(out.get_pixel(0, 0), &image::Rgba([200, 30, 30, 128]));
+    }
+
+    #[test]
+    fn recolor_masked_paints_only_the_silhouette() {
+        // Mask: left half of the box at full strength, one
+        // column at half strength (the antialiased edge),
+        // the rest background.
+        let img = opaque(20, 10, [200, 200, 200]);
+        let mask = image::GrayImage::from_fn(10, 6, |lx, _| {
+            if lx < 4 {
+                image::Luma([255])
+            } else if lx == 4 {
+                image::Luma([128])
+            } else {
+                image::Luma([0])
+            }
+        });
+        let masked = vec![MaskedDetection {
+            detection: detection(5, 2, 10, 6),
+            mask,
+        }];
+        let out = recolor_detections_masked(&img, &masked, [0, 0, 255]).to_rgb8();
+        // Full strength: the paint color.
+        assert_eq!(out.get_pixel(6, 4), &Rgb([0, 0, 255]));
+        // Half strength: halfway between the source and
+        // the paint.
+        let edge = out.get_pixel(9, 4);
+        assert!(edge[0] > 90 && edge[0] < 110, "{edge:?}");
+        assert!(edge[2] > 220 && edge[2] < 235, "{edge:?}");
+        // Background inside the box: the source, untouched.
+        assert_eq!(out.get_pixel(12, 4), &Rgb([200, 200, 200]));
+    }
+
+    #[test]
+    fn blur_masked_leaves_the_unmasked_box_pixels_alone() {
+        // Checkerboard box: the masked (left) half blurs,
+        // the unmasked half keeps its exact pixels, unlike
+        // the rectangle form which blurs the whole box.
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(20, 10, |x, y| {
+            if (x + y) % 2 == 0 {
+                Rgb([0, 0, 0])
+            } else {
+                Rgb([255, 255, 255])
+            }
+        }));
+        let mask = image::GrayImage::from_fn(10, 6, |lx, _| {
+            if lx < 5 {
+                image::Luma([255])
+            } else {
+                image::Luma([0])
+            }
+        });
+        let masked = vec![MaskedDetection {
+            detection: detection(5, 2, 10, 6),
+            mask,
+        }];
+        let out = blur_detections_masked(&img, &masked).to_rgb8();
+        // (11, 4): box-local (6, 2), unmasked: (11+4) is
+        // odd, so the source pixel is white, exactly.
+        assert_eq!(out.get_pixel(11, 4), &Rgb([255, 255, 255]));
+        // (7, 4): masked: the blur mixes the checkerboard,
+        // so the pixel is neither source extreme.
+        let blurred = out.get_pixel(7, 4);
+        assert!(blurred[0] > 40 && blurred[0] < 215, "{blurred:?}");
     }
 }

@@ -47,6 +47,8 @@ export const FILTER_DESCRIPTIONS: Record<string, string> = {
   blurclass: "blur every detected object of the named class (needs a detection model on the server)",
   pixelateclass:
     "pixelate every detected object of the named class (needs a detection model on the server)",
+  recolorclass:
+    "recolor every detected object of the named class to the given color (needs a detection model on the server)",
   removebg: "remove the background (needs an AI model on the server)",
   keep_profile: "keep the source color profile instead of converting to sRGB",
   upscale: "AI upscale by the given factor (needs an AI model on the server)",
@@ -334,6 +336,20 @@ function validateFilter(name: string, args: string | null): string | null {
     case "pixelateclass": {
       if (args === null) return bad;
       const decoded = percentDecodable(args);
+      if (decoded === null) return bad;
+      const name = decoded.trim();
+      return name.length >= 1 &&
+        new TextEncoder().encode(name).length <= 64 &&
+        /^[\p{L}\p{N} _.\-/]+$/u.test(name)
+        ? null
+        : bad;
+    }
+    case "recolorclass": {
+      if (args === null) return bad;
+      const cut = args.lastIndexOf(",");
+      if (cut < 0) return bad;
+      if (!/^[0-9a-fA-F]{6}$/.test(args.slice(cut + 1))) return bad;
+      const decoded = percentDecodable(args.slice(0, cut));
       if (decoded === null) return bad;
       const name = decoded.trim();
       return name.length >= 1 &&

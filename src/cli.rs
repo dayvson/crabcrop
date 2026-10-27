@@ -514,6 +514,12 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         Filter::PixelateClass(name) => {
             format!("pixelateclass({name}): pixelate detected {name} (AI)")
         }
+        Filter::RecolorClass(name, color) => {
+            format!(
+                "recolorclass({name},{}): recolor detected {name} (AI)",
+                hex3(*color)
+            )
+        }
         Filter::FacePad(v) => format!("facepad({v}): extra padding around faces"),
         Filter::Upscale(v) => format!("upscale({v}): AI upscale"),
         Filter::Dpr(v) => format!("dpr({v}): device pixel ratio for the whole request"),

@@ -412,5 +412,29 @@
   "group": "remove-region",
   "kind": "scripted",
   "tier": "local"
+ },
+ {
+  "id": "sg-meta-segments",
+  "group": "segment",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "sg-blurclass-mask-tight",
+  "group": "segment",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "sg-recolorclass",
+  "group": "segment",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "sg-recolorclass-unconfigured-501",
+  "group": "segment",
+  "kind": "scripted",
+  "tier": "local"
  }
 ]

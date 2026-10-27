@@ -544,6 +544,10 @@ export const filter = {
   pixelateClass(name: string): string {
     return `pixelateclass(${className("pixelateclass name", name)})`;
   },
+  /** Recolor every detected object of the named class to the given RRGGBB color. */
+  recolorClass(name: string, color: string): string {
+    return `recolorclass(${className("recolorclass name", name)},${hex6("recolorclass color", color)})`;
+  },
   /** Blur the rectangle (x, y, w, h) in pixels. */
   blurRegion(x: number, y: number, w: number, h: number): string {
     return `blur_region(${region(x, y, w, h)})`;
