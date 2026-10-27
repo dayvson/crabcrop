@@ -18,6 +18,13 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 
+[project.optional-dependencies]
+seal = ["cryptography>=41"]
+# Sealed URLs (issue #255) are the only feature that is not
+# standard-library only: AES-256-GCM comes from the
+# `cryptography` package, imported lazily by the seal
+# functions, so the signing surface stays zero-dependency.
+
 [project.urls]
 Homepage = "https://crabcrop.org"
 Repository = "https://github.com/dayvson/crabcrop"

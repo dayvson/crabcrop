@@ -2,7 +2,7 @@
  * Build and sign crabcrop URLs, per `spec/url-signing.md` in
  * the crabcrop repository. Standard library only.
  */
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 /**
  * Compute the signature segment for a remainder: the lowercase
@@ -93,6 +93,185 @@ export function signWithKeyId(secret: string, keyId: string, remainder: string):
     throw new Error(`invalid key ID ${JSON.stringify(keyId)}: 1 to 32 characters of [A-Za-z0-9_-]`);
   }
   return `${keyId}:${sign(secret, remainder)}`;
+}
+
+/**
+ * The largest remainder {@link seal} will encrypt, in bytes
+ * (issue #255). A recipe longer than this belongs in a
+ * preset; the cap also bounds the token a server must
+ * decode.
+ */
+export const MAX_SEALED_REMAINDER = 2048;
+
+/** The AAD every sealed token is bound to. */
+const SEAL_AAD = Buffer.from("crabcrop/sealed/1", "utf8");
+
+/**
+ * The seal subkey: the raw bytes of the HMAC-SHA256 of the
+ * label `crabcrop/seal-key` under the secret, its own domain
+ * beside purge, purge-group, and upload, so there is no
+ * second secret to configure or rotate: each keyring entry
+ * yields its own seal subkey, and the rotation window for
+ * signatures is the rotation window for tokens.
+ */
+function sealKey(secret: string): Buffer {
+  return Buffer.from(sign(secret, "crabcrop/seal-key"), "hex");
+}
+
+/**
+ * Seal a remainder into a token segment with a
+ * caller-supplied nonce: `s1.<base64url(nonce ||
+ * ciphertext || tag)>`, AES-256-GCM under the derived seal
+ * subkey with the fixed associated data `crabcrop/sealed/1`.
+ *
+ * DANGER: a nonce must never repeat under one secret.
+ * Reusing a nonce with AES-GCM destroys the construction's
+ * confidentiality and integrity guarantees. This function
+ * is the deterministic seam the spec's test vectors use;
+ * production minting calls {@link seal}, which draws a
+ * fresh random nonce every time.
+ */
+export function sealWithNonce(
+  secret: string,
+  remainder: string,
+  nonce: Uint8Array,
+  keyId?: string,
+): string {
+  if (nonce.length !== 12) {
+    throw new Error(`sealed token nonce must be 12 bytes, got ${nonce.length}`);
+  }
+  if (Buffer.byteLength(remainder, "utf8") > MAX_SEALED_REMAINDER) {
+    throw new Error(
+      `remainder is over the ${MAX_SEALED_REMAINDER}-byte sealing cap: a recipe that long belongs in a preset`,
+    );
+  }
+  const cipher = createCipheriv("aes-256-gcm", sealKey(secret), Buffer.from(nonce));
+  cipher.setAAD(SEAL_AAD);
+  const ciphertext = Buffer.concat([cipher.update(remainder, "utf8"), cipher.final()]);
+  const body = Buffer.concat([Buffer.from(nonce), ciphertext, cipher.getAuthTag()]);
+  const token = `s1.${body.toString("base64url")}`;
+  if (keyId === undefined) {
+    return token;
+  }
+  if (!isValidKeyId(keyId)) {
+    throw new Error(`invalid key ID ${JSON.stringify(keyId)}: 1 to 32 characters of [A-Za-z0-9_-]`);
+  }
+  return `${keyId}:${token}`;
+}
+
+/**
+ * Seal a remainder into a token segment (issue #255), with
+ * a fresh random 96-bit nonce. The token is the whole
+ * signature segment; pass `keyId` to stamp `<key-id>:`
+ * in front of it, so servers in a rotation window open it
+ * against the named key only.
+ */
+export function seal(secret: string, remainder: string, keyId?: string): string {
+  return sealWithNonce(secret, remainder, randomBytes(12), keyId);
+}
+
+/**
+ * Open a token segment, with or without a `<key-id>:`
+ * prefix, under one secret, returning the remainder it
+ * seals. The key ID is routing metadata and is not
+ * consulted: the question is whether this secret opens the
+ * token. Every failure (malformed body, wrong secret,
+ * tampered bytes, unknown version) throws the one error,
+ * `the token did not open under this secret`: openers must
+ * never learn which stage failed.
+ */
+export function unseal(secret: string, segment: string): string {
+  const openFailed = (): Error => new Error("the token did not open under this secret");
+  let token = segment;
+  const colon = segment.indexOf(":");
+  if (colon >= 0) {
+    if (!isValidKeyId(segment.slice(0, colon))) {
+      throw openFailed();
+    }
+    token = segment.slice(colon + 1);
+  }
+  if (!token.startsWith("s1.")) {
+    throw openFailed();
+  }
+  const body = token.slice(3);
+  // Node's base64 decoder is lenient (it skips characters
+  // outside the alphabet), so canonicity is checked by
+  // re-encoding: anything but the exact minted spelling
+  // fails here.
+  const raw = Buffer.from(body, "base64url");
+  if (raw.length < 12 + 16 || raw.toString("base64url") !== body) {
+    throw openFailed();
+  }
+  const decipher = createDecipheriv("aes-256-gcm", sealKey(secret), raw.subarray(0, 12));
+  decipher.setAAD(SEAL_AAD);
+  decipher.setAuthTag(raw.subarray(raw.length - 16));
+  let plain: Buffer;
+  try {
+    plain = Buffer.concat([
+      decipher.update(raw.subarray(12, raw.length - 16)),
+      decipher.final(),
+    ]);
+  } catch {
+    throw openFailed();
+  }
+  const text = plain.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(plain)) {
+    throw openFailed();
+  }
+  return text;
+}
+
+/** Options for {@link buildSealedURL}. */
+export interface SealOptions {
+  /** Unix-seconds expiry, sealed inside the token as a leading `exp:` segment. */
+  expires?: number;
+  /** Key ID to stamp on the token segment (`<key-id>:s1.…`), for rotation. */
+  keyId?: string;
+  /**
+   * The cosmetic friendly name after the token. The server
+   * never parses, validates, or authenticates it; one
+   * filename-like segment is the dependable shape. Omit it
+   * and the URL ends at the token.
+   */
+  name?: string;
+}
+
+/**
+ * Assemble a sealed crabcrop URL:
+ * `{base}/[<key-id>:]s1.<token>/{friendly-name}` (issue
+ * #255). The remainder is assembled exactly as
+ * {@link buildURL} assembles it (expiry segment,
+ * operations, source) and then sealed whole, pre-expansion,
+ * so the sealed and plain forms of one render are one cache
+ * entry and one purge target on the server. A secret is
+ * required: there is no `unsafe` spelling of a token.
+ */
+export function buildSealedURL(
+  base: string,
+  secret: string,
+  operations: string,
+  source: string,
+  options: SealOptions = {},
+): string {
+  if (secret === null || secret === undefined) {
+    throw new Error("sealing requires a secret: there is no unsafe token");
+  }
+  if (options.expires !== undefined) {
+    assertExpires(options.expires);
+  }
+  assertUrlText(operations, "operations");
+  assertUrlText(source, "source");
+  const trimmedBase = base.replace(/\/+$/, "");
+  let remainder = "";
+  if (options.expires !== undefined) {
+    remainder += `exp:${options.expires}/`;
+  }
+  if (operations) {
+    remainder += `${operations}/`;
+  }
+  remainder += source;
+  const segment = seal(secret, remainder, options.keyId);
+  return options.name ? `${trimmedBase}/${segment}/${options.name}` : `${trimmedBase}/${segment}`;
 }
 
 /**

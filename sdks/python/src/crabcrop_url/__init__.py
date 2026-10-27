@@ -1,11 +1,15 @@
 """Build and sign crabcrop URLs, per ``spec/url-signing.md``
-in the crabcrop repository. Standard library only.
+in the crabcrop repository. Standard library only, except
+sealed URLs (issue #255), which need the ``cryptography``
+package from the ``crabcrop-url[seal]`` extra.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import os
 from typing import Optional, Sequence, Union
 
 Secret = Union[str, bytes, None]
@@ -137,6 +141,187 @@ def verify(secret: Union[str, bytes], signature: str, remainder: str) -> bool:
             return False
         signature = tag
     return hmac.compare_digest(sign(secret, remainder), signature)
+
+
+# ---------------------------------------------------------------------------
+# Sealed URLs (issue #255)
+#
+# The one part of this package that is not standard-library
+# only: AES-256-GCM lives behind the `cryptography`
+# optional extra (`pip install crabcrop-url[seal]`), imported
+# lazily so the signing surface stays zero-dependency.
+# ---------------------------------------------------------------------------
+
+#: The version marker that opens a sealed token segment.
+SEALED_PREFIX = "s1."
+
+#: The AAD every sealed token is bound to.
+_SEAL_AAD = b"crabcrop/sealed/1"
+
+#: The largest remainder `seal_url` will encrypt, in bytes.
+MAX_SEALED_REMAINDER = 2048
+
+
+class SealError(ValueError):
+    """Sealing or opening a sealed token failed. Every open
+    failure is this error with the one message, on purpose:
+    openers must never learn which stage failed."""
+
+
+def seal_key(secret: Union[str, bytes]) -> bytes:
+    """The seal subkey: the raw bytes of the HMAC-SHA256 of
+    the label ``crabcrop/seal-key`` under the secret, its
+    own domain beside purge, purge-group, and upload, so
+    there is no second secret to configure or rotate: each
+    keyring entry yields its own seal subkey, and the
+    rotation window for signatures is the rotation window
+    for tokens."""
+    return bytes.fromhex(sign(secret, "crabcrop/seal-key"))
+
+
+def _aesgcm():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        raise SealError(
+            "sealing requires the cryptography package: "
+            "install it with `pip install crabcrop-url[seal]`"
+        ) from None
+    return AESGCM
+
+
+def seal_with_nonce(
+    secret: Union[str, bytes],
+    remainder: str,
+    nonce: bytes,
+    key_id: Optional[str] = None,
+) -> str:
+    """Seal a remainder into a token segment with a
+    caller-supplied nonce: ``s1.<base64url(nonce ||
+    ciphertext || tag)>``, AES-256-GCM under the derived
+    seal subkey with the fixed associated data
+    ``crabcrop/sealed/1``.
+
+    DANGER: a nonce must never repeat under one secret.
+    Reusing a nonce with AES-GCM destroys the
+    construction's confidentiality and integrity guarantees.
+    This function is the deterministic seam the spec's test
+    vectors use; production minting calls `seal_url`, which
+    draws a fresh random nonce every time."""
+    if len(nonce) != 12:
+        raise SealError(f"sealed token nonce must be 12 bytes, got {len(nonce)}")
+    if len(remainder.encode("utf-8")) > MAX_SEALED_REMAINDER:
+        raise SealError(
+            f"remainder is over the {MAX_SEALED_REMAINDER}-byte sealing cap: "
+            "a recipe that long belongs in a preset"
+        )
+    sealed = _aesgcm()(seal_key(secret)).encrypt(
+        bytes(nonce), remainder.encode("utf-8"), _SEAL_AAD
+    )
+    body = base64.urlsafe_b64encode(bytes(nonce) + sealed).rstrip(b"=").decode("ascii")
+    token = f"{SEALED_PREFIX}{body}"
+    if key_id is None:
+        return token
+    if not is_valid_key_id(key_id):
+        raise ValueError(
+            f"invalid key ID {key_id!r}: 1 to 32 characters of [A-Za-z0-9_-]"
+        )
+    return f"{key_id}:{token}"
+
+
+def seal_url(
+    secret: Union[str, bytes],
+    remainder: str,
+    key_id: Optional[str] = None,
+) -> str:
+    """Seal a remainder into a token segment (issue #255),
+    with a fresh random 96-bit nonce. Pass ``key_id`` to
+    stamp ``<key-id>:`` in front of it, so servers in a
+    rotation window open it against the named key only."""
+    return seal_with_nonce(secret, remainder, os.urandom(12), key_id)
+
+
+def unseal(secret: Union[str, bytes], segment: str) -> str:
+    """Open a token segment, with or without a ``<key-id>:``
+    prefix, under one secret, returning the remainder it
+    seals. The key ID is routing metadata and is not
+    consulted: the question is whether this secret opens
+    the token. Every failure (malformed body, wrong secret,
+    tampered bytes, unknown version) raises `SealError`
+    with the one message."""
+
+    def failed() -> SealError:
+        return SealError("the token did not open under this secret")
+
+    token = segment
+    if ":" in segment:
+        key_id, _, token = segment.partition(":")
+        if not is_valid_key_id(key_id):
+            raise failed()
+    if not token.startswith(SEALED_PREFIX):
+        raise failed()
+    body = token[len(SEALED_PREFIX) :]
+    # The standard decoder tolerates padding and stray
+    # characters; canonicity is checked by re-encoding, so
+    # anything but the exact minted spelling fails here.
+    try:
+        raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+    except (ValueError, TypeError):
+        raise failed() from None
+    if (
+        len(raw) < 12 + 16
+        or base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") != body
+    ):
+        raise failed()
+    try:
+        plain = _aesgcm()(seal_key(secret)).decrypt(raw[:12], raw[12:], _SEAL_AAD)
+    except SealError:
+        raise
+    except Exception:
+        raise failed() from None
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        raise failed() from None
+
+
+def build_sealed_url(
+    base: str,
+    secret: Optional[Union[str, bytes]],
+    operations: str,
+    source: str,
+    expires: Optional[int] = None,
+    key_id: Optional[str] = None,
+    name: Optional[str] = None,
+) -> str:
+    """Assemble a sealed crabcrop URL:
+    ``{base}/[<key-id>:]s1.<token>/{friendly-name}`` (issue
+    #255). The remainder is assembled exactly as `build_url`
+    assembles it (expiry segment, operations, source) and
+    then sealed whole, pre-expansion, so the sealed and
+    plain forms of one render are one cache entry and one
+    purge target on the server. ``name`` is the cosmetic
+    friendly name: the server never parses, validates, or
+    authenticates it; omit it and the URL ends at the
+    token. A ``None`` secret raises: there is no ``unsafe``
+    spelling of a token."""
+    if expires is not None:
+        _validate_expires(expires)
+    _validate_url_text(operations, "operations")
+    _validate_url_text(source, "source")
+    if secret is None:
+        raise SealError("sealing requires a secret: there is no unsafe token")
+    remainder = ""
+    if expires is not None:
+        remainder += f"exp:{expires}/"
+    if operations:
+        remainder += f"{operations}/"
+    remainder += source
+    segment = seal_url(secret, remainder, key_id)
+    trimmed = base.rstrip("/")
+    if name:
+        return f"{trimmed}/{segment}/{name}"
+    return f"{trimmed}/{segment}"
 
 
 def _validate_url_text(text: str, what: str) -> None:

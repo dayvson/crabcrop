@@ -12,6 +12,12 @@ const vectors = JSON.parse(
 );
 
 for (const v of vectors) {
+  if (v.signature === undefined) {
+    // Sealed entries carry a token, not a signature; the
+    // playground does not seal (issue #255 lives in the
+    // SDKs and the CLI).
+    continue;
+  }
   test(`sign vector: ${v.description}`, async () => {
     assert.equal(await sign(v.secret, v.remainder), v.signature);
   });

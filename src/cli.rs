@@ -19,6 +19,11 @@ Server:
 
 CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_SECRET):
   crabcrop sign <remainder>           Print the signed URL for an operations + source remainder.
+  crabcrop seal <remainder> [<name>]  Print the sealed URL for a remainder: the whole remainder
+                                      rides in an opaque token in the signature slot, optionally
+                                      followed by a cosmetic friendly name.
+  crabcrop unseal <url-or-path>       Print the remainder a sealed URL carries. Opens locally
+                                      under the configured secret; the server never unseals.
   crabcrop explain <url-or-path>      Break a URL down segment by segment.
   crabcrop meta <url-or-remainder>    Fetch and print the meta JSON for an image.
                                       (--placeholders / --detections ask for those fields.)
@@ -230,6 +235,8 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
     }
     match verb {
         "sign" => sign(&config, &positional),
+        "seal" => seal_cmd(&config, &positional),
+        "unseal" => unseal_cmd(&config, &positional),
         "explain" => Ok(explain(&config, &positional)?),
         "meta" => meta(&config, &positional).await,
         "purge" => purge(&config, &positional).await,
@@ -260,6 +267,78 @@ fn sign(config: &Config, positional: &[String]) -> Result<String, String> {
         None => sig,
     };
     Ok(format!("{}/{segment}/{remainder}", config.base))
+}
+
+/// The `seal` verb (issue #255): mint a sealed URL for a
+/// remainder, the token in the signature slot and the
+/// optional friendly name after it. The remainder is
+/// validated with the server's grammar first (the same
+/// discipline as `sign`): a remainder that cannot parse is
+/// refused here rather than sealed into a token that can
+/// only fail at serve time.
+fn seal_cmd(config: &Config, positional: &[String]) -> Result<String, String> {
+    let (remainder, name) = match positional {
+        [only] => (only.clone(), None),
+        [r, n] => (r.clone(), Some(n.clone())),
+        [] => return Err(format!("seal needs an argument\n\n{USAGE}")),
+        _ => {
+            return Err(format!(
+                "seal takes a remainder and an optional friendly name\n\n{USAGE}"
+            ));
+        }
+    };
+    let secret = require_secret(config)?;
+    parse_with_presets(&remainder)?;
+    let segment = match &config.key_id {
+        Some(kid) => crabcrop_url::seal_with_key_id(secret, kid, &remainder),
+        None => crabcrop_url::seal(secret, &remainder),
+    }
+    .map_err(|e| e.to_string())?;
+    // The friendly name is cosmetic: the server never
+    // parses, validates, or authenticates it. Guide, do not
+    // refuse (issue #255): one filename-like segment is the
+    // dependable shape, because intermediary path handling
+    // is the wild west and longer names can hit path-shape
+    // checks that have nothing to do with crabcrop.
+    match name {
+        Some(name) if !name.is_empty() => {
+            if name.contains('/') {
+                eprintln!(
+                    "note: the friendly name is cosmetic and never authenticated; \
+                     a single filename-like segment is the dependable shape"
+                );
+            }
+            Ok(format!("{}/{segment}/{name}", config.base))
+        }
+        _ => Ok(format!("{}/{segment}", config.base)),
+    }
+}
+
+/// The `unseal` verb (issue #255): recover the remainder a
+/// sealed URL carries, locally, under the configured
+/// secret. This is how an operator debugs a sealed link,
+/// because the server will not do it: `/explain` refuses
+/// sealed spellings rather than acting as an unsealing
+/// oracle. Prints the remainder only; the friendly name is
+/// discarded, as it carries no meaning.
+fn unseal_cmd(config: &Config, positional: &[String]) -> Result<String, String> {
+    let input = one_target(positional, "unseal")?;
+    let secret = require_secret(config)?;
+    let input = input.trim();
+    let path = match input.strip_prefix(&format!("{}/", config.base)) {
+        Some(rest) => rest.to_string(),
+        None => match input.split_once("://") {
+            Some((_, after_scheme)) => after_scheme
+                .split_once('/')
+                .map(|(_, p)| p.to_string())
+                .unwrap_or_default(),
+            None => input.strip_prefix('/').unwrap_or(input).to_string(),
+        },
+    };
+    let segment = path.split('/').next().unwrap_or("");
+    let (_, token) = crate::url::split_sealed_segment(segment)
+        .ok_or_else(|| "not a sealed URL: the first segment is not a sealed token".to_string())?;
+    crabcrop_url::open_token(secret, token).map_err(|e| e.to_string())
 }
 
 fn explain(config: &Config, positional: &[String]) -> Result<String, String> {
@@ -1334,6 +1413,95 @@ mod tests {
         // top-level spelling, not an Err to stderr.
         let out = exec(&args(&["sign", "--help"])).await.unwrap();
         assert!(out.contains("crabcrop sign"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn seal_and_unseal_round_trip() {
+        // The operator loop (issue #255): seal a remainder
+        // into a URL, recover the remainder from the URL
+        // locally. The server is never involved.
+        let sealed = exec(&args(&[
+            "seal",
+            "--secret",
+            "test-secret",
+            "300x200/https://example.com/photo.jpg",
+            "photo.jpg",
+        ]))
+        .await
+        .unwrap();
+        assert!(sealed.contains("/s1."), "{sealed}");
+        assert!(sealed.ends_with("/photo.jpg"), "{sealed}");
+        let recovered = exec(&args(&["unseal", "--secret", "test-secret", &sealed]))
+            .await
+            .unwrap();
+        assert_eq!(recovered, "300x200/https://example.com/photo.jpg");
+        // No name: the URL ends at the token, and unseal
+        // still recovers the remainder.
+        let bare = exec(&args(&[
+            "seal",
+            "--secret",
+            "test-secret",
+            "300x200/https://example.com/photo.jpg",
+        ]))
+        .await
+        .unwrap();
+        assert!(!bare.contains("photo.jpg"), "{bare}");
+        let recovered = exec(&args(&["unseal", "--secret", "test-secret", &bare]))
+            .await
+            .unwrap();
+        assert_eq!(recovered, "300x200/https://example.com/photo.jpg");
+        // A key ID rides along and is ignored by the local
+        // open, like the other verbs' local verifiers.
+        let keyed = exec(&args(&[
+            "seal",
+            "--secret",
+            "test-secret",
+            "--key-id",
+            "k2",
+            "300x200/https://example.com/photo.jpg",
+        ]))
+        .await
+        .unwrap();
+        assert!(keyed.contains("/k2:s1."), "{keyed}");
+        let recovered = exec(&args(&["unseal", "--secret", "test-secret", &keyed]))
+            .await
+            .unwrap();
+        assert_eq!(recovered, "300x200/https://example.com/photo.jpg");
+        // The wrong secret does not open it, and a plain
+        // signed URL is not a sealed one.
+        let err = exec(&args(&["unseal", "--secret", "other-secret", &sealed]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not open"), "{err}");
+        let plain = exec(&args(&[
+            "sign",
+            "--secret",
+            "test-secret",
+            "300x200/https://example.com/photo.jpg",
+        ]))
+        .await
+        .unwrap();
+        let err = exec(&args(&["unseal", "--secret", "test-secret", &plain]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a sealed URL"), "{err}");
+        // Sealing without a secret is an error: no unsafe
+        // token exists.
+        let err = exec(&args(&["seal", "300x200/https://example.com/photo.jpg"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no secret"), "{err}");
+        // A remainder the grammar refuses is refused at
+        // mint time, like sign.
+        let err = exec(&args(&[
+            "seal",
+            "--secret",
+            "test-secret",
+            "filters:quality(abc)/https://example.com/photo.jpg",
+        ]))
+        .await
+        .unwrap_err();
+        assert!(!err.is_empty());
     }
 
     #[tokio::test]

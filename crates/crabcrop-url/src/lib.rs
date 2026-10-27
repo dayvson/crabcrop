@@ -182,6 +182,302 @@ pub fn upload_signature(secret: &[u8], name: &str) -> String {
     sign(&upload_key(secret), name)
 }
 
+/// The seal subkey: the raw bytes of the HMAC-SHA256 of
+/// the domain label `crabcrop/seal-key` under the secret
+/// (issue #255). Sealed tokens are encrypted under this
+/// derived key, in their own domain beside purge,
+/// purge-group, and upload, so no artifact crosses between
+/// domains and there is no second secret to configure or
+/// rotate: each keyring entry yields its own seal subkey by
+/// this same derivation, and the rotation window for
+/// signatures is the rotation window for tokens.
+pub fn seal_key(secret: &[u8]) -> Vec<u8> {
+    hex::decode(sign(secret, "crabcrop/seal-key")).expect("sign returns lowercase hex")
+}
+
+/// The version marker that opens a sealed token segment:
+/// `s1.` followed by base64url (no padding) of
+/// `nonce (12) || ciphertext || tag (16)`, AES-256-GCM
+/// under [`seal_key`] with the fixed associated data
+/// `crabcrop/sealed/1`, which binds a token to this scheme
+/// and this version. The marker cannot collide with a plain
+/// signature segment: a signature is 64 lowercase hex
+/// characters or the literal `unsafe`, and a key ID is
+/// `[A-Za-z0-9_-]`; none of them contains a dot.
+pub const SEALED_PREFIX: &str = "s1.";
+
+/// The AAD every sealed token is bound to.
+const SEAL_AAD: &[u8] = b"crabcrop/sealed/1";
+
+/// The largest remainder [`seal`] will encrypt, in bytes.
+/// A recipe longer than this is a preset asking to happen;
+/// the cap also bounds the token a server must decode.
+pub const MAX_SEALED_REMAINDER: usize = 2048;
+
+/// The largest token segment a server will accept, in
+/// characters, checked before any decoding. Minted tokens
+/// stay well under it (see [`MAX_SEALED_REMAINDER`]).
+pub const MAX_SEALED_SEGMENT: usize = 4096;
+
+/// Why sealing or opening a sealed token failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealError {
+    /// The remainder is longer than
+    /// [`MAX_SEALED_REMAINDER`] bytes. Carries its length.
+    RemainderTooLong(usize),
+    /// A key ID is not 1 to 32 characters of `[A-Za-z0-9_-]`.
+    /// Carries the offending ID.
+    InvalidKeyId(String),
+    /// The named input ("operations" or "source") contains
+    /// a character that cannot travel in a URL path, so the
+    /// remainder it would seal could never be served.
+    InvalidCharacter { what: &'static str, character: char },
+    /// Sealing was asked for without a secret. There is no
+    /// `unsafe` spelling of a token, the mirror image of how
+    /// purge and upload signatures treat a null secret.
+    NoSecret,
+    /// The token did not open under the given secret. Every
+    /// open failure (malformed body, wrong key, tampered
+    /// bytes, unknown version) is this one value, on
+    /// purpose: openers must never learn which stage failed,
+    /// and servers answer all of them with one uniform
+    /// refusal.
+    OpenFailed,
+}
+
+impl std::fmt::Display for SealError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SealError::RemainderTooLong(n) => write!(
+                f,
+                "remainder is {n} bytes, over the {MAX_SEALED_REMAINDER}-byte sealing cap: \
+                 a recipe that long belongs in a preset"
+            ),
+            SealError::InvalidKeyId(id) => write!(
+                f,
+                "invalid key ID {id:?}: 1 to 32 characters of [A-Za-z0-9_-]"
+            ),
+            SealError::InvalidCharacter { what, character } => write!(
+                f,
+                "{what} contains a character that cannot appear in a crabcrop URL: {character:?}"
+            ),
+            SealError::NoSecret => {
+                write!(f, "sealing requires a secret: there is no unsafe token")
+            }
+            SealError::OpenFailed => write!(f, "the token did not open under this secret"),
+        }
+    }
+}
+
+impl std::error::Error for SealError {}
+
+fn seal_cipher(secret: &[u8]) -> aes_gcm::Aes256Gcm {
+    use aes_gcm::KeyInit as _;
+    let key = seal_key(secret);
+    let key = aes_gcm::Key::<aes_gcm::Aes256Gcm>::try_from(key.as_slice())
+        .expect("an HMAC-SHA256 tag is 32 bytes");
+    aes_gcm::Aes256Gcm::new(&key)
+}
+
+/// The nonce array for a 12-byte nonce, the one length
+/// [`seal`] and [`open_token`] ever pass.
+fn seal_nonce(
+    nonce: &[u8; 12],
+) -> aes_gcm::Nonce<<aes_gcm::Aes256Gcm as aes_gcm::aead::AeadCore>::NonceSize> {
+    (*nonce).into()
+}
+
+fn seal_with_fixed_nonce(
+    secret: &[u8],
+    nonce: &[u8; 12],
+    remainder: &str,
+) -> Result<String, SealError> {
+    use aes_gcm::aead::{Aead, Payload};
+    use base64::Engine as _;
+    if remainder.len() > MAX_SEALED_REMAINDER {
+        return Err(SealError::RemainderTooLong(remainder.len()));
+    }
+    let sealed = seal_cipher(secret)
+        .encrypt(
+            &seal_nonce(nonce),
+            Payload {
+                msg: remainder.as_bytes(),
+                aad: SEAL_AAD,
+            },
+        )
+        .map_err(|_| SealError::OpenFailed)?;
+    let mut body = Vec::with_capacity(12 + sealed.len());
+    body.extend_from_slice(nonce);
+    body.extend_from_slice(&sealed);
+    Ok(format!(
+        "{SEALED_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
+    ))
+}
+
+/// Seal a remainder into a token segment:
+/// `s1.<base64url(nonce || ciphertext || tag)>`, AES-256-GCM
+/// under the derived seal subkey, with a fresh random
+/// 96-bit nonce from the operating system. The token is the
+/// whole signature segment; stamp a key ID with
+/// [`seal_with_key_id`].
+pub fn seal(secret: &[u8], remainder: &str) -> Result<String, SealError> {
+    let mut nonce = [0u8; 12];
+    getrandom::fill(&mut nonce).map_err(|_| SealError::OpenFailed)?;
+    seal_with_fixed_nonce(secret, &nonce, remainder)
+}
+
+/// [`seal`] with a caller-supplied nonce: the deterministic
+/// seam the spec's test vectors use, exposed for tests and
+/// for operators who need reproducible builds.
+///
+/// # Danger
+///
+/// A nonce must never repeat under one secret. Reusing a
+/// nonce with AES-GCM destroys the construction's
+/// confidentiality and integrity guarantees. Production
+/// minting calls [`seal`], which draws a fresh random
+/// nonce every time; this function exists so a test can
+/// pin a nonce and compare bytes.
+pub fn seal_with_nonce(
+    secret: &[u8],
+    key_id: Option<&str>,
+    nonce: &[u8; 12],
+    remainder: &str,
+) -> Result<String, SealError> {
+    let token = seal_with_fixed_nonce(secret, nonce, remainder)?;
+    match key_id {
+        Some(id) => {
+            if !is_valid_key_id(id) {
+                return Err(SealError::InvalidKeyId(id.to_string()));
+            }
+            Ok(format!("{id}:{token}"))
+        }
+        None => Ok(token),
+    }
+}
+
+/// The token segment for a keyed seal: `<key-id>:`
+/// followed by the token [`seal`] computes. Servers open a
+/// keyed segment against the named key only, which is what
+/// makes secret rotation work for sealed URLs exactly as
+/// it does for signed ones (issue #255).
+pub fn seal_with_key_id(secret: &[u8], key_id: &str, remainder: &str) -> Result<String, SealError> {
+    if !is_valid_key_id(key_id) {
+        return Err(SealError::InvalidKeyId(key_id.to_string()));
+    }
+    Ok(format!("{key_id}:{}", seal(secret, remainder)?))
+}
+
+/// Open a token body (`s1.<base64url>`, no key ID) under
+/// one secret, returning the remainder it seals. Every
+/// failure is [`SealError::OpenFailed`]: malformed base64,
+/// a body too short to hold a nonce and a tag, a tag
+/// mismatch under this secret, or plaintext that is not
+/// UTF-8.
+pub fn open_token(secret: &[u8], token: &str) -> Result<String, SealError> {
+    use aes_gcm::aead::{Aead, Payload};
+    use base64::Engine as _;
+    let Some(body) = token.strip_prefix(SEALED_PREFIX) else {
+        return Err(SealError::OpenFailed);
+    };
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body)
+        .map_err(|_| SealError::OpenFailed)?;
+    if raw.len() < 12 + 16 {
+        return Err(SealError::OpenFailed);
+    }
+    let (nonce, sealed) = raw.split_at(12);
+    let plain = seal_cipher(secret)
+        .decrypt(
+            &seal_nonce(nonce.try_into().expect("split_at yields the 12-byte nonce")),
+            Payload {
+                msg: sealed,
+                aad: SEAL_AAD,
+            },
+        )
+        .map_err(|_| SealError::OpenFailed)?;
+    String::from_utf8(plain).map_err(|_| SealError::OpenFailed)
+}
+
+/// Open a full token segment, with or without a
+/// `<key-id>:` prefix, under one secret. The key ID is
+/// routing metadata and is not consulted here: this
+/// function's question is whether this secret opens the
+/// token, the same stance [`verify`] takes toward keyed
+/// signatures. Servers route by key ID through their
+/// keyring instead.
+pub fn unseal(secret: &[u8], segment: &str) -> Result<String, SealError> {
+    let token = match segment.split_once(':') {
+        Some((id, rest)) => {
+            if !is_valid_key_id(id) {
+                return Err(SealError::OpenFailed);
+            }
+            rest
+        }
+        None => segment,
+    };
+    open_token(secret, token)
+}
+
+/// Assemble a sealed crabcrop URL:
+/// `{base}/[<key-id>:]s1.<token>/{friendly-name}`.
+///
+/// The remainder is assembled exactly as [`build_url`]
+/// assembles it (expiry segment, operations, source) and
+/// then sealed whole, pre-expansion, so the sealed and
+/// plain forms of one render are one cache entry and one
+/// purge target on the server. `name` is the cosmetic
+/// friendly name: the server never parses, validates, or
+/// authenticates it, and it is excluded from the token and
+/// the cache key; pass `None` (or an empty name) to end
+/// the URL at the token. A `None` secret is an error:
+/// there is no `unsafe` spelling of a token.
+#[allow(clippy::too_many_arguments)]
+pub fn build_sealed_url(
+    base: &str,
+    secret: Option<&[u8]>,
+    operations: &str,
+    source: &str,
+    expires: Option<u64>,
+    name: Option<&str>,
+    key_id: Option<&str>,
+) -> Result<String, SealError> {
+    validate_url_text(operations, "operations").map_err(|e| match e {
+        BuildError::InvalidCharacter { what, character } => {
+            SealError::InvalidCharacter { what, character }
+        }
+        _ => SealError::OpenFailed,
+    })?;
+    validate_url_text(source, "source").map_err(|e| match e {
+        BuildError::InvalidCharacter { what, character } => {
+            SealError::InvalidCharacter { what, character }
+        }
+        _ => SealError::OpenFailed,
+    })?;
+    let Some(secret) = secret else {
+        return Err(SealError::NoSecret);
+    };
+    let base = base.trim_end_matches('/');
+    let mut remainder = String::new();
+    if let Some(exp) = expires {
+        remainder.push_str(&format!("exp:{exp}/"));
+    }
+    if !operations.is_empty() {
+        remainder.push_str(operations);
+        remainder.push('/');
+    }
+    remainder.push_str(source);
+    let segment = match key_id {
+        Some(id) => seal_with_key_id(secret, id, &remainder)?,
+        None => seal(secret, &remainder)?,
+    };
+    match name {
+        Some(name) if !name.is_empty() => Ok(format!("{base}/{segment}/{name}")),
+        _ => Ok(format!("{base}/{segment}")),
+    }
+}
+
 /// The signed string an upload signature covers: the name
 /// alone, or, for the expiring form, an `exp:<unix-seconds>`
 /// segment in front of it, exactly the spelling the request
@@ -328,8 +624,12 @@ mod tests {
     fn canonical_test_vectors() {
         let text = include_str!("../../../spec/test-vectors.json");
         let vectors: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
-        assert!(vectors.len() >= 5);
-        for v in &vectors {
+        let signed: Vec<&serde_json::Value> = vectors
+            .iter()
+            .filter(|v| v.get("signature").is_some())
+            .collect();
+        assert!(signed.len() >= 5);
+        for v in signed {
             let secret = v["secret"].as_str().unwrap();
             let remainder = v["remainder"].as_str().unwrap();
             let signature = v["signature"].as_str().unwrap();
@@ -337,6 +637,241 @@ mod tests {
             assert!(verify(secret.as_bytes(), signature, remainder));
             assert!(!verify(secret.as_bytes(), signature, "tampered"));
         }
+    }
+
+    /// The sealed vectors from `spec/test-vectors.json`
+    /// (issue #255): AES-GCM is a deterministic function of
+    /// (key, nonce, plaintext, AAD), so an injected nonce
+    /// pins the token byte for byte, and every vector's
+    /// token must open back to its remainder.
+    #[test]
+    fn sealed_test_vectors() {
+        let text = include_str!("../../../spec/test-vectors.json");
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        let sealed: Vec<&serde_json::Value> = vectors
+            .iter()
+            .filter(|v| v["sealed"].as_bool() == Some(true))
+            .collect();
+        assert!(sealed.len() >= 3, "the spec carries sealed vectors");
+        for v in sealed {
+            let secret = v["secret"].as_str().unwrap().as_bytes();
+            let key_id = v["key_id"].as_str();
+            let nonce_hex = v["nonce"].as_str().unwrap();
+            let nonce: [u8; 12] = hex::decode(nonce_hex).unwrap().try_into().unwrap();
+            let remainder = v["remainder"].as_str().unwrap();
+            let token = v["token"].as_str().unwrap();
+            assert_eq!(
+                seal_with_nonce(secret, key_id, &nonce, remainder).unwrap(),
+                token,
+                "{remainder}"
+            );
+            assert_eq!(unseal(secret, token).unwrap(), remainder);
+            assert_eq!(unseal(b"wrong-secret", token), Err(SealError::OpenFailed));
+        }
+    }
+
+    /// A tiny deterministic PRNG for the property tests:
+    /// the same generator every run, so a failure
+    /// reproduces from the seed printed in the assertion.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// Seal then open is the identity over generated
+    /// remainders, including the segment kinds that ride
+    /// inside a payload (`exp:`, `preset:`, `root:`) and
+    /// remainders at the cap boundary (issue #255).
+    #[test]
+    fn seal_open_round_trip_over_generated_remainders() {
+        let fragments = [
+            "300x200",
+            "crop:1200x630:smart",
+            "filters:format(webp):quality(80)",
+            "filters:text(hello,24,ffffff)",
+            "exp:1893456000",
+            "maxage:60",
+            "preset:og-card",
+            "https://example.com/photo.jpg",
+            "https://cdn.example.org/a/b/c-d_e.png",
+            "s3://media/photo.jpg",
+            "root:photos/cat.jpg",
+            "preset:thumb/filters:grayscale",
+        ];
+        let mut rng = XorShift(0x05ee_d255);
+        for case in 0..400 {
+            let parts = 1 + rng.below(4);
+            let mut chosen: Vec<&str> = (0..parts)
+                .map(|_| fragments[rng.below(fragments.len())])
+                .collect();
+            // A remainder ends with its source; put a source
+            // fragment last so the shape is realistic.
+            let sources = [
+                "https://example.com/photo.jpg",
+                "s3://media/photo.jpg",
+                "root:photos/cat.jpg",
+            ];
+            chosen.push(sources[rng.below(sources.len())]);
+            let remainder = chosen.join("/");
+            let secret = format!("secret-{case}");
+            let token = seal(secret.as_bytes(), &remainder).unwrap();
+            assert!(
+                token.starts_with(SEALED_PREFIX),
+                "case {case}: {token} for {remainder}"
+            );
+            assert_eq!(
+                unseal(secret.as_bytes(), &token).unwrap(),
+                remainder,
+                "case {case}"
+            );
+            // A keyed seal of the same remainder opens too,
+            // and the key ID is outside the token body.
+            let keyed = seal_with_key_id(secret.as_bytes(), "k1", &remainder).unwrap();
+            assert!(keyed.starts_with("k1:s1."), "case {case}: {keyed}");
+            assert_eq!(unseal(secret.as_bytes(), &keyed).unwrap(), remainder);
+        }
+        // At the cap, sealing works; one byte over refuses.
+        let at_cap = "a".repeat(MAX_SEALED_REMAINDER);
+        assert!(seal(b"s", &at_cap).is_ok());
+        let over = "a".repeat(MAX_SEALED_REMAINDER + 1);
+        assert_eq!(
+            seal(b"s", &over),
+            Err(SealError::RemainderTooLong(MAX_SEALED_REMAINDER + 1))
+        );
+    }
+
+    /// Bit flips anywhere in the token body (nonce,
+    /// ciphertext, tag) and any structural damage fail the
+    /// open with the one opaque error (issue #255).
+    #[test]
+    fn open_rejects_bit_flips_and_damage() {
+        let secret = b"flip-secret";
+        let token = seal(secret, "300x200/https://example.com/photo.jpg").unwrap();
+        let body = &token[SEALED_PREFIX.len()..];
+        // Flip one character at spread positions: the first
+        // body char (nonce), the middle (ciphertext), and
+        // the last (tag). Base64url chars differ in bits, so
+        // a swapped char is a bit flip in the decoded bytes.
+        for pos in [0, body.len() / 2, body.len() - 1] {
+            let mut damaged = body.to_string();
+            let orig = damaged.as_bytes()[pos];
+            let replacement = if orig == b'A' { 'B' } else { 'A' };
+            damaged.replace_range(pos..=pos, &replacement.to_string());
+            assert_eq!(
+                unseal(secret, &format!("{SEALED_PREFIX}{damaged}")),
+                Err(SealError::OpenFailed),
+                "flip at {pos}"
+            );
+        }
+        for damaged in [
+            token[..token.len() - 1].to_string(), // truncated
+            format!("{token}A"),                  // extended
+            "s2.AAAA".to_string(),                // unknown version
+            "s1.".to_string(),                    // empty body
+            "s1.!!!".to_string(),                 // not base64url
+            "s1.AAAA".to_string(),                // too short
+            token.replacen("s1.", "s1", 1),       // marker damaged
+            format!("bad id:{token}"),            // malformed key ID
+        ] {
+            assert_eq!(
+                unseal(secret, &damaged),
+                Err(SealError::OpenFailed),
+                "{damaged}"
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_builders_and_domain_separation() {
+        // The seal subkey is a fifth domain: unrelated to
+        // purge, purge-group, entry, and upload subkeys, and
+        // never the secret itself.
+        let secret = b"test-secret";
+        let key = seal_key(secret);
+        assert_eq!(key.len(), 32);
+        assert_ne!(key, purge_key(secret));
+        assert_ne!(key, purge_group_key(secret));
+        assert_ne!(key, entry_key(secret));
+        assert_ne!(key, upload_key(secret));
+        assert_ne!(key, secret.to_vec());
+        assert_eq!(key, seal_key(secret));
+        // No secret, no token.
+        assert_eq!(
+            build_sealed_url(
+                "https://img.example.com",
+                None,
+                "300x200",
+                "https://example.com/a.jpg",
+                None,
+                None,
+                None,
+            ),
+            Err(SealError::NoSecret)
+        );
+        // The assembled URL: token in the signature slot,
+        // the friendly name after it, nothing else.
+        let url = build_sealed_url(
+            "https://img.example.com/",
+            Some(secret),
+            "300x200",
+            "https://example.com/photo.jpg",
+            Some(1893456000),
+            Some("photo.jpg"),
+            None,
+        )
+        .unwrap();
+        let path = url.strip_prefix("https://img.example.com/").unwrap();
+        let (segment, name) = path.split_once('/').unwrap();
+        assert_eq!(name, "photo.jpg");
+        assert_eq!(
+            unseal(secret, segment).unwrap(),
+            "exp:1893456000/300x200/https://example.com/photo.jpg"
+        );
+        // No name: the URL ends at the token.
+        let bare = build_sealed_url(
+            "https://img.example.com",
+            Some(secret),
+            "300x200",
+            "https://example.com/photo.jpg",
+            None,
+            None,
+            Some("k2"),
+        )
+        .unwrap();
+        let segment = bare.strip_prefix("https://img.example.com/").unwrap();
+        assert!(segment.starts_with("k2:s1."), "{segment}");
+        assert_eq!(
+            unseal(secret, segment).unwrap(),
+            "300x200/https://example.com/photo.jpg"
+        );
+        // Unbuildable remainders refuse at build time, like
+        // the plain builders (audit P-4).
+        assert!(matches!(
+            build_sealed_url(
+                "https://img.example.com",
+                Some(secret),
+                "300x200",
+                "https://example.com/a.jpg?w=1",
+                None,
+                None,
+                None,
+            ),
+            Err(SealError::InvalidCharacter {
+                what: "source",
+                character: '?'
+            })
+        ));
     }
 
     #[test]

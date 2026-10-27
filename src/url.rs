@@ -968,6 +968,53 @@ pub fn is_valid_key_id(id: &str) -> bool {
     crabcrop_url::is_valid_key_id(id)
 }
 
+/// Split a sealed token off the front of a signature
+/// segment (issue #255): `Some((key_id, token))` when the
+/// segment is a sealed spelling, `[<key-id>:]s1.<body>`,
+/// `None` when it is a plain signature segment. Detection is
+/// a prefix test, complete by construction: a plain
+/// signature is 64 lowercase hex characters or `unsafe`, and
+/// a key ID is `[A-Za-z0-9_-]`, so no valid plain segment
+/// can start with `s1.`. The token keeps its `s1.` marker;
+/// the key ID routes the open (see [`Keyring::open_sealed`])
+/// and is not part of the ciphertext or the AAD.
+/// Whether a signature segment presents as a sealed
+/// spelling (issue #255): a real token (see
+/// [`split_sealed_segment`]), or a marker-shaped imitation,
+/// `s<digits>.` under an optional valid key-ID prefix. The
+/// imitation matters for error uniformity: an unknown
+/// version marker must be indistinguishable from a failed
+/// open, and answering it with the plain grammar's 400
+/// would announce exactly that. No valid plain segment has
+/// this shape (hex, `unsafe`, and key IDs contain no dot),
+/// so the test is complete the same way the prefix test
+/// is.
+pub fn looks_sealed(segment: &str) -> bool {
+    let body = match segment.split_once(':') {
+        Some((id, rest)) if is_valid_key_id(id) => rest,
+        _ => segment,
+    };
+    if body.starts_with(crabcrop_url::SEALED_PREFIX) {
+        return true;
+    }
+    let Some(rest) = body.strip_prefix('s') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0 && rest.as_bytes().get(digits) == Some(&b'.')
+}
+
+pub fn split_sealed_segment(segment: &str) -> Option<(Option<&str>, &str)> {
+    if segment.starts_with(crabcrop_url::SEALED_PREFIX) {
+        return Some((None, segment));
+    }
+    let (id, rest) = segment.split_once(':')?;
+    if is_valid_key_id(id) && rest.starts_with(crabcrop_url::SEALED_PREFIX) {
+        return Some((Some(id), rest));
+    }
+    None
+}
+
 /// Split the signature segment off a request path, returning
 /// the signature, the key ID it names (issue #143: an optional
 /// `<key-id>:` prefix on the signature segment, how rotation
@@ -3054,6 +3101,21 @@ impl Keyring {
             .iter()
             .any(|secret| verify_upload(secret, signature, name))
     }
+
+    /// Open a sealed token under the ring (issue #255): a
+    /// keyed request opens under the named key only (see
+    /// [`Self::candidates`]); an unkeyed one tries current,
+    /// then previous, which is the rotation window sealed
+    /// URLs inherit from the keyring with no second secret.
+    /// Returns the decrypted remainder, or `None` when no
+    /// candidate opens it: the caller maps every `None` to
+    /// the one uniform refusal and never learns, or
+    /// reveals, which stage failed.
+    pub fn open_sealed(&self, key_id: Option<&str>, token: &str) -> Option<String> {
+        self.candidates(key_id)
+            .iter()
+            .find_map(|secret| crabcrop_url::open_token(secret, token).ok())
+    }
 }
 
 #[cfg(test)]
@@ -3531,6 +3593,90 @@ mod tests {
         assert!(!verify_upload(secret, &Signature::Hmac(sig), name));
         let plain = upload_signature(secret, name);
         assert!(!verify_upload(secret, &Signature::Hmac(plain), &remainder));
+    }
+
+    #[test]
+    fn sealed_segment_splitting() {
+        assert_eq!(split_sealed_segment("s1.AAECAw"), Some((None, "s1.AAECAw")));
+        assert_eq!(
+            split_sealed_segment("k2:s1.AAECAw"),
+            Some((Some("k2"), "s1.AAECAw"))
+        );
+        // Plain spellings never split as sealed: a hex
+        // signature, `unsafe`, a keyed signature, and
+        // near-miss markers.
+        for plain in [
+            "0123456789abcdef",
+            "unsafe",
+            "k2:0123456789abcdef",
+            "s1",
+            "s12.AAAA",
+            "k ey:s1.AAAA",
+            ":s1.AAAA",
+        ] {
+            assert_eq!(split_sealed_segment(plain), None, "{plain}");
+        }
+        // Marker-shaped imitations still present as sealed
+        // (they earn the uniform refusal, not the grammar's
+        // 400), while ordinary segments do not.
+        for imitation in ["s2.AAAA", "s12.x", "k2:s2.AAAA", "s1.anything"] {
+            assert!(looks_sealed(imitation), "{imitation}");
+        }
+        for plain in ["unsafe", "0123456789abcdef", "sx.AAAA", "s.AAAA", "k2:a1b2"] {
+            assert!(!looks_sealed(plain), "{plain}");
+        }
+    }
+
+    #[test]
+    fn keyring_opens_sealed_tokens_across_rotation() {
+        let remainder = "300x200/https://example.com/photo.jpg";
+        let ring = Keyring {
+            current_id: "k-new".to_string(),
+            current: b"new-secret-value".to_vec(),
+            previous: Some(("k-old".to_string(), b"old-secret-value".to_vec())),
+        };
+        // A token minted under the previous secret opens
+        // during the rotation window: unkeyed (current is
+        // tried, then previous) and keyed to the old ID.
+        let old_token = crabcrop_url::seal(b"old-secret-value", remainder).unwrap();
+        assert_eq!(
+            ring.open_sealed(None, &old_token).as_deref(),
+            Some(remainder)
+        );
+        assert_eq!(
+            ring.open_sealed(Some("k-old"), &old_token).as_deref(),
+            Some(remainder)
+        );
+        // Keyed routing is exact: naming the current ID does
+        // not open a previous-key token, and an unknown ID
+        // opens nothing.
+        assert_eq!(ring.open_sealed(Some("k-new"), &old_token), None);
+        assert_eq!(ring.open_sealed(Some("k-nope"), &old_token), None);
+        // A token under a foreign secret opens under no
+        // routing.
+        let foreign = crabcrop_url::seal(b"someone-elses-secret", remainder).unwrap();
+        assert_eq!(ring.open_sealed(None, &foreign), None);
+        // Once the previous key leaves the ring, its tokens
+        // stop opening: the window has closed.
+        let rotated = Keyring {
+            current_id: "k-new".to_string(),
+            current: b"new-secret-value".to_vec(),
+            previous: None,
+        };
+        assert_eq!(rotated.open_sealed(None, &old_token), None);
+        assert_eq!(rotated.open_sealed(Some("k-old"), &old_token), None);
+        // The current key's tokens open throughout.
+        let new_token = crabcrop_url::seal(b"new-secret-value", remainder).unwrap();
+        assert_eq!(
+            rotated.open_sealed(None, &new_token).as_deref(),
+            Some(remainder)
+        );
+        // A tampered token opens nowhere.
+        let mut bytes = old_token.into_bytes();
+        let last = bytes.len() - 1;
+        bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(bytes).unwrap();
+        assert_eq!(ring.open_sealed(None, &tampered), None);
     }
 
     #[test]

@@ -22,6 +22,21 @@ for c in cases:
                                  c["widths"], expires=c.get("expires"))
         elif kind == "sign":
             v = sdk.sign(secret, c["remainder"])
+        elif kind == "seal":
+            # Sealed vectors (issue #255): the one emitter
+            # output that may legitimately be a skip, when
+            # the cryptography extra is not installed. The
+            # parity cells treat the sentinel as "compare
+            # the other two SDKs", never as a value.
+            try:
+                v = sdk.seal_with_nonce(secret, c["remainder"],
+                                        bytes.fromhex(c["nonce"]),
+                                        c.get("key_id"))
+            except Exception as e:
+                if "cryptography" in str(e):
+                    v = "SKIP:no-extra"
+                else:
+                    raise
         elif kind == "purge_sig":
             v = sdk.purge_signature(secret, c["target"])
         elif kind == "group_sig":

@@ -5,7 +5,7 @@ Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScr
 ## Usage
 
 ```ts
-import { buildURL, buildSrcSet, purgeGroupSignature, purgeSignature, sign, uploadSignature, verifyUrlSignature } from "@crabcrop/url";
+import { buildSealedURL, buildURL, buildSrcSet, purgeGroupSignature, purgeSignature, seal, sign, unseal, uploadSignature, verifyUrlSignature } from "@crabcrop/url";
 
 // A signed URL. The operation string is passed verbatim and may
 // contain several segments and preset: references.
@@ -52,6 +52,19 @@ const group = purgeGroupSignature("your-secret", "thumb");
 // then; its path is /upload/<signature>/exp:<expiry>/<name>.
 const upload = uploadSignature("your-secret", "heroes/photo.jpg");
 const expiring = uploadSignature("your-secret", "heroes/photo.jpg", 1893456000);
+
+// Sealed URLs (issue #255): the whole remainder encrypted into an
+// opaque token in the signature slot, for public links whose recipe
+// should stay unreadable. The server serves the sealed and plain
+// forms of one render from the same cache entry.
+const sealedUrl = buildSealedURL(
+  "https://images.example.com",
+  "your-secret",
+  "300x200",
+  "https://example.com/photo.jpg",
+  { name: "photo.jpg" },
+);
+const remainder = unseal("your-secret", seal("your-secret", "300x200/https://example.com/photo.jpg"));
 ```
 
 Pass `null` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode.

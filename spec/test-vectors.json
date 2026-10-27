@@ -100,5 +100,30 @@
     "remainder": "page:007/https://example.com/doc.pdf",
     "secret": "s3cr3t",
     "signature": "ae2b8fde68f8098f52b9fe980078f7576a54d09b7d21b2d5ba191c6952047769"
+  },
+  {
+    "description": "sealed: a plain remainder under an injected nonce (AES-256-GCM, key HMAC_SHA256(secret, \"crabcrop/seal-key\"), AAD crabcrop/sealed/1)",
+    "sealed": true,
+    "secret": "s3cr3t",
+    "nonce": "000102030405060708090a0b",
+    "remainder": "300x200/https://example.com/photo.jpg",
+    "token": "s1.AAECAwQFBgcICQoL4rtOMQmUdNPYyz3r5cEt98-xHjyY6uQLX54QmEJRN-xu0AFe4THlo0MKBmyd_G5VJ-woya4"
+  },
+  {
+    "description": "sealed: a keyed token (the key ID rides outside the ciphertext as routing metadata)",
+    "sealed": true,
+    "secret": "s3cr3t",
+    "key_id": "k2",
+    "nonce": "ffeeddccbbaa998877665544",
+    "remainder": "preset:og-card/https://example.com/photo.jpg",
+    "token": "k2:s1._-7dzLuqmYh3ZlVE6KzevG04KldWn3E5eImjNEU9NYdDXFfJk9p5nXWe04ow1thNm5gqZLe8O9S-eVSvUIlKnEgXSRK77vtu"
+  },
+  {
+    "description": "sealed: an expiring remainder with a source-root source",
+    "sealed": true,
+    "secret": "correct horse battery staple",
+    "nonce": "0b0a09080706050403020100",
+    "remainder": "exp:1893456000/300x200/root:photos/cat.jpg",
+    "token": "s1.CwoJCAcGBQQDAgEAM3yLQzhWSh2-e40WBlrwPD1nZpOaMpA5jHnyRJUHyv0GtY-GFViYaBukUi3oSXcviK6xl8_VMYLStw"
   }
 ]

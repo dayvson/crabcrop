@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 const dist = new URL("../../sdks/typescript/dist/index.js", import.meta.url);
 const {
   buildURL, buildSrcSet, sign, purgeSignature, purgeGroupSignature,
-  uploadSignature,
+  uploadSignature, sealWithNonce,
 } = await import(dist);
 
 const cases = JSON.parse(readFileSync(process.argv[2], "utf8"));
@@ -27,6 +27,10 @@ for (const c of cases) {
         break;
       case "sign":
         v = sign(c.secret, c.remainder);
+        break;
+      case "seal":
+        v = sealWithNonce(c.secret, c.remainder,
+          Buffer.from(c.nonce, "hex"), c.key_id ?? undefined);
         break;
       case "purge_sig":
         v = purgeSignature(c.secret, c.target);

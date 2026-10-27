@@ -88,6 +88,28 @@ Use that hex string as the first path segment. Anyone can verify the scheme agai
 
 A request with a bad signature gets `403` and the body `bad signature`. The literal signature `unsafe` skips verification, but only when the server runs with `CRABCROP_ALLOW_UNSAFE=1` (or `true`, `yes`, `on`). Keep it off in production. Purges are the exception that never bends: `/purge` and `/purge-group` always require an HMAC signature made with the secret, even in unsafe mode.
 
+### Sealed URLs
+
+Signing proves a URL was minted by someone holding the secret, but it hides nothing: the operations and the source sit in the path for anyone to read. That readability is the design (`The URL is the API` cuts both ways, and it is what makes crabcrop URLs debuggable), and for most deployments it is the right default. When it is not, the same remainder can be **sealed**: encrypted into an opaque token that sits in the signature slot.
+
+```text
+https://images.example.com/s1.AAECAwQFBgcICQoL4rtOMQ/.../photo.jpg
+```
+
+The token is `s1.` plus base64url(nonce, ciphertext, tag): AES-256-GCM over the whole remainder, under a key derived from the same secret, so there is no second secret to manage. The text after the token (`photo.jpg` above) is a friendly name: purely cosmetic, never parsed or authenticated, present so sealed URLs still read as images in logs, analytics, and page source. A sealed URL serves exactly what its plain spelling serves: the server decrypts the remainder and runs the same pipeline, so both forms share one cache entry, one ETag, and one purge target. Mint one with the builders (`build_sealed_url` in Rust, `buildSealedURL` in TypeScript, `build_sealed_url` in Python, where sealing alone needs the `crabcrop-url[seal]` extra) or the CLI:
+
+```bash
+crabcrop seal 'filters:format(webp):quality(80)/https://media.example.com/heroes/dog.jpg' dog.jpg
+```
+
+Know what sealing does and does not do:
+
+- **It hides the recipe from page readers.** Anyone who can see the URL (a page visitor, a competitor scraping your pages) learns nothing about the operations or the origin. Anyone who can observe the request itself (your CDN, a network intermediary) sees the token in the request line regardless; sealing is not transport privacy, and TLS is the answer there.
+- **It is not access control.** A sealed URL is a bearer artifact anyone can replay, exactly like a signed one. Authorization is still the source allowlist, expiry (`exp:` works inside a sealed payload, unchanged), and whatever fronts the deployment.
+- **It trades away debuggability at the server.** `/explain` refuses sealed URLs: a server endpoint that decrypts would be an oracle for anyone who lifts a token off a public page. To debug one, unseal it locally (`crabcrop unseal <url>`, under your own secret) and explain the plain form. The meta document for a sealed request likewise reports the render, never the recipe. Sealed URLs are for links that must be public and unreadable at the same time: most links are not, and the readable form stays the default and the recommendation.
+
+Failures are uniform: a malformed token, a token minted under another secret, a token whose payload does not parse, all answer `403` with the body `bad signature`, indistinguishable from each other and from a bad HMAC. (A token that opens but has expired answers `signature expired`, exactly like the plain form.) Rotation works the way it does for signatures, inherited rather than reinvented: a token may carry a key ID (`k2:s1.…`), the server opens keyed tokens against the named key only, and during a rotation window an unkeyed token opens under the previous secret until that secret is retired. Minting refuses a remainder longer than 2,048 bytes; a recipe that long belongs in a preset. The full construction is in `spec/url-signing.md`.
+
 ### Expiring URLs
 
 Add an `exp:<unix-seconds>` segment anywhere among the operations to make a signed URL expire:

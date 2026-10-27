@@ -490,5 +490,11 @@
   "group": "ocr",
   "kind": "scripted",
   "tier": "local"
+ },
+ {
+  "id": "st-sealed-meta-redaction",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "local"
  }
 ]

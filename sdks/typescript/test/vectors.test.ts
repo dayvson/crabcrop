@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
+  buildSealedURL,
   buildSrcSet,
   buildURL,
   purgeGroupSignature,
   purgeSignature,
+  seal,
+  sealWithNonce,
   sign,
+  unseal,
   uploadSignature,
   signWithKeyId,
   verifyUrlSignature,
@@ -16,13 +20,85 @@ import {
 // signing suite is the shared file from the spec directory.
 const vectors = JSON.parse(
   readFileSync(new URL("../../../spec/test-vectors.json", import.meta.url), "utf8"),
-) as { description: string; secret: string; remainder: string; signature: string }[];
+) as {
+  description: string;
+  secret: string;
+  remainder: string;
+  signature?: string;
+  sealed?: boolean;
+  key_id?: string;
+  nonce?: string;
+  token?: string;
+}[];
 
 for (const v of vectors) {
+  if (v.signature === undefined) {
+    continue;
+  }
+  const signature = v.signature;
   test(`vector: ${v.description}`, () => {
-    assert.equal(sign(v.secret, v.remainder), v.signature);
+    assert.equal(sign(v.secret, v.remainder), signature);
   });
 }
+
+// The sealed vectors (issue #255): AES-GCM is a deterministic
+// function of (key, nonce, plaintext, AAD), so an injected
+// nonce pins the token byte for byte, and every token opens
+// back to its remainder. A wrong secret opens none of them.
+for (const v of vectors) {
+  if (v.sealed !== true) {
+    continue;
+  }
+  const token = v.token as string;
+  test(`sealed vector: ${v.description}`, () => {
+    const nonce = Buffer.from(v.nonce as string, "hex");
+    assert.equal(sealWithNonce(v.secret, v.remainder, nonce, v.key_id), token);
+    assert.equal(unseal(v.secret, token), v.remainder);
+    assert.throws(() => unseal("wrong-secret", token), /did not open/);
+  });
+}
+
+test("sealed round trip and builders", () => {
+  const remainder = "300x200/https://example.com/photo.jpg";
+  const token = seal("test-secret", remainder);
+  assert.ok(token.startsWith("s1."));
+  assert.equal(unseal("test-secret", token), remainder);
+  const keyed = seal("test-secret", remainder, "k2");
+  assert.ok(keyed.startsWith("k2:s1."));
+  assert.equal(unseal("test-secret", keyed), remainder);
+  // Two seals of one remainder differ (fresh random nonce);
+  // a tampered token opens nowhere.
+  assert.notEqual(seal("test-secret", remainder), token);
+  const damaged = token.slice(0, -1) + (token.endsWith("A") ? "B" : "A");
+  assert.throws(() => unseal("test-secret", damaged), /did not open/);
+  assert.throws(() => unseal("test-secret", "s2.AAAA"), /did not open/);
+  // The assembled URL: token in the signature slot, the
+  // friendly name after it.
+  const url = buildSealedURL(
+    "https://img.example.com/",
+    "test-secret",
+    "300x200",
+    "https://example.com/photo.jpg",
+    { name: "photo.jpg" },
+  );
+  const path = url.slice("https://img.example.com/".length);
+  const [segment, name] = path.split("/", 2);
+  assert.equal(name, "photo.jpg");
+  assert.equal(unseal("test-secret", segment), remainder);
+  // No secret: no unsafe token.
+  assert.throws(
+    () =>
+      buildSealedURL(
+        "https://img.example.com",
+        null as unknown as string,
+        "300x200",
+        "https://example.com/photo.jpg",
+      ),
+    /no unsafe token/,
+  );
+  // Over the cap: refused at mint time.
+  assert.throws(() => seal("test-secret", "a".repeat(2049)), /sealing cap/);
+});
 
 test("buildURL reproduces the spec worked example", () => {
   assert.equal(

@@ -307,6 +307,42 @@ def st_meta_fields():
         "PASS" if ok else "FAIL", {"status": s}, f"meta.studio={json.dumps(stu)[:300]}")
 
 @cell
+def st_sealed_meta_redaction():
+    # The sealed audit with a real operation record
+    # (issue #255): plain meta of a studio render carries
+    # the studio object (resolved bg, shadow, pad). The
+    # same render requested in the sealed spelling carries
+    # sealed:true and no studio object and no source text:
+    # operation records are recipe text, and the sealed
+    # meta keeps only render facts.
+    from harness import cli, fetch, AI_BASES, remainder_of
+    ops = "filters:studio(product,bg:f5f0e8,shadow:strong,pad:25):format(png)"
+    src = "product-shoe.jpg"
+    s0, j0 = meta(ops, src)
+    rem = remainder_of(ops, src)
+    rc, out = cli("seal", rem, "AI")
+    token_url = out.splitlines()[0].strip() if rc == 0 else ""
+    path = token_url[len(AI_BASES["A"]) + 1:] if token_url else ""
+    st, h, payload, ms = fetch(f"{AI_BASES['A']}/{path}",
+                               {"Accept": "application/json"}, timeout=300)
+    j = {}
+    try:
+        j = json.loads(payload)
+    except Exception:
+        pass
+    text = payload.decode("utf-8", "replace")
+    ok = (rc == 0 and s0 == 200 and bool((j0 or {}).get("studio"))
+          and st == 200 and j.get("sealed") is True
+          and "studio" not in j and "f5f0e8" not in text
+          and "product-shoe" not in text)
+    rec("st-sealed-meta-redaction", "sealed",
+        "sealed meta of a studio render: no studio record", src,
+        "PASS" if ok else "FAIL", {"status": st},
+        f"plain_studio={bool((j0 or {}).get('studio'))} sealed={j.get('sealed')} "
+        f"sealed_has_studio={'studio' in j} doc={text[:220]}")
+
+
+@cell
 def st_meta_default_brand():
     s, j = meta("filters:studio(product):format(png)", "product-shoe.jpg")
     stu = j.get("studio") or {}

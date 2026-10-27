@@ -1161,9 +1161,16 @@ def parity_cases():
     ]
     vectors = json.load(open(os.path.join(REPO, "spec", "test-vectors.json")))
     for i, v in enumerate(vectors):
-        cases.append({"id": f"vec-{i}", "kind": "sign", "secret": v["secret"],
-                      "remainder": v["remainder"],
-                      "expect": v["signature"]})
+        if v.get("sealed"):
+            cases.append({"id": f"vec-seal-{i}", "kind": "seal",
+                          "secret": v["secret"],
+                          "remainder": v["remainder"], "nonce": v["nonce"],
+                          "key_id": v.get("key_id"),
+                          "expect": v["token"]})
+        else:
+            cases.append({"id": f"vec-{i}", "kind": "sign", "secret": v["secret"],
+                          "remainder": v["remainder"],
+                          "expect": v["signature"]})
     return cases
 
 
@@ -1206,7 +1213,17 @@ def parity_signatures_and_vectors():
     cases = [c for c in parity_cases() if c["kind"] not in ("build_url", "srcset")]
     py, ts, rs = run_emitters(cases)
     diffs = []
+    skipped_seal = 0
     for c in cases:
+        if c["kind"] == "seal" and py.get(c["id"]) == "SKIP:no-extra":
+            # The Python extra is absent in this run: the
+            # sealed byte-parity rests on TS and Rust, and
+            # the skip is reported, not hidden.
+            skipped_seal += 1
+            if ts.get(c["id"]) != c["expect"] or rs.get(c["id"]) != c["expect"]:
+                diffs.append(f"{c['id']}: ts={ts.get(c['id'])!r} "
+                             f"rs={rs.get(c['id'])!r} expect={c['expect']!r}")
+            continue
         vals = {py.get(c["id"]), ts.get(c["id"]), rs.get(c["id"])}
         if len(vals) != 1:
             diffs.append(f"{c['id']}: py={py.get(c['id'])!r} ts={ts.get(c['id'])!r} "
@@ -1215,9 +1232,11 @@ def parity_signatures_and_vectors():
             diffs.append(f"{c['id']}: got {py.get(c['id'])}, spec expects {c['expect']}")
     ok = not diffs
     rec("parity-signatures-and-vectors", "parity",
-        f"{len(cases)} sign/purge/group/upload cases incl. spec vectors", "-",
+        f"{len(cases)} sign/purge/group/upload/seal cases incl. spec vectors", "-",
         "PASS" if ok else "FAIL", None,
-        "byte-identical across all three SDKs and matching spec/test-vectors.json"
+        ("byte-identical across all three SDKs and matching spec/test-vectors.json"
+         + (f"; {skipped_seal} sealed vectors skipped for Python (no cryptography extra)"
+            if skipped_seal else ""))
         if ok else " | ".join(diffs)[:600])
 
 
@@ -1231,6 +1250,231 @@ def parity_cli_sign():
     rec("parity-cli-sign", "parity", "crabcrop sign vs Python build_url", "dog.jpg",
         "PASS" if ok else "FAIL", None,
         f"cli={out[:110]!r} sdk={want[:110]!r} equal={out.splitlines()[0].strip() == want if out else False}")
+
+
+# ---------------------------------------------------------------- sealed
+def seal_path(rem, base="A", name=None, extra=None):
+    """Mint a sealed path for a remainder with the CLI `seal`
+    verb (issue #255). The harness mints through the CLI on
+    purpose: the cells exercise the verb itself and never
+    depend on the Python `cryptography` extra."""
+    rc, out = cli("seal", rem, base, extra=extra)
+    if rc != 0:
+        raise AssertionError(f"cli seal failed: {out}")
+    url = out.splitlines()[0].strip()
+    path = url[len(BASES[base]):]
+    if name:
+        path = f"{path}/{name}"
+    return path
+
+
+@cell
+def sealed_serve_parity():
+    # One render, two spellings, one cache entry: the
+    # second request is a hit whichever order they arrive
+    # in, and the bytes and ETag are identical.
+    rem = f"300x200/{DOG}"
+    purge_cli(rem, "A")
+    sp = seal_path(rem, "A", name="dog.jpg")
+    fp = timed_render("sealed-serve-parity", "A", signed_path(rem))
+    fs = timed_render("sealed-serve-parity", "A", sp)
+    ok = (fp["status"] == 200 and fs["status"] == 200
+          and fp["md5"] == fs["md5"] and fp["etag"] == fs["etag"]
+          and fs["cache_status"].endswith("hit"))
+    rem2 = f"240x160/{CAT}"
+    purge_cli(rem2, "A")
+    sp2 = seal_path(rem2, "A")
+    fs2 = timed_render("sealed-serve-parity", "A", sp2)
+    fp2 = timed_render("sealed-serve-parity", "A", signed_path(rem2))
+    ok = (ok and fs2["status"] == 200 and fp2["status"] == 200
+          and fs2["md5"] == fp2["md5"]
+          and fp2["cache_status"].endswith("hit"))
+    check("sealed-serve-parity", "sealed",
+          "plain then sealed, sealed then plain", "dog.jpg/cat.jpg",
+          ok, fs,
+          f"plain={fp['status']}/{fp['cache_status']} sealed={fs['status']}/{fs['cache_status']} "
+          f"md5_equal={fp['md5'] == fs['md5']} etag_equal={fp['etag'] == fs['etag']} "
+          f"reverse: sealed={fs2['cache_status']} plain={fp2['cache_status']}")
+
+
+@cell
+def sealed_uniform_errors():
+    rem = f"300x200/{DOG}"
+    sp = seal_path(rem, "A", name="dog.jpg")
+    token = sp.split("/")[1]
+    flipped = token[:10] + ("B" if token[10] != "B" else "A") + token[11:]
+    cases = {
+        "flipped-ciphertext": flipped,
+        "unknown-key-id": seal_path(rem, "A", extra=["--key-id", "zz"]),
+        "garbage-segment": "s1.!!!",
+        "unknown-version": "s2.AAAA",
+        "oversized-segment": "s1." + "A" * 5000,
+    }
+    got = {}
+    for label, path in cases.items():
+        st, h, payload, ms = get("A", path if path.startswith("/") else f"/{path}")
+        got[label] = (st, payload.decode("utf-8", "replace").strip())
+    ok = all(v == (403, "bad signature") for v in got.values())
+    # The server is healthy after the refusals, and the
+    # genuine token still serves.
+    st, h, payload, ms = get("A", sp)
+    ok = ok and st == 200
+    check("sealed-uniform-errors", "sealed",
+          "flipped / unknown key id / garbage / unknown version / oversized",
+          "dog.jpg", ok,
+          fact_of("sealed-uniform-errors", "A", "GET", sp, st, h, payload, ms),
+          f"answers={got} genuine_after={st}")
+
+
+@cell
+def sealed_keyed_current():
+    # The default current key ID (no CRABCROP_SECRET_KEY_ID
+    # is set on these instances, so it is `current`): a
+    # token stamped with it opens; a plain signature does
+    # not suddenly need a key ID.
+    rem = f"300x200/{DOG}"
+    purge_cli(rem, "A")
+    sp = seal_path(rem, "A", extra=["--key-id", "current"])
+    f = timed_render("sealed-keyed-current", "A", sp)
+    ok = f["status"] == 200 and f["cache_status"].endswith("fwd=uri-miss")
+    check("sealed-keyed-current", "sealed", "keyed token under the current key id",
+          "dog.jpg", ok, f, f"status={f['status']} cache={f['cache_status']}")
+
+
+@cell
+def sealed_purge_cross_form():
+    # Purge in one spelling evicts the entry the other
+    # spelling serves: the canonicalization chain unseals
+    # sealed targets before keying.
+    rem = f"100x50/{DOG}"
+    sp = seal_path(rem, "A", name="dog.jpg")
+    target = sp[1:]
+    purge_cli(rem, "A")
+    f1 = timed_render("sealed-purge-cross-form", "A", signed_path(rem))
+    st, body, h = purge_http(target, purge_sig(target), "A")
+    ok1 = st == 200 and "purged 1" in body
+    f2 = timed_render("sealed-purge-cross-form", "A", signed_path(rem))
+    ok1 = ok1 and f2["cache_status"].endswith("fwd=uri-miss")
+    purge_cli(rem, "A")
+    fs1 = timed_render("sealed-purge-cross-form", "A", sp)
+    st, body, h = purge_http(rem, purge_sig(rem), "A")
+    ok2 = st == 200 and "purged 1" in body
+    fs2 = timed_render("sealed-purge-cross-form", "A", sp)
+    ok2 = ok2 and fs2["cache_status"].endswith("fwd=uri-miss")
+    check("sealed-purge-cross-form", "sealed",
+          "purge sealed evicts plain, purge plain evicts sealed", "dog.jpg",
+          ok1 and ok2, fs2,
+          f"plain-side: {f1['cache_status']} -> {f2['cache_status']} "
+          f"sealed-side: {fs1['cache_status']} -> {fs2['cache_status']}")
+
+
+@cell
+def sealed_meta_redaction():
+    rem = f"300x200/{DOG}"
+    sp = seal_path(rem, "A", name="dog.jpg")
+    st, h, payload, ms = get("A", sp, {"Accept": "application/json"})
+    j = {}
+    try:
+        j = json.loads(payload)
+    except Exception:
+        pass
+    text = payload.decode("utf-8", "replace")
+    ok = (st == 200 and j.get("sealed") is True and j.get("width") == 300
+          and j.get("height") == 200 and "dog.jpg" not in text
+          and "300x200" not in text)
+    # The plain meta of the same render carries no marker.
+    st2, h2, payload2, ms2 = get("A", signed_path(rem), {"Accept": "application/json"})
+    j2 = {}
+    try:
+        j2 = json.loads(payload2)
+    except Exception:
+        pass
+    ok = ok and st2 == 200 and "sealed" not in j2 and j2.get("width") == 300
+    check("sealed-meta-redaction", "sealed", "meta: sealed:true, no recipe text",
+          "dog.jpg", ok, fact_of("sealed-meta-redaction", "A", "GET", sp, st, h, payload, ms),
+          f"sealed_meta={j.get('sealed')} plain_has_sealed={'sealed' in j2} "
+          f"sealed_doc={text[:220]}")
+
+
+@cell
+def sealed_explain_refusal():
+    hits0 = origin_hits("/dog.jpg")
+    rem = f"300x200/{DOG}"
+    sp = seal_path(rem, "A", name="dog.jpg")
+    st, h, payload, ms = get("A", f"/explain{sp}")
+    hits1 = origin_hits("/dog.jpg")
+    ok = (st == 403 and payload.decode("utf-8", "replace").strip() == "bad signature"
+          and hits1 == hits0)
+    check("sealed-explain-refusal", "sealed", "explain refuses, zero source fetches",
+          "dog.jpg", ok, fact_of("sealed-explain-refusal", "A", "GET", f"/explain{sp}",
+                                  st, h, payload, ms),
+          f"status={st} origin_fetches={hits1 - hits0}")
+
+
+@cell
+def sealed_expired():
+    rem = f"exp:{PAST}/300x200/{DOG}"
+    sp = seal_path(rem, "A")
+    st, h, payload, ms = get("A", sp)
+    ok = (st == 403 and payload.decode("utf-8", "replace").strip() == "signature expired")
+    check("sealed-expired", "sealed", "opened token, expired payload", "dog.jpg",
+          ok, fact_of("sealed-expired", "A", "GET", sp, st, h, payload, ms),
+          f"status={st} body={payload.decode('utf-8', 'replace').strip()}")
+
+
+@cell
+def sealed_presets_only_uniform():
+    # The presets-only instance answers a freeform sealed
+    # payload with the uniform refusal, not the plain
+    # form's 400 presets_only, while a sealed preset URL
+    # serves.
+    rem = f"300x200/{DOG}"
+    sp = seal_path(rem, "OP")
+    st, h, payload, ms = get("OP", sp)
+    ok = (st == 403 and payload.decode("utf-8", "replace").strip() == "bad signature")
+    rem_p = f"preset:thumb/{DOG}"
+    sp_p = seal_path(rem_p, "OP")
+    st_p, h_p, payload_p, ms_p = get("OP", sp_p)
+    ok = ok and st_p == 200
+    check("sealed-presets-only-uniform", "sealed",
+          "presets-only: sealed freeform refused, sealed preset serves", "dog.jpg",
+          ok, fact_of("sealed-presets-only-uniform", "OP", "GET", sp, st, h, payload, ms),
+          f"freeform={st} preset={st_p}")
+
+
+@cell
+def sealed_payload_failure_uniform():
+    # Payload failures after a successful open: unknown
+    # preset and unknown source root answer the uniform
+    # refusal. A pure grammar failure is minted with the
+    # Python SDK instead of the CLI (the CLI validates
+    # remainders at mint time, by design, so it refuses to
+    # seal one), and is skipped with a note when the
+    # cryptography extra is absent.
+    got = {}
+    last = None
+    for label, rem, base in [("unknown-preset", f"preset:nope/{DOG}", "A"),
+                             ("unknown-root", "300x200/root:nope/cat.jpg", "R")]:
+        sp = seal_path(rem, base)
+        st, h, payload, ms = get(base, sp)
+        got[label] = (st, payload.decode("utf-8", "replace").strip())
+        last = (sp, st, h, payload, ms)
+    grammar_note = "grammar case skipped (no cryptography extra)"
+    try:
+        import crabcrop_url as sdk
+        token = sdk.seal_url(SECRET, f"filters:quality(abc)/{DOG}")
+        st, h, payload, ms = get("A", f"/{token}")
+        got["grammar"] = (st, payload.decode("utf-8", "replace").strip())
+        grammar_note = f"grammar={got['grammar']}"
+    except Exception as e:
+        if "cryptography" not in str(e):
+            raise
+    ok = all(v == (403, "bad signature") for v in got.values())
+    sp, st, h, payload, ms = last
+    check("sealed-payload-failure-uniform", "sealed",
+          "unknown preset / unknown root / grammar after open", "dog.jpg",
+          ok, fact_of("sealed-payload-failure-uniform", "A", "GET", sp, st, h, payload, ms),
+          f"answers={got} {grammar_note}")
 
 
 # ---------------------------------------------------------------- MCP
@@ -1364,7 +1608,7 @@ def parity_vectors_py():
     """Smoke-tier parity: the repo's published spec vectors through the
     Python SDK emitter only (no node, no cargo). The full three-SDK
     byte comparison is parity-signatures-and-vectors (full tier)."""
-    cases = [c for c in parity_cases() if c["kind"] == "sign"]
+    cases = [c for c in parity_cases() if c["kind"] in ("sign", "seal")]
     path = os.path.join(OUT, "parity-cases-py.json")
     with open(path, "w") as fh:
         json.dump(cases, fh)
@@ -1380,12 +1624,16 @@ def parity_vectors_py():
             f"emitter failed: rc={r.returncode} err={r.stderr[:300]!r}")
         return
     diffs = [f"{c['id']}: got {py.get(c['id'])}, spec expects {c['expect']}"
-             for c in cases if py.get(c["id"]) != c["expect"]]
+             for c in cases
+             if py.get(c["id"]) != c["expect"] and py.get(c["id"]) != "SKIP:no-extra"]
+    skipped = sum(1 for c in cases if py.get(c["id"]) == "SKIP:no-extra")
     ok = not diffs
     rec("parity-vectors-py", "parity",
-        f"{len(cases)} published sign vectors", "-",
+        f"{len(cases)} published sign and sealed vectors", "-",
         "PASS" if ok else "FAIL", None,
-        "python SDK matches spec/test-vectors.json on every vector"
+        ("python SDK matches spec/test-vectors.json on every vector"
+         + (f"; {skipped} sealed vectors skipped (no cryptography extra)"
+            if skipped else ""))
         if ok else " | ".join(diffs)[:600])
 
 

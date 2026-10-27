@@ -5,7 +5,7 @@ Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from Python.
 ## Usage
 
 ```python
-from crabcrop_url import build_url, build_srcset, purge_group_signature, purge_signature, sign, upload_signature, verify
+from crabcrop_url import build_sealed_url, build_url, build_srcset, purge_group_signature, purge_signature, seal_url, sign, unseal, upload_signature, verify
 
 # A signed URL. The operation string is passed verbatim and may
 # contain several segments and preset: references.
@@ -51,6 +51,20 @@ group = purge_group_signature("your-secret", "thumb")
 # then; its path is /upload/<signature>/exp:<expiry>/<name>.
 upload = upload_signature("your-secret", "heroes/photo.jpg")
 expiring = upload_signature("your-secret", "heroes/photo.jpg", 1893456000)
+
+# Sealed URLs (issue #255): the whole remainder encrypted into an
+# opaque token in the signature slot, for public links whose recipe
+# should stay unreadable. The server serves the sealed and plain
+# forms of one render from the same cache entry. Sealing alone
+# needs the cryptography package: pip install crabcrop-url[seal]
+sealed_url = build_sealed_url(
+    "https://images.example.com",
+    "your-secret",
+    "300x200",
+    "https://example.com/photo.jpg",
+    name="photo.jpg",
+)
+remainder = unseal("your-secret", seal_url("your-secret", "300x200/https://example.com/photo.jpg"))
 ```
 
 Pass `None` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode. The secret may be `str` or `bytes`.

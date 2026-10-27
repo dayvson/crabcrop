@@ -8,6 +8,14 @@ fn s(v: &Value) -> &str {
     v.as_str().unwrap_or("")
 }
 
+fn hex_bytes(v: &Value) -> Vec<u8> {
+    let text = s(v);
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap_or(0))
+        .collect()
+}
+
 fn opt_u64(v: &Value) -> Option<u64> {
     if v.is_null() {
         None
@@ -56,6 +64,19 @@ fn main() {
                 }
             }
             "sign" => sign(secret.unwrap(), s(&c["remainder"])),
+            "seal" => {
+                let nonce_vec = hex_bytes(&c["nonce"]);
+                let nonce: [u8; 12] = nonce_vec.try_into().unwrap_or([0u8; 12]);
+                let key_id = if c["key_id"].is_null() {
+                    None
+                } else {
+                    Some(s(&c["key_id"]))
+                };
+                match seal_with_nonce(secret.unwrap(), key_id, &nonce, s(&c["remainder"])) {
+                    Ok(t) => t,
+                    Err(e) => format!("ERROR:{e:?}"),
+                }
+            }
             "purge_sig" => purge_signature(secret.unwrap(), s(&c["target"])),
             "group_sig" => purge_group_signature(secret.unwrap(), s(&c["group"])),
             "upload_sig" => match opt_u64(&c["expires"]) {

@@ -516,6 +516,18 @@ async fn explain_handle(
             .into_response();
     };
     let full = format!("/{tail}");
+    // A sealed spelling is refused wholesale (issue #255):
+    // the server never unseals as a service, because an
+    // endpoint that opens tokens would be an unsealing
+    // oracle for anyone who lifts one off a public page.
+    // Operators unseal locally (the CLI's `unseal` verb,
+    // under their own secret) and then explain the plain
+    // form. The refusal is the uniform one and no source
+    // fetch happens for it.
+    let first_segment = tail.split('/').next().unwrap_or("");
+    if crate::url::looks_sealed(first_segment) {
+        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+    }
     let (signature, key_id, rest) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
@@ -733,6 +745,34 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
         purge_log("purge", target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
     }
+    // A sealed target (issue #255) unseals here, the first
+    // step of the chain, now that the purge signature has
+    // verified over the target as presented: the steps
+    // below continue with the decrypted remainder, so a
+    // purge by the sealed spelling evicts the entry its
+    // plain spelling serves, and the reverse. The decrypted
+    // remainder replaces the target wholesale (anything
+    // after the token segment was the cosmetic friendly
+    // name). A token that does not open under this keyring
+    // falls back to the presented target, which matches
+    // nothing: the same quiet no-op an unverifiable spelling
+    // gets everywhere else in this handler.
+    let unsealed;
+    let target = {
+        let presented_segment = target.split('/').next().unwrap_or("");
+        match crate::url::split_sealed_segment(presented_segment) {
+            Some((kid, token)) if presented_segment.len() <= crabcrop_url::MAX_SEALED_SEGMENT => {
+                match state.keyring.open_sealed(kid, token) {
+                    Some(text) => {
+                        unsealed = text;
+                        unsealed.as_str()
+                    }
+                    None => target,
+                }
+            }
+            _ => target,
+        }
+    };
     // The signature covers the target as presented; the
     // entries, though, are keyed by the canonical form of
     // the EXPANDED remainder (Q1, Q5). Expand presets the
@@ -956,6 +996,18 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             .into_response();
     };
     let full = format!("/{tail}");
+    // A sealed spelling is refused wholesale (issue #255):
+    // the server never unseals as a service, because an
+    // endpoint that opens tokens would be an unsealing
+    // oracle for anyone who lifts one off a public page.
+    // Operators unseal locally (the CLI's `unseal` verb,
+    // under their own secret) and then explain the plain
+    // form. The refusal is the uniform one and no source
+    // fetch happens for it.
+    let first_segment = tail.split('/').next().unwrap_or("");
+    if crate::url::looks_sealed(first_segment) {
+        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+    }
     let (signature, key_id, rest) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -1426,26 +1478,88 @@ async fn serve(
     let mut record = RequestRecord::default();
     let full = format!("/{path}");
 
+    // A sealed spelling (issue #255) is intercepted before
+    // the plain parse: the token sits in the signature slot,
+    // and everything about it (an oversized segment, a
+    // failed open, and every payload failure after a
+    // successful open) answers with the one uniform refusal,
+    // so a token is never a validity oracle. On a successful
+    // open the decrypted remainder takes the place of `rest`
+    // and flows through the exact pipeline a verified plain
+    // remainder flows through: because decryption produces
+    // the pre-expansion string the HMAC form carries, the
+    // two spellings share one cache entry, one ETag, one
+    // purge target by construction.
+    let sealed_refusal = |record: RequestRecord| {
+        (
+            (StatusCode::FORBIDDEN, "bad signature").into_response(),
+            record,
+        )
+    };
+    let mut sealed = false;
+    let mut sealed_remainder: Option<String> = None;
+    let nolead = full.strip_prefix('/').unwrap_or(&full);
+    let first_segment = nolead.split('/').next().unwrap_or("");
     // Grammar failures answer 400 with the parser's own
     // message as the body: it names only what the caller
     // sent, and it is the difference between a debuggable
     // rejection and an empty one.
-    let (signature, key_id, rest) = match parse_signature(&full) {
-        Ok(v) => v,
-        Err(e) => {
-            return (parse_failure(&e, accept), record);
+    let (signature, key_id, rest) = if crate::url::looks_sealed(first_segment)
+        && crate::url::split_sealed_segment(first_segment).is_none()
+    {
+        // Marker-shaped but not a token this scheme opens
+        // (an unknown version): the uniform refusal, never
+        // the grammar's 400, so the answer cannot announce
+        // that the segment was not a token at all.
+        return sealed_refusal(record);
+    } else if let Some((kid, token)) = crate::url::split_sealed_segment(first_segment) {
+        if first_segment.len() > crabcrop_url::MAX_SEALED_SEGMENT {
+            return sealed_refusal(record);
+        }
+        let key_id = kid.map(str::to_string);
+        let verify_start = Instant::now();
+        let opened = state.keyring.open_sealed(key_id.as_deref(), token);
+        record.verify = verify_start.elapsed();
+        match opened {
+            Some(text) => {
+                sealed = true;
+                sealed_remainder = Some(text);
+                // The placeholder signature is never read:
+                // for a sealed request the open above was
+                // the verification the branch below runs
+                // for plain spellings.
+                (crate::url::Signature::Unsafe, key_id, "")
+            }
+            None => return sealed_refusal(record),
+        }
+    } else {
+        match parse_signature(&full) {
+            Ok(v) => v,
+            Err(e) => {
+                return (parse_failure(&e, accept), record);
+            }
         }
     };
-    let verify_start = Instant::now();
-    let verified = state
-        .keyring
-        .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe);
-    record.verify = verify_start.elapsed();
-    if !verified {
-        return (
-            (StatusCode::FORBIDDEN, "bad signature").into_response(),
-            record,
-        );
+    let rest: &str = if sealed {
+        sealed_remainder
+            .as_deref()
+            .expect("set when the open succeeds")
+    } else {
+        rest
+    };
+    if !sealed {
+        let verify_start = Instant::now();
+        let verified =
+            state
+                .keyring
+                .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe);
+        record.verify = verify_start.elapsed();
+        if !verified {
+            return (
+                (StatusCode::FORBIDDEN, "bad signature").into_response(),
+                record,
+            );
+        }
     }
     // Defense in depth for the purge domain separation (audit
     // P-1): an image remainder may not begin with the `purge`
@@ -1456,6 +1570,9 @@ async fn serve(
         rest.split('/').next(),
         Some("purge" | "purge-group" | "upload")
     ) {
+        if sealed {
+            return sealed_refusal(record);
+        }
         return (
             (
                 StatusCode::BAD_REQUEST,
@@ -1483,12 +1600,18 @@ async fn serve(
             &expanded
         }
         Err(e) => {
+            if sealed {
+                return sealed_refusal(record);
+            }
             return (parse_failure(&e, accept), record);
         }
     };
     let (ops, source_url, expiry, max_age) = match parse_operations_with_expiry(rest) {
         Ok(v) => v,
         Err(e) => {
+            if sealed {
+                return sealed_refusal(record);
+            }
             return (parse_failure(&e, accept), record);
         }
     };
@@ -1510,6 +1633,9 @@ async fn serve(
             expanded_url.as_str()
         }
         Err(e) => {
+            if sealed {
+                return sealed_refusal(record);
+            }
             return (parse_failure(&e, accept), record);
         }
     };
@@ -1579,6 +1705,13 @@ async fn serve(
     // Refuse specifically rather than describing encoded
     // video bytes as if they were a still image.
     if meta && wants_video {
+        if sealed {
+            // The plain form's message echoes the payload's
+            // own format argument; a sealed payload failure
+            // answers the uniform refusal instead (issue
+            // #255).
+            return sealed_refusal(record);
+        }
         return (
             (
                 StatusCode::BAD_REQUEST,
@@ -1599,6 +1732,9 @@ async fn serve(
     // the meta document reports on.
     let debug = directives.debug_focal;
     if meta && debug {
+        if sealed {
+            return sealed_refusal(record);
+        }
         return (
             (
                 StatusCode::BAD_REQUEST,
@@ -1669,6 +1805,7 @@ async fn serve(
         groups: groups.clone(),
         cache_key: cache_key.clone(),
         max_age,
+        sealed,
     };
     // Singleflight (audit R2-09): the first miss for a key
     // leads (one fetch, one encode, under the gates below);
@@ -1798,6 +1935,13 @@ struct MissWork {
     groups: Vec<String>,
     cache_key: String,
     max_age: Option<u32>,
+    /// Whether the request arrived in the sealed spelling
+    /// (issue #255). Meta for it redacts every operation and
+    /// source text. The flag describes this request, not the
+    /// render: meta bypasses the cache in both directions,
+    /// so a plain meta request on the same render still
+    /// reports in full.
+    sealed: bool,
 }
 
 /// The cache-miss path: load the source, resolve
@@ -1825,6 +1969,7 @@ async fn serve_miss(
         groups,
         cache_key,
         max_age,
+        sealed,
     } = work;
     let accept = accept.as_deref();
     let cache_status = "crabcrop; fwd=uri-miss";
@@ -2113,6 +2258,7 @@ async fn serve_miss(
     let mut response = if meta {
         meta_response(
             &processed,
+            sealed,
             annotation.as_ref(),
             detections.as_deref(),
             moderation.as_ref(),
@@ -2853,8 +2999,10 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     half
 }
 
+#[allow(clippy::too_many_arguments)]
 fn meta_response(
     processed: &crate::engine::ProcessedImage,
+    sealed: bool,
     annotation: Option<&Annotation>,
     detections: Option<&[(String, crate::ai::Detection)]>,
     moderation: Option<&ModerationMeta>,
@@ -2871,6 +3019,22 @@ fn meta_response(
         processed.source_width,
         processed.source_height,
     );
+    if sealed {
+        // The sealed audit (issue #255): a request that
+        // arrived sealed gets the render facts and every
+        // image-derived section (tags, detections,
+        // moderation, embedding, aesthetic, OCR, placeholder,
+        // ssimulacra2), never a field that reports operation
+        // or source text. Below, that means the operation
+        // records (video, pdf, studio, inpaint, segments)
+        // are skipped: each resolves or echoes a URL
+        // argument, the recipe text the token exists to
+        // hide. Model identities inside moderation and OCR
+        // are deployment facts the plain meta of any URL
+        // already publishes, and the base fields above are
+        // measured from the render.
+        body.push_str(",\"sealed\":true");
+    }
     if let Some(a) = annotation {
         let tags: Vec<String> = a
             .tags
@@ -3004,7 +3168,7 @@ fn meta_response(
     if let Some(score) = processed.ssimulacra2 {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
     }
-    if let Some(video) = &processed.video {
+    if !sealed && let Some(video) = &processed.video {
         // The video record (issue #214): the probed facts
         // of the video source and the resolved timestamp
         // the frame was selected at. The duration is
@@ -3031,7 +3195,7 @@ fn meta_response(
             duration
         ));
     }
-    if let Some(pdf) = &processed.pdf {
+    if !sealed && let Some(pdf) = &processed.pdf {
         // The PDF record (issue #215): the document's page
         // count, the page this response rendered (after
         // canonicalization), and the page size in points.
@@ -3053,7 +3217,7 @@ fn meta_response(
             points(pdf.page_height)
         ));
     }
-    if let Some(studio) = &processed.studio {
+    if !sealed && let Some(studio) = &processed.studio {
         // The studio record (issues #197 and #198): the
         // mode, the resolved parameters, the steps that
         // ran, the fallbacks taken, and the mask confidence
@@ -3118,7 +3282,7 @@ fn meta_response(
         }
         body.push('}');
     }
-    if let Some(inpaint) = &processed.inpaint {
+    if !sealed && let Some(inpaint) = &processed.inpaint {
         // The region-removal record (issue #176): the
         // rectangles the inpainting model erased, in chain
         // order, each [x, y, w, h] in the pixel coordinates
@@ -3133,7 +3297,7 @@ fn meta_response(
             regions.join(",")
         ));
     }
-    if let Some(segments) = &processed.segments {
+    if !sealed && let Some(segments) = &processed.segments {
         // The segmentation record (issue #175): every
         // object a class operation segmented, in chain
         // order, with its mask geometry: the detection box
@@ -4718,6 +4882,279 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(resp.text().await.unwrap(), "bad signature");
+    }
+
+    /// Mint a sealed path for a remainder under the test
+    /// secret (issue #255): the token segment, plus the
+    /// friendly name when one is given.
+    fn sealed_path(remainder: &str, name: Option<&str>) -> String {
+        let token = crabcrop_url::seal(SECRET, remainder).unwrap();
+        match name {
+            Some(name) => format!("{token}/{name}"),
+            None => token,
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_and_plain_share_one_cache_entry() {
+        // The token carries the pre-expansion remainder, so
+        // the two spellings are one render: one fetch, one
+        // entry, one ETag, whichever arrives first.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        // Plain first, sealed second.
+        let plain = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), 200);
+        assert_eq!(header(&plain, "cache-status"), "crabcrop; fwd=uri-miss");
+        let etag = header(&plain, "etag");
+        let plain_bytes = plain.bytes().await.unwrap();
+        let sealed = client()
+            .get(format!(
+                "{base}/{}",
+                sealed_path(&remainder, Some("photo.png"))
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sealed.status(), 200);
+        assert_eq!(header(&sealed, "cache-status"), "crabcrop; hit");
+        assert_eq!(header(&sealed, "etag"), etag);
+        assert_eq!(sealed.bytes().await.unwrap(), plain_bytes);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The other order, on a fresh source: sealed first
+        // (with no friendly name at all), plain second.
+        let (src2, hits2) = spawn_counting_server(200, "image/png", test_png()).await;
+        let remainder2 = format!("200x40/{src2}");
+        let sealed = client()
+            .get(format!("{base}/{}", sealed_path(&remainder2, None)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sealed.status(), 200);
+        let sealed_bytes = sealed.bytes().await.unwrap();
+        let plain = client()
+            .get(format!("{base}/{}/{remainder2}", sign(&remainder2)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), 200);
+        assert_eq!(header(&plain, "cache-status"), "crabcrop; hit");
+        assert_eq!(plain.bytes().await.unwrap(), sealed_bytes);
+        assert_eq!(hits2.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sealed_failures_are_one_uniform_refusal() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let token = crabcrop_url::seal(SECRET, &remainder).unwrap();
+        let flipped = {
+            let mut t = token.clone().into_bytes();
+            let last = t.len() - 1;
+            t[last] = if t[last] == b'A' { b'B' } else { b'A' };
+            String::from_utf8(t).unwrap()
+        };
+        let cases = [
+            flipped,
+            // Minted under a secret this server does not hold.
+            crabcrop_url::seal(b"another-secret", &remainder).unwrap(),
+            // An unknown key ID routes nowhere.
+            format!("zz:{token}"),
+            // A known-shaped but wrong key ID opens nothing.
+            format!(
+                "k2:{}",
+                crabcrop_url::seal(b"another-secret", &remainder).unwrap()
+            ),
+            // Garbage in the segment.
+            "s1.!!!".to_string(),
+            "s1.AAAA".to_string(),
+            // An unknown version marker.
+            "s2.AAAA".to_string(),
+            // A truncated token.
+            token[..token.len() - 2].to_string(),
+            // Oversized: refused before decode.
+            format!("s1.{}", "A".repeat(5000)),
+        ];
+        for case in cases {
+            let resp = client()
+                .get(format!("{base}/{case}/photo.png"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{case}");
+            assert_eq!(resp.text().await.unwrap(), "bad signature", "{case}");
+        }
+        // The server is unharmed and the genuine token
+        // still serves.
+        let resp = client()
+            .get(format!("{base}/{token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn sealed_payload_failures_are_one_uniform_refusal() {
+        // Each of these remainders opens fine (minted under
+        // the server's own secret) and then fails a pipeline
+        // stage. The plain form answers some of these with
+        // instructive 400s; the sealed form must not: the
+        // failure's shape would oracle the payload.
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        for remainder in [
+            // Grammar junk: a filter argument that is not
+            // a number, and a remainder with no source.
+            format!("filters:quality(abc)/{src}"),
+            "300x50".to_string(),
+            // A reserved segment at the payload head.
+            "purge/anything".to_string(),
+            "upload/heroes/cat.jpg".to_string(),
+            // An unknown preset (a grammar error on every
+            // server).
+            format!("preset:nope/{src}"),
+            // An unknown source root.
+            "300x50/root:nope/cat.jpg".to_string(),
+        ] {
+            let resp = client()
+                .get(format!("{base}/{}", sealed_path(&remainder, None)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{remainder}");
+            assert_eq!(resp.text().await.unwrap(), "bad signature", "{remainder}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_expired_answers_signature_expired() {
+        // The one distinct sealed answer: the token opened,
+        // and its payload is expired, exactly the plain
+        // form's answer for the same remainder.
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("exp:1/300x50/{src}");
+        let resp = client()
+            .get(format!("{base}/{}", sealed_path(&remainder, None)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "signature expired");
+    }
+
+    #[tokio::test]
+    async fn explain_refuses_sealed_spellings_without_fetching() {
+        // Explain never unseals (it would be an oracle for
+        // lifted tokens): the uniform refusal, and the
+        // origin sees nothing.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let resp = client()
+            .get(format!(
+                "{base}/explain/{}",
+                sealed_path(&remainder, Some("photo.png"))
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.text().await.unwrap(), "bad signature");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sealed_meta_marks_the_request_and_hides_the_recipe() {
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let body = client()
+            .get(format!(
+                "{base}/{}",
+                sealed_path(&remainder, Some("photo.png"))
+            ))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["sealed"], true);
+        assert_eq!(doc["width"], 300);
+        assert_eq!(doc["height"], 50);
+        // No operation or source text: the source URL and
+        // the friendly name appear nowhere in the document.
+        assert!(!body.contains("src.png"), "{body}");
+        assert!(!body.contains("photo.png"), "{body}");
+        // The plain meta of the same render carries no
+        // sealed marker.
+        let plain = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        assert_eq!(doc["sealed"], serde_json::Value::Null);
+        assert_eq!(doc["width"], 300);
+    }
+
+    #[tokio::test]
+    async fn sealed_and_plain_purges_reach_each_others_entries() {
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("100x50/{src}");
+        let sealed = sealed_path(&remainder, Some("photo.png"));
+        // Render plain, purge by the sealed spelling.
+        let resp = get_signed(&base, &remainder).await;
+        assert_eq!(resp.status(), 200);
+        let resp = get_signed(&base, &remainder).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        let purge_sig = crate::url::purge_signature(SECRET, &sealed);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{sealed}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = get_signed(&base, &remainder).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // Render sealed, purge by the plain spelling.
+        let resp = client()
+            .get(format!("{base}/{sealed}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = client()
+            .get(format!("{base}/{sealed}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
     }
 
     #[tokio::test]

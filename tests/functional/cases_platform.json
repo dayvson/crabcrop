@@ -508,5 +508,59 @@
   "group": "pages",
   "kind": "scripted",
   "tier": "full"
+ },
+ {
+  "id": "sealed-serve-parity",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "sealed-uniform-errors",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "sealed-keyed-current",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "sealed-purge-cross-form",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "sealed-meta-redaction",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "sealed-explain-refusal",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "sealed-expired",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "sealed-presets-only-uniform",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
+  "id": "sealed-payload-failure-uniform",
+  "group": "sealed",
+  "kind": "scripted",
+  "tier": "full"
  }
 ]
