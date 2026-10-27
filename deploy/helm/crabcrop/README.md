@@ -7,8 +7,8 @@ Deploys the crabcrop image service. The chart is deliberately thin: the server i
 Release images are published to GHCR as `ghcr.io/dayvson/crabcrop`, tagged with the release version; the chart defaults point there. To pin the exact image, set `image.digest` (and `ai.image.digest` for the AI variant) to a `sha256:...` digest. To run your own build instead:
 
 ```bash
-docker build -t your-registry/crabcrop:0.1.0 .
-docker push your-registry/crabcrop:0.1.0
+docker build -t your-registry/crabcrop:0.7.0 .
+docker push your-registry/crabcrop:0.7.0
 ```
 
 Create the signing secret (16+ bytes; it signs and verifies every URL):
@@ -23,7 +23,7 @@ Install:
 ```bash
 helm install crabcrop deploy/helm/crabcrop \
   --set image.repository=your-registry/crabcrop \
-  --set image.tag=0.1.0 \
+  --set image.tag=0.7.0 \
   --set existingSecret=crabcrop-secret
 ```
 
