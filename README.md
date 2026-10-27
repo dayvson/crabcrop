@@ -25,9 +25,9 @@ brew install --formula ./crabcrop.rb
 **Docker:** the base image, and the AI variant with background removal and face detection on board:
 
 ```bash
-docker pull ghcr.io/dayvson/crabcrop:0.7.0
-docker pull ghcr.io/dayvson/crabcrop-ai:0.7.0
-docker run -e CRABCROP_SECRET=your-secret -p 3000:3000 ghcr.io/dayvson/crabcrop:0.7.0
+docker pull ghcr.io/dayvson/crabcrop:0.8.0
+docker pull ghcr.io/dayvson/crabcrop-ai:0.8.0
+docker run -e CRABCROP_SECRET=your-secret -p 3000:3000 ghcr.io/dayvson/crabcrop:0.8.0
 ```
 
 **Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases). To build from source instead, see [Deployment](#deployment).
