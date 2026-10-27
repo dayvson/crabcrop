@@ -197,6 +197,14 @@ pub struct AppState {
     /// aesthetic field. The score is descriptive only:
     /// nothing here alters serving either.
     pub aesthetic: Option<Arc<crate::ai::AestheticHead>>,
+    /// OCR provider for meta responses that opt in with
+    /// `ocr=1` (issue #177), preloaded at boot when the
+    /// `CRABCROP_OCR_*` set is configured. `None` means
+    /// the opt-in reports OCR as unavailable. The text
+    /// only annotates meta; nothing here alters serving
+    /// either: the image a meta request describes is the
+    /// same entry an image request returns.
+    pub ocr: Option<Arc<dyn crate::ai::OcrProvider>>,
     /// Detection provider for class redaction and meta
     /// detections, preloaded at boot when
     /// `CRABCROP_DETECT_MODEL` is configured. `None` means
@@ -2097,6 +2105,11 @@ async fn serve_miss(
         None
     };
     let aesthetic = compose_aesthetic(state, embedding_run.as_ref());
+    let ocr = if meta && wants_ocr(accept) {
+        Some(ocr_meta(state, &processed, ai_gated).await)
+    } else {
+        None
+    };
     let mut response = if meta {
         meta_response(
             &processed,
@@ -2109,6 +2122,7 @@ async fn serve_miss(
                 None
             },
             aesthetic.as_ref(),
+            ocr.as_ref(),
         )
     } else {
         respond(
@@ -2247,6 +2261,13 @@ fn wants_moderation(accept: Option<&str>) -> bool {
 /// same rule as `placeholders`.
 fn wants_embeddings(accept: Option<&str>) -> bool {
     wants_meta_param(accept, "embeddings")
+}
+
+/// Whether the accepted `application/json` entry asks
+/// for OCR text: an `ocr` parameter, same rule as
+/// `placeholders`.
+fn wants_ocr(accept: Option<&str>) -> bool {
+    wants_meta_param(accept, "ocr")
 }
 
 /// Whether the accepted `application/json` entry carries
@@ -2631,6 +2652,80 @@ async fn embed_meta(
     }
 }
 
+/// The OCR field of a meta response that asked for it
+/// (`ocr=1`, issue #177): either the provider's report,
+/// composed for the wire, or the reason there is none.
+/// Like moderation, the field is an annotation, so
+/// every failure degrades to the unavailable form and
+/// the meta request still succeeds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OcrMeta {
+    Report(crate::ai::OcrReport),
+    Unavailable(&'static str),
+}
+
+/// Compose an OCR report for the response: line scores
+/// round to 3 decimals, like tag scores. Boxes and text
+/// pass through untouched.
+fn compose_ocr(report: &crate::ai::OcrReport) -> crate::ai::OcrReport {
+    crate::ai::OcrReport {
+        model: report.model.clone(),
+        language: report.language.clone(),
+        lines: report
+            .lines
+            .iter()
+            .map(|line| crate::ai::OcrLine {
+                text: line.text.clone(),
+                score: (line.score * 1000.0).round() / 1000.0,
+                x: line.x,
+                y: line.y,
+                w: line.w,
+                h: line.h,
+            })
+            .collect(),
+    }
+}
+
+/// Run OCR for a meta response that asked for it. Same
+/// permit rule and explicit-outcome stance as
+/// `moderate_meta`: an unconfigured provider, a busy
+/// gate, and a failed inference each report unavailable,
+/// with a reason, because the client asked for the
+/// field by name.
+async fn ocr_meta(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+    ai_gated: bool,
+) -> OcrMeta {
+    let Some(provider) = state.ocr.as_ref() else {
+        return OcrMeta::Unavailable("not_configured");
+    };
+    let _permit = if ai_gated {
+        None
+    } else {
+        match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            _ => return OcrMeta::Unavailable("busy"),
+        }
+    };
+    let img = match crate::engine::decode_image(&processed.bytes) {
+        Ok(img) => img,
+        Err(_) => return OcrMeta::Unavailable("inference_failed"),
+    };
+    let provider = provider.clone();
+    match tokio::task::spawn_blocking(move || provider.recognize(&img)).await {
+        Ok(Ok(report)) => OcrMeta::Report(compose_ocr(&report)),
+        Ok(Err(e)) => {
+            eprintln!("OCR error: {e}");
+            OcrMeta::Unavailable("inference_failed")
+        }
+        Err(e) => {
+            eprintln!("OCR task failed: {e}");
+            OcrMeta::Unavailable("inference_failed")
+        }
+    }
+}
+
 /// The aesthetic field of a meta response (issue
 /// #172), present whenever a head is configured: the
 /// head's identity always rides along, and the
@@ -2765,6 +2860,7 @@ fn meta_response(
     moderation: Option<&ModerationMeta>,
     embedding: Option<&EmbeddingMeta>,
     aesthetic: Option<&AestheticMeta>,
+    ocr: Option<&OcrMeta>,
 ) -> Response {
     let mut body = format!(
         "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}",
@@ -3029,6 +3125,52 @@ fn meta_response(
             ",\"segments\":{{\"objects\":[{}]}}",
             objects.join(",")
         ));
+    }
+    if let Some(ocr) = ocr {
+        // The OCR field (issue #177): the model identity
+        // (the recognition model: it fixes the script),
+        // the operator-declared language, the lines in
+        // reading order with their boxes in the rendered
+        // image's pixels, and the lines joined as one
+        // text content. An unavailable OCR is explicit
+        // too, since the client opted in by name.
+        match ocr {
+            OcrMeta::Report(report) => {
+                let lines: Vec<String> = report
+                    .lines
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{{\"text\":{},\"score\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                            serde_json::to_string(&l.text).unwrap_or_default(),
+                            l.score,
+                            l.x,
+                            l.y,
+                            l.w,
+                            l.h
+                        )
+                    })
+                    .collect();
+                let content = report
+                    .lines
+                    .iter()
+                    .map(|l| l.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                body.push_str(&format!(
+                    ",\"ocr\":{{\"model\":{},\"language\":{},\"text\":[{}],\"text_content\":{}}}",
+                    serde_json::to_string(&report.model).unwrap_or_default(),
+                    serde_json::to_string(&report.language).unwrap_or_default(),
+                    lines.join(","),
+                    serde_json::to_string(&content).unwrap_or_default()
+                ));
+            }
+            OcrMeta::Unavailable(reason) => {
+                body.push_str(&format!(
+                    ",\"ocr\":{{\"available\":false,\"reason\":\"{reason}\"}}"
+                ));
+            }
+        }
     }
     if let Some(ph) = &processed.placeholder {
         let palette: Vec<String> = ph.palette.iter().map(|c| format!("\"{c}\"")).collect();
@@ -3358,6 +3500,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3465,6 +3608,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3545,6 +3689,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3628,6 +3773,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -3857,6 +4003,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -4210,6 +4357,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -4271,6 +4419,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -4335,6 +4484,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -4900,6 +5050,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -5722,6 +5873,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -5848,6 +6000,7 @@ mod tests {
             moderation: provider,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -6001,6 +6154,241 @@ mod tests {
         assert!(!wants_moderation(Some("application/json; moderation=yes")));
         assert!(!wants_moderation(Some("application/json; detections=1")));
         assert!(!wants_moderation(None));
+    }
+
+    #[derive(Debug)]
+    struct FakeOcr;
+
+    impl crate::ai::OcrProvider for FakeOcr {
+        fn recognize(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::OcrReport, crate::ai::AiError> {
+            // Raw scores (issue #177): the composition
+            // rounds them for the wire.
+            Ok(crate::ai::OcrReport {
+                model: "fake-recognizer".to_string(),
+                language: "en".to_string(),
+                lines: vec![
+                    crate::ai::OcrLine {
+                        text: "CRABCROP MARKET".to_string(),
+                        score: 0.98765,
+                        x: 41,
+                        y: 37,
+                        w: 490,
+                        h: 42,
+                    },
+                    crate::ai::OcrLine {
+                        text: "OPEN 24 HOURS".to_string(),
+                        score: 0.9,
+                        x: 40,
+                        y: 248,
+                        w: 401,
+                        h: 41,
+                    },
+                ],
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingOcr;
+
+    impl crate::ai::OcrProvider for FailingOcr {
+        fn recognize(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::OcrReport, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference("model exploded".to_string()))
+        }
+    }
+
+    async fn spawn_app_with_ocr(provider: Option<Arc<dyn crate::ai::OcrProvider>>) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: None,
+            segment: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            ocr: provider,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn meta_includes_ocr_text_only_on_opt_in() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_ocr(Some(Arc::new(FakeOcr))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; ocr=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let ocr = &meta["ocr"];
+        assert_eq!(ocr["model"], "fake-recognizer");
+        assert_eq!(ocr["language"], "en");
+        let lines = ocr["text"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["text"], "CRABCROP MARKET");
+        // The raw 0.98765 rounds to 3 decimals on the wire.
+        assert!((lines[0]["score"].as_f64().unwrap() - 0.988).abs() < 1e-9);
+        assert_eq!(lines[0]["x"], 41);
+        assert_eq!(lines[0]["y"], 37);
+        assert_eq!(lines[0]["w"], 490);
+        assert_eq!(lines[0]["h"], 42);
+        assert_eq!(lines[1]["text"], "OPEN 24 HOURS");
+        // The joined content is the lines in order, one
+        // per line.
+        assert_eq!(ocr["text_content"], "CRABCROP MARKET\nOPEN 24 HOURS");
+        // Without the opt-in the field is absent, even
+        // with a provider configured.
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(meta.get("ocr").is_none());
+    }
+
+    #[tokio::test]
+    async fn meta_ocr_reports_unavailable_without_a_provider() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_ocr(None).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; ocr=1")
+            .send()
+            .await
+            .unwrap();
+        // The meta request still succeeds; only the
+        // field reports its state.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["ocr"]["available"], false);
+        assert_eq!(meta["ocr"]["reason"], "not_configured");
+    }
+
+    #[tokio::test]
+    async fn meta_ocr_failure_reports_unavailable() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_ocr(Some(Arc::new(FailingOcr))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; ocr=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["ocr"]["available"], false);
+        assert_eq!(meta["ocr"]["reason"], "inference_failed");
+    }
+
+    #[tokio::test]
+    async fn ocr_meta_requests_leave_the_image_bytes_identical() {
+        // OCR is an annotation: the image entry is built
+        // and cached exactly as if the opt-in never
+        // happened (issue #177). Render the image, ask
+        // for OCR meta, render again: the bytes must be
+        // the same bytes, and the meta must describe
+        // that same length.
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_ocr(Some(Arc::new(FakeOcr))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let first = client()
+            .get(format!("{base}{url_path}"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; ocr=1")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["bytes"].as_u64().unwrap(), first.len() as u64);
+        assert!(meta.get("ocr").is_some());
+        let second = client()
+            .get(format!("{base}{url_path}"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn ocr_opt_in_takes_exact_tokens() {
+        // The #151 rule, for the OCR parameter.
+        assert!(wants_ocr(Some("application/json; ocr")));
+        assert!(wants_ocr(Some("application/json; ocr=1")));
+        assert!(wants_ocr(Some("application/json; ocr=TRUE")));
+        assert!(!wants_ocr(Some("application/json")));
+        assert!(!wants_ocr(Some("application/json; ocr=0")));
+        assert!(!wants_ocr(Some("application/json; ocr=yes")));
+        assert!(!wants_ocr(Some("application/json; moderation=1")));
+        assert!(!wants_ocr(None));
     }
 
     #[test]
@@ -6175,6 +6563,7 @@ mod tests {
             tag_threshold: 0.05,
             moderation: None,
             embeddings: provider,
+            ocr: None,
             aesthetic,
             detect: None,
             detectors: Vec::new(),
@@ -6394,6 +6783,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: Some(Arc::new(FakeDetector)),
             detectors: Vec::new(),
             focal: None,
@@ -6450,6 +6840,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -6506,6 +6897,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -6594,6 +6986,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: Some(Arc::new(FakeDetector)),
             detectors: Vec::new(),
             focal: None,
@@ -6934,6 +7327,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect,
             detectors,
             focal: None,
@@ -6995,6 +7389,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -8281,6 +8676,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -8344,6 +8740,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -8720,6 +9117,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -8814,6 +9212,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -9341,6 +9740,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -9745,6 +10145,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,
@@ -10582,6 +10983,7 @@ mod tests {
             moderation: None,
             embeddings: None,
             aesthetic: None,
+            ocr: None,
             detect: None,
             detectors: Vec::new(),
             focal: None,

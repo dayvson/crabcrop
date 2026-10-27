@@ -171,7 +171,9 @@ The directory must hold, under these names: `u2netp.onnx`,
 `detectors.json`, `upscale_swin2sr.onnx`, `lama.onnx` (the OpenCV
 zoo export of big-lama, for `remove_region`), `mobile_sam_encoder.onnx`
 and `mobile_sam_decoder.onnx` (the MobileSAM pair, for the
-mask-tight class operations). The runner boots three
+mask-tight class operations), `PP-OCRv6_det_small.onnx`,
+`PP-OCRv6_rec_small.onnx`, and `ppocrv6_dict.txt` (the RapidOCR
+PP-OCRv6 small set, for meta OCR). The runner boots three
 instances: AI (everything configured), AIN (nothing configured),
 AIC (the B/32 encoder with the mismatched L/14 aesthetic head and
 label-only moderation signals). Without the environment variables,

@@ -21,7 +21,7 @@ upscale-oom-probe assert the #243 and #244 fixes hold (a process
 kill fails the cell and the rest of the AI instance's cells with
 connection errors).
 """
-import json, os, sys, threading
+import hashlib, json, os, sys, threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (render, meta, rec, check, note, open_img,
                      alpha_stats, pixel, region_mean_p as region_mean,
@@ -965,3 +965,82 @@ def studio_timing_log():
          {"status": 200 if hits else 0},
          f"timing lines found={len(hits)} sample={hits[:2]}")
 
+
+# ---------------------------------------------------------------- ocr
+@cell
+def oc_meta_text():
+    # Issue #177: ocr=1 meta on text-bearing corpus content
+    # (screenshot.png carries the functional UI text). The
+    # pipeline must read the strong lines, name its model,
+    # echo the configured language, and keep every box in
+    # bounds with scores in range.
+    s, j = meta("0x0", "screenshot.png", accept_params="ocr=1")
+    ocr = j.get("ocr") or {}
+    content = ocr.get("text_content") or ""
+    lines = ocr.get("text") or []
+    want = ["General", "Image pipeline", "sharp edges stress",
+            "jumps over the lazy dog", "Save changes"]
+    found = [w for w in want if w in content]
+    w_img, h_img = j.get("width") or 0, j.get("height") or 0
+    shapes = all(
+        isinstance(ln.get("text"), str) and bool(ln["text"])
+        and 0.0 <= ln.get("score", -1) <= 1.0
+        and 0 <= ln.get("x", -1) and 0 <= ln.get("y", -1)
+        and ln.get("x", 0) + ln.get("w", 0) <= w_img
+        and ln.get("y", 0) + ln.get("h", 0) <= h_img
+        for ln in lines)
+    joined = "\n".join(ln["text"] for ln in lines) == content
+    ok = (s == 200 and bool(ocr.get("model"))
+          and ocr.get("language") == "en"
+          and len(found) == len(want) and shapes and joined)
+    rec("oc-meta-text", "ocr", 'meta "0x0" ocr=1', "screenshot.png",
+        "PASS" if ok else "FAIL", {"status": s},
+        f"model={ocr.get('model')} language={ocr.get('language')} "
+        f"lines={len(lines)} found={found} shapes={shapes} joined={joined} "
+        f"content_head={content[:80]!r}")
+
+
+@cell
+def oc_notext():
+    # A gradient carries no text: the report is present and
+    # empty, not an error and not an unavailable field.
+    s, j = meta("0x0", "gradient.png", accept_params="ocr=1")
+    ocr = j.get("ocr") or {}
+    ok = (s == 200 and ocr.get("text") == []
+          and ocr.get("text_content") == "" and bool(ocr.get("model")))
+    rec("oc-notext", "ocr", 'meta "0x0" ocr=1', "gradient.png",
+        "PASS" if ok else "FAIL", {"status": s}, f"ocr={ocr}")
+
+
+@cell
+def oc_unconfigured():
+    # The AIN instance has no OCR set: the field reports
+    # itself unavailable and the meta request succeeds.
+    s, j = meta("0x0", "screenshot.png", base="B", accept_params="ocr=1")
+    ocr = j.get("ocr") or {}
+    ok = (s == 200 and ocr.get("available") is False
+          and ocr.get("reason") == "not_configured")
+    rec("oc-unconfigured", "ocr", 'meta "0x0" ocr=1 (AIN)', "screenshot.png",
+        "PASS" if ok else "FAIL", {"status": s}, f"ocr={ocr}")
+
+
+@cell
+def oc_bytes_stable():
+    # OCR never touches the image entry (issue #177): two
+    # raw renders of one URL around an ocr=1 meta call are
+    # byte-identical, and the second is served from the
+    # same cache entry. Raw fetches on purpose: render()
+    # purges before its timed request by design, so it can
+    # never observe the hit this cell asserts.
+    from harness import fetch as raw_fetch, BASES as HB, ORIGIN as HO
+    url = f"{HB['AI']}/unsafe/filters:format(png)/{HO}/screenshot.png"
+    s1, h1, p1, _ = raw_fetch(url)
+    meta("0x0", "screenshot.png", accept_params="ocr=1")
+    s2, h2, p2, _ = raw_fetch(url)
+    ok = (s1 == 200 and s2 == 200 and p1 == p2
+          and "hit" in h2.get("cache-status", ""))
+    rec("oc-bytes-stable", "ocr", "raw render, ocr meta, raw render",
+        "screenshot.png", "PASS" if ok else "FAIL", {"status": s2},
+        f"md5_a={hashlib.md5(p1).hexdigest()} "
+        f"md5_b={hashlib.md5(p2).hexdigest()} "
+        f"cache2={h2.get('cache-status')}")
