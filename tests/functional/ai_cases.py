@@ -314,6 +314,78 @@ def st_meta_default_brand():
     rec("st-meta-default-brand", "studio", "meta filters:studio(product)", "product-shoe.jpg",
         "PASS" if ok else "FAIL", {"status": s}, f"meta.studio={json.dumps(stu)[:260]}")
 
+# ---------------------------------------------------------------- studio scene (#198)
+@cell
+def sc_meta_fields():
+    s, j = meta("filters:studio(scene):format(png)", "product-shoe.jpg")
+    stu = j.get("studio") or {}
+    scn = stu.get("scene") or {}
+    ok = (s == 200 and stu.get("mode") == "scene" and stu.get("pad") == 10
+          and stu.get("steps") == ["mask", "crop", "correct"] and stu.get("fallbacks") == []
+          and "bg" not in stu
+          and isinstance(scn.get("subject"), list) and len(scn["subject"]) == 4
+          and scn.get("subjects", 0) >= 1
+          and isinstance(scn.get("crop"), list) and len(scn["crop"]) == 4
+          and isinstance(scn.get("levels"), list) and len(scn["levels"]) == 3
+          and isinstance(scn.get("saturation"), (int, float)) and scn["saturation"] >= 1)
+    rec("sc-meta-fields", "studio", "meta filters:studio(scene)", "product-shoe.jpg",
+        "PASS" if ok else "FAIL", {"status": s}, f"meta.studio={json.dumps(stu)[:340]}")
+
+@cell
+def sc_canvas_kept():
+    # The reframe crops and resizes back: the canvas in
+    # effect (the 1100x733 source) never changes size.
+    f = render("sc-canvas-kept", "filters:studio(scene):format(png)", "product-shoe.jpg")
+    dims = open_img(f["path"]).size if f["path"] else None
+    check("sc-canvas-kept", "studio", "filters:studio(scene):format(png)", "product-shoe.jpg",
+          f["status"] == 200 and dims == (1100, 733), f,
+          f"status={f['status']} dims={dims} server_ms={f['server_ms']}")
+
+@cell
+def sc_pad_window():
+    s0, j0 = meta("filters:studio(scene,pad:0):format(png)", "product-shoe.jpg")
+    s4, j4 = meta("filters:studio(scene,pad:40):format(png)", "product-shoe.jpg")
+    c0 = (j0.get("studio") or {}).get("scene", {}).get("crop") or [0, 0, 0, 0]
+    c4 = (j4.get("studio") or {}).get("scene", {}).get("crop") or [0, 0, 0, 0]
+    ok = s0 == 200 and s4 == 200 and c4[2] * c4[3] > c0[2] * c0[3]
+    rec("sc-pad-window", "studio", "meta filters:studio(scene,pad:0|40)", "product-shoe.jpg",
+        "PASS" if ok else "FAIL", {"status": s0},
+        f"crop pad0={c0} pad40={c4} (expect the pad:40 window the larger)")
+
+@cell
+def sc_nosubject_gradient():
+    # The gradient's mask story is the st-nosubject one:
+    # a speck over faint coverage. Scene records the
+    # no_subject fallback, a null subject, and the full
+    # frame as the crop, and still corrects.
+    s, j = meta("filters:studio(scene):format(png)", "gradient.png")
+    stu = j.get("studio") or {}
+    scn = stu.get("scene") or {}
+    ok = (s == 200 and stu.get("mode") == "scene"
+          and stu.get("steps") == ["mask", "fallback", "correct"]
+          and stu.get("fallbacks") == ["no_subject"]
+          and scn.get("subject") is None and scn.get("crop") == [0, 0, 800, 600])
+    rec("sc-nosubject-gradient", "studio", "meta filters:studio(scene)", "gradient.png",
+        "PASS" if ok else "FAIL", {"status": s}, f"meta.studio={json.dumps(stu)[:300]}")
+
+@cell
+def sc_correction_stretches():
+    fp = render("sc-plain", "filters:format(png)", "gradient.png")
+    fs = render("sc-corrected", "filters:studio(scene):format(png)", "gradient.png")
+    def extremes(path):
+        im = open_img(path).convert("RGB").resize((200, 150))
+        px = list(im.getdata())
+        return (min(q[0] for q in px), max(q[0] for q in px),
+                min(q[1] for q in px), max(q[1] for q in px))
+    if fp["path"] and fs["path"]:
+        p = extremes(fp["path"]); c = extremes(fs["path"])
+        ok = fs["status"] == 200 and c[0] < p[0] and c[1] > p[1] and c[2] < p[2] and c[3] > p[3]
+        check("sc-correction-stretches", "studio", "filters:studio(scene):format(png)", "gradient.png",
+              ok, fs, f"plain R {p[0]}..{p[1]} G {p[2]}..{p[3]}; corrected R {c[0]}..{c[1]} G {c[2]}..{c[3]} (expect both ranges wider)")
+    else:
+        check("sc-correction-stretches", "studio", "filters:studio(scene):format(png)", "gradient.png",
+              False, fs, f"statuses plain={fp['status']} scene={fs['status']}")
+
 # ---------------------------------------------------------------- face
 AMBER = lambda r, g, b: r > 200 and 110 < g < 215 and b < 90
 BLUE = lambda r, g, b: b > 130 and r < 120 and g < 190

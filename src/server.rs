@@ -3054,30 +3054,65 @@ fn meta_response(
         ));
     }
     if let Some(studio) = &processed.studio {
-        // The studio record (issue #197): the resolved
-        // parameters, the steps that ran, the fallbacks
-        // taken, and the mask confidence when the provider
-        // exposed one. The backdrop is spelled like the
-        // placeholder colors (`#rrggbb`), or `none` when the
-        // subject kept its transparency.
-        let bg = match studio.bg {
-            Some(c) => format!("\"#{:02x}{:02x}{:02x}\"", c[0], c[1], c[2]),
-            None => "\"none\"".to_string(),
-        };
+        // The studio record (issues #197 and #198): the
+        // mode, the resolved parameters, the steps that
+        // ran, the fallbacks taken, and the mask confidence
+        // when the provider exposed one. Product spells its
+        // backdrop like the placeholder colors (`#rrggbb`),
+        // or `none` when the subject kept its transparency;
+        // scene carries its own object (subject, crop
+        // window, and the correction applied) and no
+        // backdrop fields at all.
         let steps: Vec<String> = studio.steps.iter().map(|s| format!("\"{s}\"")).collect();
         let fallbacks: Vec<String> = studio
             .fallbacks
             .iter()
             .map(|s| format!("\"{s}\""))
             .collect();
-        body.push_str(&format!(
-            ",\"studio\":{{\"bg\":{bg},\"bg_from\":\"{}\",\"shadow\":\"{}\",\"pad\":{},\"steps\":[{}],\"fallbacks\":[{}]",
-            studio.bg_from,
-            studio.shadow.name(),
-            studio.pad,
-            steps.join(","),
-            fallbacks.join(",")
-        ));
+        match studio.mode {
+            crate::url::StudioMode::Product => {
+                let bg = match studio.bg {
+                    Some(c) => format!("\"#{:02x}{:02x}{:02x}\"", c[0], c[1], c[2]),
+                    None => "\"none\"".to_string(),
+                };
+                body.push_str(&format!(
+                    ",\"studio\":{{\"mode\":\"product\",\"bg\":{bg},\"bg_from\":\"{}\",\"shadow\":\"{}\",\"pad\":{},\"steps\":[{}],\"fallbacks\":[{}]",
+                    studio.bg_from,
+                    studio.shadow.name(),
+                    studio.pad,
+                    steps.join(","),
+                    fallbacks.join(",")
+                ));
+            }
+            crate::url::StudioMode::Scene => {
+                body.push_str(&format!(
+                    ",\"studio\":{{\"mode\":\"scene\",\"pad\":{},\"steps\":[{}],\"fallbacks\":[{}]",
+                    studio.pad,
+                    steps.join(","),
+                    fallbacks.join(",")
+                ));
+                if let Some(scene) = &studio.scene {
+                    let subject = match scene.subject {
+                        Some((x, y, w, h)) => format!("[{x},{y},{w},{h}]"),
+                        None => "null".to_string(),
+                    };
+                    let (cx, cy, cw, ch) = scene.crop;
+                    let levels: Vec<String> = scene
+                        .levels
+                        .iter()
+                        .map(|[lo, hi]| format!("[{lo},{hi}]"))
+                        .collect();
+                    // Rounded to 3 decimals, like the other
+                    // model scores meta carries.
+                    let saturation = (scene.saturation * 1000.0).round() / 1000.0;
+                    body.push_str(&format!(
+                        ",\"scene\":{{\"subject\":{subject},\"subjects\":{},\"crop\":[{cx},{cy},{cw},{ch}],\"levels\":[{}],\"saturation\":{saturation}}}",
+                        scene.subjects,
+                        levels.join(",")
+                    ));
+                }
+            }
+        }
         if let Some(confidence) = studio.confidence {
             body.push_str(&format!(",\"mask_confidence\":{confidence}"));
         }
@@ -7108,6 +7143,7 @@ mod tests {
         ))
         .await;
         let studio = &meta["studio"];
+        assert_eq!(studio["mode"], "product");
         assert_eq!(studio["bg"], "#f5f0e8");
         assert_eq!(studio["bg_from"], "brand");
         assert_eq!(studio["shadow"], "none");
@@ -7134,6 +7170,31 @@ mod tests {
             studio["steps"],
             serde_json::json!(["mask", "defringe", "backdrop", "shadow", "pad"])
         );
+        // Scene mode (issue #198): the mask fake covers
+        // the whole 100x60 frame, so the subject is the
+        // frame itself and the reframe is the identity;
+        // the record carries the scene object and no
+        // backdrop fields.
+        let meta = meta_for(format!("filters:studio(scene):format(png)/{src}")).await;
+        let studio = &meta["studio"];
+        assert_eq!(studio["mode"], "scene");
+        assert_eq!(studio["pad"], 10);
+        assert_eq!(
+            studio["steps"],
+            serde_json::json!(["mask", "crop", "correct"])
+        );
+        assert_eq!(studio["fallbacks"], serde_json::json!([]));
+        assert!(studio.get("bg").is_none());
+        let scene = &studio["scene"];
+        assert_eq!(scene["subject"], serde_json::json!([0, 0, 100, 60]));
+        assert_eq!(scene["subjects"], 1);
+        assert_eq!(scene["crop"], serde_json::json!([0, 0, 100, 60]));
+        assert_eq!(
+            scene["levels"],
+            serde_json::json!([[0, 255], [0, 255], [0, 255]]),
+            "a black frame's channels are too flat to stretch"
+        );
+        assert_eq!(scene["saturation"].as_f64(), Some(1.0));
         // No studio filter, no studio record.
         let meta = meta_for(format!("40x24/{src}")).await;
         assert!(meta.get("studio").is_none());

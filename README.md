@@ -437,7 +437,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 | Filter | Parameters | Description | Example |
 | --- | --- | --- | --- |
 | `removebg` | none | Remove the background, keeping the subject over transparency. Output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:removebg:format(png)` |
-| `studio` | `studio(product,...)`, named arguments: `bg`, `shadow`, `pad` | Studio mode: composite the subject onto a backdrop with a synthesized contact shadow, scaled and centered to a pad margin. See [Studio mode](#studio-mode). Requires the removebg model. | `filters:studio(product,bg:white)` |
+| `studio` | `studio(product,...)` or `studio(scene,...)` | Studio mode: `product` composites the subject onto a backdrop with a synthesized contact shadow, scaled and centered to a pad margin; `scene` keeps the photograph's scene, reframing it on the detected subject and correcting light and color. See [Studio mode](#studio-mode). Requires the removebg model. | `filters:studio(product,bg:white)` |
 | `keep_profile` | none | Keep the source ICC profile instead of converting to sRGB; the profile is embedded in JPEG and PNG outputs. Other output formats convert to sRGB (pixels labeled as nothing would be wrong colors). | `filters:keep_profile` |
 | `blurfaces` | none | Blur every detected face (privacy redaction). Requires a face model. | `filters:blurfaces` |
 | `pixelatefaces` | none | Pixelate every detected face (privacy redaction). Requires a face model. | `filters:pixelatefaces` |
@@ -479,6 +479,21 @@ The fine print:
 - If the mask finds no subject, the fallback serves the original image centered and padded on the resolved backdrop (no shadow), rather than an empty canvas.
 - The result is a normal image in the chain, valid in every output format (JPEG included): unlike `removebg`, nothing transparent survives a backdrop. Later operations apply on top, so `filters:studio(product)/1200x1200` sizes the composite, and a `pad:` operation after `studio` pads the composite like any image. The encode-time `fill` directive only matters when transparency remains, which after `studio` means `bg:none` chains.
 - Meta responses report the run in a `studio` field: the resolved backdrop and where it came from (`argument`, `brand`, or `default`), the shadow and pad applied, the steps that ran, any fallbacks taken (the brand resolution, the no-subject fallback), and the mask confidence when the provider exposes one. See [Meta responses](#meta-responses).
+
+`studio(scene)` is the second mode: it keeps the photograph's scene instead of cutting the subject out. The expansion is a smart crop on the detected subject plus a per-image light and color correction, run at the filter's position in the chain:
+
+1. **Mask**: the same segmentation model product mode runs (without one configured, `studio(scene)` fails with `501`, the same way).
+2. **Crop**: the photograph is reframed on the subject. The subject is picked from the mask's connected regions at the subject threshold: the largest wins, ties break toward the frame center, then reading order. The frame is cropped to the smallest window with the frame's own aspect ratio that holds the subject with its pad margin, then resized back to the canvas in effect, so the output keeps the size the chain expects and later operations compose unchanged.
+3. **Correct**: a light and color correction driven by the reframed image's own histogram: a per-channel levels stretch between the 0.5th and 99.5th percentiles (a channel whose span is under 16 values is too flat to stretch and is left alone), then a saturation factor that steers the image's mean saturation toward 0.30, capped at 1.35 and never below 1, so muted photographs gain color and vivid ones are never desaturated.
+
+```bash
+# Reframe on the subject and correct, default pad
+curl "http://localhost:3000/unsafe/filters:studio(scene)/https://example.com/shoe.jpg"
+# A wider margin around the subject
+curl "http://localhost:3000/unsafe/filters:studio(scene,pad:25)/https://example.com/shoe.jpg"
+```
+
+Scene takes one argument: `pad`, 0 to 40, default `10`, the margin the subject keeps in the reframed window. The product arguments (`bg`, `shadow`) are bad arguments under scene. If the mask finds no subject (or only a speck not worth believing), the fallback skips the crop and serves the original framing, corrected. Meta reports scene runs in the same `studio` field, with `mode: "scene"` and a `scene` object: the winning subject's box, how many candidate subjects the mask carried, the crop window applied, the per-channel levels, and the saturation factor, alongside the steps and fallbacks.
 
 ## Presets
 
@@ -669,7 +684,7 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 | `bytes` | Size of the processed image in bytes. |
 | `source_width`, `source_height` | Source dimensions in pixels, after EXIF orientation. |
 | `ssimulacra2` | The verified perceptual score of the output, present when `quality(auto)` verified a JPEG or JPEG XL encode. 100 is identical. |
-| `studio` | Present when a `studio(...)` filter ran: the resolved backdrop (`bg`, spelled `#rrggbb`, or `none` for transparency) and its source (`bg_from`: `argument`, `brand`, or `default`), the `shadow` and `pad` applied, the expansion `steps` that ran, the `fallbacks` taken, and `mask_confidence` when the mask provider exposes one. See [Studio mode](#studio-mode). |
+| `studio` | Present when a `studio(...)` filter ran, with a `mode` (`product` or `scene`). Product runs report the resolved backdrop (`bg`, spelled `#rrggbb`, or `none` for transparency) and its source (`bg_from`: `argument`, `brand`, or `default`), the `shadow` and `pad` applied. Scene runs report the `pad` and a `scene` object: the winning `subject` box (or `null`), the candidate `subjects` count, the `crop` window applied, the per-channel `levels` stretch, and the `saturation` factor. Both report the expansion `steps` that ran, the `fallbacks` taken, and `mask_confidence` when the mask provider exposes one. See [Studio mode](#studio-mode). |
 | `video` | Present when the source was a video and a `frame:` segment selected the frame: the video stream's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. See [Video frames](#video-frames). |
 | `pdf` | Present when the source was a PDF and a `page:` segment selected the page: the document's `pages` count, the `page` rendered, and the page size as `page_width` and `page_height` in points. See [PDF pages](#pdf-pages). |
 
@@ -940,7 +955,7 @@ An unknown key ID is indistinguishable from a bad signature, by design: `403`, n
 
 ## AI features
 
-The features that run ONNX models in-process: `removebg` (background removal), `studio` (product-shot composites on the same mask model, see [Studio mode](#studio-mode)), `upscale` (super-resolution), `remove_region` (region removal by inpainting), face detection for crops and redaction, and per-object segmentation that tightens the class filters to silhouettes. The models are files you supply, deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
+The features that run ONNX models in-process: `removebg` (background removal), `studio` (product-shot composites and scene reframing on the same mask model, see [Studio mode](#studio-mode)), `upscale` (super-resolution), `remove_region` (region removal by inpainting), face detection for crops and redaction, and per-object segmentation that tightens the class filters to silhouettes. The models are files you supply, deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
 
 How configuration works:
 

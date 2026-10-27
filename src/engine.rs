@@ -2286,11 +2286,14 @@ fn apply_operations(
                         }
                         Filter::Studio(spec) => {
                             // Studio runs the removebg mask
-                            // model, then composites in
-                            // `crate::studio`: mask, defringe,
-                            // backdrop and shadow, pad (issue
-                            // #197). The record rides out with
-                            // the result for meta.
+                            // model, then expands in
+                            // `crate::studio`: product mode
+                            // composites (mask, defringe,
+                            // backdrop and shadow, pad; issue
+                            // #197), scene mode reframes and
+                            // corrects (mask, crop, correct;
+                            // issue #198). The record rides
+                            // out with the result for meta.
                             let provider = ctx.mask_provider.ok_or_else(|| {
                                 EngineError::NotConfigured(
                                     "studio is not configured on this server (no mask model)"
@@ -2301,13 +2304,18 @@ fn apply_operations(
                             let mask = provider.mask(&img).map_err(EngineError::Inference)?;
                             let confidence = provider.confidence(&img, &mask);
                             crate::studio::timing_mark("inference", t_timing);
-                            let outcome = crate::studio::composite(
-                                &img,
-                                &mask,
-                                confidence,
-                                spec,
-                                ctx.brand_color,
-                            );
+                            let outcome = match spec.mode {
+                                crate::url::StudioMode::Product => crate::studio::composite(
+                                    &img,
+                                    &mask,
+                                    confidence,
+                                    spec,
+                                    ctx.brand_color,
+                                ),
+                                crate::url::StudioMode::Scene => {
+                                    crate::studio::scene(&img, &mask, confidence, spec)
+                                }
+                            };
                             img = outcome.image;
                             studio_record = Some(outcome.record);
                         }
@@ -6832,6 +6840,7 @@ mod tests {
 
     fn studio_spec() -> crate::url::StudioSpec {
         crate::url::StudioSpec {
+            mode: crate::url::StudioMode::Product,
             bg: crate::url::StudioBg::White,
             shadow: crate::url::StudioShadow::None,
             pad: 10,
@@ -6885,6 +6894,66 @@ mod tests {
         assert_eq!(record.steps, ["mask", "defringe", "backdrop", "pad"]);
         assert!(record.fallbacks.is_empty());
         assert_eq!(record.confidence, Some(0.93));
+    }
+
+    #[test]
+    fn studio_scene_without_a_provider_is_a_clean_error() {
+        // Scene runs the same mask model as product
+        // (issue #198), so the preflight refusal is the
+        // same one.
+        let engine = Engine;
+        let err = engine
+            .process(
+                &product_source(),
+                &[Operation::Filters(vec![Filter::Studio(
+                    crate::url::StudioSpec {
+                        mode: crate::url::StudioMode::Scene,
+                        ..crate::url::StudioSpec::default()
+                    },
+                )])],
+            )
+            .unwrap_err();
+        match &err {
+            EngineError::NotConfigured(msg) => {
+                assert!(msg.contains("studio is not configured"), "{msg}")
+            }
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn studio_scene_reframes_and_records_the_run() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &product_source(),
+                &[Operation::Filters(vec![
+                    Filter::Studio(crate::url::StudioSpec {
+                        mode: crate::url::StudioMode::Scene,
+                        ..crate::url::StudioSpec::default()
+                    }),
+                    Filter::Format(ImageFormat::Png),
+                ])],
+                ProcessContext {
+                    mask_provider: Some(&SquareMask),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The canvas in effect never changes: the 40x40
+        // photo comes back 40x40, reframed on the mask's
+        // central square and corrected.
+        let img = image::load_from_memory(&out.bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (40, 40));
+        let record = out.studio.expect("a studio run records itself");
+        assert_eq!(record.mode, crate::url::StudioMode::Scene);
+        assert_eq!(record.steps, ["mask", "crop", "correct"]);
+        assert!(record.fallbacks.is_empty());
+        assert_eq!(record.confidence, Some(0.93));
+        let srec = record.scene.expect("a scene run records its facts");
+        assert_eq!(srec.subject, Some((10, 10, 20, 20)));
+        assert_eq!(srec.subjects, 1);
+        assert_eq!(srec.crop, (8, 8, 25, 25));
     }
 
     #[test]

@@ -462,12 +462,35 @@ impl StudioShadow {
     }
 }
 
-/// The `studio(product,...)` argument set, with the
-/// defaults already applied: an unnamed backdrop
-/// (`StudioBg::Default`), a soft shadow, and a pad of 10
-/// percent (issue #197).
+/// The studio mode a `studio(...)` filter runs (issues
+/// #197 and #198): `product` cuts the subject out onto a
+/// backdrop; `scene` keeps the photograph's scene and
+/// reframes it on the subject instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StudioMode {
+    Product,
+    Scene,
+}
+
+impl StudioMode {
+    /// The canonical spelling inside `studio(...)`.
+    pub fn name(self) -> &'static str {
+        match self {
+            StudioMode::Product => "product",
+            StudioMode::Scene => "scene",
+        }
+    }
+}
+
+/// The `studio(...)` argument set, with the defaults
+/// already applied: the `product` mode (issue #197), an
+/// unnamed backdrop (`StudioBg::Default`), a soft shadow,
+/// and a pad of 10 percent. Under `scene` (issue #198)
+/// only `pad` applies: it is the margin the reframed
+/// subject keeps, with the same range and default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StudioSpec {
+    pub mode: StudioMode,
     pub bg: StudioBg,
     pub shadow: StudioShadow,
     pub pad: u8,
@@ -476,6 +499,7 @@ pub struct StudioSpec {
 impl Default for StudioSpec {
     fn default() -> Self {
         StudioSpec {
+            mode: StudioMode::Product,
             bg: StudioBg::Default,
             shadow: StudioShadow::Soft,
             pad: 10,
@@ -484,16 +508,22 @@ impl Default for StudioSpec {
 }
 
 /// Parse the `studio(...)` argument list: the mode
-/// (`product`, the only one) followed by named `key:value`
-/// arguments. Bad arguments fail as the segment-wide
-/// invalid filter error, like every other filter: the
-/// frozen ParseError set does not grow for studio.
+/// (`product` or `scene`) followed by named `key:value`
+/// arguments. The product keys are `bg`, `shadow`, and
+/// `pad`; scene takes `pad` only, because a backdrop and
+/// a shadow are product concepts (naming one under scene
+/// is a bad argument, not a silent no-op). Bad arguments
+/// fail as the segment-wide invalid filter error, like
+/// every other filter: the frozen ParseError set does not
+/// grow for studio.
 fn parse_studio(p: &str) -> Option<StudioSpec> {
     let mut spec = StudioSpec::default();
     let mut seen: Vec<&str> = Vec::new();
     let mut parts = p.split(',');
-    if parts.next() != Some("product") {
-        return None;
+    match parts.next() {
+        Some("product") => spec.mode = StudioMode::Product,
+        Some("scene") => spec.mode = StudioMode::Scene,
+        _ => return None,
     }
     for part in parts {
         let (key, value) = part.split_once(':')?;
@@ -501,10 +531,10 @@ fn parse_studio(p: &str) -> Option<StudioSpec> {
             return None;
         }
         seen.push(key);
-        match key {
-            "bg" => spec.bg = StudioBg::parse(value)?,
-            "shadow" => spec.shadow = StudioShadow::parse(value)?,
-            "pad" => {
+        match (spec.mode, key) {
+            (StudioMode::Product, "bg") => spec.bg = StudioBg::parse(value)?,
+            (StudioMode::Product, "shadow") => spec.shadow = StudioShadow::parse(value)?,
+            (_, "pad") => {
                 let pad: u8 = value.parse().ok()?;
                 if pad > 40 {
                     return None;
@@ -604,12 +634,15 @@ pub enum Filter {
     /// model, keeping the subject over transparency. The model
     /// is operator-configured; the engine applies its mask.
     RemoveBg,
-    /// Studio mode (issue #197): composite the subject the
-    /// segmentation model finds onto a backdrop with a
-    /// synthesized contact shadow, scaled and centered to
-    /// a pad margin. A deterministic expansion into mask,
-    /// defringe, backdrop, shadow, and pad steps, reported
-    /// in meta.
+    /// Studio mode (issues #197 and #198): one filter
+    /// naming an outcome, expanded deterministically in the
+    /// engine and reported in meta. `product` composites
+    /// the subject the segmentation model finds onto a
+    /// backdrop with a synthesized contact shadow, scaled
+    /// and centered to a pad margin; `scene` keeps the
+    /// photograph's scene, reframing it on the detected
+    /// subject and applying a per-image light and color
+    /// correction.
     Studio(StudioSpec),
     /// Keep the source ICC profile instead of converting
     /// to sRGB (`filters:keep_profile`).
@@ -2556,13 +2589,16 @@ fn filter_text(filter: &Filter) -> String {
             // defaults are spelled out, in grammar order
             // (bg, shadow, pad), so `studio(product)` and
             // `studio(product,pad:10)` (the default pad)
-            // share one canonical form.
-            let mut text = "studio(product".to_string();
-            if let Some(bg) = spec.bg.text() {
-                text.push_str(&format!(",bg:{bg}"));
-            }
-            if spec.shadow != StudioShadow::Soft {
-                text.push_str(&format!(",shadow:{}", spec.shadow.name()));
+            // share one canonical form. Scene spells only
+            // its pad, the one argument it takes.
+            let mut text = format!("studio({}", spec.mode.name());
+            if spec.mode == StudioMode::Product {
+                if let Some(bg) = spec.bg.text() {
+                    text.push_str(&format!(",bg:{bg}"));
+                }
+                if spec.shadow != StudioShadow::Soft {
+                    text.push_str(&format!(",shadow:{}", spec.shadow.name()));
+                }
             }
             if spec.pad != 10 {
                 text.push_str(&format!(",pad:{}", spec.pad));
@@ -4328,6 +4364,7 @@ mod tests {
         assert_eq!(
             ops,
             vec![Operation::Filters(vec![Filter::Studio(StudioSpec {
+                mode: StudioMode::Product,
                 bg: StudioBg::Default,
                 shadow: StudioShadow::Soft,
                 pad: 10,
@@ -4347,6 +4384,7 @@ mod tests {
         assert_eq!(
             ops,
             vec![Operation::Filters(vec![Filter::Studio(StudioSpec {
+                mode: StudioMode::Product,
                 bg: StudioBg::Color([0xf5, 0xf0, 0xe8]),
                 shadow: StudioShadow::Strong,
                 pad: 25,
@@ -4398,13 +4436,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_studio_scene_mode() {
+        // Bare `studio(scene)` (issue #198): the scene
+        // mode at the default pad, keyed apart from every
+        // product spelling.
+        let (ops, _) = parse_operations("filters:studio(scene)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Studio(StudioSpec {
+                mode: StudioMode::Scene,
+                ..StudioSpec::default()
+            })])]
+        );
+        assert_eq!(
+            canonical_form(&ops, "example.com/img.jpg"),
+            "filters:studio(scene)/example.com/img.jpg"
+        );
+        assert_ne!(
+            canonical_key_form("filters:studio(scene)/example.com/img.jpg"),
+            canonical_key_form("filters:studio(product)/example.com/img.jpg")
+        );
+        // `pad` is the one argument scene takes, with the
+        // product range and default: spelled at the
+        // default it collapses into the bare form.
+        let (ops, _) =
+            parse_operations("filters:studio(scene,pad:25)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            canonical_form(&ops, "example.com/img.jpg"),
+            "filters:studio(scene,pad:25)/example.com/img.jpg"
+        );
+        let (ops, _) =
+            parse_operations("filters:studio(scene,pad:10)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            canonical_form(&ops, "example.com/img.jpg"),
+            "filters:studio(scene)/example.com/img.jpg"
+        );
+        // A scene request takes the studio preflight and
+        // the AI gate, like product.
+        let d = RequestDirectives::analyze(&ops);
+        assert!(d.studio);
+        assert!(d.uses_ai());
+        // The product-only arguments are bad arguments
+        // under scene, an unknown mode is not a mode, and
+        // the pad bounds hold in both modes.
+        for bad in [
+            "filters:studio(scene,bg:white)/example.com/img.jpg",
+            "filters:studio(scene,shadow:soft)/example.com/img.jpg",
+            "filters:studio(scene,pad:41)/example.com/img.jpg",
+            "filters:studio(scene,pad:-1)/example.com/img.jpg",
+            "filters:studio(product,pad:41)/example.com/img.jpg",
+            "filters:studio(portrait)/example.com/img.jpg",
+            "filters:studio()/example.com/img.jpg",
+            "filters:studio(scene,pad:10,pad:20)/example.com/img.jpg",
+        ] {
+            assert!(parse_operations(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn rejects_bad_studio_arguments() {
         for seg in [
-            // The mode is required, and `product` is the
-            // only one (studio(scene) is a separate design).
+            // The mode is required, and only `product`
+            // and `scene` are modes.
             "filters:studio",
             "filters:studio()",
-            "filters:studio(scene)",
             "filters:studio(product,bg:blur)",
             "filters:studio(product,bg:fffff)",
             "filters:studio(product,bg:fffffff)",

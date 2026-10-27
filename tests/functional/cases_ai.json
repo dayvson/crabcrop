@@ -390,6 +390,36 @@
   "tier": "local"
  },
  {
+  "id": "sc-meta-fields",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "sc-canvas-kept",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "sc-pad-window",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "sc-nosubject-gradient",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "sc-correction-stretches",
+  "group": "studio",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
   "id": "rr-erases-region",
   "group": "remove-region",
   "kind": "scripted",
