@@ -16,7 +16,7 @@
 
 use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage, imageops::FilterType};
 
-use crate::url::{StudioBg, StudioShadow, StudioSpec};
+use crate::url::{StudioBg, StudioMode, StudioShadow, StudioSpec};
 
 /// Whether studio stage timing is printed (issue #220): on
 /// when `CRABCROP_STUDIO_TIMING` is set to any value.
@@ -43,27 +43,37 @@ pub(crate) fn timing_mark(stage: &str, start: std::time::Instant) {
 /// full alpha ramp.
 const SUBJECT_THRESHOLD: u8 = 128;
 
-/// What studio resolved and ran, reported in meta (issue
-/// #197). The server serializes it verbatim; every value is
-/// a resolved fact about this render, never a request
-/// echo that could disagree with the output.
+/// What studio resolved and ran, reported in meta (issues
+/// #197 and #198). The server serializes it verbatim; every
+/// value is a resolved fact about this render, never a
+/// request echo that could disagree with the output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StudioRecord {
-    /// The resolved backdrop color. `None` is `bg:none`:
-    /// the subject kept its transparency.
+    /// The mode that ran: `product` (the cutout composite)
+    /// or `scene` (the reframed photograph).
+    pub mode: StudioMode,
+    /// The resolved backdrop color, product mode. `None`
+    /// is `bg:none`: the subject kept its transparency.
+    /// Inert under scene, which has no backdrop.
     pub bg: Option<[u8; 3]>,
     /// Where the backdrop came from: `"argument"` (named in
     /// the URL), `"brand"` (the operator brand color), or
     /// `"default"` (plain white, because neither applied).
+    /// Product mode; inert under scene.
     pub bg_from: &'static str,
     /// The shadow the URL asked for, whether or not one was
     /// synthesized (a `bg:none` composite skips it).
+    /// Product mode; inert under scene.
     pub shadow: StudioShadow,
-    /// The pad margin applied, percent per side.
+    /// The pad margin applied, percent per side: the
+    /// product composite's margin, or the margin the
+    /// scene reframe keeps around the subject.
     pub pad: u8,
     /// The expansion steps that ran, in pipeline order:
-    /// drawn from `mask`, `defringe`, `backdrop`, `shadow`,
-    /// `pad`, and `fallback` (the no-subject path).
+    /// product draws from `mask`, `defringe`, `backdrop`,
+    /// `shadow`, `pad`, and `fallback` (the no-subject
+    /// path); scene from `mask`, `crop`, `correct`, and
+    /// `fallback`.
     pub steps: Vec<&'static str>,
     /// The fallbacks taken, in the order they were
     /// decided: drawn from `no_subject` and
@@ -73,6 +83,44 @@ pub struct StudioRecord {
     /// provider exposes one (see
     /// [`crate::ai::MaskProvider::confidence`]).
     pub confidence: Option<f32>,
+    /// The scene run's facts (subject, crop window, and
+    /// the correction applied), scene mode only.
+    pub scene: Option<SceneRecord>,
+}
+
+/// The scene mode run's facts (issue #198), reported in
+/// meta inside the studio record: how the subject was
+/// chosen, the window the photograph was reframed to, and
+/// the exact correction the image's own histogram drove.
+/// Every value is measured from this render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneRecord {
+    /// The winning subject's bounding box, (x, y, w, h) in
+    /// the coordinates of the image the filter ran on.
+    /// `None` on the no-subject fallback.
+    pub subject: Option<(u32, u32, u32, u32)>,
+    /// How many candidate subjects the mask carried
+    /// (connected components at the subject threshold with
+    /// at least a few pixels; specks below that are not
+    /// subjects and are not counted).
+    pub subjects: u32,
+    /// The crop window applied, (x, y, w, h) in the same
+    /// coordinates: the smallest frame-aspect window that
+    /// holds the subject with its pad margin, centered on
+    /// the subject and clamped into the frame. The full
+    /// frame on the fallback, and whenever the subject
+    /// already fills its margins.
+    pub crop: (u32, u32, u32, u32),
+    /// The levels stretch applied per channel, as the
+    /// [lo, hi] input values mapped to 0 and 255. A channel
+    /// recorded as [0, 255] was left unmapped: its range
+    /// was too flat to stretch without amplifying noise.
+    pub levels: [[u8; 2]; 3],
+    /// The saturation factor applied after the stretch:
+    /// 1.0 when the image's mean saturation already met
+    /// the recipe's target (or there was no color to
+    /// scale), up to the recipe's cap otherwise.
+    pub saturation: f32,
 }
 
 /// The composite's output: the rendered image and its
@@ -459,6 +507,7 @@ pub fn composite(
     StudioOutcome {
         image: DynamicImage::ImageRgba8(canvas),
         record: StudioRecord {
+            mode: StudioMode::Product,
             bg: resolved.color,
             bg_from: resolved.from,
             shadow: spec.shadow,
@@ -466,6 +515,383 @@ pub fn composite(
             steps,
             fallbacks,
             confidence,
+            scene: None,
+        },
+    }
+}
+
+/// One connected candidate subject in a mask: its pixel
+/// area at the subject threshold, its bounding box, and
+/// its pixel-coordinate sums (for the centroid). Built by
+/// [`subject_components`].
+struct Component {
+    area: u64,
+    bbox: (u32, u32, u32, u32),
+    sum_x: u64,
+    sum_y: u64,
+}
+
+/// The smallest mask area, in pixels, that counts as a
+/// candidate subject. Below it a component is a speck of
+/// threshold noise, not something detection found.
+const MIN_SUBJECT_PIXELS: u64 = 4;
+
+/// Find the candidate subjects in a fitted mask: the
+/// connected components of the pixels at or above
+/// [`SUBJECT_THRESHOLD`], 8-connected (a diagonal touch
+/// joins, as object parts in a photograph routinely meet
+/// diagonally). The scan unions runs of subject pixels
+/// row by row, so the working set stays proportional to
+/// the mask's run count, not its pixel count.
+fn subject_components(mask: &GrayImage) -> Vec<Component> {
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    struct Run {
+        row: u32,
+        x0: u32,
+        x1: u32,
+    }
+    let (w, h) = (mask.width(), mask.height());
+    let mut runs: Vec<Run> = Vec::new();
+    let mut parent: Vec<usize> = Vec::new();
+    let mut prev: Vec<usize> = Vec::new();
+    for y in 0..h {
+        let mut cur: Vec<usize> = Vec::new();
+        let mut x = 0;
+        while x < w {
+            if mask.get_pixel(x, y)[0] < SUBJECT_THRESHOLD {
+                x += 1;
+                continue;
+            }
+            let x0 = x;
+            while x < w && mask.get_pixel(x, y)[0] >= SUBJECT_THRESHOLD {
+                x += 1;
+            }
+            let id = runs.len();
+            runs.push(Run {
+                row: y,
+                x0,
+                x1: x - 1,
+            });
+            parent.push(id);
+            // The previous row's runs are in x order: join
+            // every run this one overlaps or diagonally
+            // abuts, and stop at the first run past reach.
+            for &p in &prev {
+                let (px0, px1) = (runs[p].x0, runs[p].x1);
+                if px0 > x {
+                    break;
+                }
+                if x0 <= px1 + 1 {
+                    let (a, b) = (find(&mut parent, id), find(&mut parent, p));
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+            }
+            cur.push(id);
+        }
+        prev = cur;
+    }
+    let mut comps: Vec<Component> = Vec::new();
+    let mut by_root: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, run) in runs.iter().enumerate() {
+        let root = find(&mut parent, i);
+        let idx = *by_root.entry(root).or_insert_with(|| {
+            comps.push(Component {
+                area: 0,
+                bbox: (u32::MAX, u32::MAX, 0, 0),
+                sum_x: 0,
+                sum_y: 0,
+            });
+            comps.len() - 1
+        });
+        let c = &mut comps[idx];
+        let len = (run.x1 - run.x0 + 1) as u64;
+        c.area += len;
+        // The sum of a consecutive integer range: the
+        // product is always even, so the division is exact.
+        c.sum_x += (run.x0 as u64 + run.x1 as u64) * len / 2;
+        c.sum_y += run.row as u64 * len;
+        c.bbox.0 = c.bbox.0.min(run.x0);
+        c.bbox.1 = c.bbox.1.min(run.row);
+        c.bbox.2 = c.bbox.2.max(run.x1);
+        c.bbox.3 = c.bbox.3.max(run.row);
+    }
+    comps.retain(|c| c.area >= MIN_SUBJECT_PIXELS);
+    for c in &mut comps {
+        // The aggregation tracked the inclusive max corner;
+        // the record speaks (x, y, w, h).
+        c.bbox = (
+            c.bbox.0,
+            c.bbox.1,
+            c.bbox.2 - c.bbox.0 + 1,
+            c.bbox.3 - c.bbox.1 + 1,
+        );
+    }
+    comps
+}
+
+/// Which candidate subject wins (issue #198 settles the
+/// question the issue left open): the largest by mask
+/// area, because the mask model's subject is the salient
+/// mass of the photograph. Ties break toward the frame
+/// center (the subject a photographer centered), then
+/// toward reading order (topmost, then leftmost), so the
+/// choice is a pure function of the mask.
+fn choose_subject(candidates: &[Component], img: (u32, u32)) -> Option<&Component> {
+    let (cx, cy) = (img.0 as f64 / 2.0, img.1 as f64 / 2.0);
+    let dist2 = |c: &Component| {
+        let mx = c.sum_x as f64 / c.area as f64 - cx;
+        let my = c.sum_y as f64 / c.area as f64 - cy;
+        mx * mx + my * my
+    };
+    candidates.iter().reduce(|best, c| {
+        let better = c.area > best.area
+            || (c.area == best.area && dist2(c) < dist2(best))
+            || (c.area == best.area
+                && dist2(c) == dist2(best)
+                && (c.bbox.1, c.bbox.0) < (best.bbox.1, best.bbox.0));
+        if better { c } else { best }
+    })
+}
+
+/// The reframe window for a subject: the smallest window
+/// with the frame's own aspect ratio that holds the
+/// subject box with its pad margin on every side (the
+/// subject occupies the same `100 - 2 * pad` percent of
+/// the window that product mode gives it of the canvas),
+/// centered on the subject's center and clamped into the
+/// frame. A subject that already fills its margins gets
+/// the full frame.
+fn reframe_window(img: (u32, u32), subject: (u32, u32, u32, u32), pad: u8) -> (u32, u32, u32, u32) {
+    let (w, h) = (img.0 as f32, img.1 as f32);
+    let (sx, sy, sw, sh) = (
+        subject.0 as f32,
+        subject.1 as f32,
+        subject.2 as f32,
+        subject.3 as f32,
+    );
+    let keep = (100.0 - 2.0 * pad as f32) / 100.0;
+    let s = (sw / (keep * w)).max(sh / (keep * h));
+    if s >= 1.0 {
+        return (0, 0, img.0, img.1);
+    }
+    // Ceil, so rounding never shaves the subject's margin
+    // off one axis; the resize back absorbs the fraction.
+    let ww = ((s * w).ceil() as u32).clamp(1, img.0);
+    let wh = ((s * h).ceil() as u32).clamp(1, img.1);
+    let wx = (sx + sw / 2.0 - ww as f32 / 2.0)
+        .round()
+        .clamp(0.0, (img.0 - ww) as f32) as u32;
+    let wy = (sy + sh / 2.0 - wh as f32 / 2.0)
+        .round()
+        .clamp(0.0, (img.1 - wh) as f32) as u32;
+    (wx, wy, ww, wh)
+}
+
+/// The level below which a channel's measured range is
+/// too flat to stretch: stretching a span narrower than
+/// this amplifies sensor noise into banding, so the
+/// channel is left unmapped instead.
+const LEVELS_MIN_SPAN: u8 = 16;
+
+/// The mean saturation (HSV `S`, 0..1) the correction
+/// steers toward, and the largest saturation factor it
+/// will apply to get there. Muted photographs gain color;
+/// already-vivid ones are never desaturated.
+const SATURATION_TARGET: f64 = 0.30;
+const SATURATION_CAP: f32 = 1.35;
+
+/// The value at percentile `num / den` of a channel
+/// histogram: the smallest value whose cumulative count
+/// reaches that share of the total.
+fn percentile(hist: &[u64; 256], total: u64, num: u64, den: u64) -> u8 {
+    let target = (total * num).div_ceil(den).max(1);
+    let mut acc = 0u64;
+    for (v, n) in hist.iter().enumerate() {
+        acc += n;
+        if acc >= target {
+            return v as u8;
+        }
+    }
+    255
+}
+
+/// The scene correction (the second half of the issue
+/// #198 expansion): a per-image light and color
+/// correction driven by the image's own histogram,
+/// deterministic and fully stated in the record.
+///
+/// Light: a per-channel levels stretch mapping the
+/// 0.5th percentile to 0 and the 99.5th to 255, which
+/// lifts a compressed exposure and, being per-channel,
+/// removes a color cast the way gray-world white balance
+/// does. A channel whose percentile span is under
+/// [`LEVELS_MIN_SPAN`] is left unmapped.
+///
+/// Color: the saturation factor that would bring the
+/// image's mean saturation (measured before the stretch)
+/// to [`SATURATION_TARGET`], clamped to
+/// [1.0, `SATURATION_CAP`] and applied around each
+/// pixel's luma with the grammar's `saturation` math.
+/// Nothing is ever desaturated, and an image without
+/// color takes a factor of exactly 1.
+fn correct(img: &DynamicImage) -> (DynamicImage, [[u8; 2]; 3], f32) {
+    let rgba = img.to_rgba8();
+    let total = rgba.width() as u64 * rgba.height() as u64;
+    let mut hist = [[0u64; 256]; 3];
+    let mut sat_sum = 0f64;
+    for px in rgba.pixels() {
+        for c in 0..3 {
+            hist[c][px[c] as usize] += 1;
+        }
+        let (r, g, b) = (px[0] as f64, px[1] as f64, px[2] as f64);
+        let max = r.max(g).max(b);
+        if max > 0.0 {
+            sat_sum += (max - r.min(g).min(b)) / max;
+        }
+    }
+    let mean_sat = if total > 0 {
+        sat_sum / total as f64
+    } else {
+        0.0
+    };
+    let saturation = if mean_sat <= 0.0 || mean_sat >= SATURATION_TARGET {
+        1.0
+    } else {
+        (SATURATION_TARGET / mean_sat).min(SATURATION_CAP as f64) as f32
+    };
+    let mut levels = [[0u8, 255u8]; 3];
+    let mut luts = [[0u8; 256]; 3];
+    for c in 0..3 {
+        let lo = percentile(&hist[c], total, 1, 200);
+        let hi = percentile(&hist[c], total, 199, 200);
+        let (lo, hi) = if hi.saturating_sub(lo) < LEVELS_MIN_SPAN {
+            (0, 255)
+        } else {
+            (lo, hi)
+        };
+        levels[c] = [lo, hi];
+        for (v, slot) in luts[c].iter_mut().enumerate() {
+            *slot = if v <= lo as usize {
+                0
+            } else if v >= hi as usize {
+                255
+            } else {
+                ((v - lo as usize) * 255 + (hi - lo) as usize / 2) / (hi - lo) as usize
+            } as u8;
+        }
+    }
+    let mut out = rgba;
+    for px in out.pixels_mut() {
+        for c in 0..3 {
+            px[c] = luts[c][px[c] as usize];
+        }
+        if saturation != 1.0 {
+            let luma = 0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32;
+            for c in 0..3 {
+                px[c] = (luma + (px[c] as f32 - luma) * saturation).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    (DynamicImage::ImageRgba8(out), levels, saturation)
+}
+
+/// Run the scene expansion over `img` with the provider's
+/// `mask` (issue #198): choose the subject, reframe the
+/// photograph on it (crop to the subject's window and
+/// resize back, so the canvas in effect never changes,
+/// exactly the contract product mode keeps), then apply
+/// the histogram-driven correction. Without a subject the
+/// fallback serves the original framing, corrected, and
+/// says so in the record.
+pub fn scene(
+    img: &DynamicImage,
+    mask: &GrayImage,
+    confidence: Option<f32>,
+    spec: &StudioSpec,
+) -> StudioOutcome {
+    let (w, h) = (img.width(), img.height());
+    let mut steps: Vec<&'static str> = vec!["mask"];
+    let mut fallbacks: Vec<&'static str> = Vec::new();
+
+    // Fit the mask to the image, exactly as the product
+    // composite does: the provider answers at its own
+    // resolution.
+    let t_stage = std::time::Instant::now();
+    let fitted;
+    let mask = if mask.width() == w && mask.height() == h {
+        mask
+    } else {
+        fitted = image::imageops::resize(mask, w, h, FilterType::Triangle);
+        &fitted
+    };
+    let candidates = subject_components(mask);
+    // A winner that is a degenerate speck against the
+    // mask's whole covered region is the model saying it
+    // found nothing in particular (issue #243, the
+    // product rule): it takes the no-subject fallback.
+    let region = mask_bbox(mask, 1);
+    let winner = choose_subject(&candidates, (w, h))
+        .filter(|c| region.is_some_and(|r| !degenerate_subject(c.bbox, r)));
+    timing_mark("mask_prep", t_stage);
+
+    let t_stage = std::time::Instant::now();
+    let (framed, crop) = match winner {
+        Some(c) => {
+            steps.push("crop");
+            let window = reframe_window((w, h), c.bbox, spec.pad);
+            let framed = if window == (0, 0, w, h) {
+                img.clone()
+            } else {
+                let piece = image::imageops::crop_imm(img, window.0, window.1, window.2, window.3)
+                    .to_image();
+                DynamicImage::ImageRgba8(image::imageops::resize(
+                    &piece,
+                    w,
+                    h,
+                    FilterType::Triangle,
+                ))
+            };
+            (framed, window)
+        }
+        None => {
+            steps.push("fallback");
+            fallbacks.push("no_subject");
+            (img.clone(), (0, 0, w, h))
+        }
+    };
+    timing_mark("reframe", t_stage);
+
+    let t_stage = std::time::Instant::now();
+    let (image, levels, saturation) = correct(&framed);
+    steps.push("correct");
+    timing_mark("correct", t_stage);
+
+    StudioOutcome {
+        image,
+        record: StudioRecord {
+            mode: StudioMode::Scene,
+            bg: None,
+            bg_from: "argument",
+            shadow: spec.shadow,
+            pad: spec.pad,
+            steps,
+            fallbacks,
+            confidence,
+            scene: Some(SceneRecord {
+                subject: winner.map(|c| c.bbox),
+                subjects: candidates.len() as u32,
+                crop,
+                levels,
+                saturation,
+            }),
         },
     }
 }
@@ -512,7 +938,20 @@ mod tests {
     }
 
     fn spec(bg: StudioBg, shadow: StudioShadow, pad: u8) -> StudioSpec {
-        StudioSpec { bg, shadow, pad }
+        StudioSpec {
+            mode: StudioMode::Product,
+            bg,
+            shadow,
+            pad,
+        }
+    }
+
+    fn scene_spec(pad: u8) -> StudioSpec {
+        StudioSpec {
+            mode: StudioMode::Scene,
+            pad,
+            ..StudioSpec::default()
+        }
     }
 
     fn px(img: &DynamicImage, x: u32, y: u32) -> [u8; 4] {
@@ -857,6 +1296,223 @@ mod tests {
             None,
         );
         assert_eq!(under_line.record.fallbacks, ["no_subject"]);
+    }
+
+    /// A scene-mode photo on a 100x80 canvas: two objects
+    /// on a plain field, a large red block at 55..85 x
+    /// 40..70 and a small blue block at 5..15 x 5..15,
+    /// with the mask to match (255 on the blocks, 0
+    /// elsewhere).
+    fn two_object_photo() -> (DynamicImage, GrayImage) {
+        let img = ImageBuffer::from_fn(100, 80, |x, y| {
+            let big = (55..85).contains(&x) && (40..70).contains(&y);
+            let small = (5..15).contains(&x) && (5..15).contains(&y);
+            let c = if big {
+                RED
+            } else if small {
+                [30, 30, 200]
+            } else {
+                GREEN
+            };
+            Rgba([c[0], c[1], c[2], 255])
+        });
+        let mask = GrayImage::from_fn(100, 80, |x, y| {
+            let big = (55..85).contains(&x) && (40..70).contains(&y);
+            let small = (5..15).contains(&x) && (5..15).contains(&y);
+            Luma([if big || small { 255 } else { 0 }])
+        });
+        (DynamicImage::ImageRgba8(img), mask)
+    }
+
+    #[test]
+    fn scene_reframes_on_the_subject_and_keeps_the_canvas() {
+        let (img, mask) = product_photo();
+        let out = scene(&img, &mask, Some(0.88), &scene_spec(10));
+        let rec = &out.record;
+        assert_eq!(rec.mode, StudioMode::Scene);
+        assert_eq!(rec.steps, ["mask", "crop", "correct"]);
+        assert!(rec.fallbacks.is_empty());
+        assert_eq!(rec.confidence, Some(0.88));
+        let srec = rec.scene.as_ref().unwrap();
+        // The product photo's mask subject (threshold
+        // ring included) is the red square's box, the
+        // only candidate.
+        assert_eq!(srec.subject, Some((30, 20, 40, 40)));
+        assert_eq!(srec.subjects, 1);
+        // Pad 10: the window is the smallest 5:4 window
+        // holding the subject at 80 percent: 62.5x50,
+        // ceiled and centered on (50, 40).
+        assert_eq!(srec.crop, (19, 15, 63, 50));
+        // The canvas never changes size: the reframe is a
+        // crop resized back, like the product composite's
+        // fixed canvas.
+        assert_eq!((out.image.width(), out.image.height()), (100, 80));
+        // The subject is zoomed: the frame's center is the
+        // product's red, and the subject fills more of the
+        // middle row than the 40 of 100 pixels it held in
+        // the source.
+        let center = px(&out.image, 50, 40);
+        assert!(center[0] > center[1] && center[0] > center[2], "{center:?}");
+        let red_run = (0..100)
+            .filter(|&x| {
+                let p = px(&out.image, x, 40);
+                p[0] as i32 > p[1] as i32 + 30 && p[0] as i32 > p[2] as i32 + 30
+            })
+            .count();
+        assert!(red_run > 45, "subject run {red_run}");
+    }
+
+    #[test]
+    fn scene_picks_the_largest_subject_then_the_most_central() {
+        let (img, mask) = two_object_photo();
+        let out = scene(&img, &mask, None, &scene_spec(10));
+        let srec = out.record.scene.as_ref().unwrap();
+        assert_eq!(srec.subjects, 2);
+        assert_eq!(
+            srec.subject,
+            Some((55, 40, 30, 30)),
+            "the larger block wins"
+        );
+        // Equal areas: the one nearer the center wins,
+        // wherever it sits in reading order.
+        let mask = GrayImage::from_fn(100, 80, |x, y| {
+            let corner = x < 10 && y < 10;
+            let middle = (45..55).contains(&x) && (35..45).contains(&y);
+            Luma([if corner || middle { 255 } else { 0 }])
+        });
+        let out = scene(&img, &mask, None, &scene_spec(10));
+        let srec = out.record.scene.as_ref().unwrap();
+        assert_eq!(srec.subjects, 2);
+        assert_eq!(
+            srec.subject,
+            Some((45, 35, 10, 10)),
+            "the central block wins the tie"
+        );
+    }
+
+    #[test]
+    fn scene_specks_and_degenerate_winners_are_no_subject() {
+        let (img, _) = product_photo();
+        // A 1x3 speck is under the candidate floor: no
+        // subjects at all, and the fallback path.
+        let speck = GrayImage::from_fn(100, 80, |x, y| {
+            Luma([if x < 3 && y == 0 { 255 } else { 0 }])
+        });
+        let out = scene(&img, &speck, None, &scene_spec(10));
+        let srec = out.record.scene.as_ref().unwrap();
+        assert_eq!(srec.subjects, 0);
+        assert_eq!(srec.subject, None);
+        assert_eq!(out.record.fallbacks, ["no_subject"]);
+        assert_eq!(out.record.steps, ["mask", "fallback", "correct"]);
+        assert_eq!(srec.crop, (0, 0, 100, 80));
+        // The #243 shape: faint coverage everywhere and a
+        // small solid speck. The speck is a candidate
+        // (subjects counts it) but degenerate against the
+        // covered region, so the run still falls back.
+        let faint = GrayImage::from_fn(100, 80, |x, y| {
+            Luma([if x < 3 && y < 2 { 255 } else { 64 }])
+        });
+        let out = scene(&img, &faint, None, &scene_spec(10));
+        let srec = out.record.scene.as_ref().unwrap();
+        assert_eq!(srec.subjects, 1);
+        assert_eq!(srec.subject, None);
+        assert_eq!(out.record.fallbacks, ["no_subject"]);
+    }
+
+    #[test]
+    fn scene_no_subject_still_corrects_the_original_framing() {
+        // A compressed-range gray ramp, 40..90 over the
+        // width, with an empty mask: the fallback serves
+        // the same framing, levels-stretched to the full
+        // range, dimensions untouched.
+        let img = DynamicImage::ImageRgba8(ImageBuffer::from_fn(100, 80, |x, _| {
+            let v = 40 + (x * 50 / 99) as u8;
+            Rgba([v, v, v, 255])
+        }));
+        let empty = GrayImage::from_pixel(100, 80, Luma([0]));
+        let out = scene(&img, &empty, None, &scene_spec(10));
+        let srec = out.record.scene.as_ref().unwrap();
+        assert_eq!(srec.levels, [[40, 90], [40, 90], [40, 90]]);
+        assert_eq!(srec.saturation, 1.0, "a gray image has no color to scale");
+        assert_eq!(px(&out.image, 0, 40)[0], 0);
+        assert_eq!(px(&out.image, 99, 40)[0], 255);
+        assert_eq!(px(&out.image, 50, 40)[0], 128);
+        assert_eq!((out.image.width(), out.image.height()), (100, 80));
+    }
+
+    #[test]
+    fn scene_correction_leaves_flat_channels_and_alpha_alone() {
+        // Red varies over the width; green and blue are
+        // flat lines, and the whole frame carries alpha
+        // 77. Only the red channel stretches; the flat
+        // channels record the identity mapping, and the
+        // alpha survives untouched.
+        let img = DynamicImage::ImageRgba8(ImageBuffer::from_fn(100, 80, |x, _| {
+            Rgba([40 + (x * 50 / 99) as u8, 100, 50, 77])
+        }));
+        let empty = GrayImage::from_pixel(100, 80, Luma([0]));
+        let out = scene(&img, &empty, None, &scene_spec(10));
+        let srec = out.record.scene.as_ref().unwrap();
+        assert_eq!(srec.levels[0], [40, 90]);
+        assert_eq!(srec.levels[1], [0, 255], "flat green is unmapped");
+        assert_eq!(srec.levels[2], [0, 255], "flat blue is unmapped");
+        assert_eq!(px(&out.image, 99, 40)[3], 77);
+        assert_eq!(px(&out.image, 99, 40)[1], 100);
+        assert_eq!(px(&out.image, 99, 40)[2], 50);
+    }
+
+    #[test]
+    fn scene_correction_boosts_a_muted_image_to_the_cap() {
+        // A flat muted color: mean saturation 25/120 is
+        // under the target, so the factor runs to the
+        // recipe cap, pushing channels away from the luma.
+        let img =
+            DynamicImage::ImageRgba8(ImageBuffer::from_pixel(100, 80, Rgba([120, 100, 95, 255])));
+        let empty = GrayImage::from_pixel(100, 80, Luma([0]));
+        let out = scene(&img, &empty, None, &scene_spec(10));
+        let srec = out.record.scene.as_ref().unwrap();
+        assert!(
+            (srec.saturation - SATURATION_CAP).abs() < 0.001,
+            "{}",
+            srec.saturation
+        );
+        let p = px(&out.image, 50, 40);
+        assert!(
+            p[0] > 120 && p[2] < 95,
+            "channels spread around the luma: {p:?}"
+        );
+        // A vivid image is never desaturated.
+        let vivid =
+            DynamicImage::ImageRgba8(ImageBuffer::from_pixel(100, 80, Rgba([220, 40, 30, 255])));
+        let out = scene(&vivid, &empty, None, &scene_spec(10));
+        assert_eq!(out.record.scene.as_ref().unwrap().saturation, 1.0);
+        assert_eq!(px(&out.image, 50, 40), [220, 40, 30, 255]);
+    }
+
+    #[test]
+    fn reframe_window_geometry_holds() {
+        // The product photo's subject at three pads: the
+        // window shrinks as the margin does.
+        assert_eq!(
+            reframe_window((100, 80), (30, 20, 40, 40), 0),
+            (25, 20, 50, 40)
+        );
+        assert_eq!(
+            reframe_window((100, 80), (30, 20, 40, 40), 10),
+            (19, 15, 63, 50)
+        );
+        // A subject in the corner: the window pins to the
+        // corner rather than leaving the frame.
+        assert_eq!(
+            reframe_window((100, 80), (0, 0, 20, 20), 10),
+            (0, 0, 32, 25)
+        );
+        // A subject that already fills its margins: the
+        // full frame, no reframe.
+        assert_eq!(
+            reframe_window((100, 80), (5, 4, 90, 72), 10),
+            (0, 0, 100, 80)
+        );
     }
 
     #[test]
