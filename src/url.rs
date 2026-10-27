@@ -628,6 +628,12 @@ pub enum Filter {
     /// (privacy redaction), backed by the server's
     /// detection model.
     PixelateClass(String),
+    /// Recolor every detected object of the named class to
+    /// the given RGB color (issue #175), backed by the
+    /// server's detection model. With a segment provider
+    /// configured the paint follows the object's
+    /// silhouette; without one it fills the box.
+    RecolorClass(String, [u8; 3]),
     /// Padding for `crop:*:face`, as a fraction of the face
     /// size added on every side. A request-wide directive,
     /// like `no_upscale`.
@@ -1275,7 +1281,8 @@ fn parse_format(s: &str) -> Option<ImageFormat> {
 }
 
 /// Parse the filter list after `filters:`.
-/// A detection class name for `blurclass` / `pixelateclass`:
+/// A detection class name for the class filters
+/// (`blurclass` / `pixelateclass` / `recolorclass`):
 /// the vocabulary's own spellings (COCO names like `traffic
 /// light` and `cell phone` included), so letters, digits,
 /// spaces, and a few joiners, trimmed, non-empty, bounded.
@@ -1561,6 +1568,17 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             ("pixelateclass", Some(p)) => Filter::PixelateClass(
                 parse_class_name(&percent_decode(p).ok_or_else(invalid)?).ok_or_else(invalid)?,
             ),
+            ("recolorclass", Some(p)) => {
+                // <class>,<hex>: the class name's charset
+                // excludes commas, so the last comma is the
+                // separator. The hex spells like the other
+                // color parameters (issue #175).
+                let (raw_name, raw_hex) = p.rsplit_once(',').ok_or_else(invalid)?;
+                let name = parse_class_name(&percent_decode(raw_name).ok_or_else(invalid)?)
+                    .ok_or_else(invalid)?;
+                let color = parse_hex6(raw_hex).map_err(|_| invalid())?;
+                Filter::RecolorClass(name, color)
+            }
             ("facepad", Some(p)) => {
                 let pad: f32 = p.parse().map_err(|_| invalid())?;
                 if !pad.is_finite() || !(0.0..=3.0).contains(&pad) {
@@ -2231,8 +2249,9 @@ pub struct RequestDirectives {
     /// crop, or a face redaction filter. (Smart alignment does
     /// not count here: it falls back to saliency.)
     pub needs_face_model: bool,
-    /// Class names requested by class redaction filters, in
-    /// request order.
+    /// Class names requested by class operations (the
+    /// redaction filters and `recolorclass`), in request
+    /// order.
     pub classes: Vec<String>,
     /// Padding for a face-aligned crop, as a fraction of the
     /// face size added on every side. Defaults to 0.5.
@@ -2320,9 +2339,9 @@ impl RequestDirectives {
                         Filter::Quality(_) => d.quality_directive = true,
                         Filter::Text { .. } => d.text = true,
                         Filter::BlurFaces | Filter::PixelateFaces => d.needs_face_model = true,
-                        Filter::BlurClass(name) | Filter::PixelateClass(name) => {
-                            d.classes.push(name.clone())
-                        }
+                        Filter::BlurClass(name)
+                        | Filter::PixelateClass(name)
+                        | Filter::RecolorClass(name, _) => d.classes.push(name.clone()),
                         Filter::FacePad(p) => d.face_padding = *p,
                         Filter::Watermark { url, .. } | Filter::Overlay { url, .. }
                             if !d.watermark_urls.contains(url) =>
@@ -2337,7 +2356,7 @@ impl RequestDirectives {
         d
     }
 
-    /// Whether any class redaction filter is present (which
+    /// Whether any class operation is present (which
     /// needs the detection model and the AI gate).
     pub fn has_class_redaction(&self) -> bool {
         !self.classes.is_empty()
@@ -2556,6 +2575,9 @@ fn filter_text(filter: &Filter) -> String {
         Filter::PixelateFaces => "pixelatefaces".to_string(),
         Filter::BlurClass(name) => format!("blurclass({})", encode_arg(name)),
         Filter::PixelateClass(name) => format!("pixelateclass({})", encode_arg(name)),
+        Filter::RecolorClass(name, color) => {
+            format!("recolorclass({},{})", encode_arg(name), hex3(*color))
+        }
         Filter::FacePad(v) => format!("facepad({v})"),
         Filter::Upscale(v) => format!("upscale({v})"),
         Filter::Dpr(v) => format!("dpr({v})"),
@@ -4801,12 +4823,53 @@ mod tests {
         ] {
             assert!(parse_operations(bad).is_err(), "{bad}");
         }
-
         for bad in [
             "filters:facepad(9)/example.com/img.jpg",
             "filters:facepad(-1)/example.com/img.jpg",
             "filters:facepad(x)/example.com/img.jpg",
             "filters:blurfaces(1)/example.com/img.jpg",
+        ] {
+            assert!(parse_operations(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn recolorclass_parses_like_the_other_class_filters() {
+        // Issue #175: <class>,<hex>, the class percent-
+        // decoded like the other class filters, the hex in
+        // the color parameters' spelling; the canonical
+        // form lowercases the hex and re-encodes the name.
+        let (ops, _) =
+            parse_operations("filters:recolorclass(traffic%20light,FF8800)/example.com/img.jpg")
+                .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::RecolorClass(
+                "traffic light".to_string(),
+                [0xff, 0x88, 0x00],
+            )])]
+        );
+        assert_eq!(
+            canonical_key_form("filters:recolorclass(traffic%20light,FF8800)/example.com/img.jpg"),
+            "filters:recolorclass(traffic%20light,ff8800)/example.com/img.jpg"
+        );
+        // A recolor names a class like the redaction
+        // filters: it joins the class list and takes the
+        // AI gate.
+        let d = RequestDirectives::analyze(&ops);
+        assert_eq!(d.classes, ["traffic light"]);
+        assert!(d.has_class_redaction());
+        assert!(d.uses_ai());
+        for bad in [
+            "filters:recolorclass(person)/example.com/img.jpg",
+            "filters:recolorclass(person,)/example.com/img.jpg",
+            "filters:recolorclass(,ff0000)/example.com/img.jpg",
+            "filters:recolorclass(person,ff00)/example.com/img.jpg",
+            "filters:recolorclass(person,ff00000)/example.com/img.jpg",
+            "filters:recolorclass(person,gg0000)/example.com/img.jpg",
+            "filters:recolorclass(person,#ff0000)/example.com/img.jpg",
+            "filters:recolorclass(per%24on,ff0000)/example.com/img.jpg",
+            "filters:recolorclass/example.com/img.jpg",
         ] {
             assert!(parse_operations(bad).is_err(), "{bad}");
         }

@@ -169,7 +169,9 @@ The directory must hold, under these names: `u2netp.onnx`,
 `moderation_labels.txt`, `moderation_signal_labels.txt`,
 `aesthetic_b32.pth`, `aesthetic_l14_v1.pth`, `yolo.onnx`,
 `detectors.json`, `upscale_swin2sr.onnx`, `lama.onnx` (the OpenCV
-zoo export of big-lama, for `remove_region`). The runner boots three
+zoo export of big-lama, for `remove_region`), `mobile_sam_encoder.onnx`
+and `mobile_sam_decoder.onnx` (the MobileSAM pair, for the
+mask-tight class operations). The runner boots three
 instances: AI (everything configured), AIN (nothing configured),
 AIC (the B/32 encoder with the mismatched L/14 aesthetic head and
 label-only moderation signals). Without the environment variables,

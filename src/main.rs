@@ -86,6 +86,12 @@
 //! - `CRABCROP_INPAINT_MODEL`: path to a LaMa-family ONNX
 //!   model (two inputs, image plus mask, at a fixed 512x512)
 //!   for the `remove_region` filter. Same preload rule.
+//! - `CRABCROP_SEGMENT_ENCODER_MODEL` /
+//!   `CRABCROP_SEGMENT_DECODER_MODEL`: a SAM-family ONNX
+//!   model pair (image encoder plus prompt decoder) that
+//!   gives the class filters mask-tight silhouettes instead
+//!   of detection rectangles. Both are required together; a
+//!   partial set is a startup error. Same preload rule.
 //! - `CRABCROP_FACE_MODEL`: path to a YuNet ONNX model for
 //!   face-aware smart crops. Same preload rule; unset means
 //!   smart crops use the saliency estimate.
@@ -938,6 +944,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         removebg: ai.removebg,
         upscale: ai.upscale,
         inpaint: ai.inpaint,
+        segment: ai.segment,
         face: ai.face,
         tagger: ai.tagger,
         tag_threshold: ai.tag_threshold,
@@ -1053,6 +1060,8 @@ fn config_fingerprint(
         "CRABCROP_REMOVEBG_MODEL",
         "CRABCROP_UPSCALE_MODEL",
         "CRABCROP_INPAINT_MODEL",
+        "CRABCROP_SEGMENT_ENCODER_MODEL",
+        "CRABCROP_SEGMENT_DECODER_MODEL",
         "CRABCROP_FACE_MODEL",
         "CRABCROP_DETECT_MODEL",
         "CRABCROP_CLIP_IMAGE_MODEL",
@@ -1195,6 +1204,7 @@ struct AiProviders {
     removebg: Option<Arc<dyn crate::ai::MaskProvider>>,
     upscale: Option<Arc<dyn crate::ai::UpscaleProvider>>,
     inpaint: Option<Arc<dyn crate::ai::InpaintProvider>>,
+    segment: Option<Arc<dyn crate::ai::SegmentProvider>>,
     face: Option<Arc<dyn crate::ai::FaceProvider>>,
     tagger: Option<Arc<dyn crate::ai::TagProvider>>,
     tag_threshold: f32,
@@ -1241,6 +1251,7 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         }
         _ => None,
     };
+    let segment = build_segment(ort_dylib.as_deref(), &get)?;
     let (tagger, tag_threshold, embeddings) = match build_tagger(ort_dylib.as_deref(), &get)? {
         Some(setup) => (
             Some(setup.provider),
@@ -1266,6 +1277,7 @@ fn build_ai_providers(get: impl Fn(&str) -> Option<String>) -> Result<AiProvider
         removebg,
         upscale,
         inpaint,
+        segment,
         face,
         tagger,
         tag_threshold,
@@ -1426,6 +1438,36 @@ fn build_pdf_renderer(
             Ok(Some(Arc::new(renderer)))
         }
         _ => Ok(None),
+    }
+}
+
+/// Build the segment provider from the environment: the
+/// `CRABCROP_SEGMENT_*_MODEL` pair (encoder plus prompt
+/// decoder, issue #175), preloaded like every other
+/// model. The pair is all-or-nothing, the CLIP rule: a
+/// partial set is a startup error naming what is missing.
+fn build_segment(
+    ort_dylib: Option<&str>,
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<dyn crate::ai::SegmentProvider>>, String> {
+    let encoder = get("CRABCROP_SEGMENT_ENCODER_MODEL").filter(|v| !v.is_empty());
+    let decoder = get("CRABCROP_SEGMENT_DECODER_MODEL").filter(|v| !v.is_empty());
+    match (encoder, decoder) {
+        (None, None) => Ok(None),
+        (Some(encoder), Some(decoder)) => {
+            let provider = crate::ai::OnnxSegmentProvider::load(ort_dylib, &encoder, &decoder)
+                .map_err(|e| format!("cannot load the segment model pair: {e}"))?;
+            println!("segment models loaded from {encoder} (encoder) and {decoder} (decoder)");
+            Ok(Some(Arc::new(provider)))
+        }
+        (None, Some(_)) => Err(
+            "segmentation is partially configured: missing CRABCROP_SEGMENT_ENCODER_MODEL"
+                .to_string(),
+        ),
+        (Some(_), None) => Err(
+            "segmentation is partially configured: missing CRABCROP_SEGMENT_DECODER_MODEL"
+                .to_string(),
+        ),
     }
 }
 
@@ -2828,6 +2870,31 @@ mod tests {
             err.contains("CRABCROP_AESTHETIC_HEAD is set but the CRABCROP_CLIP_* set"),
             "{err}"
         );
+        // Half a segmentation pair refuses the same way
+        // (issue #175): the provider is an encoder and a
+        // prompt decoder, and one without the other
+        // segments nothing.
+        let model = missing_path("segment");
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_SEGMENT_ENCODER_MODEL",
+            model.as_str(),
+        )])));
+        assert!(
+            err.contains(
+                "segmentation is partially configured: missing CRABCROP_SEGMENT_DECODER_MODEL"
+            ),
+            "{err}"
+        );
+        let err = expect_err(build_ai_providers(env_of(&[(
+            "CRABCROP_SEGMENT_DECODER_MODEL",
+            model.as_str(),
+        )])));
+        assert!(
+            err.contains(
+                "segmentation is partially configured: missing CRABCROP_SEGMENT_ENCODER_MODEL"
+            ),
+            "{err}"
+        );
     }
 
     /// Configured-but-unloadable models refuse construction
@@ -2872,6 +2939,14 @@ mod tests {
             ("CRABCROP_CLIP_LABELS", missing.as_str()),
         ])));
         assert!(err.contains("cannot load the CLIP tagging models"), "{err}");
+        // A full segmentation pair whose files do not
+        // exist refuses too (issue #175).
+        let err = expect_err(build_ai_providers(env_of(&[
+            ("CRABCROP_ORT_DYLIB", dylib.as_str()),
+            ("CRABCROP_SEGMENT_ENCODER_MODEL", missing.as_str()),
+            ("CRABCROP_SEGMENT_DECODER_MODEL", missing.as_str()),
+        ])));
+        assert!(err.contains("cannot load the segment model pair"), "{err}");
     }
 
     /// Full AI construction with real models: every
@@ -2935,10 +3010,25 @@ mod tests {
         } else {
             false
         };
+        // Segmentation joins the same way, as a pair
+        // (CRABCROP_TEST_SEGMENT_ENCODER_MODEL and
+        // CRABCROP_TEST_SEGMENT_DECODER_MODEL).
+        let want_segment = match (
+            std::env::var("CRABCROP_TEST_SEGMENT_ENCODER_MODEL"),
+            std::env::var("CRABCROP_TEST_SEGMENT_DECODER_MODEL"),
+        ) {
+            (Ok(encoder), Ok(decoder)) => {
+                map.insert("CRABCROP_SEGMENT_ENCODER_MODEL".to_string(), encoder);
+                map.insert("CRABCROP_SEGMENT_DECODER_MODEL".to_string(), decoder);
+                true
+            }
+            _ => false,
+        };
         let ai = build_ai_providers(|name: &str| map.get(name).cloned()).unwrap();
         assert!(ai.removebg.is_some());
         assert!(ai.upscale.is_some());
         assert_eq!(ai.inpaint.is_some(), want_inpaint);
+        assert_eq!(ai.segment.is_some(), want_segment);
         assert!(ai.face.is_some());
         assert!(ai.tagger.is_some());
         // The embedding provider rides the tagger.

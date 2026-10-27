@@ -850,6 +850,105 @@ def rr_unconfigured_501():
           f, f"status={f['status']} body={f['body'][:110]}")
 
 
+# ---------------------------------------------------------------- segmentation
+def _person_segment():
+    """The segments record for the portrait's person, from
+    a blurclass meta request against the AI instance."""
+    s, j = meta("filters:blurclass(person):format(png)", "person-portrait.jpg")
+    objects = ((j.get("segments") or {}).get("objects")) or []
+    person = next((o for o in objects if o.get("label") == "person"), None)
+    return s, j, person
+
+
+def _corners(box):
+    x, y, w, h = box
+    return [(x, y), (x + w - 1, y), (x, y + h - 1), (x + w - 1, y + h - 1)]
+
+
+@cell
+def sg_meta_segments():
+    s, j, person = _person_segment()
+    ok = s == 200 and person is not None
+    evidence = f"status={s} segments={json.dumps(j.get('segments'))[:220]}"
+    if ok:
+        x, y, w, h = person["box"]
+        tx, ty, tw, th = person["tight_box"]
+        cov = person["coverage"]
+        inside = tx >= x and ty >= y and tx + tw <= x + w and ty + th <= y + h
+        tighter = tw * th < w * h
+        ok = inside and tighter and 0.05 < cov < 0.95
+        evidence += (f" box={person['box']} tight={person['tight_box']} "
+                     f"coverage={cov} centroid={person['centroid']}")
+    rec("sg-meta-segments", "segment", "filters:blurclass(person) meta",
+        "person-portrait.jpg", "PASS" if ok else "FAIL", {"status": s},
+        evidence)
+
+
+@cell
+def sg_blurclass_mask_tight():
+    s, j, person = _person_segment()
+    fb = render("sg-base-portrait", "filters:format(png)", "person-portrait.jpg")
+    f = render("sg-blurclass-mask", "filters:blurclass(person):format(png)",
+               "person-portrait.jpg")
+    ok = False
+    evidence = f"meta_status={s} render_status={f['status']}"
+    if person and fb["path"] and f["path"]:
+        # The box's corners are background in a portrait:
+        # a mask-tight blur leaves them bit-identical to
+        # the plain render (the rectangle form blurs them
+        # too). One corner may legitimately carry hair, so
+        # three of four must survive exactly.
+        same = sum(1 for pt in _corners(person["box"])
+                   if pixel(f["path"], *pt) == pixel(fb["path"], *pt))
+        # Inside the silhouette the blur bites: the tight
+        # box's local variance collapses like the det
+        # cell's torso check (local_var crops by corners).
+        tx, ty, tw, th = person["tight_box"]
+        crop = (tx, ty, tx + tw, ty + th)
+        vb = local_var(fb["path"], crop)
+        vf = local_var(f["path"], crop)
+        ok = same >= 3 and vf < vb * 0.6
+        evidence += (f" box={person['box']} tight={person['tight_box']} "
+                     f"corners_bit_identical={same}/4 tight_var base={vb} "
+                     f"blurred={vf}")
+    check("sg-blurclass-mask-tight", "segment",
+          "filters:blurclass(person):format(png)", "person-portrait.jpg",
+          ok, f, evidence)
+
+
+@cell
+def sg_recolorclass():
+    s, j, person = _person_segment()
+    fb = render("sg-base-portrait2", "filters:format(png)", "person-portrait.jpg")
+    f = render("sg-recolorclass", "filters:recolorclass(person,ff0000):format(png)",
+               "person-portrait.jpg")
+    ok = False
+    evidence = f"meta_status={s} render_status={f['status']}"
+    if person and fb["path"] and f["path"]:
+        cx, cy = person["centroid"]
+        centre = pixel(f["path"], cx, cy)
+        painted = centre[0] > 200 and centre[1] < 60 and centre[2] < 60
+        same = sum(1 for pt in _corners(person["box"])
+                   if pixel(f["path"], *pt) == pixel(fb["path"], *pt))
+        ok = painted and same >= 3
+        evidence += (f" centroid={person['centroid']} centroid_px={centre} "
+                     f"corners_bit_identical={same}/4")
+    check("sg-recolorclass", "segment",
+          "filters:recolorclass(person,ff0000):format(png)",
+          "person-portrait.jpg", ok, f, evidence)
+
+
+@cell
+def sg_recolorclass_unconfigured_501():
+    f = render("sg-recolor-unconfigured-501",
+               "filters:recolorclass(person,ff0000):format(png)", "dog.jpg",
+               base="B")
+    check("sg-recolorclass-unconfigured-501", "segment",
+          "filters:recolorclass(person,ff0000)", "dog.jpg",
+          f["status"] == 501 and "not configured" in f["body"],
+          f, f"status={f['status']} body={f['body'][:110]}")
+
+
 # ---------------------------------------------------------------- studio timing log
 @cell
 def studio_timing_log():

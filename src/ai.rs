@@ -655,6 +655,453 @@ impl InpaintProvider for OnnxInpaintProvider {
     }
 }
 
+/// A SAM-family image embedding: the encoder's output for
+/// one image, opaque to callers. Segmentation decoders
+/// consume it once per box prompt, so a request encodes
+/// once and decodes per object (issue #175).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentEmbedding {
+    /// The embedding field in the SAM layout: 256 channels
+    /// on a 64x64 grid, row-major.
+    pub data: Vec<f32>,
+}
+
+/// The SAM encoder's fixed input edge.
+const SEGMENT_INPUT: u32 = 1024;
+/// The SAM embedding's channel count and grid edge: the
+/// fixed output shape of the encoder exports the segment
+/// contract targets.
+const SEGMENT_CHANNELS: usize = 256;
+const SEGMENT_GRID: usize = 64;
+/// The decoder's mask-prompt input edge (4x the grid): the
+/// contract takes a mask prompt slot even when no mask is
+/// being prompted, so it is always fed, empty.
+const SEGMENT_MASK_INPUT: usize = 256;
+
+/// Produces a per-object mask from a box prompt: the
+/// silhouette of the object inside a detection's rectangle,
+/// upgrading class operations from rectangles to the
+/// object's own shape (issue #175). Implemented by the
+/// ONNX provider in production and by fakes in tests.
+pub trait SegmentProvider: Send + Sync + std::fmt::Debug {
+    /// Encode an image once; the result feeds every
+    /// `decode` for that image.
+    fn encode(&self, img: &DynamicImage) -> Result<SegmentEmbedding, AiError>;
+    /// Decode one box prompt against a previous `encode`
+    /// of the same image. `bbox` is (x, y, w, h) in image
+    /// pixels; the mask comes back at the box's own
+    /// resolution, soft (strength 0..255), zero where the
+    /// object is not.
+    fn decode(
+        &self,
+        embedding: &SegmentEmbedding,
+        img_w: u32,
+        img_h: u32,
+        bbox: (u32, u32, u32, u32),
+    ) -> Result<GrayImage, AiError>;
+    /// Encode and decode in one call, for callers with a
+    /// single box to segment.
+    fn segment(
+        &self,
+        img: &DynamicImage,
+        bbox: (u32, u32, u32, u32),
+    ) -> Result<GrayImage, AiError> {
+        let embedding = self.encode(img)?;
+        self.decode(&embedding, img.width(), img.height(), bbox)
+    }
+}
+
+/// SAM input preprocessing, the reference pipeline: resize
+/// the longest side to the encoder's edge keeping aspect,
+/// normalize with the SAM pixel statistics (which are in
+/// 0..255 scale), and zero-pad to the square in normalized
+/// space. Output is planar CHW at the encoder's edge.
+pub fn segment_preprocess(img: &DynamicImage) -> Vec<f32> {
+    const MEAN: [f32; 3] = [123.675, 116.28, 103.53];
+    const STD: [f32; 3] = [58.395, 57.12, 57.375];
+    let (w, h) = (img.width(), img.height());
+    let scale = SEGMENT_INPUT as f32 / w.max(h) as f32;
+    let nw = ((w as f32 * scale).round() as u32).max(1);
+    let nh = ((h as f32 * scale).round() as u32).max(1);
+    let resized = img.resize_exact(nw, nh, FilterType::Triangle).to_rgb8();
+    let size = SEGMENT_INPUT as usize;
+    let mut out = vec![0f32; 3 * size * size];
+    for (i, px) in resized.pixels().enumerate() {
+        let (rx, ry) = ((i as u32 % nw) as usize, (i as u32 / nw) as usize);
+        for c in 0..3 {
+            out[c * size * size + ry * size + rx] = (px[c] as f32 - MEAN[c]) / STD[c];
+        }
+    }
+    out
+}
+
+/// The decoder's box-prompt coordinates for one box, as
+/// (x0, y0, x1, y1) in the encoder's input space. The
+/// exported decoder does not rescale prompts (its point
+/// embedding only shifts by half a pixel and divides by
+/// the input edge), so the caller applies the same
+/// longest-side scale the image itself got, exactly as
+/// the reference ONNX pipeline does.
+pub fn segment_box_coords(img_w: u32, img_h: u32, bbox: (u32, u32, u32, u32)) -> [f32; 4] {
+    let scale = SEGMENT_INPUT as f32 / img_w.max(img_h) as f32;
+    let (x, y, w, h) = bbox;
+    [
+        x as f32 * scale,
+        y as f32 * scale,
+        x.saturating_add(w) as f32 * scale,
+        y.saturating_add(h) as f32 * scale,
+    ]
+}
+
+/// One decoder mask channel (logits) as soft strengths:
+/// the logistic function scaled to 0..255.
+fn sigmoid_strengths(logits: &[f32]) -> Vec<u8> {
+    logits
+        .iter()
+        .map(|&v| (255.0 / (1.0 + (-v).exp())).round() as u8)
+        .collect()
+}
+
+/// The geometry of one segmentation mask (issue #175):
+/// where the silhouette sits inside the mask, how much of
+/// it the silhouette covers, and where its mass centers.
+/// This is the mask geometry crop anchoring and meta
+/// reporting consume: a tighter statement of an object
+/// than its detection rectangle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaskGeometry {
+    /// The silhouette's tight box, in mask coordinates:
+    /// (x, y, w, h) spanning the pixels over half strength.
+    pub tight: (u32, u32, u32, u32),
+    /// The silhouette's soft area share of the mask,
+    /// 0..=1: every pixel weighted by its strength.
+    pub coverage: f32,
+    /// The mask's center of mass, as fractions of the
+    /// mask's width and height.
+    pub centroid: (f32, f32),
+}
+
+/// Measure a soft segment mask (0 is background). `None`
+/// when nothing in the mask passes half strength: the
+/// model found no object there.
+pub fn mask_geometry(mask: &GrayImage) -> Option<MaskGeometry> {
+    let (w, h) = (mask.width(), mask.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (mut total, mut sx, mut sy) = (0f64, 0f64, 0f64);
+    let (mut min_x, mut min_y) = (w, h);
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    let mut any = false;
+    for (x, y, p) in mask.enumerate_pixels() {
+        let v = p[0] as f64;
+        if v > 0.0 {
+            total += v;
+            sx += v * x as f64;
+            sy += v * y as f64;
+        }
+        if p[0] > 127 {
+            any = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if !any || total == 0.0 {
+        return None;
+    }
+    Some(MaskGeometry {
+        tight: (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1),
+        coverage: (total / (w as f64 * h as f64 * 255.0)) as f32,
+        centroid: (
+            (sx / total / w as f64) as f32,
+            (sy / total / h as f64) as f32,
+        ),
+    })
+}
+
+/// Box-prompted segmentation backed by a SAM-family ONNX
+/// export pair (issue #175): an image encoder producing a
+/// 256x64x64 embedding from a 1024x1024 input, and a
+/// prompt decoder (the `SamOnnxModel` export shape) taking
+/// the embedding plus point prompts and answering mask
+/// logits at the original image size, one candidate per
+/// mask token, with predicted-IoU scores. The reference
+/// artifact is MobileSAM (Apache-2.0): a 28 MB encoder and
+/// a 16.5 MB decoder exported from the project's
+/// checkpoint with its own ONNX export path. Box prompts
+/// are two corner points with labels 2 and 3; the best
+/// candidate by predicted IoU wins, and its logits become
+/// the soft mask through the logistic function.
+pub struct OnnxSegmentProvider {
+    encoder: Mutex<Session>,
+    decoder: Mutex<Session>,
+    encoder_input: String,
+    embeddings_input: String,
+    coords_input: String,
+    labels_input: String,
+    mask_input: String,
+    has_mask_input: String,
+    size_input: String,
+    masks_output: String,
+    scores_output: String,
+}
+
+impl OnnxSegmentProvider {
+    /// Load an encoder/decoder pair. Input and output
+    /// names are found by their conventional names,
+    /// falling back to declaration order, like the
+    /// inpainting provider. A model that does not fit the
+    /// pair contract (wrong input count, an embedding of
+    /// the wrong shape, a probe mask of the wrong size)
+    /// is rejected here, at boot.
+    pub fn load(
+        dylib: Option<&str>,
+        encoder_path: &str,
+        decoder_path: &str,
+    ) -> Result<Self, AiError> {
+        let (encoder, encoder_input) = build_session(dylib, encoder_path)?;
+        let (decoder, _) = build_session(dylib, decoder_path)?;
+        let names: Vec<String> = decoder
+            .inputs()
+            .iter()
+            .map(|i| i.name().to_string())
+            .collect();
+        if names.len() < 6 {
+            return Err(AiError::Load(format!(
+                "the model {decoder_path} has {} input(s); a segment decoder \
+                 takes an embedding, point coordinates and labels, a mask \
+                 prompt slot, its presence flag, and the image size",
+                names.len()
+            )));
+        }
+        let pick = |want: &str, fallback: usize| -> String {
+            names
+                .iter()
+                .find(|n| n.eq_ignore_ascii_case(want))
+                .cloned()
+                .unwrap_or_else(|| names[fallback].clone())
+        };
+        let out_names: Vec<String> = decoder
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        let pick_out = |want: &str, fallback: usize| -> Result<String, AiError> {
+            out_names
+                .iter()
+                .find(|n| n.eq_ignore_ascii_case(want))
+                .cloned()
+                .or_else(|| out_names.get(fallback).cloned())
+                .ok_or_else(|| {
+                    AiError::Load(format!("the model {decoder_path} has no output for {want}"))
+                })
+        };
+        let provider = Self {
+            encoder: Mutex::new(encoder),
+            decoder: Mutex::new(decoder),
+            encoder_input,
+            embeddings_input: pick("image_embeddings", 0),
+            coords_input: pick("point_coords", 1),
+            labels_input: pick("point_labels", 2),
+            mask_input: pick("mask_input", 3),
+            has_mask_input: pick("has_mask_input", 4),
+            size_input: pick("orig_im_size", 5),
+            masks_output: pick_out("masks", 0)?,
+            scores_output: pick_out("iou_predictions", 1)?,
+        };
+        // Probe the pair end to end, like the other
+        // providers probe their contracts: encode a small
+        // image and segment a box inside it.
+        let probe = DynamicImage::new_rgb8(64, 48);
+        let mask = provider
+            .segment(&probe, (8, 8, 32, 24))
+            .map_err(|e| AiError::Load(format!("the segment model pair failed its probe: {e}")))?;
+        if (mask.width(), mask.height()) != (32, 24) {
+            return Err(AiError::Load(format!(
+                "the segment model pair failed its probe: a 32x24 box came \
+                 back as a {}x{} mask",
+                mask.width(),
+                mask.height()
+            )));
+        }
+        Ok(provider)
+    }
+}
+
+impl std::fmt::Debug for OnnxSegmentProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxSegmentProvider")
+            .field("encoder_input", &self.encoder_input)
+            .field("embeddings_input", &self.embeddings_input)
+            .field("masks_output", &self.masks_output)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SegmentProvider for OnnxSegmentProvider {
+    fn encode(&self, img: &DynamicImage) -> Result<SegmentEmbedding, AiError> {
+        let size = SEGMENT_INPUT as usize;
+        let input = segment_preprocess(img);
+        let tensor = ort::value::Tensor::from_array(([1, 3, size, size], input.into_boxed_slice()))
+            .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let mut session = self.encoder.lock().map_err(|_| AiError::LockPoisoned)?;
+        let outputs = session
+            .run(ort::inputs![self.encoder_input.as_str() => tensor])
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+        let (_, first) = outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
+        let (shape, data) = first
+            .try_extract_tensor::<f32>()
+            .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
+        let want = SEGMENT_CHANNELS * SEGMENT_GRID * SEGMENT_GRID;
+        if shape.len() != 4
+            || shape[1] as usize != SEGMENT_CHANNELS
+            || shape[2] as usize != SEGMENT_GRID
+            || shape[3] as usize != SEGMENT_GRID
+            || data.len() != want
+        {
+            return Err(AiError::BadOutput(format!(
+                "unexpected embedding shape: {shape:?} ({} values); the \
+                 contract takes a 256x64x64 field",
+                data.len()
+            )));
+        }
+        Ok(SegmentEmbedding {
+            data: data.to_vec(),
+        })
+    }
+
+    fn decode(
+        &self,
+        embedding: &SegmentEmbedding,
+        img_w: u32,
+        img_h: u32,
+        bbox: (u32, u32, u32, u32),
+    ) -> Result<GrayImage, AiError> {
+        let (x, y, w, h) = bbox;
+        if w == 0 || h == 0 {
+            return Ok(GrayImage::new(w, h));
+        }
+        let want = SEGMENT_CHANNELS * SEGMENT_GRID * SEGMENT_GRID;
+        if embedding.data.len() != want {
+            return Err(AiError::BadOutput(format!(
+                "the embedding carries {} values; the segment contract \
+                 takes {want}",
+                embedding.data.len()
+            )));
+        }
+        let coords = segment_box_coords(img_w, img_h, bbox);
+        let embeddings_tensor = ort::value::Tensor::from_array((
+            [1, SEGMENT_CHANNELS, SEGMENT_GRID, SEGMENT_GRID],
+            embedding.data.clone().into_boxed_slice(),
+        ))
+        .map_err(|e| AiError::Inference(format!("cannot build the embedding tensor: {e}")))?;
+        let coords_tensor = ort::value::Tensor::from_array((
+            [1, 2, 2],
+            vec![coords[0], coords[1], coords[2], coords[3]].into_boxed_slice(),
+        ))
+        .map_err(|e| AiError::Inference(format!("cannot build the prompt tensor: {e}")))?;
+        let labels_tensor =
+            ort::value::Tensor::from_array(([1, 2], vec![2.0f32, 3.0].into_boxed_slice()))
+                .map_err(|e| AiError::Inference(format!("cannot build the prompt tensor: {e}")))?;
+        let mask_tensor = ort::value::Tensor::from_array((
+            [1, 1, SEGMENT_MASK_INPUT, SEGMENT_MASK_INPUT],
+            vec![0f32; SEGMENT_MASK_INPUT * SEGMENT_MASK_INPUT].into_boxed_slice(),
+        ))
+        .map_err(|e| AiError::Inference(format!("cannot build the mask prompt tensor: {e}")))?;
+        let has_mask_tensor =
+            ort::value::Tensor::from_array(([1], vec![0.0f32].into_boxed_slice())).map_err(
+                |e| AiError::Inference(format!("cannot build the mask flag tensor: {e}")),
+            )?;
+        let size_tensor = ort::value::Tensor::from_array((
+            [2],
+            vec![img_h as f32, img_w as f32].into_boxed_slice(),
+        ))
+        .map_err(|e| AiError::Inference(format!("cannot build the size tensor: {e}")))?;
+        let mut session = self.decoder.lock().map_err(|_| AiError::LockPoisoned)?;
+        let outputs = session
+            .run(ort::inputs![
+                self.embeddings_input.as_str() => embeddings_tensor,
+                self.coords_input.as_str() => coords_tensor,
+                self.labels_input.as_str() => labels_tensor,
+                self.mask_input.as_str() => mask_tensor,
+                self.has_mask_input.as_str() => has_mask_tensor,
+                self.size_input.as_str() => size_tensor
+            ])
+            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+        let outputs = collect_outputs(outputs)?;
+        let find = |want: &str| -> Option<&(String, Vec<i64>, Vec<f32>)> {
+            outputs
+                .iter()
+                .find(|(name, _, _)| name.eq_ignore_ascii_case(want))
+        };
+        let (_, mask_dims, mask_data) = find(&self.masks_output)
+            .or_else(|| outputs.first())
+            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
+        let (_, _, score_data) = find(&self.scores_output)
+            .or_else(|| outputs.get(1))
+            .ok_or_else(|| {
+                AiError::BadOutput("the model produced no IoU predictions".to_string())
+            })?;
+        if mask_dims.len() != 4 || mask_dims[0] != 1 {
+            return Err(AiError::BadOutput(format!(
+                "unexpected mask output shape: {mask_dims:?}"
+            )));
+        }
+        let (candidates, mh, mw) = (
+            mask_dims[1] as usize,
+            mask_dims[2] as u32,
+            mask_dims[3] as u32,
+        );
+        if candidates == 0 || score_data.len() < candidates {
+            return Err(AiError::BadOutput(format!(
+                "the model produced {candidates} mask candidates but {} scores",
+                score_data.len()
+            )));
+        }
+        // The predicted-IoU scores are unbounded model
+        // predictions (a near-perfect mask can score over
+        // 1.0): they rank the candidates, nothing more.
+        let best = score_data[..candidates]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let plane = (mw * mh) as usize;
+        let channel = &mask_data[best * plane..(best + 1) * plane];
+        let full = GrayImage::from_raw(mw, mh, sigmoid_strengths(channel)).ok_or_else(|| {
+            AiError::BadOutput("the mask channel does not fit its shape".to_string())
+        })?;
+        let full = if (mw, mh) == (img_w, img_h) {
+            full
+        } else {
+            image::imageops::resize(&full, img_w, img_h, FilterType::Triangle)
+        };
+        // Crop the box out of the full-size mask. A box
+        // reaching past the frame (a detector's rounding)
+        // clips, and the missing strip stays background, so
+        // the answer is always the box's own size.
+        let cx = x.min(img_w);
+        let cy = y.min(img_h);
+        let cw = w.min(img_w - cx);
+        let ch = h.min(img_h - cy);
+        if (cw, ch) == (w, h) {
+            return Ok(image::imageops::crop_imm(&full, cx, cy, cw, ch).to_image());
+        }
+        let mut boxed = GrayImage::new(w, h);
+        if cw > 0 && ch > 0 {
+            let crop = image::imageops::crop_imm(&full, cx, cy, cw, ch).to_image();
+            image::imageops::overlay(&mut boxed, &crop, 0, 0);
+        }
+        Ok(boxed)
+    }
+}
+
 /// A detected face, in source-image pixels, with the
 /// detector's confidence in 0.0..=1.0.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1159,6 +1606,159 @@ mod tests {
             &missing_path("inpaint"),
         ));
         assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    #[test]
+    fn segment_preprocess_pads_and_normalizes() {
+        // 200x100 red: the longest side scales to 1024, so
+        // the image occupies 1024x512 and the rest of the
+        // square is normalized-space zero padding.
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            200,
+            100,
+            image::Rgb([255, 0, 0]),
+        ));
+        let input = segment_preprocess(&img);
+        let plane = 1024 * 1024;
+        assert_eq!(input.len(), 3 * plane);
+        let at = |c: usize, x: usize, y: usize| input[c * plane + y * 1024 + x];
+        // The SAM statistics, in 0..255 scale.
+        assert!((at(0, 0, 0) - (255.0 - 123.675) / 58.395).abs() < 0.01);
+        assert!((at(1, 0, 0) - (0.0 - 116.28) / 57.12).abs() < 0.01);
+        assert!((at(2, 1023, 511) - (0.0 - 103.53) / 57.375).abs() < 0.01);
+        // Below the image: padding, exactly zero.
+        assert_eq!(at(0, 0, 512), 0.0);
+        assert_eq!(at(1, 1023, 1023), 0.0);
+    }
+
+    #[test]
+    fn segment_box_coords_scale_into_encoder_space() {
+        // 800x600 image: the scale is 1024/800. The box
+        // corners land where the encoder sees them.
+        let coords = segment_box_coords(800, 600, (260, 180, 300, 290));
+        let want = [332.8, 230.4, 716.8, 601.6];
+        for (got, want) in coords.iter().zip(want) {
+            assert!((got - want).abs() < 0.01, "{got} vs {want}");
+        }
+        // A square image at the encoder's own size is the
+        // identity.
+        assert_eq!(
+            segment_box_coords(1024, 1024, (10, 20, 30, 40)),
+            [10.0, 20.0, 40.0, 60.0]
+        );
+    }
+
+    #[test]
+    fn sigmoid_strengths_map_logits_to_a_soft_mask() {
+        assert_eq!(sigmoid_strengths(&[-100.0, 0.0, 100.0]), vec![0, 128, 255]);
+    }
+
+    #[test]
+    fn mask_geometry_measures_a_soft_mask() {
+        // Left half at full strength, one dim pixel at
+        // (7, 7): the tight box is the half, the dim pixel
+        // still weighs into coverage and the centroid.
+        let mask = GrayImage::from_fn(10, 10, |x, y| {
+            if x < 5 {
+                image::Luma([255])
+            } else if (x, y) == (7, 7) {
+                image::Luma([100])
+            } else {
+                image::Luma([0])
+            }
+        });
+        let g = mask_geometry(&mask).expect("a geometry");
+        assert_eq!(g.tight, (0, 0, 5, 10));
+        assert!((g.coverage - 0.5039).abs() < 0.001, "{}", g.coverage);
+        assert!((g.centroid.0 - 0.2039).abs() < 0.001, "{}", g.centroid.0);
+        assert!((g.centroid.1 - 0.4519).abs() < 0.001, "{}", g.centroid.1);
+        // Nothing over half strength: no object, no
+        // geometry, even though the mask is not empty.
+        let faint = GrayImage::from_pixel(10, 10, image::Luma([100]));
+        assert_eq!(mask_geometry(&faint), None);
+        assert_eq!(mask_geometry(&GrayImage::new(10, 10)), None);
+        assert_eq!(mask_geometry(&GrayImage::new(0, 0)), None);
+    }
+
+    /// The real MobileSAM pair, end to end: a red disc on
+    /// a textured ground, prompted with the disc's box.
+    /// The mask must be the disc's silhouette: strong at
+    /// the center, absent at the box's corners, covering
+    /// about pi/4 of the box.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_SEGMENT_ENCODER_MODEL=...
+    /// CRABCROP_TEST_SEGMENT_DECODER_MODEL=...
+    /// cargo test -- --ignored segment_with_the_real_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and model files (env-configured)"]
+    fn segment_with_the_real_model() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let encoder = std::env::var("CRABCROP_TEST_SEGMENT_ENCODER_MODEL").unwrap();
+        let decoder = std::env::var("CRABCROP_TEST_SEGMENT_DECODER_MODEL").unwrap();
+        let provider = OnnxSegmentProvider::load(Some(&dylib), &encoder, &decoder).unwrap();
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(200, 150, |x, y| {
+            let dx = x as i32 - 100;
+            let dy = y as i32 - 75;
+            if dx * dx + dy * dy <= 40 * 40 {
+                image::Rgb([220, 40, 30])
+            } else {
+                let v = 90 + ((x * 7 + y * 13) % 40) as u8;
+                image::Rgb([v, v, v])
+            }
+        }));
+        let mask = provider.segment(&img, (60, 35, 80, 80)).unwrap();
+        assert_eq!((mask.width(), mask.height()), (80, 80));
+        assert!(
+            mask.get_pixel(40, 40)[0] > 200,
+            "center {}",
+            mask.get_pixel(40, 40)[0]
+        );
+        assert!(
+            mask.get_pixel(2, 2)[0] < 30,
+            "corner {}",
+            mask.get_pixel(2, 2)[0]
+        );
+        let g = mask_geometry(&mask).expect("the disc has geometry");
+        assert!(
+            (0.6..0.92).contains(&g.coverage),
+            "coverage {} (pi/4 is 0.785)",
+            g.coverage
+        );
+        // Encoding is reusable: two boxes against one
+        // encoding decode independently.
+        let embedding = provider.encode(&img).unwrap();
+        let again = provider
+            .decode(&embedding, 200, 150, (60, 35, 80, 80))
+            .unwrap();
+        assert_eq!(again, mask);
+    }
+
+    /// A missing file in the pair fails as Load, the same
+    /// boot story as the other providers.
+    /// CRABCROP_TEST_ORT_DYLIB=... cargo test -- --ignored segment_load_missing
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn segment_load_missing_model_file_is_a_load_error() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let message = expect_load(OnnxSegmentProvider::load(
+            Some(&dylib),
+            &missing_path("segment-encoder"),
+            &missing_path("segment-decoder"),
+        ));
+        assert!(message.contains("cannot load the model"), "{message}");
+    }
+
+    /// A one-input model is not a segment decoder: the
+    /// load rejects the pair as Load. The encoder file
+    /// stands in for the decoder here (it has one input).
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_SEGMENT_ENCODER_MODEL=...
+    /// cargo test -- --ignored segment_load_rejects
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn segment_load_rejects_a_decoder_without_the_prompt_inputs() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let encoder = std::env::var("CRABCROP_TEST_SEGMENT_ENCODER_MODEL").unwrap();
+        let message = expect_load(OnnxSegmentProvider::load(Some(&dylib), &encoder, &encoder));
+        assert!(message.contains("a segment decoder takes"), "{message}");
     }
 
     /// Load-failure coverage (#179, item 2): a missing model

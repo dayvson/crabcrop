@@ -481,6 +481,13 @@ pub struct ProcessedImage {
     /// erased, for meta responses. `None` when no removal
     /// ran (or on the animated paths).
     pub inpaint: Option<InpaintRecord>,
+    /// The segmentation record (issue #175) when a class
+    /// operation ran with a segment provider configured on
+    /// the still pipeline: the objects it segmented and
+    /// their mask geometry, for meta responses. `None`
+    /// when no class operation segmented anything (or on
+    /// the animated paths).
+    pub segments: Option<SegmentRecord>,
     /// The SSIMULACRA2 score of the returned bytes against the
     /// processed source, set when `quality(auto)` verified its
     /// encode (JPEG and JXL). `None` when nothing was scored.
@@ -526,6 +533,41 @@ pub struct VideoSourceMeta {
 pub struct InpaintRecord {
     /// The erased rectangles, each (x, y, w, h).
     pub regions: Vec<(u32, u32, u32, u32)>,
+}
+
+/// The segmentation record (issue #175): every object a
+/// class operation segmented, in chain order, in the
+/// pixel coordinates in effect where its filter ran, for
+/// meta responses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentRecord {
+    /// The segmented objects.
+    pub objects: Vec<SegmentObject>,
+}
+
+/// One segmented object in the segmentation record: the
+/// detection it came from and the geometry of its mask,
+/// the tighter statement of the object that crop
+/// anchoring consumes (issue #175).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentObject {
+    /// The detection's class label, in the model's own
+    /// spelling.
+    pub label: String,
+    /// The detection's score.
+    pub score: f32,
+    /// The detection's box, (x, y, w, h).
+    pub detection: (u32, u32, u32, u32),
+    /// The silhouette's tight box, (x, y, w, h) in image
+    /// coordinates: where the object actually is, inside
+    /// its detection box.
+    pub tight_box: (u32, u32, u32, u32),
+    /// The silhouette's soft area share of the detection
+    /// box, 0..=1.
+    pub coverage: f32,
+    /// The silhouette's center of mass, in image
+    /// coordinates.
+    pub centroid: (u32, u32),
 }
 
 /// Facts about a PDF source, probed at page rendering
@@ -638,6 +680,10 @@ pub struct ProcessContext<'a> {
     /// Inpainting provider for `remove_region`, when the
     /// deployment configured a model.
     pub inpaint_provider: Option<&'a dyn crate::ai::InpaintProvider>,
+    /// Segment provider for mask-tight class operations
+    /// (issue #175), when the deployment configured a
+    /// model pair.
+    pub segment_provider: Option<&'a dyn crate::ai::SegmentProvider>,
     /// Face provider for smart crops, when configured.
     pub face_provider: Option<&'a dyn crate::ai::FaceProvider>,
     /// Detection provider for class redaction, when
@@ -708,6 +754,7 @@ impl Default for ProcessContext<'_> {
             mask_provider: None,
             upscale_provider: None,
             inpaint_provider: None,
+            segment_provider: None,
             face_provider: None,
             detect_provider: None,
             declared_detect_providers: &[],
@@ -1131,7 +1178,7 @@ impl Engine {
         } else {
             None
         };
-        let (img, encode_opts, studio, inpaint) = apply_operations(
+        let (img, encode_opts, studio, inpaint, segments) = apply_operations(
             img,
             ops,
             cap,
@@ -1330,6 +1377,7 @@ impl Engine {
             placeholder,
             studio,
             inpaint,
+            segments,
             ssimulacra2: ssim,
             video: video_meta,
             pdf: pdf_meta,
@@ -1368,7 +1416,7 @@ impl Engine {
         for frame in frames {
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
@@ -1407,6 +1455,7 @@ impl Engine {
             placeholder,
             studio: None,
             inpaint: None,
+            segments: None,
             ssimulacra2: None,
             video: None,
             pdf: None,
@@ -1453,7 +1502,7 @@ impl Engine {
         for frame in frames {
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(crate::video::VideoFrame {
                 pixels: img.to_rgba8(),
@@ -1489,6 +1538,7 @@ impl Engine {
             placeholder,
             studio: None,
             inpaint: None,
+            segments: None,
             ssimulacra2: None,
             video: None,
             pdf: None,
@@ -1820,6 +1870,84 @@ fn detections_of_class(
         .collect()
 }
 
+/// Memoized image encoding for one pipeline run (issue
+/// #175): the image dimensions the embedding belongs to,
+/// and the segment provider's result. The encoder is the
+/// expensive half of segmentation (the decoder runs per
+/// box), so chained class operations on the same image
+/// state share one encoding, like detection memoization.
+type SegmentMemo = Option<(
+    u32,
+    u32,
+    Result<crate::ai::SegmentEmbedding, crate::ai::AiError>,
+)>;
+
+/// Segment one detection's box against the memoized
+/// encoding of `img`. A provider failure is an inference
+/// error: on a redaction request that fails the request,
+/// the same rule detection follows (never an unredacted,
+/// or silently rectangle-redacted, response).
+fn segment_detection(
+    memo: &mut SegmentMemo,
+    provider: &dyn crate::ai::SegmentProvider,
+    img: &DynamicImage,
+    det: &crate::ai::Detection,
+) -> Result<image::GrayImage, EngineError> {
+    let dims = (img.width(), img.height());
+    let stale = !matches!(memo, Some((w, h, _)) if (*w, *h) == dims);
+    if stale {
+        *memo = Some((dims.0, dims.1, provider.encode(img)));
+    }
+    let (_, _, cached) = memo.as_ref().expect("memo just populated");
+    let embedding = cached
+        .as_ref()
+        .map_err(|e| EngineError::Inference(e.clone()))?;
+    provider
+        .decode(embedding, dims.0, dims.1, (det.x, det.y, det.w, det.h))
+        .map_err(EngineError::Inference)
+}
+
+/// The detections of one class operation with their
+/// segmentation masks, plus the record entries the masks
+/// produced (issue #175). The geometry is measured on
+/// each mask and stated in image coordinates: the tight
+/// box and centroid are the mask geometry crop anchoring
+/// consumes. A mask in which the model found no object
+/// (nothing over half strength) still redacts its box's
+/// soft shape, it just contributes no geometry, so it
+/// leaves no record entry.
+fn segment_for_class(
+    memo: &mut SegmentMemo,
+    provider: &dyn crate::ai::SegmentProvider,
+    img: &DynamicImage,
+    detections: &[crate::ai::Detection],
+) -> Result<(Vec<crate::filters::MaskedDetection>, Vec<SegmentObject>), EngineError> {
+    let mut masked = Vec::with_capacity(detections.len());
+    let mut objects = Vec::new();
+    for det in detections {
+        let mask = segment_detection(memo, provider, img, det)?;
+        if let Some(geometry) = crate::ai::mask_geometry(&mask) {
+            let (tx, ty, tw, th) = geometry.tight;
+            objects.push(SegmentObject {
+                label: det.label.clone(),
+                score: det.score,
+                detection: (det.x, det.y, det.w, det.h),
+                tight_box: (det.x + tx, det.y + ty, tw, th),
+                coverage: geometry.coverage,
+                centroid: (
+                    det.x + (geometry.centroid.0 * det.w as f32).round() as u32,
+                    det.y + (geometry.centroid.1 * det.h as f32).round() as u32,
+                ),
+            });
+        }
+        masked.push(crate::filters::MaskedDetection {
+            detection: det.clone(),
+            mask,
+        });
+    }
+    Ok((masked, objects))
+}
+
 /// The crop-rect stance for explicit regions: a rectangle
 /// that overflows the image in effect at this point in the
 /// chain fails the request, rather than redacting less than
@@ -1849,6 +1977,18 @@ fn check_region(
     Ok(())
 }
 
+/// What [`apply_operations`] hands back: the rendered
+/// image, its encode options, and the records the
+/// operations produced (studio, inpaint, segments) for
+/// the meta response.
+type ApplyOutcome = (
+    DynamicImage,
+    EncodeOptions,
+    Option<crate::studio::StudioRecord>,
+    Option<InpaintRecord>,
+    Option<SegmentRecord>,
+);
+
 fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
@@ -1856,15 +1996,7 @@ fn apply_operations(
     dpr: f32,
     ctx: &ProcessContext<'_>,
     directives: &crate::url::RequestDirectives,
-) -> Result<
-    (
-        DynamicImage,
-        EncodeOptions,
-        Option<crate::studio::StudioRecord>,
-        Option<InpaintRecord>,
-    ),
-    EngineError,
-> {
+) -> Result<ApplyOutcome, EngineError> {
     check_operation_count(ops)?;
     let mut encode_opts = EncodeOptions::default();
     let mut face_memo: FaceMemo = None;
@@ -1889,6 +2021,12 @@ fn apply_operations(
     // The region-removal record (issue #176): every
     // `remove_region(...)` in the chain, in order.
     let mut inpaint_regions: Vec<(u32, u32, u32, u32)> = Vec::new();
+    // The segmentation state (issue #175): the encoder
+    // memo (one encoding per image state, however many
+    // class operations decode against it) and the record
+    // of what was segmented, in chain order.
+    let mut segment_memo: SegmentMemo = None;
+    let mut segment_objects: Vec<SegmentObject> = Vec::new();
     for op in ops {
         match op {
             Operation::DebugFocal => debug_armed = true,
@@ -2196,7 +2334,23 @@ fn apply_operations(
                                 &img,
                                 class,
                             )?;
-                            img = crate::filters::blur_detections(&img, &boxes);
+                            img = match ctx.segment_provider {
+                                // Mask-tight when a segment
+                                // provider is configured
+                                // (issue #175): the object's
+                                // silhouette, not its box.
+                                Some(provider) => {
+                                    let (masked, mut objects) = segment_for_class(
+                                        &mut segment_memo,
+                                        provider,
+                                        &img,
+                                        &boxes,
+                                    )?;
+                                    segment_objects.append(&mut objects);
+                                    crate::filters::blur_detections_masked(&img, &masked)
+                                }
+                                None => crate::filters::blur_detections(&img, &boxes),
+                            };
                         }
                         Filter::PixelateClass(class) => {
                             let boxes = detect_for_class(
@@ -2205,7 +2359,48 @@ fn apply_operations(
                                 &img,
                                 class,
                             )?;
-                            img = crate::filters::pixelate_detections(&img, &boxes);
+                            img = match ctx.segment_provider {
+                                Some(provider) => {
+                                    let (masked, mut objects) = segment_for_class(
+                                        &mut segment_memo,
+                                        provider,
+                                        &img,
+                                        &boxes,
+                                    )?;
+                                    segment_objects.append(&mut objects);
+                                    crate::filters::pixelate_detections_masked(&img, &masked)
+                                }
+                                None => crate::filters::pixelate_detections(&img, &boxes),
+                            };
+                        }
+                        Filter::RecolorClass(class, color) => {
+                            // The class rules are the
+                            // redaction filters': detection
+                            // resolves the class, and a
+                            // failure fails the request.
+                            // The paint follows the
+                            // silhouette when a segment
+                            // provider is configured, the
+                            // box when not (issue #175).
+                            let boxes = detect_for_class(
+                                &mut detection_memos,
+                                &detect_providers,
+                                &img,
+                                class,
+                            )?;
+                            img = match ctx.segment_provider {
+                                Some(provider) => {
+                                    let (masked, mut objects) = segment_for_class(
+                                        &mut segment_memo,
+                                        provider,
+                                        &img,
+                                        &boxes,
+                                    )?;
+                                    segment_objects.append(&mut objects);
+                                    crate::filters::recolor_detections_masked(&img, &masked, *color)
+                                }
+                                None => crate::filters::recolor_detections(&img, &boxes, *color),
+                            };
                         }
                         // Padding is read from the request as a
                         // whole by the face crop; no pixels here.
@@ -2334,7 +2529,20 @@ fn apply_operations(
             regions: inpaint_regions,
         })
     };
-    Ok((img, encode_opts, studio_record, inpaint_record))
+    let segment_record = if segment_objects.is_empty() {
+        None
+    } else {
+        Some(SegmentRecord {
+            objects: segment_objects,
+        })
+    };
+    Ok((
+        img,
+        encode_opts,
+        studio_record,
+        inpaint_record,
+        segment_record,
+    ))
 }
 
 /// Build the debug capture for a crop that reported a
@@ -5335,7 +5543,7 @@ mod tests {
         // A quarter turn keeps the pixel count and passes.
         let ops = [Operation::Filters(vec![Filter::Rotate(90.0)])];
         let directives = crate::url::RequestDirectives::analyze(&ops);
-        let (out, _, _, _) = apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
+        let (out, _, _, _, _) = apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
         assert_eq!((out.width(), out.height()), (8000, 8000));
     }
 
@@ -7733,6 +7941,258 @@ mod tests {
                     "person".to_string(),
                 )])],
                 detect_ctx(&FailingObjects),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Inference(_)), "{err:?}");
+    }
+
+    /// A fake segment provider (issue #175): the
+    /// silhouette of any box is its left half, at full
+    /// strength; the right half is background. Counts
+    /// encodings and decodings so the memoization is
+    /// observable.
+    #[derive(Debug, Default)]
+    struct LeftHalfSegment {
+        encodes: std::sync::atomic::AtomicUsize,
+        decodes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::ai::SegmentProvider for LeftHalfSegment {
+        fn encode(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<crate::ai::SegmentEmbedding, crate::ai::AiError> {
+            self.encodes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::ai::SegmentEmbedding { data: vec![0.0] })
+        }
+
+        fn decode(
+            &self,
+            _embedding: &crate::ai::SegmentEmbedding,
+            _img_w: u32,
+            _img_h: u32,
+            bbox: (u32, u32, u32, u32),
+        ) -> Result<image::GrayImage, crate::ai::AiError> {
+            self.decodes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (_, _, w, h) = bbox;
+            Ok(image::GrayImage::from_fn(w, h, |lx, _| {
+                if lx < w / 2 {
+                    image::Luma([255])
+                } else {
+                    image::Luma([0])
+                }
+            }))
+        }
+    }
+
+    fn segment_ctx<'a>(
+        detect: &'a dyn crate::ai::DetectionProvider,
+        segment: &'a dyn crate::ai::SegmentProvider,
+    ) -> ProcessContext<'a> {
+        ProcessContext {
+            detect_provider: Some(detect),
+            segment_provider: Some(segment),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn blurclass_with_a_segment_provider_blurs_only_the_silhouette() {
+        let engine = Engine;
+        let segment = LeftHalfSegment::default();
+        let out = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::BlurClass(
+                    "person".to_string(),
+                )])],
+                segment_ctx(&KnownObjects, &segment),
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // The person box is (10, 10, 60, 80); its left half
+        // is the silhouette. (11, 50) is inside it: the
+        // checkerboard there is blurred away from both
+        // source extremes.
+        let blurred = result.get_pixel(11, 50);
+        assert!(blurred[0] > 40 && blurred[0] < 215, "{blurred:?}");
+        // (55, 50) is inside the box but outside the
+        // silhouette: (55 + 50) is odd, so the source is
+        // white, and it must survive exactly — the
+        // rectangle form would have blurred it.
+        assert_eq!(result.get_pixel(55, 50), &image::Rgb([255, 255, 255]));
+        // The car box is untouched by a person filter:
+        // (121 + 11) is even, so the source pixel is black.
+        assert_eq!(result.get_pixel(121, 11), &image::Rgb([0, 0, 0]));
+        // The record carries the mask geometry: the tight
+        // box is the box's left half, coverage a half.
+        let record = out.segments.expect("a segments record");
+        assert_eq!(record.objects.len(), 1);
+        let object = &record.objects[0];
+        assert_eq!(object.label, "person");
+        assert_eq!(object.detection, (10, 10, 60, 80));
+        assert_eq!(object.tight_box, (10, 10, 30, 80));
+        assert!((object.coverage - 0.5).abs() < 0.01, "{}", object.coverage);
+        assert_eq!(object.centroid, (25, 50));
+    }
+
+    #[test]
+    fn pixelateclass_with_a_segment_provider_pixelates_only_the_silhouette() {
+        let engine = Engine;
+        let segment = LeftHalfSegment::default();
+        let out = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::PixelateClass(
+                    "person".to_string(),
+                )])],
+                segment_ctx(&KnownObjects, &segment),
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // Inside the silhouette the checkerboard is gone.
+        assert_eq!(result.get_pixel(11, 11), result.get_pixel(12, 11));
+        // Inside the box but outside the silhouette it
+        // survives.
+        assert_ne!(result.get_pixel(41, 11), result.get_pixel(42, 11));
+    }
+
+    #[test]
+    fn chained_class_operations_share_one_encoding() {
+        let engine = Engine;
+        let segment = LeftHalfSegment::default();
+        engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![
+                    Filter::BlurClass("person".to_string()),
+                    Filter::PixelateClass("car".to_string()),
+                    Filter::RecolorClass("person".to_string(), [255, 0, 0]),
+                ])],
+                segment_ctx(&KnownObjects, &segment),
+            )
+            .unwrap();
+        // Three class operations, three boxes decoded, but
+        // the image was encoded once: the encoder is the
+        // expensive half and the memo serves the chain.
+        assert_eq!(segment.encodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(segment.decodes.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn recolorclass_paints_the_box_without_a_segment_provider() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::RecolorClass(
+                    "person".to_string(),
+                    [255, 0, 0],
+                )])],
+                detect_ctx(&KnownObjects),
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        // The whole person box is painted, corners
+        // included: without a segment provider the box is
+        // the shape.
+        assert_eq!(result.get_pixel(20, 50), &image::Rgb([255, 0, 0]));
+        assert_eq!(result.get_pixel(69, 89), &image::Rgb([255, 0, 0]));
+        // The car box keeps the checkerboard, and no
+        // segments record exists: nothing was segmented.
+        assert_ne!(result.get_pixel(121, 11), result.get_pixel(122, 11));
+        assert!(out.segments.is_none());
+    }
+
+    #[test]
+    fn recolorclass_with_a_segment_provider_paints_only_the_silhouette() {
+        let engine = Engine;
+        let segment = LeftHalfSegment::default();
+        let out = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::RecolorClass(
+                    "person".to_string(),
+                    [255, 0, 0],
+                )])],
+                segment_ctx(&KnownObjects, &segment),
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(result.get_pixel(20, 50), &image::Rgb([255, 0, 0]));
+        // In the box but outside the silhouette: (55 + 50)
+        // is odd, so white survives, unpainted.
+        assert_eq!(result.get_pixel(55, 50), &image::Rgb([255, 255, 255]));
+        assert!(out.segments.is_some());
+    }
+
+    #[test]
+    fn recolorclass_unknown_class_and_missing_model_fail_cleanly() {
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::RecolorClass(
+                    "zebra".to_string(),
+                    [255, 0, 0],
+                )])],
+                detect_ctx(&KnownObjects),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        let err = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::RecolorClass(
+                    "person".to_string(),
+                    [255, 0, 0],
+                )])],
+                ProcessContext::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+    }
+
+    /// A segment provider whose encoding fails.
+    #[derive(Debug)]
+    struct FailingSegment;
+
+    impl crate::ai::SegmentProvider for FailingSegment {
+        fn encode(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<crate::ai::SegmentEmbedding, crate::ai::AiError> {
+            Err(crate::ai::AiError::Inference(
+                "encoder exploded".to_string(),
+            ))
+        }
+
+        fn decode(
+            &self,
+            _embedding: &crate::ai::SegmentEmbedding,
+            _img_w: u32,
+            _img_h: u32,
+            _bbox: (u32, u32, u32, u32),
+        ) -> Result<image::GrayImage, crate::ai::AiError> {
+            unreachable!("decode is not reached when encode fails")
+        }
+    }
+
+    #[test]
+    fn segment_failure_fails_the_request() {
+        // The class rule, extended: a segmentation failure
+        // fails the request rather than serve a silently
+        // rectangle-redacted image.
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![Filter::BlurClass(
+                    "person".to_string(),
+                )])],
+                segment_ctx(&KnownObjects, &FailingSegment),
             )
             .unwrap_err();
         assert!(matches!(err, EngineError::Inference(_)), "{err:?}");

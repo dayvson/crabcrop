@@ -160,6 +160,11 @@ pub struct AppState {
     /// the feature is off; `remove_region` requests then
     /// fail cleanly.
     pub inpaint: Option<Arc<dyn crate::ai::InpaintProvider>>,
+    /// Segment provider, preloaded at boot when the
+    /// `CRABCROP_SEGMENT_*_MODEL` pair is configured.
+    /// `None` means class operations use detection
+    /// rectangles; configured, they follow silhouettes.
+    pub segment: Option<Arc<dyn crate::ai::SegmentProvider>>,
     /// Face provider for smart crops, preloaded at boot when
     /// `CRABCROP_FACE_MODEL` is configured. `None` means smart
     /// crops use the saliency estimate.
@@ -1259,6 +1264,7 @@ struct ProcessJob {
     mask_provider: Option<Arc<dyn crate::ai::MaskProvider>>,
     upscale_provider: Option<Arc<dyn crate::ai::UpscaleProvider>>,
     inpaint_provider: Option<Arc<dyn crate::ai::InpaintProvider>>,
+    segment_provider: Option<Arc<dyn crate::ai::SegmentProvider>>,
     face_provider: Option<Arc<dyn crate::ai::FaceProvider>>,
     detect_provider: Option<Arc<dyn crate::ai::DetectionProvider>>,
     declared_detect_providers: Vec<Arc<dyn crate::ai::DetectionProvider>>,
@@ -1372,6 +1378,7 @@ async fn run_process(
                 mask_provider: job.mask_provider.as_deref(),
                 upscale_provider: job.upscale_provider.as_deref(),
                 inpaint_provider: job.inpaint_provider.as_deref(),
+                segment_provider: job.segment_provider.as_deref(),
                 face_provider: job.face_provider.as_deref(),
                 detect_provider: job.detect_provider.as_deref(),
                 declared_detect_providers: &declared_refs,
@@ -1971,6 +1978,7 @@ async fn serve_miss(
         mask_provider: state.removebg.clone(),
         upscale_provider: state.upscale.clone(),
         inpaint_provider: state.inpaint.clone(),
+        segment_provider: state.segment.clone(),
         face_provider: state.face.clone(),
         detect_provider: state.detect.clone(),
         declared_detect_providers: state.detectors.iter().map(|d| d.provider.clone()).collect(),
@@ -2994,6 +3002,34 @@ fn meta_response(
             regions.join(",")
         ));
     }
+    if let Some(segments) = &processed.segments {
+        // The segmentation record (issue #175): every
+        // object a class operation segmented, in chain
+        // order, with its mask geometry: the detection box
+        // it came from, the silhouette's tight box inside
+        // it, and the silhouette's coverage of the box.
+        let objects: Vec<String> = segments
+            .objects
+            .iter()
+            .map(|o| {
+                let (x, y, w, h) = o.detection;
+                let (tx, ty, tw, th) = o.tight_box;
+                let (cx, cy) = o.centroid;
+                let label = serde_json::to_string(&o.label).unwrap_or_default();
+                let score = format!("{:.3}", o.score);
+                let coverage = format!("{:.3}", o.coverage);
+                format!(
+                    "{{\"label\":{label},\"score\":{score},\"box\":[{x},{y},{w},{h}],\
+                     \"tight_box\":[{tx},{ty},{tw},{th}],\
+                     \"coverage\":{coverage},\"centroid\":[{cx},{cy}]}}"
+                )
+            })
+            .collect();
+        body.push_str(&format!(
+            ",\"segments\":{{\"objects\":[{}]}}",
+            objects.join(",")
+        ));
+    }
     if let Some(ph) = &processed.placeholder {
         let palette: Vec<String> = ph.palette.iter().map(|c| format!("\"{c}\"")).collect();
         body.push_str(&format!(
@@ -3315,6 +3351,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -3421,6 +3458,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -3500,6 +3538,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -3582,6 +3621,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -3810,6 +3850,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -4162,6 +4203,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -4222,6 +4264,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -4285,6 +4328,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -4849,6 +4893,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -5670,6 +5715,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
@@ -5795,6 +5841,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6122,6 +6169,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6339,6 +6387,7 @@ mod tests {
             removebg: Some(Arc::new(FakeMask)),
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: Some(Arc::new(FakeTagger)),
             tag_threshold: 0.05,
@@ -6394,6 +6443,7 @@ mod tests {
             removebg: Some(Arc::new(FakeMask)),
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6449,6 +6499,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: Some(Arc::new(FakeInpaint)),
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6489,6 +6540,155 @@ mod tests {
             axum::serve(listener, app(state)).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// The segmentation fake for the server tests
+    /// (issue #175): the silhouette of any box is its
+    /// left half at full strength.
+    #[derive(Debug)]
+    struct FakeSegment;
+
+    impl crate::ai::SegmentProvider for FakeSegment {
+        fn encode(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::SegmentEmbedding, crate::ai::AiError> {
+            Ok(crate::ai::SegmentEmbedding { data: vec![0.0] })
+        }
+
+        fn decode(
+            &self,
+            _embedding: &crate::ai::SegmentEmbedding,
+            _img_w: u32,
+            _img_h: u32,
+            bbox: (u32, u32, u32, u32),
+        ) -> Result<image::GrayImage, crate::ai::AiError> {
+            let (_, _, w, h) = bbox;
+            Ok(image::GrayImage::from_fn(w, h, |lx, _| {
+                if lx < w / 2 {
+                    image::Luma([255])
+                } else {
+                    image::Luma([0])
+                }
+            }))
+        }
+    }
+
+    /// An app with the detection and segmentation fakes
+    /// configured, for the segment tests.
+    async fn spawn_app_with_segment() -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            metrics: Arc::new(Metrics::default()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: None,
+            segment: Some(Arc::new(FakeSegment)),
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            detect: Some(Arc::new(FakeDetector)),
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(Inflight::default()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn meta_includes_the_segments_record() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_segment().await;
+        // A mask-tight blurclass: the record names the
+        // detection, its silhouette's tight box (the fake
+        // silhouette is the box's left half), its coverage
+        // and its centroid.
+        let remainder = format!("filters:blurclass(person):format(png)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let objects = meta["segments"]["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["label"], "person");
+        assert_eq!(objects[0]["box"], serde_json::json!([1, 2, 30, 20]));
+        assert_eq!(objects[0]["tight_box"], serde_json::json!([1, 2, 15, 20]));
+        assert_eq!(objects[0]["coverage"], 0.5);
+        assert_eq!(objects[0]["centroid"], serde_json::json!([8, 12]));
+        // No class operation, no segments record.
+        let remainder = format!("40x24/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(meta.get("segments").is_none());
+    }
+
+    #[tokio::test]
+    async fn recolorclass_renders_and_needs_a_detector() {
+        let src = spawn_image_server().await;
+        // Configured: the recolor renders.
+        let base = spawn_app_with_segment().await;
+        let remainder = format!("filters:recolorclass(person,ff0000):format(png)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // No detector anywhere: the class operations'
+        // shared clean 501.
+        let base = spawn_app(false).await;
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("not configured"), "body: {body}");
     }
 
     #[tokio::test]
@@ -6727,6 +6927,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -6787,6 +6988,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -8072,6 +8274,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -8134,6 +8337,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -8509,6 +8713,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -8554,6 +8759,7 @@ mod tests {
             mask_provider: None,
             upscale_provider: None,
             inpaint_provider: None,
+            segment_provider: None,
             face_provider: None,
             detect_provider: None,
             declared_detect_providers: Vec::new(),
@@ -8601,6 +8807,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -8649,6 +8856,7 @@ mod tests {
             mask_provider: None,
             upscale_provider: None,
             inpaint_provider: None,
+            segment_provider: None,
             face_provider: None,
             detect_provider: None,
             declared_detect_providers: Vec::new(),
@@ -9126,6 +9334,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -9529,6 +9738,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
@@ -10365,6 +10575,7 @@ mod tests {
             removebg: None,
             upscale: None,
             inpaint: None,
+            segment: None,
             face: None,
             tagger: None,
             tag_threshold: 0.05,
