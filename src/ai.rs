@@ -362,10 +362,24 @@ impl UpscaleProvider for OnnxUpscaleProvider {
             )));
         }
         let (ow, oh) = (shape[3] as u32, shape[2] as u32);
+        // The claimed shape must fit the values actually
+        // returned before anything indexes by it (issue
+        // #267): a corrupt-but-loadable model can claim
+        // dimensions its tensor does not carry.
+        let plane = (ow as usize).checked_mul(oh as usize).ok_or_else(|| {
+            AiError::BadOutput(format!("model output shape overflows: {shape:?}"))
+        })?;
+        if data.len() < plane * 3 {
+            return Err(AiError::BadOutput(format!(
+                "model output has {} values, short of the {} its shape claims",
+                data.len(),
+                plane * 3
+            )));
+        }
         let mut out = image::RgbImage::new(ow, oh);
         for (i, px) in out.pixels_mut().enumerate() {
             for c in 0..3 {
-                let v = data[c * (ow * oh) as usize + i];
+                let v = data[c * plane + i];
                 px[c] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             }
         }
@@ -641,13 +655,27 @@ impl InpaintProvider for OnnxInpaintProvider {
             )));
         }
         let (ow, oh) = (shape[3] as u32, shape[2] as u32);
+        // The claimed shape must fit the values actually
+        // returned before anything indexes by it (issue
+        // #267): a corrupt-but-loadable model can claim
+        // dimensions its tensor does not carry.
+        let plane = (ow as usize).checked_mul(oh as usize).ok_or_else(|| {
+            AiError::BadOutput(format!("model output shape overflows: {shape:?}"))
+        })?;
+        if data.len() < plane * 3 {
+            return Err(AiError::BadOutput(format!(
+                "model output has {} values, short of the {} its shape claims",
+                data.len(),
+                plane * 3
+            )));
+        }
         // The export answers in 0..255 (see the type's
         // contract note), so the values clamp there, not
         // at 1.
         let mut filled = image::RgbImage::new(ow, oh);
         for (i, px) in filled.pixels_mut().enumerate() {
             for c in 0..3 {
-                let v = data[c * (ow * oh) as usize + i];
+                let v = data[c * plane + i];
                 px[c] = v.clamp(0.0, 255.0).round() as u8;
             }
         }
@@ -1072,8 +1100,27 @@ impl SegmentProvider for OnnxSegmentProvider {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .unwrap_or(0);
-        let plane = (mw * mh) as usize;
-        let channel = &mask_data[best * plane..(best + 1) * plane];
+        // The claimed mask shape must fit the values
+        // actually returned before anything slices by it
+        // (issue #267), with overflow treated as a bad
+        // output rather than a wrap or a panic.
+        let Some(plane) = (mw as usize).checked_mul(mh as usize) else {
+            return Err(AiError::BadOutput(format!(
+                "mask shape overflows: {mask_dims:?}"
+            )));
+        };
+        let Some(end) = (best + 1).checked_mul(plane) else {
+            return Err(AiError::BadOutput(format!(
+                "mask shape overflows: {mask_dims:?}"
+            )));
+        };
+        if mask_data.len() < end {
+            return Err(AiError::BadOutput(format!(
+                "mask output has {} values, short of the {end} its shape claims",
+                mask_data.len()
+            )));
+        }
+        let channel = &mask_data[best * plane..end];
         let full = GrayImage::from_raw(mw, mh, sigmoid_strengths(channel)).ok_or_else(|| {
             AiError::BadOutput("the mask channel does not fit its shape".to_string())
         })?;
@@ -6438,7 +6485,14 @@ impl OnnxOcrProvider {
             detect_input,
             recognize_input,
             dict,
-            model: recognize_path.to_string(),
+            // Meta reports the model label, never the
+            // operator's filesystem layout (issue #268):
+            // the file name identifies the model without
+            // disclosing where it lives.
+            model: std::path::Path::new(recognize_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "ocr".to_string()),
             language: language.to_string(),
         };
         let probe = DynamicImage::new_rgb8(64, 64);
