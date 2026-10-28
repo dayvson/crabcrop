@@ -1948,3 +1948,61 @@ def pages_cache_and_purge():
           f"repeat: hits+{hits2 - hits1} cache={f2['cache']} | "
           f"page:02: cache={f2b['cache']} hits+{hits2b - hits1} | "
           f"purge: {st} {body} | after: hits+{hits3 - hits2}")
+
+
+# ------------------------------------------------------------------
+# Provenance cells (issue #173): the C instance carries the
+# suite's test C2PA identity; A carries none. Deep manifest
+# validation lives in the Rust suites (the SDK reads the
+# manifests back there); these cells assert the
+# deployment-level behavior: boot with the identity, sign on
+# output, report in meta.
+
+@cell
+def provenance_meta_unsigned():
+    rem = f"300x200/{DOG}"
+    st, h, payload, ms = get("A", signed_path(rem), {"Accept": "application/json"})
+    f = fact_of("provenance-meta-unsigned", "A", "GET", signed_path(rem), st, h, payload, ms)
+    prov = {}
+    try:
+        prov = json.loads(payload).get("provenance") or {}
+    except Exception:
+        pass
+    ok = (st == 200 and prov.get("signing_configured") is False
+          and prov.get("source") is None and prov.get("output") is None)
+    check("provenance-meta-unsigned", "provenance", "300x200 (meta)", "dog.jpg", ok, f,
+          f"status={st} provenance={prov}")
+
+
+@cell
+def provenance_meta_signed():
+    rem = f"300x200/{DOG}"
+    st, h, payload, ms = get("C", signed_path(rem), {"Accept": "application/json"})
+    f = fact_of("provenance-meta-signed", "C", "GET", signed_path(rem), st, h, payload, ms)
+    prov = {}
+    try:
+        prov = json.loads(payload).get("provenance") or {}
+    except Exception:
+        pass
+    out = prov.get("output") or {}
+    ok = (st == 200 and prov.get("signing_configured") is True
+          and prov.get("source") is None
+          and out.get("state") == "valid"
+          and out.get("signer") == "crabcrop test signer"
+          and out.get("ingredients") == 1)
+    check("provenance-meta-signed", "provenance", "300x200 (meta)", "dog.jpg", ok, f,
+          f"status={st} provenance={prov}")
+
+
+@cell
+def provenance_signed_output():
+    rem = f"300x200/{DOG}"
+    st, h, payload, ms = get("C", signed_path(rem))
+    f = fact_of("provenance-signed-output", "C", "GET", signed_path(rem), st, h, payload, ms)
+    st_a, _h, plain, _ms = get("A", signed_path(rem))
+    ok = (st == 200 and st_a == 200
+          and b"c2pa" in payload and b"jumb" in payload
+          and b"c2pa" not in plain
+          and len(payload) > len(plain))
+    check("provenance-signed-output", "provenance", "300x200", "dog.jpg", ok, f,
+          f"status={st} signed_bytes={len(payload)} plain_bytes={len(plain)}")

@@ -300,6 +300,10 @@ def main():
             if any(c["group"] == "pages" for c in platform_rows) \
                     and shutil.which("pdftocairo"):
                 need.add("D")
+            # The provenance cells (issue #173) need the C
+            # instance (the suite's test C2PA identity).
+            if any(c["group"] == "provenance" for c in platform_rows):
+                need.add("C")
             ok = hz.start_instances(sorted(need))
             bad = [k for k, v in ok.items() if not v]
             if bad:
