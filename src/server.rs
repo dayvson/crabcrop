@@ -145,8 +145,9 @@ pub struct AppState {
     pub engine: Engine,
     /// Per-request processing deadline (issue #260), from
     /// `CRABCROP_PROCESS_TIMEOUT_SECS`: the engine checks
-    /// it between stages, and the process runner stops
-    /// waiting at it, answering 504.
+    /// it between stages and aborts chained work with a
+    /// 504. Single stages are not interrupted (see
+    /// `RUNAWAY_CAP`).
     pub process_timeout: std::time::Duration,
     /// Request metrics, shared behind an `Arc` so clones agree.
     pub metrics: Arc<Metrics>,
@@ -1356,17 +1357,29 @@ enum ProcessFailure {
     /// The engine panicked. The panic is contained at this
     /// seam (audit E-8) and surfaces as a 500.
     Panicked,
-    /// The job ran past the processing deadline (issue
-    /// #260): the runner stopped waiting and the request
-    /// is shed with a 504. The blocking job itself is
-    /// detached; the engine's own deadline checks abort
-    /// it at the next stage boundary.
+    /// The job ran past the runaway cap (issue #260):
+    /// the runner stopped waiting and the request is
+    /// shed with a 504. The blocking job itself is
+    /// detached; it keeps its permit until it finishes
+    /// or the engine's deadline checks abort it.
     TimedOut,
 }
 
 /// How long a cache miss may wait for a processing slot
 /// before the server sheds it with a 503.
 const PROCESS_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The runaway cap on one processing job (issue #260):
+/// ten minutes, far past any legitimate render. The
+/// processing deadline is checked between stages, so
+/// chains abort promptly; a single stage (one encode,
+/// one filter) is never interrupted mid-flight, because
+/// legitimate single renders run long (the animated
+/// WebP encodes of issue #227 take minutes and are the
+/// project's accepted normal). This cap exists only so
+/// a stage that never returns at all (a hung encoder)
+/// cannot hold its process permit forever.
+const RUNAWAY_CAP: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long an AI-backed request may wait for an inference
 /// slot before the server sheds it with a 503 (audit PL-14).
@@ -1423,9 +1436,10 @@ async fn run_process(
     let bytes = bytes.to_vec();
     let engine = state.engine;
     // The processing deadline (issue #260): the engine
-    // checks it between stages, and the runner below stops
-    // waiting at it, so a heavy request is shed with a 504
-    // instead of running unbounded.
+    // checks it between stages (operations, frames) and
+    // aborts chained work promptly. The runner's own wait
+    // is bounded only by the runaway cap: a single stage
+    // is never interrupted mid-flight.
     let deadline = std::time::Instant::now() + state.process_timeout;
     let handle = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -1479,11 +1493,12 @@ async fn run_process(
             Err(_) => Err(ProcessFailure::Panicked),
         }
     });
-    // Past the deadline the runner stops waiting and sheds
-    // the request. The detached job keeps its process
-    // permit until the engine's own deadline checks abort
-    // it at the next stage boundary; its result is dropped.
-    match tokio::time::timeout(state.process_timeout, handle).await {
+    // Past the runaway cap the runner stops waiting and
+    // sheds the request. The detached job keeps its
+    // process permit until it finishes or the engine's
+    // deadline checks abort it at a stage boundary; its
+    // result is dropped.
+    match tokio::time::timeout(RUNAWAY_CAP, handle).await {
         Ok(joined) => joined.unwrap_or(Err(ProcessFailure::Panicked)),
         Err(_) => Err(ProcessFailure::TimedOut),
     }

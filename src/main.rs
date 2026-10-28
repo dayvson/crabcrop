@@ -226,8 +226,12 @@
 //! - `CRABCROP_PROCESS_TIMEOUT_SECS`: per-request
 //!   processing deadline in seconds (default 30, 1 to
 //!   600). The engine checks it between operations and
-//!   frames; a request that runs past it is shed with a
-//!   504 instead of running unbounded (issue #260).
+//!   frames, and chained work that runs past it aborts
+//!   with a 504 (issue #260). A single stage (one
+//!   encode, one filter) is never interrupted
+//!   mid-flight: legitimate single renders run long,
+//!   and a fixed ten-minute runaway cap bounds a stage
+//!   that never returns at all.
 //! - `PORT`: listen port, default 3000.
 
 #![forbid(unsafe_code)]
