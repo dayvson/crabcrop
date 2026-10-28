@@ -146,6 +146,14 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
     const refused = await client.call("fetch_meta", { url: source });
     assert.match(refused, /refusing to fetch/);
 
+    // fetch_meta also refuses the system endpoints on the
+    // configured origin (issue #271): they are not meta
+    // targets, and /metrics is token-gated besides.
+    const sysRefused = await client.call("fetch_meta", {
+      url: "http://127.0.0.1:3323/metrics",
+    });
+    assert.match(sysRefused, /system endpoint/);
+
     const explanation = await client.call("explain_url", { url });
     assert.match(explanation, /signature \(hmac\)/);
     assert.match(explanation, /resize to 300px width by 200px height/);

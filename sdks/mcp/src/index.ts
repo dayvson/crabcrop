@@ -228,6 +228,17 @@ const TOOLS = [
           true,
         );
       }
+      // The system endpoints are not meta targets (issue
+      // #271): this tool's contract is the meta JSON of an
+      // image URL, and /metrics is token-gated on the
+      // server besides, so the tool is not a route around
+      // the gate.
+      if (target.pathname === "/metrics" || target.pathname === "/health") {
+        return textResult(
+          `fetch_meta: refusing to fetch the system endpoint ${target.pathname}; this tool reads meta for image URLs`,
+          true,
+        );
+      }
       const accept = boolArg(args, "placeholders")
         ? "application/json; placeholders=1"
         : "application/json";

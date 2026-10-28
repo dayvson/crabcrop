@@ -674,7 +674,10 @@ fn stderr_excerpt(stderr: &str) -> String {
 
 /// Kill a runaway tool's whole process group (it may
 /// have spawned helpers). Mirrors the frame extractor's
-/// discipline exactly.
+/// discipline exactly. The group kill is the whole
+/// mechanism (issue #272): a descendant that detaches
+/// (setsid, double-fork) escapes it by design of the
+/// tool contract, which forbids daemonizing.
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {
     if let Ok(pid) = i32::try_from(pid)

@@ -223,6 +223,17 @@
 //!   (requests fail cleanly with 501).
 //!   `CRABCROP_PDF_TIMEOUT_SECS` bounds one renderer
 //!   run (default 30, 1 to 600).
+//!   All three external tools share one contract rule:
+//!   a tool must not daemonize or detach (no `setsid`,
+//!   no double-fork). Timeouts kill the tool's process
+//!   group; a detached descendant escapes the kill and
+//!   is the operator's responsibility (issue #272).
+//! - `CRABCROP_METRICS_TOKEN`: bearer token the
+//!   `/metrics` endpoint requires (`Authorization:
+//!   Bearer <token>`). Unset closes the endpoint (it
+//!   answers 403): the exposition is operational data
+//!   and is never served unauthenticated (issue #270).
+//!   `/health` stays open; it discloses only liveness.
 //! - `CRABCROP_PROCESS_TIMEOUT_SECS`: per-request
 //!   processing deadline in seconds (default 30, 1 to
 //!   600). The engine checks it between operations and
@@ -821,6 +832,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             format!("CRABCROP_SSIM_TARGET must be between 0 and 100, got {ssim_target}").into(),
         );
     }
+    // The /metrics bearer token (issue #270): an empty
+    // value is no token, and no token closes the
+    // endpoint rather than serving it publicly.
+    let metrics_token = env::var("CRABCROP_METRICS_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
     let process_timeout_secs: u64 = parse_env("CRABCROP_PROCESS_TIMEOUT_SECS", 30)?;
     if !(1..=600).contains(&process_timeout_secs) {
         return Err(format!(
@@ -1002,6 +1019,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         engine: Engine,
         process_timeout: std::time::Duration::from_secs(process_timeout_secs),
         metrics: Arc::new(Metrics::default()),
+        metrics_token,
         cache: Arc::new(Cache::new(cache_bytes)),
         removebg: ai.removebg,
         upscale: ai.upscale,

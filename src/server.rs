@@ -151,6 +151,11 @@ pub struct AppState {
     pub process_timeout: std::time::Duration,
     /// Request metrics, shared behind an `Arc` so clones agree.
     pub metrics: Arc<Metrics>,
+    /// The bearer token `/metrics` requires (issue #270),
+    /// from `CRABCROP_METRICS_TOKEN`. `None` closes the
+    /// endpoint: it answers 403 rather than serving the
+    /// exposition unauthenticated.
+    pub metrics_token: Option<String>,
     /// Processed-response cache, shared like the metrics.
     pub cache: Arc<Cache>,
     /// Background-removal provider, preloaded at boot when
@@ -399,7 +404,38 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn metrics(State(state): State<AppState>) -> Response {
+/// Constant-time equality for a bearer token, so the
+/// comparison leaks nothing about it through timing.
+fn token_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // The exposition is operational data (issue #270,
+    // the PL-5 residual): it serves only to a bearer of
+    // the configured token, and an unconfigured server
+    // keeps it closed rather than public.
+    let Some(token) = &state.metrics_token else {
+        return (
+            StatusCode::FORBIDDEN,
+            "metrics are disabled: set CRABCROP_METRICS_TOKEN to enable them",
+        )
+            .into_response();
+    };
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if !presented.is_some_and(|p| token_eq(p.as_bytes(), token.as_bytes())) {
+        return (StatusCode::UNAUTHORIZED, "metrics require a bearer token").into_response();
+    }
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         state.metrics.render(),
@@ -3787,7 +3823,13 @@ mod tests {
         (format!("http://{addr}/src.png"), hits)
     }
 
+    const TEST_METRICS_TOKEN: &str = "test-metrics-token";
+
     async fn spawn_app(allow_unsafe: bool) -> String {
+        spawn_app_with_metrics(allow_unsafe, Some(TEST_METRICS_TOKEN.to_string())).await
+    }
+
+    async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String>) -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe,
@@ -3795,6 +3837,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -3896,6 +3939,22 @@ mod tests {
     /// An app whose animation gate the test controls
     /// (issue #231), so the shed and isolation tests can
     /// hold the single permit themselves.
+    /// GET /metrics with the test token (issue #270).
+    async fn metrics_response(base: &str) -> reqwest::Response {
+        client()
+            .get(format!("{base}/metrics"))
+            .header("authorization", format!("Bearer {TEST_METRICS_TOKEN}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn metrics_text(base: &str) -> String {
+        let resp = metrics_response(base).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.text().await.unwrap()
+    }
+
     async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
@@ -3904,6 +3963,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -3986,6 +4046,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -4071,6 +4132,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -4302,6 +4364,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -4657,6 +4720,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -4720,6 +4784,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -4786,6 +4851,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -5667,6 +5733,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -6491,6 +6558,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -6619,6 +6687,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -6841,6 +6910,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -7185,6 +7255,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -7405,6 +7476,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: Some(Arc::new(FakeMask)),
             upscale: None,
@@ -7463,6 +7535,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: Some(Arc::new(FakeMask)),
             upscale: None,
@@ -7521,6 +7594,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -7611,6 +7685,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -7979,6 +8054,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -8042,6 +8118,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(cache_bytes)),
             removebg: None,
             upscale: None,
@@ -9330,6 +9407,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -9395,6 +9473,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -9750,14 +9829,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.status(), 200);
-        let metrics = client()
-            .get(format!("{base}/metrics"))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
+        let metrics = metrics_text(&base).await;
         assert!(metrics.contains("crabcrop_purges_total 2"), "{metrics}");
     }
 
@@ -9773,6 +9845,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -9869,6 +9942,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -10398,6 +10472,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -10804,6 +10879,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
@@ -11209,14 +11285,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let metrics = client()
-            .get(format!("{base}/metrics"))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
+        let metrics = metrics_text(&base).await;
         assert!(metrics.contains("crabcrop_uploads_total 2"), "{metrics}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11276,14 +11345,7 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(second.bytes().await.unwrap(), first_body);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
-        let body = client()
-            .get(format!("{base}/metrics"))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
+        let body = metrics_text(&base).await;
         assert!(body.contains("crabcrop_cache_hits_total 1"), "{body}");
         assert!(body.contains("crabcrop_cache_misses_total 1"), "{body}");
     }
@@ -11555,6 +11617,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_require_the_configured_token() {
+        // Issue #270: with no token configured the
+        // endpoint is closed; with one, it gates.
+        let closed = spawn_app_with_metrics(false, None).await;
+        let resp = client()
+            .get(format!("{closed}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // /health stays open either way: it discloses
+        // only liveness.
+        let resp = client()
+            .get(format!("{closed}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let base = spawn_app(false).await;
+        let resp = client()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = client()
+            .get(format!("{base}/metrics"))
+            .header("authorization", "Bearer wrong-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = metrics_response(&base).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn metrics_reflect_traffic() {
         let src = spawn_image_server().await;
         let base = spawn_app(false).await;
@@ -11575,13 +11675,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        let resp = client()
-            .get(format!("{base}/metrics"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.text().await.unwrap();
+        let body = metrics_text(&base).await;
         assert!(
             body.contains("crabcrop_requests_total{status_class=\"2xx\"} 1"),
             "{body}"
@@ -11643,6 +11737,7 @@ mod tests {
             engine: Engine,
             process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
             upscale: None,
