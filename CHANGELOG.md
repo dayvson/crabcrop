@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.9.0] - 2026-10-28
+
+### Added
+
+- C2PA provenance (issue #173). Meta responses now carry a `provenance` object reporting the Content Credentials a source carries: its validation state (`valid`, `trusted`, or `invalid`), the signer, and the manifest store's composition, verified with c2pa-rs 0.91, the first release line that enforces the specification's exclusion rules (the October 2026 forgery class). With a signing identity configured (`CRABCROP_C2PA_CERT` and `CRABCROP_C2PA_KEY`, a PEM chain and its PKCS#8 key; `CRABCROP_C2PA_TSA_URL` optionally adds a timestamp authority), still JPEG, PNG, WebP, and AVIF outputs are signed as they are produced. The source is recorded as a parent ingredient (its hash always, its manifest store when it has one, because a manifest cannot survive a transform byte-wise), and the AI edits (removebg, studio, remove_region, upscale, class and face edits) record the edit with the IPTC `compositeWithTrainedAlgorithmicMedia` source type. The identity is proven at boot with a sign-and-verify round trip, so a broken one (a bare self-signed certificate, a mismatched key, a chain outside the C2PA certificate profile) is a startup error naming the reason. GIF, JPEG XL, video, and animated WebP outputs are served unsigned in this version. A valid credential proves origin, not untouched pixels; whether verifiers call the result trusted depends on the operator's certificate chain reaching the C2PA trust list, which the README now spells out.
+
 ## [0.8.3] - 2026-10-28
 
 ### Fixed
