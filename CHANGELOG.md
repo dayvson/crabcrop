@@ -2,6 +2,15 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.8.1] - 2026-10-28
+
+### Fixed
+
+- Sealed URLs keep their payload sealed after the token opens (issues #259, #264). Every failure past the open (source load, watermark load, engine errors, gate sheds) now collapses to the one uniform `403 bad signature`, where before the plain path's instructive errors leaked the hidden source host, an origin oracle, and the source's dimensions. The remainder cap is enforced on open as well as at mint, so tokens minted over the cap by any implementation fail to open.
+- Processing is deadline-bounded (issues #260, #261). A new `CRABCROP_PROCESS_TIMEOUT_SECS` (default 30) sets a per-request deadline the engine checks between operations and frames: chained work that runs past it aborts with a `504`, and a fixed ten-minute runaway cap bounds a stage that never returns at all. Single stages are never interrupted mid-flight, because legitimate single renders run long. AI filters no longer run on animated sources at all: the chain applied them once per frame (a 20-frame GIF with `remove_region` held one of two AI gate permits for 249 seconds), so inference-class operations on an animated source now answer a `400` naming the class, while a still spelling of the same source runs them normally.
+- Subprocess and raster bounds (issues #262, #263, #266). PDF rendering clamps by area (64 Mpx) as well as per axis, so a tiny hostile MediaBox page can no longer drive the renderer to a gigabyte of raster per request. The frame and PDF tool runners mirror the video runner: pipe readers are detached rather than joined, so a tool that forks a stdio-inheriting grandchild cannot defeat the timeout or discard finished output. The frame probe refuses still images promoted to video streams by raw image demuxers: a JPEG embedded in a PDF, a zip, or junk bytes is not a video, and attached pictures no longer count as the video stream.
+- Smaller hardening (issues #265, #267, #268). Upload source references are correct when the file root is configured above the upload directory (the returned `file:///` ref carries the nesting). AI output reads (upscale, inpaint, segmentation) validate the returned tensor length against the model-claimed shape with checked arithmetic and fail as bad output instead of slicing blind. Preset bodies are capped at the per-request operation limit at boot, parse-error responses truncate the echoed segment at 200 bytes, and OCR meta reports the recognition model file name rather than its absolute path.
+
 ## [0.8.0] - 2026-10-27
 
 ### Added
