@@ -802,6 +802,33 @@ impl Default for ProcessContext<'_> {
     }
 }
 
+/// Inference-class operations do not run on animated
+/// sources (issue #261): the animated paths apply the
+/// chain per frame, so one request would run inference
+/// up to 200 times and hold an AI gate permit for
+/// minutes to hours. The set mirrors the AI gate's own
+/// (`RequestDirectives::uses_ai`) minus saliency smart
+/// crop, which is bounded pixel work, not inference,
+/// and stays available on animated sources under the
+/// processing deadline. A still spelling of the same
+/// source (a `frame:` selection renders one frame)
+/// runs these operations normally.
+fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), EngineError> {
+    let inference_bound = directives.removebg
+        || directives.studio
+        || directives.remove_region
+        || directives.upscale
+        || directives.needs_face_model
+        || directives.has_class_redaction()
+        || directives.debug_focal;
+    if inference_bound {
+        return Err(EngineError::Unsupported(
+            "AI filters do not run on animated sources".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Decodes, resizes, and encodes images.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Engine;
@@ -1430,6 +1457,7 @@ impl Engine {
         loop_count: Option<u16>,
     ) -> Result<ProcessedImage, EngineError> {
         let directives = crate::url::RequestDirectives::analyze(ops);
+        refuse_animated_ai(&directives)?;
         let (source_width, source_height) = {
             let b = frames[0].buffer();
             (b.width(), b.height())
@@ -1517,6 +1545,7 @@ impl Engine {
             )
         })?;
         let directives = crate::url::RequestDirectives::analyze(ops);
+        refuse_animated_ai(&directives)?;
         let (source_width, source_height) = {
             let b = frames[0].buffer();
             (b.width(), b.height())
@@ -5062,6 +5091,37 @@ mod tests {
             assert!(err.to_string().contains("debug:focal"), "{err}");
             assert!(err.to_string().contains("animated"), "{err}");
         }
+    }
+
+    #[test]
+    fn ai_filters_refuse_animated_sources() {
+        // Issue #261: an inference filter in an animated
+        // chain would run once per frame (up to the 200
+        // frame cap) under one AI gate permit. The refusal
+        // names the class; a plain filter chain on the
+        // same source still runs.
+        let engine = Engine;
+        let src = animated_gif_bytes();
+        let ops = [Operation::Filters(vec![Filter::RemoveRegion {
+            x: 0,
+            y: 0,
+            w: 5,
+            h: 5,
+        }])];
+        // The provider is configured, so the configuration
+        // preflight passes and the animated refusal is
+        // what answers.
+        let ctx = ProcessContext {
+            inpaint_provider: Some(&FlatInpaint),
+            ..Default::default()
+        };
+        let err = engine.process_preferred(&src, &ops, ctx).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("animated"), "{err}");
+        let plain = [Operation::Filters(vec![Filter::Grayscale])];
+        engine
+            .process_preferred(&src, &plain, ProcessContext::default())
+            .unwrap();
     }
 
     #[test]
