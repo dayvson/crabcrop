@@ -321,6 +321,7 @@ impl VideoFrameExtractor {
         });
 
         let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
         let stderr_thread = std::thread::spawn(move || {
             let mut kept = Vec::new();
             let mut chunk = [0u8; 16 * 1024];
@@ -335,7 +336,7 @@ impl VideoFrameExtractor {
                     }
                 }
             }
-            String::from_utf8_lossy(&kept).into_owned()
+            let _ = err_tx.send(String::from_utf8_lossy(&kept).into_owned());
         });
 
         let deadline = Instant::now() + self.timeout;
@@ -412,8 +413,19 @@ impl VideoFrameExtractor {
             }
         };
         let _ = writer.join();
-        let stderr = stderr_thread.join().unwrap_or_default();
-        let _ = stdout_thread.join();
+        // The reader threads are deliberately never
+        // joined (issue #263, the video.rs pattern): a
+        // grandchild that inherited the pipes and holds
+        // them open would block a join for its whole
+        // lifetime, defeating the timeout above. stderr
+        // is worth a short grace through its channel, no
+        // more; the stdout result already arrived through
+        // its own channel.
+        let stderr = err_rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap_or_default();
+        drop(stdout_thread);
+        drop(stderr_thread);
         Ok(ToolRun {
             status,
             stdout,
@@ -488,18 +500,72 @@ fn format_seconds(value: f64) -> String {
 /// Returns `None` when no usable video stream appears,
 /// which is the not-a-video answer for every corrupt,
 /// audio-only, or non-video source.
+/// Demuxers that carry raw still images rather than
+/// video (issue #266): ffmpeg promotes a JPEG embedded
+/// in an arbitrary blob (a PDF, a zip, junk bytes) to a
+/// "video" stream through one of these, so a report
+/// whose input is only one of them is not a video, no
+/// matter what its stream list says. A real video, even
+/// an MJPEG one, arrives through a container demuxer
+/// (avi, mov, matroska, ...), never one of these alone.
+const IMAGE_DEMUXERS: &[&str] = &[
+    "image2",
+    "image2pipe",
+    "mjpeg",
+    "jpeg_pipe",
+    "jpegls_pipe",
+    "jpeg2000_pipe",
+    "png_pipe",
+    "bmp_pipe",
+    "webp_pipe",
+    "gif",
+    "gif_pipe",
+    "tiff_pipe",
+    "avif_pipe",
+    "exr_pipe",
+    "hdr_pipe",
+    "dpx_pipe",
+    "fits_pipe",
+    "pam_pipe",
+    "pbm_pipe",
+    "pgm_pipe",
+    "ppm_pipe",
+    "qoi_pipe",
+    "sunrast_pipe",
+    "xbm_pipe",
+    "xpm_pipe",
+    "svg_pipe",
+];
+
 pub fn parse_probe(report: &str) -> Option<VideoProbe> {
     let mut duration = None;
     let mut stream: Option<(u32, u32, Option<f64>)> = None;
+    let mut demuxers: Vec<&str> = Vec::new();
     for line in report.lines() {
+        if demuxers.is_empty()
+            && let Some(rest) = line.trim_start().strip_prefix("Input #")
+            && let Some((_, after)) = rest.split_once(", ")
+            && let Some((list, _)) = after.split_once(", from ")
+        {
+            demuxers = list.split(',').map(str::trim).collect();
+        }
         if duration.is_none()
             && let Some(rest) = line.split("Duration: ").nth(1)
         {
             duration = parse_duration(rest);
         }
-        if stream.is_none() && line.contains("Stream #") && line.contains(": Video: ") {
+        // An attached picture (album art) is not the
+        // video stream, even when it is the only one.
+        if stream.is_none()
+            && line.contains("Stream #")
+            && line.contains(": Video: ")
+            && !line.contains("(attached pic)")
+        {
             stream = parse_video_stream(line);
         }
+    }
+    if !demuxers.is_empty() && demuxers.iter().all(|d| IMAGE_DEMUXERS.contains(d)) {
+        return None;
     }
     let (width, height, fps) = stream?;
     Some(VideoProbe {
@@ -658,6 +724,45 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
             .is_none()
         );
         assert!(parse_probe("").is_none());
+    }
+
+    #[test]
+    fn probe_rejects_still_images_promoted_to_video() {
+        // Issue #266: ffmpeg probes a JPEG embedded in a
+        // PDF, a zip, or junk bytes through the raw mjpeg
+        // demuxer and calls it a video stream. Recorded
+        // from the reference tool on such a blob.
+        let report = "\
+Input #0, mjpeg, from 'pipe:0':
+  Duration: N/A, bitrate: N/A
+  Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc), 800x600, 25 fps, 1200k tbr
+";
+        assert!(parse_probe(report).is_none());
+        // A plain JPEG probes through jpeg_pipe: also a
+        // still, also refused.
+        let report = "\
+Input #0, jpeg_pipe, from 'pipe:0':
+  Duration: N/A, bitrate: N/A
+  Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc), 800x600, 25 fps, 25 tbr
+";
+        assert!(parse_probe(report).is_none());
+        // But MJPEG is a real video codec inside a
+        // container: an AVI of it parses normally.
+        let report = "\
+Input #0, avi, from 'pipe:0':
+  Duration: 00:00:05.00, start: 0.000000, bitrate: N/A
+  Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc), 640x480, 25 fps, 25 tbr
+";
+        let probe = parse_probe(report).expect("container MJPEG is a video");
+        assert_eq!((probe.width, probe.height), (640, 480));
+        // An attached picture alone is not a video.
+        let report = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
+  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A
+  Stream #0:0: Audio: aac (LC), 44100 Hz, mono, fltp, 69 kb/s (default)
+  Stream #0:1: Video: mjpeg (Baseline), yuvj420p(pc), 500x500, 90k tbr (attached pic)
+";
+        assert!(parse_probe(report).is_none());
     }
 
     #[test]

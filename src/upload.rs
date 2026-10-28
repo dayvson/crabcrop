@@ -147,6 +147,12 @@ pub struct UploadStore {
     /// Whether a PUT may replace an existing object.
     /// Off by default: an existing name is a 409.
     pub allow_overwrite: bool,
+    /// For a local destination, the upload directory's
+    /// path relative to the loader's file root, empty or
+    /// ending in `/` (issue #265): `source_ref` must name
+    /// the object where the loader will actually look for
+    /// it, which is under the root, not at its top.
+    ref_prefix: String,
 }
 
 impl UploadStore {
@@ -158,7 +164,16 @@ impl UploadStore {
             backend: Backend::Local(dir),
             max_bytes,
             allow_overwrite,
+            ref_prefix: String::new(),
         }
+    }
+
+    /// Set the local destination's path relative to the
+    /// loader's file root (issue #265): boot computes it
+    /// when a root is configured above the upload dir.
+    pub fn with_ref_prefix(mut self, ref_prefix: String) -> Self {
+        self.ref_prefix = ref_prefix;
+        self
     }
 
     /// An S3 destination, reusing the source S3
@@ -198,6 +213,7 @@ impl UploadStore {
             },
             max_bytes,
             allow_overwrite,
+            ref_prefix: String::new(),
         }
     }
 
@@ -220,7 +236,7 @@ impl UploadStore {
     /// bucket destination.
     pub fn source_ref(&self, name: &str) -> String {
         match &self.backend {
-            Backend::Local(_) => format!("file:///{name}"),
+            Backend::Local(_) => format!("file:///{}{name}", self.ref_prefix),
             Backend::S3 { bucket, prefix, .. } => format!("s3://{bucket}/{prefix}{name}"),
         }
     }
@@ -464,6 +480,14 @@ mod tests {
         let dir = temp_dir("local");
         let store = UploadStore::local(dir.clone(), 1024, false);
         assert_eq!(store.source_ref("heroes/cat.jpg"), "file:///heroes/cat.jpg");
+        // With the upload dir nested under the file root,
+        // the ref carries the nesting (issue #265).
+        let nested =
+            UploadStore::local(dir.clone(), 1024, false).with_ref_prefix("uploads/".into());
+        assert_eq!(
+            nested.source_ref("heroes/cat.jpg"),
+            "file:///uploads/heroes/cat.jpg"
+        );
         assert!(!store.exists("heroes/cat.jpg").await);
         store.put("heroes/cat.jpg", b"pixels").await.unwrap();
         assert!(store.exists("heroes/cat.jpg").await);

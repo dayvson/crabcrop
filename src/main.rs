@@ -223,6 +223,11 @@
 //!   (requests fail cleanly with 501).
 //!   `CRABCROP_PDF_TIMEOUT_SECS` bounds one renderer
 //!   run (default 30, 1 to 600).
+//! - `CRABCROP_PROCESS_TIMEOUT_SECS`: per-request
+//!   processing deadline in seconds (default 30, 1 to
+//!   600). The engine checks it between operations and
+//!   frames; a request that runs past it is shed with a
+//!   504 instead of running unbounded (issue #260).
 //! - `PORT`: listen port, default 3000.
 
 #![forbid(unsafe_code)]
@@ -330,6 +335,13 @@ fn build_presets(
     Ok((presets, only_presets))
 }
 
+/// The most operations one preset body may carry: the
+/// engine's per-request operation cap, applied at boot
+/// (issue #268). A preset larger than any request may
+/// legally run would otherwise boot fine and make one
+/// cache-miss request do thousands of filter passes.
+const MAX_PRESET_OPERATIONS: usize = 100;
+
 /// Parse preset definitions: one `name = operations` entry
 /// per line, blank lines and `#` comments skipped. Names are
 /// letters, digits, `_`, and `-`; every operation string must
@@ -357,8 +369,14 @@ fn parse_presets(text: &str) -> Result<std::collections::HashMap<String, String>
         if map.contains_key(name) {
             return Err(format!("duplicate preset name: {name}"));
         }
-        crate::url::parse_preset_operations(ops)
+        let parsed = crate::url::parse_preset_operations(ops)
             .map_err(|e| format!("invalid operations for preset {name}: {e}"))?;
+        if parsed.len() > MAX_PRESET_OPERATIONS {
+            return Err(format!(
+                "preset {name} has {} operations, over the {MAX_PRESET_OPERATIONS} operation cap",
+                parsed.len()
+            ));
+        }
         map.insert(name.to_string(), ops.to_string());
     }
     Ok(map)
@@ -725,8 +743,24 @@ fn build_upload_store(
             println!(
                 "uploads enabled: directory {dir} (cap {max_mb} MB, overwrite {allow_overwrite})"
             );
+            // The reference an upload hands back must name
+            // the object under the file root (issue #265):
+            // with a root configured above the upload dir,
+            // the ref carries the dir's path below the
+            // root; with no root, boot points the root at
+            // the dir itself and the ref stays bare.
+            let ref_prefix = match &sources.file_root {
+                Some(root) => match canonical.strip_prefix(root) {
+                    Ok(rel) if !rel.as_os_str().is_empty() => {
+                        format!("{}/", rel.to_string_lossy().replace('\\', "/"))
+                    }
+                    _ => String::new(),
+                },
+                None => String::new(),
+            };
             Ok(Some(std::sync::Arc::new(
-                crate::upload::UploadStore::local(canonical, max_bytes, allow_overwrite),
+                crate::upload::UploadStore::local(canonical, max_bytes, allow_overwrite)
+                    .with_ref_prefix(ref_prefix),
             )))
         }
         (None, Some(bucket)) => {
@@ -782,6 +816,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(
             format!("CRABCROP_SSIM_TARGET must be between 0 and 100, got {ssim_target}").into(),
         );
+    }
+    let process_timeout_secs: u64 = parse_env("CRABCROP_PROCESS_TIMEOUT_SECS", 30)?;
+    if !(1..=600).contains(&process_timeout_secs) {
+        return Err(format!(
+            "CRABCROP_PROCESS_TIMEOUT_SECS must be between 1 and 600, got {process_timeout_secs}"
+        )
+        .into());
     }
     let avif_speed: u8 = parse_env("CRABCROP_AVIF_SPEED", crate::engine::DEFAULT_AVIF_SPEED)?;
     if !(1..=10).contains(&avif_speed) {
@@ -955,6 +996,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_policy(policy)
             .with_sources(sources),
         engine: Engine,
+        process_timeout: std::time::Duration::from_secs(process_timeout_secs),
         metrics: Arc::new(Metrics::default()),
         cache: Arc::new(Cache::new(cache_bytes)),
         removebg: ai.removebg,
@@ -3511,5 +3553,16 @@ mod tests {
         ] {
             assert!(parse_presets(bad).is_err(), "{bad}");
         }
+        // A body over the operation cap refuses at boot
+        // (issue #268): at the cap it parses, one over it
+        // does not.
+        let at_cap = format!("big = {}", vec!["300x200"; MAX_PRESET_OPERATIONS].join("/"));
+        assert!(parse_presets(&at_cap).is_ok());
+        let over_cap = format!(
+            "big = {}",
+            vec!["300x200"; MAX_PRESET_OPERATIONS + 1].join("/")
+        );
+        let err = parse_presets(&over_cap).unwrap_err();
+        assert!(err.contains("operation cap"), "{err}");
     }
 }

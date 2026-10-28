@@ -623,6 +623,11 @@ pub enum EngineError {
     Pdf(String),
     /// A text overlay could not be rendered. Carries the cause.
     Render(String),
+    /// The request ran past its processing deadline
+    /// (issue #260): the pipeline checks the deadline
+    /// between operations and frames and aborts instead
+    /// of running unbounded. The server maps it to 504.
+    Timeout,
 }
 
 impl std::fmt::Display for EngineError {
@@ -654,6 +659,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::Render(cause) => {
                 write!(f, "cannot render text overlay: {cause}")
+            }
+            EngineError::Timeout => {
+                write!(f, "processing exceeded the time budget")
             }
         }
     }
@@ -736,6 +744,25 @@ pub struct ProcessContext<'a> {
     /// jixel speed tier for JPEG XL encodes, from
     /// `CRABCROP_JXL_SPEED`.
     pub jxl_speed: jixel::Speed,
+    /// Processing deadline for this request (issue #260),
+    /// from `CRABCROP_PROCESS_TIMEOUT_SECS`: pipeline
+    /// stages check it between operations and frames and
+    /// abort with `EngineError::Timeout` once it passes.
+    /// `None` means no deadline (tests, library use).
+    pub deadline: Option<std::time::Instant>,
+}
+
+impl ProcessContext<'_> {
+    /// Fail with `EngineError::Timeout` when the request's
+    /// processing deadline has passed.
+    pub fn check_deadline(&self) -> Result<(), EngineError> {
+        if let Some(deadline) = self.deadline
+            && std::time::Instant::now() >= deadline
+        {
+            return Err(EngineError::Timeout);
+        }
+        Ok(())
+    }
 }
 
 /// Default AVIF speed tier: the value the encoder ran at
@@ -770,6 +797,7 @@ impl Default for ProcessContext<'_> {
             brand_color: None,
             avif_speed: DEFAULT_AVIF_SPEED,
             jxl_speed: DEFAULT_JXL_SPEED,
+            deadline: None,
         }
     }
 }
@@ -1178,6 +1206,7 @@ impl Engine {
         } else {
             None
         };
+        ctx.check_deadline()?;
         let (img, encode_opts, studio, inpaint, segments) = apply_operations(
             img,
             ops,
@@ -1186,6 +1215,7 @@ impl Engine {
             &ctx,
             &directives,
         )?;
+        ctx.check_deadline()?;
         // Placeholders describe the final pixels, so they are
         // computed here, before encoding.
         let placeholder = if ctx.placeholders {
@@ -1414,6 +1444,7 @@ impl Engine {
         let mut budget = OutputBudget::new();
         let mut out_frames = Vec::with_capacity(frames.len());
         for frame in frames {
+            ctx.check_deadline()?;
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
             let (img, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
@@ -1500,6 +1531,7 @@ impl Engine {
         let mut budget = OutputBudget::new();
         let mut out_frames = Vec::with_capacity(frames.len());
         for frame in frames {
+            ctx.check_deadline()?;
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
             let (img, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
@@ -2028,6 +2060,7 @@ fn apply_operations(
     let mut segment_memo: SegmentMemo = None;
     let mut segment_objects: Vec<SegmentObject> = Vec::new();
     for op in ops {
+        ctx.check_deadline()?;
         match op {
             Operation::DebugFocal => debug_armed = true,
             // Frame selection already happened at decode
@@ -4129,6 +4162,31 @@ mod tests {
             u16::from_le_bytes(tiff[8 + 2 + 8..8 + 2 + 10].try_into().unwrap()),
             1
         );
+    }
+
+    #[test]
+    fn a_passed_processing_deadline_aborts_the_request() {
+        // Issue #260: with the deadline already gone, the
+        // pipeline refuses before doing the work; with
+        // time on the clock the same request runs.
+        let engine = Engine;
+        let src = gradient_png();
+        let past = ProcessContext {
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let err = engine
+            .process_preferred(&src, &[], past)
+            .expect_err("a passed deadline aborts");
+        assert_eq!(err, EngineError::Timeout);
+        let future = ProcessContext {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            ..Default::default()
+        };
+        engine.process_preferred(&src, &[], future).unwrap();
+        // No deadline at all stays unbounded (tests and
+        // library callers rely on it).
+        engine.process(&src, &[]).unwrap();
     }
 
     #[test]

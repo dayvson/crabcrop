@@ -143,6 +143,11 @@ pub struct AppState {
     pub allow_unsafe: bool,
     pub loader: Loader,
     pub engine: Engine,
+    /// Per-request processing deadline (issue #260), from
+    /// `CRABCROP_PROCESS_TIMEOUT_SECS`: the engine checks
+    /// it between stages, and the process runner stops
+    /// waiting at it, answering 504.
+    pub process_timeout: std::time::Duration,
     /// Request metrics, shared behind an `Arc` so clones agree.
     pub metrics: Arc<Metrics>,
     /// Processed-response cache, shared like the metrics.
@@ -1351,6 +1356,12 @@ enum ProcessFailure {
     /// The engine panicked. The panic is contained at this
     /// seam (audit E-8) and surfaces as a 500.
     Panicked,
+    /// The job ran past the processing deadline (issue
+    /// #260): the runner stopped waiting and the request
+    /// is shed with a 504. The blocking job itself is
+    /// detached; the engine's own deadline checks abort
+    /// it at the next stage boundary.
+    TimedOut,
 }
 
 /// How long a cache miss may wait for a processing slot
@@ -1411,7 +1422,12 @@ async fn run_process(
     let job = job.clone();
     let bytes = bytes.to_vec();
     let engine = state.engine;
-    tokio::task::spawn_blocking(move || {
+    // The processing deadline (issue #260): the engine
+    // checks it between stages, and the runner below stops
+    // waiting at it, so a heavy request is shed with a 504
+    // instead of running unbounded.
+    let deadline = std::time::Instant::now() + state.process_timeout;
+    let handle = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let declared_refs: Vec<&dyn crate::ai::DetectionProvider> = job
             .declared_detect_providers
@@ -1454,6 +1470,7 @@ async fn run_process(
                 brand_color: job.brand_color,
                 avif_speed: job.avif_speed,
                 jxl_speed: job.jxl_speed,
+                deadline: Some(deadline),
             };
             engine.process_preferred(&bytes, &job.ops, ctx)
         })) {
@@ -1461,9 +1478,15 @@ async fn run_process(
             Ok(Err(e)) => Err(ProcessFailure::Engine(e)),
             Err(_) => Err(ProcessFailure::Panicked),
         }
-    })
-    .await
-    .unwrap_or(Err(ProcessFailure::Panicked))
+    });
+    // Past the deadline the runner stops waiting and sheds
+    // the request. The detached job keeps its process
+    // permit until the engine's own deadline checks abort
+    // it at the next stage boundary; its result is dropped.
+    match tokio::time::timeout(state.process_timeout, handle).await {
+        Ok(joined) => joined.unwrap_or(Err(ProcessFailure::Panicked)),
+        Err(_) => Err(ProcessFailure::TimedOut),
+    }
 }
 
 async fn serve(
@@ -2008,7 +2031,7 @@ async fn serve_miss(
                 }
                 None => {
                     record.fail = FailStage::Load;
-                    return (load_error_response(e), record);
+                    return (sealed_or(sealed, load_error_response(e)), record);
                 }
             }
         }
@@ -2032,7 +2055,7 @@ async fn serve_miss(
             Ok(b) => b,
             Err(e) => {
                 record.fail = FailStage::Load;
-                return (load_error_response(e), record);
+                return (sealed_or(sealed, load_error_response(e)), record);
             }
         };
         watermark_sources.push((wm_url.to_string(), wm_bytes));
@@ -2050,7 +2073,10 @@ async fn serve_miss(
             Ok(Ok(permit)) => Some(permit),
             _ => {
                 return (
-                    busy_response("server busy: AI processing queue is full", 5),
+                    sealed_or(
+                        sealed,
+                        busy_response("server busy: AI processing queue is full", 5),
+                    ),
                     record,
                 );
             }
@@ -2076,7 +2102,10 @@ async fn serve_miss(
             Ok(Ok(permit)) => Some(permit),
             _ => {
                 return (
-                    busy_response("server busy: video processing queue is full", 5),
+                    sealed_or(
+                        sealed,
+                        busy_response("server busy: video processing queue is full", 5),
+                    ),
                     record,
                 );
             }
@@ -2097,7 +2126,10 @@ async fn serve_miss(
             Ok(Ok(permit)) => Some(permit),
             _ => {
                 return (
-                    busy_response("server busy: animation encoding queue is full", 5),
+                    sealed_or(
+                        sealed,
+                        busy_response("server busy: animation encoding queue is full", 5),
+                    ),
                     record,
                 );
             }
@@ -2150,14 +2182,30 @@ async fn serve_miss(
         Ok(p) => p,
         Err(ProcessFailure::Busy) => {
             return (
-                busy_response("server busy: too many images processing at once", 1),
+                sealed_or(
+                    sealed,
+                    busy_response("server busy: too many images processing at once", 1),
+                ),
                 record,
             );
         }
         Err(ProcessFailure::Panicked) => {
             record.fail = FailStage::Engine;
             return (
-                (StatusCode::INTERNAL_SERVER_ERROR, "image processing failed").into_response(),
+                sealed_or(
+                    sealed,
+                    (StatusCode::INTERNAL_SERVER_ERROR, "image processing failed").into_response(),
+                ),
+                record,
+            );
+        }
+        Err(ProcessFailure::TimedOut) => {
+            record.fail = FailStage::Engine;
+            return (
+                sealed_or(
+                    sealed,
+                    (StatusCode::GATEWAY_TIMEOUT, "processing timed out").into_response(),
+                ),
                 record,
             );
         }
@@ -2183,7 +2231,7 @@ async fn serve_miss(
                 }
                 None => {
                     record.fail = FailStage::Engine;
-                    return (engine_error_response(e), record);
+                    return (sealed_or(sealed, engine_error_response(e)), record);
                 }
             }
         }
@@ -3500,6 +3548,25 @@ fn busy_response(message: &'static str, retry_after_secs: u64) -> Response {
     response
 }
 
+/// The uniform refusal for a sealed request (issues #255,
+/// #259): once a token has opened, every failure answers
+/// with the same 403, so a lifted token reveals nothing
+/// about the payload it carries. The real error still
+/// reaches the server log through the normal builders.
+fn sealed_refusal_response() -> Response {
+    (StatusCode::FORBIDDEN, "bad signature").into_response()
+}
+
+/// `resp` for a plain request, the uniform sealed refusal
+/// for a sealed one.
+fn sealed_or(sealed: bool, resp: Response) -> Response {
+    if sealed {
+        sealed_refusal_response()
+    } else {
+        resp
+    }
+}
+
 fn load_error_response(e: LoadError) -> Response {
     // The detailed cause (which can embed origin-controlled
     // strings and server-constructed store URLs) goes to the
@@ -3533,14 +3600,34 @@ fn load_error_response(e: LoadError) -> Response {
 /// (`{"error":{"code","message"}}`, the code being the
 /// error's stable name) when the client asked for JSON,
 /// the same test the meta surface uses.
+/// Cap for a parse error echoed to a client (issue
+/// #268): the parser's message embeds the offending
+/// segment verbatim, and a segment is bounded only by
+/// the URL length cap, so a 10 KB segment produced a
+/// 10 KB error body. 200 bytes keeps the useful head of
+/// every message shape; the full text stays in the
+/// server log through the record.
+const MAX_ERROR_ECHO: usize = 200;
+
+fn truncate_echo(message: &str) -> String {
+    if message.len() <= MAX_ERROR_ECHO {
+        return message.to_string();
+    }
+    let mut end = MAX_ERROR_ECHO;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &message[..end])
+}
+
 fn parse_failure(e: &crate::url::ParseError, accept: Option<&str>) -> Response {
     if wants_meta(accept) {
         let body = serde_json::json!({
-            "error": { "code": e.code(), "message": e.to_string() }
+            "error": { "code": e.code(), "message": truncate_echo(&e.to_string()) }
         });
         (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
     } else {
-        (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        (StatusCode::BAD_REQUEST, truncate_echo(&e.to_string())).into_response()
     }
 }
 
@@ -3554,6 +3641,10 @@ fn engine_error_response(e: EngineError) -> Response {
         EngineError::Encode(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "image encoding failed".to_string(),
+        ),
+        EngineError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "processing timed out".to_string(),
         ),
         EngineError::Unsupported(what) => (StatusCode::BAD_REQUEST, what),
         EngineError::NotConfigured(what) => (StatusCode::NOT_IMPLEMENTED, what),
@@ -3687,6 +3778,7 @@ mod tests {
             allow_unsafe,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -3795,6 +3887,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -3876,6 +3969,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -3960,6 +4054,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -4190,6 +4285,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -4544,6 +4640,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -4606,6 +4703,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -4671,6 +4769,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -5030,6 +5129,47 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{remainder}");
             assert_eq!(resp.text().await.unwrap(), "bad signature", "{remainder}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_post_open_failures_are_one_uniform_refusal() {
+        // Issue #259: the uniform collapse used to end at
+        // the load boundary, so load and engine errors
+        // leaked the payload (the hidden host, an origin
+        // oracle, the source's dimensions). Each remainder
+        // below opens fine and fails after the open; the
+        // plain form answers instructively, the sealed
+        // form must answer the one refusal.
+        let (not_found, _hits) = spawn_counting_server(404, "image/png", test_png()).await;
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        for remainder in [
+            // Loader policy refusal (userinfo source).
+            "300x50/http://user:pass@127.0.0.1:1/img.jpg".to_string(),
+            // Origin answers 404.
+            format!("300x50/{not_found}"),
+            // Engine refusal echoing the op and the
+            // hidden source's bounds.
+            format!("crop-rect:0x0:99999x99999/{src}"),
+        ] {
+            let plain = client()
+                .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+                .send()
+                .await
+                .unwrap();
+            // The plain form is instructive: a policy
+            // refusal is a 403 too, but its body names the
+            // reason, and the others are 502/400 shapes.
+            // None of them is the sealed refusal.
+            assert_ne!(plain.text().await.unwrap(), "bad signature", "{remainder}");
+            let sealed = client()
+                .get(format!("{base}/{}", sealed_path(&remainder, None)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(sealed.status(), StatusCode::FORBIDDEN, "{remainder}");
+            assert_eq!(sealed.text().await.unwrap(), "bad signature", "{remainder}");
         }
     }
 
@@ -5510,6 +5650,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -6333,6 +6474,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -6460,6 +6602,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -6681,6 +6824,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -7024,6 +7168,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -7243,6 +7388,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: Some(Arc::new(FakeMask)),
@@ -7300,6 +7446,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: Some(Arc::new(FakeMask)),
@@ -7357,6 +7504,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -7446,6 +7594,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -7813,6 +7962,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -7875,6 +8025,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(cache_bytes)),
             removebg: None,
@@ -9162,6 +9313,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -9226,6 +9378,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -9603,6 +9756,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -9698,6 +9852,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -10226,6 +10381,7 @@ mod tests {
                     ..Default::default()
                 }),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -10631,6 +10787,7 @@ mod tests {
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,
@@ -11469,6 +11626,7 @@ mod tests {
             allow_unsafe: false,
             loader,
             engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
             metrics: Arc::new(Metrics::default()),
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
             removebg: None,

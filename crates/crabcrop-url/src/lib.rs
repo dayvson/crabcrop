@@ -373,8 +373,11 @@ pub fn seal_with_key_id(secret: &[u8], key_id: &str, remainder: &str) -> Result<
 /// one secret, returning the remainder it seals. Every
 /// failure is [`SealError::OpenFailed`]: malformed base64,
 /// a body too short to hold a nonce and a tag, a tag
-/// mismatch under this secret, or plaintext that is not
-/// UTF-8.
+/// mismatch under this secret, plaintext that is not
+/// UTF-8, or a remainder over [`MAX_SEALED_REMAINDER`].
+/// The cap is enforced here, not only at mint time, so
+/// it holds for tokens minted by any implementation
+/// (issue #264).
 pub fn open_token(secret: &[u8], token: &str) -> Result<String, SealError> {
     use aes_gcm::aead::{Aead, Payload};
     use base64::Engine as _;
@@ -397,6 +400,9 @@ pub fn open_token(secret: &[u8], token: &str) -> Result<String, SealError> {
             },
         )
         .map_err(|_| SealError::OpenFailed)?;
+    if plain.len() > MAX_SEALED_REMAINDER {
+        return Err(SealError::OpenFailed);
+    }
     String::from_utf8(plain).map_err(|_| SealError::OpenFailed)
 }
 
@@ -686,6 +692,41 @@ mod tests {
         }
         fn below(&mut self, n: usize) -> usize {
             (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// A token minted by an implementation that ignores
+    /// the cap still fails to open (issue #264): the cap
+    /// is enforced on the open side, not only at mint.
+    #[test]
+    fn open_token_refuses_remainders_over_the_cap() {
+        use aes_gcm::aead::{Aead, Payload};
+        use base64::Engine as _;
+        let secret = b"test-secret-for-seal-cap";
+        let nonce = [7u8; 12];
+        for len in [MAX_SEALED_REMAINDER, MAX_SEALED_REMAINDER + 1, 3040] {
+            let remainder = "a".repeat(len);
+            let sealed = seal_cipher(secret)
+                .encrypt(
+                    &seal_nonce(&nonce),
+                    Payload {
+                        msg: remainder.as_bytes(),
+                        aad: SEAL_AAD,
+                    },
+                )
+                .unwrap();
+            let mut body = Vec::with_capacity(12 + sealed.len());
+            body.extend_from_slice(&nonce);
+            body.extend_from_slice(&sealed);
+            let token = format!(
+                "{SEALED_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
+            );
+            if len <= MAX_SEALED_REMAINDER {
+                assert_eq!(open_token(secret, &token).unwrap(), remainder);
+            } else {
+                assert_eq!(open_token(secret, &token), Err(SealError::OpenFailed));
+            }
         }
     }
 

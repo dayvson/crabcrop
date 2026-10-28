@@ -74,6 +74,14 @@ pub const RENDER_SCALE: f64 = 2.0;
 /// for a raster the pipeline would refuse.
 const MAX_RASTER_AXIS: f64 = 16_384.0;
 
+/// The total raster area a render may not exceed, in
+/// pixels: 64 Mpx, the raster the 256 MB decode budget
+/// holds at 4 bytes per pixel. The per-axis clamp alone
+/// allows 16384 squared (about 268 Mpx, over 1 GB of
+/// renderer memory), which a tiny hostile MediaBox
+/// reaches trivially (issue #262).
+const MAX_RASTER_PIXELS: f64 = 64_000_000.0;
+
 /// How much of a probe report the parser keeps. The
 /// report is a few hundred bytes; this is generous
 /// headroom for chatty builds.
@@ -406,6 +414,7 @@ impl PdfRenderer {
         });
 
         let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
         let stderr_thread = std::thread::spawn(move || {
             let mut kept = Vec::new();
             let mut chunk = [0u8; 16 * 1024];
@@ -420,7 +429,7 @@ impl PdfRenderer {
                     }
                 }
             }
-            String::from_utf8_lossy(&kept).into_owned()
+            let _ = err_tx.send(String::from_utf8_lossy(&kept).into_owned());
         });
 
         let deadline = Instant::now() + self.timeout;
@@ -498,8 +507,19 @@ impl PdfRenderer {
             }
         };
         let _ = writer.join();
-        let stderr = stderr_thread.join().unwrap_or_default();
-        let _ = stdout_thread.join();
+        // The reader threads are deliberately never
+        // joined (issue #263, the video.rs pattern): a
+        // grandchild that inherited the pipes and holds
+        // them open would block a join for its whole
+        // lifetime, defeating the timeout above. stderr
+        // is worth a short grace through its channel, no
+        // more; the stdout result already arrived through
+        // its own channel.
+        let stderr = err_rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap_or_default();
+        drop(stdout_thread);
+        drop(stderr_thread);
         Ok(ToolRun {
             status,
             stdout,
@@ -558,13 +578,19 @@ fn validate_program(path: &Path, what: &str) -> Result<(), PdfError> {
 
 /// The render scale for a page of the given size in
 /// points: the fixed [`RENDER_SCALE`], clamped down so
-/// neither raster axis exceeds the decode cap.
+/// neither raster axis exceeds the decode cap and the
+/// raster area stays within [`MAX_RASTER_PIXELS`].
 pub fn render_scale(page_width: f64, page_height: f64) -> f64 {
     let longest = page_width.max(page_height);
     if longest <= 0.0 {
         return RENDER_SCALE;
     }
-    RENDER_SCALE.min(MAX_RASTER_AXIS / longest)
+    let mut scale = RENDER_SCALE.min(MAX_RASTER_AXIS / longest);
+    let area = page_width * page_height;
+    if area > 0.0 {
+        scale = scale.min((MAX_RASTER_PIXELS / area).sqrt());
+    }
+    scale
 }
 
 /// Parse the probe facts out of a `pdfinfo` report: the
@@ -741,10 +767,22 @@ Page size:       792 x 612 pts (letter)
     fn scale_is_two_until_the_decode_cap_bites() {
         assert_eq!(render_scale(612.0, 792.0), 2.0);
         assert_eq!(render_scale(595.28, 841.89), 2.0);
-        // A 200-inch poster page (14400 pt per axis):
-        // the scale clamps to the 16384 px axis cap.
+        // A 200-inch poster page (14400 pt per axis): the
+        // area budget bites before the axis cap (issue
+        // #262), clamping the raster to 64 Mpx.
         let scale = render_scale(14_400.0, 14_400.0);
-        assert!((scale - 16_384.0 / 14_400.0).abs() < 1e-9, "{scale}");
+        let expected = (64_000_000.0f64 / (14_400.0 * 14_400.0)).sqrt();
+        assert!((scale - expected).abs() < 1e-9, "{scale}");
+        let axis = 14_400.0 * scale;
+        assert!(axis * axis <= 64_000_001.0, "{axis}");
+        // A wide-but-short page still clamps by axis.
+        let scale = render_scale(20_000.0, 100.0);
+        assert!((scale - 16_384.0 / 20_000.0).abs() < 1e-9, "{scale}");
+        // The hostile MediaBox from the finding: a
+        // 100000 pt square page renders at 8000 px per
+        // axis (64 Mpx), not 16384 (268 Mpx).
+        let scale = render_scale(100_000.0, 100_000.0);
+        assert!((100_000.0 * scale - 8_000.0).abs() < 1e-6, "{scale}");
         // A degenerate size keeps the fixed scale; the
         // renderer run is where that document fails.
         assert_eq!(render_scale(0.0, 0.0), 2.0);
