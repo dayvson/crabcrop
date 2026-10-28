@@ -13,6 +13,18 @@ members = ["crates/crabcrop-url"]
 crabcrop-url = { path = "crates/crabcrop-url" }
 ab_glyph = "0.2"
 axum = "0.8"
+# C2PA provenance (issue #173), pinned to the exact release:
+# 0.91.0 is the first release that enforces the spec's
+# exclusion rule (the October 2026 forgery), and the crate is
+# pre-1.0 with breaking trains roughly every two months, so
+# upgrades are deliberate. Default features off: the default
+# crypto is a vendored OpenSSL build, and this tree has no
+# OpenSSL; `rust_native_crypto` swaps in the pure-Rust
+# backend. The two HTTP features mirror upstream's default
+# set (minus the wasm backends) so a configured timestamp
+# authority can be reached. All c2pa contact lives in
+# src/provenance.rs.
+c2pa = { version = "=0.91.7", default-features = false, features = ["rust_native_crypto", "http_reqwest", "http_ureq"] }
 fast-ssim2 = "0.9"
 fast_image_resize = { version = "6.1", features = ["image"] }
 hex = "0.4"

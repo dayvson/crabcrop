@@ -504,6 +504,14 @@ pub struct ProcessedImage {
     /// the selected page, and the page size, for meta
     /// responses. `None` for every non-PDF source.
     pub pdf: Option<PdfSourceMeta>,
+    /// The C2PA provenance facts (issue #173) for meta
+    /// responses: what the source carried and what the
+    /// output carries. The engine never sets this; the
+    /// server fills it in around the signing step, which
+    /// lives outside the engine (the manifest is embedded
+    /// in the encoded bytes, after encoding). `None` unless
+    /// the caller asked for the facts.
+    pub provenance: Option<crate::provenance::ProvenanceFacts>,
 }
 
 /// Facts about a video source, probed at frame
@@ -1438,6 +1446,7 @@ impl Engine {
             ssimulacra2: ssim,
             video: video_meta,
             pdf: pdf_meta,
+            provenance: None,
         })
     }
 
@@ -1518,6 +1527,7 @@ impl Engine {
             ssimulacra2: None,
             video: None,
             pdf: None,
+            provenance: None,
         })
     }
 
@@ -1603,6 +1613,7 @@ impl Engine {
             ssimulacra2: None,
             video: None,
             pdf: None,
+            provenance: None,
         })
     }
 }

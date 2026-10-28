@@ -319,6 +319,12 @@ pub struct AppState {
     /// gate below: it is the same class of subprocess
     /// work as frame extraction.
     pub pdf_renderer: Option<Arc<crate::pdf::PdfRenderer>>,
+    /// C2PA output signer (issue #173), built and
+    /// self-validated at boot when `CRABCROP_C2PA_CERT`
+    /// and `CRABCROP_C2PA_KEY` are configured. `None`
+    /// means outputs are served unsigned; meta responses
+    /// still report the provenance a source carries.
+    pub provenance_signer: Option<Arc<crate::provenance::ProvenanceSigner>>,
     /// Bounds concurrent video encodes: the subprocess is
     /// the server's most expensive and least predictable
     /// work, so it gets its own small gate (2 permits, like
@@ -1375,6 +1381,17 @@ struct ProcessJob {
     video_encoder: Option<Arc<crate::video::VideoEncoder>>,
     frame_extractor: Option<Arc<crate::frames::VideoFrameExtractor>>,
     pdf_renderer: Option<Arc<crate::pdf::PdfRenderer>>,
+    /// C2PA output signer (issue #173) when the operator
+    /// configured one.
+    provenance_signer: Option<Arc<crate::provenance::ProvenanceSigner>>,
+    /// Whether this request's operations include an AI
+    /// edit (removebg, studio, remove_region, upscale,
+    /// class edits, face redactions), recorded on the
+    /// output manifest's edit action.
+    ai_edited: bool,
+    /// Whether the caller wants provenance facts computed
+    /// for the response (meta requests).
+    want_provenance: bool,
     dpr: Option<f32>,
     ssim_target: f64,
     brand_color: Option<[u8; 3]>,
@@ -1522,7 +1539,9 @@ async fn run_process(
                 jxl_speed: job.jxl_speed,
                 deadline: Some(deadline),
             };
-            engine.process_preferred(&bytes, &job.ops, ctx)
+            let mut processed = engine.process_preferred(&bytes, &job.ops, ctx)?;
+            apply_provenance(&job, &bytes, &mut processed)?;
+            Ok(processed)
         })) {
             Ok(Ok(processed)) => Ok(processed),
             Ok(Err(e)) => Err(ProcessFailure::Engine(e)),
@@ -1538,6 +1557,88 @@ async fn run_process(
         Ok(joined) => joined.unwrap_or(Err(ProcessFailure::Panicked)),
         Err(_) => Err(ProcessFailure::TimedOut),
     }
+}
+
+/// The C2PA step (issue #173), run inside the gated
+/// process job: verify what the source carries and, when
+/// a signer is configured, sign the output. Byte
+/// preservation of a source manifest is impossible (the
+/// pipeline drops the segments it lives in), so the
+/// source's manifest rides into the output's manifest
+/// store as a parent ingredient instead, keeping the
+/// provenance chain intact. Signing covers still JPEG,
+/// PNG, WebP, and AVIF outputs; GIF, JPEG XL, video, and
+/// animated WebP outputs are served unsigned. A signing
+/// failure fails the request: serving unmarked output
+/// from a server configured to mark would be a silent
+/// policy break.
+fn apply_provenance(
+    job: &ProcessJob,
+    source_bytes: &[u8],
+    processed: &mut crate::engine::ProcessedImage,
+) -> Result<(), EngineError> {
+    let signer = &job.provenance_signer;
+    if signer.is_none() && !job.want_provenance {
+        return Ok(());
+    }
+    let source_format = crate::provenance::sniff_format(source_bytes);
+    // The source summary is a meta-only fact: reading it
+    // validates the source's whole manifest store, work
+    // an image response has no use for.
+    let source = if job.want_provenance {
+        crate::provenance::read_manifest(source_bytes, source_format)
+    } else {
+        None
+    };
+    let mut signed = false;
+    if let Some(signer) = signer {
+        let mime = crate::provenance::signable_mime(processed.format);
+        let animated_webp = processed.format == ImageFormat::WebP
+            && crate::provenance::webp_is_animated(&processed.bytes);
+        if let (Some(mime), false) = (mime, animated_webp) {
+            // The source asset rides as a parent
+            // ingredient whenever it is an image asset,
+            // manifest or not: the ingredient records its
+            // hash, and its manifest store when it has
+            // one. Video and PDF sources are not
+            // ingredient-shaped; their outputs start a
+            // fresh chain (see provenance::sign).
+            let ingredient = match source_format {
+                "image/jpeg" | "image/png" | "image/webp" | "image/avif" | "image/heic"
+                | "image/gif" | "image/jxl" => Some((source_bytes, source_format)),
+                _ => None,
+            };
+            let request = crate::provenance::SignRequest {
+                ingredient,
+                ai_edited: job.ai_edited,
+            };
+            match signer.sign(&processed.bytes, mime, &request) {
+                Ok(bytes) => {
+                    processed.bytes = bytes;
+                    signed = true;
+                }
+                Err(e) => {
+                    return Err(EngineError::Encode(format!("C2PA signing failed: {e}")));
+                }
+            }
+        }
+    }
+    if job.want_provenance {
+        let output = if signed {
+            crate::provenance::read_manifest(
+                &processed.bytes,
+                crate::provenance::sniff_format(&processed.bytes),
+            )
+        } else {
+            None
+        };
+        processed.provenance = Some(crate::provenance::ProvenanceFacts {
+            source,
+            output,
+            signing_configured: signer.is_some(),
+        });
+    }
+    Ok(())
 }
 
 async fn serve(
@@ -2223,6 +2324,14 @@ async fn serve_miss(
         video_encoder: state.video_encoder.clone(),
         frame_extractor: state.frame_extractor.clone(),
         pdf_renderer: state.pdf_renderer.clone(),
+        provenance_signer: state.provenance_signer.clone(),
+        ai_edited: directives.removebg
+            || directives.studio
+            || directives.remove_region
+            || directives.upscale
+            || directives.needs_face_model
+            || directives.has_class_redaction(),
+        want_provenance: meta,
         dpr: dpr_hint,
         ssim_target: state.ssim_target,
         brand_color: state.brand_color,
@@ -3267,6 +3376,43 @@ fn meta_response(
     if let Some(score) = processed.ssimulacra2 {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
     }
+    if let Some(facts) = &processed.provenance {
+        // C2PA provenance (issue #173): what the source
+        // carried and what the output carries, verified
+        // inside the process job. Both are facts read from
+        // the assets' embedded credentials, the same class
+        // as the tags above, so a sealed request reports
+        // them too (never operation or source text). A
+        // valid credential proves origin, not untouched
+        // pixels: the states say exactly which of valid,
+        // trusted, or invalid each manifest earned.
+        let summary = |s: &crate::provenance::ManifestSummary| {
+            format!(
+                "{{\"state\":\"{}\",\"signer\":{},\"manifests\":{},\"ingredients\":{}}}",
+                s.state,
+                s.signer
+                    .as_ref()
+                    .map(|n| serde_json::to_string(n).unwrap_or_default())
+                    .unwrap_or_else(|| "null".to_string()),
+                s.manifests,
+                s.ingredients,
+            )
+        };
+        body.push_str(&format!(
+            ",\"provenance\":{{\"signing_configured\":{},\"source\":{},\"output\":{}}}",
+            facts.signing_configured,
+            facts
+                .source
+                .as_ref()
+                .map(summary)
+                .unwrap_or_else(|| "null".to_string()),
+            facts
+                .output
+                .as_ref()
+                .map(summary)
+                .unwrap_or_else(|| "null".to_string()),
+        ));
+    }
     if !sealed && let Some(video) = &processed.video {
         // The video record (issue #214): the probed facts
         // of the video source and the resolved timestamp
@@ -3876,6 +4022,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4002,6 +4149,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate,
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4085,6 +4233,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4171,6 +4320,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4403,6 +4553,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4760,6 +4911,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4823,6 +4975,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4890,6 +5043,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5772,6 +5926,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6597,6 +6752,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6726,6 +6882,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6949,6 +7106,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7294,6 +7452,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7515,6 +7674,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7574,6 +7734,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7633,6 +7794,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7724,6 +7886,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8093,6 +8256,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8166,6 +8330,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9453,6 +9618,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9528,6 +9694,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9833,6 +10000,286 @@ mod tests {
         assert!(metrics.contains("crabcrop_purges_total 2"), "{metrics}");
     }
 
+    /// A process job with the provenance knobs set
+    /// explicitly, for the direct `apply_provenance`
+    /// tests below (issue #173).
+    fn provenance_job(
+        signer: Option<Arc<crate::provenance::ProvenanceSigner>>,
+        ai_edited: bool,
+    ) -> ProcessJob {
+        ProcessJob {
+            save_data: false,
+            preserve_metadata: false,
+            brand_color: None,
+            ops: Vec::new(),
+            preferred: None,
+            watermark_sources: Vec::new(),
+            placeholders: false,
+            mask_provider: None,
+            upscale_provider: None,
+            inpaint_provider: None,
+            segment_provider: None,
+            face_provider: None,
+            detect_provider: None,
+            declared_detect_providers: Vec::new(),
+            focal_provider: None,
+            text_renderer: None,
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            provenance_signer: signer,
+            ai_edited,
+            want_provenance: true,
+            dpr: None,
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+        }
+    }
+
+    fn still_processed(bytes: Vec<u8>, format: ImageFormat) -> crate::engine::ProcessedImage {
+        crate::engine::ProcessedImage {
+            bytes,
+            format,
+            quality: None,
+            width: 100,
+            height: 60,
+            source_width: 100,
+            source_height: 60,
+            placeholder: None,
+            studio: None,
+            inpaint: None,
+            segments: None,
+            ssimulacra2: None,
+            video: None,
+            pdf: None,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn provenance_step_signs_a_still_and_records_the_facts() {
+        let job = provenance_job(Some(crate::provenance::test_signer()), false);
+        let source = test_png();
+        let mut processed = still_processed(source.clone(), ImageFormat::Png);
+        apply_provenance(&job, &source, &mut processed).unwrap();
+        let facts = processed.provenance.expect("facts are recorded");
+        assert!(facts.signing_configured);
+        assert!(facts.source.is_none(), "the source carried no manifest");
+        let output = facts.output.expect("the output is signed");
+        assert_eq!(output.state, "valid");
+        assert_eq!(output.signer.as_deref(), Some("crabcrop test signer"));
+        assert_eq!(output.manifests, 1);
+        assert_eq!(output.ingredients, 1, "the source asset is the ingredient");
+    }
+
+    #[test]
+    fn provenance_step_carries_a_signed_source_chain() {
+        let signer = crate::provenance::test_signer();
+        let parent = signer
+            .sign(
+                &test_png(),
+                "image/png",
+                &crate::provenance::SignRequest {
+                    ingredient: None,
+                    ai_edited: false,
+                },
+            )
+            .unwrap();
+        let job = provenance_job(Some(signer), false);
+        let mut processed = still_processed(test_png(), ImageFormat::Png);
+        apply_provenance(&job, &parent, &mut processed).unwrap();
+        let facts = processed.provenance.expect("facts are recorded");
+        let source = facts.source.expect("the source manifest is reported");
+        assert_eq!(source.state, "valid");
+        let output = facts.output.expect("the output is signed");
+        assert_eq!(output.state, "valid");
+        assert_eq!(output.manifests, 2, "the parent store rides along");
+        assert_eq!(output.ingredients, 1);
+    }
+
+    #[test]
+    fn provenance_step_marks_ai_edits() {
+        let job = provenance_job(Some(crate::provenance::test_signer()), true);
+        let source = test_png();
+        let mut processed = still_processed(source.clone(), ImageFormat::Png);
+        apply_provenance(&job, &source, &mut processed).unwrap();
+        let json = crate::provenance::manifest_json(&processed.bytes, "image/png");
+        assert!(
+            json.contains("compositeWithTrainedAlgorithmicMedia"),
+            "the edit action records the IPTC source type: {json}"
+        );
+    }
+
+    #[test]
+    fn provenance_step_leaves_unsignable_outputs_alone() {
+        let job = provenance_job(Some(crate::provenance::test_signer()), false);
+        let source = test_png();
+        // Video output: not a signable format.
+        let mut video = still_processed(b"video-bytes".to_vec(), ImageFormat::Mp4);
+        apply_provenance(&job, &source, &mut video).unwrap();
+        assert_eq!(video.bytes, b"video-bytes");
+        let facts = video.provenance.expect("facts are recorded");
+        assert!(facts.output.is_none());
+        // Animated WebP: a signable format, but the bytes
+        // are an animation, and signing covers stills.
+        let mut anim = b"RIFF\x00\x00\x00\x00WEBPVP8X".to_vec();
+        anim.extend_from_slice(&[0, 0, 0, 0, 0x02, 0, 0, 0]);
+        let before = anim.clone();
+        let mut processed = still_processed(anim, ImageFormat::WebP);
+        apply_provenance(&job, &source, &mut processed).unwrap();
+        assert_eq!(processed.bytes, before);
+        assert!(processed.provenance.unwrap().output.is_none());
+    }
+
+    #[test]
+    fn provenance_step_without_a_signer_only_verifies() {
+        let signer = crate::provenance::test_signer();
+        let parent = signer
+            .sign(
+                &test_png(),
+                "image/png",
+                &crate::provenance::SignRequest {
+                    ingredient: None,
+                    ai_edited: false,
+                },
+            )
+            .unwrap();
+        let job = provenance_job(None, false);
+        let mut processed = still_processed(test_png(), ImageFormat::Png);
+        let before = processed.bytes.clone();
+        apply_provenance(&job, &parent, &mut processed).unwrap();
+        assert_eq!(processed.bytes, before, "no signer, no signing");
+        let facts = processed.provenance.expect("facts are recorded");
+        assert!(!facts.signing_configured);
+        assert_eq!(facts.source.expect("source reported").state, "valid");
+        assert!(facts.output.is_none());
+    }
+
+    /// An app whose state carries the C2PA test signing
+    /// identity (issue #173).
+    async fn spawn_app_with_signer() -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
+            metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: None,
+            segment: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            ocr: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(Inflight::default()),
+            provenance_signer: Some(crate::provenance::test_signer()),
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn meta_reports_provenance_without_a_signer() {
+        let signer = crate::provenance::test_signer();
+        let signed_source = signer
+            .sign(
+                &test_png(),
+                "image/png",
+                &crate::provenance::SignRequest {
+                    ingredient: None,
+                    ai_edited: false,
+                },
+            )
+            .unwrap();
+        let src = spawn_bytes_server(signed_source).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let prov = &meta["provenance"];
+        assert_eq!(prov["signing_configured"], false);
+        assert_eq!(prov["source"]["state"], "valid");
+        assert_eq!(prov["source"]["signer"], "crabcrop test signer");
+        assert!(prov["output"].is_null());
+    }
+
+    #[tokio::test]
+    async fn signing_server_signs_image_responses() {
+        let base = spawn_app_with_signer().await;
+        let src = spawn_image_server().await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.bytes().await.unwrap().to_vec();
+        let summary = crate::provenance::read_manifest(&bytes, "image/png")
+            .expect("the response carries a manifest");
+        assert_eq!(summary.state, "valid");
+        assert_eq!(summary.signer.as_deref(), Some("crabcrop test signer"));
+        assert_eq!(summary.ingredients, 1);
+        // Meta agrees about the output side.
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["provenance"]["signing_configured"], true);
+        assert_eq!(meta["provenance"]["output"]["state"], "valid");
+        assert!(meta["provenance"]["source"].is_null());
+    }
+
     #[tokio::test]
     async fn processing_gate_bounds_concurrency() {
         // A state whose single process permit the test holds:
@@ -9884,6 +10331,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let job = ProcessJob {
@@ -9906,6 +10354,9 @@ mod tests {
             video_encoder: None,
             frame_extractor: None,
             pdf_renderer: None,
+            provenance_signer: None,
+            ai_edited: false,
+            want_provenance: false,
             dpr: None,
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
@@ -9981,6 +10432,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let job = ProcessJob {
@@ -10006,6 +10458,9 @@ mod tests {
             video_encoder: None,
             frame_extractor: None,
             pdf_renderer: None,
+            provenance_signer: None,
+            ai_edited: false,
+            want_provenance: false,
             dpr: None,
             ssim_target: state.ssim_target,
             avif_speed: state.avif_speed,
@@ -10515,6 +10970,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10925,6 +11381,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: fingerprint.to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11776,6 +12233,7 @@ mod tests {
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

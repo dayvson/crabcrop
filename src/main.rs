@@ -228,6 +228,27 @@
 //!   no double-fork). Timeouts kill the tool's process
 //!   group; a detached descendant escapes the kill and
 //!   is the operator's responsibility (issue #272).
+//! - `CRABCROP_C2PA_CERT` / `CRABCROP_C2PA_KEY`: paths
+//!   to a PEM certificate chain and its private key (in
+//!   PKCS#8 PEM form): the
+//!   C2PA signing identity for output provenance (issue
+//!   #173). Both or neither; a partial set is a startup
+//!   error. The identity is proven at boot with a
+//!   sign-and-verify round trip, and a broken one (a bare
+//!   self-signed certificate, a mismatched key, a chain
+//!   outside the C2PA certificate profile) is a startup
+//!   error, not a first-request surprise. When set,
+//!   still JPEG, PNG, WebP, and AVIF outputs are signed:
+//!   a source manifest rides into the output as a parent
+//!   ingredient (byte preservation through a transform is
+//!   impossible), and AI-edited outputs record the edit.
+//!   `CRABCROP_C2PA_TSA_URL` optionally names a timestamp
+//!   authority. Unset: outputs are unsigned, and meta
+//!   still reports the provenance a source carries. A
+//!   chain that does not reach the C2PA trust list signs
+//!   and validates but public verifiers show the output
+//!   as valid-not-trusted; reaching the trust list is the
+//!   operator's certificate choice, not a server setting.
 //! - `CRABCROP_METRICS_TOKEN`: bearer token the
 //!   `/metrics` endpoint requires (`Authorization:
 //!   Bearer <token>`). Unset closes the endpoint (it
@@ -263,6 +284,7 @@ mod loader;
 mod observe;
 mod pdf;
 mod placeholder;
+mod provenance;
 mod quality;
 mod s3store;
 mod server;
@@ -1008,6 +1030,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let video_encoder = build_video_encoder(|name| env::var(name).ok())?;
     let frame_extractor = build_video_decoder(|name| env::var(name).ok())?;
     let pdf_renderer = build_pdf_renderer(|name| env::var(name).ok())?;
+    let provenance_signer = build_provenance_signer(|name| env::var(name).ok())?;
 
     let state = AppState {
         keyring,
@@ -1059,6 +1082,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         video_encoder,
         frame_extractor,
         pdf_renderer,
+        provenance_signer,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         inflight: Arc::new(crate::server::Inflight::default()),
@@ -1160,6 +1184,8 @@ fn config_fingerprint(
         "CRABCROP_VIDEO_ENCODER",
         "CRABCROP_VIDEO_DECODER",
         "CRABCROP_PDF_RENDERER",
+        "CRABCROP_C2PA_KEY",
+        "CRABCROP_C2PA_TSA_URL",
     ] {
         if let Some(value) = get(name).filter(|v| !v.is_empty()) {
             part(name, &value);
@@ -1175,6 +1201,25 @@ fn config_fingerprint(
             })
             .unwrap_or_else(|_| "unreadable".to_string());
         part("CRABCROP_DETECTORS_FILE", &format!("{path}:{digest}"));
+    }
+    // The signing certificate is hashed like the
+    // detectors file (issue #173): the chain is embedded
+    // in every signed output, so rotating the certificate
+    // at the same path still starts a fresh cache epoch.
+    // An unreadable file contributes its path only: boot
+    // fails on it later, in the signer build, with the
+    // precise error. The key file is never read here, only
+    // named in the list above.
+    if let Some(path) = get("CRABCROP_C2PA_CERT").filter(|v| !v.is_empty()) {
+        let digest = std::fs::read(&path)
+            .map(|bytes| {
+                sha2::Sha256::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|_| "unreadable".to_string());
+        part("CRABCROP_C2PA_CERT", &format!("{path}:{digest}"));
     }
     let digest = hasher.finalize();
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
@@ -1511,6 +1556,52 @@ fn pdf_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String
 /// a set path that is not a usable renderer, or one
 /// whose `pdfinfo` sibling is missing, is fatal here,
 /// not on the first `page:` request.
+/// Build the C2PA output signer from the environment
+/// (issue #173): the `CRABCROP_C2PA_CERT` /
+/// `CRABCROP_C2PA_KEY` pair (a PEM certificate chain and
+/// its private key), with `CRABCROP_C2PA_TSA_URL` as an
+/// optional timestamp authority. The pair is
+/// all-or-nothing, the CLIP rule: a partial set is a
+/// startup error naming what is missing, and a timestamp
+/// authority without the pair is one too. The identity is
+/// proven at boot by a sign-and-verify round trip (see
+/// `ProvenanceSigner::from_pem`): a broken identity is
+/// fatal here, not at the first signed request.
+fn build_provenance_signer(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Arc<crate::provenance::ProvenanceSigner>>, String> {
+    let cert = get("CRABCROP_C2PA_CERT").filter(|v| !v.is_empty());
+    let key = get("CRABCROP_C2PA_KEY").filter(|v| !v.is_empty());
+    let tsa = get("CRABCROP_C2PA_TSA_URL").filter(|v| !v.is_empty());
+    match (cert, key) {
+        (None, None) => {
+            if tsa.is_some() {
+                return Err(
+                    "CRABCROP_C2PA_TSA_URL is set but no signing identity is configured: \
+                     set CRABCROP_C2PA_CERT and CRABCROP_C2PA_KEY"
+                        .to_string(),
+                );
+            }
+            Ok(None)
+        }
+        (Some(cert), Some(key)) => {
+            let signer = crate::provenance::ProvenanceSigner::from_files(&cert, &key, tsa)
+                .map_err(|e| format!("cannot use the C2PA signing identity: {e}"))?;
+            println!(
+                "C2PA provenance signing: {} (certificate {cert})",
+                signer.name
+            );
+            Ok(Some(Arc::new(signer)))
+        }
+        (None, Some(_)) => {
+            Err("C2PA signing is partially configured: missing CRABCROP_C2PA_CERT".to_string())
+        }
+        (Some(_), None) => {
+            Err("C2PA signing is partially configured: missing CRABCROP_C2PA_KEY".to_string())
+        }
+    }
+}
+
 fn build_pdf_renderer(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Arc<crate::pdf::PdfRenderer>>, String> {
@@ -2361,6 +2452,30 @@ mod tests {
             ),
             "a brand color shapes studio output"
         );
+        assert_ne!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_C2PA_CERT", "/identity/cert.pem")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "a signing identity shapes signed output"
+        );
+        assert_ne!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_C2PA_TSA_URL", "https://tsa.example.com")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "a timestamp authority shapes signatures"
+        );
         assert_eq!(
             base,
             config_fingerprint(
@@ -2864,6 +2979,48 @@ mod tests {
         ]))
         .unwrap();
         assert!(decoder.is_some());
+    }
+
+    #[test]
+    fn provenance_signer_construction_is_all_or_nothing() {
+        // Unset: no signing (issue #173).
+        assert!(build_provenance_signer(env_of(&[])).unwrap().is_none());
+        // A timestamp authority alone is a configuration
+        // error, not a silent no-op.
+        let err = expect_err(build_provenance_signer(env_of(&[(
+            "CRABCROP_C2PA_TSA_URL",
+            "https://tsa.example.com",
+        )])));
+        assert!(err.contains("CRABCROP_C2PA_TSA_URL"), "{err}");
+        // A partial pair names the missing half.
+        let cert = temp_file("c2pa-cert", crate::provenance::TEST_CHAIN.as_bytes());
+        let err = expect_err(build_provenance_signer(env_of(&[(
+            "CRABCROP_C2PA_CERT",
+            cert.as_str(),
+        )])));
+        assert!(err.contains("missing CRABCROP_C2PA_KEY"), "{err}");
+        let key = temp_file("c2pa-key", crate::provenance::TEST_KEY.as_bytes());
+        let err = expect_err(build_provenance_signer(env_of(&[(
+            "CRABCROP_C2PA_KEY",
+            key.as_str(),
+        )])));
+        assert!(err.contains("missing CRABCROP_C2PA_CERT"), "{err}");
+        // The pair constructs, proven at boot by the
+        // sign-and-verify round trip inside the build.
+        let signer = build_provenance_signer(env_of(&[
+            ("CRABCROP_C2PA_CERT", cert.as_str()),
+            ("CRABCROP_C2PA_KEY", key.as_str()),
+        ]))
+        .unwrap()
+        .expect("the pair configures a signer");
+        assert_eq!(signer.name, "crabcrop test signer");
+        // A set but unreadable certificate is fatal here.
+        let missing = missing_path("c2pa-cert");
+        let err = expect_err(build_provenance_signer(env_of(&[
+            ("CRABCROP_C2PA_CERT", missing.as_str()),
+            ("CRABCROP_C2PA_KEY", key.as_str()),
+        ])));
+        assert!(err.contains("CRABCROP_C2PA_CERT"), "{err}");
     }
 
     #[test]

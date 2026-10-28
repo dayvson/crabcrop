@@ -510,6 +510,24 @@
   "tier": "full"
  },
  {
+  "id": "provenance-meta-unsigned",
+  "group": "provenance",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "provenance-meta-signed",
+  "group": "provenance",
+  "kind": "scripted",
+  "tier": "smoke"
+ },
+ {
+  "id": "provenance-signed-output",
+  "group": "provenance",
+  "kind": "scripted",
+  "tier": "full"
+ },
+ {
   "id": "sealed-serve-parity",
   "group": "sealed",
   "kind": "scripted",

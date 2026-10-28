@@ -34,7 +34,7 @@ SECRET = "functional-test-secret-0123456789"
 PORTS = {"origin": 8971, "A": 8972, "AN": 8973, "AP": 8974, "P": 8975,
          "N": 8976, "U": 8977, "OP": 8978, "E": 8979, "BOOT": 8980,
          "AI": 8981, "AIN": 8982, "AIC": 8983, "R": 8984, "V": 8985,
-         "D": 8986}
+         "D": 8986, "C": 8987}
 BASES = {k: f"http://127.0.0.1:{p}" for k, p in PORTS.items() if k != "origin"}
 ORIGIN = f"http://127.0.0.1:{PORTS['origin']}"
 SRC127 = ORIGIN
@@ -178,6 +178,14 @@ INSTANCE_ENV = {
     "D": dict(CRABCROP_ALLOW_UNSAFE="1",
               CRABCROP_PDF_RENDERER=shutil.which("pdftocairo") or "",
               CRABCROP_PDF_TIMEOUT_SECS="5",
+              **ALLOW),
+    # C carries the C2PA signing identity (issue #173):
+    # the suite's test-only chain and key, the fixtures
+    # the Rust suites use, so signed output validates as
+    # "crabcrop test signer".
+    "C": dict(CRABCROP_ALLOW_UNSAFE="1",
+              CRABCROP_C2PA_CERT=os.path.join(FUNC_DIR, "c2pa_cert.pem"),
+              CRABCROP_C2PA_KEY=os.path.join(FUNC_DIR, "c2pa_key.pem"),
               **ALLOW),
 }
 # U needs the runtime upload dir; filled in by start_instances().
