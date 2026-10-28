@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.8.3] - 2026-10-28
+
+### Fixed
+
+- Distribution only: v0.8.2's SDK packages published (crates.io, npm, PyPI) but its release run skipped the platform binary builds and container images, leaving that release page without archives. v0.8.3 is the same code as v0.8.2 with a complete distribution; prefer it.
+
 ## [0.8.2] - 2026-10-28
 
 ### Changed
