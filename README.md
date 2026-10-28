@@ -4,7 +4,15 @@
   <img src="assets/crabcrop-mascot.webp" alt="The crabcrop mascot: a crochet crab waving hello and holding a photo" width="260">
 </p>
 
-crabcrop is an on-demand image optimization service written in Rust. You request an image with the operations encoded in the URL, resize, crop, convert, filter, and crabcrop fetches the source image, applies the operations in order, and returns the result. There are no pre-generated thumbnails and no build step: the URL is the API.
+<p align="center">
+  <a href="https://crabcrop.org/">Website</a> · <a href="https://crabcrop.org/docs.html">Documentation</a>
+</p>
+
+**Blazing fast, on-demand images.**
+
+crabcrop is a Rust-built, lightning-fast on-demand image API supporting all major formats in and out, with over 42 filters and AI features like background removal. It resizes, crops, converts, and filters your images straight from a signed URL. One binary, no pre-generated thumbnails, no build step: the URL is the API.
+
+Everything an image pipeline does, in one signed URL: resize, crop, adjust, shape, overlay, and encode, chained in the order written, plus background removal, studio mode, smart face-safe crops, redaction, and content provenance. Ask for JSON instead of an image and the meta endpoint describes it: dimensions, detections, OCR text, and more.
 
 crabcrop is for sites and apps that serve the same images at many sizes and want signed, cacheable image URLs in front of an origin image store.
 
