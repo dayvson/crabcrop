@@ -8,10 +8,6 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
-    ignore:
-      # tokio 1.54 breaks the loader HTTP tests; held until #257 is resolved.
-      - dependency-name: "tokio"
-        versions: ["1.54.x"]
 
   - package-ecosystem: cargo
     directory: "/fuzz"

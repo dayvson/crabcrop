@@ -784,7 +784,7 @@ fn map_request_error(e: reqwest::Error) -> LoadError {
 mod tests {
     use super::*;
     use std::future::Future;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::sleep;
 
@@ -804,6 +804,14 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             match respond {
                 Respond::Bytes(bytes) => {
+                    // Consume the request before answering.
+                    // Answering on accept races the client:
+                    // unread request bytes left in the receive
+                    // buffer can reset the connection on close
+                    // and make the client discard the response
+                    // (issue #257).
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
                     let _ = socket.write_all(&bytes).await;
                 }
                 Respond::Hang => {
@@ -861,9 +869,9 @@ mod tests {
         // Audit L-3: a client pinned for an unresolvable name
         // connects to the validated address anyway (and would
         // authenticate TLS for the original name). This test's
-        // server reads the request before answering (the
-        // shared fixture answers on accept, which races a
-        // client whose request lands after the response).
+        // server reads the request before answering, like the
+        // shared fixture (answering on accept races a client
+        // whose request lands after the response; issue #257).
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
