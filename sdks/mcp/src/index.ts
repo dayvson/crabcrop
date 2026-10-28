@@ -20,7 +20,7 @@
  */
 import { buildURL, explainUrl, purgeSignature, sign } from "@crabcrop/url";
 
-const SERVER = { name: "crabcrop", version: "0.8.1" };
+const SERVER = { name: "crabcrop", version: "0.8.2" };
 const PROTOCOL = "2024-11-05";
 
 const envBase = process.env.CRABCROP_BASE ?? "";

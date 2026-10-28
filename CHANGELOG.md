@@ -2,6 +2,17 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.8.2] - 2026-10-28
+
+### Changed
+
+- `/metrics` is no longer public (issue #270, the PL-5 residual from the first audit, closed out in security round 2). A new `CRABCROP_METRICS_TOKEN` configures a bearer token the endpoint requires (`Authorization: Bearer <token>`, compared in constant time); with no token configured the endpoint answers `403` rather than serving the exposition unauthenticated. The exposition itself is unchanged (aggregates only), and `/health` stays open: it discloses only liveness and load balancers need it unauthenticated. Scrapers must send the token after upgrading.
+
+### Fixed
+
+- The MCP server's `fetch_meta` refuses the system endpoints (issue #271). Its origin check let any path on the configured origin through, including `/metrics`; it now denies `/metrics` and `/health` by exact path, since the tool's contract is the meta JSON of an image URL and the server-side token gate should not have a side route around it.
+- The external tool contract is documented (issue #272). The configuration docs for `CRABCROP_VIDEO_ENCODER`, `CRABCROP_VIDEO_DECODER`, and `CRABCROP_PDF_RENDERER` now state that a tool must not daemonize or detach (no `setsid`, no double-fork): timeouts kill the tool's process group, and a detached descendant escapes the kill as the operator's responsibility.
+
 ## [0.8.1] - 2026-10-28
 
 ### Fixed
