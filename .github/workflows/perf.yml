@@ -32,6 +32,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install nasm (rav1e SIMD build)
+        run: sudo apt-get update && sudo apt-get install -y nasm
       - name: Build (release)
         run: cargo build --release --locked
       - name: Run the performance gate

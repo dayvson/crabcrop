@@ -91,6 +91,9 @@ jobs:
       - name: Install Poppler (the pages cells' renderer, issue #215)
         run: sudo apt-get install -y -qq poppler-utils
 
+      - name: Install nasm (rav1e SIMD build)
+        run: sudo apt-get install -y -qq nasm
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: steps.tier.outputs.tier == 'full'
         with:

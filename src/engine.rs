@@ -94,6 +94,25 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
             )));
         }
     }
+    // Fast paths for the two hottest source formats, taken only
+    // where they are output-identical to the generic decode
+    // below (perf wave 3, codecs lane; the probe above has
+    // already enforced the dimension and allocation budgets).
+    // Any fast-path failure falls through to the generic decode,
+    // so error behavior for corrupt or exotic files is unchanged.
+    match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Jpeg) => {
+            if let Some(img) = decode_jpeg_direct(bytes) {
+                return Ok(img);
+            }
+        }
+        Ok(image::ImageFormat::WebP) => {
+            if let Some(img) = decode_webp_direct(bytes) {
+                return Ok(img);
+            }
+        }
+        _ => {}
+    }
     let mut reader = image::ImageReader::new(Cursor::new(bytes));
     reader.limits(decode_limits());
     let reader = reader
@@ -102,6 +121,48 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     reader
         .decode()
         .map_err(|e| EngineError::Decode(e.to_string()))
+}
+
+/// JPEG decode through zune-jpeg directly: the same decoder
+/// the image crate wraps, with the same options the wrapper
+/// uses, minus the wrapper's input copy, header pre-pass, and
+/// decode-into-buffer plumbing (measured about 28 percent
+/// faster at 2400x1600, byte-identical output). Restricted to
+/// the YCbCr and RGB inputs the generic path also surfaces as
+/// Rgb8; grayscale, CMYK, and anything else returns None and
+/// keeps the generic path, as does any zune error (for
+/// example arithmetic-coded files zune cannot read).
+fn decode_jpeg_direct(bytes: &[u8]) -> Option<DynamicImage> {
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
+        .set_strict_mode(false)
+        .set_max_width(MAX_DECODE_DIMENSION as usize)
+        .set_max_height(MAX_DECODE_DIMENSION as usize);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), options);
+    decoder.decode_headers().ok()?;
+    match decoder.input_colorspace()? {
+        ColorSpace::YCbCr | ColorSpace::RGB => {}
+        _ => return None,
+    }
+    let (width, height) = decoder.dimensions()?;
+    let pixels = decoder.decode().ok()?;
+    let buf =
+        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(width as u32, height as u32, pixels)?;
+    Some(DynamicImage::ImageRgb8(buf))
+}
+
+/// WebP still decode through libwebp (the `webp` crate):
+/// measured about 3.5x faster than image-webp at 2400x1600
+/// with bit-identical pixels, for lossy and lossless files
+/// alike. The crate refuses animated files (returns None),
+/// which keeps animated sources on the generic path, and its
+/// DynamicImage variant matches the generic path (Rgba8 only
+/// when the file has alpha).
+fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
+    let decoded = webp::Decoder::new(bytes).decode()?;
+    Some(decoded.to_image())
 }
 
 /// The media kind an upload validated as (issue #192):
