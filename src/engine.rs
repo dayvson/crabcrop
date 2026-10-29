@@ -1504,7 +1504,7 @@ impl Engine {
         let out = match format {
             ImageFormat::Gif => {
                 let mut out = Vec::new();
-                image::codecs::gif::GifEncoder::new(&mut out)
+                image::codecs::gif::GifEncoder::new_with_speed(&mut out, 10)
                     .encode_frames(out_frames)
                     .map_err(|e| EngineError::Encode(e.to_string()))?;
                 out
@@ -2988,7 +2988,7 @@ fn encode(
             .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Gif => {
-            image::codecs::gif::GifEncoder::new(&mut buf)
+            image::codecs::gif::GifEncoder::new_with_speed(&mut buf, 10)
                 .encode(src.rgba().as_raw(), w, h, ExtendedColorType::Rgba8)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
