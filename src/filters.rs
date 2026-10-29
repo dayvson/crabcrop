@@ -92,7 +92,7 @@ pub fn apply_filters_filled(
     for filter in filters {
         match filter {
             Filter::Grayscale => {
-                img = map_rgb(&img, |r, g, b| {
+                img = map_rgb(img, |r, g, b| {
                     let y = luma(r, g, b).round().clamp(0.0, 255.0) as u8;
                     [y, y, y]
                 });
@@ -101,7 +101,7 @@ pub fn apply_filters_filled(
             Filter::Blur(sigma) => img = img.blur(blur_sigma(*sigma)),
             Filter::Brighten(amount) => img = img.brighten(*amount),
             Filter::Contrast(amount) => {
-                img = map_rgb_image(&img, |rgb| image::imageops::contrast(rgb, *amount));
+                img = map_rgb_image(img, |rgb| contrast_in_place(rgb, *amount));
             }
             Filter::HueRotate(degrees) => img = img.huerotate(*degrees),
             Filter::Sharpen(amount) => {
@@ -109,13 +109,13 @@ pub fn apply_filters_filled(
                 // boosted, the cross neighbors subtracted.
                 let a = *amount;
                 let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
-                img = map_rgb_image(&img, |rgb| image::imageops::filter3x3(rgb, &kernel));
+                img = map_rgb_image(img, |rgb| filter3x3_rgb(&rgb, &kernel));
             }
             Filter::Saturation(amount) => {
-                img = map_rgb_image(&img, |rgb| saturate(rgb, *amount));
+                img = map_rgb_image(img, |rgb| saturate(rgb, *amount));
             }
             Filter::Rgb(r, g, b) => {
-                img = map_rgb(&img, |pr, pg, pb| {
+                img = map_rgb(img, |pr, pg, pb| {
                     [
                         (pr as i32 + r).clamp(0, 255) as u8,
                         (pg as i32 + g).clamp(0, 255) as u8,
@@ -133,7 +133,7 @@ pub fn apply_filters_filled(
                 img = add_noise(&img, *amount);
             }
             Filter::Equalize => {
-                img = map_rgb_image(&img, equalize);
+                img = map_rgb_image(img, equalize);
             }
             Filter::Rotate(degrees) => {
                 let normalized = ((degrees % 360.0) + 360.0) % 360.0;
@@ -192,9 +192,9 @@ pub fn apply_filters_filled(
             // resolves it against the request as a whole (with
             // the client-hint fallback). (Same routing.)
             Filter::Dpr(_) => {}
-            Filter::Sepia => img = sepia(&img),
-            Filter::Duotone(shadow, highlight) => img = duotone(&img, *shadow, *highlight),
-            Filter::Monochrome(color) => img = monochrome(&img, *color),
+            Filter::Sepia => img = sepia(img),
+            Filter::Duotone(shadow, highlight) => img = duotone(img, *shadow, *highlight),
+            Filter::Monochrome(color) => img = monochrome(img, *color),
             Filter::Pixelate(block) => img = pixelate(&img, *block),
             Filter::Flip(direction) => {
                 img = match direction {
@@ -324,35 +324,68 @@ fn luma(r: u8, g: u8, b: u8) -> f32 {
 /// returns the new channels. Alpha survives untouched when
 /// the image carries it; other channel layouts normalize to
 /// RGB first, like the sibling color filters.
-fn map_rgb(img: &DynamicImage, f: impl Fn(u8, u8, u8) -> [u8; 3]) -> DynamicImage {
+fn map_rgb(img: DynamicImage, f: impl Fn(u8, u8, u8) -> [u8; 3] + Sync) -> DynamicImage {
     if img.color().has_alpha() {
-        let mut rgba = img.to_rgba8();
-        for p in rgba.pixels_mut() {
-            let [r, g, b] = f(p[0], p[1], p[2]);
-            p[0] = r;
-            p[1] = g;
-            p[2] = b;
-        }
+        let mut rgba = img.into_rgba8();
+        let w = rgba.width() as usize;
+        map_rgb_bands::<4>(rgba.as_mut(), w, &f);
         DynamicImage::ImageRgba8(rgba)
     } else {
-        let mut rgb = img.to_rgb8();
-        for p in rgb.pixels_mut() {
-            let [r, g, b] = f(p[0], p[1], p[2]);
-            p[0] = r;
-            p[1] = g;
-            p[2] = b;
-        }
+        let mut rgb = img.into_rgb8();
+        let w = rgb.width() as usize;
+        map_rgb_bands::<3>(rgb.as_mut(), w, &f);
         DynamicImage::ImageRgb8(rgb)
     }
 }
 
+/// Apply a per-pixel RGB mapping over a raw channel buffer,
+/// in row bands across scoped threads when the frame is
+/// large enough for the split to pay for itself. Each output
+/// pixel depends only on the same input pixel, so banding
+/// cannot change the result; small frames run sequentially
+/// on the calling thread.
+fn map_rgb_bands<const CH: usize>(
+    buf: &mut [u8],
+    width: usize,
+    f: &(impl Fn(u8, u8, u8) -> [u8; 3] + Sync),
+) {
+    let row = width * CH;
+    let rows = buf.len() / row.max(1);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4);
+    if threads < 2 || rows < 256 || buf.len() < 3_000_000 {
+        for p in buf.as_chunks_mut::<CH>().0 {
+            let [r, g, b] = f(p[0], p[1], p[2]);
+            p[0] = r;
+            p[1] = g;
+            p[2] = b;
+        }
+        return;
+    }
+    let band_rows = rows.div_ceil(threads);
+    std::thread::scope(|s| {
+        for band in buf.chunks_mut(band_rows * row) {
+            s.spawn(move || {
+                for p in band.as_chunks_mut::<CH>().0 {
+                    let [r, g, b] = f(p[0], p[1], p[2]);
+                    p[0] = r;
+                    p[1] = g;
+                    p[2] = b;
+                }
+            });
+        }
+    });
+}
+
 fn map_rgb_image(
-    img: &DynamicImage,
-    f: impl FnOnce(&image::RgbImage) -> image::RgbImage,
+    img: DynamicImage,
+    f: impl FnOnce(image::RgbImage) -> image::RgbImage,
 ) -> DynamicImage {
-    let mapped = f(&img.to_rgb8());
     if img.color().has_alpha() {
-        let mut out = img.to_rgba8();
+        let mapped = f(img.to_rgb8());
+        let mut out = img.into_rgba8();
         for (o, m) in out.pixels_mut().zip(mapped.pixels()) {
             o[0] = m[0];
             o[1] = m[1];
@@ -360,8 +393,81 @@ fn map_rgb_image(
         }
         DynamicImage::ImageRgba8(out)
     } else {
-        DynamicImage::ImageRgb8(mapped)
+        DynamicImage::ImageRgb8(f(img.into_rgb8()))
     }
+}
+
+/// 3x3 convolution of an RGB image with the exact arithmetic
+/// of the image crate's `filter3x3` (same tap order, same
+/// inverse-sum scaling, same clamp and truncation, and the
+/// same zeroed border: the crate only writes interior pixels
+/// into a fresh buffer), but over raw row slices instead of
+/// per-pixel trait calls. Zero-weight taps are skipped: every
+/// input channel is a non-negative f32, so a zero tap only
+/// ever added +0.0, which cannot change the running sum.
+fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let mut out = image::RgbImage::new(w as u32, h as u32);
+    if w < 2 || h < 2 {
+        return out;
+    }
+    let src = img.as_raw();
+    let dst: &mut [u8] = out.as_mut();
+    let stride = w * 3;
+    let sum: f32 = kernel.iter().sum();
+    let inverse_sum = if sum == 0.0 { 1.0 } else { 1.0 / sum };
+    // (row delta, byte offset of the tap column within its
+    // row relative to the pixel's own first byte, weight)
+    let taps: Vec<(usize, usize, f32)> = kernel
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k != 0.0)
+        .map(|(ki, k)| (ki / 3, (ki % 3) * 3, *k))
+        .collect();
+    for y in 1..h - 1 {
+        let rows = [
+            &src[(y - 1) * stride..y * stride],
+            &src[y * stride..(y + 1) * stride],
+            &src[(y + 1) * stride..(y + 2) * stride],
+        ];
+        for x in 1..w - 1 {
+            let xb = x * 3;
+            let mut t = [0f32; 3];
+            for &(rd, coff, k) in &taps {
+                let b = xb + coff - 3;
+                let row = rows[rd];
+                t[0] += row[b] as f32 * k;
+                t[1] += row[b + 1] as f32 * k;
+                t[2] += row[b + 2] as f32 * k;
+            }
+            let base = y * stride + xb;
+            for c in 0..3 {
+                dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Contrast through a 256-entry lookup table: the image
+/// crate's per-channel formula (scale about the midpoint by
+/// `((100 + amount) / 100)^2`, clamp, truncate) depends only
+/// on the input byte, so evaluating it once per byte value
+/// with the identical f32 arithmetic and then mapping bytes
+/// is byte-identical to evaluating it per pixel.
+fn contrast_in_place(mut img: image::RgbImage, amount: f32) -> image::RgbImage {
+    let percent = ((100.0 + amount) / 100.0).powi(2);
+    let mut lut = [0u8; 256];
+    for (i, e) in lut.iter_mut().enumerate() {
+        let c = i as f32;
+        let d = ((c / 255.0 - 0.5) * percent + 0.5) * 255.0;
+        *e = d.clamp(0.0, 255.0) as u8;
+    }
+    let w = img.width() as usize;
+    map_rgb_bands::<3>(img.as_mut(), w, &|r, g, b| {
+        [lut[r as usize], lut[g as usize], lut[b as usize]]
+    });
+    img
 }
 
 /// The 256-entry lookup table for one tone curve: inputs at
@@ -412,7 +518,7 @@ pub fn tone_curve(img: &DynamicImage, channel: CurveChannel, points: &[(u8, u8)]
         CurveChannel::G => (&identity, &curved, &identity),
         CurveChannel::B => (&identity, &identity, &curved),
     };
-    map_rgb(img, |r, g, b| {
+    map_rgb(img.clone(), |r, g, b| {
         [
             r_lut[usize::from(r)],
             g_lut[usize::from(g)],
@@ -452,37 +558,96 @@ pub fn convolve(img: &DynamicImage, kernel: &[f64], normalize: bool) -> DynamicI
         1.0
     };
     let has_alpha = img.color().has_alpha();
-    let rgba = img.to_rgba8();
-    let (width, height) = (rgba.width() as i32, rgba.height() as i32);
-    let mut out = rgba.clone();
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = [0.0f64; 3];
-            for ky in 0..size as i32 {
-                let sy = (y + ky - radius).clamp(0, height - 1) as u32;
-                for kx in 0..size as i32 {
-                    let k = kernel[(ky as usize) * size + kx as usize] * scale;
-                    if k == 0.0 {
-                        continue;
-                    }
-                    let sx = (x + kx - radius).clamp(0, width - 1) as u32;
-                    let p = rgba.get_pixel(sx, sy);
-                    for (c, a) in acc.iter_mut().enumerate() {
-                        *a += k * f64::from(p[c]);
-                    }
-                }
-            }
-            let o = out.get_pixel_mut(x as u32, y as u32);
-            for (c, a) in acc.iter().enumerate() {
-                o[c] = round_clamp(*a);
-            }
-        }
+    // Fast path for opaque RGB sources: the RGBA detour this
+    // function used to take only ever read and wrote the three
+    // color channels (the synthesized alpha was dropped again
+    // on the way back), so working on the RGB buffer directly
+    // is byte-identical while skipping both conversions.
+    if let DynamicImage::ImageRgb8(rgb) = img {
+        let out = convolve_raw::<3>(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            kernel,
+            size,
+            radius,
+            scale,
+        );
+        return DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(rgb.width(), rgb.height(), out).unwrap(),
+        );
     }
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let out = convolve_raw::<4>(rgba.as_raw(), w, h, kernel, size, radius, scale);
+    let out = image::RgbaImage::from_raw(w, h, out).unwrap();
     if has_alpha {
         DynamicImage::ImageRgba8(out)
     } else {
         DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(out).to_rgb8())
     }
+}
+
+/// Raw-slice convolution core for [`convolve`]: the same
+/// clamped sampling and the same f64 accumulation order (row
+/// of taps, then column, zero weights skipped) as the
+/// per-pixel original, without per-tap trait calls. `CH` is
+/// the source's channel count; only the first three channels
+/// are convolved or written, the rest pass through from the
+/// copied source buffer.
+fn convolve_raw<const CH: usize>(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    kernel: &[f64],
+    size: usize,
+    radius: i32,
+    scale: f64,
+) -> Vec<u8> {
+    let (w, h) = (width as i32, height as i32);
+    let stride = width as usize * CH;
+    let mut out = src.to_vec();
+    // One output pixel: taps in kernel order (row, then
+    // column), zero weights skipped, f64 throughout.
+    let acc_at = |x: i32, y: i32, clamped: bool| -> [f64; 3] {
+        let mut acc = [0.0f64; 3];
+        for ky in 0..size as i32 {
+            let sy = if clamped {
+                (y + ky - radius).clamp(0, h - 1)
+            } else {
+                y + ky - radius
+            } as usize;
+            for kx in 0..size as i32 {
+                let k = kernel[(ky as usize) * size + kx as usize] * scale;
+                if k == 0.0 {
+                    continue;
+                }
+                let sx = if clamped {
+                    (x + kx - radius).clamp(0, w - 1)
+                } else {
+                    x + kx - radius
+                } as usize;
+                let base = sy * stride + sx * CH;
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a += k * f64::from(src[base + c]);
+                }
+            }
+        }
+        acc
+    };
+    let r = radius;
+    let interior = w > 2 * r && h > 2 * r;
+    for y in 0..h {
+        for x in 0..w {
+            let clamped = !(interior && x >= r && x < w - r && y >= r && y < h - r);
+            let acc = acc_at(x, y, clamped);
+            let base = y as usize * stride + x as usize * CH;
+            for (c, a) in acc.iter().enumerate() {
+                out[base + c] = round_clamp(*a);
+            }
+        }
+    }
+    out
 }
 
 /// SplitMix64: a small deterministic 64-bit generator,
@@ -551,7 +716,7 @@ pub fn add_noise(img: &DynamicImage, amount: u8) -> DynamicImage {
 }
 
 /// The classic warm sepia tone (the standard sepia matrix).
-pub fn sepia(img: &DynamicImage) -> DynamicImage {
+pub fn sepia(img: DynamicImage) -> DynamicImage {
     map_rgb(img, |r, g, b| {
         let (r, g, b) = (r as f32, g as f32, b as f32);
         [
@@ -572,7 +737,7 @@ pub fn sepia(img: &DynamicImage) -> DynamicImage {
 /// luminance: black renders exactly `shadow`, white exactly
 /// `highlight`, and everything between is the straight
 /// interpolation at the pixel's luminance.
-pub fn duotone(img: &DynamicImage, shadow: [u8; 3], highlight: [u8; 3]) -> DynamicImage {
+pub fn duotone(img: DynamicImage, shadow: [u8; 3], highlight: [u8; 3]) -> DynamicImage {
     map_rgb(img, |r, g, b| {
         let t = luma(r, g, b) / 255.0;
         let mut out = [0u8; 3];
@@ -588,7 +753,7 @@ pub fn duotone(img: &DynamicImage, shadow: [u8; 3], highlight: [u8; 3]) -> Dynam
 /// Single-hue rendering in `color`: each pixel's luminance
 /// scaled by the color, so full luminance renders exactly
 /// `color` and black stays black.
-pub fn monochrome(img: &DynamicImage, color: [u8; 3]) -> DynamicImage {
+pub fn monochrome(img: DynamicImage, color: [u8; 3]) -> DynamicImage {
     map_rgb(img, |r, g, b| {
         let l = luma(r, g, b);
         let mut out = [0u8; 3];
@@ -1169,26 +1334,33 @@ fn trim(img: DynamicImage, tolerance: u8) -> DynamicImage {
 
 /// Scale each pixel's distance from its luma by `amount`:
 /// 0 collapses to gray, 1 is the identity.
-fn saturate(img: &image::RgbImage, amount: f32) -> image::RgbImage {
-    let mut out = img.clone();
-    for p in out.pixels_mut() {
-        let luma = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
-        for c in 0..3 {
-            p[c] = (luma + (p[c] as f32 - luma) * amount).clamp(0.0, 255.0) as u8;
-        }
-    }
+fn saturate(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
+    let w = out.width() as usize;
+    map_rgb_bands::<3>(out.as_mut(), w, &|r, g, b| {
+        let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        [
+            (luma + (r as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
+            (luma + (g as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
+            (luma + (b as f32 - luma) * amount).clamp(0.0, 255.0) as u8,
+        ]
+    });
     out
 }
 
 /// Histogram equalization, independently per channel.
-fn equalize(img: &image::RgbImage) -> image::RgbImage {
+fn equalize(img: image::RgbImage) -> image::RgbImage {
     let total = (img.width() * img.height()) as u64;
     let mut maps: [[u8; 256]; 3] = [[0; 256]; 3];
+    // One pass for all three channel histograms (the counts
+    // are the same three passes would produce).
+    let mut hists = [[0u64; 256]; 3];
+    for p in img.pixels() {
+        hists[0][p[0] as usize] += 1;
+        hists[1][p[1] as usize] += 1;
+        hists[2][p[2] as usize] += 1;
+    }
     for c in 0..3 {
-        let mut hist = [0u64; 256];
-        for p in img.pixels() {
-            hist[p[c] as usize] += 1;
-        }
+        let hist = hists[c];
         let mut cdf = [0u64; 256];
         let mut acc = 0u64;
         for i in 0..256 {
@@ -1207,7 +1379,7 @@ fn equalize(img: &image::RgbImage) -> image::RgbImage {
             };
         }
     }
-    let mut out = img.clone();
+    let mut out = img;
     for p in out.pixels_mut() {
         for c in 0..3 {
             p[c] = maps[c][p[c] as usize];
@@ -1370,7 +1542,7 @@ mod tests {
         for p in img.as_mut_rgba8().unwrap().pixels_mut() {
             *p = image::Rgba([100, 150, 200, 77]);
         }
-        let out = sepia(&img);
+        let out = sepia(img);
         assert_eq!(out.to_rgba8().get_pixel(0, 0)[3], 77);
     }
 
@@ -1810,7 +1982,7 @@ mod tests {
         let bw = |px: [u8; 3]| {
             let mut img = DynamicImage::new_rgb8(1, 1);
             img.as_mut_rgb8().unwrap().get_pixel_mut(0, 0).0 = px;
-            duotone(&img, [255, 0, 0], [0, 0, 255])
+            duotone(img.clone(), [255, 0, 0], [0, 0, 255])
                 .to_rgb8()
                 .get_pixel(0, 0)
                 .0
@@ -1826,7 +1998,10 @@ mod tests {
         let one = |px: [u8; 3]| {
             let mut img = DynamicImage::new_rgb8(1, 1);
             img.as_mut_rgb8().unwrap().get_pixel_mut(0, 0).0 = px;
-            monochrome(&img, [255, 128, 0]).to_rgb8().get_pixel(0, 0).0
+            monochrome(img.clone(), [255, 128, 0])
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0
         };
         assert_eq!(one([255, 255, 255]), [255, 128, 0]);
         assert_eq!(one([0, 0, 0]), [0, 0, 0]);
@@ -2428,5 +2603,120 @@ mod tests {
         // so the pixel is neither source extreme.
         let blurred = out.get_pixel(7, 4);
         assert!(blurred[0] > 40 && blurred[0] < 215, "{blurred:?}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod identity_proofs {
+    use super::*;
+
+    fn rand_rgb(w: u32, h: u32, seed: u64) -> image::RgbImage {
+        let mut s = seed;
+        let mut buf = vec![0u8; (w * h * 3) as usize];
+        for b in buf.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        image::RgbImage::from_raw(w, h, buf).unwrap()
+    }
+
+    pub(crate) fn old_convolve(
+        img: &DynamicImage,
+        kernel: &[f64],
+        normalize: bool,
+    ) -> DynamicImage {
+        let size = if kernel.len() == 9 { 3 } else { 5 };
+        let radius = (size / 2) as i32;
+        let sum: f64 = kernel.iter().sum();
+        let scale = if normalize && sum != 0.0 {
+            1.0 / sum
+        } else {
+            1.0
+        };
+        let has_alpha = img.color().has_alpha();
+        let rgba = img.to_rgba8();
+        let (width, height) = (rgba.width() as i32, rgba.height() as i32);
+        let mut out = rgba.clone();
+        for y in 0..height {
+            for x in 0..width {
+                let mut acc = [0.0f64; 3];
+                for ky in 0..size as i32 {
+                    let sy = (y + ky - radius).clamp(0, height - 1) as u32;
+                    for kx in 0..size as i32 {
+                        let k = kernel[(ky as usize) * size + kx as usize] * scale;
+                        if k == 0.0 {
+                            continue;
+                        }
+                        let sx = (x + kx - radius).clamp(0, width - 1) as u32;
+                        let p = rgba.get_pixel(sx, sy);
+                        for (c, a) in acc.iter_mut().enumerate() {
+                            *a += k * f64::from(p[c]);
+                        }
+                    }
+                }
+                let o = out.get_pixel_mut(x as u32, y as u32);
+                for (c, a) in acc.iter().enumerate() {
+                    o[c] = round_clamp(*a);
+                }
+            }
+        }
+        if has_alpha {
+            DynamicImage::ImageRgba8(out)
+        } else {
+            DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(out).to_rgb8())
+        }
+    }
+
+    #[test]
+    fn filter3x3_rgb_matches_image_crate() {
+        let a = 1.5f32;
+        let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
+        let blur_kernel: [f32; 9] = [1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0];
+        for (w, h) in [(1, 1), (2, 2), (3, 3), (4, 7), (17, 13), (64, 48)] {
+            let img = rand_rgb(w, h, 42 + w as u64);
+            for k in [kernel, blur_kernel] {
+                let mine = filter3x3_rgb(&img, &k);
+                let theirs = image::imageops::filter3x3(&img, &k);
+                assert_eq!(mine.as_raw(), theirs.as_raw(), "size {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn convolve_matches_old_implementation() {
+        let k3: Vec<f64> = vec![1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0];
+        let k5: Vec<f64> = (0..25).map(|i| (i % 7) as f64 - 2.0).collect();
+        for (w, h) in [(1, 1), (3, 2), (9, 5), (31, 17)] {
+            let rgb = DynamicImage::ImageRgb8(rand_rgb(w, h, 7 + w as u64));
+            let mut rgba_buf = rgb.to_rgba8();
+            for (i, p) in rgba_buf.pixels_mut().enumerate() {
+                p[3] = ((i * 37) % 256) as u8;
+            }
+            let rgba = DynamicImage::ImageRgba8(rgba_buf);
+            for img in [&rgb, &rgba] {
+                for (k, norm) in [(&k3, true), (&k3, false), (&k5, true)] {
+                    let mine = convolve(img, k, norm);
+                    let theirs = old_convolve(img, k, norm);
+                    assert_eq!(
+                        mine.to_rgba8().as_raw(),
+                        theirs.to_rgba8().as_raw(),
+                        "size {w}x{h} alpha={} norm={norm}",
+                        img.color().has_alpha()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_lut_matches_image_crate() {
+        for amount in [-100.0f32, -25.0, 0.0, 10.0, 25.0, 100.0] {
+            let rgb = rand_rgb(64, 48, 7);
+            let mine = contrast_in_place(rgb.clone(), amount);
+            let theirs = image::imageops::contrast(&rgb, amount);
+            assert_eq!(mine.as_raw(), theirs.as_raw(), "amount {amount}");
+        }
     }
 }

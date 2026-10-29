@@ -2,6 +2,14 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Changed
+
+- Cache hits no longer get slower as the cache fills (issue #274). Both cache tiers tracked recency in a list that every hit scanned end to end, so a hot key in a full cache cost several times a small-cache hit. Recency is now a per-key monotonic stamp: hits are O(1), eviction picks the same victims in the same order, and cache keys, the disk format, and ETags are unchanged.
+- GIF output encodes about four times faster (issue #275). Palette quantization now runs at sampling speed 10 (the gif crate's own default) instead of the slowest setting; output dimensions and quality hold (44.25 dB PSNR against the source vs 46.96 dB before, on a format that is 256-color lossy at any setting) and file sizes do not grow. Animated GIF output improves by the same factor per frame.
+- The filter pipeline does less copying and less repeated math, with byte-identical output throughout (issues #276, #277, #278, #279, #280). Pointwise filters take the frame by value instead of cloning it per call (saturation paid that clone twice); contrast evaluates its per-channel formula 256 times into a lookup table instead of once per pixel (about 80 ms to about 7 ms at 2400x1600); sharpen uses its own 3x3 convolution that skips the kernel's four zero taps (about 154 ms to about 69 ms); the caller-supplied convolution filter walks raw row slices instead of per-tap trait calls and no longer converts opaque sources to RGBA and back; and pointwise filters on large frames (at least 3 MB and 256 rows) apply in row bands across up to four scoped threads. A chained saturation, sharpen, and contrast request at 2400x1600 drops from about 316 ms to about 151 ms end to end.
+
 ## [0.9.0] - 2026-10-28
 
 ### Added
