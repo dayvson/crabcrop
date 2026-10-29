@@ -2,6 +2,13 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Changed
+
+- The AVIF encoder default speed rises from 8 to 9 (issue #281). At 800w and quality 80 the default encode runs about 1.8x faster for about 15 percent larger output; `CRABCROP_AVIF_SPEED` still overrides the default, and 8 remains available for the smallest files of the fast tiers.
+- The JPEG XL encoder default speed tier rises from `fast` to `fastest` (issue #282). At 800w and quality 80 the default encode runs about 2x faster for about 18 percent larger output; `CRABCROP_JXL_SPEED` still overrides the default.
+
 ## [0.9.1] - 2026-10-28
 
 ### Changed

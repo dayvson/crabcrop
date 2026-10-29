@@ -29,7 +29,7 @@
 //!   `quality(auto)` verifies against for JPEG and JXL output,
 //!   default 75.
 //! - `CRABCROP_AVIF_SPEED`: ravif speed tier for AVIF encodes,
-//!   1 (slowest, smallest) to 10 (fastest), default 8.
+//!   1 (slowest, smallest) to 10 (fastest), default 9.
 //! - `CRABCROP_METADATA`: `strip` (default) drops embedded
 //!   EXIF/XMP/IPTC on output; `preserve` copies them into
 //!   JPEG and PNG outputs.
@@ -37,7 +37,7 @@
 //!   width client hints, 1 to 2000, default 100.
 //! - `CRABCROP_JXL_SPEED`: jixel speed tier for JPEG XL encodes,
 //!   one of ultrafast, fastest, fast, medium, slow, extraslow,
-//!   default fast.
+//!   default fastest.
 //! - `CRABCROP_ALLOWED_SOURCES`: comma-separated host suffixes the
 //!   loader may fetch from; unset allows every host.
 //! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: `1` or `true` to refuse

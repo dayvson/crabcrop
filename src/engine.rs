@@ -773,12 +773,14 @@ impl ProcessContext<'_> {
     }
 }
 
-/// Default AVIF speed tier: the value the encoder ran at
-/// before it became configurable.
-pub const DEFAULT_AVIF_SPEED: u8 = 8;
+/// Default AVIF speed tier (issue #281): speed 9 encodes
+/// about 1.8x faster than 8 for about 15 percent more bytes.
+pub const DEFAULT_AVIF_SPEED: u8 = 9;
 
-/// Default JPEG XL speed tier: jixel's own default.
-pub const DEFAULT_JXL_SPEED: jixel::Speed = jixel::Speed::Fast;
+/// Default JPEG XL speed tier (issue #282): Fastest encodes
+/// about 2x faster than jixel's Fast for about 18 percent
+/// more bytes.
+pub const DEFAULT_JXL_SPEED: jixel::Speed = jixel::Speed::Fastest;
 
 impl Default for ProcessContext<'_> {
     fn default() -> Self {
