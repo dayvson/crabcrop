@@ -127,7 +127,7 @@ fn build_session(dylib: Option<&str>, model_path: &str) -> Result<(Session, Stri
     let env = environment(dylib)?;
     let session = Session::builder(env)
         .map_err(|e| AiError::Load(format!("cannot create a session: {e}")))?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .with_optimization_level(GraphOptimizationLevel::All)
         .map_err(|e| AiError::Load(format!("cannot configure the session: {e}")))?
         .commit_from_file(model_path)
         .map_err(|e| AiError::Load(format!("cannot load the model {model_path}: {e}")))?;
