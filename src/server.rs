@@ -2407,7 +2407,7 @@ async fn serve_miss(
     // result its key would claim.
     if !meta && !used_fallback && !debug {
         let entry = CachedImage {
-            bytes: processed.bytes.clone(),
+            bytes: bytes::Bytes::from(processed.bytes.clone()),
             format: processed.format,
             quality: processed.quality,
             groups: groups.clone(),
@@ -2482,7 +2482,7 @@ async fn serve_miss(
         respond(
             processed.format,
             processed.quality,
-            processed.bytes,
+            bytes::Bytes::from(processed.bytes),
             max_age,
         )
     };
@@ -3652,7 +3652,7 @@ fn meta_response(
 fn respond(
     format: ImageFormat,
     quality: Option<u8>,
-    bytes: Vec<u8>,
+    bytes: bytes::Bytes,
     max_age: Option<u32>,
 ) -> Response {
     let content_type = match format {
@@ -8469,13 +8469,23 @@ mod tests {
         let etag = etag_for("key");
         // No conditional header: the ETag is attached and the
         // response is otherwise untouched.
-        let mut resp = respond(ImageFormat::Png, None, vec![1, 2, 3], None);
+        let mut resp = respond(
+            ImageFormat::Png,
+            None,
+            bytes::Bytes::from(vec![1, 2, 3]),
+            None,
+        );
         finalize_validators(&mut resp, &etag, None);
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get(header::ETAG).unwrap(), etag.as_str());
         // A matching If-None-Match: 304, empty body, and the
         // content headers are gone.
-        let mut resp = respond(ImageFormat::Png, None, vec![1, 2, 3], None);
+        let mut resp = respond(
+            ImageFormat::Png,
+            None,
+            bytes::Bytes::from(vec![1, 2, 3]),
+            None,
+        );
         finalize_validators(&mut resp, &etag, Some(etag.as_str()));
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
         assert!(resp.headers().get(header::CONTENT_TYPE).is_none());
@@ -8485,7 +8495,12 @@ mod tests {
             .unwrap();
         assert!(body.is_empty());
         // A non-matching value: the full 200 goes out, ETag on.
-        let mut resp = respond(ImageFormat::Png, None, vec![1, 2, 3], None);
+        let mut resp = respond(
+            ImageFormat::Png,
+            None,
+            bytes::Bytes::from(vec![1, 2, 3]),
+            None,
+        );
         finalize_validators(&mut resp, &etag, Some("\"other\""));
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -8499,14 +8514,14 @@ mod tests {
         let etag = etag_for("key");
         // Meta responses are private, no-store: no ETag is
         // attached and a matching conditional never 304s them.
-        let mut resp = respond(ImageFormat::Png, None, vec![1], None);
+        let mut resp = respond(ImageFormat::Png, None, bytes::Bytes::from(vec![1]), None);
         resp.headers_mut()
             .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
         finalize_validators(&mut resp, &etag, Some(etag.as_str()));
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get(header::ETAG).is_none());
         // An error status is left alone too, public or not.
-        let mut resp = respond(ImageFormat::Png, None, vec![1], None);
+        let mut resp = respond(ImageFormat::Png, None, bytes::Bytes::from(vec![1]), None);
         *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         finalize_validators(&mut resp, &etag, Some(etag.as_str()));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);

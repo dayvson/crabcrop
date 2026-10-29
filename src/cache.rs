@@ -15,7 +15,7 @@ use crate::url::ImageFormat;
 /// including the auto-quality header value when there is one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedImage {
-    pub bytes: Vec<u8>,
+    pub bytes: bytes::Bytes,
     pub format: ImageFormat,
     pub quality: Option<u8>,
     /// Cache groups (RFC 9875) the response belongs to: the
@@ -92,22 +92,18 @@ impl Cache {
     /// `#`-suffixed prefix (the cache's variant keys). Returns
     /// how many entries were removed.
     pub fn purge_matching(&self, base: &str) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
         // Built once, not per key examined.
         let prefix = format!("{base}#");
-        let keys: Vec<String> = inner
-            .entries
-            .keys()
-            .filter(|k| k.as_str() == base || k.starts_with(&prefix))
-            .cloned()
-            .collect();
         let mut removed = 0;
-        for key in keys {
-            if let Some(old) = inner.entries.remove(&key) {
-                inner.total_bytes -= old.bytes.len();
-                inner.stamps.remove(&key);
-                removed += 1;
-            }
+        for (key, old) in inner
+            .entries
+            .extract_if(|k, _| k.as_str() == base || k.starts_with(&prefix))
+        {
+            inner.total_bytes -= old.bytes.len();
+            inner.stamps.remove(&key);
+            removed += 1;
         }
         removed
     }
@@ -116,20 +112,16 @@ impl Cache {
     /// grouped invalidation). Returns how many entries were
     /// removed.
     pub fn purge_group(&self, group: &str) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        let keys: Vec<String> = inner
-            .entries
-            .iter()
-            .filter(|(_, image)| image.groups.iter().any(|g| g == group))
-            .map(|(key, _)| key.clone())
-            .collect();
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
         let mut removed = 0;
-        for key in keys {
-            if let Some(old) = inner.entries.remove(&key) {
-                inner.total_bytes -= old.bytes.len();
-                inner.stamps.remove(&key);
-                removed += 1;
-            }
+        for (key, old) in inner
+            .entries
+            .extract_if(|_, image| image.groups.iter().any(|g| g == group))
+        {
+            inner.total_bytes -= old.bytes.len();
+            inner.stamps.remove(&key);
+            removed += 1;
         }
         removed
     }
@@ -158,20 +150,18 @@ impl Cache {
     /// replaced original's derivatives stop serving.
     /// Returns how many entries were removed.
     pub fn purge_source(&self, source: &str) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        let keys: Vec<String> = inner
-            .entries
-            .keys()
-            .filter(|k| key_belongs_to_source(k, source))
-            .cloned()
-            .collect();
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        // Built once, not per key examined.
+        let suffix = format!("/{source}");
         let mut removed = 0;
-        for key in keys {
-            if let Some(old) = inner.entries.remove(&key) {
-                inner.total_bytes -= old.bytes.len();
-                inner.stamps.remove(&key);
-                removed += 1;
-            }
+        for (key, old) in inner.entries.extract_if(|k, _| {
+            let base = k.split('#').next().unwrap_or(k);
+            base == source || base.ends_with(&suffix)
+        }) {
+            inner.total_bytes -= old.bytes.len();
+            inner.stamps.remove(&key);
+            removed += 1;
         }
         removed
     }
@@ -222,7 +212,7 @@ mod tests {
 
     fn img(n: usize) -> CachedImage {
         CachedImage {
-            bytes: vec![7; n],
+            bytes: bytes::Bytes::from(vec![7; n]),
             format: ImageFormat::Png,
             quality: None,
             groups: Vec::new(),
