@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Changed
+
+- The AI providers resample with fast_image_resize instead of imageops (issue #283). Model inputs and masks moved through the image crate's single-threaded Triangle filter, which for the small models cost more than inference itself (face detection spent 57 ms resizing its input against 44 ms of inference). The mask upsample in background removal, the segmentation mask upsample and input resize, the face detection input, the detection letterbox, and the OCR detection input now use the SIMD Bilinear kernel from the crate the core pipeline already depends on, 7 to 12 times faster on those resizes. Outputs move by a few levels of 255 at most: the background removal mask differs by at most 1 of 255 with the swap, and face detection scores move by at most 0.077, so only a candidate sitting at the score threshold can flip. The background removal input downscale stays on Triangle pending a quiet-host retest.
+
 ## [0.9.2] - 2026-10-29
 
 ### Changed

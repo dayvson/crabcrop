@@ -8,7 +8,7 @@
 //! once against a process-wide ONNX environment, and inference
 //! runs behind the server-wide concurrency gate.
 
-use image::{DynamicImage, GrayImage, imageops::FilterType};
+use image::{DynamicImage, GrayImage, RgbImage, imageops::FilterType};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::sync::{Mutex, OnceLock};
 
@@ -196,6 +196,61 @@ impl MaskProvider for OnnxMaskProvider {
     }
 }
 
+/// Resample with fast_image_resize's Bilinear kernel instead
+/// of imageops Triangle (issue #283). The AI providers'
+/// resampling cost more than the small models' inference
+/// (YuNet: 57 ms of resize against 44 ms of inference), and
+/// the SIMD kernel does the same resizes 7 to 12 times
+/// faster. The kernel change moves model inputs and mask
+/// edges by a few levels of 255 at most, measured on the
+/// functional corpus and confirmed visually; the issue
+/// carries the bounds. Falls back to the Triangle path if
+/// the SIMD resizer rejects the geometry.
+fn fir_resize_rgb(img: &RgbImage, w: u32, h: u32) -> RgbImage {
+    use fast_image_resize::images::Image as FirImage;
+    use fast_image_resize::{PixelType, ResizeAlg, ResizeOptions, Resizer};
+    let fallback = || image::imageops::resize(img, w, h, FilterType::Triangle);
+    let Ok(src) = FirImage::from_vec_u8(
+        img.width(),
+        img.height(),
+        img.as_raw().clone(),
+        PixelType::U8x3,
+    ) else {
+        return fallback();
+    };
+    let mut dst = FirImage::new(w, h, PixelType::U8x3);
+    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(
+        fast_image_resize::FilterType::Bilinear,
+    ));
+    match Resizer::new().resize(&src, &mut dst, &opts) {
+        Ok(()) => RgbImage::from_raw(w, h, dst.into_vec()).unwrap_or_else(fallback),
+        Err(_) => fallback(),
+    }
+}
+
+/// The grayscale twin of `fir_resize_rgb`, for mask fields.
+fn fir_resize_gray(img: &GrayImage, w: u32, h: u32) -> GrayImage {
+    use fast_image_resize::images::Image as FirImage;
+    use fast_image_resize::{PixelType, ResizeAlg, ResizeOptions, Resizer};
+    let fallback = || image::imageops::resize(img, w, h, FilterType::Triangle);
+    let Ok(src) = FirImage::from_vec_u8(
+        img.width(),
+        img.height(),
+        img.as_raw().clone(),
+        PixelType::U8,
+    ) else {
+        return fallback();
+    };
+    let mut dst = FirImage::new(w, h, PixelType::U8);
+    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(
+        fast_image_resize::FilterType::Bilinear,
+    ));
+    match Resizer::new().resize(&src, &mut dst, &opts) {
+        Ok(()) => GrayImage::from_raw(w, h, dst.into_vec()).unwrap_or_else(fallback),
+        Err(_) => fallback(),
+    }
+}
+
 /// U²-Net preprocessing, matching the reference pipeline:
 /// resize to the model's 320x320, scale by the image maximum,
 /// then normalize per channel with ImageNet statistics. Output
@@ -241,7 +296,7 @@ fn postprocess(data: &[f32], w: u32, h: u32) -> Result<GrayImage, AiError> {
     Ok(if (w, h) == (320, 320) {
         mask
     } else {
-        image::imageops::resize(&mask, w, h, FilterType::Triangle)
+        fir_resize_gray(&mask, w, h)
     })
 }
 
@@ -751,7 +806,7 @@ pub fn segment_preprocess(img: &DynamicImage) -> Vec<f32> {
     let scale = SEGMENT_INPUT as f32 / w.max(h) as f32;
     let nw = ((w as f32 * scale).round() as u32).max(1);
     let nh = ((h as f32 * scale).round() as u32).max(1);
-    let resized = img.resize_exact(nw, nh, FilterType::Triangle).to_rgb8();
+    let resized = fir_resize_rgb(&img.to_rgb8(), nw, nh);
     let size = SEGMENT_INPUT as usize;
     let mut out = vec![0f32; 3 * size * size];
     for (i, px) in resized.pixels().enumerate() {
@@ -1127,7 +1182,7 @@ impl SegmentProvider for OnnxSegmentProvider {
         let full = if (mw, mh) == (img_w, img_h) {
             full
         } else {
-            image::imageops::resize(&full, img_w, img_h, FilterType::Triangle)
+            fir_resize_gray(&full, img_w, img_h)
         };
         // Crop the box out of the full-size mask. A box
         // reaching past the frame (a detector's rounding)
@@ -1211,9 +1266,7 @@ impl FaceProvider for OnnxFaceProvider {
         // The export takes exactly 640x640. The image is scaled
         // to fit (the reference wrapper resizes the same way);
         // boxes map back with independent axis scales.
-        let small = img
-            .resize_exact(FACE_INPUT, FACE_INPUT, FilterType::Triangle)
-            .to_rgb8();
+        let small = fir_resize_rgb(&img.to_rgb8(), FACE_INPUT, FACE_INPUT);
         // BGR planar floats at 0..255: the channel order and
         // scale the model was trained with.
         let plane = (FACE_INPUT * FACE_INPUT) as usize;
@@ -4360,7 +4413,7 @@ fn letterbox(img: &DynamicImage) -> (Vec<f32>, f32, u32, u32) {
     let scale = (DETECT_INPUT as f32 / w as f32).min(DETECT_INPUT as f32 / h as f32);
     let nw = ((w as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
     let nh = ((h as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
-    let resized = img.resize_exact(nw, nh, FilterType::Triangle).to_rgb8();
+    let resized = fir_resize_rgb(&img.to_rgb8(), nw, nh);
     let pad_x = (DETECT_INPUT - nw) / 2;
     let pad_y = (DETECT_INPUT - nh) / 2;
     let plane = (DETECT_INPUT * DETECT_INPUT) as usize;
@@ -5957,7 +6010,7 @@ fn ocr_det_preprocess(img: &DynamicImage) -> (Vec<f32>, u32, u32) {
     const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
     const STD: [f32; 3] = [0.229, 0.224, 0.225];
     let (rw, rh) = ocr_det_size(img.width(), img.height());
-    let resized = img.resize_exact(rw, rh, FilterType::Triangle).to_rgb8();
+    let resized = fir_resize_rgb(&img.to_rgb8(), rw, rh);
     let plane = (rw * rh) as usize;
     let mut out = vec![0f32; 3 * plane];
     for (i, px) in resized.pixels().enumerate() {
