@@ -4,7 +4,15 @@
   <img src="assets/crabcrop-mascot.webp" alt="The crabcrop mascot: a crochet crab waving hello and holding a photo" width="260">
 </p>
 
-crabcrop is an on-demand image optimization service written in Rust. You request an image with the operations encoded in the URL, resize, crop, convert, filter, and crabcrop fetches the source image, applies the operations in order, and returns the result. There are no pre-generated thumbnails and no build step: the URL is the API.
+<p align="center">
+  <a href="https://crabcrop.org/">Website</a> · <a href="https://crabcrop.org/docs.html">Documentation</a>
+</p>
+
+**Blazing fast, on-demand images.**
+
+crabcrop is a Rust-built, lightning-fast on-demand image API supporting all major formats in and out, with over 42 filters and AI features like background removal. It resizes, crops, converts, and filters your images straight from a signed URL. One binary, no pre-generated thumbnails, no build step: the URL is the API.
+
+Everything an image pipeline does, in one signed URL: resize, crop, adjust, shape, overlay, and encode, chained in the order written, plus background removal, studio mode, smart face-safe crops, redaction, and content provenance. Ask for JSON instead of an image and the meta endpoint describes it: dimensions, detections, OCR text, and more.
 
 crabcrop is for sites and apps that serve the same images at many sizes and want signed, cacheable image URLs in front of an origin image store.
 
@@ -25,9 +33,9 @@ brew install --formula ./crabcrop.rb
 **Docker:** the base image, and the AI variant with background removal and face detection on board:
 
 ```bash
-docker pull ghcr.io/dayvson/crabcrop:0.8.3
-docker pull ghcr.io/dayvson/crabcrop-ai:0.8.3
-docker run -e CRABCROP_SECRET=your-secret -p 3000:3000 ghcr.io/dayvson/crabcrop:0.8.3
+docker pull ghcr.io/dayvson/crabcrop:0.9.3
+docker pull ghcr.io/dayvson/crabcrop-ai:0.9.3
+docker run -e CRABCROP_SECRET=your-secret -p 3000:3000 ghcr.io/dayvson/crabcrop:0.9.3
 ```
 
 **Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases). To build from source instead, see [Deployment](#deployment).
@@ -919,8 +927,8 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
 | `CRABCROP_METADATA` | `strip` | `preserve` copies source EXIF/XMP (and IPTC for JPEG) into JPEG and PNG outputs; see [Color management and metadata](#color-management-and-metadata). |
 | `CRABCROP_WIDTH_STEP` | `100` | Quantization step in pixels for width client hints: hinted widths round up to a multiple of this. |
-| `CRABCROP_AVIF_SPEED` | `8` | ravif speed tier for AVIF encodes, 1 (slowest, smallest output) to 10 (fastest). At 800w and quality 80, speed 8 encodes in about 1 s cold and produces the smallest files of the fast tiers; speed 10 is roughly 3x quicker for about 47% more bytes. |
-| `CRABCROP_JXL_SPEED` | `fast` | jixel speed tier for JPEG XL encodes: `ultrafast`, `fastest`, `fast`, `medium`, `slow`, or `extraslow`. Slower tiers shrink output with steep latency costs (`slow` is about 8x the latency of `fast` for about 18% fewer bytes at 800w). |
+| `CRABCROP_AVIF_SPEED` | `9` | ravif speed tier for AVIF encodes, 1 (slowest, smallest output) to 10 (fastest). At 800w and quality 80, the default speed 9 encodes about 1.8x faster than speed 8 for about 15% more bytes; speed 10 is roughly 3x quicker than speed 8 for about 44% more bytes. Set 8 for the smallest files of the fast tiers. |
+| `CRABCROP_JXL_SPEED` | `fastest` | jixel speed tier for JPEG XL encodes: `ultrafast`, `fastest`, `fast`, `medium`, `slow`, or `extraslow`. The default `fastest` encodes about 2x faster than `fast` for about 18% more bytes at 800w. Slower tiers shrink output with steep latency costs (`slow` is about 8x the latency of `fast` for about 18% fewer bytes at 800w). |
 | `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](#presets). |
 | `CRABCROP_ONLY_PRESETS` | off | Rejects free-form operations in requests; only preset references (and `exp:` / `maxage:` metadata) are allowed. Requires at least one preset. |
 | `CRABCROP_SOURCE_ROOTS_FILE` | unset | Path to a source roots file. See [Source roots](#source-roots). |

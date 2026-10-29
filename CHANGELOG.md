@@ -2,6 +2,33 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.9.3] - 2026-10-29
+
+### Changed
+
+- The AI providers resample with fast_image_resize instead of imageops (issue #283). Model inputs and masks moved through the image crate's single-threaded Triangle filter, which for the small models cost more than inference itself (face detection spent 57 ms resizing its input against 44 ms of inference). The mask upsample in background removal, the segmentation mask upsample and input resize, the face detection input, the detection letterbox, and the OCR detection input now use the SIMD Bilinear kernel from the crate the core pipeline already depends on, 7 to 12 times faster on those resizes. Outputs move by a few levels of 255 at most: the background removal mask differs by at most 1 of 255 with the swap, and face detection scores move by at most 0.077, so only a candidate sitting at the score threshold can flip. The background removal input downscale stays on Triangle pending a quiet-host retest.
+
+## [0.9.2] - 2026-10-29
+
+### Changed
+
+- The AVIF encoder default speed rises from 8 to 9 (issue #281). At 800w and quality 80 the default encode runs about 1.8x faster for about 15 percent larger output; `CRABCROP_AVIF_SPEED` still overrides the default, and 8 remains available for the smallest files of the fast tiers.
+- The JPEG XL encoder default speed tier rises from `fast` to `fastest` (issue #282). At 800w and quality 80 the default encode runs about 2x faster for about 18 percent larger output; `CRABCROP_JXL_SPEED` still overrides the default.
+
+## [0.9.1] - 2026-10-28
+
+### Changed
+
+- Cache hits no longer get slower as the cache fills (issue #274). Both cache tiers tracked recency in a list that every hit scanned end to end, so a hot key in a full cache cost several times a small-cache hit. Recency is now a per-key monotonic stamp: hits are O(1), eviction picks the same victims in the same order, and cache keys, the disk format, and ETags are unchanged.
+- GIF output encodes about four times faster (issue #275). Palette quantization now runs at sampling speed 10 (the gif crate's own default) instead of the slowest setting; output dimensions and quality hold (44.25 dB PSNR against the source vs 46.96 dB before, on a format that is 256-color lossy at any setting) and file sizes do not grow. Animated GIF output improves by the same factor per frame.
+- The filter pipeline does less copying and less repeated math, with byte-identical output throughout (issues #276, #277, #278, #279, #280). Pointwise filters take the frame by value instead of cloning it per call (saturation paid that clone twice); contrast evaluates its per-channel formula 256 times into a lookup table instead of once per pixel (about 80 ms to about 7 ms at 2400x1600); sharpen uses its own 3x3 convolution that skips the kernel's four zero taps (about 154 ms to about 69 ms); the caller-supplied convolution filter walks raw row slices instead of per-tap trait calls and no longer converts opaque sources to RGBA and back; and pointwise filters on large frames (at least 3 MB and 256 rows) apply in row bands across up to four scoped threads. A chained saturation, sharpen, and contrast request at 2400x1600 drops from about 316 ms to about 151 ms end to end.
+
+## [0.9.0] - 2026-10-28
+
+### Added
+
+- C2PA provenance (issue #173). Meta responses now carry a `provenance` object reporting the Content Credentials a source carries: its validation state (`valid`, `trusted`, or `invalid`), the signer, and the manifest store's composition, verified with c2pa-rs 0.91, the first release line that enforces the specification's exclusion rules (the October 2026 forgery class). With a signing identity configured (`CRABCROP_C2PA_CERT` and `CRABCROP_C2PA_KEY`, a PEM chain and its PKCS#8 key; `CRABCROP_C2PA_TSA_URL` optionally adds a timestamp authority), still JPEG, PNG, WebP, and AVIF outputs are signed as they are produced. The source is recorded as a parent ingredient (its hash always, its manifest store when it has one, because a manifest cannot survive a transform byte-wise), and the AI edits (removebg, studio, remove_region, upscale, class and face edits) record the edit with the IPTC `compositeWithTrainedAlgorithmicMedia` source type. The identity is proven at boot with a sign-and-verify round trip, so a broken one (a bare self-signed certificate, a mismatched key, a chain outside the C2PA certificate profile) is a startup error naming the reason. GIF, JPEG XL, video, and animated WebP outputs are served unsigned in this version. A valid credential proves origin, not untouched pixels; whether verifiers call the result trusted depends on the operator's certificate chain reaching the C2PA trust list, which the README now spells out.
+
 ## [0.8.3] - 2026-10-28
 
 ### Fixed

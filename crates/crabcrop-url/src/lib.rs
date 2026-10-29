@@ -1,6 +1,26 @@
-//! Build and sign crabcrop URLs, per `spec/url-signing.md` in
-//! the crabcrop repository. This is the same code the server
-//! verifies with: one implementation, reused by every client.
+//! Build, sign, seal, and verify crabcrop URLs, per
+//! `spec/url-signing.md` in the crabcrop repository. This is
+//! the same code the server verifies with: one
+//! implementation, reused by every client.
+//!
+//! A crabcrop URL names an image and the operations to
+//! apply to it. This crate mints and checks the four kinds
+//! of authority segment such a URL can carry:
+//!
+//! - **Signed URLs**: an HMAC-SHA256 tag over the
+//!   remainder (operations and source), optionally with an
+//!   `exp:` expiry segment inside the signed text and a
+//!   key ID naming the signing key, which is what makes
+//!   secret rotation an overlap instead of a flag day.
+//! - **Sealed URLs**: the whole remainder encrypted into
+//!   an opaque `s1.` token (AES-256-GCM under a derived
+//!   subkey), so the URL reveals neither the recipe nor
+//!   the source. Key IDs work here exactly as for signed
+//!   URLs.
+//! - **Purge and upload signatures**: the same HMAC under
+//!   domain-separated derived subkeys, so a signature
+//!   minted for one endpoint can never be replayed
+//!   against another.
 //!
 //! ```
 //! let url = crabcrop_url::build_url(
@@ -14,6 +34,33 @@
 //! assert_eq!(
 //!     url,
 //!     "https://images.example.com/3c1f6c180116661877bd4c85fd201a178087d74c1cc188cc584e819d901308c6/300x200/https://example.com/photo.jpg"
+//! );
+//! ```
+//!
+//! ```
+//! // A keyed signature segment: the server verifies it
+//! // against the named key only.
+//! let segment = crabcrop_url::sign_with_key_id(
+//!     b"your-secret",
+//!     "k2026",
+//!     "300x200/https://example.com/photo.jpg",
+//! )
+//! .unwrap();
+//! assert!(segment.starts_with("k2026:"));
+//! ```
+//!
+//! ```
+//! // A sealed token round trip: opaque in the URL,
+//! // openable only under the secret.
+//! let token = crabcrop_url::seal(
+//!     b"your-secret",
+//!     "300x200/https://example.com/photo.jpg",
+//! )
+//! .unwrap();
+//! assert!(token.starts_with("s1."));
+//! assert_eq!(
+//!     crabcrop_url::unseal(b"your-secret", &token).unwrap(),
+//!     "300x200/https://example.com/photo.jpg"
 //! );
 //! ```
 
