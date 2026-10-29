@@ -2,6 +2,17 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.9.4] - 2026-10-29
+
+### Changed
+
+- AVIF encoding runs about four times faster, with byte-identical output (issue #288). The image crate gates rav1e's SIMD assembly behind its `nasm` feature, which was never enabled here, so every AVIF encode has been running the scalar fallback; the feature is now on. The same change decodes JPEG through zune-jpeg directly instead of the image crate's wrapper (about 1.4x faster, byte-identical) and decodes still WebP through libwebp (about 3.5x faster, bit-identical). Building from source now requires nasm on the build machine; the CI workflows and the Docker builder install it.
+- The filter pipeline does less per-pixel work, with byte-identical output throughout (issue #285). Brighten evaluates through a 256-entry lookup table instead of per-pixel float math (4 to 6x faster); gaussian blur runs in tree in row bands, mirroring the image crate's own two engines including their kernel quantization and rounding, wired into blur, region blur, face blur, and pad backgrounds (1.4 to 1.8x); rotate180, flipv, and rotate270 take permutation fast paths (up to about 5x), including through EXIF orientation; hue rotate walks raw slices with the crate's own matrix (1.5 to 1.9x, its identity proven against an exhaustive sweep of all 16.7M RGB colors); and arbitrary-angle rotate applies in output-row bands (about 1.45x). Cache keys, ETags, and stored entries are unaffected.
+- Cache hits and purges move less memory (issue #289). Cached bodies are stored as `bytes::Bytes`, so a hit, a miss store, and a tier promotion bump a refcount instead of cloning the whole body, and the hit-path clone no longer happens under the cache lock; at 626 KB payloads, paired hit measurements improved 9 to 45 percent. Purge passes in both cache tiers now remove matches with `extract_if` in a single pass instead of collecting cloned keys first, with identical removed sets and counts. The disk format and response bytes are unchanged.
+- AI inference uses ONNX Runtime's full graph optimization (issue #291). Sessions build with `GraphOptimizationLevel::All`, which in this runtime enables strictly more than the level used before: background removal inference improves 13 to 26 percent and face detection and OCR recognition about 20 percent, with bit-identical outputs on every model tested and no change to the MobileSAM encoder's timing.
+- The `crabcrop-url` documentation was rewritten end to end. The crate README and the crate-level docs now cover signed and expiring URLs, key IDs and rotation, srcset generation, sealed URLs, verification, purge signatures, upload signatures, unsigned mode, and the typed error set, with runnable examples throughout.
+- getrandom updated from 0.3.4 to 0.4.3 for the `crabcrop-url` crate (PR #258).
+
 ## [0.9.3] - 2026-10-29
 
 ### Changed

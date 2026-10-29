@@ -1,6 +1,6 @@
 {
   "name": "@crabcrop/framework-nextjs",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": true,
   "type": "module",
   "scripts": { "test": "node --test test/*.test.ts" },
