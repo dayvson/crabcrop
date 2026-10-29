@@ -6,7 +6,7 @@
 //! bounded by total bytes with least-recently-used eviction. Only
 //! successful responses are stored; errors are never cached.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::url::ImageFormat;
@@ -53,8 +53,12 @@ pub(crate) fn union_groups(existing: &[String], extra: &[String]) -> Vec<String>
 #[derive(Debug, Default)]
 struct Inner {
     entries: HashMap<String, CachedImage>,
-    /// Keys from least to most recently used.
-    order: VecDeque<String>,
+    /// Last-access stamp per key (monotonic clock). Eviction
+    /// removes the smallest stamp, which is the least recently
+    /// used entry: the same order the VecDeque kept, at O(1)
+    /// per access instead of a linear scan per hit.
+    stamps: HashMap<String, u64>,
+    clock: u64,
     total_bytes: usize,
 }
 
@@ -101,7 +105,7 @@ impl Cache {
         for key in keys {
             if let Some(old) = inner.entries.remove(&key) {
                 inner.total_bytes -= old.bytes.len();
-                remove_from_order(&mut inner, &key);
+                inner.stamps.remove(&key);
                 removed += 1;
             }
         }
@@ -123,7 +127,7 @@ impl Cache {
         for key in keys {
             if let Some(old) = inner.entries.remove(&key) {
                 inner.total_bytes -= old.bytes.len();
-                remove_from_order(&mut inner, &key);
+                inner.stamps.remove(&key);
                 removed += 1;
             }
         }
@@ -165,7 +169,7 @@ impl Cache {
         for key in keys {
             if let Some(old) = inner.entries.remove(&key) {
                 inner.total_bytes -= old.bytes.len();
-                remove_from_order(&mut inner, &key);
+                inner.stamps.remove(&key);
                 removed += 1;
             }
         }
@@ -182,30 +186,33 @@ impl Cache {
         let mut inner = self.inner.lock().unwrap();
         if let Some(old) = inner.entries.remove(&key) {
             inner.total_bytes -= old.bytes.len();
-            remove_from_order(&mut inner, &key);
+            inner.stamps.remove(&key);
         }
         while inner.total_bytes + image.bytes.len() > self.max_bytes {
-            let Some(oldest) = inner.order.pop_front() else {
-                break;
-            };
+            let oldest = inner
+                .stamps
+                .iter()
+                .min_by_key(|(_, stamp)| *stamp)
+                .map(|(k, _)| k.clone());
+            let Some(oldest) = oldest else { break };
             if let Some(evicted) = inner.entries.remove(&oldest) {
                 inner.total_bytes -= evicted.bytes.len();
             }
+            inner.stamps.remove(&oldest);
         }
         inner.total_bytes += image.bytes.len();
-        inner.order.push_back(key.clone());
+        inner.clock += 1;
+        let stamp = inner.clock;
+        inner.stamps.insert(key.clone(), stamp);
         inner.entries.insert(key, image);
     }
 }
 
 fn touch(inner: &mut Inner, key: &str) {
-    remove_from_order(inner, key);
-    inner.order.push_back(key.to_string());
-}
-
-fn remove_from_order(inner: &mut Inner, key: &str) {
-    if let Some(pos) = inner.order.iter().position(|k| k == key) {
-        inner.order.remove(pos);
+    inner.clock += 1;
+    let stamp = inner.clock;
+    if let Some(s) = inner.stamps.get_mut(key) {
+        *s = stamp;
     }
 }
 

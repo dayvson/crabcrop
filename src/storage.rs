@@ -13,7 +13,7 @@
 //! budget evicts least recently used entries, with recency
 //! tracked in memory and re-seeded from file times at open.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -29,8 +29,12 @@ type HmacSha256 = Hmac<Sha256>;
 struct Inner {
     /// Cache key -> (file stem, total file size, cache groups).
     entries: HashMap<String, (String, usize, Vec<String>)>,
-    /// Keys from least to most recently used.
-    order: VecDeque<String>,
+    /// Last-access stamp per key (monotonic clock). Eviction
+    /// removes the smallest stamp, the least recently used
+    /// entry: the same order the VecDeque kept, at O(1) per
+    /// access instead of a linear scan per hit.
+    stamps: HashMap<String, u64>,
+    clock: u64,
     total_bytes: usize,
 }
 
@@ -180,7 +184,9 @@ impl DiskStore {
         let mut inner = self.inner.lock().unwrap();
         for (_, key, stem, size, groups) in found {
             inner.total_bytes += size;
-            inner.order.push_back(key.clone());
+            inner.clock += 1;
+            let stamp = inner.clock;
+            inner.stamps.insert(key.clone(), stamp);
             inner.entries.insert(key, (stem, size, groups));
         }
         Ok(())
@@ -248,19 +254,25 @@ impl DiskStore {
             let mut inner = self.inner.lock().unwrap();
             if let Some((_, old_size, _)) = inner.entries.remove(key) {
                 inner.total_bytes -= old_size;
-                remove_from_order(&mut inner, key);
+                inner.stamps.remove(key);
             }
             while inner.total_bytes + data.len() > self.max_bytes {
-                let Some(oldest) = inner.order.pop_front() else {
-                    break;
-                };
+                let oldest = inner
+                    .stamps
+                    .iter()
+                    .min_by_key(|(_, stamp)| *stamp)
+                    .map(|(k, _)| k.clone());
+                let Some(oldest) = oldest else { break };
                 if let Some((old_stem, size, _)) = inner.entries.remove(&oldest) {
                     inner.total_bytes -= size;
                     evicted.push(old_stem);
                 }
+                inner.stamps.remove(&oldest);
             }
             inner.total_bytes += data.len();
-            inner.order.push_back(key.to_string());
+            inner.clock += 1;
+            let stamp = inner.clock;
+            inner.stamps.insert(key.to_string(), stamp);
             inner
                 .entries
                 .insert(key.to_string(), (stem, data.len(), image.groups.clone()));
@@ -369,25 +381,21 @@ impl DiskStore {
 }
 
 pub(crate) fn key_stem(key: &str) -> String {
-    let digest = Sha256::digest(key.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(Sha256::digest(key.as_bytes()))
 }
 
 fn touch(inner: &mut Inner, key: &str) {
-    remove_from_order(inner, key);
-    inner.order.push_back(key.to_string());
-}
-
-fn remove_from_order(inner: &mut Inner, key: &str) {
-    if let Some(pos) = inner.order.iter().position(|k| k == key) {
-        inner.order.remove(pos);
+    inner.clock += 1;
+    let stamp = inner.clock;
+    if let Some(s) = inner.stamps.get_mut(key) {
+        *s = stamp;
     }
 }
 
 fn evict_entry(inner: &mut Inner, key: &str) -> Option<(String, usize)> {
     let (stem, size, _) = inner.entries.remove(key)?;
     inner.total_bytes -= size;
-    remove_from_order(inner, key);
+    inner.stamps.remove(key);
     Some((stem, size))
 }
 
