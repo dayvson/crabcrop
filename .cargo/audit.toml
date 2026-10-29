@@ -1,0 +1,21 @@
+# cargo audit configuration.
+#
+# One advisory is ignored, with cause:
+#
+# RUSTSEC-2023-0071 (crate: rsa 0.9.10, "Marvin Attack") is a timing
+# sidechannel in RSA PKCS#1 v1.5 decryption. Exploiting it needs a
+# decryption oracle: an attacker who can submit many chosen
+# ciphertexts to a private-key decryption operation and measure the
+# timing. crabcrop has no such surface. The rsa crate enters the tree
+# only through c2pa (content provenance), where it is used to verify
+# signatures and to sign outputs with an operator-supplied key.
+# Signing is not decryption, no RSA private key in this codebase ever
+# decrypts attacker-supplied data, and verification uses public keys.
+# The advisory also has no fixed release ("No fixed upgrade is
+# available"), so there is no version to move to; the crate arrives
+# transitively via c2pa_raw_crypto and cannot be dropped without
+# dropping C2PA support. The ignore is scoped to this single advisory
+# so any other finding still fails the audit job. Revisit when the
+# rsa crate ships a fix or c2pa drops the dependency.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
