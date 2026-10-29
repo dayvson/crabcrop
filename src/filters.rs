@@ -98,12 +98,12 @@ pub fn apply_filters_filled(
                 });
             }
             Filter::Invert => img.invert(),
-            Filter::Blur(sigma) => img = img.blur(blur_sigma(*sigma)),
-            Filter::Brighten(amount) => img = img.brighten(*amount),
+            Filter::Blur(sigma) => img = blur_fast(&img, blur_sigma(*sigma)),
+            Filter::Brighten(amount) => img = brighten_fast(img, *amount),
             Filter::Contrast(amount) => {
                 img = map_rgb_image(img, |rgb| contrast_in_place(rgb, *amount));
             }
-            Filter::HueRotate(degrees) => img = img.huerotate(*degrees),
+            Filter::HueRotate(degrees) => img = huerotate_fast(img, *degrees),
             Filter::Sharpen(amount) => {
                 // Unsharp mask as a 3x3 convolution: the center is
                 // boosted, the cross neighbors subtracted.
@@ -140,9 +140,9 @@ pub fn apply_filters_filled(
                 img = if normalized == 90.0 {
                     img.rotate90()
                 } else if normalized == 180.0 {
-                    img.rotate180()
+                    rotate180_fast(&img)
                 } else if normalized == 270.0 {
-                    img.rotate270()
+                    rotate270_fast(&img)
                 } else if normalized == 0.0 {
                     img
                 } else {
@@ -198,8 +198,8 @@ pub fn apply_filters_filled(
             Filter::Pixelate(block) => img = pixelate(&img, *block),
             Filter::Flip(direction) => {
                 img = match direction {
-                    crate::url::FlipDirection::Horizontal => img.fliph(),
-                    crate::url::FlipDirection::Vertical => img.flipv(),
+                    crate::url::FlipDirection::Horizontal => fliph_fast(&img),
+                    crate::url::FlipDirection::Vertical => flipv_fast(&img),
                 }
             }
             Filter::Radius(radii) => img = rounded_corners(&img, *radii),
@@ -254,15 +254,16 @@ fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> D
         [r, g, b, 255]
     };
     let src = img.into_rgba8();
-    let (w, h) = (src.width() as f32, src.height() as f32);
+    let (sw, sh) = (src.width(), src.height());
+    let (w, h) = (sw as f32, sh as f32);
     let theta = degrees.to_radians();
     let (sin, cos) = theta.sin_cos();
-    let (new_w, new_h) = rotated_canvas(src.width(), src.height(), degrees);
+    let (new_w, new_h) = rotated_canvas(sw, sh, degrees);
     let (scx, scy) = ((w - 1.0) / 2.0, (h - 1.0) / 2.0);
     let (dcx, dcy) = ((new_w as f32 - 1.0) / 2.0, (new_h as f32 - 1.0) / 2.0);
-    let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
+    let src_raw = src.as_raw();
     let sample = |x: i32, y: i32| -> [f32; 4] {
-        if x < 0 || y < 0 || x >= src.width() as i32 || y >= src.height() as i32 {
+        if x < 0 || y < 0 || x >= sw as i32 || y >= sh as i32 {
             [
                 background[0] as f32,
                 background[1] as f32,
@@ -270,43 +271,66 @@ fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> D
                 background[3] as f32,
             ]
         } else {
-            let p = src.get_pixel(x as u32, y as u32).0;
-            [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]
+            let i = ((y as u32 * sw + x as u32) * 4) as usize;
+            [
+                src_raw[i] as f32,
+                src_raw[i + 1] as f32,
+                src_raw[i + 2] as f32,
+                src_raw[i + 3] as f32,
+            ]
         }
     };
-    for y in 0..new_h {
-        for x in 0..new_w {
-            let dx = x as f32 - dcx;
-            let dy = y as f32 - dcy;
-            let sx = cos * dx + sin * dy + scx;
-            let sy = -sin * dx + cos * dy + scy;
-            let x0 = sx.floor();
-            let y0 = sy.floor();
-            let fx = sx - x0;
-            let fy = sy - y0;
-            let (x0, y0) = (x0 as i32, y0 as i32);
-            let mut px = [0f32; 4];
-            for (wx, xx) in [(1.0 - fx, x0), (fx, x0 + 1)] {
-                for (wy, yy) in [(1.0 - fy, y0), (fy, y0 + 1)] {
-                    let tap = sample(xx, yy);
-                    let weight = wx * wy;
-                    for (i, channel) in px.iter_mut().enumerate() {
-                        *channel += tap[i] * weight;
+    let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
+    // Every output pixel is a pure function of the source,
+    // so the canvas splits into row bands across scoped
+    // threads without changing a byte (wave 3); small
+    // canvases run sequentially on the calling thread.
+    let row_len = (new_w * 4) as usize;
+    let threads = band_threads();
+    let band_rows = if threads > 1 && new_h >= 128 {
+        (new_h as usize).div_ceil(threads)
+    } else {
+        new_h as usize
+    };
+    let out_raw = out.as_mut();
+    std::thread::scope(|s| {
+        for (bi, band) in out_raw.chunks_mut(band_rows * row_len).enumerate() {
+            let y_start = (bi * band_rows) as u32;
+            let sample = &sample;
+            s.spawn(move || {
+                let rows = band.len() / row_len;
+                for ly in 0..rows {
+                    let y = y_start + ly as u32;
+                    for x in 0..new_w {
+                        let dx = x as f32 - dcx;
+                        let dy = y as f32 - dcy;
+                        let sx = cos * dx + sin * dy + scx;
+                        let sy = -sin * dx + cos * dy + scy;
+                        let x0 = sx.floor();
+                        let y0 = sy.floor();
+                        let fx = sx - x0;
+                        let fy = sy - y0;
+                        let (x0, y0) = (x0 as i32, y0 as i32);
+                        let mut px = [0f32; 4];
+                        for (wx, xx) in [(1.0 - fx, x0), (fx, x0 + 1)] {
+                            for (wy, yy) in [(1.0 - fy, y0), (fy, y0 + 1)] {
+                                let tap = sample(xx, yy);
+                                let weight = wx * wy;
+                                for (i, channel) in px.iter_mut().enumerate() {
+                                    *channel += tap[i] * weight;
+                                }
+                            }
+                        }
+                        let o = ly * row_len + (x * 4) as usize;
+                        band[o] = px[0].round() as u8;
+                        band[o + 1] = px[1].round() as u8;
+                        band[o + 2] = px[2].round() as u8;
+                        band[o + 3] = px[3].round() as u8;
                     }
                 }
-            }
-            out.put_pixel(
-                x,
-                y,
-                image::Rgba([
-                    px[0].round() as u8,
-                    px[1].round() as u8,
-                    px[2].round() as u8,
-                    px[3].round() as u8,
-                ]),
-            );
+            });
         }
-    }
+    });
     if has_alpha {
         DynamicImage::ImageRgba8(out)
     } else {
@@ -394,6 +418,656 @@ fn map_rgb_image(
         DynamicImage::ImageRgba8(out)
     } else {
         DynamicImage::ImageRgb8(f(img.into_rgb8()))
+    }
+}
+
+// ----------------------------------------------------------------
+// Wave-3 fast paths. Every function in this section is a
+// byte-identical stand-in for the image-crate operation it
+// replaces: the identity is pinned by tests in this module
+// against the crate over fixture sweeps, and (for hue) an
+// exhaustive check over the RGB cube in the wave-3 spike.
+// ----------------------------------------------------------------
+
+/// Below this frame size (in subpixels) the crate's
+/// permutation loops are cache-resident and beat a thread
+/// spawn plus a fresh destination buffer; the fast paths
+/// gate on it and fall back to the crate.
+const PERM_FAST_MIN_SUBPIXELS: usize = 4_000_000;
+
+fn blur_kernel_size(sigma: f32) -> u32 {
+    let possible_size = (((((sigma - 0.8) / 0.3) + 1.) * 2.) + 1.).max(3.) as u32;
+    if possible_size.is_multiple_of(2) {
+        return possible_size + 1;
+    }
+    possible_size
+}
+
+fn blur_gaussian_kernel(width: usize, sigma: f32) -> Vec<f32> {
+    let mut sum_norm: f32 = 0f32;
+    let mut kernel = vec![0f32; width];
+    let scale = 1f32 / (f32::sqrt(2f32 * std::f32::consts::PI) * sigma);
+    let mean = (width / 2) as f32;
+    for (x, weight) in kernel.iter_mut().enumerate() {
+        let new_weight = f32::exp(-0.5f32 * f32::powf((x as f32 - mean) / sigma, 2.0f32)) * scale;
+        *weight = new_weight;
+        sum_norm += new_weight;
+    }
+    if sum_norm != 0f32 {
+        let sum_scale = 1f32 / sum_norm;
+        for weight in &mut kernel {
+            *weight *= sum_scale;
+        }
+    }
+    kernel
+}
+
+fn blur_prepare_kernel<T: Copy + PartialEq + Default>(kernel: &[T]) -> Vec<T> {
+    let zero = T::default();
+    let mut new_kernel = kernel.to_vec();
+    while new_kernel.len() > 2
+        && new_kernel.last() == Some(&zero)
+        && new_kernel.first() == Some(&zero)
+    {
+        new_kernel.remove(0);
+        new_kernel.remove(new_kernel.len() - 1);
+    }
+    new_kernel
+}
+
+// The min/max chain is the crate's own expression; clamp
+// would differ on NaN, and the port stays bit-faithful.
+#[allow(clippy::manual_clamp)]
+fn blur_q15(w: f32) -> u32 {
+    (w * 32768.0).min(32767.0).max(0.0) as u32
+}
+
+fn blur_q15_out(acc: u32) -> u8 {
+    ((acc + (1 << 14)) >> 15).min(255) as u8
+}
+
+fn blur_par_bands<T, F>(dst: &mut [T], row_len: usize, rows: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    if rows == 0 || row_len == 0 {
+        return;
+    }
+    let band_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
+        .min(rows);
+    if band_threads <= 1 {
+        f(0, dst);
+        return;
+    }
+    let band = rows.div_ceil(band_threads);
+    let mut chunks: Vec<(usize, &mut [T])> = Vec::with_capacity(band_threads);
+    let mut rest = dst;
+    let mut start = 0usize;
+    while !rest.is_empty() {
+        let take = (band * row_len).min(rest.len());
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(take);
+        chunks.push((start, head));
+        start += take / row_len;
+        rest = tail;
+    }
+    std::thread::scope(|s| {
+        for (start_row, chunk) in chunks {
+            let f = &f;
+            s.spawn(move || f(start_row, chunk));
+        }
+    });
+}
+
+fn blur_clamp_idx(i: isize, len: usize) -> usize {
+    i.clamp(0, len as isize - 1) as usize
+}
+
+fn blur_arena_row<const N: usize>(src_row: &[u8], pad: usize, out: &mut Vec<u8>) {
+    let w = src_row.len();
+    out.clear();
+    out.reserve(w + 2 * pad * N);
+    let first = &src_row[..N];
+    let last = &src_row[w - N..];
+    for _ in 0..pad {
+        out.extend_from_slice(first);
+    }
+    out.extend_from_slice(src_row);
+    for _ in 0..pad {
+        out.extend_from_slice(last);
+    }
+}
+
+fn blur_sym_row<const N: usize>(arena: &[u8], dst_row: &mut [u8], kernel: &[u32]) {
+    let len = kernel.len();
+    let half = len / 2;
+    let hc = kernel[half];
+    let (chunks, rem) = dst_row.as_chunks_mut::<4>();
+    for (x, dst) in chunks.iter_mut().enumerate() {
+        let src = &arena[x * 4..];
+        let c = &src[half * N..half * N + 4];
+        let mut k0 = c[0] as u32 * hc;
+        let mut k1 = c[1] as u32 * hc;
+        let mut k2 = c[2] as u32 * hc;
+        let mut k3 = c[3] as u32 * hc;
+        for i in 0..half {
+            let other = len - 1 - i;
+            let fw = &src[i * N..i * N + 4];
+            let bw = &src[other * N..other * N + 4];
+            k0 += (fw[0] as u32 + bw[0] as u32) * kernel[i];
+            k1 += (fw[1] as u32 + bw[1] as u32) * kernel[i];
+            k2 += (fw[2] as u32 + bw[2] as u32) * kernel[i];
+            k3 += (fw[3] as u32 + bw[3] as u32) * kernel[i];
+        }
+        dst[0] = blur_q15_out(k0);
+        dst[1] = blur_q15_out(k1);
+        dst[2] = blur_q15_out(k2);
+        dst[3] = blur_q15_out(k3);
+    }
+    let dz = chunks.len() * 4;
+    for (x, dst) in rem.iter_mut().enumerate() {
+        let src = &arena[dz + x..];
+        let mut acc = src[half * N] as u32 * hc;
+        for i in 0..half {
+            let other = len - 1 - i;
+            acc += (src[i * N] as u32 + src[other * N] as u32) * kernel[i];
+        }
+        *dst = blur_q15_out(acc);
+    }
+}
+
+fn blur_sym_col(brows: &[&[u8]], dst_row: &mut [u8], kernel: &[u32]) {
+    let len = kernel.len();
+    let half = len / 2;
+    let hc = kernel[half];
+    let center = brows[half];
+    let total = dst_row.len();
+    let n32 = total / 32;
+    let n16 = (total - n32 * 32) / 16;
+    let (head, tail) = dst_row.split_at_mut(n32 * 32);
+    for (x, chunk) in head.chunks_mut(32).enumerate() {
+        let cx = x * 32;
+        let mut store0 = [0u32; 16];
+        let mut store1 = [0u32; 16];
+        for (dst, src) in store0.iter_mut().zip(&center[cx..cx + 16]) {
+            *dst = *src as u32 * hc;
+        }
+        for (dst, src) in store1.iter_mut().zip(&center[cx + 16..cx + 32]) {
+            *dst = *src as u32 * hc;
+        }
+        for i in 0..half {
+            let other = len - 1 - i;
+            let fw0 = &brows[i][cx..cx + 16];
+            let bw0 = &brows[other][cx..cx + 16];
+            let fw1 = &brows[i][cx + 16..cx + 32];
+            let bw1 = &brows[other][cx + 16..cx + 32];
+            for ((dst, f), b) in store0.iter_mut().zip(fw0).zip(bw0) {
+                *dst += (*f as u32 + *b as u32) * kernel[i];
+            }
+            for ((dst, f), b) in store1.iter_mut().zip(fw1).zip(bw1) {
+                *dst += (*f as u32 + *b as u32) * kernel[i];
+            }
+        }
+        let (lo, hi) = chunk.split_at_mut(16);
+        for (src, dst) in store0.iter().zip(lo) {
+            *dst = blur_q15_out(*src);
+        }
+        for (src, dst) in store1.iter().zip(hi) {
+            *dst = blur_q15_out(*src);
+        }
+    }
+    let (head16, scalar) = tail.split_at_mut(n16 * 16);
+    for (x, chunk) in head16.chunks_mut(16).enumerate() {
+        let cx = n32 * 32 + x * 16;
+        let mut store = [0u32; 16];
+        for (dst, src) in store.iter_mut().zip(&center[cx..cx + 16]) {
+            *dst = *src as u32 * hc;
+        }
+        for i in 0..half {
+            let other = len - 1 - i;
+            let fw = &brows[i][cx..cx + 16];
+            let bw = &brows[other][cx..cx + 16];
+            for ((dst, f), b) in store.iter_mut().zip(fw).zip(bw) {
+                *dst += (*f as u32 + *b as u32) * kernel[i];
+            }
+        }
+        for (src, dst) in store.iter().zip(chunk.iter_mut()) {
+            *dst = blur_q15_out(*src);
+        }
+    }
+    let scalar_start = n32 * 32 + n16 * 16;
+    for (j, dst) in scalar.iter_mut().enumerate() {
+        let cx = scalar_start + j;
+        let mut acc = center[cx] as u32 * hc;
+        for i in 0..half {
+            let other = len - 1 - i;
+            acc += (brows[i][cx] as u32 + brows[other][cx] as u32) * kernel[i];
+        }
+        *dst = blur_q15_out(acc);
+    }
+}
+
+pub fn blur_ring<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32) -> Vec<u8> {
+    let sigma = if sigma == 0.0 { 0.8 } else { sigma };
+    if w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let f_kernel = blur_gaussian_kernel(blur_kernel_size(sigma) as usize, sigma);
+    let kernel: Vec<u32> =
+        blur_prepare_kernel(&f_kernel.iter().map(|&v| blur_q15(v)).collect::<Vec<_>>());
+    let half = kernel.len() / 2;
+    let pad = half.max(1);
+    let row_len = w * N;
+    let mut out = vec![0u8; src.len()];
+    blur_par_bands(&mut out, row_len, h, |y0, band| {
+        let perm_band_rows = band.len() / row_len;
+        let klen = kernel.len();
+        let mut ring = vec![0u8; klen * row_len];
+        let mut arena: Vec<u8> = Vec::new();
+        let mut next_row = blur_clamp_idx(y0 as isize - half as isize, h);
+        for ly in 0..perm_band_rows {
+            let y = y0 + ly;
+            let need_hi = blur_clamp_idx(y as isize + half as isize, h);
+            while next_row <= need_hi {
+                let slot = next_row % klen;
+                blur_arena_row::<N>(
+                    &src[next_row * row_len..(next_row + 1) * row_len],
+                    pad,
+                    &mut arena,
+                );
+                blur_sym_row::<N>(
+                    &arena,
+                    &mut ring[slot * row_len..(slot + 1) * row_len],
+                    &kernel,
+                );
+                next_row += 1;
+            }
+            let mut brows: Vec<&[u8]> = Vec::with_capacity(klen);
+            for k in 0..klen {
+                let sy = blur_clamp_idx(y as isize + k as isize - half as isize, h);
+                brows.push(&ring[(sy % klen) * row_len..(sy % klen + 1) * row_len]);
+            }
+            blur_sym_col(&brows, &mut band[ly * row_len..(ly + 1) * row_len], &kernel);
+        }
+    });
+    out
+}
+
+/// Banded-transient variant for large kernels: horizontal pass
+/// into a full transient buffer (rows in parallel), then the
+/// column pass in output-row bands over the shared transient.
+/// Same inner functions, so the same per-pixel arithmetic.
+pub fn blur_transient<const N: usize>(src: &[u8], w: usize, h: usize, sigma: f32) -> Vec<u8> {
+    let sigma = if sigma == 0.0 { 0.8 } else { sigma };
+    if w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let f_kernel = blur_gaussian_kernel(blur_kernel_size(sigma) as usize, sigma);
+    let kernel: Vec<u32> =
+        blur_prepare_kernel(&f_kernel.iter().map(|&v| blur_q15(v)).collect::<Vec<_>>());
+    let half = kernel.len() / 2;
+    let pad = half.max(1);
+    let row_len = w * N;
+    let mut transient = vec![0u8; src.len()];
+    blur_par_bands(&mut transient, row_len, h, |y0, band| {
+        let mut arena: Vec<u8> = Vec::new();
+        for (ly, dst_row) in band.chunks_mut(row_len).enumerate() {
+            let y = y0 + ly;
+            blur_arena_row::<N>(&src[y * row_len..(y + 1) * row_len], pad, &mut arena);
+            blur_sym_row::<N>(&arena, dst_row, &kernel);
+        }
+    });
+    let mut out = vec![0u8; src.len()];
+    blur_par_bands(&mut out, row_len, h, |y0, band| {
+        for (ly, dst_row) in band.chunks_mut(row_len).enumerate() {
+            let y = y0 + ly;
+            let mut brows: Vec<&[u8]> = Vec::with_capacity(kernel.len());
+            for k in 0..kernel.len() {
+                let sy = blur_clamp_idx(y as isize + k as isize - half as isize, h);
+                brows.push(&transient[sy * row_len..(sy + 1) * row_len]);
+            }
+            blur_sym_col(&brows, dst_row, &kernel);
+        }
+    });
+    out
+}
+
+pub(crate) fn blur_fast(img: &DynamicImage, sigma: f32) -> DynamicImage {
+    // Ring for kernel < 55 (the crate's own cutoff), transient
+    // above it: same split as the crate, both banded.
+    let sigma = if sigma == 0.0 { 0.8 } else { sigma };
+    let klen = blur_kernel_size(sigma) as usize;
+    macro_rules! arm {
+        ($i:expr, $ch:expr, $ctor:expr) => {{
+            let (w, h) = ($i.width() as usize, $i.height() as usize);
+            let out = if klen < 55 {
+                blur_ring::<$ch>($i.as_raw(), w, h, sigma)
+            } else {
+                blur_transient::<$ch>($i.as_raw(), w, h, sigma)
+            };
+            $ctor(out)
+        }};
+    }
+    match img {
+        DynamicImage::ImageLuma8(i) => arm!(i, 1, |out| DynamicImage::ImageLuma8(
+            image::GrayImage::from_raw(i.width(), i.height(), out).expect("blur size")
+        )),
+        DynamicImage::ImageLumaA8(i) => arm!(i, 2, |out| DynamicImage::ImageLumaA8(
+            image::GrayAlphaImage::from_raw(i.width(), i.height(), out).expect("blur size")
+        )),
+        DynamicImage::ImageRgb8(i) => arm!(i, 3, |out| DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(i.width(), i.height(), out).expect("blur size")
+        )),
+        DynamicImage::ImageRgba8(i) => arm!(i, 4, |out| DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(i.width(), i.height(), out).expect("blur size")
+        )),
+        other => other.blur(sigma),
+    }
+}
+
+fn band_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
+}
+
+fn perm_band_rows(rows: usize, total_subpx: usize) -> usize {
+    if band_threads() > 1 && total_subpx >= 3_000_000 {
+        rows.div_ceil(band_threads())
+    } else {
+        rows
+    }
+}
+
+fn map_pixels_bands<const CH: usize>(
+    buf: &mut [u8],
+    width: usize,
+    f: &(impl Fn(&mut [u8; CH]) + Sync),
+) {
+    let total = buf.len();
+    let px = buf.as_chunks_mut::<CH>().0;
+    let rows = px.len() / width.max(1);
+    let br = perm_band_rows(rows, total);
+    if br >= rows {
+        for p in px {
+            f(p);
+        }
+        return;
+    }
+    std::thread::scope(|s| {
+        for band in px.chunks_mut(br * width) {
+            s.spawn(move || {
+                for p in band {
+                    f(p);
+                }
+            });
+        }
+    });
+}
+
+fn rot270_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
+    let br = perm_band_rows(w, w * h * CH);
+    std::thread::scope(|s| {
+        for (bi, band) in dst.chunks_mut(br * h).enumerate() {
+            let y0 = bi * br;
+            s.spawn(move || {
+                let tile = 64usize;
+                let mut ty = 0usize;
+                while ty < h {
+                    let t_end = (ty + tile).min(h);
+                    for (ly, orow) in band.chunks_mut(h).enumerate() {
+                        let c = w - 1 - (y0 + ly);
+                        for y in ty..t_end {
+                            orow[y] = src[y * w + c];
+                        }
+                    }
+                    ty = t_end;
+                }
+            });
+        }
+    });
+}
+
+fn rot180_px<const CH: usize>(src: &[[u8; CH]], _w: usize, _h: usize, dst: &mut [[u8; CH]]) {
+    let n = src.len();
+    let br = perm_band_rows(n, n * CH);
+    std::thread::scope(|s| {
+        let mut rest = dst;
+        let mut start = 0usize;
+        while !rest.is_empty() {
+            let take = br.min(rest.len());
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(take);
+            let st = start;
+            start += take;
+            rest = tail;
+            s.spawn(move || {
+                for (i, px) in head.iter_mut().enumerate() {
+                    *px = src[n - 1 - (st + i)];
+                }
+            });
+        }
+    });
+}
+
+fn fliph_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
+    let br = perm_band_rows(h, w * h * CH);
+    std::thread::scope(|s| {
+        for (sband, dband) in src.chunks(br * w).zip(dst.chunks_mut(br * w)) {
+            s.spawn(move || {
+                for (srow, drow) in sband.chunks(w).zip(dband.chunks_mut(w)) {
+                    for (i, px) in drow.iter_mut().enumerate() {
+                        *px = srow[w - 1 - i];
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn flipv_px<const CH: usize>(src: &[[u8; CH]], w: usize, h: usize, dst: &mut [[u8; CH]]) {
+    let br = perm_band_rows(h, w * h * CH);
+    std::thread::scope(|s| {
+        let mut rest = dst;
+        let mut y0 = 0usize;
+        while !rest.is_empty() {
+            let take = (br * w).min(rest.len());
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(take);
+            let rows = take / w;
+            let src_rows = &src[(h - y0 - rows) * w..(h - y0) * w];
+            s.spawn(move || {
+                for r in 0..rows {
+                    head[r * w..(r + 1) * w]
+                        .copy_from_slice(&src_rows[(rows - 1 - r) * w..(rows - r) * w]);
+                }
+            });
+            y0 += rows;
+            rest = tail;
+        }
+    });
+}
+
+fn run_perm<const CH: usize>(
+    raw: &[u8],
+    w: usize,
+    h: usize,
+    op: impl Fn(&[[u8; CH]], usize, usize, &mut [[u8; CH]]),
+) -> Vec<u8> {
+    let src = raw.as_chunks::<CH>().0;
+    let mut dst = vec![0u8; raw.len()];
+    let dstp = dst.as_chunks_mut::<CH>().0;
+    op(src, w, h, dstp);
+    dst
+}
+
+macro_rules! perm_fn {
+    ($name:ident, $op:expr, $swap:expr, $fallback:ident) => {
+        pub(crate) fn $name(img: &DynamicImage) -> DynamicImage {
+            if (img.width() as usize)
+                * (img.height() as usize)
+                * (img.color().bytes_per_pixel() as usize)
+                < PERM_FAST_MIN_SUBPIXELS
+            {
+                return img.$fallback();
+            }
+            match img {
+                DynamicImage::ImageLuma8(i) => {
+                    let (w, h) = (i.width() as usize, i.height() as usize);
+                    let out = run_perm::<1>(i.as_raw(), w, h, $op);
+                    let (ow, oh) = if $swap { (h, w) } else { (w, h) };
+                    DynamicImage::ImageLuma8(
+                        image::GrayImage::from_raw(ow as u32, oh as u32, out).expect("perm size"),
+                    )
+                }
+                DynamicImage::ImageLumaA8(i) => {
+                    let (w, h) = (i.width() as usize, i.height() as usize);
+                    let out = run_perm::<2>(i.as_raw(), w, h, $op);
+                    let (ow, oh) = if $swap { (h, w) } else { (w, h) };
+                    DynamicImage::ImageLumaA8(
+                        image::GrayAlphaImage::from_raw(ow as u32, oh as u32, out)
+                            .expect("perm size"),
+                    )
+                }
+                DynamicImage::ImageRgb8(i) => {
+                    let (w, h) = (i.width() as usize, i.height() as usize);
+                    let out = run_perm::<3>(i.as_raw(), w, h, $op);
+                    let (ow, oh) = if $swap { (h, w) } else { (w, h) };
+                    DynamicImage::ImageRgb8(
+                        image::RgbImage::from_raw(ow as u32, oh as u32, out).expect("perm size"),
+                    )
+                }
+                DynamicImage::ImageRgba8(i) => {
+                    let (w, h) = (i.width() as usize, i.height() as usize);
+                    let out = run_perm::<4>(i.as_raw(), w, h, $op);
+                    let (ow, oh) = if $swap { (h, w) } else { (w, h) };
+                    DynamicImage::ImageRgba8(
+                        image::RgbaImage::from_raw(ow as u32, oh as u32, out).expect("perm size"),
+                    )
+                }
+                other => other.$fallback(),
+            }
+        }
+    };
+}
+
+perm_fn!(rotate270_fast, rot270_px, true, rotate270);
+perm_fn!(rotate180_fast, rot180_px, false, rotate180);
+perm_fn!(fliph_fast, fliph_px, false, fliph);
+perm_fn!(flipv_fast, flipv_px, false, flipv);
+
+// ---------------- huerotate ----------------
+
+fn hue_matrix(value: i32) -> [f64; 9] {
+    let angle: f64 = value as f64;
+    let cosv = angle.to_radians().cos();
+    let sinv = angle.to_radians().sin();
+    [
+        0.213 + cosv * 0.787 - sinv * 0.213,
+        0.715 - cosv * 0.715 - sinv * 0.715,
+        0.072 - cosv * 0.072 + sinv * 0.928,
+        0.213 - cosv * 0.213 + sinv * 0.143,
+        0.715 + cosv * 0.285 + sinv * 0.140,
+        0.072 - cosv * 0.072 - sinv * 0.283,
+        0.213 - cosv * 0.213 - sinv * 0.787,
+        0.715 - cosv * 0.715 + sinv * 0.715,
+        0.072 + cosv * 0.928 + sinv * 0.072,
+    ]
+}
+
+fn hue_apply<const CH: usize>(buf: &mut [u8], width: usize, m: &[f64; 9]) {
+    // The crate reads pixels through channels4(), which pads
+    // missing channels with 255 (it does not replicate luma):
+    // Luma inputs are (v, 255, 255); LumaA inputs are
+    // (v, alpha, 255) and its output alpha is clamp(new_g),
+    // because from_channels keeps the first CHANNELS values.
+    map_pixels_bands::<CH>(buf, width, &|p: &mut [u8; CH]| {
+        let r = p[0] as f64;
+        let (g, b) = match CH {
+            1 => (255.0, 255.0),
+            2 => (p[1] as f64, 255.0),
+            _ => (p[1] as f64, p[2] as f64),
+        };
+        let nr = m[0] * r + m[1] * g + m[2] * b;
+        if CH == 2 {
+            let ng = m[3] * r + m[4] * g + m[5] * b;
+            p[0] = nr.clamp(0.0, 255.0) as u8;
+            p[1] = ng.clamp(0.0, 255.0) as u8;
+            return;
+        }
+        p[0] = nr.clamp(0.0, 255.0) as u8;
+        if CH >= 3 {
+            let ng = m[3] * r + m[4] * g + m[5] * b;
+            let nb = m[6] * r + m[7] * g + m[8] * b;
+            p[1] = ng.clamp(0.0, 255.0) as u8;
+            p[2] = nb.clamp(0.0, 255.0) as u8;
+        }
+    });
+}
+
+pub(crate) fn huerotate_fast(img: DynamicImage, value: i32) -> DynamicImage {
+    let m = hue_matrix(value);
+    match img {
+        DynamicImage::ImageLuma8(mut i) => {
+            let w = i.width() as usize;
+            hue_apply::<1>(i.as_mut(), w, &m);
+            DynamicImage::ImageLuma8(i)
+        }
+        DynamicImage::ImageLumaA8(mut i) => {
+            let w = i.width() as usize;
+            hue_apply::<2>(i.as_mut(), w, &m);
+            DynamicImage::ImageLumaA8(i)
+        }
+        DynamicImage::ImageRgb8(mut i) => {
+            let w = i.width() as usize;
+            hue_apply::<3>(i.as_mut(), w, &m);
+            DynamicImage::ImageRgb8(i)
+        }
+        DynamicImage::ImageRgba8(mut i) => {
+            let w = i.width() as usize;
+            hue_apply::<4>(i.as_mut(), w, &m);
+            DynamicImage::ImageRgba8(i)
+        }
+        other => other.huerotate(value),
+    }
+}
+
+// ---------------- brighten ----------------
+
+pub(crate) fn brighten_fast(img: DynamicImage, value: i32) -> DynamicImage {
+    let lut: [u8; 256] = std::array::from_fn(|b| (b as i32 + value).clamp(0, 255) as u8);
+    fn apply<const CH: usize, const ALPHA: bool>(buf: &mut [u8], width: usize, lut: &[u8; 256]) {
+        map_pixels_bands::<CH>(buf, width, &|p: &mut [u8; CH]| {
+            let n = if ALPHA { CH - 1 } else { CH };
+            for c in 0..n {
+                p[c] = lut[p[c] as usize];
+            }
+        });
+    }
+    match img {
+        DynamicImage::ImageLuma8(mut i) => {
+            let w = i.width() as usize;
+            apply::<1, false>(i.as_mut(), w, &lut);
+            DynamicImage::ImageLuma8(i)
+        }
+        DynamicImage::ImageLumaA8(mut i) => {
+            let w = i.width() as usize;
+            apply::<2, true>(i.as_mut(), w, &lut);
+            DynamicImage::ImageLumaA8(i)
+        }
+        DynamicImage::ImageRgb8(mut i) => {
+            let w = i.width() as usize;
+            apply::<3, false>(i.as_mut(), w, &lut);
+            DynamicImage::ImageRgb8(i)
+        }
+        DynamicImage::ImageRgba8(mut i) => {
+            let w = i.width() as usize;
+            apply::<4, true>(i.as_mut(), w, &lut);
+            DynamicImage::ImageRgba8(i)
+        }
+        other => other.brighten(value),
     }
 }
 
@@ -867,7 +1541,7 @@ fn apply_to_region(
 /// tall thin region blurs to its own scale.
 pub fn blur_region(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> DynamicImage {
     let sigma = (w.min(h) as f32 / 8.0).clamp(1.0, 30.0);
-    apply_to_region(img, x, y, w, h, |region| region.blur(sigma))
+    apply_to_region(img, x, y, w, h, |region| blur_fast(region, sigma))
 }
 
 /// Pixelate one rectangle of `img`, with the block size
@@ -1035,7 +1709,7 @@ pub fn draw_border(img: &DynamicImage, width: u32, color: [u8; 3]) -> DynamicIma
 pub fn blur_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicImage {
     redact_faces(img, faces, |region, face| {
         let sigma = (face.w.min(face.h) as f32 / 6.0).max(1.0);
-        region.blur(sigma)
+        blur_fast(region, sigma)
     })
 }
 
@@ -2717,6 +3391,261 @@ pub(crate) mod identity_proofs {
             let mine = contrast_in_place(rgb.clone(), amount);
             let theirs = image::imageops::contrast(&rgb, amount);
             assert_eq!(mine.as_raw(), theirs.as_raw(), "amount {amount}");
+        }
+    }
+}
+
+// ===== Wave-3 identity proofs: the fast paths in this
+// module against the image-crate operations they replace.
+#[cfg(test)]
+mod w3proofs {
+    use super::*;
+
+    fn photo(w: u32, h: u32) -> DynamicImage {
+        let mut buf = vec![0u8; (w * h * 3) as usize];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                buf[i] = ((x * 255) / w.max(1)) as u8 ^ (next() >> 3);
+                buf[i + 1] = ((y * 255) / h.max(1)) as u8 ^ (next() >> 3);
+                buf[i + 2] = (((x + y) * 255) / (w + h).max(1)) as u8 ^ (next() >> 3);
+            }
+        }
+        DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, buf).unwrap())
+    }
+
+    fn checker(w: u32, h: u32) -> DynamicImage {
+        let mut img = image::RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x / 7 + y / 7) % 2 == 0 { 255 } else { 0 };
+                img.put_pixel(x, y, image::Rgb([v, 255 - v, (x % 251) as u8]));
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    fn bytes(img: &DynamicImage) -> (std::mem::Discriminant<DynamicImage>, (u32, u32), Vec<u8>) {
+        let raw: Vec<u8> = match img {
+            DynamicImage::ImageLuma8(i) => i.as_raw().clone(),
+            DynamicImage::ImageLumaA8(i) => i.as_raw().clone(),
+            DynamicImage::ImageRgb8(i) => i.as_raw().clone(),
+            DynamicImage::ImageRgba8(i) => i.as_raw().clone(),
+            other => other.to_rgba8().as_raw().clone(),
+        };
+        (
+            std::mem::discriminant(img),
+            (img.width(), img.height()),
+            raw,
+        )
+    }
+
+    fn variants(img: &DynamicImage) -> Vec<DynamicImage> {
+        vec![
+            DynamicImage::ImageLuma8(img.to_luma8()),
+            DynamicImage::ImageLumaA8(img.to_luma_alpha8()),
+            img.to_rgb8().into(),
+            img.to_rgba8().into(),
+        ]
+    }
+
+    #[test]
+    fn w3_blur_fast_matches_crate() {
+        // The sigma set straddles the crate's ring/transient
+        // engine split (kernel 55 at sigma ~8.45).
+        for make in [photo as fn(u32, u32) -> DynamicImage, checker] {
+            for (w, h) in [(333u32, 257u32), (64, 48), (7, 5), (3, 2), (1, 1), (31, 17)] {
+                let base = make(w, h);
+                for v in variants(&base) {
+                    for sigma in [0.3f32, 0.5, 1.0, 2.0, 4.0, 8.0, 8.4, 8.5, 12.0, 16.0, 40.0] {
+                        assert_eq!(
+                            bytes(&blur_fast(&v, sigma)),
+                            bytes(&v.blur(sigma)),
+                            "blur sigma {sigma} at {w}x{h}"
+                        );
+                    }
+                }
+            }
+        }
+        let big = photo(1200, 900);
+        for sigma in [2.0f32, 8.5, 16.0] {
+            assert_eq!(
+                bytes(&blur_fast(&big, sigma)),
+                bytes(&big.blur(sigma)),
+                "big blur {sigma}"
+            );
+        }
+        // sigma == 0 follows the crate's 0.8 substitution.
+        assert_eq!(bytes(&blur_fast(&big, 0.0)), bytes(&big.blur(0.0)));
+    }
+
+    #[test]
+    fn w3_perms_match_crate() {
+        // 1601x901 RGB is above the fast-path size gate, so
+        // these exercise the tiled/banded code, not the
+        // fallback; the small size exercises the fallback.
+        for (w, h) in [(1601u32, 901u32), (333, 257), (64, 48)] {
+            let base = photo(w, h);
+            for v in variants(&base) {
+                assert_eq!(
+                    bytes(&rotate180_fast(&v)),
+                    bytes(&v.rotate180()),
+                    "r180 {w}x{h}"
+                );
+                assert_eq!(
+                    bytes(&rotate270_fast(&v)),
+                    bytes(&v.rotate270()),
+                    "r270 {w}x{h}"
+                );
+                assert_eq!(bytes(&fliph_fast(&v)), bytes(&v.fliph()), "fliph {w}x{h}");
+                assert_eq!(bytes(&flipv_fast(&v)), bytes(&v.flipv()), "flipv {w}x{h}");
+            }
+        }
+        // Single-channel frames need 2000x2000 to clear the
+        // size gate; check the fast path engages correctly
+        // there too.
+        let big = photo(2000, 2000);
+        for v in [
+            DynamicImage::ImageLuma8(big.to_luma8()),
+            DynamicImage::ImageLumaA8(big.to_luma_alpha8()),
+        ] {
+            assert_eq!(
+                bytes(&rotate180_fast(&v)),
+                bytes(&v.rotate180()),
+                "r180 luma big"
+            );
+            assert_eq!(
+                bytes(&rotate270_fast(&v)),
+                bytes(&v.rotate270()),
+                "r270 luma big"
+            );
+            assert_eq!(bytes(&fliph_fast(&v)), bytes(&v.fliph()), "fliph luma big");
+            assert_eq!(bytes(&flipv_fast(&v)), bytes(&v.flipv()), "flipv luma big");
+        }
+    }
+
+    #[test]
+    fn w3_huerotate_and_brighten_match_crate() {
+        for (w, h) in [(1600u32, 900u32), (333, 257)] {
+            let base = photo(w, h);
+            for v in variants(&base) {
+                for deg in [0i32, 30, 90, 137, 180, 359, -45, 720] {
+                    assert_eq!(
+                        bytes(&huerotate_fast(v.clone(), deg)),
+                        bytes(&v.huerotate(deg)),
+                        "hue {deg} {w}x{h}"
+                    );
+                }
+                for val in [-200i32, -40, -1, 0, 1, 40, 200] {
+                    assert_eq!(
+                        bytes(&brighten_fast(v.clone(), val)),
+                        bytes(&v.brighten(val)),
+                        "brighten {val} {w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The pre-wave-3 rotate_arbitrary body, kept as the
+    /// reference the banded version must match byte for byte.
+    fn seq_rotate_reference(
+        img: DynamicImage,
+        degrees: f32,
+        fill: Option<[u8; 3]>,
+    ) -> DynamicImage {
+        let has_alpha = img.color().has_alpha();
+        let background: [u8; 4] = if has_alpha {
+            [0, 0, 0, 0]
+        } else {
+            let [r, g, b] = fill.unwrap_or([255, 255, 255]);
+            [r, g, b, 255]
+        };
+        let src = img.into_rgba8();
+        let (w, h) = (src.width() as f32, src.height() as f32);
+        let theta = degrees.to_radians();
+        let (sin, cos) = theta.sin_cos();
+        let (new_w, new_h) = rotated_canvas(src.width(), src.height(), degrees);
+        let (scx, scy) = ((w - 1.0) / 2.0, (h - 1.0) / 2.0);
+        let (dcx, dcy) = ((new_w as f32 - 1.0) / 2.0, (new_h as f32 - 1.0) / 2.0);
+        let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
+        let sample = |x: i32, y: i32| -> [f32; 4] {
+            if x < 0 || y < 0 || x >= src.width() as i32 || y >= src.height() as i32 {
+                [
+                    background[0] as f32,
+                    background[1] as f32,
+                    background[2] as f32,
+                    background[3] as f32,
+                ]
+            } else {
+                let p = src.get_pixel(x as u32, y as u32).0;
+                [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]
+            }
+        };
+        for y in 0..new_h {
+            for x in 0..new_w {
+                let dx = x as f32 - dcx;
+                let dy = y as f32 - dcy;
+                let sx = cos * dx + sin * dy + scx;
+                let sy = -sin * dx + cos * dy + scy;
+                let x0 = sx.floor();
+                let y0 = sy.floor();
+                let fx = sx - x0;
+                let fy = sy - y0;
+                let (x0, y0) = (x0 as i32, y0 as i32);
+                let mut px = [0f32; 4];
+                for (wx, xx) in [(1.0 - fx, x0), (fx, x0 + 1)] {
+                    for (wy, yy) in [(1.0 - fy, y0), (fy, y0 + 1)] {
+                        let tap = sample(xx, yy);
+                        let weight = wx * wy;
+                        for (i, channel) in px.iter_mut().enumerate() {
+                            *channel += tap[i] * weight;
+                        }
+                    }
+                }
+                out.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([
+                        px[0].round() as u8,
+                        px[1].round() as u8,
+                        px[2].round() as u8,
+                        px[3].round() as u8,
+                    ]),
+                );
+            }
+        }
+        if has_alpha {
+            DynamicImage::ImageRgba8(out)
+        } else {
+            DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(out).to_rgb8())
+        }
+    }
+
+    #[test]
+    fn w3_rotate_arbitrary_banded_matches_sequential() {
+        for (w, h) in [(800u32, 533u32), (333, 257)] {
+            let rgb = photo(w, h);
+            let rgba = DynamicImage::ImageRgba8(rgb.to_rgba8());
+            for deg in [30.0f32, 45.0, 12.5, 200.0] {
+                assert_eq!(
+                    bytes(&rotate_arbitrary(rgb.clone(), deg, None)),
+                    bytes(&seq_rotate_reference(rgb.clone(), deg, None)),
+                    "rotate {deg} rgb {w}x{h}"
+                );
+                assert_eq!(
+                    bytes(&rotate_arbitrary(rgba.clone(), deg, Some([9, 99, 199]))),
+                    bytes(&seq_rotate_reference(rgba.clone(), deg, Some([9, 99, 199]))),
+                    "rotate {deg} rgba {w}x{h}"
+                );
+            }
         }
     }
 }

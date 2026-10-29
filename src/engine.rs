@@ -2666,14 +2666,14 @@ pub(crate) fn exif_orientation(bytes: &[u8]) -> Option<u32> {
 /// Values outside 1-8 leave the image untouched.
 pub(crate) fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
     match orientation {
-        2 => img.fliph(),
-        3 => img.rotate180(),
-        4 => img.flipv(),
+        2 => crate::filters::fliph_fast(&img),
+        3 => crate::filters::rotate180_fast(&img),
+        4 => crate::filters::flipv_fast(&img),
         // Transpose and anti-transpose: a rotation plus a mirror.
-        5 => img.rotate90().fliph(),
+        5 => crate::filters::fliph_fast(&img.rotate90()),
         6 => img.rotate90(),
-        7 => img.rotate270().fliph(),
-        8 => img.rotate270(),
+        7 => crate::filters::fliph_fast(&crate::filters::rotate270_fast(&img)),
+        8 => crate::filters::rotate270_fast(&img),
         _ => img,
     }
 }
@@ -3272,10 +3272,10 @@ fn apply_size(
         resize_lanczos3(&img, w, h)
     };
     if size.flip_horizontal {
-        img = img.fliph();
+        img = crate::filters::fliph_fast(&img);
     }
     if size.flip_vertical {
-        img = img.flipv();
+        img = crate::filters::flipv_fast(&img);
     }
     Ok(img)
 }
@@ -3376,8 +3376,10 @@ fn apply_pad(
             // canvas, then blurred hard enough that only its
             // broad colors survive.
             let sigma = ((target_w.max(target_h) as f32) / 16.0).clamp(2.0, 80.0);
-            img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle)
-                .blur(sigma)
+            crate::filters::blur_fast(
+                &img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle),
+                sigma,
+            )
         }
     };
     let mut base = canvas.to_rgba8();
