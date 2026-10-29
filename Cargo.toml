@@ -13,6 +13,7 @@ members = ["crates/crabcrop-url"]
 crabcrop-url = { path = "crates/crabcrop-url" }
 ab_glyph = "0.2"
 axum = "0.8"
+bytes = "1"
 # C2PA provenance (issue #173), pinned to the exact release:
 # 0.91.0 is the first release that enforces the spec's
 # exclusion rule (the October 2026 forgery), and the crate is

@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::cache::{CachedImage, key_belongs_to_source};
+use crate::cache::CachedImage;
 use crate::url::ImageFormat;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -287,17 +287,18 @@ impl DiskStore {
     /// many entries were removed.
     pub fn purge_matching(&self, base: &str) -> usize {
         let stems: Vec<String> = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
             // Built once, not per key examined.
             let prefix = format!("{base}#");
-            let keys: Vec<String> = inner
+            inner
                 .entries
-                .keys()
-                .filter(|k| k.as_str() == base || k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            keys.iter()
-                .filter_map(|key| evict_entry(&mut inner, key).map(|(stem, _)| stem))
+                .extract_if(|k, _| k.as_str() == base || k.starts_with(&prefix))
+                .map(|(key, (stem, size, _))| {
+                    inner.total_bytes -= size;
+                    inner.stamps.remove(&key);
+                    stem
+                })
                 .collect()
         };
         for stem in &stems {
@@ -312,15 +313,16 @@ impl DiskStore {
     /// were removed.
     pub fn purge_group(&self, group: &str) -> usize {
         let stems: Vec<String> = {
-            let mut inner = self.inner.lock().unwrap();
-            let keys: Vec<String> = inner
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            inner
                 .entries
-                .iter()
-                .filter(|(_, (_, _, groups))| groups.iter().any(|g| g == group))
-                .map(|(key, _)| key.clone())
-                .collect();
-            keys.iter()
-                .filter_map(|key| evict_entry(&mut inner, key).map(|(stem, _)| stem))
+                .extract_if(|_, (_, _, groups)| groups.iter().any(|g| g == group))
+                .map(|(key, (stem, size, _))| {
+                    inner.total_bytes -= size;
+                    inner.stamps.remove(&key);
+                    stem
+                })
                 .collect()
         };
         for stem in &stems {
@@ -355,15 +357,21 @@ impl DiskStore {
     /// Returns how many entries were removed.
     pub fn purge_source(&self, source: &str) -> usize {
         let stems: Vec<String> = {
-            let mut inner = self.inner.lock().unwrap();
-            let keys: Vec<String> = inner
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            // Built once, not per key examined.
+            let suffix = format!("/{source}");
+            inner
                 .entries
-                .keys()
-                .filter(|k| key_belongs_to_source(k, source))
-                .cloned()
-                .collect();
-            keys.iter()
-                .filter_map(|key| evict_entry(&mut inner, key).map(|(stem, _)| stem))
+                .extract_if(|k, _| {
+                    let base = k.split('#').next().unwrap_or(k);
+                    base == source || base.ends_with(&suffix)
+                })
+                .map(|(key, (stem, size, _))| {
+                    inner.total_bytes -= size;
+                    inner.stamps.remove(&key);
+                    stem
+                })
                 .collect()
         };
         for stem in &stems {
@@ -621,14 +629,14 @@ pub(crate) fn parse_entry(data: &[u8], entry_key: &[u8]) -> Option<(String, Cach
     if !verify_entry_mac(entry_key, &data[header.covered_start..], &header.mac) {
         return None;
     }
-    let bytes = data.get(header.payload_offset..)?.to_vec();
-    if bytes.is_empty() {
+    let payload = data.get(header.payload_offset..)?;
+    if payload.is_empty() {
         return None;
     }
     Some((
         header.key,
         CachedImage {
-            bytes,
+            bytes: bytes::Bytes::copy_from_slice(payload),
             format: header.format,
             quality: header.quality,
             groups: header.groups,
@@ -690,7 +698,7 @@ mod tests {
 
     fn image(bytes: &[u8]) -> CachedImage {
         CachedImage {
-            bytes: bytes.to_vec(),
+            bytes: bytes::Bytes::copy_from_slice(bytes),
             format: ImageFormat::Png,
             quality: Some(80),
             groups: Vec::new(),

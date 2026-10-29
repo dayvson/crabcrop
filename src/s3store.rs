@@ -785,7 +785,7 @@ mod tests {
 
     fn image(bytes: &[u8], groups: &[&str]) -> CachedImage {
         CachedImage {
-            bytes: bytes.to_vec(),
+            bytes: bytes::Bytes::copy_from_slice(bytes),
             format: ImageFormat::WebP,
             quality: Some(80),
             groups: groups.iter().map(|g| g.to_string()).collect(),
@@ -802,7 +802,7 @@ mod tests {
             .await;
         // A second instance (another replica) reads it back.
         let got = b.get("300x200/example.com/i.jpg").await.unwrap();
-        assert_eq!(got.bytes, b"pixels");
+        assert_eq!(got.bytes, bytes::Bytes::from_static(b"pixels"));
         assert_eq!(got.groups, vec!["hero".to_string()]);
         assert_eq!(got.quality, Some(80));
     }
@@ -986,8 +986,14 @@ mod tests {
         // different entry: invisible, and independently held.
         assert!(b.get("same-key").await.is_none());
         b.put("same-key", &image(b"from-b", &[])).await;
-        assert_eq!(a.get("same-key").await.unwrap().bytes, b"from-a");
-        assert_eq!(b.get("same-key").await.unwrap().bytes, b"from-b");
+        assert_eq!(
+            a.get("same-key").await.unwrap().bytes,
+            bytes::Bytes::from_static(b"from-a")
+        );
+        assert_eq!(
+            b.get("same-key").await.unwrap().bytes,
+            bytes::Bytes::from_static(b"from-b")
+        );
         assert!(
             fake.objects
                 .lock()
@@ -999,7 +1005,10 @@ mod tests {
         // A purge under one prefix never reaches the other.
         assert_eq!(a.purge_group("hero").await, 1);
         assert!(a.get("same-key").await.is_none());
-        assert_eq!(b.get("same-key").await.unwrap().bytes, b"from-b");
+        assert_eq!(
+            b.get("same-key").await.unwrap().bytes,
+            bytes::Bytes::from_static(b"from-b")
+        );
         assert_eq!(b.purge_matching("same-key", "same-key").await, 1);
         assert!(fake.objects.lock().unwrap().is_empty());
     }

@@ -1012,6 +1012,7 @@ version = "0.9.3"
 dependencies = [
  "ab_glyph",
  "axum",
+ "bytes",
  "c2pa",
  "crabcrop-url",
  "fast-ssim2",
