@@ -15,7 +15,7 @@ FROM rust:1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e935
 WORKDIR /build
 # pkg-config + the dav1d headers for the avif-decode build.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config libdav1d-dev \
+    && apt-get install -y --no-install-recommends pkg-config libdav1d-dev nasm \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
