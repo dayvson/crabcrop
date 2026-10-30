@@ -2124,6 +2124,122 @@ type ApplyOutcome = (
     Option<SegmentRecord>,
 );
 
+/// A crop+resize fusion the chain qualifies for (issue
+/// #287): the rectangle a `crop-rect` cuts, resampled to the
+/// chain's resize target in a single fast_image_resize call
+/// through its crop box, instead of materializing the window
+/// and resampling that. The backend computes its convolution
+/// coefficients against the full-source geometry when a crop
+/// box is set, so the fused result differs from the two-step
+/// chain by rounding-class deltas: the wave-3 pipeline lane
+/// measured 1.0 to 3.5 percent of pixels differing, a max
+/// delta of 4 on downscales and 10 on upscales, and a mean
+/// delta of at most 0.027, for a 1.5 to 3.6x speedup on the
+/// fused shapes. Any chain the gates in [`fusion_plan`] do
+/// not accept runs the two-step path untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FusionPlan {
+    /// Index of the `crop-rect` operation in the chain.
+    crop_index: usize,
+    /// Index of the resize operation in the chain.
+    size_index: usize,
+    /// The crop window: (left, top, width, height).
+    window: (u32, u32, u32, u32),
+}
+
+/// Decide whether the chain's crop and resize fuse (issue
+/// #287). The gates, one per condition:
+///
+/// - G1: exactly one crop in the chain, and it is a
+///   `crop-rect`. Its window is static in the operation; an
+///   aspect crop's window depends on focal and detection
+///   state decided at run time, so it never fuses.
+/// - G2: exactly one resize (`Operation::Size`) in the
+///   chain.
+/// - G3: the crop precedes the resize, and only decode-time
+///   no-ops (`frame`, `page`) sit between them: no pixel
+///   operation may run on the window before the resample.
+/// - G4: the resize is the chain's final pixel operation:
+///   only decode-time no-ops follow it.
+/// - G5: no operation after the crop consumes the full
+///   frame's geometry. A focal rectangle validates against
+///   the frame in effect where it sits, a pad builds a
+///   canvas from it, filters read regions and detections
+///   from it; under fusion the frame at those points is the
+///   un-cropped one, so any of them after the crop refuses
+///   the fusion. G3 and G4 are this gate's two halves; it is
+///   checked as its own scan so the condition stands on its
+///   own.
+/// - G6: the chain is not a debug chain (`debug:focal`
+///   renders a diagnostic of the exact pixels, so it stays
+///   on the two-step path), and the rectangle has positive
+///   area.
+fn fusion_plan(ops: &[Operation]) -> Option<FusionPlan> {
+    // G1: one crop, and it is a crop-rect.
+    let mut crop: Option<(usize, (u32, u32, u32, u32))> = None;
+    for (index, op) in ops.iter().enumerate() {
+        match op {
+            Operation::CropRect {
+                left,
+                top,
+                right,
+                bottom,
+            } => {
+                if crop.is_some() {
+                    return None;
+                }
+                crop = Some((index, (*left, *top, *right, *bottom)));
+            }
+            Operation::Crop { .. } => return None,
+            _ => {}
+        }
+    }
+    let (crop_index, (left, top, right, bottom)) = crop?;
+    // G2: one resize.
+    let mut size_index: Option<usize> = None;
+    for (index, op) in ops.iter().enumerate() {
+        if matches!(op, Operation::Size(_)) {
+            if size_index.is_some() {
+                return None;
+            }
+            size_index = Some(index);
+        }
+    }
+    let size_index = size_index?;
+    // G3: the crop precedes the resize, with only decode-time
+    // no-ops between them.
+    if crop_index > size_index {
+        return None;
+    }
+    let decode_noop = |op: &Operation| matches!(op, Operation::Frame(_) | Operation::Page(_));
+    if !ops[crop_index + 1..size_index].iter().all(decode_noop) {
+        return None;
+    }
+    // G4: the resize is the final pixel operation.
+    if !ops[size_index + 1..].iter().all(decode_noop) {
+        return None;
+    }
+    // G5: nothing after the crop consumes the full frame.
+    for (index, op) in ops.iter().enumerate().skip(crop_index + 1) {
+        if index != size_index && !decode_noop(op) {
+            return None;
+        }
+    }
+    // G6: no debug chain, and the rectangle has positive
+    // area.
+    if ops.iter().any(|op| matches!(op, Operation::DebugFocal)) {
+        return None;
+    }
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(FusionPlan {
+        crop_index,
+        size_index,
+        window: (left, top, right - left, bottom - top),
+    })
+}
+
 fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
@@ -2162,7 +2278,13 @@ fn apply_operations(
     // of what was segmented, in chain order.
     let mut segment_memo: SegmentMemo = None;
     let mut segment_objects: Vec<SegmentObject> = Vec::new();
-    for op in ops {
+    // The crop+resize fusion plan (issue #287): when the
+    // chain qualifies, the crop-rect arm records its window
+    // instead of materializing it, and the resize arm
+    // resamples the window straight from the frame in hand.
+    let fusion = fusion_plan(ops);
+    let mut fused_window: Option<(u32, u32, u32, u32)> = None;
+    for (op_index, op) in ops.iter().enumerate() {
         ctx.check_deadline()?;
         match op {
             Operation::DebugFocal => debug_armed = true,
@@ -2176,7 +2298,20 @@ fn apply_operations(
             // runs on.
             Operation::Page(_) => {}
             Operation::Size(size) => {
-                img = apply_size(img, size, cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)), dpr)?
+                img = if fusion.is_some_and(|plan| plan.size_index == op_index) {
+                    let window = fused_window
+                        .take()
+                        .expect("the fusion plan pairs this resize with its crop");
+                    apply_size_cropped(
+                        img,
+                        window,
+                        size,
+                        cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
+                        dpr,
+                    )?
+                } else {
+                    apply_size(img, size, cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)), dpr)?
+                }
             }
             Operation::FitIn { size, adaptive } => {
                 img = apply_fit_in(img, size, *adaptive, cap, dpr)?
@@ -2225,7 +2360,21 @@ fn apply_operations(
                         img.height()
                     )));
                 }
-                img = img.crop_imm(*left, *top, right - left, bottom - top);
+                if fusion.is_some_and(|plan| plan.crop_index == op_index) {
+                    // Issue #287: the bounds validation above
+                    // already ran, so an out-of-bounds
+                    // rectangle errors exactly as the two-step
+                    // path does. The window itself is cut by
+                    // the resize, not here; the budget check
+                    // the two-step path runs on the cropped
+                    // result at the end of this step runs on
+                    // the window now, so an oversized window
+                    // refuses the same way.
+                    check_output_pixels(right - left, bottom - top)?;
+                    fused_window = Some((*left, *top, right - left, bottom - top));
+                } else {
+                    img = img.crop_imm(*left, *top, right - left, bottom - top);
+                }
             }
             Operation::Crop { size, align } => {
                 let (tw, th) = match (size.width, size.height) {
@@ -2633,8 +2782,15 @@ fn apply_operations(
         }
         // The running image stays inside the output budget
         // after every operation, not only after the ones
-        // that size it (issue #182, audit R2-12).
-        check_output_pixels(img.width(), img.height())?;
+        // that size it (issue #182, audit R2-12). While a
+        // fused window is pending (issue #287) the image in
+        // hand is still the pre-crop frame: the two-step
+        // path checks the window at this point, and the
+        // fused crop ran that same check on the window when
+        // it recorded it.
+        if fused_window.is_none() {
+            check_output_pixels(img.width(), img.height())?;
+        }
     }
     if debug_armed {
         // The debug view replaces the transform result. With
@@ -3298,13 +3454,43 @@ fn apply_size(
     cap: Option<SizeCap>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
+    apply_size_windowed(img, size, cap, dpr, None)
+}
+
+/// [`apply_size`] for the crop+resize fusion (issue #287):
+/// `img` is still the whole frame and `window` is the (left,
+/// top, width, height) rectangle the chain's crop-rect named.
+/// The size resolves against the window's dimensions, exactly
+/// as it resolves against the materialized crop in the
+/// two-step path, and the resample reads the window straight
+/// from the frame.
+fn apply_size_cropped(
+    img: DynamicImage,
+    window: (u32, u32, u32, u32),
+    size: &ImageSize,
+    cap: Option<SizeCap>,
+    dpr: f32,
+) -> Result<DynamicImage, EngineError> {
+    apply_size_windowed(img, size, cap, dpr, Some(window))
+}
+
+fn apply_size_windowed(
+    img: DynamicImage,
+    size: &ImageSize,
+    cap: Option<SizeCap>,
+    dpr: f32,
+    window: Option<(u32, u32, u32, u32)>,
+) -> Result<DynamicImage, EngineError> {
     let size = &ImageSize {
         width: scale_dimension(size.width, dpr),
         height: scale_dimension(size.height, dpr),
         flip_horizontal: size.flip_horizontal,
         flip_vertical: size.flip_vertical,
     };
-    let (sw, sh) = (img.width(), img.height());
+    let (sw, sh) = match window {
+        Some((_, _, w, h)) => (w, h),
+        None => (img.width(), img.height()),
+    };
     let w = match size.width {
         Dimension::Pixels(n) => n,
         Dimension::Original => sw,
@@ -3328,9 +3514,18 @@ fn apply_size(
     };
     check_output_pixels(w, h)?;
     let mut img = if w == sw && h == sh {
-        img
+        match window {
+            // No resample runs: the two-step path returns
+            // the materialized window itself, so the fused
+            // path materializes it here.
+            Some((x, y, ww, wh)) => img.crop_imm(x, y, ww, wh),
+            None => img,
+        }
     } else {
-        resize_lanczos3(&img, w, h)
+        match window {
+            Some((x, y, ww, wh)) => resize_lanczos3_cropped(&img, x, y, ww, wh, w, h),
+            None => resize_lanczos3(&img, w, h),
+        }
     };
     if size.flip_horizontal {
         img = crate::filters::fliph_fast(&img);
@@ -3349,18 +3544,9 @@ fn apply_size(
 /// ones. Pixel types the backend does not cover fall back to
 /// the image crate.
 pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
-    let mut dst = match img {
-        DynamicImage::ImageLuma8(_) => DynamicImage::new_luma8(w, h),
-        DynamicImage::ImageLumaA8(_) => DynamicImage::new_luma_a8(w, h),
-        DynamicImage::ImageRgb8(_) => DynamicImage::new_rgb8(w, h),
-        DynamicImage::ImageRgba8(_) => DynamicImage::new_rgba8(w, h),
-        DynamicImage::ImageLuma16(_) => DynamicImage::new_luma16(w, h),
-        DynamicImage::ImageLumaA16(_) => DynamicImage::new_luma_a16(w, h),
-        DynamicImage::ImageRgb16(_) => DynamicImage::new_rgb16(w, h),
-        DynamicImage::ImageRgba16(_) => DynamicImage::new_rgba16(w, h),
-        DynamicImage::ImageRgb32F(_) => DynamicImage::new_rgb32f(w, h),
-        DynamicImage::ImageRgba32F(_) => DynamicImage::new_rgba32f(w, h),
-        _ => {
+    let mut dst = match blank_like(img, w, h) {
+        Some(dst) => dst,
+        None => {
             return DynamicImage::ImageRgba8(image::imageops::resize(
                 img,
                 w,
@@ -3380,6 +3566,61 @@ pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImag
             h,
             image::imageops::FilterType::Lanczos3,
         )),
+    }
+}
+
+/// A blank destination image of `img`'s own variant at
+/// (w, h): the resizers' shared starting point. `None` for
+/// the variants outside the table, which the resizers hand
+/// to the image crate instead.
+fn blank_like(img: &DynamicImage, w: u32, h: u32) -> Option<DynamicImage> {
+    match img {
+        DynamicImage::ImageLuma8(_) => Some(DynamicImage::new_luma8(w, h)),
+        DynamicImage::ImageLumaA8(_) => Some(DynamicImage::new_luma_a8(w, h)),
+        DynamicImage::ImageRgb8(_) => Some(DynamicImage::new_rgb8(w, h)),
+        DynamicImage::ImageRgba8(_) => Some(DynamicImage::new_rgba8(w, h)),
+        DynamicImage::ImageLuma16(_) => Some(DynamicImage::new_luma16(w, h)),
+        DynamicImage::ImageLumaA16(_) => Some(DynamicImage::new_luma_a16(w, h)),
+        DynamicImage::ImageRgb16(_) => Some(DynamicImage::new_rgb16(w, h)),
+        DynamicImage::ImageRgba16(_) => Some(DynamicImage::new_rgba16(w, h)),
+        DynamicImage::ImageRgb32F(_) => Some(DynamicImage::new_rgb32f(w, h)),
+        DynamicImage::ImageRgba32F(_) => Some(DynamicImage::new_rgba32f(w, h)),
+        _ => None,
+    }
+}
+
+/// [`resize_lanczos3`] fused with the crop that precedes it
+/// (issue #287): the resample reads the (x, y, w, h) window
+/// straight from `img` through the backend's crop box,
+/// instead of resampling a materialized copy of the window.
+/// The backend computes its coefficients against the
+/// full-source geometry when a crop box is set, so the
+/// result differs from the two-step chain by the
+/// rounding-class deltas [`fusion_plan`] documents. A
+/// backend failure, or a variant outside the table, falls
+/// back to the exact two-step chain.
+pub(crate) fn resize_lanczos3_cropped(
+    img: &DynamicImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    target_w: u32,
+    target_h: u32,
+) -> DynamicImage {
+    let two_step = || resize_lanczos3(&img.crop_imm(x, y, w, h), target_w, target_h);
+    let mut dst = match blank_like(img, target_w, target_h) {
+        Some(dst) => dst,
+        None => return two_step(),
+    };
+    let opts = fast_image_resize::ResizeOptions::new()
+        .crop(x as f64, y as f64, w as f64, h as f64)
+        .resize_alg(fast_image_resize::ResizeAlg::Convolution(
+            fast_image_resize::FilterType::Lanczos3,
+        ));
+    match fast_image_resize::Resizer::new().resize(img, &mut dst, &opts) {
+        Ok(()) => dst,
+        Err(_) => two_step(),
     }
 }
 
@@ -4927,6 +5168,334 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+    }
+
+    fn rect_op(left: u32, top: u32, right: u32, bottom: u32) -> Operation {
+        Operation::CropRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn fusion_plan_accepts_the_canonical_chain() {
+        // Issue #287: one crop-rect feeding one resize, and
+        // nothing else, fuses; the plan carries the window.
+        let ops = [
+            rect_op(600, 400, 1800, 1200),
+            size_op(Dimension::Pixels(800), Dimension::Pixels(533)),
+        ];
+        let plan = fusion_plan(&ops).expect("the canonical chain fuses");
+        assert_eq!(plan.crop_index, 0);
+        assert_eq!(plan.size_index, 1);
+        assert_eq!(plan.window, (600, 400, 1200, 800));
+        // Work ahead of the crop runs identically on either
+        // path, and decode-time no-ops may sit between the
+        // crop and the resize and after it.
+        let ops = [
+            Operation::Filters(vec![Filter::Grayscale]),
+            rect_op(600, 400, 1800, 1200),
+            Operation::Page(2),
+            size_op(Dimension::Pixels(800), Dimension::Pixels(533)),
+            Operation::Frame(crate::url::FrameSelection::Poster),
+        ];
+        assert!(fusion_plan(&ops).is_some());
+        // A focal rectangle ahead of the crop validates
+        // against the pre-crop frame on both paths.
+        let ops = [
+            focal_op(0, 0, 100, 100),
+            rect_op(600, 400, 1800, 1200),
+            size_op(Dimension::Pixels(800), Dimension::Pixels(533)),
+        ];
+        assert!(fusion_plan(&ops).is_some());
+    }
+
+    #[test]
+    fn fusion_plan_g1_requires_one_crop_rect() {
+        // An aspect crop's window is a run-time decision, not
+        // a static rectangle.
+        let ops = [
+            crop_op(800, 533, Align::Center),
+            size_op(Dimension::Pixels(800), Dimension::Pixels(533)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+        // Two crop-rects: the second window is named in the
+        // first window's coordinates, not the frame's.
+        let ops = [
+            rect_op(0, 0, 100, 100),
+            rect_op(0, 0, 50, 50),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+        // No crop at all.
+        let ops = [size_op(Dimension::Pixels(800), Dimension::Pixels(533))];
+        assert!(fusion_plan(&ops).is_none());
+    }
+
+    #[test]
+    fn fusion_plan_g2_requires_one_resize() {
+        // No resize: nothing for the crop to fuse into.
+        let ops = [rect_op(0, 0, 100, 100)];
+        assert!(fusion_plan(&ops).is_none());
+        // Two resizes: the plan would have to pick one.
+        let ops = [
+            rect_op(0, 0, 100, 100),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+            size_op(Dimension::Pixels(40), Dimension::Pixels(40)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+    }
+
+    #[test]
+    fn fusion_plan_g3_requires_the_crop_to_feed_the_resize() {
+        // A pixel operation between the crop and the resize
+        // runs on the window in the two-step path.
+        let ops = [
+            rect_op(0, 0, 100, 100),
+            Operation::Filters(vec![Filter::Grayscale]),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+        // A resize ahead of the crop resamples the frame, not
+        // the window.
+        let ops = [
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+            rect_op(0, 0, 100, 100),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+    }
+
+    #[test]
+    fn fusion_plan_g4_requires_the_resize_to_be_the_final_pixel_op() {
+        let ops = [
+            rect_op(0, 0, 100, 100),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+            Operation::Filters(vec![Filter::Grayscale]),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+    }
+
+    #[test]
+    fn fusion_plan_g5_refuses_geometry_consumers_after_the_crop() {
+        // A focal rectangle after the crop validates against
+        // the frame in effect where it sits: the window in
+        // the two-step path, the whole frame under fusion.
+        let ops = [
+            rect_op(0, 0, 100, 100),
+            focal_op(0, 0, 50, 50),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+        let ops = [
+            rect_op(0, 0, 100, 100),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+            focal_op(0, 0, 50, 50),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+        // A pad after the crop builds its canvas from the
+        // frame in effect where it sits.
+        let ops = [
+            rect_op(0, 0, 100, 100),
+            Operation::Pad {
+                size: ImageSize {
+                    width: Dimension::Pixels(200),
+                    height: Dimension::Pixels(200),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                fill: PadFill::Color([0, 0, 0]),
+            },
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+    }
+
+    #[test]
+    fn fusion_plan_g6_refuses_debug_chains_and_empty_rectangles() {
+        // The debug view renders a diagnostic of the exact
+        // pixels, so its chains stay on the two-step path.
+        let ops = [
+            Operation::DebugFocal,
+            rect_op(0, 0, 100, 100),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+        // Zero-area rectangles keep today's behavior, odd as
+        // it may be, on the two-step path.
+        let ops = [
+            rect_op(10, 10, 10, 20),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+        let ops = [
+            rect_op(10, 10, 20, 10),
+            size_op(Dimension::Pixels(80), Dimension::Pixels(80)),
+        ];
+        assert!(fusion_plan(&ops).is_none());
+    }
+
+    /// The pixel delta between two same-sized images, in
+    /// the wave-3 lane's measures: (percent of pixels
+    /// differing, max subpixel delta, mean subpixel delta).
+    fn pixel_delta(a: &DynamicImage, b: &DynamicImage) -> (f64, u32, f64) {
+        let (a, b) = (a.to_rgb8(), b.to_rgb8());
+        assert_eq!(a.dimensions(), b.dimensions());
+        let mut diff_px = 0u64;
+        let mut max = 0u32;
+        let mut sum = 0u64;
+        for (pa, pb) in a.pixels().zip(b.pixels()) {
+            if pa != pb {
+                diff_px += 1;
+            }
+            for i in 0..3 {
+                let d = pa.0[i].abs_diff(pb.0[i]) as u32;
+                max = max.max(d);
+                sum += d as u64;
+            }
+        }
+        let total = (a.width() * a.height()) as u64;
+        (
+            diff_px as f64 * 100.0 / total as f64,
+            max,
+            sum as f64 / (total * 3) as f64,
+        )
+    }
+
+    /// The sinusoid photo surrogate at any size (the
+    /// generator behind `photo_like_png`, unencoded).
+    fn photo_like_rgb(w: u32, h: u32) -> DynamicImage {
+        let mut img = DynamicImage::new_rgb8(w, h);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            let (fx, fy) = (x as f64, y as f64);
+            let wave = |phase: f64, a: f64, b: f64| {
+                128.0
+                    + 62.0 * (fx * a + phase).sin() * (fy * b + phase * 0.7).cos()
+                    + 24.0 * ((fx + fy) * 0.021 + phase).sin()
+            };
+            *p = image::Rgb([
+                wave(0.0, 0.11, 0.07).clamp(0.0, 255.0) as u8,
+                wave(2.1, 0.09, 0.13).clamp(0.0, 255.0) as u8,
+                wave(4.2, 0.05, 0.05).clamp(0.0, 255.0) as u8,
+            ]);
+        }
+        img
+    }
+
+    /// The wave-3 lane's probe photo (a gradient with
+    /// LCG noise), the fixture the accepted fusion
+    /// envelope was measured on, at the lane's
+    /// own shapes.
+    fn lane_photo(w: u32, h: u32) -> DynamicImage {
+        let mut buf = vec![0u8; (w * h * 3) as usize];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                buf[i] = ((x * 255) / w.max(1)) as u8 ^ (next() >> 3);
+                buf[i + 1] = ((y * 255) / h.max(1)) as u8 ^ (next() >> 3);
+                buf[i + 2] = (((x + y) * 255) / (w + h).max(1)) as u8 ^ (next() >> 3);
+            }
+        }
+        DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, buf).unwrap())
+    }
+
+    fn run_chain(img: &DynamicImage, ops: &[Operation]) -> DynamicImage {
+        let directives = crate::url::RequestDirectives::analyze(ops);
+        let ctx = ProcessContext::default();
+        apply_operations(img.clone(), ops, None, 1.0, &ctx, &directives)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn fused_crop_resize_downscale_stays_inside_the_accepted_delta() {
+        // Issue #287: the fused output differs from the
+        // two-step chain by rounding-class deltas only. On
+        // this fixture at this shape the wave-3 lane
+        // measured the envelope the change was accepted
+        // with: 1.0 percent of pixels differ, max delta 4,
+        // mean 0.007 (reproduced exactly by this test's
+        // inputs). The guards keep the delta in that class
+        // with headroom for the rounding jitter between the
+        // backend's CPU kernel tiers; a wrong window or
+        // geometry would land orders of magnitude outside
+        // them.
+        let src = lane_photo(2400, 1600);
+        let ops = [
+            rect_op(600, 400, 1800, 1200),
+            size_op(Dimension::Pixels(800), Dimension::Pixels(533)),
+        ];
+        let fused = run_chain(&src, &ops);
+        let two_step = resize_lanczos3(&src.crop_imm(600, 400, 1200, 800), 800, 533);
+        assert_eq!(fused.dimensions(), (800, 533));
+        let (pct, max, mean) = pixel_delta(&fused, &two_step);
+        assert!(pct > 0.0, "the fused path must actually engage");
+        assert!(pct <= 3.5, "{pct}% of pixels differ");
+        assert!(max <= 6, "max delta {max}");
+        assert!(mean <= 0.02, "mean delta {mean}");
+    }
+
+    #[test]
+    fn fused_crop_resize_upscale_stays_inside_the_accepted_delta() {
+        // The upscale shape from the same probe: 3.5
+        // percent of pixels differ, max delta 10, mean
+        // 0.027 measured; the guards carry the same
+        // headroom as the downscale's.
+        let src = lane_photo(2400, 1600);
+        let ops = [
+            rect_op(100, 100, 700, 500),
+            size_op(Dimension::Pixels(1200), Dimension::Pixels(800)),
+        ];
+        let fused = run_chain(&src, &ops);
+        let two_step = resize_lanczos3(&src.crop_imm(100, 100, 600, 400), 1200, 800);
+        assert_eq!(fused.dimensions(), (1200, 800));
+        let (pct, max, mean) = pixel_delta(&fused, &two_step);
+        assert!(pct > 0.0, "the fused path must actually engage");
+        assert!(pct <= 5.0, "{pct}% of pixels differ");
+        assert!(max <= 14, "max delta {max}");
+        assert!(mean <= 0.04, "mean delta {mean}");
+    }
+
+    #[test]
+    fn fused_chain_out_of_bounds_crop_rect_errors_like_the_two_step_path() {
+        // The fused crop validates before it defers: the
+        // error is the two-step path's own.
+        let engine = Engine;
+        let src = solid_png(100, 60, [10, 20, 30]);
+        let plain = engine.process(&src, &[rect_op(0, 0, 101, 60)]).unwrap_err();
+        let fused = engine
+            .process(
+                &src,
+                &[
+                    rect_op(0, 0, 101, 60),
+                    size_op(Dimension::Pixels(50), Dimension::Pixels(30)),
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(fused.to_string(), plain.to_string());
+    }
+
+    #[test]
+    fn fused_chain_without_a_resample_returns_the_window_itself() {
+        // When the resize target is the window's own size no
+        // resample runs on either path, and the fused path
+        // materializes the window exactly.
+        let src = photo_like_rgb(120, 80);
+        let ops = [
+            rect_op(10, 10, 50, 40),
+            size_op(Dimension::Pixels(40), Dimension::Pixels(30)),
+        ];
+        let out = run_chain(&src, &ops);
+        let window = src.crop_imm(10, 10, 40, 30);
+        assert_eq!(out.to_rgb8().as_raw(), window.to_rgb8().as_raw());
     }
 
     fn focal_op(left: u32, top: u32, right: u32, bottom: u32) -> Operation {
