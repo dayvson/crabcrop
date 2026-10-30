@@ -256,7 +256,7 @@ fn fir_resize_gray(img: &GrayImage, w: u32, h: u32) -> GrayImage {
 /// then normalize per channel with ImageNet statistics. Output
 /// is planar CHW.
 fn preprocess(img: &DynamicImage) -> Vec<f32> {
-    let small = img.resize_exact(320, 320, FilterType::Triangle).to_rgb8();
+    let small = fir_resize_rgb(&img.to_rgb8(), 320, 320);
     let max = small.pixels().flat_map(|p| p.0).max().unwrap_or(0);
     let scale = if max == 0 { 1.0 } else { max as f32 };
     const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
