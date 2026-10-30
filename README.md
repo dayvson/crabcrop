@@ -24,23 +24,21 @@ crabcrop is for sites and apps that serve the same images at many sizes and want
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releases/latest/download/crabcrop-installer.sh | sh
 ```
 
-**Homebrew:** download `crabcrop.rb` from the [latest release](https://github.com/dayvson/crabcrop/releases/latest), then:
-
-```bash
-brew install --formula ./crabcrop.rb
-```
-
 **Docker:** the base image, and the AI variant with background removal and face detection on board:
 
 ```bash
 docker pull ghcr.io/dayvson/crabcrop:0.9.5
 docker pull ghcr.io/dayvson/crabcrop-ai:0.9.5
-docker run -e CRABCROP_SECRET=your-secret -p 3000:3000 ghcr.io/dayvson/crabcrop:0.9.5
+docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.9.5
 ```
 
 **Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases). To build from source instead, see [Deployment](#deployment).
 
+**crates.io:** `cargo install crabcrop` installs the current release by building it from source, so it needs the source-build prerequisites listed in the [Quickstart](#quickstart).
+
 ## Quickstart
+
+Step 1 builds from source. Beyond the Rust toolchain, a source build needs a C compiler (the tree vendors C libraries), nasm on x86_64 (the AVIF encoder's assembly; its build script fails without it), and, only for the vendored AVIF decode route (`--features avif-decode`), meson and ninja, or a system libdav1d 1.3 or newer found through pkg-config instead. The prebuilt routes in [Install](#install) need none of this.
 
 **1. Start the server.** A secret is required. For local development, also allow unsigned URLs:
 
@@ -60,10 +58,10 @@ Replace `example.com/photo.jpg` with the URL of an image you control. You get ba
 **3. Sign your URLs in production.** Drop `CRABCROP_ALLOW_UNSAFE` and put an HMAC signature in the first path segment:
 
 ```bash
-curl "http://localhost:3000/3c1f6c180116661877bd4c85fd201a178087d74c1cc188cc584e819d901308c6/300x200/https://example.com/photo.jpg" --output photo.jpg
+curl "http://localhost:3000/9e24ae8bf61c0d40cb6f1ca9f9e1d3e771f6c8bc8b8ab7270e6d15458d4c14ab/300x200/https://example.com/photo.jpg" --output photo.jpg
 ```
 
-That signature is HMAC-SHA256 of `300x200/https://example.com/photo.jpg` under the secret `your-secret`. See [Sign a request](#sign-a-request).
+That signature is HMAC-SHA256 of `300x200/https://example.com/photo.jpg` under the secret from step 1, `local-dev-secret`. See [Sign a request](#sign-a-request).
 
 ## How requests work
 
@@ -170,7 +168,7 @@ Three more source kinds cover originals that do not live behind a public URL:
 
 Bucket sources are gated by `CRABCROP_ALLOWED_BUCKETS` rather than the host policy, since the endpoint is operator configuration, not request input. When signing credentials are configured, the allowlist is required: the server refuses to boot without it, because signed fetches would otherwise reach every bucket the credentials can read. List `*` to deliberately allow all buckets. A bucket or object key carrying a dot segment (a `.` or `..` path component) is refused, since the request path would collapse it past the allowlisted bucket; dots inside a segment name are fine. Bucket names must also follow the S3 naming rules (3 to 63 characters of lowercase letters, digits, dots, and hyphens, starting and ending with a letter or digit, no adjacent dots, not an IP address spelling): the name is interpolated into the request host, so a name carrying a `?` or another host-breaking character is refused at parse time, whatever the allowlist says. Store responses are not redirected: a 3xx from a store surfaces as its status code.
 
-JPEG, PNG, WebP, GIF, and JPEG XL sources are decoded. EXIF orientation is applied before any operation runs, so phone photos come out upright. Animated GIFs keep their frames when the output format is GIF; converting an animated GIF to a still format uses the first frame. Animated WebPs keep their frames when the output format is WebP or GIF, with frame delays and the loop count preserved; converting one to a still format uses the first frame. Animated WebP output is always encoded losslessly: the pure-Rust WebP encoder has no lossy animation mode, so a quality setting does not apply to it (the same is true of GIF output). That lossless encode is also the slowest work the server does, so animated WebP renders run behind a dedicated gate of one encode at a time: while one is running, another animated WebP request waits up to 10 seconds for the slot and then sheds with a `503` rather than queueing behind a minutes-long encode, and still renders keep their own processing pool throughout. AVIF sources are decoded in builds that include AVIF decoding: the Docker image, the release binaries, and the Homebrew install (which ships the release binary). A source build includes it with `--features avif-decode`, which links dav1d (a system libdav1d 1.3 or newer, or a vendored build); without it, AVIF sources fail with `502` and an error naming the feature. Animated AVIF sources decode their first frame. HEIC/HEIF sources are decoded in every build by the pure-Rust oxideav stack (`oxideav-heif` + `oxideav-h265`): the primary image only, with grid and overlay compositions resolved, EXIF orientation honored, and 10-bit sources flattened to the pipeline's 8-bit working space, as AVIF sources are.
+JPEG, PNG, WebP, GIF, and JPEG XL sources are decoded. EXIF orientation is applied before any operation runs, so phone photos come out upright. Animated GIFs keep their frames when the output format is GIF; converting an animated GIF to a still format uses the first frame. Animated WebPs keep their frames when the output format is WebP or GIF, with frame delays and the loop count preserved; converting one to a still format uses the first frame. Animated WebP output is always encoded losslessly: the pure-Rust WebP encoder has no lossy animation mode, so a quality setting does not apply to it (the same is true of GIF output). That lossless encode is also the slowest work the server does, so animated WebP renders run behind a dedicated gate of one encode at a time: while one is running, another animated WebP request waits up to 10 seconds for the slot and then sheds with a `503` rather than queueing behind a minutes-long encode, and still renders keep their own processing pool throughout. AVIF sources are decoded in builds that include AVIF decoding: the Docker image and the release binaries. A source build includes it with `--features avif-decode`, which links dav1d (a system libdav1d 1.3 or newer, or a vendored build); without it, AVIF sources fail with `502` and an error naming the feature. Animated AVIF sources decode their first frame. HEIC/HEIF sources are decoded in every build by the pure-Rust oxideav stack (`oxideav-heif` + `oxideav-h265`): the primary image only, with grid and overlay compositions resolved, EXIF orientation honored, and 10-bit sources flattened to the pipeline's 8-bit working space, as AVIF sources are.
 
 SVG sources are supported and detected by content, not by the declared content type. An SVG is sanitized before it is rendered: script elements, event handlers, and references to external resources are stripped, so a source SVG can only draw what it carries with it. The sanitized document is rasterized at the size the URL asks for (or its intrinsic size when the URL asks for none) and then runs through the normal pipeline. Output defaults to PNG for SVG sources.
 
@@ -1087,7 +1085,7 @@ The repo ships a multi-stage `Dockerfile` (the runtime image carries the binary,
 
 ```bash
 docker build -t crabcrop:latest .
-docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret crabcrop:latest
+docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret-change-me crabcrop:latest
 ```
 
 For the AI features, build `Dockerfile.ai` on top of that image; see [AI features](#ai-features).
