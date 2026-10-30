@@ -10,6 +10,11 @@ Why the pairing works at all: crabcrop puts the signature and the operations in 
 
 Do not add an edge token-authentication layer in front of the service. That is a second token checked against Fastly-side secrets; crabcrop's in-path signatures already do the job, and stacking the two means every client integration carries both.
 
+## Prerequisites
+
+- A running crabcrop origin, reachable over HTTPS. Every recipe in this family configures a CDN in front of an origin that already works; deploy one from the platform table in the main README first.
+- A Fastly service for the crabcrop domain (the recipe gives crabcrop its own service; see The shape above), and an API token: step 5's purges go through the API.
+
 ## 1. Let origin headers govern
 
 Fastly needs no TTL configuration for this origin, provided you do not add any:
@@ -80,3 +85,7 @@ Run against your service after setup:
 3. Purge one URL in both layers, then request it: `x-cache: MISS`, then HIT again on the next request.
 4. If you use key purges: request a `preset:` URL with a `Fastly-Debug: 1` request header and confirm the debug response shows a `Surrogate-Key` header carrying the preset name. Purge that key in both layers and request the URL again. A MISS proves the keys landed.
 5. If you left formats unpinned, request one URL with a Chrome `Accept` header and then with a Safari one: different bytes (each browser's negotiated format) prove `Vary` is splitting variants. If you installed the normalize snippet, follow with a different spelling of the Chrome `Accept` (same formats, different order or spacing): a HIT with identical bytes proves the normalization is keying correctly.
+
+## Teardown
+
+Clone the active service version, remove what the recipe added (the snippets from `fastly-snippets.vcl`, and shielding if you enabled it in step 6), and activate. Image Optimizer stays off either way: it was never enabled. To remove crabcrop from Fastly entirely, delete the service and point the domain's DNS elsewhere.

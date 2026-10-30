@@ -10,6 +10,11 @@ Why the pairing works at all: crabcrop puts the signature and the operations in 
 
 Do not require CloudFront signed URLs or signed cookies on this behavior. Those are a second signature layer checked against CloudFront's own keys; crabcrop's in-path signatures already do the job, and stacking the two means every client integration carries both.
 
+## Prerequisites
+
+- A running crabcrop origin, reachable over HTTPS. Every recipe in this family configures a CDN in front of an origin that already works; deploy one from the platform table in the main README first.
+- An AWS account in which you can create a distribution, a cache policy, and an origin request policy, and publish a CloudFront Function.
+
 ## 1. A cache policy that respects the origin
 
 Create a custom cache policy for the behavior:
@@ -82,3 +87,7 @@ Run against your distribution after setup:
 3. Invalidate one URL in both layers, then request it: `x-cache: Miss from cloudfront`, then a Hit again on the next request.
 4. If you use tag invalidation: request a `preset:` URL, invalidate `#<name>`, and request it again. A Miss proves the tags landed.
 5. If you left formats unpinned with the function attached, request one URL with a Chrome `Accept` header and then with a Safari one. Different bytes (AVIF versus the Safari-negotiated format) under the two spellings that mean the same thing prove the normalization is keying correctly; identical bytes across an AVIF and a JPEG-only `Accept` mean it is not.
+
+## Teardown
+
+Disable the distribution, then delete it: that takes the behavior, the custom cache policy, the origin request policy, the `normalize-accept` function association, and the `CacheTagConfig` with it. Delete the policy and the function themselves afterwards if nothing else uses them. If the distribution carries other hostnames, removing only the crabcrop behavior is enough.

@@ -12,16 +12,22 @@ cache hit rate, never correctness. On AWS the shared result
 tier is native: set `CRABCROP_RESULT_BUCKET` (see step 5) and
 every task reads and writes one S3 bucket.
 
-Nothing is published to a public registry yet. Build the
-image from the repo Dockerfile and push it to your ECR
-repository, then replace the `REPLACE_ME` values in
-`task-definition.json`:
+Release images are published to GHCR as
+`ghcr.io/dayvson/crabcrop`, tagged with the release
+version. Set the `image` in `task-definition.json` to
+`ghcr.io/dayvson/crabcrop:0.9.5` (or to your own build of
+the repo Dockerfile, pushed to your ECR repository), then
+replace the remaining `REPLACE_ME` values in
+`task-definition.json`.
 
-```sh
-docker build -t crabcrop:latest .
-docker tag crabcrop:latest <account>.dkr.ecr.<region>.amazonaws.com/crabcrop:latest
-docker push <account>.dkr.ecr.<region>.amazonaws.com/crabcrop:latest
-```
+## Prerequisites
+
+- The AWS CLI, configured for the account and region.
+- An ECS cluster, plus a VPC subnet and a security group
+  for the tasks.
+- Two IAM roles: the execution role and the task role the
+  task definition names. Steps 1 and 5 grant each of them
+  the permissions it needs.
 
 ## 1. The signing secret
 
@@ -121,3 +127,20 @@ With the service behind its ALB DNS name `<host>`:
    pick it up on their next start; for zero-downtime
    rotation use the key ID flow in the main README
    (`CRABCROP_SECRET_PREVIOUS` plus key IDs).
+
+## Teardown
+
+Delete the service first so no task keeps running, then
+the rest:
+
+```sh
+aws ecs update-service --cluster <cluster> --service crabcrop --desired-count 0
+aws ecs delete-service --cluster <cluster> --service crabcrop --force
+aws ecs deregister-task-definition --task-definition crabcrop:<revision>
+aws secretsmanager delete-secret --secret-id crabcrop/secret --force-delete-without-recovery
+```
+
+Delete the ALB and its target group from step 3 as well.
+If you wired the shared result tier in step 5, its S3
+bucket is yours to keep or empty; crabcrop does not delete
+stored results.

@@ -14,11 +14,21 @@ of its own; for the shared result tier, point
 `CRABCROP_S3_ENDPOINT` at an S3-compatible gateway if you
 run one, and otherwise plan on per-replica caches.
 
-Nothing is published to a public registry yet. Build the
-image from the repo Dockerfile and push it to your Azure
-Container Registry, then replace the `REPLACE_ME` values in
+Release images are published to GHCR as
+`ghcr.io/dayvson/crabcrop`, tagged with the release
+version. Replace the `REPLACE_ME` values in
 `containerapp.yaml` (location, environment resource ID,
-image, and the placeholder secret value).
+image, and the placeholder secret value), pointing the
+image at `ghcr.io/dayvson/crabcrop:0.9.5` or at your own
+build of the repo Dockerfile pushed to your Azure
+Container Registry.
+
+## Prerequisites
+
+- An Azure subscription and a resource group, with the
+  Azure CLI configured.
+- For the Key Vault route in step 1: a vault, and a
+  user-assigned managed identity for the app.
 
 ## 1. The signing secret
 
@@ -118,3 +128,15 @@ With the app's FQDN `<host>`:
    to pick it up; for zero-downtime rotation use the key ID
    flow in the main README (`CRABCROP_SECRET_PREVIOUS` plus
    key IDs).
+
+## Teardown
+
+```sh
+az containerapp delete --name crabcrop --resource-group <group> --yes
+az containerapp env delete --name <environment> --resource-group <group> --yes
+```
+
+Delete the Key Vault secret and the managed identity from
+step 1 as well, if the app was their only consumer. The
+disk tier's Azure Files volume is yours to keep or delete;
+crabcrop does not delete stored results.

@@ -8,6 +8,12 @@ A Cloudflare zone in front of a crabcrop origin: the cache rules, the purge mapp
 
 Why the pairing works at all: crabcrop puts the signature and the operations in the URL path, and Cloudflare's default cache key is the full URL, so every signed variant is its own cache entry with no key configuration. crabcrop also sends `Cache-Control: public, max-age=31536000, immutable` on image responses, so an edge that respects origin headers caches for a year and never revalidates, which matches how crabcrop treats its own tiers.
 
+## Prerequisites
+
+- A running crabcrop origin, reachable over HTTPS. Every recipe in this family configures a CDN in front of an origin that already works; deploy one from the platform table in the main README first.
+- A Cloudflare zone for the crabcrop hostname, proxied, with SSL mode Full (Strict), as The shape above describes.
+- Some steps are plan-gated: Polish and Vary for Images are Pro plans and up, and the custom cache key in step 3 is Enterprise only. The recipe marks each one where it comes up.
+
 ## 1. Make image responses eligible, and respect the origin
 
 By default Cloudflare only caches a fixed list of file extensions, and a crabcrop URL does not guarantee one (a source can be extensionless). One Cache Rule fixes eligibility and pins the TTL behavior:
@@ -82,3 +88,7 @@ Run against your zone after setup:
 3. Purge one URL in both layers, then request it: `cf-cache-status: MISS`, then HIT again on the next request.
 4. If you use the tag bridge: request a `preset:` URL, purge by its tag, and request it again. A MISS proves the tag landed.
 5. If you left formats unpinned, request one URL with an AVIF `Accept` header and then with a JPEG-only one. Identical bytes mean your variant split from step 3 is not in effect.
+
+## Teardown
+
+Remove what the recipe added, in any order: the Cache Rules and the Configuration Rule (steps 1 and 2), the Cache Response Rules or the Worker's route if you installed the tag bridge (step 5), and the Tiered Cache or Cache Reserve settings if you turned them on (step 6). Then either remove the hostname's DNS record or set it to DNS-only (grey cloud), which takes the origin out from behind Cloudflare entirely.

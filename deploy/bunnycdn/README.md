@@ -10,6 +10,11 @@ Why the pairing works at all: crabcrop puts the signature and the operations in 
 
 Do not enable Token Authentication on this Pull Zone (the zone's Security settings). That is a second signature layer checked against a Bunny-side key: classic tokens travel in the query string, which this cache key ignores and crabcrop URLs never carry, and the V2 path form (`bcdn_token=...` as the first path segment) collides with the signed path layout crabcrop verifies byte-for-byte. crabcrop's in-path signatures already do the job; stacking the two means requests fail one check or the other, and every client integration carries both.
 
+## Prerequisites
+
+- A running crabcrop origin, reachable over HTTPS. Every recipe in this family configures a CDN in front of an origin that already works; deploy one from the platform table in the main README first.
+- A Bunny account with a Pull Zone to give crabcrop (see The shape above), and your account API key for step 5's purges: URL purges are API-only, while the dashboard covers the full and tag purges.
+
 ## 1. Let origin headers govern
 
 In the Pull Zone's **Caching > General** settings:
@@ -83,3 +88,7 @@ Run against your Pull Zone after setup:
 3. Purge one URL in both layers, then request it: `CDN-Cache: MISS`, then HIT again on the next request.
 4. If you use the tag bridge: request a `preset:` URL, purge by tag (`CacheTag` set to the preset name), and request it again. A MISS proves the middleware's tags landed and are indexed.
 5. If you left formats unpinned with the Vary Cache toggles on, request one URL with an AVIF-capable `Accept` header and then with a WebP-only one. Different bytes prove the capability classes are splitting the key; identical bytes mean the toggles are not in effect (check that the source path ends in one of the extensions the toggles cover).
+
+## Teardown
+
+Delete the Pull Zone and crabcrop is off Bunny entirely. To keep the zone but undo the recipe: set the Cache Expiration Time back to a fixed duration of your choice, remove the step 4 Edge Rule, unlink the middleware script, and turn Origin Shield off. Bunny Optimizer and Token Authentication were never enabled, so there is nothing to switch back there.

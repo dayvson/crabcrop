@@ -19,10 +19,19 @@ matches the injection. Everywhere else in these recipes
 `PORT` is set explicitly; here the platform setting it is
 the wiring.
 
-Nothing is published to a public registry yet. Build the
-image from the repo Dockerfile and push it to Artifact
-Registry, then replace the `REPLACE_ME` image in
-`service.yaml`.
+Release images are published to GHCR as
+`ghcr.io/dayvson/crabcrop`, tagged with the release
+version. Replace the `REPLACE_ME` image in `service.yaml`
+with `ghcr.io/dayvson/crabcrop:0.9.5`, or with your own
+build of the repo Dockerfile pushed to Artifact Registry.
+
+## Prerequisites
+
+- A GCP project with Cloud Run and Secret Manager
+  available, and the gcloud CLI configured for it.
+- A runtime service account for the service. Step 1 gives
+  it access to the signing secret, and step 4 uses it
+  again for the shared result tier.
 
 ## 1. The signing secret
 
@@ -128,3 +137,15 @@ With the service URL `<host>`:
    revisions pick it up; for zero-downtime rotation use the
    key ID flow in the main README (`CRABCROP_SECRET_PREVIOUS`
    plus key IDs).
+
+## Teardown
+
+```sh
+gcloud run services delete crabcrop
+gcloud secrets delete crabcrop-secret
+```
+
+If you created the presets secret or the HMAC secrets from
+steps 3 and 4, delete those too. The shared result tier's
+bucket is yours to keep or empty; crabcrop does not delete
+stored results.

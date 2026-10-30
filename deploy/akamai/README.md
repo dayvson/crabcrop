@@ -12,6 +12,11 @@ Do not add Akamai token authentication (or any other edge token check) on this h
 
 The behaviors below are also in `property-rules.json` in this directory, as a rule fragment in Property Manager's JSON format: merge the behaviors into your default rule and the child rules under it. It is illustrative of the exact settings named in each step, not a complete property; origin, hostname, and CP code settings are made in Property Manager as usual.
 
+## Prerequisites
+
+- A running crabcrop origin, reachable over HTTPS. Every recipe in this family configures a CDN in front of an origin that already works; deploy one from the platform table in the main README first.
+- An Akamai property for the crabcrop hostname with its own CP code (see The shape above), Property Manager access to edit and activate it, and EdgeGrid credentials for step 5's Fast Purge API. Work on the staging network first, as the checklist does.
+
 ## 1. Let origin headers govern
 
 Akamai's defaults run the other way from the other CDNs in this series: a property caches content indefinitely (evicting least-recently-used objects when full) and does not honor the origin's `Cache-Control` or `Expires` headers at all until the Caching behavior tells it to. Three settings fix that:
@@ -81,3 +86,7 @@ Run against your property after setup, on the staging network first and then on 
 4. If you use tag purges: set Cache Tag Visibility to `PRAGMA_HEADER`, request a `preset:` URL with a `Pragma: akamai-x-get-cache-tags` request header, and confirm the returned `Edge-Cache-Tag` header carries the preset name. Purge that tag in both layers and request the URL again: an origin fill proves the tags landed. Set visibility back to `NEVER`.
 5. If you left formats unpinned with variant caching on (step 3, option 2): request one negotiated URL with a Chrome `Accept` header and then with a Safari one. Different bytes, each an origin fill once and an edge hit on repeat, prove the variants are keying and caching. Identical bytes across the two, or an origin fill on every repeat, mean the combination is not holding on your property: pin formats instead.
 6. Request a URL with an `Accept` offering JPEG XL and confirm the response is `image/jxl`. Image and Video Manager has no JPEG XL support, so JPEG XL bytes prove it is not in the path; also confirm no rule in the property carries its behavior.
+
+## Teardown
+
+Activate a property version with the recipe removed: the default rule's behaviors from step 1 back to your standard settings, and the child rules deleted (the per-preset Cache Tag rules and the `exp:` TTL cap from step 4, and the Tiered Distribution behavior if you enabled it in step 6). Image and Video Manager was never added to any rule, so there is nothing to remove there. To take the hostname off Akamai entirely, remove it from the property and point its DNS elsewhere.
