@@ -148,7 +148,7 @@ Every cacheable image response also carries a strong `ETag`, derived from the re
 
 The loader fetches the source under fixed limits, for every source kind:
 
-- 10 seconds total per fetch, including redirects.
+- 10 seconds per HTTP request; a redirect hop is a new request with its own 10 seconds.
 - 10 MiB maximum body; larger sources fail with `502` (the request was fine; the origin object is too big).
 - If an HTTP response carries a `Content-Type` header, it must start with `image/`. The exceptions are the media selections: when the URL carries a `frame:` segment, a `video/*` Content-Type is accepted too (see [Video frames](#video-frames)), and when it carries a `page:` segment, `application/pdf` is accepted (see [PDF pages](#pdf-pages)). Both admissions belong to the request, never to the response alone.
 
@@ -166,7 +166,7 @@ Three more source kinds cover originals that do not live behind a public URL:
 - `gs://bucket/key`: the same, against Google Cloud Storage's S3-compatible XML API, signed with the HMAC pair `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY` when set.
 - `file:///path`: a local file under `CRABCROP_FILE_ROOT`. The path is canonicalized per request and must stay under the root, so `..` segments and symlink escapes are refused. Unset root disables file sources.
 
-Bucket sources are gated by `CRABCROP_ALLOWED_BUCKETS` rather than the host policy, since the endpoint is operator configuration, not request input. When signing credentials are configured, the allowlist is required: the server refuses to boot without it, because signed fetches would otherwise reach every bucket the credentials can read. List `*` to deliberately allow all buckets. A bucket or object key carrying a dot segment (a `.` or `..` path component) is refused, since the request path would collapse it past the allowlisted bucket; dots inside a segment name are fine. Bucket names must also follow the S3 naming rules (3 to 63 characters of lowercase letters, digits, dots, and hyphens, starting and ending with a letter or digit, no adjacent dots, not an IP address spelling): the name is interpolated into the request host, so a name carrying a `?` or another host-breaking character is refused at parse time, whatever the allowlist says. Store responses are not redirected: a 3xx from a store surfaces as its status code.
+Bucket sources are gated by `CRABCROP_ALLOWED_BUCKETS` rather than the host policy, since the endpoint is operator configuration, not request input. When signing credentials are configured, the allowlist is required: the server refuses to boot without it, because signed fetches would otherwise reach every bucket the credentials can read. List `*` to deliberately allow all buckets. A bucket or object key carrying a dot segment (a `.` or `..` path component) is refused, since the request path would collapse it past the allowlisted bucket; dots inside a segment name are fine. Bucket names must also follow the S3 naming rules (3 to 63 characters of lowercase letters, digits, dots, and hyphens, starting and ending with a letter or digit, no adjacent dots, no dot beside a hyphen, not an IP address spelling): the name is interpolated into the request host, so a name carrying a `?` or another host-breaking character is refused at parse time, whatever the allowlist says. Store responses are not redirected: a 3xx from a store surfaces as its status code.
 
 JPEG, PNG, WebP, GIF, and JPEG XL sources are decoded. EXIF orientation is applied before any operation runs, so phone photos come out upright. Animated GIFs keep their frames when the output format is GIF; converting an animated GIF to a still format uses the first frame. Animated WebPs keep their frames when the output format is WebP or GIF, with frame delays and the loop count preserved; converting one to a still format uses the first frame. Animated WebP output is always encoded losslessly: the pure-Rust WebP encoder has no lossy animation mode, so a quality setting does not apply to it (the same is true of GIF output). That lossless encode is also the slowest work the server does, so animated WebP renders run behind a dedicated gate of one encode at a time: while one is running, another animated WebP request waits up to 10 seconds for the slot and then sheds with a `503` rather than queueing behind a minutes-long encode, and still renders keep their own processing pool throughout. AVIF sources are decoded in builds that include AVIF decoding: the Docker image and the release binaries. A source build includes it with `--features avif-decode`, which links dav1d (a system libdav1d 1.3 or newer, or a vendored build); without it, AVIF sources fail with `502` and an error naming the feature. Animated AVIF sources decode their first frame. HEIC/HEIF sources are decoded in every build by the pure-Rust oxideav stack (`oxideav-heif` + `oxideav-h265`): the primary image only, with grid and overlay compositions resolved, EXIF orientation honored, and 10-bit sources flattened to the pipeline's 8-bit working space, as AVIF sources are.
 
@@ -357,17 +357,17 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | `convolution` | `convolution(0,-1,0,-1,5,-1,0,-1,0,0)`, 9 (3×3) or 25 (5×5) kernel values in row-major order, each a plain decimal from −1024 to 1024, then a normalize flag (0 or 1) | Apply the kernel once over the image; edges replicate. With the flag on, the kernel is scaled by the sum of its entries first (an all-ones kernel averages); a zero sum applies the kernel as written. | `filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)` |
 | `noise` | `noise(40)`, strength, an integer from 0 to 100, percent of full scale | Monochrome film grain: one noise value per pixel, uniform within ±strength percent of full scale, added equally to the red, green, and blue channels (alpha untouched). The field is deterministic, seeded from the image content and the amount, so the same request always returns the same bytes and caches soundly. `noise(0)` changes nothing. On animated sources it applies per frame, seeded from each frame's own content, so the frames grain independently. | `filters:noise(40)` |
 | `equalize` | none | Histogram equalization, per channel. | `filters:equalize` |
-| `rotate` | `rotate(45)`, any angle in degrees, decimals allowed; negatives allowed | Rotate the image. Multiples of 90 are exact quarter turns; other angles expand the canvas to fit, filling the uncovered corners with the `fill` color (white by default) or transparency when the image carries alpha. | `filters:rotate(-90)` |
+| `rotate` | `rotate(45)`, angle in degrees, from -36000 to 36000, decimals allowed | Rotate the image. Multiples of 90 are exact quarter turns; other angles expand the canvas to fit, filling the uncovered corners with the `fill` color (white by default) or transparency when the image carries alpha. | `filters:rotate(-90)` |
 | `trim` | `trim` or `trim(20)`, tolerance 0–255, default 10 | Crop away the border that matches the top-left corner color within the tolerance. | `filters:trim(20)` |
 | `sepia` | none | The classic warm sepia tone. | `filters:sepia` |
 | `duotone` | `duotone(1a1a40,ffd9a0)`, two colors, six hex digits each | Map shadows to the first color and highlights to the second, by luminance. | `filters:duotone(1a1a40,ffd9a0)` |
 | `monochrome` | `monochrome(ff8000)`, six hex digits | Single-hue rendering: each pixel's luminance scaled by the color, so full luminance renders exactly that color. | `filters:monochrome(ff8000)` |
-| `pixelate` | `pixelate(8)`, block size in pixels, at least 1 | Mosaic the image into square blocks, each painted with the average of its pixels. | `filters:pixelate(8)` |
+| `pixelate` | `pixelate(8)`, block size in pixels, from 1 to 16383 | Mosaic the image into square blocks, each painted with the average of its pixels. | `filters:pixelate(8)` |
 | `flip` | `flip(h)` or `flip(v)` | Mirror the image horizontally or vertically, at this point in the chain. | `filters:flip(h)` |
 | `blur_region` | `blur_region(x,y,w,h)`, pixels | Gaussian-blur one rectangle (license plates, screens, documents). Coordinates address the image at this point in the chain; blur strength scales with the region. A region that overflows the image is an error, not a partial redaction. | `filters:blur_region(120,40,180,60)` |
 | `pixelate_region` | `pixelate_region(x,y,w,h)`, pixels | Pixelate one rectangle, with the same bounds rule as `blur_region`. Block size scales with the region. | `filters:pixelate_region(120,40,180,60)` |
 | `remove_region` | `remove_region(x,y,w,h)`, pixels | Erase one rectangle and inpaint it from the surrounding pixels (AI, LaMa-family model). Same bounds rule as `blur_region`. The fill is fabricated by the model: plausible on smooth surroundings, visibly wrong on structured content. See [AI features](#ai-features). | `filters:remove_region(120,40,180,60)` |
-| `radius` | `radius(24)`, pixels; or four values `radius(24,24,0,0)` in CSS corner order (top-left, top-right, bottom-right, bottom-left) | Round the corners, antialiased. Radii larger than the frame shrink proportionally so corners never overlap. The output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:radius(24):format(png)` |
+| `radius` | `radius(24)`, pixels, each radius from 0 to 16383; or four values `radius(24,24,0,0)` in CSS corner order (top-left, top-right, bottom-right, bottom-left) | Round the corners, antialiased. Radii larger than the frame shrink proportionally so corners never overlap. The output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:radius(24):format(png)` |
 | `border` | `border(4,000000)`, width from 0 to 16383 pixels, color as six hex digits | Paint an opaque band of the color inside the frame. A width of 0 is a no-op. Dimensions do not change. Works on any format. | `filters:border(4,000000)` |
 | `mask` | `mask(circle)` or `mask(ellipse)` | Keep only the inscribed shape (the circle's diameter is the smaller dimension); the rest becomes transparent. The output format must carry alpha. | `filters:mask(circle):format(png)` |
 
@@ -545,7 +545,7 @@ Point `CRABCROP_PRESETS_FILE` at it, and requests can use `preset:<name>` anywhe
 curl "http://localhost:3000/<signature>/preset:og-card/https://example.com/photo.jpg"
 ```
 
-The signature covers the preset reference; the server expands it deterministically after verification, and cache entries key on the expanded operations. Treat a preset as a stable template: **never edit a definition in place**. Roll a change out under a new name (`thumb2`) and update your templates to reference it. Editing in place changes the bytes behind URLs already signed and shared, and image responses travel with `Cache-Control: immutable` for a year, so browsers and CDNs holding the old response keep serving it, beyond the reach of any purge. (This server's own caches are not the problem: they key on the expanded form, so they would pick the edit up. Downstream copies are the ones stranded.) Purging accepts the preset URL itself, exactly as an operator holds it; the server expands it before matching entries, and `/purge-group` clears a preset's whole output set at once. An unknown preset name is a `400`. Preset definitions are validated at startup: malformed entries refuse the boot, and presets cannot contain a source segment, an `exp:`, or another preset.
+The signature covers the preset reference; the server expands it deterministically after verification, and cache entries key on the expanded operations. Treat a preset as a stable template: **never edit a definition in place**. Roll a change out under a new name (`thumb2`) and update your templates to reference it. Editing in place changes the bytes behind URLs already signed and shared, and image responses travel with `Cache-Control: immutable` for a year, so browsers and CDNs holding the old response keep serving it, beyond the reach of any purge. (This server's own caches are not the problem: they key on the expanded form, so they would pick the edit up. Downstream copies are the ones stranded.) Purging accepts the preset URL itself, exactly as an operator holds it; the server expands it before matching entries, and `/purge-group` clears a preset's whole output set at once. An unknown preset name is a `400`. Preset definitions are validated at startup: malformed entries refuse the boot, and presets cannot contain a source segment, an `exp:`, a `maxage:`, or another preset.
 
 With `CRABCROP_ONLY_PRESETS=1`, free-form operations are rejected with `400`: requests may use preset references, `exp:` and `maxage:` metadata, and bare sources only. The mode does not change signature rules. Combined with `CRABCROP_ALLOW_UNSAFE=1` it makes a public deployment where browsers and CMSs can build URLs from preset names alone, with no secret to hold and no way to invent a transform.
 
@@ -580,7 +580,7 @@ The URL grammar and signing scheme are specified in [`spec/url-signing.md`](spec
 
 - **Rust**: the `crabcrop-url` crate in this workspace (`crates/crabcrop-url`) with `sign`, `verify`, `build_url`, `build_srcset`, and the purge helpers `purge_signature` and `purge_group_signature`. The server verifies with this same crate, so client and server cannot drift.
 - **TypeScript**: [`sdks/typescript`](sdks/typescript), `@crabcrop/url`, with `sign`, `verifyUrlSignature`, `buildURL`, `buildSrcSet`, `purgeSignature`, and `purgeGroupSignature`, plus typed operation builders (`ops`, `filter`) that validate against the grammar and compile to the same canonical strings. Standard library only; tests run on `node --test`.
-- **Python**: [`sdks/python`](sdks/python), `crabcrop_url`, with `sign`, `verify`, `build_url`, `build_srcset`, `purge_signature`, and `purge_group_signature`. Standard library only; tests run on `python3 -m unittest`.
+- **Python**: [`sdks/python`](sdks/python), `crabcrop_url`, with `sign`, `verify`, `build_url`, `build_srcset`, `purge_signature`, and `purge_group_signature`. Standard library only, except that sealing needs the `crabcrop-url[seal]` extra; tests run on `python3 -m unittest`.
 
 All three take an optional expiry (emitted as a leading `exp:` segment) and a null secret for the `unsafe` form used by unsafe and presets-only deployments.
 
@@ -588,7 +588,7 @@ Framework integrations in [`frameworks/`](frameworks) sit on the TypeScript buil
 
 The [playground](playground) is a static page (no build step, no server state) for building, signing, previewing, and debugging URLs in the browser: the secret never leaves the page, signatures verify locally, and pasted URLs are explained segment by segment with errors highlighted.
 
-For coding agents, [`sdks/mcp`](sdks/mcp) is a first-party MCP server (stdio, no dependencies) exposing `sign_url`, `explain_url`, `fetch_meta`, and `purge_result` over the same SDK and HTTP surface, configured with `CRABCROP_BASE` / `CRABCROP_SECRET`. Client setup snippets are in its README.
+For coding agents, [`sdks/mcp`](sdks/mcp) is a first-party MCP server (stdio; it bundles the `@crabcrop/url` SDK it is built on) exposing `sign_url`, `explain_url`, `fetch_meta`, and `purge_result` over the same SDK and HTTP surface, configured with `CRABCROP_BASE` / `CRABCROP_SECRET`. Client setup snippets are in its README.
 
 ## Format negotiation
 
@@ -739,7 +739,7 @@ Crabcrop reads and writes [C2PA](https://c2pa.org/) Content Credentials. Two hal
 
 **Verify, always on.** Every meta response carries a `provenance` object reporting what the source asset carried: whether it has a manifest, whether that manifest validates (`valid`, `trusted`, or `invalid`), who signed it, and how the store is composed. No configuration is needed, and verification runs on the c2pa-rs 0.91 line, the first that enforces the specification's exclusion rules.
 
-**Sign, when you configure an identity.** Set `CRABCROP_C2PA_CERT` and `CRABCROP_C2PA_KEY` to a PEM certificate chain and its private key, and still JPEG, PNG, WebP, and AVIF outputs are signed as they are produced. A manifest cannot survive a transform byte for byte (decoding and re-encoding drop the segments it lives in), so the source itself is recorded in the output's manifest as a parent ingredient: its hash always, and its own manifest store whenever it carries one, so the chain stays walkable end to end. Outputs of the AI edits (background removal, studio mode, region removal, upscale, class and face edits) record the edit with the IPTC `compositeWithTrainedAlgorithmicMedia` source type. GIF, JPEG XL, video, and animated WebP outputs are served unsigned in this version.
+**Sign, when you configure an identity.** Set `CRABCROP_C2PA_CERT` and `CRABCROP_C2PA_KEY` to a PEM certificate chain and its private key, and still JPEG, PNG, WebP, and AVIF outputs are signed as they are produced. A manifest cannot survive a transform byte for byte (decoding and re-encoding drop the segments it lives in), so the source itself is recorded in the output's manifest as a parent ingredient: its hash, and its own manifest store whenever it carries one, so the chain stays walkable end to end. Video and PDF sources are the exception: a frame or page render starts a fresh chain, and no source ingredient is recorded for them. Outputs of the AI edits (background removal, studio mode, region removal, upscale, class and face edits) record the edit with the IPTC `compositeWithTrainedAlgorithmicMedia` source type. GIF, JPEG XL, video, and animated WebP outputs are served unsigned in this version.
 
 The identity is yours, like the models and the secret: the server holds no certificate of its own. It is proven at boot with a sign-and-verify round trip, so a broken identity (a bare self-signed certificate, a key that does not match, a chain outside the C2PA certificate profile) is a startup error with the reason named, never a first-request surprise. `CRABCROP_C2PA_TSA_URL` optionally adds a timestamp authority.
 
@@ -792,14 +792,17 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 | Status | Meaning |
 | --- | --- |
 | `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px output cap or the 262,144 px per-run input budget, a `crop-rect` or `remove_region` outside the image, a video format asked of a still source. |
+| `401` | `GET /metrics` with a missing or wrong `CRABCROP_METRICS_TOKEN` bearer. |
 | `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
 | `404` | A `PUT` to `/upload/...` when uploads are not configured, or a `PUT` to any path that is not the upload route. |
+| `409` | An upload to a name that already exists, while `CRABCROP_UPLOAD_ALLOW_OVERWRITE` is off. |
 | `413` | An upload body larger than the `CRABCROP_UPLOAD_MAX_MB` cap. |
+| `415` | An upload body that does not decode as an image, or whose media kind does not match the name's extension. |
 | `500` | Encoding the output failed, or an AI model failed at inference time (the runtime errored, or a model session lock was poisoned by an earlier failure). A model that cannot be loaded at all fails startup instead of answering requests. |
 | `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font, a video format with no encoder configured. |
 | `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image, including AVIF sources in builds without AVIF decoding, corrupt HEIC sources, and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). A configured video encoder that fails, times out, or exceeds its output cap also lands here. |
 | `503` | The server shed the request because a processing, AI, video, or animation gate waited past its timeout; the response carries `Retry-After`. |
-| `504` | The source fetch timed out (10 seconds). |
+| `504` | The source fetch timed out (10 seconds per request), or processing ran past the `CRABCROP_PROCESS_TIMEOUT_SECS` limit (30 seconds by default). |
 
 For example, a `removebg` request to a server with no background-removal model returns `501` with the body `removebg is not configured on this server`.
 
@@ -808,7 +811,7 @@ For example, a `removebg` request to a server with no background-removal model r
 | Route | Description |
 | --- | --- |
 | `GET /health` | Health check. Returns `200` with the body `ok`. |
-| `GET /metrics` | Prometheus metrics in text format: request counts by status class (`crabcrop_requests_total`), request/load/process durations, cache hit and miss counters, loader and engine error counters, and byte totals. |
+| `GET /metrics` | Prometheus metrics in text format: request counts by status class (`crabcrop_requests_total`), request/load/process durations, cache hit and miss counters, loader and engine error counters, and byte totals. Gated by `CRABCROP_METRICS_TOKEN`: with no token configured it answers `403`; with one, requests must carry it as a bearer token, and a missing or wrong token answers `401`. |
 | `POST /purge/<signature>/<path>` | Invalidate every stored variant of one result, across all cache tiers. See below. |
 | `POST /purge-group/<signature>/<group>` | Invalidate every stored result in a cache group, across all cache tiers. See below. |
 | `PUT /upload/<signature>/<name>` | Store one original in the configured upload destination. Only exists when uploads are configured. See [Upload an original](#upload-an-original). |
@@ -906,6 +909,11 @@ crabcrop meta --placeholders --detections "300x200/https://example.com/photo.jpg
 crabcrop purge "300x200/https://example.com/photo.jpg"
 crabcrop purge-group thumb
 
+# Seal a remainder into an opaque token URL (with an optional friendly
+# name), or recover the remainder a sealed URL carries
+crabcrop seal "300x200/https://example.com/photo.jpg" photo.jpg
+crabcrop unseal "http://localhost:3000/s1.<token>/photo.jpg"
+
 # Upload an original to the server's upload store (prints the
 # source reference for transform URLs; see Upload an original)
 crabcrop upload ./photo.jpg heroes/photo.jpg
@@ -924,6 +932,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_SECRET_KEY_ID` | `current` | The current secret's key ID, named by keyed signature segments (`<key-id>:<tag>`). |
 | `CRABCROP_SECRET_PREVIOUS` | unset | The outgoing secret during a rotation window; the server verifies it alongside the current one. Same minimum length. |
 | `CRABCROP_SECRET_PREVIOUS_KEY_ID` | `previous` | The previous secret's key ID. Must differ from the current one. |
+| `CRABCROP_METRICS_TOKEN` | unset | Bearer token for `GET /metrics`. Unset, `/metrics` answers `403` to everyone; set, the request must carry `Authorization: Bearer <token>`, and a missing or wrong token answers `401`. |
 | `CRABCROP_DEFAULT_OPS` | unset | Operations prepended to every request (a house format, quality, or watermark), validated at boot. See [Server-wide default operations](#server-wide-default-operations). |
 | `PORT` | `3000` | Listen port. `CRABCROP_PORT` is the namespaced alias and wins when both are set. |
 | `CRABCROP_ALLOW_UNSAFE` | off | Honors `unsafe` URLs (for the boolean spellings, see above). |
@@ -966,6 +975,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_FONT_PATH` | unset | Path to a TTF/OTF font for the `text(...)` overlay filter, loaded at startup. Unset disables the filter. |
 | `CRABCROP_VIDEO_ENCODER` | unset | Path to the external video encoder program for `format(mp4)` / `format(webm)`, validated at startup. Unset disables video output. See [Video output](#video-output). |
 | `CRABCROP_VIDEO_DECODER` | unset | Path to the external video decoder program for `frame:` extraction from video sources, validated at startup. Unset disables frame selection. See [Video frames](#video-frames). |
+| `CRABCROP_PROCESS_TIMEOUT_SECS` | `30` | Hard wall-clock limit on processing one request, 1 to 600 seconds. A request that exceeds it answers `504`. |
 | `CRABCROP_VIDEO_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external video tool run (one encode, or one frame probe/extraction), 1 to 600 seconds. |
 | `CRABCROP_PDF_RENDERER` | unset | Path to the external PDF renderer program for `page:` rendering from PDF sources (its `pdfinfo` sibling is derived and validated alongside), validated at startup. Unset disables page selection. See [PDF pages](#pdf-pages). |
 | `CRABCROP_C2PA_CERT` | unset | Path to a PEM certificate chain: the C2PA signing identity for output provenance. Set together with `CRABCROP_C2PA_KEY`; a partial set is a startup error, and the identity is proven at boot. Unset disables output signing. See [Provenance (C2PA)](#provenance-c2pa). |
@@ -1122,7 +1132,7 @@ Results are cached in up to three tiers: an in-memory LRU (256 MB by default, `C
 
 #### Lock down the edge
 
-Run crabcrop behind a reverse proxy or CDN in production. The application bounds its own work (the processing, AI, video, and animation gates shed overload with `503`), but connection-level protections belong at the edge: request and header timeouts, connection limits, rate limiting, and TLS termination. Restrict `/health` and `/metrics` to your internal network at the proxy: both are unauthenticated (they are served with `Cache-Control: no-store`), and the metrics expose traffic and error counters.
+Run crabcrop behind a reverse proxy or CDN in production. The application bounds its own work (the processing, AI, video, and animation gates shed overload with `503`), but connection-level protections belong at the edge: request and header timeouts, connection limits, rate limiting, and TLS termination. Restrict `/health` and `/metrics` to your internal network at the proxy: `/health` is unauthenticated, and `/metrics` is gated by its bearer token (it answers `403` when no `CRABCROP_METRICS_TOKEN` is configured, and `401` for a missing or wrong bearer when one is). Both are served with `Cache-Control: no-store`, and the metrics expose traffic and error counters.
 
 #### Rotating the signing secret
 
