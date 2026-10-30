@@ -72,6 +72,22 @@ test("expired expiries and malformed segments are flagged", () => {
   assert.ok(badSig.errors.length > 0);
 });
 
+test("studio filters explain, including inside a chain", () => {
+  const product = explainUrl(
+    `https://x/${SIG}/filters:studio(product,bg:f5f0e8,shadow:strong,pad:25)/https://e.com/a.jpg`,
+  );
+  assert.equal(product.errors.length, 0);
+
+  const chained = explainUrl(`https://x/${SIG}/filters:studio(scene,pad:25):quality(80)/https://e.com/a.jpg`);
+  assert.equal(chained.errors.length, 0);
+
+  const sceneBg = explainUrl(`https://x/${SIG}/filters:studio(scene,bg:white)/https://e.com/a.jpg`);
+  assert.ok(sceneBg.errors.some((e) => e.includes("the server rejects this filter: studio")));
+
+  const padTooBig = explainUrl(`https://x/${SIG}/filters:studio(product,pad:41)/https://e.com/a.jpg`);
+  assert.ok(padTooBig.errors.some((e) => e.includes("the server rejects this filter: studio")));
+});
+
 test("preset-looking text inside the source stays source", () => {
   const out = explainUrl(`https://x/${SIG}/300x200/example.com/preset:thumb/img.jpg`);
   assert.equal(out.source, "example.com/preset:thumb/img.jpg");

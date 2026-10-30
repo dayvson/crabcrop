@@ -266,6 +266,50 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:format(mp4)/" + SRC, false, SRC],
     ["filters:format(webm)/" + SRC, false, SRC],
     ["filters:format(mov)/" + SRC, true, SRC],
+    // Studio (issues #197, #198): the mode first, then
+    // named key:value arguments, each at most once.
+    // Product takes bg, shadow, and pad; scene takes pad
+    // only. Verdicts verified against parse_studio in
+    // src/url.rs.
+    ["filters:studio(product)/" + SRC, false, SRC],
+    ["filters:studio(product,bg:white)/" + SRC, false, SRC],
+    ["filters:studio(product,bg:brand)/" + SRC, false, SRC],
+    ["filters:studio(product,bg:none)/" + SRC, false, SRC],
+    ["filters:studio(product,bg:f5f0e8)/" + SRC, false, SRC],
+    ["filters:studio(product,bg:F5F0E8)/" + SRC, false, SRC],
+    ["filters:studio(product,shadow:none)/" + SRC, false, SRC],
+    ["filters:studio(product,shadow:strong,pad:0)/" + SRC, false, SRC],
+    ["filters:studio(product,pad:40)/" + SRC, false, SRC],
+    ["filters:studio(product,pad:25,shadow:strong,bg:f5f0e8)/" + SRC, false, SRC],
+    ["filters:studio(product,pad:+10)/" + SRC, false, SRC],
+    ["filters:studio(product,pad:010)/" + SRC, false, SRC],
+    ["filters:studio(scene)/" + SRC, false, SRC],
+    ["filters:studio(scene,pad:25)/" + SRC, false, SRC],
+    ["filters:studio(scene,pad:40)/" + SRC, false, SRC],
+    // The chain splits on ':' outside parentheses, so a
+    // studio filter composes with its neighbours.
+    ["filters:grayscale:studio(product,bg:white):blur(2)/" + SRC, false, SRC],
+    ["filters:studio/" + SRC, true, SRC],
+    ["filters:studio()/" + SRC, true, SRC],
+    ["filters:studio(portrait)/" + SRC, true, SRC],
+    ["filters:studio(product,bg:blur)/" + SRC, true, SRC],
+    ["filters:studio(product,bg:fffff)/" + SRC, true, SRC],
+    ["filters:studio(product,bg:fffffff)/" + SRC, true, SRC],
+    ["filters:studio(product,bg:White)/" + SRC, true, SRC],
+    ["filters:studio(product,shadow:hard)/" + SRC, true, SRC],
+    ["filters:studio(product,pad:41)/" + SRC, true, SRC],
+    ["filters:studio(product,pad:-1)/" + SRC, true, SRC],
+    ["filters:studio(product,pad:-0)/" + SRC, true, SRC],
+    ["filters:studio(product,pad:1.5)/" + SRC, true, SRC],
+    ["filters:studio(product,zoom:2)/" + SRC, true, SRC],
+    ["filters:studio(product,pad:5,pad:6)/" + SRC, true, SRC],
+    ["filters:studio(product,bg:white,bg:none)/" + SRC, true, SRC],
+    ["filters:studio(product,pad)/" + SRC, true, SRC],
+    ["filters:studio(product,)/" + SRC, true, SRC],
+    ["filters:studio(scene,bg:white)/" + SRC, true, SRC],
+    ["filters:studio(scene,shadow:soft)/" + SRC, true, SRC],
+    ["filters:studio(scene,pad:41)/" + SRC, true, SRC],
+    ["filters:studio(scene,pad:10,pad:20)/" + SRC, true, SRC],
     // AP-23 parity cases: each verdict below is the Rust
     // parser's, verified against src/url.rs.
     ["crop-rect:50x50:0x0/" + SRC, true, SRC],
@@ -294,6 +338,28 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     assert.equal(out.source, expectSource, remainder);
     assert.equal(out.errors.length > 0, expectError, `${remainder}: ${JSON.stringify(out.errors)}`);
   }
+});
+
+test("explainUrl explains studio filters instead of calling them unknown", () => {
+  const SIG = "a".repeat(64);
+  const SRC = "https://example.com/a.jpg";
+  const out = explainUrl(
+    `https://img.example.com/${SIG}/filters:studio(product,bg:white)/${SRC}`,
+  );
+  assert.deepEqual(out.errors, []);
+  assert.equal(out.source, SRC);
+  assert.match(out.segments[0].detail ?? "", /studio\(product,bg:white\): studio mode/);
+  // A chain neighbour of a studio filter still parses.
+  const chained = explainUrl(
+    `https://img.example.com/${SIG}/filters:grayscale:studio(scene,pad:25)/${SRC}`,
+  );
+  assert.deepEqual(chained.errors, []);
+  // And a product-only argument under scene is an error,
+  // not a silent no-op.
+  const bad = explainUrl(
+    `https://img.example.com/${SIG}/filters:studio(scene,bg:white)/${SRC}`,
+  );
+  assert.ok(bad.errors.length > 0);
 });
 
 test("purge signatures match the published vectors", () => {

@@ -31,6 +31,8 @@ test("typed segments match the canonical spellings", () => {
     [ops.maxage(0), "maxage:0"],
     [ops.maxage(31536000), "maxage:31536000"],
     [ops.debugFocal(), "debug:focal"],
+    [ops.filters(filter.studio("product", { bg: "white" })), "filters:studio(product,bg:white)"],
+    [ops.filters(filter.studio("scene", { pad: 25 })), "filters:studio(scene,pad:25)"],
   ];
   for (const [got, want] of cases) {
     assert.equal(got, want);
@@ -124,6 +126,31 @@ test("typed filters match the canonical spellings", () => {
     [filter.format("webm"), "format(webm)"],
     [filter.fill("FF8800"), "fill(ff8800)"],
     [filter.facePad(0.25), "facepad(0.25)"],
+    [filter.studio("product"), "studio(product)"],
+    [filter.studio("scene"), "studio(scene)"],
+    [filter.studio("product", { bg: "white" }), "studio(product,bg:white)"],
+    [filter.studio("product", { bg: "brand" }), "studio(product,bg:brand)"],
+    [filter.studio("product", { bg: "none" }), "studio(product,bg:none)"],
+    // A hex backdrop canonicalizes to lowercase.
+    [filter.studio("product", { bg: "F5F0E8" }), "studio(product,bg:f5f0e8)"],
+    [
+      filter.studio("product", { bg: "f5f0e8", shadow: "strong", pad: 25 }),
+      "studio(product,bg:f5f0e8,shadow:strong,pad:25)",
+    ],
+    // The named arguments spell in grammar order (bg,
+    // shadow, pad) whatever order the options object
+    // names them in.
+    [
+      filter.studio("product", { pad: 0, shadow: "none" }),
+      "studio(product,shadow:none,pad:0)",
+    ],
+    // Arguments at their defaults collapse into the bare
+    // form, the server's canonical spelling.
+    [filter.studio("product", { shadow: "soft", pad: 10 }), "studio(product)"],
+    [filter.studio("product", { pad: 40 }), "studio(product,pad:40)"],
+    [filter.studio("scene", { pad: 25 }), "studio(scene,pad:25)"],
+    [filter.studio("scene", { pad: 10 }), "studio(scene)"],
+    [filter.studio("scene", { pad: 0 }), "studio(scene,pad:0)"],
     [filter.upscale(2), "upscale(2)"],
     [filter.dpr(2), "dpr(2)"],
     [filter.dpr(1.5), "dpr(1.5)"],
@@ -253,6 +280,19 @@ test("typed builders reject what the server would reject", () => {
     () => ops.preset("a:b"),
     () => ops.preset("a b"),
     () => filter.maxBytes(0),
+    () => filter.studio("portrait" as never),
+    () => filter.studio("product", { bg: "blur" }),
+    () => filter.studio("product", { bg: "fffff" }),
+    () => filter.studio("product", { bg: "fffffff" }),
+    () => filter.studio("product", { bg: "White" }),
+    () => filter.studio("product", { shadow: "hard" as never }),
+    () => filter.studio("product", { pad: 41 }),
+    () => filter.studio("product", { pad: -1 }),
+    () => filter.studio("product", { pad: 1.5 }),
+    // The product arguments are bad arguments under scene.
+    () => filter.studio("scene", { bg: "white" }),
+    () => filter.studio("scene", { shadow: "soft" }),
+    () => filter.studio("scene", { pad: 41 }),
     () => filter.radius(-1),
     () => filter.border(0, "000000"),
   ];

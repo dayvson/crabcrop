@@ -389,6 +389,9 @@ export type {
   Dimension,
   ImageFormat,
   MaskShape,
+  StudioMode,
+  StudioOptions,
+  StudioShadow,
 } from "./operations.ts";
 
 import { explainUrl } from "./explain.ts";
