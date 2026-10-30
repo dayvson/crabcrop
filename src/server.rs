@@ -69,6 +69,11 @@ impl std::fmt::Debug for NamedDetector {
 pub struct Inflight {
     leaders:
         std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::watch::Sender<bool>>>>,
+    /// Meta flights (issue #295): the same coalescing for
+    /// meta requests, whose results are never cached, so
+    /// the leader's document travels in a slot beside the
+    /// wake channel instead of through the cache tiers.
+    meta_leaders: std::sync::Mutex<std::collections::HashMap<String, Arc<MetaSlot>>>,
 }
 
 impl std::fmt::Debug for Inflight {
@@ -129,6 +134,88 @@ impl Inflight {
         if leaders.get(key).is_some_and(|s| Arc::ptr_eq(s, sender)) {
             leaders.remove(key);
         }
+    }
+
+    /// Claim leadership of the meta flight for `key`, or
+    /// follow the request already leading it.
+    fn lead_meta(self: &Arc<Self>, key: &str) -> MetaFlight {
+        let mut leaders = self.meta_leaders.lock().unwrap();
+        if let Some(slot) = leaders.get(key) {
+            return MetaFlight::Follower(slot.sender.subscribe(), slot.clone());
+        }
+        let (sender, _) = tokio::sync::watch::channel(false);
+        let slot = Arc::new(MetaSlot {
+            sender: Arc::new(sender),
+            shared: std::sync::Mutex::new(None),
+        });
+        leaders.insert(key.to_string(), slot.clone());
+        MetaFlight::Leader(
+            MetaLeaderGuard {
+                inflight: self.clone(),
+                key: key.to_string(),
+                slot: slot.clone(),
+            },
+            slot,
+        )
+    }
+
+    /// Remove `key` if `slot` is still its meta leader
+    /// (the `remove` rule, for the meta map).
+    fn remove_meta(&self, key: &str, slot: &Arc<MetaSlot>) {
+        let mut leaders = self.meta_leaders.lock().unwrap();
+        if leaders.get(key).is_some_and(|s| Arc::ptr_eq(s, slot)) {
+            leaders.remove(key);
+        }
+    }
+}
+
+/// One shared meta document (issue #295): the leader's
+/// status, headers, and body, handed to the followers
+/// that waited on its flight. Only 200 documents are
+/// shared, and only within the flight: the slot dies
+/// with the leader's guard, so meta stays uncached
+/// across time exactly as before.
+#[derive(Clone)]
+struct SharedMeta {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+}
+
+/// The slot one meta flight shares through: followers
+/// subscribe to the wake channel, and the leader fills
+/// `shared` before its guard drops, so a woken follower
+/// either finds the document or learns the flight
+/// produced nothing shareable.
+struct MetaSlot {
+    sender: Arc<tokio::sync::watch::Sender<bool>>,
+    shared: std::sync::Mutex<Option<SharedMeta>>,
+}
+
+/// The caller's role for one meta flight key.
+enum MetaFlight {
+    /// This request runs the miss path; dropping the
+    /// guard wakes the waiters.
+    Leader(MetaLeaderGuard, Arc<MetaSlot>),
+    /// Another request is already running the miss path
+    /// for this flight; wait on the channel, then read
+    /// the slot.
+    Follower(tokio::sync::watch::Receiver<bool>, Arc<MetaSlot>),
+}
+
+/// Removes the meta key from the in-flight map and wakes
+/// its waiters when dropped, on every exit path alike
+/// (the `LeaderGuard` pattern, for the meta map).
+struct MetaLeaderGuard {
+    inflight: Arc<Inflight>,
+    key: String,
+    slot: Arc<MetaSlot>,
+}
+
+impl Drop for MetaLeaderGuard {
+    fn drop(&mut self) {
+        self.inflight.remove_meta(&self.key, &self.slot);
+        let _ = self.slot.sender.send(true);
     }
 }
 
@@ -1982,6 +2069,31 @@ async fn serve(
         max_age,
         sealed,
     };
+    // Debug requests keep bypassing everything, per
+    // request, as before.
+    if debug {
+        return serve_miss(state, work, record).await;
+    }
+    // Meta requests coalesce through their own flights
+    // (issue #295): the flight key is the cache key plus
+    // every fact the document depends on beyond it (the
+    // sealed spelling, which redacts the document, the
+    // placeholder fields, and the Accept opt-ins), each
+    // computed by the same helpers the miss path branches
+    // on, so the key can never disagree with the document
+    // a flight shares.
+    if meta {
+        let flight_key = format!(
+            "{cache_key}\u{1}meta\u{1}{}{}{}{}{}{}",
+            sealed as u8,
+            placeholders as u8,
+            wants_detections(accept) as u8,
+            wants_moderation(accept) as u8,
+            wants_embeddings(accept) as u8,
+            wants_ocr(accept) as u8,
+        );
+        return serve_meta_flight(state, work, record, &flight_key).await;
+    }
     // Singleflight (audit R2-09): the first miss for a key
     // leads (one fetch, one encode, under the gates below);
     // concurrent requests for the same key wait for the
@@ -1995,17 +2107,13 @@ async fn serve(
     // queueing them forever.
     let mut waits = 0;
     loop {
-        if !bypass && let Some((hit, cache_status)) = lookup_tiers(state, &cache_key, &groups).await
-        {
+        if let Some((hit, cache_status)) = lookup_tiers(state, &cache_key, &groups).await {
             record.cache_hit = true;
             record.bytes_out = hit.bytes.len();
             let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
             attach_cache_headers(&mut response, cache_status, &groups);
             finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
-        }
-        if bypass {
-            return serve_miss(state, work, record).await;
         }
         match state.inflight.lead(&cache_key) {
             Flight::Leader(guard) => {
@@ -2029,6 +2137,126 @@ async fn serve(
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed())
                     .await;
             }
+        }
+    }
+}
+
+/// The body size above which a meta document is not
+/// shared with a flight's followers (issue #295): real
+/// documents are KB-scale, so the cap only ever refuses
+/// the pathological.
+const META_SHARE_CAP: usize = 4 * 1024 * 1024;
+
+/// Meta singleflight (issue #295): concurrent identical
+/// meta requests share one run of the miss path instead
+/// of each loading and rendering the same source. The
+/// leader runs `serve_miss` unchanged; on a 200 it
+/// collects the document into the flight's slot before
+/// its guard drops, and followers answer with a
+/// reconstructed response (the leader's status, headers,
+/// and body) and their own request record, which
+/// truthfully shows they ran no load and no process
+/// stage. Only 200 documents are shared: a flight that
+/// produced anything else leaves its slot empty, and its
+/// followers loop to lead or follow the next flight and
+/// finally run the miss path themselves, so errors are
+/// never shared and every request keeps the error
+/// semantics of a solo request. Nothing outlives the
+/// flight: meta remains uncached across time, exactly
+/// as before.
+///
+/// The two choices this settles, deliberately: request
+/// records stay per request with no flight marker (the
+/// record type has no such field, and none is invented;
+/// a follower is recognizable by its zero load and
+/// process times), and a follower's response headers are
+/// the leader's, which is sound because the flight key
+/// pins every input the headers and the document were
+/// computed from (see `serve`).
+async fn serve_meta_flight(
+    state: &AppState,
+    work: MissWork,
+    mut record: RequestRecord,
+    key: &str,
+) -> (Response, RequestRecord) {
+    let mut waits = 0;
+    loop {
+        match state.inflight.lead_meta(key) {
+            MetaFlight::Leader(guard, slot) => {
+                let (response, record) = serve_miss(state, work, record).await;
+                if response.status() == StatusCode::OK {
+                    let (response, shared) = share_meta_response(response).await;
+                    if let Some(shared) = shared {
+                        *slot.shared.lock().unwrap() = Some(shared);
+                    }
+                    drop(guard);
+                    return (response, record);
+                }
+                drop(guard);
+                return (response, record);
+            }
+            MetaFlight::Follower(mut changed, slot) => {
+                if waits >= MAX_FLIGHT_WAITS {
+                    return serve_miss(state, work, record).await;
+                }
+                waits += 1;
+                // The leader always signals on drop; the
+                // timeout is only a backstop against a
+                // wedged leader, after which the waiter
+                // re-checks the slot and may lead itself.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed())
+                    .await;
+                if let Some(shared) = slot.shared.lock().unwrap().clone() {
+                    record.bytes_out = shared.body.len();
+                    return (respond_shared(&shared), record);
+                }
+            }
+        }
+    }
+}
+
+/// Rebuild a response from a shared meta document: the
+/// leader's status and headers, its body bytes.
+fn respond_shared(shared: &SharedMeta) -> Response {
+    let mut response = Response::new(axum::body::Body::from(shared.body.clone()));
+    *response.status_mut() = shared.status;
+    *response.headers_mut() = shared.headers.clone();
+    response
+}
+
+/// Split a 200 meta response into the shared form a
+/// flight slot carries, rebuilding the leader's own
+/// response from the same parts. Returns `None` for the
+/// shared form when the body is not collected whole
+/// within the share cap; meta bodies are in-memory, so
+/// in practice only the cap refuses, and the leader's
+/// response is rebuilt untouched in that case whenever
+/// the body was not consumed trying.
+async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta>) {
+    let (parts, body) = response.into_parts();
+    if <axum::body::Body as axum::body::HttpBody>::size_hint(&body)
+        .exact()
+        .is_none_or(|n| n > META_SHARE_CAP as u64)
+    {
+        return (Response::from_parts(parts, body), None);
+    }
+    match axum::body::to_bytes(body, META_SHARE_CAP).await {
+        Ok(bytes) => {
+            let shared = SharedMeta {
+                status: parts.status,
+                headers: parts.headers.clone(),
+                body: bytes,
+            };
+            let response = Response::from_parts(parts, axum::body::Body::from(shared.body.clone()));
+            (response, Some(shared))
+        }
+        Err(_) => {
+            // Unreachable for the in-memory bodies meta
+            // answers with (the size hint above already
+            // vouched for the body); the status and
+            // headers survive, the body does not.
+            eprintln!("meta flight: leader body could not be collected for sharing");
+            (Response::from_parts(parts, axum::body::Body::empty()), None)
         }
     }
 }
@@ -11293,6 +11521,129 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "one origin fetch for the whole burst"
+        );
+    }
+
+    /// Fire `n` concurrent meta requests for one URL and
+    /// collect their (status, body) pairs.
+    async fn meta_burst(url: &str, accept: &str, n: usize) -> Vec<(StatusCode, bytes::Bytes)> {
+        let mut tasks = Vec::new();
+        for _ in 0..n {
+            let url = url.to_string();
+            let accept = accept.to_string();
+            tasks.push(tokio::spawn(async move {
+                let resp = client()
+                    .get(&url)
+                    .header("Accept", accept.as_str())
+                    .send()
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                (status, resp.bytes().await.unwrap())
+            }));
+        }
+        let mut out = Vec::new();
+        for task in tasks {
+            out.push(task.await.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn concurrent_meta_requests_share_one_origin_fetch() {
+        // Issue #295: a burst of identical meta requests
+        // collapses into one load and one render, like
+        // image misses do (audit R2-09); the followers
+        // receive the leader's document from its flight.
+        let (src, hits) = spawn_slow_counting_server(test_png(), 500).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let first = meta_burst(&url, "application/json", 8).await;
+        assert!(first.iter().all(|(s, _)| *s == StatusCode::OK));
+        assert!(
+            first.windows(2).all(|w| w[0].1 == w[1].1),
+            "every follower received the leader's document"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "one origin fetch for the whole meta burst"
+        );
+        // Nothing is shared across time: a second burst,
+        // after the flight has ended, leads a fresh flight
+        // and fetches exactly once more.
+        let second = meta_burst(&url, "application/json", 8).await;
+        assert!(second.iter().all(|(s, _)| *s == StatusCode::OK));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the second burst fetched again, once"
+        );
+        assert_eq!(first[0].1, second[0].1, "the same document both times");
+    }
+
+    #[tokio::test]
+    async fn concurrent_meta_requests_with_different_opt_ins_do_not_share() {
+        // Issue #295: the flight key carries the Accept
+        // opt-ins, so a burst asking for placeholder
+        // fields never receives a document computed
+        // without them, nor the other way around: the two
+        // bursts lead separate flights, one fetch each.
+        let (src, hits) = spawn_slow_counting_server(test_png(), 500).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let plain = tokio::spawn({
+            let url = url.clone();
+            async move { meta_burst(&url, "application/json", 4).await }
+        });
+        let opted =
+            tokio::spawn(
+                async move { meta_burst(&url, "application/json; placeholders=1", 4).await },
+            );
+        let plain = plain.await.unwrap();
+        let opted = opted.await.unwrap();
+        assert!(plain.iter().all(|(s, _)| *s == StatusCode::OK));
+        assert!(opted.iter().all(|(s, _)| *s == StatusCode::OK));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "one fetch per opt-in set, not one per request and not one overall"
+        );
+        assert!(
+            plain
+                .iter()
+                .all(|(_, b)| !String::from_utf8_lossy(b).contains("\"placeholder\"")),
+            "the plain burst's documents carry no placeholder fields"
+        );
+        assert!(
+            opted
+                .iter()
+                .all(|(_, b)| String::from_utf8_lossy(b).contains("\"placeholder\"")),
+            "the opt-in burst's documents all carry placeholder fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_meta_requests_keep_solo_error_semantics() {
+        // Issue #295: errors are never shared, and no
+        // waiter hangs or panics: when the origin fails,
+        // every request in the burst ends with the failure
+        // a solo request gets, from its own attempt at the
+        // miss path.
+        let (src, _hits) = spawn_counting_server(404, "image/png", Vec::new()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let solo = meta_burst(&url, "application/json", 1).await;
+        assert_eq!(solo[0].0, StatusCode::BAD_GATEWAY);
+        let burst = meta_burst(&url, "application/json", 6).await;
+        assert!(
+            burst
+                .iter()
+                .all(|(s, b)| *s == solo[0].0 && *b == solo[0].1),
+            "every waiter failed the way the solo request did"
         );
     }
 
