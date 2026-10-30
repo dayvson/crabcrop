@@ -21,3 +21,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "parse_request"
 path = "fuzz_targets/parse_request.rs"
+
+[[bin]]
+name = "unseal"
+path = "fuzz_targets/unseal.rs"
