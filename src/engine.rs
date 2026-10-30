@@ -3343,9 +3343,18 @@ fn encode(
 }
 
 /// Encode WebP. Quality below 100 is a lossy VP8 encode via
-/// oxideav-webp (pure Rust); quality 100 (or an encode the ladder
-/// starts there) keeps the image crate's lossless VP8L encode.
-/// The default quality is 80, like the other lossy formats.
+/// libwebp (the `webp` crate, method 4) since issue #292:
+/// measured about 2.7x faster than the oxideav-webp encode it
+/// replaced, at slightly higher PSNR; the output bytes
+/// differ, which is the accepted cost.
+/// The swap is a temporary measure: the daily oxideav watch
+/// re-benches this path, and the lossy encode returns to
+/// oxideav-webp once a release closes the gap to roughly 1.3x
+/// of libwebp method 4 at equal or better size and quality.
+/// Quality 100 (or an encode the ladder starts there) keeps
+/// the image crate's lossless VP8L encode (libwebp lossless
+/// measured about 92x slower, so it stays). The default
+/// quality is 80, like the other lossy formats.
 fn encode_webp(src: &EncodeBuffers<'_>, quality: Option<u8>) -> Result<Vec<u8>, EngineError> {
     let img = src.img;
     let q = quality.unwrap_or(80);
@@ -3367,13 +3376,22 @@ fn encode_webp(src: &EncodeBuffers<'_>, quality: Option<u8>) -> Result<Vec<u8>, 
             "webp: dimension exceeds the 16383 format limit".into(),
         ));
     }
-    let opts = oxideav_webp::EncodeOptions::default().with_quality(q as f32);
-    let encoded = if img.color().has_alpha() {
-        oxideav_webp::encode_rgba8(img.width(), img.height(), src.rgba().as_raw(), &opts)
+    let encoder = if img.color().has_alpha() {
+        webp::Encoder::from_rgba(src.rgba().as_raw(), img.width(), img.height())
     } else {
-        oxideav_webp::encode_rgb8(img.width(), img.height(), src.rgb().as_raw(), &opts)
+        webp::Encoder::from_rgb(src.rgb().as_raw(), img.width(), img.height())
     };
-    encoded.map_err(|e| EngineError::Encode(e.to_string()))
+    // The lane prototype's configuration: libwebp defaults
+    // with the quality set and the method pinned to 4.
+    let mut config = webp::WebPConfig::new().map_err(|_| {
+        EngineError::Encode("webp: libwebp rejected its default configuration".into())
+    })?;
+    config.quality = q as f32;
+    config.method = 4;
+    let encoded = encoder
+        .encode_advanced(&config)
+        .map_err(|e| EngineError::Encode(format!("webp: {e:?}")))?;
+    Ok(encoded.to_vec())
 }
 
 /// Overlay `wm` onto `base` at (x, y) with `alpha` percent
@@ -6131,6 +6149,66 @@ mod tests {
         let decoded = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
         assert_eq!(decoded.get_pixel(12, 8)[3], 255);
         assert_eq!(decoded.get_pixel(4, 8)[3], 0);
+    }
+
+    #[test]
+    fn webp_lossy_opaque_rgba_keeps_alpha() {
+        // An RGBA source whose alpha is fully opaque still
+        // takes the RGBA encode branch; the decoded output
+        // must keep alpha 255 everywhere and stay lossy.
+        let engine = Engine;
+        let rgba = image::RgbaImage::from_pixel(24, 18, image::Rgba([90, 140, 60, 255]));
+        let src = png_bytes(&DynamicImage::ImageRgba8(rgba));
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::WebP),
+                    Filter::Quality(Quality::Value(80)),
+                ])],
+            )
+            .unwrap();
+        assert_eq!(webp_chunk(&out.bytes), "VP8 ");
+        assert_eq!(decode_dims(&out.bytes), (24, 18));
+        let decoded = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert!(decoded.pixels().all(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn webp_lossy_keeps_channel_order() {
+        // Three vertical bands, each dominated by one channel:
+        // a swapped-channel encode would flip the per-band
+        // dominant channel in the decoded output.
+        let engine = Engine;
+        let mut rgb = image::RgbImage::new(48, 16);
+        for (x, _y, px) in rgb.enumerate_pixels_mut() {
+            *px = match x {
+                0..16 => image::Rgb([210, 40, 40]),
+                16..32 => image::Rgb([40, 200, 50]),
+                _ => image::Rgb([50, 60, 215]),
+            };
+        }
+        let src = png_bytes(&DynamicImage::ImageRgb8(rgb));
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::WebP),
+                    Filter::Quality(Quality::Value(90)),
+                ])],
+            )
+            .unwrap();
+        let decoded = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        let band = |x: u32| {
+            let p = decoded.get_pixel(x, 8);
+            (p[0], p[1], p[2])
+        };
+        let (r, g, b) = band(8);
+        assert!(r > g + 60 && r > b + 60, "red band decoded {r},{g},{b}");
+        let (r, g, b) = band(24);
+        assert!(g > r + 60 && g > b + 60, "green band decoded {r},{g},{b}");
+        let (r, g, b) = band(40);
+        assert!(b > r + 60 && b > g + 60, "blue band decoded {r},{g},{b}");
     }
 
     #[test]
