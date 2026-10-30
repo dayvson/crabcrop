@@ -2,6 +2,17 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.9.5] - 2026-10-30
+
+### Changed
+
+- A rectangular crop followed by a resize now runs as one fused sampling pass (issue #287) instead of materializing the cropped frame and resampling it. The fused shapes run 1.5 to 3.2 times faster on the measured probes. Output is not byte-identical to the two-step path: 1.0 to 3.5 percent of pixels differ, by at most 4 of 255 when downscaling and 10 of 255 when upscaling. Aspect crops are excluded, because their windows come from focal and face decisions, and still take the two-step path.
+- WebP lossy encoding runs through libwebp (issue #292), the same library that has decoded WebP since 0.9.4, at method 4. It encodes several times faster than the pure-Rust encoder it replaces, at equal or better quality: about 1.7 dB higher PSNR on the comparison fixtures with file sizes roughly unchanged. Lossless and animated WebP encoding are unchanged. This is a deliberate, temporary exception to the pure-Rust encoder set, taken for performance; the switch back is tracked against the upstream pure-Rust encoder closing to roughly 1.3 times libwebp at equal or better size and quality.
+- GIF encoding quantizes with quantizr instead of NeuQuant (issue #294), writing indexed frames through the gif crate directly. On the comparison fixtures the encoded files run about a fifth smaller at about 4 dB higher PSNR fidelity, and encoding runs about 1.2 times faster; animated GIFs quantize per frame through the same path, with frame delays and transparency preserved.
+- Concurrent metadata requests for the same image share one origin fetch and render (issue #295). A second in-flight map alongside the image flights keys on everything that can change a meta response: the cache key, the sealed bit, and each Accept opt-in (detections, moderation, embeddings, OCR, placeholders). Followers receive the leader's response; errors are never shared, shared responses are capped at 4 MB, and per-request records are unchanged.
+- Background removal preprocessing resizes with fast_image_resize instead of the image crate's Triangle filter (issue #296), the resize the 0.9.3 sweep deliberately left behind because it feeds a model. The preprocess step drops from 114.5 ms to 24.9 ms on the reference measurement (about 90 ms saved per background removal call). The mask moves slightly: at most 11 of 255 on the largest comparison image, with mean differences below a tenth of a level. Model-input normalization is untouched.
+- Contributor work in this release: a fuzz target for the sealed token parser (PR #300), the minimum supported Rust version declared in the workspace (PR #301), and an AGPL licensing note in the documentation (PR #302).
+
 ## [0.9.4] - 2026-10-29
 
 ### Changed
