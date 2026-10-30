@@ -6,12 +6,13 @@ rust-version = "1.96"
 description = "On-demand image optimization service in Rust"
 license = "MIT"
 repository = "https://github.com/dayvson/crabcrop"
+include = ["/src/**/*", "/tests/fixtures/**/*", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 
 [workspace]
 members = ["crates/crabcrop-url"]
 
 [dependencies]
-crabcrop-url = { path = "crates/crabcrop-url" }
+crabcrop-url = { path = "crates/crabcrop-url", version = "0.9" }
 ab_glyph = "0.2"
 axum = "0.8"
 bytes = "1"
