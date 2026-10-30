@@ -56,9 +56,11 @@ image = { version = "0.25", features = ["avif", "nasm"] }
 # wraps for JPEG (already in the tree transitively); calling it
 # directly skips the wrapper's copies. The webp crate binds
 # libwebp for still WebP decode, bit-identical to image-webp
-# and about 3.5x faster; libwebp-sys compiles the vendored C
-# sources and links them statically, so no system package or
-# runtime library is involved.
+# and about 3.5x faster; it also carries the lossy WebP encode
+# since issue #292 (about 2.7x faster than oxideav-webp, a
+# temporary measure until oxideav closes the gap). libwebp-sys
+# compiles the vendored C sources and links them statically,
+# so no system package or runtime library is involved.
 zune-jpeg = "0.5"
 zune-core = "0.5"
 webp = "0.3"
