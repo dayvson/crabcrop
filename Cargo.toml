@@ -62,6 +62,15 @@ image = { version = "0.25", features = ["avif", "nasm"] }
 zune-jpeg = "0.5"
 zune-core = "0.5"
 webp = "0.3"
+# GIF writes go through the gif crate directly (already in the
+# tree transitively via image) so quantization can swap from
+# NeuQuant to quantizr (issue #294): at 800x533, quantizr with
+# Floyd-Steinberg dithering at 1.0 measured about 1.66x faster
+# than the speed-10 NeuQuant path, a third smaller, and about
+# 3.4 dB higher PSNR. quantizr is pure Rust and actively
+# maintained; the palette (and therefore the bytes) changes.
+gif = "0.14"
+quantizr = "1.4"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "fs", "io-util", "signal"] }
 
 # Safe process-group signalling for the video encoder's
