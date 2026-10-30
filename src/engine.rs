@@ -1567,9 +1567,40 @@ impl Engine {
         let out = match format {
             ImageFormat::Gif => {
                 let mut out = Vec::new();
-                image::codecs::gif::GifEncoder::new_with_speed(&mut out, 10)
-                    .encode_frames(out_frames)
-                    .map_err(|e| EngineError::Encode(e.to_string()))?;
+                let first = out_frames
+                    .first()
+                    .expect("process_animated is called with at least one frame");
+                let (canvas_w, canvas_h) = (first.buffer().width(), first.buffer().height());
+                let mut enc = gif::Encoder::new(
+                    &mut out,
+                    u16::try_from(canvas_w).map_err(|_| {
+                        EngineError::Encode("gif: width exceeds the 65535 format limit".to_string())
+                    })?,
+                    u16::try_from(canvas_h).map_err(|_| {
+                        EngineError::Encode(
+                            "gif: height exceeds the 65535 format limit".to_string(),
+                        )
+                    })?,
+                    &[],
+                )
+                .map_err(|e| EngineError::Encode(e.to_string()))?;
+                for f in &out_frames {
+                    // GIF delays are hundredths of a second; the
+                    // image crate saturated this conversion at
+                    // u16::MAX, and so does this.
+                    let (numer, denom) = f.delay().numer_denom_ms();
+                    let delay = u16::try_from(numer / denom / 10).unwrap_or(u16::MAX);
+                    let buffer = f.buffer();
+                    let frame = gif_frame_quantized(
+                        buffer.as_raw(),
+                        buffer.width(),
+                        buffer.height(),
+                        delay,
+                    )?;
+                    enc.write_frame(&frame)
+                        .map_err(|e| EngineError::Encode(e.to_string()))?;
+                }
+                drop(enc);
                 out
             }
             ImageFormat::WebP => encode_animated_webp(out_frames, loop_count.unwrap_or(0))?,
@@ -3120,6 +3151,96 @@ impl<'a> EncodeBuffers<'a> {
     }
 }
 
+/// Quantize one RGBA frame with quantizr and wrap it as a
+/// `gif::Frame` carrying its own palette (issue #294). This is
+/// the GIF write path for both still and animated output; it
+/// replaces the image crate's NeuQuant conversion
+/// (`Frame::from_rgba_speed`) and mirrors its alpha semantics:
+/// alpha is binarized before quantizing (any non-zero alpha is
+/// opaque; fully transparent pixels are unified to one color),
+/// because GIF carries only 1-bit transparency. The palette
+/// entry those pixels land on has alpha 0, and it becomes the
+/// frame's transparent index.
+fn gif_frame_quantized(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    delay: u16,
+) -> Result<gif::Frame<'static>, EngineError> {
+    let encode_err = |msg: &str| EngineError::Encode(format!("gif: {msg}"));
+    if width == 0 || height == 0 {
+        return Err(encode_err("zero dimension"));
+    }
+    let w = u16::try_from(width).map_err(|_| encode_err("width exceeds the 65535 format limit"))?;
+    let h =
+        u16::try_from(height).map_err(|_| encode_err("height exceeds the 65535 format limit"))?;
+    // Binarize alpha on a copy: quantizr reads the buffer as
+    // given, and the caller's frame is shared.
+    let mut pixels = rgba.to_vec();
+    let mut transparent_color: Option<[u8; 3]> = None;
+    let (chunks, _) = pixels.as_chunks_mut::<4>();
+    for pix in chunks {
+        if pix[3] == 0 {
+            match transparent_color {
+                Some([r, g, b]) => {
+                    pix[0] = r;
+                    pix[1] = g;
+                    pix[2] = b;
+                }
+                None => transparent_color = Some([pix[0], pix[1], pix[2]]),
+            }
+        } else {
+            pix[3] = 0xFF;
+        }
+    }
+    let image = quantizr::Image::new(&pixels, width as usize, height as usize)
+        .map_err(|e| encode_err(&e.to_string()))?;
+    let mut opts = quantizr::Options::default();
+    opts.set_max_colors(256)
+        .map_err(|e| encode_err(&e.to_string()))?;
+    let mut result = quantizr::QuantizeResult::quantize(&image, &opts);
+    result
+        .set_dithering_level(1.0)
+        .map_err(|e| encode_err(&e.to_string()))?;
+    let palette = result.get_palette();
+    let entries = &palette.entries[..palette.count as usize];
+    let mut palette_bytes = Vec::with_capacity(entries.len() * 3);
+    for entry in entries {
+        palette_bytes.extend_from_slice(&[entry.r, entry.g, entry.b]);
+    }
+    // The transparent pixels quantized to the palette's
+    // alpha-0 entry (fully transparent input is one color to
+    // quantizr, whatever its RGB was); if clustering left no
+    // pure alpha-0 entry, the lowest-alpha entry is the one
+    // they remapped to, and it takes the role instead.
+    let transparent = if transparent_color.is_some() {
+        entries
+            .iter()
+            .position(|entry| entry.a == 0)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.a < 0xFF)
+                    .min_by_key(|(_, entry)| entry.a)
+                    .map(|(i, _)| i)
+            })
+            .map(|i| i as u8)
+    } else {
+        None
+    };
+    let mut indices = vec![0u8; width as usize * height as usize];
+    result
+        .remap_image(&image, &mut indices)
+        .map_err(|e| encode_err(&e.to_string()))?;
+    let mut frame = gif::Frame::from_palette_pixels(w, h, indices, palette_bytes, transparent);
+    frame.delay = delay;
+    // The image crate's encoder disposed every frame to the
+    // background; keep that behavior.
+    frame.dispose = gif::DisposalMethod::Background;
+    Ok(frame)
+}
+
 /// Encode `src.img` to `format`. `quality` applies to JPEG,
 /// JPEG XL, AVIF, and WebP (where 100 selects the lossless
 /// encode). `fill` composites transparency for formats without
@@ -3207,8 +3328,10 @@ fn encode(
             .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Gif => {
-            image::codecs::gif::GifEncoder::new_with_speed(&mut buf, 10)
-                .encode(src.rgba().as_raw(), w, h, ExtendedColorType::Rgba8)
+            let frame = gif_frame_quantized(src.rgba().as_raw(), w, h, 0)?;
+            let mut enc = gif::Encoder::new(&mut buf, frame.width, frame.height, &[])
+                .map_err(|e| EngineError::Encode(e.to_string()))?;
+            enc.write_frame(&frame)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
@@ -6404,6 +6527,108 @@ mod tests {
             .unwrap();
         assert_eq!(out.format, ImageFormat::Gif);
         assert_eq!(&out.bytes[..6], b"GIF89a");
+    }
+
+    /// A still with more colors than a GIF palette holds, so
+    /// the quantizer really runs, plus a fully transparent
+    /// block whose RGB must not leak into the output.
+    fn colorful_transparent_png() -> Vec<u8> {
+        let mut img = image::RgbaImage::new(48, 32);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgba([
+                (x * 5 % 256) as u8,
+                (y * 8 % 256) as u8,
+                ((x + y) * 3 % 256) as u8,
+                0xFF,
+            ]);
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                img.put_pixel(x, y, image::Rgba([200, 30, 30, 0]));
+            }
+        }
+        let mut out = Vec::new();
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn gif_still_quantizer_keeps_transparency() {
+        // Issue #294: the quantizr path must carry the frame's
+        // transparent index, not just its colors.
+        let engine = Engine;
+        let out = engine
+            .process(
+                &colorful_transparent_png(),
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Gif)])],
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        assert_eq!(&out.bytes[..6], b"GIF89a");
+        let frames = decoded_gif_frames(&out.bytes);
+        assert_eq!(frames.len(), 1);
+        let buf = frames[0].buffer();
+        assert_eq!((buf.width(), buf.height()), (48, 32));
+        // The transparent block decodes back to alpha 0, the
+        // opaque gradient to alpha 255.
+        assert_eq!(buf.get_pixel(4, 4)[3], 0);
+        assert_eq!(buf.get_pixel(40, 24)[3], 0xFF);
+    }
+
+    /// Two 40x20 frames with a transparent corner: frame one
+    /// opaque red with the corner cut out, frame two blue.
+    fn animated_transparent_gif_bytes() -> Vec<u8> {
+        let mut red = image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255]));
+        for y in 0..5 {
+            for x in 0..5 {
+                red.put_pixel(x, y, image::Rgba([255, 0, 0, 0]));
+            }
+        }
+        let mut blue = image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 0, 255, 255]));
+        for y in 0..5 {
+            for x in 0..5 {
+                blue.put_pixel(x, y, image::Rgba([0, 0, 255, 0]));
+            }
+        }
+        let delay = image::Delay::from_numer_denom_ms(100, 1);
+        let frames = vec![
+            image::Frame::from_parts(red, 0, 0, delay),
+            image::Frame::from_parts(blue, 0, 0, delay),
+        ];
+        let mut out = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut out)
+            .encode_frames(frames)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn animated_gif_quantizer_keeps_frames_delays_and_transparency() {
+        // Issue #294: the per-frame swap must keep every frame,
+        // its delay, and its transparent pixels.
+        let engine = Engine;
+        let src = animated_transparent_gif_bytes();
+        let out = engine.process(&src, &[]).unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        let frames = decoded_gif_frames(&out.bytes);
+        assert_eq!(frames.len(), 2);
+        for frame in &frames {
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            assert_eq!(numer / denom, 100, "frame delay must survive");
+            let buf = frame.buffer();
+            assert_eq!((buf.width(), buf.height()), (40, 20));
+            assert_eq!(
+                buf.get_pixel(2, 2)[3],
+                0,
+                "transparent corner stays transparent"
+            );
+            assert_eq!(buf.get_pixel(20, 10)[3], 0xFF);
+        }
+        // Frame bodies keep their colors: red first, blue second.
+        assert!(frames[0].buffer().get_pixel(20, 10)[0] > 200);
+        assert!(frames[1].buffer().get_pixel(20, 10)[2] > 200);
     }
 
     #[test]
