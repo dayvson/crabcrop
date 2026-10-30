@@ -50,6 +50,8 @@ export const FILTER_DESCRIPTIONS: Record<string, string> = {
   recolorclass:
     "recolor every detected object of the named class to the given color (needs a detection model on the server)",
   removebg: "remove the background (needs an AI model on the server)",
+  studio:
+    "studio mode: `product` composites the subject onto a backdrop (bg: white, a RRGGBB color, brand, or none) with a synthesized contact shadow (shadow: soft, strong, or none), scaled and centered to a pad margin (pad: 0..40, default 10); `scene` keeps the photograph's scene, reframing it on the detected subject with light and color correction (pad only) (needs an AI model on the server)",
   keep_profile: "keep the source color profile instead of converting to sRGB",
   upscale: "AI upscale by the given factor (needs an AI model on the server)",
   equalize: "histogram equalization",
@@ -271,6 +273,48 @@ function validateFilter(name: string, args: string | null): string | null {
       return args !== null && /^[+-]?\d+$/.test(args) && (Number(args) === 2 || Number(args) === 4)
         ? null
         : bad;
+    case "studio": {
+      // The server's studio grammar (url.rs parse_studio):
+      // the mode (`product` or `scene`) first, then named
+      // `key:value` arguments, each key at most once.
+      // Product takes `bg`, `shadow`, and `pad`; scene
+      // takes `pad` only, because a backdrop and a shadow
+      // are product concepts (naming one under scene is a
+      // bad argument, not a silent no-op).
+      if (args === null) return bad;
+      const parts = args.split(",");
+      const mode = parts[0];
+      if (mode !== "product" && mode !== "scene") return bad;
+      const seen = new Set<string>();
+      for (const part of parts.slice(1)) {
+        const cut = part.indexOf(":");
+        if (cut === -1) return bad;
+        const key = part.slice(0, cut);
+        const value = part.slice(cut + 1);
+        if (seen.has(key)) return bad;
+        seen.add(key);
+        if (key === "pad") {
+          // The pad parses as a Rust u8 (an optional `+`,
+          // then digits; no minus sign, not even `-0`) and
+          // is bounded to 40.
+          if (!/^\+?\d+$/.test(value) || BigInt(value) > 40n) return bad;
+        } else if (mode === "product" && key === "bg") {
+          if (
+            value !== "white" &&
+            value !== "brand" &&
+            value !== "none" &&
+            !/^[0-9a-fA-F]{6}$/.test(value)
+          ) {
+            return bad;
+          }
+        } else if (mode === "product" && key === "shadow") {
+          if (value !== "none" && value !== "soft" && value !== "strong") return bad;
+        } else {
+          return bad;
+        }
+      }
+      return null;
+    }
     case "dpr":
       return args !== null && isFloat(args) && [1, 1.5, 2, 3].includes(Number(args))
         ? null
@@ -415,9 +459,28 @@ function validateFilter(name: string, args: string | null): string | null {
 }
 
 function explainFilters(rest: string): { detail?: string; error?: string } {
-  // The server splits the list naively on ':'; a ':' inside
-  // parentheses is not special there either.
-  const parts = rest.split(":");
+  // The server splits the list on the ':' separators that
+  // sit outside parentheses (url.rs split_filter_chain):
+  // an argument list may itself contain ':' (the studio
+  // filter's named arguments are `key:value`), so a naive
+  // split would cut those filters apart. Unbalanced
+  // parentheses leave the tail in one part, which then
+  // fails its own parse, as on the server.
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i];
+    if (c === "(") {
+      depth += 1;
+    } else if (c === ")") {
+      depth = Math.max(0, depth - 1);
+    } else if (c === ":" && depth === 0) {
+      parts.push(rest.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(rest.slice(start));
   const blurbs = [];
   for (const part of parts) {
     const match = part.match(/^([a-z_0-9]+)(?:\((.*)\))?$/);

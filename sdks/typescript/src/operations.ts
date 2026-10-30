@@ -39,6 +39,39 @@ export type MaskShape = "circle" | "ellipse";
 /** Channels the `curve(...)` filter remaps. */
 export type CurveChannel = "rgb" | "r" | "g" | "b";
 
+/** Modes the `studio(...)` filter runs. */
+export type StudioMode = "product" | "scene";
+
+/** Contact shadow strengths for `studio(product, ...)`. */
+export type StudioShadow = "soft" | "strong" | "none";
+
+/**
+ * Named arguments for the `studio(...)` filter. `bg` and
+ * `shadow` are product arguments only: the server rejects
+ * them under `scene`, so the builder throws for them there.
+ */
+export interface StudioOptions {
+  /**
+   * The product backdrop: `"white"`, `"brand"` (the
+   * operator brand color, white when none is configured),
+   * `"none"` (the subject keeps its transparency and no
+   * shadow is synthesized), or a RRGGBB hex color. Unset
+   * means the unnamed default: the brand color when one
+   * is configured, else white. Naming `"white"` is not
+   * the default: the two can resolve differently, so they
+   * spell differently.
+   */
+  bg?: string;
+  /** Contact shadow strength; the default is `"soft"`. */
+  shadow?: StudioShadow;
+  /**
+   * Pad margin in percent, 0..40; the default is 10.
+   * Under `scene` it is the margin the reframed subject
+   * keeps.
+   */
+  pad?: number;
+}
+
 /**
  * One side of a size: a pixel count (1..16383), 0 for
  * proportional, a negative count to flip that axis, or
@@ -158,6 +191,8 @@ const ANCHORS: readonly string[] = [
 ];
 const BLEND_MODES: readonly string[] = ["normal", "multiply", "screen", "overlay"];
 const CURVE_CHANNELS: readonly string[] = ["rgb", "r", "g", "b"];
+const STUDIO_MODES: readonly string[] = ["product", "scene"];
+const STUDIO_SHADOWS: readonly string[] = ["soft", "strong", "none"];
 const IMAGE_FORMATS: readonly string[] = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"];
 
 /** Operation segments, one typed call per segment kind. */
@@ -439,6 +474,47 @@ export const filter = {
   /** How much a face crop expands around the face: 0..3. */
   facePad(amount: number): string {
     return `facepad(${num(floatIn("facepad", amount, 0, 3))})`;
+  },
+  /**
+   * Studio mode: `studio(product)` composites the subject
+   * the server's segmentation model finds onto a backdrop
+   * with a synthesized contact shadow, scaled and centered
+   * to the pad margin; `studio(scene)` keeps the
+   * photograph's scene, reframing it on the detected
+   * subject and correcting light and color. See
+   * {@link StudioOptions} for the named arguments.
+   * Arguments spelled at their defaults (shadow `soft`,
+   * pad 10) are omitted, matching the server's canonical
+   * spelling, so `studio("product", { pad: 10 })` and
+   * `studio("product")` are the same string.
+   */
+  studio(mode: StudioMode, options: StudioOptions = {}): string {
+    if (!STUDIO_MODES.includes(mode)) {
+      fail("studio mode", mode, `one of ${STUDIO_MODES.join(", ")}`);
+    }
+    const { bg, shadow, pad } = options;
+    if (mode === "scene" && (bg !== undefined || shadow !== undefined)) {
+      fail("studio scene options", options, "pad only: bg and shadow are product arguments");
+    }
+    const parts: string[] = [mode];
+    if (mode === "product") {
+      if (bg !== undefined) {
+        const value =
+          bg === "white" || bg === "brand" || bg === "none" ? bg : hex6("studio bg", bg);
+        parts.push(`bg:${value}`);
+      }
+      if (shadow !== undefined) {
+        if (!STUDIO_SHADOWS.includes(shadow)) {
+          fail("studio shadow", shadow, `one of ${STUDIO_SHADOWS.join(", ")}`);
+        }
+        if (shadow !== "soft") parts.push(`shadow:${shadow}`);
+      }
+    }
+    if (pad !== undefined) {
+      intIn("studio pad", pad, 0, 40);
+      if (pad !== 10) parts.push(`pad:${pad}`);
+    }
+    return `studio(${parts.join(",")})`;
   },
   /** AI upscale by the given factor. */
   upscale(factor: 2 | 4): string {
