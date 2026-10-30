@@ -1102,6 +1102,7 @@ For the AI features, build `Dockerfile.ai` on top of that image; see [AI feature
 | GCP | [Cloud Run](deploy/cloud-run/README.md) | `service.yaml` | Secret Manager | A managed service; the recipe keeps one instance warm |
 | Azure | [Container Apps](deploy/container-apps/README.md) | `containerapp.yaml` | The app secret store, or a Key Vault reference | A managed app with ingress; the recipe keeps one replica warm |
 | Single host | [Docker Compose](deploy/compose/README.md) | `docker-compose.yml` | An environment variable | One host, for evaluation |
+| Single host | [Binary on a VM](deploy/vm/README.md) | The release binary, `crabcrop.service`, and a proxy config | A root-only environment file | One host, for production: systemd plus a TLS proxy |
 
 ### Put a CDN in front
 

@@ -1,0 +1,18 @@
+# crabcrop behind Caddy: Caddy obtains and renews the TLS
+# certificate for the hostname automatically once its DNS
+# points at this host. Everything proxies to crabcrop on
+# port 3000, except /health (unauthenticated) and /metrics
+# (traffic and error counters), which are served to
+# localhost only.
+images.example.com {
+	@internal path /health /metrics
+	handle @internal {
+		@local remote_ip 127.0.0.1 ::1
+		reverse_proxy @local 127.0.0.1:3000
+		respond 403
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+}

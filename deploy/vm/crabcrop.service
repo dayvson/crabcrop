@@ -1,0 +1,28 @@
+[Unit]
+Description=crabcrop image optimization service
+Documentation=https://github.com/dayvson/crabcrop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crabcrop
+Group=crabcrop
+EnvironmentFile=/etc/crabcrop/crabcrop.env
+ExecStart=/usr/local/bin/crabcrop
+Restart=on-failure
+RestartSec=2
+
+# Creates /var/cache/crabcrop, owned by the service user.
+# The env file points CRABCROP_RESULT_STORAGE_DIR at it.
+CacheDirectory=crabcrop
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# If the env file points any *_DIR setting somewhere else,
+# add that path here so the service can write to it.
+ReadWritePaths=/var/cache/crabcrop
+
+[Install]
+WantedBy=multi-user.target
