@@ -1,0 +1,6 @@
+# Upgrade corpus presets. Local to this suite so the corpus does not
+# depend on the functional suite's file. Never edit a definition in
+# place: roll a change out under a new name, because corpus entries
+# freeze the bytes these definitions produced at baseline time.
+thumb = 300x200/filters:format(webp)
+card = crop:400x225/filters:quality(75)

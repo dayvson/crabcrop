@@ -38,6 +38,9 @@ if [ "$SKIP_RUST" -eq 0 ]; then
   cargo test -p crabcrop-url
 fi
 
+step "Upgrade test (previous-release corpus)"
+python3 tests/upgrade/run_upgrade.py --bin target/debug/crabcrop
+
 step "TypeScript SDK"
 (cd sdks/typescript && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm run build && npm test)
 

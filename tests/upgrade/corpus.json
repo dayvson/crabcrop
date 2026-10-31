@@ -1,0 +1,385 @@
+{
+ "baseline": {
+  "release": "v0.9.5",
+  "tag_commit": "5a1674f4908ccc8ca83f64c134e98a60744fcd24",
+  "how": "Goldens produced by tests/upgrade/freeze.py against a release build (cargo build --release --locked) of the baseline tag, rendering each entry twice from two separate server boots and keeping only byte-identical entries."
+ },
+ "freeze_date": "2026-10-31",
+ "secrets": {
+  "current": "upgrade-corpus-current-secret",
+  "current_key_id": "2026-08",
+  "previous": "upgrade-corpus-previous-secret",
+  "previous_key_id": "2025-11",
+  "comment": "Test fixtures only, minted for this corpus. They protect nothing and appear here so the frozen URLs stay verifiable."
+ },
+ "server": {
+  "origin_port": 8991,
+  "server_port": 8992,
+  "presets_file": "tests/upgrade/presets.txt",
+  "source_root": "photos = http://127.0.0.1:8991 (generated at runtime)"
+ },
+ "entries": [
+  {
+   "id": "resize-exact",
+   "kind": "render",
+   "path": "/622623aeec61c4e64fcaa047340c9da2d2f938cf747d88636906bef5cfd47961/300x200/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 16307,
+   "sha256": "28111a651af844ca80ae8f5a44bbb234cc3ca8ae4a3c4fb9fc013ac7fde3d2f6",
+   "note": ""
+  },
+  {
+   "id": "resize-proportional",
+   "kind": "render",
+   "path": "/3a6685fa84442947d945f881bee78a7d59a81ddebf5c868c5e554ce0e90b8ff7/300x0/http://127.0.0.1:8991/gradient.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 2189,
+   "sha256": "ef43b0e7acc3234ca796465476525fa38da5f61b34e84fef003c3a8b82143cdc",
+   "note": ""
+  },
+  {
+   "id": "crop-plain",
+   "kind": "render",
+   "path": "/c3ee9f05d79b9ac7018bf5f59c66e4e10583d4e53a54c017a6e6663a085e3912/crop:400x300/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 28849,
+   "sha256": "06713baf71b383d511d80fc5df3812848e5797f9d0e184b23d1ca2976e28aa6d",
+   "note": ""
+  },
+  {
+   "id": "crop-gravity",
+   "kind": "render",
+   "path": "/420c70d2666c2bc0b323ec681973540f88a3212f47faba1bf8b944439eec65d7/crop:300x300:bottom-right/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 19939,
+   "sha256": "7120b5e05daec4337f3fbaa1b714ff17bed4f521af5adc2487482f3876239ed4",
+   "note": ""
+  },
+  {
+   "id": "rotate-90",
+   "kind": "render",
+   "path": "/616ef1b2c9dc245b8cfbb95ef52ca3c47cb8a3d06910eca73199c2964cc3f491/filters:rotate(90):format(png)/http://127.0.0.1:8991/logo.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 22318,
+   "sha256": "97cab0ac363e087dbc629f65313e9b7a835565ddfaa8fb6ef6f85a70bfe70bae",
+   "note": ""
+  },
+  {
+   "id": "flip-horizontal",
+   "kind": "render",
+   "path": "/bd0af11d4032778d744c055804c7d5e6eec6c8db4fec5d18062072d0ca6d046c/400x0/filters:flip(h):format(png)/http://127.0.0.1:8991/gradient.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 2947,
+   "sha256": "c21e97794040f47392118d977fc8e9f4cd6347141425f920abfedfcb58d77db3",
+   "note": ""
+  },
+  {
+   "id": "format-webp",
+   "kind": "render",
+   "path": "/7e8a621d78b50ad6a2ee4be5e2e12c872ce493caa0dabec9d32c2036777c98cd/300x0/filters:format(webp)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/webp",
+   "bytes": 13400,
+   "sha256": "ae3a9a8011e9037fdf31516c3a6f2c059ff17c60c74764b047f5304765a5b105",
+   "note": ""
+  },
+  {
+   "id": "format-avif",
+   "kind": "render",
+   "path": "/d96b613cafafd80fa5940974539ac77c0c67073e47ac64630cc9b6a378695dc3/300x0/filters:format(avif)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/avif",
+   "bytes": 12034,
+   "sha256": "683324fa1e21b23466c1cef39d55102a7d96f916ce35f970b6a9565514e49fa4",
+   "note": ""
+  },
+  {
+   "id": "format-jxl",
+   "kind": "render",
+   "path": "/e7b6578bbb85df9bcbe0ba403c1267584ae4411b22929bbb0e8260fe8af7fc4a/300x0/filters:format(jxl)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jxl",
+   "bytes": 8815,
+   "sha256": "42ca768141c7c873cba25d055bfe49bab09c20eb4d3f60c6b47e392dc68a8a54",
+   "note": ""
+  },
+  {
+   "id": "format-png",
+   "kind": "render",
+   "path": "/c3c391bb4a4f1421eaa0b43642b9940bc91dda485a3033bfa16bfea0a3945ee7/300x0/filters:format(png)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 121273,
+   "sha256": "047eaf5c3b0e49792da3e03314aa2460530028f9b4813f9e5cfe8e23302f1515",
+   "note": ""
+  },
+  {
+   "id": "format-gif",
+   "kind": "render",
+   "path": "/9a75932128bdbd15218574134c44c71dc66c88b13d0b7b5c87cfb5876ec9bb24/300x0/filters:format(gif)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/gif",
+   "bytes": 43077,
+   "sha256": "9ae618232df5f0d8c921fc0bbd9ceada3657823ff88446b6932e5b72548f39d7",
+   "note": ""
+  },
+  {
+   "id": "quality-override",
+   "kind": "render",
+   "path": "/92a6abeeb92cc5805c2a8f68afe6e0b0c2a740ab474e2d6d235b2c14a91de5a1/300x0/filters:quality(55)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 10444,
+   "sha256": "b20a4ad13420f3a75bde5c156e69e4353811d69d368e9047b095b8bc1774c9a8",
+   "note": ""
+  },
+  {
+   "id": "grayscale",
+   "kind": "render",
+   "path": "/6d52f0e7c2d89b10e5c1bd07770294d5cb317621c5b20cb0ca0bf413213ff526/300x0/filters:grayscale/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 14605,
+   "sha256": "4ad48fd5fe959a90141cab206442eba9c3f46e4982109b2fc3ee89ec60563842",
+   "note": ""
+  },
+  {
+   "id": "chain-multi-filter",
+   "kind": "render",
+   "path": "/eef49b1a662a3f7876124102cd6beabdd8919449ca977c886bccc2a0388c6df1/400x0/filters:blur(1.5):saturation(1.4):sharpen(1.2):format(webp)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/webp",
+   "bytes": 13412,
+   "sha256": "8a5847f931db1aca6f0bc27cb0243f6a9cedc023721646407058f511c441c033",
+   "note": ""
+  },
+  {
+   "id": "blur",
+   "kind": "render",
+   "path": "/eb125f33ddca978212a34f1e9dc8a064aba420d6fbb547c4f0a3d0d145103842/300x0/filters:blur(2.5):format(png)/http://127.0.0.1:8991/gradient.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 2189,
+   "sha256": "8f7f31ebcb3d2be6522270d99992739c1765d9947f32cf9bfd51160b196a3071",
+   "note": ""
+  },
+  {
+   "id": "sharpen",
+   "kind": "render",
+   "path": "/458e404be9765a2835a5aba8e189700751c1a24ca595eafb4b18ea7c6063c542/300x0/filters:sharpen(1.5):format(png)/http://127.0.0.1:8991/gradient.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 2587,
+   "sha256": "3b5f1682069d15fd2bff114456791ff537d5d2d07836882a5a0f3824a5a7635c",
+   "note": ""
+  },
+  {
+   "id": "adjust-bright-contrast-saturation",
+   "kind": "render",
+   "path": "/9d1ed6f40ac27e0ccfe081bb7cdfe1cec387b3fc77ca5b0ea271e08c89bf05ed/filters:brighten(30):contrast(25):saturation(0.5):format(png)/http://127.0.0.1:8991/base-rgb.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 2613,
+   "sha256": "d4407972c948f3190d40f8c8adf6e485eb2af292e77daf65d060e4956c4934d5",
+   "note": ""
+  },
+  {
+   "id": "invert",
+   "kind": "render",
+   "path": "/3d40b04c9942c700337df0f989ad36f98a9e60fb2a28266f9c9659fa196b4528/filters:invert:format(png)/http://127.0.0.1:8991/base-rgb.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 2612,
+   "sha256": "55dbaf9c9f42987fa6fafed2e0daf6d966fdce0d663658921ee53a570a0769ed",
+   "note": ""
+  },
+  {
+   "id": "hue-rotate",
+   "kind": "render",
+   "path": "/a68001ba846cd36be65b4418f5c1fabc23527a52289f140efa84d03e4ffc7d97/filters:huerotate(90):format(png)/http://127.0.0.1:8991/base-rgb.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 2608,
+   "sha256": "1ef2806a39fb048ca5477432076890b080f83b59d640fac4ba0e51c5a14b5de7",
+   "note": ""
+  },
+  {
+   "id": "pixelate",
+   "kind": "render",
+   "path": "/c73a3206e95fb2a6321a6d00b0c769c9031c07ca144c534c6bf6ee67387b8aa4/400x0/filters:pixelate(10):format(png)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 7069,
+   "sha256": "78baf2f1caa766e595970585a33d5440eb7a9e747b60d37b23f3b84675365f97",
+   "note": ""
+  },
+  {
+   "id": "radius-rounded",
+   "kind": "render",
+   "path": "/95221434132342f118d777b0bb8d4dc35e39c356ed4f3eae3151f03eea90ee85/300x0/filters:radius(40):format(png)/http://127.0.0.1:8991/alpha-base.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 2905,
+   "sha256": "eed9f631bd0a2824b7d4cc82d8e4c6ba0b7086b5a03c459b804c55c77b07a4f5",
+   "note": ""
+  },
+  {
+   "id": "pad-fill",
+   "kind": "render",
+   "path": "/e13d697767d607144467b76e01c889987ee761e9f0862debcf591a88a560f373/pad:500x400:00ff00/filters:format(png)/http://127.0.0.1:8991/logo.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 24278,
+   "sha256": "8d8a9296aae93b84f8de2df25c5741eb786003f22b1b0f97e75392930de558c1",
+   "note": ""
+  },
+  {
+   "id": "metadata-strip",
+   "kind": "render",
+   "path": "/2dd2bbdbe1f2311e0e7879bfae9b41678b17091be7b4dff7a36de7718db82d65/0x0/filters:format(jpeg)/http://127.0.0.1:8991/exif-orient.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 66847,
+   "sha256": "57ee613bcdeabea7def615be5de85380697aafdfdce35e4c5d08e90be5425646",
+   "note": ""
+  },
+  {
+   "id": "metadata-preserve",
+   "kind": "render-preserve",
+   "path": "/2dd2bbdbe1f2311e0e7879bfae9b41678b17091be7b4dff7a36de7718db82d65/0x0/filters:format(jpeg)/http://127.0.0.1:8991/exif-orient.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 66967,
+   "sha256": "dab58cfdb2d474d779ce92ceb3c9325d015fd4edad69e8826972123ef8bac4a1",
+   "note": ""
+  },
+  {
+   "id": "watermark-overlay",
+   "kind": "render",
+   "path": "/822b96338522f9ff4ade36e89eca4e04f2030ca2159c0182f34772ecee0c77e0/600x0/filters:watermark(http%3A%2F%2F127.0.0.1%3A8991%2Flogo.png,-10,-10,80):format(png)/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 398221,
+   "sha256": "235db991d9586766dd822ce4ef66961bdb19e98f791c55ee613418b0915e56d2",
+   "note": ""
+  },
+  {
+   "id": "animated-gif-resize",
+   "kind": "render",
+   "path": "/016cfae7eb888732d988c44ebe4b11b5d005e7fc4c17d563a10ca7e91f47f582/240x0/http://127.0.0.1:8991/anim.gif",
+   "status": 200,
+   "content_type": "image/gif",
+   "bytes": 358732,
+   "sha256": "f8d608e9864ef0768e2bba63a64809c202b7c1a35fc633f87fbf2060f3387447",
+   "note": ""
+  },
+  {
+   "id": "preset-thumb",
+   "kind": "render",
+   "path": "/921bc6aa9461bc56c424302379dec4ee32554b1b2da0550c2187cb99635a96c8/preset:thumb/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/webp",
+   "bytes": 13400,
+   "sha256": "ae3a9a8011e9037fdf31516c3a6f2c059ff17c60c74764b047f5304765a5b105",
+   "note": ""
+  },
+  {
+   "id": "preset-card",
+   "kind": "render",
+   "path": "/91c46cf9287e54e3f8fa6d8ab019b5f9d85e6125f25fd86d37a8ac2be8623889/preset:card/http://127.0.0.1:8991/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 20412,
+   "sha256": "8963ed0e37b88c7b67b9e2e16b9804d686dc755ba5650cade57cf8740acb32a2",
+   "note": ""
+  },
+  {
+   "id": "source-root-short",
+   "kind": "render",
+   "path": "/96451c9d9ff0857ecc7af0cc39fa678c5529e82e72d26efd8e1cf73320cb8765/300x200/root:photos/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 16307,
+   "sha256": "28111a651af844ca80ae8f5a44bbb234cc3ca8ae4a3c4fb9fc013ac7fde3d2f6",
+   "note": ""
+  },
+  {
+   "id": "sealed-url",
+   "kind": "render",
+   "path": "/s1.dXBnMzExbm9uY2Ux5a9pTF9TrjNSr2ihi6NcaPQO-xCpH21yrTJhWhXsPiqLzuEW5JkYG1T-jxEScnTsJXci1iM8reRAH01D/crab-photo.jpg",
+   "status": 200,
+   "content_type": "image/jpeg",
+   "bytes": 16307,
+   "sha256": "28111a651af844ca80ae8f5a44bbb234cc3ca8ae4a3c4fb9fc013ac7fde3d2f6",
+   "note": ""
+  },
+  {
+   "id": "exp-future",
+   "kind": "render",
+   "path": "/6172883b27cbefb83333d416157cb5bcddfb3eee0de66aa3037734341980f7cc/exp:1893456000/200x0/http://127.0.0.1:8991/gradient.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 1188,
+   "sha256": "34d1f864d68b5baa92e943fe21de2f637777b339c42f676c9d003e942c34dcdf",
+   "note": ""
+  },
+  {
+   "id": "exp-past",
+   "kind": "expired",
+   "path": "/28acf1675547bce421df31cf8ca65b8bddcee7f6573a74aab7939de021da2c4b/exp:946684800/200x0/http://127.0.0.1:8991/gradient.png",
+   "status": 403,
+   "content_type": "text/plain; charset=utf-8",
+   "bytes": 17,
+   "sha256": "041bb5a6b271102539db73397b8f2d2cd221c78d1a8a79393ed9880192cfe1dc",
+   "note": ""
+  },
+  {
+   "id": "keyid-current",
+   "kind": "render",
+   "path": "/2026-08:7bcc16ab0834e2072d1bcbccc7f79a9bfe5590409d99071fa2ea6daecb8629ce/250x0/http://127.0.0.1:8991/logo.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 11921,
+   "sha256": "3a8ea7507a85b29ca4683d07daa003b805b98ee8fb1877e6cebba25b862924cf",
+   "note": ""
+  },
+  {
+   "id": "keyid-previous",
+   "kind": "render",
+   "path": "/2025-11:857197c8dbe03118fc4c4fa2bdb3e8938dfb1bc053190d47b354f74084738d2c/250x0/http://127.0.0.1:8991/gradient.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 1736,
+   "sha256": "dc8e219d9aa3f8b6ae6b5e9616b8fe9dc16c5fda0684719c981378360347a471",
+   "note": ""
+  },
+  {
+   "id": "unkeyed-previous-secret",
+   "kind": "render",
+   "path": "/18d4914c046aafd2a681bdf8df0dcb8bbb43ee2fe20249910846fce4dd40004e/250x0/filters:format(png)/http://127.0.0.1:8991/alpha-base.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 1443,
+   "sha256": "572a230b5d7737562314dfd7b4e8fc1e449bd662570684f9bf250f1432566772",
+   "note": ""
+  },
+  {
+   "id": "purge-roundtrip",
+   "kind": "purge",
+   "path": "/8596dc0eb30c710718871f948fedffd928d43f2a8b4a7c42835f05bc73ecdd4c/275x0/http://127.0.0.1:8991/base-rgb.png",
+   "status": 200,
+   "content_type": "image/png",
+   "bytes": 1644,
+   "sha256": "9eb7a2bdea3350a71b79b98c24c322ff0f2cd1e9962ff75ebe44f53454f80f15",
+   "note": "",
+   "remainder": "275x0/http://127.0.0.1:8991/base-rgb.png",
+   "purge_signature": "ad27fcc6c3c1fc96a9fc859567da7c4eacd02704df3d8c92a862abbf184efadc"
+  }
+ ]
+}
