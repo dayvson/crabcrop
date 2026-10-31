@@ -14,9 +14,10 @@ never repo content. Run them locally with models configured:
 Instances: AI (all models configured), AIN (nothing configured),
 AIC (CLIP B/32 encoder with the mismatched L/14 aesthetic head and
 label-only moderation signals). See README.md for the model file
-list. Two cells encode known-defect probes from the campaign and are
-expected to pass on current builds: rb-2000-webp and st-bg-none-webp
-record #227 sightings as NOTEs; st-nosubject-gradient and
+list. Two cells encode known-defect probes from the campaign:
+rb-2000-webp still records #227 sightings as a NOTE, while
+st-bg-none-webp was promoted to a check when the libwebp swap
+(#292) closed the encode path behind #303; st-nosubject-gradient and
 upscale-oom-probe assert the #243 and #244 fixes hold (a process
 kill fails the cell and the rest of the AI instance's cells with
 connection errors).
@@ -192,15 +193,22 @@ def st_bg_none_png():
 
 @cell
 def st_bg_none_webp():
-    # Transparent backdrop into lossy WebP: #227 family, timing is the data point.
-    f = render("st-bg-none-webp", "filters:studio(product,bg:none):format(webp)", "product-shoe.jpg", timeout=900)
+    # Transparent backdrop into lossy WebP: the #303 regression
+    # guard. While the lossy encode ran through oxideav-webp
+    # (#227 family) this cell was a note: the encode of a large
+    # alpha image never returned and server memory ballooned
+    # past 3 GB after the overlay stage. The libwebp swap
+    # (#292) made the path fast and bounded, so the cell is a
+    # check now: status, the alpha shape the PNG sibling
+    # asserts, and a server-time bound with wide headroom over
+    # the healthy ~1-5 s class (the pathological encode alone
+    # ran past 240 s). A regression fails like any other case.
+    f = render("st-bg-none-webp", "filters:studio(product,bg:none):format(webp)", "product-shoe.jpg", timeout=300)
     a = alpha_stats(f["path"]) if f["path"] else {}
-    if f["status"] == 200:
-        note("st-bg-none-webp", "studio", "filters:studio(product,bg:none):format(webp)", "product-shoe.jpg", f,
-             f"#227 known family: status=200 server_ms={f['server_ms']} client_ms={f['client_ms']} alpha={a}")
-    else:
-        note("st-bg-none-webp", "studio", "filters:studio(product,bg:none):format(webp)", "product-shoe.jpg", f,
-             f"#227 known family: status={f['status']} body={f['body'][:120]}")
+    ok = (f["status"] == 200 and a.get("has_alpha") and a["transparent"] > 0.2
+          and a["opaque"] > 0.1 and (f["server_ms"] or 999999) < 20000)
+    check("st-bg-none-webp", "studio", "filters:studio(product,bg:none):format(webp)", "product-shoe.jpg",
+          ok, f, f"status={f['status']} server_ms={f['server_ms']} alpha={a}")
 
 @cell
 def st_opaque_webp_fast():
