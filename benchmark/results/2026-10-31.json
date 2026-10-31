@@ -1,0 +1,497 @@
+{
+  "meta": {
+    "sources": 25,
+    "source_dims": "2400x1600 JPEG, 25 files, see fixtures/",
+    "origin_port": 8911,
+    "ops": [
+      "resize_w800",
+      "crop_400x300",
+      "webp800_q80",
+      "gray800",
+      "avif800_q80",
+      "jxl800_q80",
+      "jpeg800_q60",
+      "jpeg800_q95",
+      "webp800_q60",
+      "webp800_q95"
+    ]
+  },
+  "crabcrop": {
+    "resize_w800": {
+      "cold": {
+        "mean_ms": 30.1,
+        "p50_ms": 30.4,
+        "p95_ms": 36.5,
+        "min_ms": 22.2,
+        "max_ms": 40.5
+      },
+      "warm": {
+        "mean_ms": 0.3,
+        "p50_ms": 0.2,
+        "p95_ms": 0.4,
+        "min_ms": 0.2,
+        "max_ms": 0.7
+      },
+      "avg_bytes": 26540
+    },
+    "crop_400x300": {
+      "cold": {
+        "mean_ms": 57.2,
+        "p50_ms": 57.1,
+        "p95_ms": 61.4,
+        "min_ms": 41.0,
+        "max_ms": 71.5
+      },
+      "warm": {
+        "mean_ms": 0.2,
+        "p50_ms": 0.2,
+        "p95_ms": 0.5,
+        "min_ms": 0.2,
+        "max_ms": 0.7
+      },
+      "avg_bytes": 11325
+    },
+    "webp800_q80": {
+      "cold": {
+        "mean_ms": 65.2,
+        "p50_ms": 65.5,
+        "p95_ms": 66.9,
+        "min_ms": 61.6,
+        "max_ms": 72.5
+      },
+      "warm": {
+        "mean_ms": 0.3,
+        "p50_ms": 0.3,
+        "p95_ms": 0.5,
+        "min_ms": 0.2,
+        "max_ms": 0.7
+      },
+      "avg_bytes": 11990
+    },
+    "gray800": {
+      "cold": {
+        "mean_ms": 25.8,
+        "p50_ms": 25.8,
+        "p95_ms": 27.0,
+        "min_ms": 25.2,
+        "max_ms": 27.1
+      },
+      "warm": {
+        "mean_ms": 0.3,
+        "p50_ms": 0.2,
+        "p95_ms": 0.5,
+        "min_ms": 0.2,
+        "max_ms": 0.7
+      },
+      "avg_bytes": 20275
+    },
+    "avif800_q80": {
+      "cold": {
+        "mean_ms": 125.9,
+        "p50_ms": 109.7,
+        "p95_ms": 179.9,
+        "min_ms": 76.1,
+        "max_ms": 183.3
+      },
+      "warm": {
+        "mean_ms": 0.3,
+        "p50_ms": 0.2,
+        "p95_ms": 0.4,
+        "min_ms": 0.2,
+        "max_ms": 0.7
+      },
+      "avg_bytes": 13772
+    },
+    "jxl800_q80": {
+      "cold": {
+        "mean_ms": 33.3,
+        "p50_ms": 32.8,
+        "p95_ms": 36.8,
+        "min_ms": 30.8,
+        "max_ms": 37.6
+      },
+      "warm": {
+        "mean_ms": 0.2,
+        "p50_ms": 0.2,
+        "p95_ms": 0.5,
+        "min_ms": 0.2,
+        "max_ms": 0.7
+      },
+      "avg_bytes": 13175
+    },
+    "jpeg800_q60": {
+      "cold": {
+        "mean_ms": 23.9,
+        "p50_ms": 23.9,
+        "p95_ms": 25.8,
+        "min_ms": 22.0,
+        "max_ms": 26.2
+      },
+      "warm": {
+        "mean_ms": 0.3,
+        "p50_ms": 0.2,
+        "p95_ms": 0.4,
+        "min_ms": 0.2,
+        "max_ms": 0.6
+      },
+      "avg_bytes": 18602
+    },
+    "jpeg800_q95": {
+      "cold": {
+        "mean_ms": 24.7,
+        "p50_ms": 24.7,
+        "p95_ms": 25.8,
+        "min_ms": 23.6,
+        "max_ms": 25.8
+      },
+      "warm": {
+        "mean_ms": 0.4,
+        "p50_ms": 0.3,
+        "p95_ms": 0.7,
+        "min_ms": 0.2,
+        "max_ms": 1.2
+      },
+      "avg_bytes": 62716
+    },
+    "webp800_q60": {
+      "cold": {
+        "mean_ms": 62.9,
+        "p50_ms": 62.4,
+        "p95_ms": 66.4,
+        "min_ms": 60.6,
+        "max_ms": 71.1
+      },
+      "warm": {
+        "mean_ms": 0.2,
+        "p50_ms": 0.2,
+        "p95_ms": 0.4,
+        "min_ms": 0.2,
+        "max_ms": 0.7
+      },
+      "avg_bytes": 8579
+    },
+    "webp800_q95": {
+      "cold": {
+        "mean_ms": 78.8,
+        "p50_ms": 75.7,
+        "p95_ms": 86.0,
+        "min_ms": 72.8,
+        "max_ms": 135.3
+      },
+      "warm": {
+        "mean_ms": 0.3,
+        "p50_ms": 0.2,
+        "p95_ms": 0.4,
+        "min_ms": 0.2,
+        "max_ms": 0.8
+      },
+      "avg_bytes": 31916
+    },
+    "throughput_warm_resize": {
+      "requests": 25,
+      "workers": 8,
+      "total_s": 0.01,
+      "req_per_s": 2066.8
+    }
+  },
+  "thumbor": {
+    "resize_w800": {
+      "cold": {
+        "mean_ms": 42.2,
+        "p50_ms": 41.7,
+        "p95_ms": 46.9,
+        "min_ms": 38.7,
+        "max_ms": 50.4
+      },
+      "warm": {
+        "mean_ms": 38.7,
+        "p50_ms": 38.7,
+        "p95_ms": 39.4,
+        "min_ms": 37.6,
+        "max_ms": 39.5
+      },
+      "avg_bytes": 24586
+    },
+    "crop_400x300": {
+      "cold": {
+        "mean_ms": 73.3,
+        "p50_ms": 71.9,
+        "p95_ms": 75.5,
+        "min_ms": 70.3,
+        "max_ms": 95.8
+      },
+      "warm": {
+        "mean_ms": 71.9,
+        "p50_ms": 72.0,
+        "p95_ms": 73.8,
+        "min_ms": 70.1,
+        "max_ms": 74.6
+      },
+      "avg_bytes": 10857
+    },
+    "webp800_q80": {
+      "cold": {
+        "mean_ms": 87.4,
+        "p50_ms": 80.4,
+        "p95_ms": 107.2,
+        "min_ms": 76.5,
+        "max_ms": 186.0
+      },
+      "warm": {
+        "mean_ms": 80.0,
+        "p50_ms": 77.9,
+        "p95_ms": 89.4,
+        "min_ms": 74.7,
+        "max_ms": 109.9
+      },
+      "avg_bytes": 12012
+    },
+    "gray800": {
+      "cold": {
+        "mean_ms": 38.5,
+        "p50_ms": 38.3,
+        "p95_ms": 39.5,
+        "min_ms": 37.5,
+        "max_ms": 39.6
+      },
+      "warm": {
+        "mean_ms": 39.0,
+        "p50_ms": 38.8,
+        "p95_ms": 42.1,
+        "min_ms": 37.2,
+        "max_ms": 42.3
+      },
+      "avg_bytes": 17657
+    },
+    "avif800_q80": {
+      "unsupported": "no encoder or filter for this operation"
+    },
+    "jxl800_q80": {
+      "unsupported": "no encoder or filter for this operation"
+    },
+    "jpeg800_q60": {
+      "cold": {
+        "mean_ms": 37.8,
+        "p50_ms": 37.7,
+        "p95_ms": 39.6,
+        "min_ms": 36.5,
+        "max_ms": 42.0
+      },
+      "warm": {
+        "mean_ms": 37.8,
+        "p50_ms": 37.5,
+        "p95_ms": 40.4,
+        "min_ms": 36.5,
+        "max_ms": 42.1
+      },
+      "avg_bytes": 16464
+    },
+    "jpeg800_q95": {
+      "cold": {
+        "mean_ms": 41.5,
+        "p50_ms": 41.3,
+        "p95_ms": 43.0,
+        "min_ms": 40.0,
+        "max_ms": 43.0
+      },
+      "warm": {
+        "mean_ms": 41.1,
+        "p50_ms": 41.1,
+        "p95_ms": 42.1,
+        "min_ms": 40.1,
+        "max_ms": 42.7
+      },
+      "avg_bytes": 57802
+    },
+    "webp800_q60": {
+      "cold": {
+        "mean_ms": 82.9,
+        "p50_ms": 81.4,
+        "p95_ms": 94.5,
+        "min_ms": 75.1,
+        "max_ms": 108.1
+      },
+      "warm": {
+        "mean_ms": 81.6,
+        "p50_ms": 81.4,
+        "p95_ms": 89.2,
+        "min_ms": 74.4,
+        "max_ms": 91.4
+      },
+      "avg_bytes": 8589
+    },
+    "webp800_q95": {
+      "cold": {
+        "mean_ms": 91.8,
+        "p50_ms": 90.8,
+        "p95_ms": 100.5,
+        "min_ms": 86.4,
+        "max_ms": 103.0
+      },
+      "warm": {
+        "mean_ms": 93.4,
+        "p50_ms": 90.9,
+        "p95_ms": 99.8,
+        "min_ms": 85.1,
+        "max_ms": 133.2
+      },
+      "avg_bytes": 32248
+    },
+    "throughput_warm_resize": {
+      "requests": 25,
+      "workers": 8,
+      "total_s": 0.97,
+      "req_per_s": 25.8
+    }
+  },
+  "imgproxy": {
+    "resize_w800": {
+      "cold": {
+        "mean_ms": 17.3,
+        "p50_ms": 16.9,
+        "p95_ms": 20.0,
+        "min_ms": 15.9,
+        "max_ms": 20.1
+      },
+      "warm": {
+        "mean_ms": 19.9,
+        "p50_ms": 17.3,
+        "p95_ms": 30.5,
+        "min_ms": 16.2,
+        "max_ms": 31.7
+      },
+      "avg_bytes": 24060
+    },
+    "crop_400x300": {
+      "cold": {
+        "mean_ms": 11.8,
+        "p50_ms": 11.8,
+        "p95_ms": 12.3,
+        "min_ms": 11.2,
+        "max_ms": 12.6
+      },
+      "warm": {
+        "mean_ms": 12.3,
+        "p50_ms": 12.0,
+        "p95_ms": 13.3,
+        "min_ms": 11.1,
+        "max_ms": 15.6
+      },
+      "avg_bytes": 10490
+    },
+    "webp800_q80": {
+      "cold": {
+        "mean_ms": 62.7,
+        "p50_ms": 62.6,
+        "p95_ms": 65.2,
+        "min_ms": 60.2,
+        "max_ms": 65.2
+      },
+      "warm": {
+        "mean_ms": 62.5,
+        "p50_ms": 61.9,
+        "p95_ms": 64.4,
+        "min_ms": 59.4,
+        "max_ms": 73.6
+      },
+      "avg_bytes": 12249
+    },
+    "gray800": {
+      "unsupported": "no encoder or filter for this operation"
+    },
+    "avif800_q80": {
+      "unsupported": "status 500 ct text/plain"
+    },
+    "jxl800_q80": {
+      "cold": {
+        "mean_ms": 40.4,
+        "p50_ms": 39.5,
+        "p95_ms": 44.2,
+        "min_ms": 36.8,
+        "max_ms": 57.8
+      },
+      "warm": {
+        "mean_ms": 41.5,
+        "p50_ms": 40.0,
+        "p95_ms": 54.1,
+        "min_ms": 37.4,
+        "max_ms": 54.9
+      },
+      "avg_bytes": 17963
+    },
+    "jpeg800_q60": {
+      "cold": {
+        "mean_ms": 17.4,
+        "p50_ms": 17.5,
+        "p95_ms": 18.4,
+        "min_ms": 16.5,
+        "max_ms": 18.6
+      },
+      "warm": {
+        "mean_ms": 17.8,
+        "p50_ms": 17.5,
+        "p95_ms": 19.6,
+        "min_ms": 16.1,
+        "max_ms": 22.3
+      },
+      "avg_bytes": 15849
+    },
+    "jpeg800_q95": {
+      "cold": {
+        "mean_ms": 20.1,
+        "p50_ms": 19.6,
+        "p95_ms": 25.7,
+        "min_ms": 18.2,
+        "max_ms": 25.8
+      },
+      "warm": {
+        "mean_ms": 20.3,
+        "p50_ms": 19.8,
+        "p95_ms": 22.3,
+        "min_ms": 18.5,
+        "max_ms": 23.0
+      },
+      "avg_bytes": 81335
+    },
+    "webp800_q60": {
+      "cold": {
+        "mean_ms": 65.1,
+        "p50_ms": 61.7,
+        "p95_ms": 87.2,
+        "min_ms": 58.8,
+        "max_ms": 120.0
+      },
+      "warm": {
+        "mean_ms": 60.3,
+        "p50_ms": 60.0,
+        "p95_ms": 63.4,
+        "min_ms": 57.2,
+        "max_ms": 66.0
+      },
+      "avg_bytes": 8799
+    },
+    "webp800_q95": {
+      "cold": {
+        "mean_ms": 73.3,
+        "p50_ms": 73.0,
+        "p95_ms": 75.8,
+        "min_ms": 71.7,
+        "max_ms": 76.4
+      },
+      "warm": {
+        "mean_ms": 72.4,
+        "p50_ms": 72.6,
+        "p95_ms": 74.1,
+        "min_ms": 69.0,
+        "max_ms": 77.8
+      },
+      "avg_bytes": 32450
+    },
+    "throughput_warm_resize": {
+      "requests": 25,
+      "workers": 8,
+      "total_s": 0.41,
+      "req_per_s": 61.0
+    }
+  }
+}
