@@ -187,6 +187,7 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
             // the source at its render scale, which the
             // raw-bytes probe does not know.
             Operation::FocalRect { .. }
+            | Operation::FocalPoint { .. }
             | Operation::DebugFocal
             | Operation::Frame(_)
             | Operation::Page(_) => cur,

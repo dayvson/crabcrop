@@ -2435,6 +2435,11 @@ fn apply_operations(
     // The pending focal rectangle from a `focal:` segment,
     // consumed by the next crop.
     let mut focal: Option<(u32, u32, u32, u32)> = None;
+    // The pending focal point from a `focalpoint:` segment
+    // (issue #313), consumed the same way. Setting either
+    // focal form clears the other, so the last one in the
+    // chain is the one the crop obeys.
+    let mut focal_point: Option<(f32, f32, f32)> = None;
     // The `debug:focal` state: armed by the segment, captured
     // by the first crop that follows it. The capture holds
     // the values that crop actually used (threaded out of the
@@ -2523,6 +2528,14 @@ fn apply_operations(
                     )));
                 }
                 focal = Some((*left, *top, *right, *bottom));
+                focal_point = None;
+            }
+            Operation::FocalPoint { x, y, zoom } => {
+                // Fractions of the image in effect at this
+                // point, so there is no bounds failure to
+                // make: any image can carry the point.
+                focal_point = Some((*x, *y, *zoom));
+                focal = None;
             }
             Operation::CropRect {
                 left,
@@ -2572,6 +2585,12 @@ fn apply_operations(
                 let focal_rect = focal
                     .take()
                     .filter(|_| *align == Align::Center || *align == Align::Smart);
+                // A pending focal point behaves the same way
+                // (issue #313): center and smart crops center
+                // on it, explicit alignments ignore it.
+                let focal_pt = focal_point
+                    .take()
+                    .filter(|_| *align == Align::Center || *align == Align::Smart);
                 // With the debug view armed, this crop is the
                 // one the view annotates: clone the canvas it
                 // operates on and run the traced crop variants,
@@ -2597,6 +2616,26 @@ fn apply_operations(
                         cropped
                     } else {
                         crate::crop::crop_to_aspect_focal(img, tw, th, rect)
+                    }
+                } else if let Some(pt) = focal_pt {
+                    if want_trace {
+                        let (cropped, window) =
+                            crate::crop::crop_to_aspect_point_traced(img, tw, th, pt);
+                        let canvas = canvas.expect("want_trace clones the canvas");
+                        let (cw, ch) = (canvas.width(), canvas.height());
+                        debug_capture = Some(crate::debugview::FocalCapture {
+                            canvas,
+                            focal: Some((
+                                ((pt.0 * cw as f32).round() as u32).min(cw.saturating_sub(1)),
+                                ((pt.1 * ch as f32).round() as u32).min(ch.saturating_sub(1)),
+                            )),
+                            focal_rect: None,
+                            window,
+                            faces: Vec::new(),
+                        });
+                        cropped
+                    } else {
+                        crate::crop::crop_to_aspect_point(img, tw, th, pt)
                     }
                 } else if *align == Align::Face {
                     // Crop around the largest detected face. A
@@ -5880,6 +5919,110 @@ mod tests {
         let with_focal = engine.process(&src, &[focal_op(1, 1, 7, 3)]).unwrap();
         assert_eq!(with_focal.bytes, plain.bytes);
         assert_eq!(dims_of(&with_focal), dims_of(&plain));
+    }
+
+    fn point_op(x: f32, y: f32, zoom: f32) -> Operation {
+        Operation::FocalPoint { x, y, zoom }
+    }
+
+    #[test]
+    fn focal_point_centers_the_crop_on_the_point() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        // The bottom-right corner point: the 4x4 fill window
+        // anchors at (4, 0), all black. The plain center crop
+        // (window at (2, 0)) keeps part of the white quadrant.
+        let out = engine
+            .process(&src, &[point_op(1.0, 1.0, 1.0), square_crop(Align::Center)])
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().all(|p| p[0] == 0));
+        let out = engine.process(&src, &[square_crop(Align::Center)]).unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().any(|p| p[0] > 0));
+        // The top-left corner point keeps the white quadrant
+        // in frame (window at (0, 0), mixed), where the
+        // zoomed version below is uniformly white. The
+        // downscale blends the rows, so the checks are on
+        // bands, not exact values.
+        let out = engine
+            .process(&src, &[point_op(0.0, 0.0, 1.0), square_crop(Align::Center)])
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().any(|p| p[0] > 200));
+        assert!(img.pixels().any(|p| p[0] < 55));
+    }
+
+    #[test]
+    fn focal_point_zoom_tightens_the_window() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        // Zoom 2 at the top-left corner: the window is the
+        // 2x2 white block itself.
+        let out = engine
+            .process(&src, &[point_op(0.0, 0.0, 2.0), square_crop(Align::Center)])
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().all(|p| p[0] == 255));
+        // Zoom 2 at the bottom-right corner: all black.
+        let out = engine
+            .process(&src, &[point_op(1.0, 1.0, 2.0), square_crop(Align::Center)])
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().all(|p| p[0] == 0));
+    }
+
+    #[test]
+    fn focal_point_and_rect_last_one_wins() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        // Rect after point: the rectangle (the white block)
+        // steers, so white survives.
+        let out = engine
+            .process(
+                &src,
+                &[
+                    point_op(1.0, 1.0, 1.0),
+                    focal_op(0, 0, 4, 2),
+                    square_crop(Align::Center),
+                ],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().any(|p| p[0] > 0));
+        // Point after rect: the corner point steers, all black.
+        let out = engine
+            .process(
+                &src,
+                &[
+                    focal_op(0, 0, 4, 2),
+                    point_op(1.0, 1.0, 1.0),
+                    square_crop(Align::Center),
+                ],
+            )
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().all(|p| p[0] == 0));
+    }
+
+    #[test]
+    fn focal_point_is_ignored_by_a_directional_align() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        let out = engine
+            .process(&src, &[point_op(1.0, 1.0, 1.0), square_crop(Align::Left)])
+            .unwrap();
+        let img = image::load_from_memory(&out.bytes).unwrap().to_luma8();
+        assert!(img.pixels().any(|p| p[0] > 0));
+    }
+
+    #[test]
+    fn focal_point_without_a_crop_is_a_no_op() {
+        let engine = Engine;
+        let src = png_bytes(&quadrant_pattern());
+        let plain = engine.process(&src, &[]).unwrap();
+        let with_point = engine.process(&src, &[point_op(0.25, 0.75, 3.0)]).unwrap();
+        assert_eq!(with_point.bytes, plain.bytes);
     }
 
     fn crop_op(w: u32, h: u32, align: Align) -> Operation {

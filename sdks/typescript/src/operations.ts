@@ -253,6 +253,20 @@ export const ops = {
     return `focal:${left}x${top}:${right}x${bottom}`;
   },
 
+  /** `focalpoint:0.75x0.4:2` (fractions of the image dimensions, zoom optional); steers the next crop. */
+  focalPoint(x: number, y: number, zoom = 1): string {
+    const frac = (what: string, v: number): number => {
+      if (!Number.isFinite(v) || v < 0 || v > 1) {
+        fail(what, v, "a fraction from 0 to 1");
+      }
+      return v;
+    };
+    if (!Number.isFinite(zoom) || zoom <= 0 || zoom > 100) {
+      fail("focalpoint zoom", zoom, "a number above 0 and at most 100");
+    }
+    return `focalpoint:${num(frac("focalpoint x", x))}x${num(frac("focalpoint y", y))}:${num(zoom)}`;
+  },
+
   /** `pad:300x200`, optionally `:blur` or a RRGGBB fill color. */
   pad(width: number, height: number, fill?: "blur" | string): string {
     const box = pixelBox("pad", width, height);

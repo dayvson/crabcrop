@@ -35,7 +35,7 @@ Two operational differences matter. First, imgix signing is opt-in per Source (W
 | `crop=edges` | `crop:WxH:smart` | Approximate: edge detection becomes saliency-plus-faces |
 | `crop=faces` | `crop:WxH:smart` | Approximate: `smart` keeps faces whole inside the window rather than centering on them; `crop:WxH:face` centers the largest face |
 | `fit=facearea`, with `facepad=1.5` | `crop:WxH:face` plus `filters:facepad(1.5)` | Approximate: crabcrop frames the largest detected face and requires `CRABCROP_FACE_MODEL`; `faceindex` (pick the Nth face) has no equivalent |
-| `crop=focalpoint` with `fp-x`, `fp-y` | `focal:<rect>` before `crop:WxH:smart` | Approximate, and only with source dimensions in hand: the fractions become pixels, and a point becomes a small rectangle around it (see the worked example). `fp-z` shrinks that rectangle to zoom; `fp-debug` maps to the `debug:focal` operation |
+| `crop=focalpoint` with `fp-x`, `fp-y`, `fp-z` | `focalpoint:<fp-x>x<fp-y>:<fp-z>` before `crop:WxH` | Direct: the fractions and the zoom carry over as written, with no source dimensions needed (see the worked example). `fp-debug` maps to the `debug:focal` operation |
 | `crop` fallback chains (`crop=faces,entropy`) and the object-class values (`crop=car`, subject detection) | One alignment per crop | Unsupported as written: pick the first chain entry that matters and use it |
 | `fit=max` | `fit-in:WxH` plus `filters:no_upscale` | Direct: fit inside, never upscale |
 | `fit=min` | `crop:WxH` plus `filters:no_upscale` | Direct: crop to the aspect, capped at the source size |
@@ -126,7 +126,7 @@ imgix adjustments mostly run -100 to 100 with 0 as unchanged. crabcrop's adjustm
 
 Could a `convert-imgix` verb sit next to `convert-thumbor`? The mechanical core could: imgix URLs parse cleanly (a path plus a query string), most size, format, quality, and adjustment parameters have the equivalents above, and the Thumbor converter's pattern, convert what is faithful and drop the rest with a named warning rather than guessing, fits.
 
-Three things keep it from being a weekend verb. First, the source: a Thumbor URL carries its source in full, but a bucket Source's imgix URL does not, so the verb needs the Source base supplied out of band before it can emit a crabcrop URL at all. Second, fraction-valued parameters (`fp-x` and `fp-y`, fractional `w` and `h`, the relative layout values in the `txt` and `mark` families) need the source's pixel dimensions, which a converter that does not fetch the source cannot know; those become warnings and dropped parameters, not conversions. Third, the surface doubles itself: every parameter has a Base64 twin (`txt64`, `mark64`, `blend64`, and so on) that must be decoded first, `mark` and `blend` values can nest whole imgix URLs with their own parameters inside them, and `crop` fallback chains have no target spelling. None of that blocks a useful verb; all of it argues for shipping the tables first, which is what this guide is.
+Three things keep it from being a weekend verb. First, the source: a Thumbor URL carries its source in full, but a bucket Source's imgix URL does not, so the verb needs the Source base supplied out of band before it can emit a crabcrop URL at all. Second, fraction-valued parameters (fractional `w` and `h`, the relative layout values in the `txt` and `mark` families) need the source's pixel dimensions, which a converter that does not fetch the source cannot know; those become warnings and dropped parameters, not conversions. (`fp-x` and `fp-y` are no longer in that set: `focalpoint:` takes the fractions directly.) Third, the surface doubles itself: every parameter has a Base64 twin (`txt64`, `mark64`, `blend64`, and so on) that must be decoded first, `mark` and `blend` values can nest whole imgix URLs with their own parameters inside them, and `crop` fallback chains have no target spelling. None of that blocks a useful verb; all of it argues for shipping the tables first, which is what this guide is.
 
 ## Rolling out
 
@@ -178,14 +178,14 @@ crabcrop:
   /<signature>/800x0/filters:brighten(26):contrast(20):saturation(0.7):huerotate(15):sharpen(0.4)/https://images.example.com/street.jpg
 ```
 
-A focal-point crop. The source is 2000x1333, so `fp-x=0.75` and `fp-y=0.4` land on the point (1500, 533), which becomes a 100px focal rectangle around it:
+A focal-point crop. The fractions carry over as written, so no source dimensions and no rectangle arithmetic are needed:
 
 ```
 imgix:
-  https://yourbrand.imgix.net/puppy.jpg?w=600&h=600&fit=crop&crop=focalpoint&fp-x=0.75&fp-y=0.4
+  https://yourbrand.imgix.net/puppy.jpg?w=600&h=600&fit=crop&crop=focalpoint&fp-x=0.75&fp-y=0.4&fp-z=2
 
 crabcrop:
-  /<signature>/focal:1450x483:1550x583/crop:600x600:smart/https://images.example.com/puppy.jpg
+  /<signature>/focalpoint:0.75x0.4:2/crop:600x600/https://images.example.com/puppy.jpg
 ```
 
 A watermarked share card. The grid position and pad become negative pixel offsets, and `mark-scale` moves to the overlay filter's width argument:

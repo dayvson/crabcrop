@@ -649,6 +649,35 @@ function explainSegment(seg, nowSeconds) {
     }
     return { kind: "operation", title: "Focal rectangle", detail: `set the focal rectangle ${rest} for the next crop (left x top : right x bottom)` };
   }
+  if (seg.startsWith("focalpoint:")) {
+    const rest = seg.slice(11);
+    const colon = rest.indexOf(":");
+    const point = colon === -1 ? rest : rest.slice(0, colon);
+    const zoomText = colon === -1 ? null : rest.slice(colon + 1);
+    const xy = point.split("x");
+    const ok =
+      xy.length === 2 &&
+      isFloat(xy[0]) &&
+      isFloat(xy[1]) &&
+      Number(xy[0]) >= 0 &&
+      Number(xy[0]) <= 1 &&
+      Number(xy[1]) >= 0 &&
+      Number(xy[1]) <= 1 &&
+      (zoomText === null ||
+        (isFloat(zoomText) && Number(zoomText) > 0 && Number(zoomText) <= 100));
+    if (!ok) {
+      return {
+        kind: "operation",
+        title: "Focal point",
+        error: `malformed focalpoint segment: ${seg} (want focalpoint:<x>x<y>[:<zoom>] with x and y in 0..1 and zoom in (0, 100])`,
+      };
+    }
+    return {
+      kind: "operation",
+      title: "Focal point",
+      detail: `set the focal point ${point} at zoom ${zoomText ?? "1"} for the next crop (fractions of the image dimensions; zoom above 1 tightens the crop around the point)`,
+    };
+  }
   if (seg.startsWith("crop:")) {
     const rest = seg.slice(5);
     const idx = rest.indexOf(":");

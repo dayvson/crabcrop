@@ -494,6 +494,9 @@ pub(crate) fn describe_operation_text(op: &Operation) -> Vec<String> {
         } => vec![format!(
             "set the focal rectangle {left},{top} to {right},{bottom} for the next crop"
         )],
+        Operation::FocalPoint { x, y, zoom } => vec![format!(
+            "set the focal point {x}x{y} at zoom {zoom} for the next crop"
+        )],
         Operation::Filters(filters) => filters.iter().map(describe_filter).collect(),
         Operation::DebugFocal => vec![
             "render the smart-crop debug view (focal point, focal rectangle, and crop window drawn on the crop's canvas; never cached)"

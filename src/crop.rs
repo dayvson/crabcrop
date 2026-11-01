@@ -289,7 +289,88 @@ pub fn crop_to_aspect_focal_traced(
     (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
 }
 
-/// Crop `img` to the `target_w:target_h` aspect around `face`:
+/// Crop `img` to the `target_w:target_h` aspect ratio,
+/// centered on the focal point `(x, y)` (fractions of the
+/// image dimensions) at the given zoom (a `focalpoint:`
+/// segment; issue #313). Zoom 1 cuts the ordinary fill
+/// window, positioned on the point instead of the frame
+/// center; above 1 the window tightens around the point
+/// (both axes scale by `1 / zoom`, so the point stays the
+/// window's center until the frame edge clamps it); below
+/// 1 the window loosens toward the fill window, which it
+/// can never exceed, so a small zoom converges on the
+/// zoom-1 crop. Like [`crop_to_aspect`], it returns `img`
+/// unchanged when the ratios already match or the target
+/// dimensions are zero.
+pub fn crop_to_aspect_point(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    point: (f32, f32, f32),
+) -> DynamicImage {
+    crop_to_aspect_point_traced(img, target_w, target_h, point).0
+}
+
+/// [`crop_to_aspect_point`], also reporting the window it
+/// cut, as (left, top, width, height): `None` when no crop
+/// ran (a zero target), the full frame when the aspect
+/// already matched.
+pub fn crop_to_aspect_point_traced(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    point: (f32, f32, f32),
+) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
+    if target_w == 0 || target_h == 0 {
+        return (img, None);
+    }
+    let (w, h) = (img.width(), img.height());
+    // Compare w/h with target_w/target_h via cross-multiplication.
+    let src_ratio = w as u64 * target_h as u64;
+    let dst_ratio = target_w as u64 * h as u64;
+    if src_ratio == dst_ratio {
+        return (img, Some((0, 0, w, h)));
+    }
+    // The fill window: the largest target-aspect window in
+    // the frame, the window the other crops cut.
+    let (fill_w, fill_h) = if src_ratio > dst_ratio {
+        (
+            ((h as u64 * target_w as u64) / target_h as u64).max(1) as u32,
+            h,
+        )
+    } else {
+        (
+            w,
+            ((w as u64 * target_h as u64) / target_w as u64).max(1) as u32,
+        )
+    };
+    let (fx, fy, zoom) = point;
+    // The grammar guarantees the point and zoom ranges; the
+    // sanitization keeps a hand-built call from reaching the
+    // window math with values that would invert it, the
+    // same stance as the filter value clamps.
+    let fx = if fx.is_finite() {
+        fx.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let fy = if fy.is_finite() {
+        fy.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let zoom = if zoom.is_finite() && zoom > 0.0 {
+        zoom.min(crate::url::MAX_FOCAL_ZOOM)
+    } else {
+        1.0
+    };
+    let cw = ((fill_w as f32 / zoom).round() as u32).clamp(1, fill_w);
+    let ch = ((fill_h as f32 / zoom).round() as u32).clamp(1, fill_h);
+    let x = point_start(fx, cw, w);
+    let y = point_start(fy, ch, h);
+    let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
+    (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
+}
 /// the smallest region with that aspect which contains the face
 /// expanded by `padding` (a fraction of the face's size, added
 /// on every side), centered on the face's center and clamped
@@ -599,6 +680,73 @@ mod tests {
         assert_eq!(window, Some((40, 0, 60, 60)));
         let (_, window) = crop_around_face_traced(face_canvas(), 1, 1, &face(300, 20, 60, 60), 0.5);
         assert_eq!(window, Some((270, 0, 120, 120)));
+    }
+
+    /// An image whose pixel (x, y) reads back as [x, y, 0],
+    /// so a crop's origin is visible in its first pixel.
+    fn coords(w: u32, h: u32) -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([x as u8, y as u8, 0])
+        }))
+    }
+
+    #[test]
+    fn point_crop_at_zoom_one_positions_the_fill_window_on_the_point() {
+        // 200x100, square target: the fill window is 100x100.
+        // Centered on the point (150, 50), not the frame
+        // center: the plain center crop would start at 50.
+        let (out, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (0.75, 0.5, 1.0));
+        assert_eq!(window, Some((100, 0, 100, 100)));
+        assert_eq!(rgb(&out, 0, 0), [100, 0, 0]);
+        // The frame center at zoom 1 is the plain center crop.
+        let (_, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (0.5, 0.5, 1.0));
+        assert_eq!(window, Some((50, 0, 100, 100)));
+        // A taller frame: the window slides down the y axis.
+        let (_, window) = crop_to_aspect_point_traced(coords(100, 200), 1, 1, (0.5, 0.75, 1.0));
+        assert_eq!(window, Some((0, 100, 100, 100)));
+    }
+
+    #[test]
+    fn point_crop_zoom_tightens_and_loosens_around_the_point() {
+        // Zoom 2 halves both axes around (150, 50).
+        let (out, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (0.75, 0.5, 2.0));
+        assert_eq!(window, Some((125, 25, 50, 50)));
+        assert_eq!(rgb(&out, 0, 0), [125, 25, 0]);
+        // Zoom below 1 loosens toward the fill window and
+        // converges on it: it can never exceed the frame.
+        let (_, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (0.75, 0.5, 0.5));
+        assert_eq!(window, Some((100, 0, 100, 100)));
+        let (_, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (0.75, 0.5, 0.01));
+        assert_eq!(window, Some((100, 0, 100, 100)));
+    }
+
+    #[test]
+    fn point_crop_clamps_at_the_frame_corners() {
+        let (_, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (0.0, 0.0, 2.0));
+        assert_eq!(window, Some((0, 0, 50, 50)));
+        let (_, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (1.0, 1.0, 2.0));
+        assert_eq!(window, Some((150, 50, 50, 50)));
+    }
+
+    #[test]
+    fn point_crop_edge_cases() {
+        // Aspect already matched: no crop, full-frame window.
+        let (out, window) = crop_to_aspect_point_traced(coords(100, 100), 1, 1, (0.25, 0.25, 3.0));
+        assert_eq!(window, Some((0, 0, 100, 100)));
+        assert_eq!((out.width(), out.height()), (100, 100));
+        // A zero target runs no crop.
+        let (_, window) = crop_to_aspect_point_traced(coords(100, 100), 0, 1, (0.5, 0.5, 1.0));
+        assert_eq!(window, None);
+        // Out-of-contract values sanitize instead of
+        // inverting the window math: NaN zoom acts as 1, a
+        // NaN point as the center, a huge zoom as the cap.
+        let (_, window) =
+            crop_to_aspect_point_traced(coords(200, 100), 1, 1, (f32::NAN, 0.5, f32::NAN));
+        assert_eq!(window, Some((50, 0, 100, 100)));
+        let (_, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (0.5, 0.5, 1000.0));
+        assert_eq!(window, Some((100, 50, 1, 1)));
+        let (_, window) = crop_to_aspect_point_traced(coords(200, 100), 1, 1, (0.5, 0.5, -2.0));
+        assert_eq!(window, Some((50, 0, 100, 100)));
     }
 
     #[test]

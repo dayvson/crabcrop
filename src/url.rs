@@ -46,6 +46,11 @@ pub enum ParseError {
     /// `focal:<left>x<top>:<right>x<bottom>` with right > left
     /// and bottom > top. Carries the offending segment.
     InvalidFocalRect(String),
+    /// A `focalpoint:...` segment did not match
+    /// `focalpoint:<x>x<y>[:<zoom>]` with both fractions in
+    /// 0..=1 and a zoom in (0, [`MAX_FOCAL_ZOOM`]]. Carries
+    /// the offending segment.
+    InvalidFocalPoint(String),
     /// A `pad:...` segment did not match `pad:<WxH>[:<fill>]`.
     /// Carries the offending segment.
     InvalidPad(String),
@@ -125,6 +130,7 @@ impl ParseError {
             ParseError::InvalidCrop(_) => "invalid_crop",
             ParseError::InvalidCropRect(_) => "invalid_crop_rect",
             ParseError::InvalidFocalRect(_) => "invalid_focal_rect",
+            ParseError::InvalidFocalPoint(_) => "invalid_focal_point",
             ParseError::InvalidPad(_) => "invalid_pad",
             ParseError::InvalidExpiry(_) => "invalid_expiry",
             ParseError::InvalidMaxAge(_) => "invalid_maxage",
@@ -158,6 +164,9 @@ impl std::fmt::Display for ParseError {
             }
             ParseError::InvalidFocalRect(seg) => {
                 write!(f, "invalid focal segment: {seg}")
+            }
+            ParseError::InvalidFocalPoint(seg) => {
+                write!(f, "invalid focalpoint segment: {seg}")
             }
             ParseError::InvalidPad(seg) => write!(f, "invalid pad segment: {seg}"),
             ParseError::InvalidExpiry(seg) => write!(f, "invalid expiry segment: {seg}"),
@@ -853,6 +862,15 @@ pub enum Operation {
         right: u32,
         bottom: u32,
     },
+    /// Name the point the next crop centers on, as fractions
+    /// of the image dimensions, with a zoom factor
+    /// (`focalpoint:<x>x<y>[:<zoom>]`; issue #313). Zoom 1 is
+    /// the ordinary fill crop positioned on the point; above
+    /// 1 the crop window tightens around the point, below 1
+    /// it loosens toward the fill window. Produces no pixels
+    /// of its own; the next `Crop` consumes it, like
+    /// [`Operation::FocalRect`].
+    FocalPoint { x: f32, y: f32, zoom: f32 },
     /// Render the smart-crop debug view (`debug:focal`): the
     /// response is a diagnostic image of the focal decision
     /// the next `Crop` makes (or of the final image, when no
@@ -943,6 +961,12 @@ pub const MAX_BLUR_SIGMA: f32 = 512.0;
 /// curve crushes all but a handful of input values to the
 /// endpoints, so the cap costs no real image.
 pub const MAX_GAMMA: f32 = 10.0;
+
+/// The largest `focalpoint:` zoom the grammar accepts
+/// (issue #313). At 100 the crop window is one hundredth of
+/// the fill window on each axis, already a handful of
+/// pixels on any canvas the output budget allows.
+pub const MAX_FOCAL_ZOOM: f32 = 100.0;
 
 fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
     let (flip, digits) = match part.strip_prefix('-') {
@@ -1093,6 +1117,9 @@ fn parse_operation(seg: &str) -> Option<Result<Operation, ParseError>> {
     }
     if let Some(rest) = seg.strip_prefix("crop-rect:") {
         return Some(parse_crop_rect(rest, seg));
+    }
+    if let Some(rest) = seg.strip_prefix("focalpoint:") {
+        return Some(parse_focal_point(rest, seg));
     }
     if let Some(rest) = seg.strip_prefix("focal:") {
         return Some(parse_focal_rect(rest, seg));
@@ -1293,6 +1320,34 @@ fn parse_focal_rect(rest: &str, seg: &str) -> Result<Operation, ParseError> {
         right,
         bottom,
     })
+}
+
+/// Parse `<x>x<y>[:<zoom>]` after `focalpoint:` (issue
+/// #313): the point is a pair of fractions of the image
+/// dimensions and the zoom, when spelled, is a positive
+/// factor no larger than [`MAX_FOCAL_ZOOM`]. The zoom is
+/// optional on input and always spelled in the canonical
+/// form, the way bare `trim` canonicalizes to `trim(10)`.
+fn parse_focal_point(rest: &str, seg: &str) -> Result<Operation, ParseError> {
+    let invalid = || ParseError::InvalidFocalPoint(seg.to_string());
+    let (point, zoom_text) = match rest.split_once(':') {
+        Some((point, zoom)) => (point, Some(zoom)),
+        None => (rest, None),
+    };
+    let (x_text, y_text) = point.split_once('x').ok_or_else(invalid)?;
+    let x: f32 = x_text.parse().map_err(|_| invalid())?;
+    let y: f32 = y_text.parse().map_err(|_| invalid())?;
+    if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+        return Err(invalid());
+    }
+    let zoom: f32 = match zoom_text {
+        Some(text) => text.parse().map_err(|_| invalid())?,
+        None => 1.0,
+    };
+    if !zoom.is_finite() || zoom <= 0.0 || zoom > MAX_FOCAL_ZOOM {
+        return Err(invalid());
+    }
+    Ok(Operation::FocalPoint { x, y, zoom })
 }
 
 /// Parse an `<x>x<y>` point with unsigned coordinates.
@@ -2792,6 +2847,7 @@ fn operation_text(op: &Operation) -> String {
             right,
             bottom,
         } => format!("focal:{left}x{top}:{right}x{bottom}"),
+        Operation::FocalPoint { x, y, zoom } => format!("focalpoint:{x}x{y}:{zoom}"),
         Operation::DebugFocal => "debug:focal".to_string(),
         Operation::Frame(selection) => frame_text(selection),
         Operation::Page(page) => format!("page:{page}"),
@@ -3363,6 +3419,10 @@ mod tests {
                 ParseError::InvalidFocalRect("x".into()),
                 "invalid_focal_rect",
             ),
+            (
+                ParseError::InvalidFocalPoint("x".into()),
+                "invalid_focal_point",
+            ),
             (ParseError::InvalidPad("x".into()), "invalid_pad"),
             (ParseError::InvalidExpiry("x".into()), "invalid_expiry"),
             (ParseError::InvalidMaxAge("x".into()), "invalid_maxage"),
@@ -3410,6 +3470,9 @@ mod tests {
             ("crop:300x200:center", "crop:300x200"),
             // Bare trim is trim(10).
             ("filters:trim", "filters:trim(10)"),
+            // The focal point zoom defaults to 1 and is
+            // spelled out in the canonical form.
+            ("focalpoint:0.75x0.4", "focalpoint:0.75x0.4:1"),
             // One radius is four.
             ("filters:radius(10)", "filters:radius(10,10,10,10)"),
             // Float spellings.
@@ -4970,6 +5033,62 @@ mod tests {
                 matches!(
                     parse_operations(&path),
                     Err(ParseError::InvalidFocalRect(_))
+                ),
+                "{seg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_focal_point() {
+        // The zoom is optional on input and defaults to 1.
+        let (ops, _) = parse_operations("focalpoint:0.75x0.4/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::FocalPoint {
+                x: 0.75,
+                y: 0.4,
+                zoom: 1.0,
+            }]
+        );
+        let (ops, _) = parse_operations("focalpoint:0.75x0.4:2/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::FocalPoint {
+                x: 0.75,
+                y: 0.4,
+                zoom: 2.0,
+            }]
+        );
+        // The corners of the frame are valid points, and the
+        // zoom endpoints are in.
+        assert!(parse_operations("focalpoint:0x0:100/example.com/img.jpg").is_ok());
+        assert!(parse_operations("focalpoint:1x1:0.01/example.com/img.jpg").is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_focal_point() {
+        for seg in [
+            "focalpoint:",
+            "focalpoint:0.75",
+            "focalpoint:0.75x",
+            "focalpoint:x0.4",
+            "focalpoint:0.75x0.4x0.2",
+            "focalpoint:1.5x0.4",
+            "focalpoint:0.75x-0.1",
+            "focalpoint:nanx0.4",
+            "focalpoint:0.75x0.4:0",
+            "focalpoint:0.75x0.4:-2",
+            "focalpoint:0.75x0.4:101",
+            "focalpoint:0.75x0.4:inf",
+            "focalpoint:0.75x0.4:2:3",
+            "focalpoint:0.75x0.4:",
+        ] {
+            let path = format!("{seg}/example.com/img.jpg");
+            assert!(
+                matches!(
+                    parse_operations(&path),
+                    Err(ParseError::InvalidFocalPoint(_))
                 ),
                 "{seg}"
             );

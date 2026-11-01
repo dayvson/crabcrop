@@ -114,6 +114,12 @@
     "signature": "a91f98eb5268b39de30d404e0590b18065d4ed157cc2342c4aadda57aca63754"
   },
   {
+    "description": "a focal point crop with zoom (issue #313)",
+    "remainder": "focalpoint:0.75x0.4:2/crop:600x600/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "c67db31f358adf845837ce865f04915592fdf186b815cfbf2838c1fcdf0056d8"
+  },
+  {
     "description": "sealed: a plain remainder under an injected nonce (AES-256-GCM, key HMAC_SHA256(secret, \"crabcrop/seal-key\"), AAD crabcrop/sealed/1)",
     "sealed": true,
     "secret": "s3cr3t",

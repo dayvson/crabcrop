@@ -276,6 +276,18 @@ Names the rectangle the next `crop:` in the URL must keep, in source pixels. The
 curl "http://localhost:3000/unsafe/focal:100x50:700x450/crop:800x600:smart/https://example.com/photo.jpg"
 ```
 
+### Focal point
+
+```text
+focalpoint:<x>x<y>[:<zoom>]
+```
+
+Names the point the next `crop:` in the URL centers on, as fractions of the image dimensions (`0.75x0.4` is three quarters across, two fifths down), with an optional zoom factor. Like the focal rectangle, the segment produces no output of its own; the crop consumes it, a `center` or `smart` crop positions on it, and the directional alignments and `face` ignore it. When a URL carries both focal forms, the last one before the crop wins. At zoom 1 the crop is the ordinary fill crop positioned on the point instead of the frame center. Above 1 the crop window tightens around the point (zoom 2 halves each axis, keeping the requested output size, so the crop renders from fewer source pixels); below 1 it loosens toward the fill window, which it can never exceed, so a small zoom converges on the zoom-1 crop. The zoom runs from above 0 to 100 and defaults to 1; the canonical form always spells it. Because the point is fractional, it addresses whatever image is in effect at that point in the chain and can never fall outside it, so there is no bounds failure. This is the form to migrate imgix focal-point crops (`fp-x`, `fp-y`, `fp-z`) to: the fractions and the zoom carry over as written.
+
+```bash
+curl "http://localhost:3000/unsafe/focalpoint:0.75x0.4:2/crop:800x600/https://example.com/photo.jpg"
+```
+
 ### Debug view
 
 ```text
@@ -789,7 +801,7 @@ With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at sta
 
 ## Errors
 
-Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`, `invalid_frame`, `invalid_page`. The statuses you can get:
+Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_focal_point`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`, `invalid_frame`, `invalid_page`. The statuses you can get:
 
 | Status | Meaning |
 | --- | --- |
@@ -1071,7 +1083,7 @@ Beyond the one built-in detection model, `CRABCROP_DETECTORS_FILE` points at a J
 - **`focal`** is a heatmap model: one fixed `[1, C, H, W]` input (C is 1 for luma, 3 for RGB) of at most 409,600 pixels (the detection contract's 640x640 frame; the input tensor and the boot probe are allocated from the declared shape, so a larger declared frame is a startup error) and exactly one output shaped `[H, W]`, `[1, H, W]`, or `[1, 1, H, W]`. The focal point is the heatmap's hottest cell, ties going to the first in row-major order. `labels` and `threshold` do not apply to this kind.
 - Class redaction resolves a class across providers in a fixed order: the built-in detector first, then declared `boxes` detectors in file order; the first provider whose vocabulary knows the class runs it. Chained class filters still share one run per provider per request.
 - Meta detections aggregate every configured detector: the built-in's boxes first, then each declared detector's in file order, and every box carries a `detector` field naming its source (`"builtin"`, or the declaration's name). One detector's failure omits only its own boxes.
-- Smart crops consult focal sources in this order: a caller `focal:` rectangle, then the face model, then the first declared `focal` provider, then the built-in saliency estimate. Only the first `focal` declaration is consulted; later ones are loaded and probed at boot, then stand by.
+- Smart crops consult focal sources in this order: a caller focal form (`focalpoint:` or `focal:`, the last one named in the chain), then the face model, then the first declared `focal` provider, then the built-in saliency estimate. Only the first `focal` declaration is consulted; later ones are loaded and probed at boot, then stand by.
 - Every declaration is loaded and probed at boot, like every other model: a missing model file, an unreadable or malformed declarations file, an unknown kind, or an output that does not fit the contract is a startup error naming the declaration.
 - `upscale(4)` on a server whose model is natively 2× composes two model runs and lands the exact requested size; when the native factor does not divide the request, a final high-quality resize trims the difference. Source transparency is carried across an upscale even though the model only sees RGB.
 - The ONNX Runtime library itself comes from `CRABCROP_ORT_DYLIB`, or from the standard `ORT_DYLIB_PATH` variable, or the system library search path when neither is set.
