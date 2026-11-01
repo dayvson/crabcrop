@@ -203,7 +203,10 @@ jobs:
           night scene
           EOF
 
-      - name: Run the real-model AI tests
+      - name: Install nasm (rav1e SIMD build)
+              run: sudo apt-get install -y -qq nasm
+              
+              - name: Run the real-model AI tests
         env:
           CRABCROP_TEST_ORT_DYLIB: ${{ env.AI_ASSETS }}/libonnxruntime.so
           CRABCROP_TEST_FACE_MODEL: ${{ env.AI_ASSETS }}/yunet.onnx
