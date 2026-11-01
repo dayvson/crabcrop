@@ -60,6 +60,12 @@ const MAX_REDIRECTS: usize = 5;
 pub enum LoadError {
     /// DNS, connect, TLS, or body-stream failure. Carries the cause.
     Network(String),
+    /// The source does not exist: a file missing under a file
+    /// root, a path that resolves outside every root, or an
+    /// origin (an object store included) that answered 404.
+    /// One variant for all three, so the answer is never an
+    /// oracle for what exists (issue #325).
+    NotFound,
     /// The server answered with a non-2xx status. Carries the code.
     BadStatus(u16),
     /// The response exceeded the byte limit. Carries the limit.
@@ -78,6 +84,7 @@ impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoadError::Network(cause) => write!(f, "network error: {cause}"),
+            LoadError::NotFound => write!(f, "source not found"),
             LoadError::BadStatus(code) => write!(f, "source answered HTTP {code}"),
             LoadError::TooLarge { limit } => {
                 write!(f, "source exceeded the {limit}-byte limit")
@@ -347,6 +354,12 @@ impl Loader {
         admission: MediaAdmission,
     ) -> Result<Vec<u8>, LoadError> {
         let status = resp.status();
+        if status.as_u16() == 404 {
+            // A missing object is not a gateway fault, and it
+            // gets the same not-found answer as a missing file
+            // (issue #325).
+            return Err(LoadError::NotFound);
+        }
         if !status.is_success() {
             return Err(LoadError::BadStatus(status.as_u16()));
         }
@@ -499,22 +512,21 @@ impl Loader {
         let candidate = root.join(decoded.trim_start_matches('/'));
         let canonical = tokio::fs::canonicalize(&candidate)
             .await
-            .map_err(|e| LoadError::Network(format!("cannot read file source: {e}")))?;
+            .map_err(map_file_error)?;
         if !canonical.starts_with(root) {
-            return Err(LoadError::Forbidden(
-                "file source escapes the configured root".to_string(),
-            ));
+            // Outside the root is the same answer as missing
+            // inside it (issue #325): distinguishing the two
+            // would make the response an oracle for what
+            // exists on disk.
+            return Err(LoadError::NotFound);
         }
         let mut file = tokio::fs::File::open(&canonical)
             .await
-            .map_err(|e| LoadError::Network(format!("cannot read file source: {e}")))?;
+            .map_err(map_file_error)?;
         let mut body = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| LoadError::Network(format!("cannot read file source: {e}")))?;
+            let n = file.read(&mut buf).await.map_err(map_file_error)?;
             if n == 0 {
                 break;
             }
@@ -780,6 +792,17 @@ fn map_request_error(e: reqwest::Error) -> LoadError {
     }
 }
 
+/// Map a file-source io failure: a missing file is the
+/// uniform not-found answer (issue #325); anything else
+/// keeps the read-failure mapping it has today.
+fn map_file_error(e: std::io::Error) -> LoadError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        LoadError::NotFound
+    } else {
+        LoadError::Network(format!("cannot read file source: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +920,7 @@ mod tests {
 
     #[test]
     fn errors_render() {
+        assert_eq!(LoadError::NotFound.to_string(), "source not found");
         assert_eq!(
             LoadError::BadStatus(404).to_string(),
             "source answered HTTP 404"
@@ -1028,11 +1052,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_bad_status() {
+    async fn origin_404_is_not_found() {
+        // Issue #325: an origin answering 404 means the
+        // source is not there, not that the gateway failed.
         let resp = response("404 Not Found", "Content-Length: 0\r\n", b"");
         let base = spawn_server(Respond::Bytes(resp)).await;
         let loader = Loader::with_defaults().unwrap();
-        assert_eq!(fetch(&loader, &base).await, Err(LoadError::BadStatus(404)));
+        assert_eq!(fetch(&loader, &base).await, Err(LoadError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_status() {
+        let resp = response("500 Internal Server Error", "Content-Length: 0\r\n", b"");
+        let base = spawn_server(Respond::Bytes(resp)).await;
+        let loader = Loader::with_defaults().unwrap();
+        assert_eq!(fetch(&loader, &base).await, Err(LoadError::BadStatus(500)));
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_a_network_error() {
+        // Issue #325: the transport half of the split. A
+        // port nothing listens on refuses the connection,
+        // which stays a gateway-class failure, never a 404.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let loader = Loader::with_defaults().unwrap();
+        let err = loader
+            .load(&format!("http://127.0.0.1:{port}/img.jpg"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoadError::Network(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -1490,15 +1540,22 @@ mod tests {
         std::os::unix::fs::symlink(base.join("secret.jpg"), root.join("link.jpg")).unwrap();
         std::os::unix::fs::symlink(&base, root.join("linkdir")).unwrap();
         let loader = file_loader(&root, 1024);
-        for url in ["file:///link.jpg", "file:///linkdir/secret.jpg"] {
+        // An escape answers exactly what a missing file
+        // answers (issue #325), so the response cannot be
+        // used to tell the two apart.
+        for url in [
+            "file:///link.jpg",
+            "file:///linkdir/secret.jpg",
+            "file:///%2e%2e/secret.jpg",
+        ] {
             let err = loader.load(url).await.unwrap_err();
-            assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
+            assert!(matches!(err, LoadError::NotFound), "{url}: {err:?}");
         }
         // Dot-segment escapes are collapsed by URL parsing into
         // the root and fail there as missing files; either way
         // the secret is never served.
         for url in ["file:///../secret.jpg", "file:///sub/../../secret.jpg"] {
-            assert!(loader.load(url).await.is_err(), "{url}");
+            assert_eq!(loader.load(url).await, Err(LoadError::NotFound), "{url}");
         }
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1507,7 +1564,10 @@ mod tests {
     async fn file_sources_missing_unconfigured_and_oversized() {
         let (base, root) = make_file_tree();
         let loader = file_loader(&root, 1024);
-        assert!(loader.load("file:///nope.jpg").await.is_err());
+        assert_eq!(
+            loader.load("file:///nope.jpg").await,
+            Err(LoadError::NotFound)
+        );
         let small = file_loader(&root, 8);
         assert_eq!(
             small.load("file:///big.bin").await,

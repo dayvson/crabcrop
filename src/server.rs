@@ -911,6 +911,7 @@ fn explain_load_error(e: LoadError) -> Response {
             StatusCode::FORBIDDEN,
             "source refused by policy".to_string(),
         ),
+        LoadError::NotFound => (StatusCode::NOT_FOUND, "source not found".to_string()),
         LoadError::BadStatus(code) => (
             StatusCode::BAD_GATEWAY,
             format!("source returned status {code}"),
@@ -4208,6 +4209,7 @@ fn load_error_response(e: LoadError) -> Response {
     eprintln!("load error: {e}");
     let (status, message) = match e {
         LoadError::Forbidden(reason) => (StatusCode::FORBIDDEN, reason),
+        LoadError::NotFound => (StatusCode::NOT_FOUND, "source not found".to_string()),
         LoadError::BadStatus(code) => (
             StatusCode::BAD_GATEWAY,
             format!("source returned status {code}"),
@@ -4815,6 +4817,64 @@ mod tests {
         assert_eq!(meta["video"]["frame_timestamp"], 1.5, "{meta}");
         assert_eq!(meta["source_width"], 100, "{meta}");
         assert_eq!(meta["source_height"], 60, "{meta}");
+    }
+
+    #[tokio::test]
+    async fn missing_sources_answer_404_and_transport_failures_502() {
+        // Issue #325: a source that is not there (a missing
+        // file under the root, a path escaping the root, an
+        // origin answering 404) is a 404 with one generic
+        // body, while a genuine transport failure stays 502.
+        let dir = upload_dir("notfound");
+        let base = spawn_app_with_upload(&dir, 1024 * 1024, false).await;
+
+        let remainder = "50x30/file:///missing.jpg";
+        let url = format!("{base}/{}/{remainder}", sign(remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let missing_body = resp.text().await.unwrap();
+        assert_eq!(missing_body, "source not found");
+
+        // A symlink out of the root: the canonicalized path
+        // escapes, and the answer must be indistinguishable
+        // from the missing file above.
+        let outside =
+            std::env::temp_dir().join(format!("crabcrop-srv-outside-{}", std::process::id()));
+        std::fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link.jpg")).unwrap();
+        let remainder = "50x30/file:///link.jpg";
+        let url = format!("{base}/{}/{remainder}", sign(remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.text().await.unwrap(), missing_body);
+
+        // The explain route maps the same case the same way.
+        let remainder = "50x30/file:///missing.jpg";
+        let url = format!("{base}/explain/{}/{remainder}", sign(remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.text().await.unwrap(), missing_body);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+
+        // An origin answering 404 is the same 404...
+        let (src, _hits) = spawn_counting_server(404, "text/html", b"nope".to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.text().await.unwrap(), missing_body);
+
+        // ...while a refused connection stays a 502.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let remainder = format!("50x30/http://127.0.0.1:{port}/img.jpg");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.text().await.unwrap(), "source fetch failed");
     }
 
     #[tokio::test]
@@ -12411,7 +12471,9 @@ mod tests {
         let remainder = format!("50x30/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
         let solo = meta_burst(&url, "application/json", 1).await;
-        assert_eq!(solo[0].0, StatusCode::BAD_GATEWAY);
+        // The origin answers 404, which is a not-found
+        // answer since issue #325, not a gateway failure.
+        assert_eq!(solo[0].0, StatusCode::NOT_FOUND);
         let burst = meta_burst(&url, "application/json", 6).await;
         assert!(
             burst
@@ -12967,7 +13029,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_requests_are_not_cached() {
-        let (src, hits) = spawn_counting_server(404, "text/plain", b"nope".to_vec()).await;
+        let (src, hits) = spawn_counting_server(500, "text/plain", b"nope".to_vec()).await;
         let base = spawn_app(false).await;
         let remainder = format!("300x50/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));

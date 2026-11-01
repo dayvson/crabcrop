@@ -119,7 +119,7 @@ ImageKit overlays are layers: `l-image`, `l-text`, and solid-color blocks opened
 
 | ImageKit | crabcrop | Mapping |
 | --- | --- | --- |
-| `l-image,i-<path>` (a Media Library path, folders joined with `@@`), or `ie-<base64>` for a full URL | `filters:watermark(<url>,<x>,<y>,<alpha>)` | Approximate: the layer input becomes a percent-encoded URL, fetched through the same source policy as source images. A failed overlay load fails the request (502) instead of being skipped |
+| `l-image,i-<path>` (a Media Library path, folders joined with `@@`), or `ie-<base64>` for a full URL | `filters:watermark(<url>,<x>,<y>,<alpha>)` | Approximate: the layer input becomes a percent-encoded URL, fetched through the same source policy as source images. A failed overlay load fails the request with the load error status (404 when the overlay source is not found, 502 on a fetch failure) instead of being skipped |
 | Layer position: `lx`, `ly` pixels; `N` negatives anchor from the right and bottom; `lfo` and `lap` anchor grids | Negative `x`, `y` in `watermark` or `overlay` | Direct in convention: negative offsets anchor from the right and bottom edges on both systems. A named anchor plus offsets becomes computed pixel offsets |
 | The layer's own `w`, `h`, and effects (`e-grayscale` inside a layer, and friends) | `filters:overlay(<url>,<x>,<y>,<alpha>,<blend>,<width>)` | Partial: overlay's width is a percent of the base width (1 to 400), so a pixel width becomes a percentage of the base. There is no way to pre-transform the overlay image itself |
 | `lm-multiply` | `overlay(...,multiply)` | Direct: one of the four blend modes crabcrop has (`normal`, `multiply`, `screen`, `overlay`) |
