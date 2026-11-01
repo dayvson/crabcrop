@@ -1515,11 +1515,11 @@ impl Engine {
 
     /// Process an animated source (GIF or WebP) frame by frame:
     /// every frame runs the same operations and keeps its delay,
-    /// so the output stays animated in `format`. Encoding
-    /// directives do not apply (neither animated encoder here
-    /// has a quality lever). A WebP output carries the source's
-    /// loop count over; GIF output keeps the GIF encoder's
-    /// default, as it always has.
+    /// so the output stays animated in `format`. A WebP output
+    /// carries the source's loop count over and honors the
+    /// request quality like the still WebP path does (issue
+    /// #323); GIF output keeps the GIF encoder's default, as it
+    /// always has, and has no quality lever.
     fn process_animated(
         &self,
         frames: Vec<image::Frame>,
@@ -1543,14 +1543,44 @@ impl Engine {
         let dpr = dpr_factor(directives.dpr, ctx);
         let mut budget = OutputBudget::new();
         let mut out_frames = Vec::with_capacity(frames.len());
+        // The encoding directives are a property of the ops,
+        // not of a frame, so every frame reports the same ones;
+        // the first frame's copy is the request's.
+        let mut encode_opts = EncodeOptions::default();
         for frame in frames {
             ctx.check_deadline()?;
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, opts, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            if out_frames.is_empty() {
+                encode_opts = opts;
+            }
             budget.charge(img.width(), img.height())?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
         }
+        // Resolve the quality directive for a WebP output the
+        // same way the still path does: an explicit value is
+        // used as given, `quality(auto)` is picked from the
+        // first processed frame (the frame the placeholder also
+        // describes) and reported back, and Save-Data steps an
+        // unspecified quality down one notch. GIF output has no
+        // quality lever, so nothing resolves for it.
+        let (encode_quality, chosen_quality) = if format == ImageFormat::WebP {
+            match encode_opts.quality {
+                Some(Quality::Value(q)) => (Some(q), None),
+                Some(Quality::Auto) => {
+                    let first = out_frames
+                        .first()
+                        .expect("process_animated is called with at least one frame");
+                    let q = auto_quality(&DynamicImage::ImageRgba8(first.buffer().clone()));
+                    (Some(q), Some(q))
+                }
+                None if ctx.save_data => (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         let (width, height) = out_frames
             .first()
             .map(|f| (f.buffer().width(), f.buffer().height()))
@@ -1603,13 +1633,15 @@ impl Engine {
                 drop(enc);
                 out
             }
-            ImageFormat::WebP => encode_animated_webp(out_frames, loop_count.unwrap_or(0))?,
+            ImageFormat::WebP => {
+                encode_animated_webp(out_frames, loop_count.unwrap_or(0), encode_quality)?
+            }
             _ => unreachable!("process_animated is only called for GIF and WebP"),
         };
         Ok(ProcessedImage {
             bytes: out,
             format,
-            quality: None,
+            quality: chosen_quality,
             width,
             height,
             source_width,
@@ -1799,33 +1831,107 @@ fn decode_webp_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
     collect_frames(decoder.into_frames(), "WebP")
 }
 
-/// Encode frames as an animated WebP. The pure-Rust encoder
-/// (oxideav-webp, the crate the lossy still path uses) writes
-/// lossless VP8L frames and has no lossy animation mode, so
-/// there is no quality lever here; `loop_count` is carried
-/// over from the source (0 loops forever). The frames are
-/// consumed so each pixel buffer moves into the encoder
-/// instead of being cloned a second time (issue #182).
+/// Encode frames as an animated WebP through libwebp's
+/// animated encoder (the `webp` crate's `AnimEncoder`, method
+/// 4), since issue #323. The pure-Rust encoder it replaces
+/// (oxideav-webp) writes lossless VP8L frames only and has no
+/// lossy animation mode, so animated output had no quality
+/// lever and a cold encode of a real animation ran past the
+/// 600 s processing deadline on the production soak host
+/// (issue #310). The quality mapping matches the still path
+/// in [`encode_webp`]: the default quality is 80, quality
+/// below 100 is a lossy encode at that quality, and quality
+/// 100 is a lossless encode through the same libwebp encoder.
+/// The lossless corner stays on libwebp because its animated
+/// lossless encode is faster than the oxideav lossless encode
+/// it replaces, not slower: on the soak site files the oxideav
+/// encode did not finish inside the 600 s deadline at all,
+/// while libwebp lossless took 23.6 s for the 40 frame mascot
+/// and 148.5 s for the 120 frame snap-toy (measured in the
+/// bench recorded on issue #323). That is the opposite of the
+/// roughly 92x gap the still lossless path measured in issue
+/// #292, so no second encoder stays wired in for one corner.
+/// The swap follows the #292 pattern and is a temporary
+/// measure: the animated encode returns to oxideav-webp once
+/// a release closes the gap to roughly 1.3x of libwebp method
+/// 4 at equal or better size and quality.
+/// `loop_count` is carried over from the source (0 loops
+/// forever) and set on the muxer, which is where the ANIM
+/// loop count lives. Frames arrive already composited onto
+/// the full canvas by the decode side, so each one is handed
+/// to the encoder as a full-canvas RGBA frame and alpha is
+/// preserved.
+/// Frame timestamps are the accumulated start times of each
+/// frame, with one adjustment: the timeline starts at minus
+/// the total duration instead of at zero. The `webp` crate
+/// finishes an animation by adding a null frame at timestamp
+/// 0, and libwebp takes the last frame's duration from that
+/// final timestamp; starting below zero makes the final call
+/// land exactly on the end of the last frame through the
+/// uint32 wrap-around libwebp's timestamp arithmetic allows,
+/// so the last frame keeps its own duration instead of being
+/// assigned the average of the frames before it. A total
+/// duration beyond the i32 timestamp range (an animation
+/// longer than about 24 days) falls back to a zero-based
+/// timeline and that average.
 fn encode_animated_webp(
     frames: Vec<image::Frame>,
     loop_count: u16,
+    quality: Option<u8>,
 ) -> Result<Vec<u8>, EngineError> {
-    let frames: Vec<oxideav_webp::Frame> = frames
-        .into_iter()
-        .map(|frame| -> Result<oxideav_webp::Frame, EngineError> {
+    let first = frames
+        .first()
+        .ok_or_else(|| EngineError::Encode("webp: animation has no frames".to_string()))?;
+    let (width, height) = (first.buffer().width(), first.buffer().height());
+    // VP8 frames carry 14-bit dimensions, as on the still path.
+    if width > 16383 || height > 16383 {
+        return Err(EngineError::Encode(
+            "webp: dimension exceeds the 16383 format limit".into(),
+        ));
+    }
+    let q = quality.unwrap_or(80);
+    let mut config = webp::WebPConfig::new().map_err(|_| {
+        EngineError::Encode("webp: libwebp rejected its default configuration".into())
+    })?;
+    config.quality = q as f32;
+    config.method = 4;
+    if q >= 100 {
+        config.lossless = 1;
+    }
+    let delays_ms: Vec<i64> = frames
+        .iter()
+        .map(|frame| {
             let delay: std::time::Duration = frame.delay().into();
-            let buffer = frame.into_buffer();
-            let image = oxideav_webp::WebpImage::from_rgba8(
-                buffer.width(),
-                buffer.height(),
-                buffer.into_raw(),
-            )
-            .map_err(|e| EngineError::Encode(e.to_string()))?;
-            Ok(oxideav_webp::Frame::new(image, Some(delay)))
+            i64::try_from(delay.as_millis()).unwrap_or(i64::MAX)
         })
-        .collect::<Result<_, _>>()?;
-    let opts = oxideav_webp::EncodeOptions::default().with_loop_count(loop_count);
-    oxideav_webp::encode_animation(&frames, &opts).map_err(|e| EngineError::Encode(e.to_string()))
+        .collect();
+    let total_ms: i64 = delays_ms.iter().fold(0, |acc, d| acc.saturating_add(*d));
+    let mut timestamp_ms: i64 = if total_ms <= i64::from(i32::MAX) {
+        -total_ms
+    } else {
+        0
+    };
+    let mut encoder = webp::AnimEncoder::new(width, height, &config);
+    encoder.set_loop_count(i32::from(loop_count));
+    for (frame, delay_ms) in frames.iter().zip(&delays_ms) {
+        let buffer = frame.buffer();
+        if buffer.width() != width || buffer.height() != height {
+            return Err(EngineError::Encode(
+                "webp: animated frames do not share one canvas".into(),
+            ));
+        }
+        encoder.add_frame(webp::AnimFrame::from_rgba(
+            buffer.as_raw(),
+            width,
+            height,
+            i32::try_from(timestamp_ms).unwrap_or(i32::MAX),
+        ));
+        timestamp_ms = timestamp_ms.saturating_add(*delay_ms);
+    }
+    let encoded = encoder
+        .try_encode()
+        .map_err(|e| EngineError::Encode(format!("webp: {e:?}")))?;
+    Ok(encoded.to_vec())
 }
 
 /// The largest width or height an AI upscale may produce.
@@ -7325,11 +7431,9 @@ mod tests {
         );
         let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
         assert_eq!(delays, [100, 200, 300]);
-        // Lossless frames: the colors survive the resize exactly.
-        assert_eq!(
-            frames[1].buffer().get_pixel(0, 0),
-            &image::Rgba([0, 200, 0, 255])
-        );
+        // Lossy frames (issue #323): the colors survive the
+        // resize close to exact, within lossy tolerance.
+        assert_pixel_near(frames[1].buffer().get_pixel(0, 0), [0, 200, 0, 255], 16);
     }
 
     #[test]
@@ -7345,10 +7449,129 @@ mod tests {
         let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
         assert_eq!(delays, [100, 200, 300]);
         for frame in &frames {
+            // Lossy encode (issue #323): the channels of a
+            // grayscale pixel stay equal within lossy tolerance
+            // rather than exactly.
             let p = frame.buffer().get_pixel(0, 0);
-            assert_eq!(p[0], p[1], "pixel {p:?}");
-            assert_eq!(p[1], p[2], "pixel {p:?}");
+            assert!(p[0].abs_diff(p[1]) <= 8, "pixel {p:?}");
+            assert!(p[1].abs_diff(p[2]) <= 8, "pixel {p:?}");
         }
+    }
+
+    /// Three 40x20 frames with distinct colors and alpha
+    /// values, delays of 100, 200, and 300 ms, and a loop
+    /// count of 3. Built with the oxideav encoder, like
+    /// [`animated_webp_bytes`], so the fixture's pixels and
+    /// timing are known exactly before the libwebp output
+    /// path under test ever runs.
+    fn animated_webp_alpha_loop_bytes() -> Vec<u8> {
+        let frame = |rgba: [u8; 4], delay_ms: u64| {
+            let img = image::RgbaImage::from_pixel(40, 20, image::Rgba(rgba));
+            let image = oxideav_webp::WebpImage::from_rgba8(40, 20, img.as_raw().clone()).unwrap();
+            oxideav_webp::Frame::new(image, Some(std::time::Duration::from_millis(delay_ms)))
+        };
+        let frames = vec![
+            frame([255, 0, 0, 128], 100),
+            frame([0, 200, 0, 64], 200),
+            frame([0, 0, 255, 255], 300),
+        ];
+        let opts = oxideav_webp::EncodeOptions::default()
+            .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless)
+            .with_loop_count(3);
+        oxideav_webp::encode_animation(&frames, &opts).unwrap()
+    }
+
+    fn assert_pixel_near(actual: &image::Rgba<u8>, expected: [u8; 4], tol: u8) {
+        for (channel, (a, e)) in actual.0.iter().zip(expected).enumerate() {
+            let diff = a.abs_diff(e);
+            assert!(
+                diff <= tol,
+                "channel {channel}: pixel {actual:?}, expected near {expected:?} (tol {tol})"
+            );
+        }
+    }
+
+    #[test]
+    fn animated_webp_output_preserves_frames_durations_alpha_and_loop_count() {
+        let engine = Engine;
+        let src = animated_webp_alpha_loop_bytes();
+        assert_eq!(webp_animation_params(&src).map(|p| p.0), Some(3));
+        let out = engine.process(&src, &[]).unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        // The loop count survives the libwebp mux exactly.
+        assert_eq!(webp_animation_params(&out.bytes).map(|p| p.0), Some(3));
+        let frames = decoded_webp_frames(&out.bytes);
+        assert_eq!(frames.len(), 3);
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.buffer().width() == 40 && f.buffer().height() == 20)
+        );
+        // Per-frame durations survive exactly, including the
+        // last frame's 300 ms (not the 150 ms average of the
+        // two before it).
+        let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
+        assert_eq!(delays, [100, 200, 300]);
+        // Lossy at the default quality 80: colors and alpha
+        // land close to the source frames, not exact.
+        assert_pixel_near(frames[0].buffer().get_pixel(0, 0), [255, 0, 0, 128], 32);
+        assert_pixel_near(frames[1].buffer().get_pixel(0, 0), [0, 200, 0, 64], 32);
+        assert_pixel_near(frames[2].buffer().get_pixel(0, 0), [0, 0, 255, 255], 32);
+    }
+
+    #[test]
+    fn animated_webp_quality_100_is_lossless_and_default_is_quality_80() {
+        let engine = Engine;
+        let src = animated_webp_alpha_loop_bytes();
+        let lossless = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Quality(Quality::Value(
+                    100,
+                ))])],
+            )
+            .unwrap();
+        let frames = decoded_webp_frames(&lossless.bytes);
+        assert_eq!(frames.len(), 3);
+        let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
+        assert_eq!(delays, [100, 200, 300]);
+        assert_eq!(webp_animation_params(&lossless.bytes).map(|p| p.0), Some(3));
+        // Lossless means exact pixels, alpha included. The
+        // check runs through the libwebp decoder: the image
+        // crate's decoder composites a blended frame with a
+        // rounding that can land one unit off (a [0, 0, 255,
+        // 255] frame over a translucent one reads back as
+        // 254), which is a decode-side artifact the spike
+        // probe on issue #323 isolated from the encode.
+        let anim = webp::AnimDecoder::new(&lossless.bytes).decode().unwrap();
+        assert_eq!(anim.loop_count, 3);
+        let decoded: Vec<image::RgbaImage> = anim
+            .into_iter()
+            .map(|f| {
+                let img: DynamicImage = (&f).into();
+                img.to_rgba8()
+            })
+            .collect();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].get_pixel(0, 0), &image::Rgba([255, 0, 0, 128]));
+        assert_eq!(decoded[1].get_pixel(0, 0), &image::Rgba([0, 200, 0, 64]));
+        assert_eq!(decoded[2].get_pixel(0, 0), &image::Rgba([0, 0, 255, 255]));
+        // An unspecified quality encodes exactly like an
+        // explicit quality(80): the default is threaded
+        // through, not dropped.
+        let default = engine.process(&src, &[]).unwrap();
+        let explicit = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Quality(Quality::Value(
+                    80,
+                ))])],
+            )
+            .unwrap();
+        assert_eq!(default.bytes, explicit.bytes);
+        // The lossy default and the lossless encode of the
+        // same frames are different bytes.
+        assert_ne!(default.bytes, lossless.bytes);
     }
 
     #[test]
