@@ -516,10 +516,10 @@
   "assert": [
    {
     "t": "status",
-    "eq": 502
+    "eq": 404
    }
   ],
-  "why": "Docs: a watermark that fails to load fails the request with 502.",
+  "why": "Docs: a watermark that fails to load fails the request; a source the origin answers 404 for answers 404, the same not-found answer as a missing source image (issue #325).",
   "tier": "full"
  },
  {

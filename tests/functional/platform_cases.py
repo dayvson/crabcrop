@@ -1044,7 +1044,10 @@ def src_origin_errors():
     fbig = render_signed("src-origin-errors", "P", f"300x200/{SRC127}/big.jpg")
     fct = render_signed("src-origin-errors", "P", f"300x200/{SRC127}/notimage")
     fbb = render_signed("src-origin-errors", "P", f"300x200/{SRC127}/badbytes.jpg")
-    ok = (f404["status"] == 502 and fbig["status"] == 502
+    # Since #325, a source the origin answers 404 for is
+    # a not-found answer, not a gateway failure; the other
+    # origin failures stay 502.
+    ok = (f404["status"] == 404 and fbig["status"] == 502
           and fct["status"] == 502 and fbb["status"] == 502)
     check("src-origin-errors", "sources", "300x200",
           "missing / big / notimage / badbytes", ok, f404,
