@@ -375,6 +375,22 @@ impl OnnxUpscaleProvider {
     }
 }
 
+/// Super-resolution exports in the Swin family run their
+/// window attention on a grid of 8x8 windows and pad the
+/// input up to a whole number of windows inside the graph.
+/// In the exports this service loads, that internal padding
+/// disagrees with a later reshape whenever a side is not
+/// already a multiple of 8, and the run fails (issue #326).
+const UPSCALE_PAD_MULTIPLE: u32 = 8;
+
+/// The size an upscale input is padded to before inference:
+/// both sides rounded up to a multiple of
+/// [`UPSCALE_PAD_MULTIPLE`].
+fn upscale_padded_dims(w: u32, h: u32) -> (u32, u32) {
+    let round = |v: u32| v.div_ceil(UPSCALE_PAD_MULTIPLE) * UPSCALE_PAD_MULTIPLE;
+    (round(w), round(h))
+}
+
 impl std::fmt::Debug for OnnxUpscaleProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OnnxUpscaleProvider")
@@ -390,16 +406,32 @@ impl UpscaleProvider for OnnxUpscaleProvider {
     }
 
     fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, AiError> {
-        let (w, h) = (img.width() as usize, img.height() as usize);
+        let (w, h) = (img.width(), img.height());
+        // Pad to a multiple of 8 with edge pixels replicated,
+        // so the model's own window padding is a no-op and
+        // its reshape agrees with its output (issue #326);
+        // the result is cropped back below.
+        let (pw, ph) = upscale_padded_dims(w, h);
         let rgb = img.to_rgb8();
-        let mut input = vec![0f32; 3 * w * h];
-        for (i, px) in rgb.pixels().enumerate() {
-            for c in 0..3 {
-                input[c * w * h + i] = px[c] as f32 / 255.0;
+        let raw = rgb.as_raw();
+        let in_plane = pw as usize * ph as usize;
+        let mut input = vec![0f32; 3 * in_plane];
+        for y in 0..ph as usize {
+            let sy = y.min(h.saturating_sub(1) as usize);
+            for x in 0..pw as usize {
+                let sx = x.min(w.saturating_sub(1) as usize);
+                let src = (sy * w as usize + sx) * 3;
+                let dst = y * pw as usize + x;
+                for c in 0..3 {
+                    input[c * in_plane + dst] = raw[src + c] as f32 / 255.0;
+                }
             }
         }
-        let tensor = ort::value::Tensor::from_array(([1, 3, h, w], input.into_boxed_slice()))
-            .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
+        let tensor = ort::value::Tensor::from_array((
+            [1, 3, ph as usize, pw as usize],
+            input.into_boxed_slice(),
+        ))
+        .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
         let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
         let outputs = session
             .run(ort::inputs![self.input_name.as_str() => tensor])
@@ -438,7 +470,32 @@ impl UpscaleProvider for OnnxUpscaleProvider {
                 px[c] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             }
         }
-        let out = DynamicImage::ImageRgb8(out);
+        let mut out = DynamicImage::ImageRgb8(out);
+        let (ow, oh) = if (pw, ph) != (w, h) {
+            // The model enlarged the padded input; crop the
+            // replicated-edge margin back off so the result
+            // is exactly the factor times the source size
+            // (issue #326).
+            let f = if pw > 0 && ph > 0 && ow % pw == 0 && oh % ph == 0 && ow / pw == oh / ph {
+                ow / pw
+            } else {
+                0
+            };
+            let (Some(crop_w), Some(crop_h)) = (w.checked_mul(f), h.checked_mul(f)) else {
+                return Err(AiError::BadOutput(format!(
+                    "unexpected model output shape for a padded input: {shape:?}"
+                )));
+            };
+            if f < 1 || crop_w > ow || crop_h > oh {
+                return Err(AiError::BadOutput(format!(
+                    "unexpected model output shape for a padded input: {shape:?}"
+                )));
+            }
+            out = out.crop_imm(0, 0, crop_w, crop_h);
+            (crop_w, crop_h)
+        } else {
+            (ow, oh)
+        };
         // The model sees RGB only; carry the source alpha over
         // with a plain resize so transparency survives.
         if matches!(
@@ -1488,6 +1545,40 @@ mod tests {
         let out = provider.upscale(&solid(120, 30, 200, 24, 18)).unwrap();
         assert_eq!(out.width(), 24 * provider.factor());
         assert_eq!(out.height(), 18 * provider.factor());
+    }
+
+    #[test]
+    fn upscale_padded_dims_round_up_to_a_multiple_of_eight() {
+        // Issue #326: inputs are padded to a multiple of 8
+        // before inference; sizes already on the grid pass
+        // through unchanged.
+        assert_eq!(upscale_padded_dims(101, 53), (104, 56));
+        assert_eq!(upscale_padded_dims(202, 106), (208, 112));
+        assert_eq!(upscale_padded_dims(16, 16), (16, 16));
+        assert_eq!(upscale_padded_dims(8, 8), (8, 8));
+        assert_eq!(upscale_padded_dims(1, 1), (8, 8));
+        assert_eq!(upscale_padded_dims(9, 7), (16, 8));
+    }
+
+    /// Real-model verification for issue #326, run manually
+    /// with the deployment artifacts in place: odd dimensions
+    /// used to fail inside the model. The provider pads to a
+    /// multiple of 8 and crops back, so a 101x53 input yields
+    /// exactly 202x106 at the model's 2x factor, and a second
+    /// pass (the engine's route to 4x) exactly 404x212.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_UPSCALE_MODEL=...
+    /// cargo test -- --ignored upscale_odd_dimensions_with_the_real_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn upscale_odd_dimensions_with_the_real_model() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_UPSCALE_MODEL").unwrap();
+        let provider = OnnxUpscaleProvider::load(Some(&dylib), &model).unwrap();
+        let f = provider.factor();
+        let out = provider.upscale(&solid(120, 30, 200, 101, 53)).unwrap();
+        assert_eq!((out.width(), out.height()), (101 * f, 53 * f));
+        let out = provider.upscale(&out).unwrap();
+        assert_eq!((out.width(), out.height()), (101 * f * f, 53 * f * f));
     }
 
     /// Real-model verification, run manually with the deployment
