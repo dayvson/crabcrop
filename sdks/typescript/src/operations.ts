@@ -356,6 +356,13 @@ export const filter = {
   contrast(percent: number): string {
     return `contrast(${num(floatIn("contrast", percent, -100, 100))})`;
   },
+  /** Gamma correction divisor: 0 < g <= 10 (1 unchanged; above 1 brightens midtones). */
+  gamma(value: number): string {
+    if (!Number.isFinite(value) || value <= 0 || value > 10) {
+      fail("gamma", value, "a number above 0 and at most 10");
+    }
+    return `gamma(${num(value)})`;
+  },
   /** Rotate the hue by integer degrees. */
   hueRotate(degrees: number): string {
     return `huerotate(${intIn("huerotate degrees", degrees, -2147483648, 2147483647)})`;

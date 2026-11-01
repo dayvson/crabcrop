@@ -529,6 +529,7 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         Filter::Blur(v) => format!("blur({v}): gaussian blur"),
         Filter::Brighten(v) => format!("brighten({v}): adjust brightness"),
         Filter::Contrast(v) => format!("contrast({v}): adjust contrast"),
+        Filter::Gamma(v) => format!("gamma({v}): apply gamma correction"),
         Filter::HueRotate(v) => format!("huerotate({v}): rotate the hue"),
         Filter::Sharpen(v) => format!("sharpen({v}): sharpen"),
         Filter::Saturation(v) => format!("saturation({v}): adjust saturation"),

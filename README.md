@@ -350,6 +350,7 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | `blur` | `blur(2.5)`, sigma, a positive number up to 512 | Gaussian blur. | `filters:blur(2.5)` |
 | `brighten` | `brighten(40)`, integer from −255 to 255, added to every channel and clamped to 0–255 | Brighten (or darken, with a negative value). | `filters:brighten(40)` |
 | `contrast` | `contrast(25)`, percent, −100 to 100; 0 is unchanged, −100 is flat gray, positive raises contrast | Adjust contrast. | `filters:contrast(25)` |
+| `gamma` | `gamma(2.2)`, divisor from above 0 to 10; 1 is unchanged, above 1 brightens midtones, below 1 darkens them | Gamma correction: each channel value `v` becomes `255 * (v / 255)^(1 / g)`, the levels-style midtone gamma. Black and white stay fixed at every setting, and alpha is untouched. Unlike `curve`, no control points need translating: the gamma value from another tool carries over as written. | `filters:gamma(2.2)` |
 | `huerotate` | `huerotate(90)`, degrees, integer | Rotate the hue. | `filters:huerotate(90)` |
 | `sharpen` | `sharpen(1.5)`, strength, a positive number | Unsharp-mask sharpening. | `filters:sharpen(1.5)` |
 | `saturation` | `saturation(1.5)`, 0 to 255; 0 is grayscale, 1 is unchanged | Scale color saturation. | `filters:saturation(0.5)` |

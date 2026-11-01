@@ -565,6 +565,14 @@ pub enum Filter {
     /// Adjust contrast, percent-style (-100..=100): 0 is
     /// identity, -100 is flat gray.
     Contrast(f32),
+    /// Gamma correction with the given divisor: each
+    /// channel value `v` becomes `255 * (v / 255)^(1 / g)`,
+    /// the levels-style midtone gamma. 1 is identity,
+    /// values above 1 brighten the midtones, values below
+    /// 1 darken them. The grammar accepts 0 < g <= 10
+    /// (issue #313); the scale is the exponent itself, the
+    /// one scale comparable products agree on for gamma.
+    Gamma(f32),
     /// Rotate the hue, in degrees.
     HueRotate(i32),
     /// Sharpen by this amount (unsharp mask strength, > 0).
@@ -922,6 +930,13 @@ pub const MAX_KERNEL_VALUE: f64 = 1024.0;
 /// with the cap: a subnormal sigma panics the image crate's
 /// Gaussian setup, which asserts `sigma.is_normal()`.
 pub const MAX_BLUR_SIGMA: f32 = 512.0;
+
+/// The largest `gamma` divisor the grammar accepts (issue
+/// #313). 10 is the top of the range the levels tools this
+/// filter maps from use, and at the extremes past it the
+/// curve crushes all but a handful of input values to the
+/// endpoints, so the cap costs no real image.
+pub const MAX_GAMMA: f32 = 10.0;
 
 fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
     let (flip, digits) = match part.strip_prefix('-') {
@@ -1528,6 +1543,13 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     return Err(invalid());
                 }
                 Filter::Contrast(amount)
+            }
+            ("gamma", Some(p)) => {
+                let value: f32 = p.parse().map_err(|_| invalid())?;
+                if !value.is_finite() || value <= 0.0 || value > MAX_GAMMA {
+                    return Err(invalid());
+                }
+                Filter::Gamma(value)
             }
             ("huerotate", Some(p)) => {
                 let degrees: i32 = p.parse().map_err(|_| invalid())?;
@@ -2580,6 +2602,7 @@ fn filter_text(filter: &Filter) -> String {
         Filter::Blur(v) => format!("blur({v})"),
         Filter::Brighten(v) => format!("brighten({v})"),
         Filter::Contrast(v) => format!("contrast({v})"),
+        Filter::Gamma(v) => format!("gamma({v})"),
         Filter::HueRotate(v) => format!("huerotate({v})"),
         Filter::Sharpen(v) => format!("sharpen({v})"),
         Filter::Saturation(v) => format!("saturation({v})"),
@@ -3369,6 +3392,7 @@ mod tests {
             ("filters:radius(10)", "filters:radius(10,10,10,10)"),
             // Float spellings.
             ("filters:contrast(1.50)", "filters:contrast(1.5)"),
+            ("filters:gamma(2.20)", "filters:gamma(2.2)"),
             // Six-digit text colors gain an opaque alpha.
             (
                 "filters:text(Hi,20,ffaa00,center)",
@@ -4094,6 +4118,8 @@ mod tests {
             "filters:brighten(-255)",
             "filters:contrast(100)",
             "filters:contrast(-100)",
+            "filters:gamma(10)",
+            "filters:gamma(0.1)",
             "filters:saturation(0)",
             "filters:saturation(255)",
             "filters:quality(1)",
@@ -4104,6 +4130,12 @@ mod tests {
                 "{seg}"
             );
         }
+    }
+
+    #[test]
+    fn parses_gamma_filter() {
+        let (ops, _) = parse_operations("filters:gamma(2.2)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Gamma(2.2)])]);
     }
 
     #[test]
@@ -4130,6 +4162,12 @@ mod tests {
             "filters:brighten(-256)",
             "filters:contrast(101)",
             "filters:contrast(-100.5)",
+            "filters:gamma(0)",
+            "filters:gamma(-1)",
+            "filters:gamma(10.5)",
+            "filters:gamma(nan)",
+            "filters:gamma(inf)",
+            "filters:gamma()",
             "filters:saturation(256)",
             "filters:saturation(-1)",
             "filters:quality()",

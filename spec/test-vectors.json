@@ -102,6 +102,12 @@
     "signature": "ae2b8fde68f8098f52b9fe980078f7576a54d09b7d21b2d5ba191c6952047769"
   },
   {
+    "description": "a gamma filter chain (issue #313)",
+    "remainder": "filters:gamma(2.2)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "30139aa29597be221216319d43f0b4d98db2206823b0b7564bf4bf76e62b86b9"
+  },
+  {
     "description": "sealed: a plain remainder under an injected nonce (AES-256-GCM, key HMAC_SHA256(secret, \"crabcrop/seal-key\"), AAD crabcrop/sealed/1)",
     "sealed": true,
     "secret": "s3cr3t",

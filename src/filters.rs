@@ -7,7 +7,7 @@
 
 use image::DynamicImage;
 
-use crate::url::{CurveChannel, Filter, ImageFormat, MAX_BLUR_SIGMA, Quality};
+use crate::url::{CurveChannel, Filter, ImageFormat, MAX_BLUR_SIGMA, MAX_GAMMA, Quality};
 
 /// Encoding directives collected from filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -102,6 +102,9 @@ pub fn apply_filters_filled(
             Filter::Brighten(amount) => img = brighten_fast(img, *amount),
             Filter::Contrast(amount) => {
                 img = map_rgb_image(img, |rgb| contrast_in_place(rgb, *amount));
+            }
+            Filter::Gamma(gamma) => {
+                img = gamma_correct(&img, *gamma);
             }
             Filter::HueRotate(degrees) => img = huerotate_fast(img, *degrees),
             Filter::Sharpen(amount) => {
@@ -1142,6 +1145,46 @@ fn contrast_in_place(mut img: image::RgbImage, amount: f32) -> image::RgbImage {
         [lut[r as usize], lut[g as usize], lut[b as usize]]
     });
     img
+}
+
+/// The 256-entry lookup table for one gamma divisor: entry
+/// `v` is `255 * (v / 255)^(1 / g)`, rounded to the nearest
+/// value, so 0 and 255 are fixed points at every setting
+/// and the table is monotone. A divisor outside the
+/// grammar's contract (non-finite, non-positive, or past
+/// [`MAX_GAMMA`]) is sanitized like `blur_sigma` sanitizes
+/// its input: it clamps into the accepted range instead of
+/// reaching the power function with a value that would
+/// invert the curve or produce NaNs.
+fn gamma_lut(gamma: f32) -> [u8; 256] {
+    let g = if gamma.is_finite() && gamma > 0.0 {
+        gamma.min(MAX_GAMMA)
+    } else {
+        1.0
+    };
+    let exponent = 1.0 / g;
+    let mut lut = [0u8; 256];
+    for (i, entry) in lut.iter_mut().enumerate() {
+        *entry = (255.0 * (i as f32 / 255.0).powf(exponent))
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    lut
+}
+
+/// Gamma correction (issue #313): remap every channel
+/// through the divisor's lookup table. Alpha is never
+/// touched (the `map_rgb` contract, like the other color
+/// filters).
+fn gamma_correct(img: &DynamicImage, gamma: f32) -> DynamicImage {
+    let lut = gamma_lut(gamma);
+    map_rgb(img.clone(), |r, g, b| {
+        [
+            lut[usize::from(r)],
+            lut[usize::from(g)],
+            lut[usize::from(b)],
+        ]
+    })
 }
 
 /// The 256-entry lookup table for one tone curve: inputs at
@@ -3128,6 +3171,60 @@ mod tests {
         let (img, _) = apply_filters(solid(200, 200, 200), &[Filter::Contrast(2.0)]);
         let px = first_pixel(&img);
         assert!(px[0] > 200, "pixel = {px:?}");
+    }
+
+    #[test]
+    fn gamma_one_is_the_identity() {
+        let lut = gamma_lut(1.0);
+        for (i, entry) in lut.iter().enumerate() {
+            assert_eq!(*entry, i as u8);
+        }
+        let (img, _) = apply_filters(solid(37, 128, 250), &[Filter::Gamma(1.0)]);
+        assert_eq!(first_pixel(&img), [37, 128, 250]);
+    }
+
+    #[test]
+    fn gamma_moves_midtones_and_keeps_the_endpoints() {
+        // 255 * (64 / 255)^(1/2) rounds to 128; squared
+        // (gamma 0.5) it rounds to 16.
+        let (img, _) = apply_filters(solid(64, 64, 64), &[Filter::Gamma(2.0)]);
+        assert_eq!(first_pixel(&img), [128, 128, 128]);
+        let (img, _) = apply_filters(solid(64, 64, 64), &[Filter::Gamma(0.5)]);
+        assert_eq!(first_pixel(&img), [16, 16, 16]);
+        for gamma in [0.45, 2.2, 10.0] {
+            let (img, _) = apply_filters(solid(0, 255, 0), &[Filter::Gamma(gamma)]);
+            assert_eq!(first_pixel(&img), [0, 255, 0], "gamma {gamma}");
+        }
+        // The table is monotone at the extremes of the range.
+        for gamma in [0.1, 10.0] {
+            let lut = gamma_lut(gamma);
+            assert!(lut.windows(2).all(|w| w[0] <= w[1]), "gamma {gamma}");
+        }
+    }
+
+    #[test]
+    fn gamma_preserves_alpha() {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([64, 32, 16, 128]),
+        ));
+        let (out, _) = apply_filters(img, &[Filter::Gamma(2.0)]);
+        let px = out.to_rgba8().get_pixel(0, 0).0;
+        assert_eq!(px[3], 128);
+        assert_eq!(px[0], 128);
+    }
+
+    #[test]
+    fn gamma_lut_sanitizes_out_of_contract_values() {
+        // The parser never produces these; the table builder
+        // still refuses to reach powf with them.
+        for bad in [f32::NAN, f32::INFINITY, 0.0, -2.0] {
+            let lut = gamma_lut(bad);
+            assert_eq!(lut[64], 64, "gamma {bad}");
+            assert_eq!(lut[200], 200, "gamma {bad}");
+        }
+        assert_eq!(gamma_lut(100.0), gamma_lut(MAX_GAMMA));
     }
 
     #[test]

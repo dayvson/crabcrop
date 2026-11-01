@@ -85,6 +85,8 @@ const FILTER_BLURBS = {
   blurfaces: "blur detected faces (needs a face model on the server)",
   brighten: "brighten by the given amount (-255..255)",
   contrast: "contrast in percent, -100..100 (0 is unchanged, -100 is flat)",
+  gamma:
+    "gamma correction with divisor g, 0 < g <= 10: each channel becomes 255 * (v / 255)^(1 / g) (1 is unchanged, above 1 brightens midtones)",
   huerotate: "rotate the hue by the given degrees",
   rotate: "rotate by the given angle in degrees; the canvas expands to fit",
   quality: "output quality 1..100, or `auto` for perceptual targeting",
@@ -262,6 +264,10 @@ function validateFilter(name, args) {
       return args !== null && isIntIn(args, -2147483648, 2147483647) ? null : bad;
     case "contrast":
       return args !== null && isFloat(args) && Number(args) >= -100 && Number(args) <= 100
+        ? null
+        : bad;
+    case "gamma":
+      return args !== null && isFloat(args) && Number(args) > 0 && Number(args) <= 10
         ? null
         : bad;
     case "saturation":

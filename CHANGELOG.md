@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Added
+
+- Gamma correction (issue #313). A new `gamma(g)` filter applies the levels-style midtone gamma: each channel value `v` becomes `255 * (v / 255)^(1 / g)`, with `0 < g <= 10`; 1 is unchanged, values above 1 brighten the midtones, and values below 1 darken them. Black and white are fixed points at every setting and alpha is untouched. The scale is called out because the rest of the adjustment family speaks in percents and offsets: gamma's scale is the exponent itself, the one scale the comparable tools agree on, so a gamma value from another tool carries over as written where `curve` would have needed translated control points. The TypeScript SDK gains a `gamma` builder.
+
 ## [0.9.6] - 2026-11-01
 
 ### Added

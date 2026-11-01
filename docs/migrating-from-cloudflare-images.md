@@ -76,7 +76,7 @@ Cloudflare's adjustment options are multipliers with 1 as unchanged. crabcrop's 
 | `saturation=0.5` | `filters:saturation(0.5)` | Direct, and the only adjustment that copies verbatim: both are factors, 1 unchanged, 0 grayscale |
 | `contrast=1.5` | `filters:contrast(50)` | Value changes meaning: Cloudflare is a multiplier (1 unchanged), crabcrop a percent (-100 to 100, 0 unchanged). Convert with `(factor - 1) x 100`. A factor of 0 to 2 spans the whole percent range; above 2, clamp at 100 |
 | `brightness=0.9` | `filters:brighten(-26)` as a starting point | Approximate, because the operations differ in shape: Cloudflare multiplies luminance (black stays black, whites scale), crabcrop adds a fixed channel shift from -255 to 255 (black lifts too). There is no faithful conversion; `brighten((factor - 1) x 255)`, rounded, matches near the highlights and is a reasonable place to start tuning |
-| `gamma=0.5` | `filters:curve(rgb,0,0,64,128,128,180,192,221,255,255)` | Approximate: crabcrop has no gamma filter, so the power curve is sampled into `curve(...)` control points (this example is `gamma=0.5`, where `out = in^0.5`). Mind the convention: Cloudflare gamma below 1 lightens midtones, above 1 darkens them, and 0 and 1 are both no change |
+| `gamma=0.5` | `filters:gamma(2)` | Value inverts: Cloudflare applies the exponent directly (`out = in^g`, so below 1 lightens midtones, above 1 darkens them, and 0 and 1 are both no change), crabcrop takes the divisor, so convert with `1 / g`. Cloudflare's 0 (no change) has no divisor form; drop the parameter |
 | `sharpen=2` | `filters:sharpen(2)` | Approximate: both are unsharp-mask strengths and the number carries as a starting point (Cloudflare's scale runs 0 to 10; crabcrop's is any positive number), but the kernels differ |
 | `blur=50` | `filters:blur(5)` as a starting point | Approximate: Cloudflare's value is a radius from 0 to 250, crabcrop's a Gaussian sigma. The numbers do not convert by a constant; sigma near radius / 10 is a reasonable first guess, then compare renders |
 
@@ -114,7 +114,7 @@ Cloudflare's adjustment options are multipliers with 1 as unchanged. crabcrop's 
 
 ## Converter feasibility
 
-Could a `convert-cloudflare` verb sit next to `convert-thumbor`? For zone transformation URLs, the mechanical core could: the options are comma-separated `key=value` pairs in a single path segment, the source follows in full, and the Thumbor converter's pattern, convert what is faithful and drop the rest with a named warning rather than guessing, fits. The fit, gravity, format, quality, and copying saturation rows are table lookups; contrast and brightness become conversions with warnings; gamma and the trims become warnings and drops.
+Could a `convert-cloudflare` verb sit next to `convert-thumbor`? For zone transformation URLs, the mechanical core could: the options are comma-separated `key=value` pairs in a single path segment, the source follows in full, and the Thumbor converter's pattern, convert what is faithful and drop the rest with a named warning rather than guessing, fits. The fit, gravity, format, quality, and copying saturation rows are table lookups; contrast, brightness, and gamma become conversions with warnings; the trims become warnings and drops.
 
 Two things keep it from being a weekend verb. First, the hosted form does not carry its source: an account hash and a UUID image ID name nothing on your origin, so the verb needs an ID to URL manifest (exportable from the Images API) or a custom-ID base supplied out of band before it can emit a crabcrop URL at all, the same blocker as imgix bucket Sources. Second, variant names are opaque to the URL: expanding `thumbnail` into operations needs the account's variant definitions, fetched from the API and translated by these tables, after which a variant is just a preset definition waiting to be written. None of that blocks a useful verb for zone URLs; all of it argues for shipping the tables first, which is what this guide is.
 
@@ -202,14 +202,14 @@ crabcrop:
   /<signature>/800x0/filters:removebg:format(png)/https://images.example.com/product.png
 ```
 
-A gamma lift, sampled into a tone curve:
+A gamma lift. The value inverts (see the table): Cloudflare's 0.5 is crabcrop's 2:
 
 ```
 Cloudflare:
   https://example.com/cdn-cgi/image/gamma=0.5/images/street.jpg
 
 crabcrop:
-  /<signature>/filters:curve(rgb,0,0,64,128,128,180,192,221,255,255)/https://images.example.com/street.jpg
+  /<signature>/filters:gamma(2)/https://images.example.com/street.jpg
 ```
 
 A signed, expiring URL. The timestamp copies exactly; what changes is that the expiry now sits inside the signature instead of beside it, and scale-down becomes fit-in with the no-upscale cap:
