@@ -2,6 +2,20 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.9.6] - 2026-11-01
+
+### Added
+
+- A slow lane isolates long-running work from still renders (issue #324). Animated WebP encodes and the external-tool work (video encodes, `frame:` extractions, `page:` renders) draw permits from a separate gate sized by the new `CRABCROP_SLOW_LANE_PERMITS` configuration (default 1) instead of the shared process gate, so a saturated animation queue can no longer starve stills: in the acceptance measurement at the processing seam the still cold-render band did not move under slow-lane saturation (median 1.28 ms unsaturated, 1.27 ms saturated). Lane overflow sheds in its own lane with a 503, the message "server busy: long-running processing lane is full", and `Retry-After: 5`; there is no spillover onto the stills lane. The `/metrics` endpoint now exposes `crabcrop_lane_in_use` and `crabcrop_lane_capacity` gauges for both lanes.
+
+### Changed
+
+- Animated WebP encoding runs through libwebp's animated encoder at method 4 (issue #323), with the stills quality mapping: quality 80 by default, lossy below 100, and lossless at quality 100 through the same encoder. The pure-Rust encoder it replaces encoded losslessly with no quality lever and did not finish the crabcrop.org animation files inside the 600 s processing deadline (all 8 returned 504 in the production soak); the same files now encode in 1.0 to 4.7 s each, with frame counts, per-frame delays, loop counts, and canvas preserved exactly. Animated WebP output bytes change: the default output is now lossy at quality 80, with a mean absolute pixel error of 1.35 to 1.78 against the decoded source frames on the measured files, where it was lossless before; quality 100 remains available for exact pixels and is also faster than the encoder it replaces (23.6 s and 148.5 s on the two largest test files, where the old encoder never finished). Like the stills change in 0.9.5, this is a deliberate, temporary exception to the pure-Rust encoder set, taken for performance; the switch back is tracked against the same bar as issue #292, the upstream pure-Rust encoder closing to roughly 1.3 times libwebp at equal or better size and quality.
+
+### Fixed
+
+- A timed-out request no longer keeps the encode gates (issue #322). The processing deadline is now honored inside the chunked encode loops (per frame for animated GIF and WebP, per attempt in the quality ladders) as well as between pipeline stages, the runner's wait is bounded by the deadline plus a 2 s grace instead of a flat 600 s cap, and the gate permits stay on the async side and drop with the 504 answer. In the production soak, one timed-out encode kept running detached and held the gate for over 20 minutes, shedding five follow-up requests with 503 until the service was restarted; a timed-out encode now releases every gate it holds as it answers, and the next request gets a genuine attempt. One boundary is unchanged and stated plainly: a single library encode call cannot be interrupted mid-call, so such a job runs until its current call returns and then aborts at the next deadline check, holding no gate meanwhile.
+
 ## [0.9.5] - 2026-10-30
 
 ### Changed

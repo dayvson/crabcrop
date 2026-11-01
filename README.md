@@ -27,9 +27,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releas
 **Docker:** the base image, and the AI variant with background removal and face detection on board:
 
 ```bash
-docker pull ghcr.io/dayvson/crabcrop:0.9.5
-docker pull ghcr.io/dayvson/crabcrop-ai:0.9.5
-docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.9.5
+docker pull ghcr.io/dayvson/crabcrop:0.9.6
+docker pull ghcr.io/dayvson/crabcrop-ai:0.9.6
+docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.9.6
 ```
 
 **Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases). To build from source instead, see [Deployment](#deployment).
