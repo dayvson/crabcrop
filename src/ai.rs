@@ -1438,6 +1438,27 @@ fn iou(a: &FaceBox, b: &FaceBox) -> f32 {
     if union <= 0.0 { 0.0 } else { inter / union }
 }
 
+/// Reads one of the CRABCROP_TEST_* variables the real-model
+/// tests take their model paths from. An unset variable means
+/// that model is not provisioned in this environment, so the
+/// caller early-returns and the test skips instead of
+/// panicking: provisioning is a deliberate choice, and the
+/// ai-models workflow sets only some of the variables. A set
+/// variable keeps the old behavior exactly, including the
+/// panic on a non-UTF-8 value and any failure for a missing
+/// or invalid file it points at.
+#[cfg(test)]
+pub(crate) fn env_or_skip(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!("skipping: {name} is not set");
+            None
+        }
+        Err(err) => panic!("{name}: {err}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1726,8 +1747,12 @@ mod tests {
     #[test]
     #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
     fn inpaint_with_the_real_model() {
-        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-        let model = std::env::var("CRABCROP_TEST_INPAINT_MODEL").unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(model) = env_or_skip("CRABCROP_TEST_INPAINT_MODEL") else {
+            return;
+        };
         let provider = OnnxInpaintProvider::load(Some(&dylib), &model).unwrap();
         // A smooth gradient with a solid red square pasted
         // in the middle: the model's one plausible answer
@@ -1882,9 +1907,15 @@ mod tests {
     #[test]
     #[ignore = "needs the ONNX runtime and model files (env-configured)"]
     fn segment_with_the_real_model() {
-        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-        let encoder = std::env::var("CRABCROP_TEST_SEGMENT_ENCODER_MODEL").unwrap();
-        let decoder = std::env::var("CRABCROP_TEST_SEGMENT_DECODER_MODEL").unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(encoder) = env_or_skip("CRABCROP_TEST_SEGMENT_ENCODER_MODEL") else {
+            return;
+        };
+        let Some(decoder) = env_or_skip("CRABCROP_TEST_SEGMENT_DECODER_MODEL") else {
+            return;
+        };
         let provider = OnnxSegmentProvider::load(Some(&dylib), &encoder, &decoder).unwrap();
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(200, 150, |x, y| {
             let dx = x as i32 - 100;
@@ -1946,8 +1977,12 @@ mod tests {
     #[test]
     #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
     fn segment_load_rejects_a_decoder_without_the_prompt_inputs() {
-        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-        let encoder = std::env::var("CRABCROP_TEST_SEGMENT_ENCODER_MODEL").unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(encoder) = env_or_skip("CRABCROP_TEST_SEGMENT_ENCODER_MODEL") else {
+            return;
+        };
         let message = expect_load(OnnxSegmentProvider::load(Some(&dylib), &encoder, &encoder));
         assert!(message.contains("a segment decoder takes"), "{message}");
     }
@@ -4224,8 +4259,12 @@ mod moderation_tests {
     #[test]
     #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
     fn moderation_with_the_real_model() {
-        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-        let model = std::env::var("CRABCROP_TEST_MODERATION_MODEL").unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(model) = env_or_skip("CRABCROP_TEST_MODERATION_MODEL") else {
+            return;
+        };
         let provider = OnnxModerationProvider::load(Some(&dylib), &model, None).unwrap();
         // No labels configured: the Falconsai pair applies.
         assert_eq!(provider.labels(), ["normal", "nsfw"]);
@@ -4261,8 +4300,12 @@ mod moderation_tests {
     #[test]
     #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
     fn moderation_labels_rename_the_outputs() {
-        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-        let model = std::env::var("CRABCROP_TEST_MODERATION_MODEL").unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(model) = env_or_skip("CRABCROP_TEST_MODERATION_MODEL") else {
+            return;
+        };
         let named = vec!["safe".to_string(), "explicit".to_string()];
         let provider = OnnxModerationProvider::load(Some(&dylib), &model, Some(named)).unwrap();
         assert_eq!(provider.labels(), ["safe", "explicit"]);
@@ -5404,12 +5447,13 @@ mod focal_tests {
     #[test]
     #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
     fn focal_live_point_tracks_the_brightest_block() {
-        let var = |name: &str| std::env::var(name).unwrap();
-        let provider = OnnxFocalProvider::load(
-            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
-            &var("CRABCROP_TEST_FOCAL_MODEL"),
-        )
-        .unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(model) = env_or_skip("CRABCROP_TEST_FOCAL_MODEL") else {
+            return;
+        };
+        let provider = OnnxFocalProvider::load(Some(&dylib), &model).unwrap();
         // 64x64 black with a white block at x 40..48,
         // y 8..16; the model sees it at 32x32, so the
         // block lands at x 20..24, y 4..8 and the first
@@ -5928,18 +5972,29 @@ mod embedding_tests {
     #[test]
     #[ignore = "needs the ONNX runtime, CLIP model files, and a head file (env-configured)"]
     fn embedding_and_aesthetic_with_the_real_models() {
-        let var = |name: &str| std::env::var(name).unwrap();
-        let image_model = var("CRABCROP_TEST_CLIP_IMAGE_MODEL");
-        let tagger = OnnxClipProvider::load(
-            Some(&var("CRABCROP_TEST_ORT_DYLIB")),
-            &image_model,
-            &var("CRABCROP_TEST_CLIP_TEXT_MODEL"),
-            &var("CRABCROP_TEST_CLIP_TOKENIZER"),
-            &var("CRABCROP_TEST_CLIP_LABELS"),
-        )
-        .unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(image_model) = env_or_skip("CRABCROP_TEST_CLIP_IMAGE_MODEL") else {
+            return;
+        };
+        let Some(text_model) = env_or_skip("CRABCROP_TEST_CLIP_TEXT_MODEL") else {
+            return;
+        };
+        let Some(tokenizer) = env_or_skip("CRABCROP_TEST_CLIP_TOKENIZER") else {
+            return;
+        };
+        let Some(labels) = env_or_skip("CRABCROP_TEST_CLIP_LABELS") else {
+            return;
+        };
+        let Some(head_path) = env_or_skip("CRABCROP_TEST_AESTHETIC_HEAD") else {
+            return;
+        };
+        let tagger =
+            OnnxClipProvider::load(Some(&dylib), &image_model, &text_model, &tokenizer, &labels)
+                .unwrap();
         let provider = ClipEmbeddingProvider::new(std::sync::Arc::new(tagger), image_model.clone());
-        let head = AestheticHead::load(&var("CRABCROP_TEST_AESTHETIC_HEAD")).unwrap();
+        let head = AestheticHead::load(&head_path).unwrap();
         assert_eq!(head.expected_dim(), 512);
         let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
         let img = image::load_from_memory(bytes).unwrap();
@@ -5971,8 +6026,10 @@ mod embedding_tests {
     #[test]
     #[ignore = "needs a head file for another encoder (env-configured)"]
     fn aesthetic_head_for_another_encoder_loads_and_scores_none() {
-        let head = AestheticHead::load(&std::env::var("CRABCROP_TEST_AESTHETIC_HEAD_L14").unwrap())
-            .unwrap();
+        let Some(head_path) = env_or_skip("CRABCROP_TEST_AESTHETIC_HEAD_L14") else {
+            return;
+        };
+        let head = AestheticHead::load(&head_path).unwrap();
         assert_eq!(head.expected_dim(), 768);
         // A 512-dim embedding against the 768 head:
         // no score, and no panic.
@@ -7048,10 +7105,18 @@ mod ocr_tests {
     #[test]
     #[ignore = "needs the ONNX runtime and model files (env-configured)"]
     fn ocr_with_the_real_models() {
-        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-        let detect = std::env::var("CRABCROP_TEST_OCR_DETECT_MODEL").unwrap();
-        let recognize = std::env::var("CRABCROP_TEST_OCR_RECOGNIZE_MODEL").unwrap();
-        let dict = std::env::var("CRABCROP_TEST_OCR_DICT").unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(detect) = env_or_skip("CRABCROP_TEST_OCR_DETECT_MODEL") else {
+            return;
+        };
+        let Some(recognize) = env_or_skip("CRABCROP_TEST_OCR_RECOGNIZE_MODEL") else {
+            return;
+        };
+        let Some(dict) = env_or_skip("CRABCROP_TEST_OCR_DICT") else {
+            return;
+        };
         let provider =
             OnnxOcrProvider::load(Some(&dylib), &detect, &recognize, &dict, "en").unwrap();
         // The shipped dictionary is the PP-OCRv6 table.
@@ -7103,9 +7168,15 @@ mod ocr_tests {
     #[test]
     #[ignore = "needs the ONNX runtime and model files (env-configured)"]
     fn ocr_load_rejects_a_mismatched_dictionary() {
-        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-        let detect = std::env::var("CRABCROP_TEST_OCR_DETECT_MODEL").unwrap();
-        let recognize = std::env::var("CRABCROP_TEST_OCR_RECOGNIZE_MODEL").unwrap();
+        let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(detect) = env_or_skip("CRABCROP_TEST_OCR_DETECT_MODEL") else {
+            return;
+        };
+        let Some(recognize) = env_or_skip("CRABCROP_TEST_OCR_RECOGNIZE_MODEL") else {
+            return;
+        };
         let tiny = temp_file("tiny-dict", b"a\nb\nc\n");
         let message = expect_load(OnnxOcrProvider::load(
             Some(&dylib),

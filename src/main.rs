@@ -3640,10 +3640,15 @@ mod tests {
     #[test]
     #[ignore = "needs the ONNX runtime and model files (env-configured)"]
     fn declared_detectors_build_from_a_file_with_real_models() {
-        let var = |name: &str| std::env::var(name).unwrap();
-        let dylib = var("CRABCROP_TEST_ORT_DYLIB");
-        let yolo = var("CRABCROP_TEST_DETECT_MODEL");
-        let focal_model = var("CRABCROP_TEST_FOCAL_MODEL");
+        let Some(dylib) = crate::ai::env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+            return;
+        };
+        let Some(yolo) = crate::ai::env_or_skip("CRABCROP_TEST_DETECT_MODEL") else {
+            return;
+        };
+        let Some(focal_model) = crate::ai::env_or_skip("CRABCROP_TEST_FOCAL_MODEL") else {
+            return;
+        };
         // The declaration's vocabulary must match the
         // export's class count (the load probe enforces
         // it): 80 generated names.
