@@ -232,9 +232,12 @@ pub struct AppState {
     pub engine: Engine,
     /// Per-request processing deadline (issue #260), from
     /// `CRABCROP_PROCESS_TIMEOUT_SECS`: the engine checks
-    /// it between stages and aborts chained work with a
-    /// 504. Single stages are not interrupted (see
-    /// `RUNAWAY_CAP`).
+    /// it between stages and inside chunked encode loops
+    /// and aborts chained work with a 504, and the runner
+    /// stops waiting and releases every gate at the
+    /// deadline plus `DEADLINE_GRACE` even when a single
+    /// opaque stage cannot be interrupted mid-call (issue
+    /// #322).
     pub process_timeout: std::time::Duration,
     /// Request metrics, shared behind an `Arc` so clones agree.
     pub metrics: Arc<Metrics>,
@@ -1497,11 +1500,18 @@ enum ProcessFailure {
     /// The engine panicked. The panic is contained at this
     /// seam (audit E-8) and surfaces as a 500.
     Panicked,
-    /// The job ran past the runaway cap (issue #260):
-    /// the runner stopped waiting and the request is
-    /// shed with a 504. The blocking job itself is
-    /// detached; it keeps its permit until it finishes
-    /// or the engine's deadline checks abort it.
+    /// The job ran past its processing deadline plus the
+    /// grace bound (issue #322): the runner stopped
+    /// waiting and the request is shed with a 504. The
+    /// blocking job itself is detached, but it holds no
+    /// gate permit: the process permit stays on the async
+    /// side and drops with this answer, and the handler's
+    /// AI, video, and animation permits drop with it, so
+    /// a follow-up request gets a genuine attempt instead
+    /// of shedding on a dead request's gates. The detached
+    /// job aborts at the engine's next deadline check; a
+    /// job stuck inside one opaque encoder call runs only
+    /// until that call returns.
     TimedOut,
 }
 
@@ -1509,17 +1519,27 @@ enum ProcessFailure {
 /// before the server sheds it with a 503.
 const PROCESS_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The runaway cap on one processing job (issue #260):
-/// ten minutes, far past any legitimate render. The
-/// processing deadline is checked between stages, so
-/// chains abort promptly; a single stage (one encode,
-/// one filter) is never interrupted mid-flight, because
-/// legitimate single renders run long (the animated
-/// WebP encodes of issue #227 take minutes and are the
-/// project's accepted normal). This cap exists only so
-/// a stage that never returns at all (a hung encoder)
-/// cannot hold its process permit forever.
-const RUNAWAY_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+/// The grace bound past the processing deadline (issue
+/// #322): how long the runner keeps waiting for a job
+/// whose deadline has passed before it answers 504,
+/// releases every gate the request holds, and detaches
+/// the job. The engine checks the deadline between
+/// stages and inside its chunked encode loops (per frame
+/// for animated GIF and WebP, per attempt for the
+/// quality ladders), so a checkpointed job aborts on its
+/// own within this window and answers with the engine's
+/// own Timeout. A job still running when the grace runs
+/// out is inside a single opaque encoder call (one still
+/// encode, libwebp's animated `try_encode`, one AI
+/// inference, the external video encoder), which no
+/// checkpoint can interrupt: detaching is what bounds
+/// its hold on the server, and it aborts at the first
+/// deadline check after that call returns. Before issue
+/// #322 the runner waited on a flat ten-minute runaway
+/// cap instead, and the detached job kept the process
+/// permit with it, so one stuck encode shed every
+/// follow-up request with a gate 503 until it finished.
+const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long an AI-backed request may wait for an inference
 /// slot before the server sheds it with a 503 (audit PL-14).
@@ -1577,12 +1597,21 @@ async fn run_process(
     let engine = state.engine;
     // The processing deadline (issue #260): the engine
     // checks it between stages (operations, frames) and
-    // aborts chained work promptly. The runner's own wait
-    // is bounded only by the runaway cap: a single stage
-    // is never interrupted mid-flight.
+    // inside its chunked encode loops and aborts chained
+    // work promptly. The runner's own wait is bounded by
+    // the deadline plus the grace bound (issue #322).
+    // The process permit deliberately stays here, on the
+    // async side, instead of moving into the blocking
+    // closure as it used to: when the wait times out, the
+    // permit drops with this function's answer and the
+    // gate is free for the next request at once, however
+    // long the detached job takes to unwind. Jobs that
+    // finish or abort before the wait ends never see the
+    // difference: the permit is held for exactly the span
+    // the caller is waiting on the work.
+    let _permit = permit;
     let deadline = std::time::Instant::now() + state.process_timeout;
     let handle = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
         let declared_refs: Vec<&dyn crate::ai::DetectionProvider> = job
             .declared_detect_providers
             .iter()
@@ -1635,12 +1664,24 @@ async fn run_process(
             Err(_) => Err(ProcessFailure::Panicked),
         }
     });
-    // Past the runaway cap the runner stops waiting and
-    // sheds the request. The detached job keeps its
-    // process permit until it finishes or the engine's
-    // deadline checks abort it at a stage boundary; its
-    // result is dropped.
-    match tokio::time::timeout(RUNAWAY_CAP, handle).await {
+    // Past the deadline plus the grace bound the runner
+    // stops waiting and sheds the request with a 504
+    // (issue #322). The detached job keeps no permit: the
+    // process permit above drops as this function
+    // returns, and the caller's AI, video, and animation
+    // permits drop as the handler answers, so a follow-up
+    // request gets a genuine encode attempt instead of
+    // the gate 503s the #310 soak produced. The detached
+    // job's result is dropped; it aborts at the engine's
+    // next deadline check, or, when it is stuck inside a
+    // single opaque encoder call, as soon as that call
+    // returns and the next check runs.
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline + DEADLINE_GRACE),
+        handle,
+    )
+    .await
+    {
         Ok(joined) => joined.unwrap_or(Err(ProcessFailure::Panicked)),
         Err(_) => Err(ProcessFailure::TimedOut),
     }
@@ -10618,6 +10659,159 @@ mod tests {
         drop(held);
         let processed = waiting.await.unwrap();
         assert_eq!((processed.width, processed.height), (100, 60));
+    }
+
+    #[tokio::test]
+    async fn timed_out_encode_releases_the_process_gate() {
+        // Issue #322, the #310 soak scenario in miniature:
+        // one encode runs far past the processing deadline
+        // inside a single blocking stage (here the external
+        // video encoder, a script that drains its input,
+        // sleeps 9 seconds, and only then answers), and a
+        // follow-up request arrives while it is stuck. The
+        // stuck request must answer TimedOut at its deadline
+        // (plus the grace bound) instead of whenever the
+        // encode happens to return, and the follow-up must
+        // get a genuine encode attempt on the freed gate
+        // instead of the gate-held 503 (Busy) the soak's
+        // follow-up requests got.
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "crabcrop-server-stuck-encode-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("encoder.sh");
+        let mut file = std::fs::File::create(&script_path).unwrap();
+        file.write_all(b"#!/bin/sh\ncat > /dev/null\nsleep 9\nprintf 'x'\n")
+            .unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let encoder = crate::video::VideoEncoder::new(
+            script_path,
+            std::time::Duration::from_secs(30),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            process_timeout: std::time::Duration::from_millis(300),
+            metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: None,
+            segment: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            ocr: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
+            config_fingerprint: "test".to_string(),
+        };
+        let job = |video_encoder: Option<Arc<crate::video::VideoEncoder>>, ops_str: &str| {
+            let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
+            ProcessJob {
+                save_data: false,
+                preserve_metadata: false,
+                brand_color: None,
+                ops,
+                preferred: None,
+                watermark_sources: Vec::new(),
+                placeholders: false,
+                mask_provider: None,
+                upscale_provider: None,
+                inpaint_provider: None,
+                segment_provider: None,
+                face_provider: None,
+                detect_provider: None,
+                declared_detect_providers: Vec::new(),
+                focal_provider: None,
+                text_renderer: None,
+                video_encoder,
+                frame_extractor: None,
+                pdf_renderer: None,
+                provenance_signer: None,
+                ai_edited: false,
+                want_provenance: false,
+                dpr: None,
+                ssim_target: state.ssim_target,
+                avif_speed: state.avif_speed,
+                jxl_speed: state.jxl_speed,
+            }
+        };
+        let stuck_job = job(
+            Some(Arc::new(encoder)),
+            "filters:format(mp4)/example.com/i.gif",
+        );
+        let follow_job = job(None, "example.com/i.png");
+        let gif = animated_gif_bytes();
+        let png = test_png();
+        let started = Instant::now();
+        let (first, (follow_elapsed, follow)) =
+            tokio::join!(run_process(&state, &stuck_job, &gif), async {
+                // Arrive while the first encode is stuck,
+                // well past its 300 ms deadline.
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                let follow_start = Instant::now();
+                let result = run_process(&state, &follow_job, &png).await;
+                (follow_start.elapsed(), result)
+            });
+        assert!(
+            matches!(first, Err(ProcessFailure::TimedOut)),
+            "the stuck encode must answer TimedOut at its deadline, got {first:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(7),
+            "the timeout and the follow-up must not wait out the 9 s encode"
+        );
+        let processed = follow.unwrap_or_else(|e| {
+            panic!("the follow-up must get a genuine encode attempt, got {e:?}")
+        });
+        assert_eq!((processed.width, processed.height), (100, 60));
+        assert!(
+            follow_elapsed < PROCESS_GATE_WAIT,
+            "the follow-up must not shed on the gate the dead request held"
+        );
+        assert_eq!(state.process_gate.available_permits(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

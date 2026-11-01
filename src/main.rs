@@ -258,12 +258,15 @@
 //! - `CRABCROP_PROCESS_TIMEOUT_SECS`: per-request
 //!   processing deadline in seconds (default 30, 1 to
 //!   600). The engine checks it between operations and
-//!   frames, and chained work that runs past it aborts
-//!   with a 504 (issue #260). A single stage (one
-//!   encode, one filter) is never interrupted
-//!   mid-flight: legitimate single renders run long,
-//!   and a fixed ten-minute runaway cap bounds a stage
-//!   that never returns at all.
+//!   frames and inside its chunked encode loops, and
+//!   chained work that runs past it aborts with a 504
+//!   (issues #260, #322). A single opaque encoder call
+//!   is never interrupted mid-flight, but it cannot
+//!   hold the server: at the deadline plus a two-second
+//!   grace the request answers 504 and releases every
+//!   processing gate it holds, and the detached work
+//!   aborts at the first deadline check after the call
+//!   returns.
 //! - `PORT`: listen port, default 3000.
 
 #![forbid(unsafe_code)]

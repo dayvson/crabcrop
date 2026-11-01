@@ -816,8 +816,16 @@ pub struct ProcessContext<'a> {
     /// Processing deadline for this request (issue #260),
     /// from `CRABCROP_PROCESS_TIMEOUT_SECS`: pipeline
     /// stages check it between operations and frames and
-    /// abort with `EngineError::Timeout` once it passes.
-    /// `None` means no deadline (tests, library use).
+    /// abort with `EngineError::Timeout` once it passes,
+    /// and the chunked encode loops (per frame for
+    /// animated GIF and WebP, per attempt for the quality
+    /// ladders) check it inside the encode as well (issue
+    /// #322). A single opaque encoder call (one still
+    /// encode, libwebp's animated `try_encode`, one AI
+    /// inference, the external video encoder) has no
+    /// checkpoint inside it and is never interrupted
+    /// mid-call. `None` means no deadline (tests, library
+    /// use).
     pub deadline: Option<std::time::Instant>,
 }
 
@@ -1385,6 +1393,11 @@ impl Engine {
                 ctx.ssim_target,
                 &mut encode_budget,
                 |q| {
+                    // Between attempts, not just between
+                    // stages (issue #322): a bisection that
+                    // ignores the deadline would keep
+                    // encoding long past it.
+                    ctx.check_deadline()?;
                     let candidate = encode(
                         &enc_src,
                         format,
@@ -1442,6 +1455,10 @@ impl Engine {
                 && attempts < max_quality_attempts(format)
                 && encode_budget > 0
             {
+                // Between ladder attempts, not just between
+                // stages (issue #322): each re-encode is a
+                // fresh chance to honor the deadline.
+                ctx.check_deadline()?;
                 let steps_remaining =
                     (max_quality_attempts(format) - attempts).min(encode_budget as u32);
                 current = next_quality(current, steps_remaining);
@@ -1615,6 +1632,13 @@ impl Engine {
                 )
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
                 for f in &out_frames {
+                    // The deadline is checked per frame inside
+                    // the encode loop itself (issue #322): a
+                    // many-frame GIF encode is chunked work, so
+                    // it aborts at the deadline instead of
+                    // running every frame's quantization first
+                    // and being noticed only afterwards.
+                    ctx.check_deadline()?;
                     // GIF delays are hundredths of a second; the
                     // image crate saturated this conversion at
                     // u16::MAX, and so does this.
@@ -1633,9 +1657,12 @@ impl Engine {
                 drop(enc);
                 out
             }
-            ImageFormat::WebP => {
-                encode_animated_webp(out_frames, loop_count.unwrap_or(0), encode_quality)?
-            }
+            ImageFormat::WebP => encode_animated_webp(
+                out_frames,
+                loop_count.unwrap_or(0),
+                encode_quality,
+                ctx.deadline,
+            )?,
             _ => unreachable!("process_animated is only called for GIF and WebP"),
         };
         Ok(ProcessedImage {
@@ -1878,6 +1905,7 @@ fn encode_animated_webp(
     frames: Vec<image::Frame>,
     loop_count: u16,
     quality: Option<u8>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, EngineError> {
     let first = frames
         .first()
@@ -1914,6 +1942,18 @@ fn encode_animated_webp(
     let mut encoder = webp::AnimEncoder::new(width, height, &config);
     encoder.set_loop_count(i32::from(loop_count));
     for (frame, delay_ms) in frames.iter().zip(&delays_ms) {
+        // The deadline is checked per frame while the
+        // frames are handed over (issue #322). The final
+        // `try_encode` below is a single libwebp call with
+        // no cancellation hook, so it remains one opaque
+        // stage: it cannot be interrupted mid-call, and
+        // the server side bounds what it can hold (see
+        // `run_process` in server.rs).
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() >= deadline
+        {
+            return Err(EngineError::Timeout);
+        }
         let buffer = frame.buffer();
         if buffer.width() != width || buffer.height() != height {
             return Err(EngineError::Encode(
@@ -7517,6 +7557,37 @@ mod tests {
         assert_pixel_near(frames[0].buffer().get_pixel(0, 0), [255, 0, 0, 128], 32);
         assert_pixel_near(frames[1].buffer().get_pixel(0, 0), [0, 200, 0, 64], 32);
         assert_pixel_near(frames[2].buffer().get_pixel(0, 0), [0, 0, 255, 255], 32);
+    }
+
+    #[test]
+    fn animated_webp_encode_honors_a_passed_deadline() {
+        // Issue #322: the per-frame deadline check inside
+        // the animated WebP encode hands back Timeout
+        // instead of feeding every frame to libwebp when
+        // the deadline has already passed.
+        let delay = image::Delay::from_numer_denom_ms(100, 1);
+        let frames = vec![
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255])),
+                0,
+                0,
+                delay,
+            ),
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 0, 255, 255])),
+                0,
+                0,
+                delay,
+            ),
+        ];
+        let err = encode_animated_webp(
+            frames,
+            0,
+            None,
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        )
+        .unwrap_err();
+        assert_eq!(err, EngineError::Timeout);
     }
 
     #[test]
