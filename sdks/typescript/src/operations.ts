@@ -463,6 +463,11 @@ export const filter = {
   trim(tolerance = 10): string {
     return `trim(${intIn("trim tolerance", tolerance, 0, 255)})`;
   },
+  /** Trim uniform borders, then remove pixels per side (left, top, right, bottom). */
+  trimSides(tolerance: number, left: number, top: number, right: number, bottom: number): string {
+    const side = (what: string, v: number) => intIn(what, v, 0, 4294967295);
+    return `trim(${intIn("trim tolerance", tolerance, 0, 255)},${side("trim left", left)},${side("trim top", top)},${side("trim right", right)},${side("trim bottom", bottom)})`;
+  },
   /** Encoding quality 1..100, or `"auto"` for perceptual targeting. */
   quality(value: number | "auto"): string {
     if (value === "auto") return "quality(auto)";

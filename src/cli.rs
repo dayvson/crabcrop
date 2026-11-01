@@ -558,6 +558,11 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         Filter::Equalize => "equalize: histogram equalization".into(),
         Filter::Rotate(v) => format!("rotate({v}): rotate by a multiple of 90 degrees"),
         Filter::Trim(v) => format!("trim({v}): trim near-uniform borders"),
+        Filter::TrimSides(t, [l, tp, r, b]) => {
+            format!(
+                "trim({t},{l},{tp},{r},{b}): trim near-uniform borders, then remove pixels per side"
+            )
+        }
         Filter::Watermark { url, x, y, alpha } => {
             format!("watermark: {url} at {x},{y}, alpha {alpha}")
         }

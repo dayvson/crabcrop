@@ -6,6 +6,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Added
 
+- Per-side trim (issue #313). `trim` gains a five-argument form, `trim(tolerance,left,top,right,bottom)`: the tolerance pass runs first, exactly as before, and the named pixel amounts then come off the left, top, right, and bottom of what remains, clamped so at least one pixel survives on each axis (the near side takes from the dimension first, the far side from what is left). The one-argument and bare forms are unchanged. The TypeScript SDK gains a `trimSides` builder.
+
 - Gamma correction (issue #313). A new `gamma(g)` filter applies the levels-style midtone gamma: each channel value `v` becomes `255 * (v / 255)^(1 / g)`, with `0 < g <= 10`; 1 is unchanged, values above 1 brighten the midtones, and values below 1 darken them. Black and white are fixed points at every setting and alpha is untouched. The scale is called out because the rest of the adjustment family speaks in percents and offsets: gamma's scale is the exponent itself, the one scale the comparable tools agree on, so a gamma value from another tool carries over as written where `curve` would have needed translated control points. The TypeScript SDK gains a `gamma` builder.
 
 ## [0.9.6] - 2026-11-01

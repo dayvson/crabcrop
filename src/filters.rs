@@ -153,6 +153,7 @@ pub fn apply_filters_filled(
                 };
             }
             Filter::Trim(tolerance) => img = trim(img, *tolerance),
+            Filter::TrimSides(tolerance, sides) => img = trim_sides(img, *tolerance, *sides),
             // Watermarks are applied by the engine, which owns
             // the resolved images; one reaching this function is
             // unresolved by construction and leaves pixels alone.
@@ -2049,6 +2050,28 @@ fn trim(img: DynamicImage, tolerance: u8) -> DynamicImage {
     )
 }
 
+/// Per-side trim (issue #313): the tolerance pass runs
+/// first, exactly as `trim` alone, then the named pixel
+/// amounts come off the left, top, right, and bottom of
+/// what remains. The amounts clamp so one pixel always
+/// survives on each axis: the near side takes from the
+/// dimension first and the far side takes from what is
+/// left, so an oversized pair can never underflow or
+/// produce an empty image.
+fn trim_sides(img: DynamicImage, tolerance: u8, sides: [u32; 4]) -> DynamicImage {
+    let img = trim(img, tolerance);
+    let (w, h) = (img.width(), img.height());
+    let [left, top, right, bottom] = sides;
+    let left = left.min(w - 1);
+    let right = right.min(w - 1 - left);
+    let top = top.min(h - 1);
+    let bottom = bottom.min(h - 1 - top);
+    if left == 0 && top == 0 && right == 0 && bottom == 0 {
+        return img;
+    }
+    img.crop_imm(left, top, w - left - right, h - top - bottom)
+}
+
 /// Scale each pixel's distance from its luma by `amount`:
 /// 0 collapses to gray, 1 is the identity.
 fn saturate(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
@@ -3283,6 +3306,53 @@ mod tests {
         let (img, _) = apply_filters(solid(77, 77, 77), &[Filter::Trim(10)]);
         assert_eq!((img.width(), img.height()), (4, 4));
         assert_eq!(first_pixel(&img), [77, 77, 77]);
+    }
+
+    #[test]
+    fn trim_sides_shaves_after_the_tolerance_pass() {
+        // bordered() trims to the 20x14 inner box; the sides
+        // then come off that box, not the original frame
+        // (sides first would still end at 20x14 after the
+        // tolerance pass found the same inner box).
+        let (img, _) = apply_filters(
+            bordered([255, 255, 255], [255, 0, 0]),
+            &[Filter::TrimSides(0, [5, 2, 5, 2])],
+        );
+        assert_eq!((img.width(), img.height()), (10, 10));
+        assert_eq!(first_pixel(&img), [255, 0, 0]);
+        // Zero sides are exactly the tolerance-only form.
+        let (img, _) = apply_filters(
+            bordered([255, 255, 255], [255, 0, 0]),
+            &[Filter::TrimSides(0, [0, 0, 0, 0])],
+        );
+        assert_eq!((img.width(), img.height()), (20, 14));
+        // On a uniform image the tolerance pass is a no-op
+        // and the sides still apply.
+        let (img, _) = apply_filters(
+            DynamicImage::new_rgb8(10, 6),
+            &[Filter::TrimSides(10, [2, 1, 2, 1])],
+        );
+        assert_eq!((img.width(), img.height()), (6, 4));
+    }
+
+    #[test]
+    fn trim_sides_clamps_to_one_surviving_pixel() {
+        // Amounts past the frame clamp instead of
+        // underflowing: the near side takes from the
+        // dimension first, the far side from what is left.
+        let (img, _) = apply_filters(
+            bordered([255, 255, 255], [255, 0, 0]),
+            &[Filter::TrimSides(0, [100, 100, 100, 100])],
+        );
+        assert_eq!((img.width(), img.height()), (1, 1));
+        assert_eq!(first_pixel(&img), [255, 0, 0]);
+        // One axis only: 19 from the left of the 20-wide
+        // box leaves one column; the right amount gets 0.
+        let (img, _) = apply_filters(
+            bordered([255, 255, 255], [255, 0, 0]),
+            &[Filter::TrimSides(0, [19, 0, 19, 0])],
+        );
+        assert_eq!((img.width(), img.height()), (1, 14));
     }
 
     fn detection(x: u32, y: u32, w: u32, h: u32) -> crate::ai::Detection {

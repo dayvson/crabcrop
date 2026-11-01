@@ -64,7 +64,7 @@ export const FILTER_DESCRIPTIONS: Record<string, string> = {
   curve: "tone curve: remap the named channel (rgb, r, g, or b) through 2 to 16 x,y control points, linearly interpolated, ends clamped",
   convolution: "convolve with a 3x3 or 5x5 kernel: 9 or 25 row-major values (plain decimals, -1024..1024), then a normalize flag (0 or 1); edges replicate",
   noise: "add monochrome film grain: one deterministic noise value per pixel on all channels, strength 0..100 percent of full scale (0 is a no-op)",
-  trim: "trim uniform borders",
+  trim: "trim uniform borders; the five-argument form (tolerance,left,top,right,bottom) also removes that many pixels per side after the tolerance pass",
   dpr: "device pixel ratio the sizes are multiplied by",
   watermark: "overlay a watermark image",
   max_bytes: "cap the output size, lowering quality to fit",
@@ -219,8 +219,16 @@ function validateFilter(name: string, args: string | null): string | null {
     return args === null ? null : bad;
   }
   switch (name) {
-    case "trim":
-      return args === null || isIntIn(args, 0, 255) ? null : bad;
+    case "trim": {
+      if (args === null) return null;
+      const parts = args.split(",");
+      if (parts.length === 1) return isIntIn(parts[0], 0, 255) ? null : bad;
+      return parts.length === 5 &&
+        isIntIn(parts[0], 0, 255) &&
+        parts.slice(1).every((p) => isIntIn(p, 0, 4294967295))
+        ? null
+        : bad;
+    }
     case "blur":
     case "sharpen":
       return args !== null && isFloat(args) && Number(args) > 0 ? null : bad;

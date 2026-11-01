@@ -613,6 +613,12 @@ pub enum Filter {
     /// Crop away the uniform border, keeping pixels that differ
     /// from the corner color by more than this tolerance (0-255).
     Trim(u8),
+    /// Trim at this tolerance, then remove the named pixel
+    /// amounts from the left, top, right, and bottom of what
+    /// remains (issue #313). The amounts are plain pixel
+    /// counts, clamped by the engine so at least one pixel
+    /// survives on each axis.
+    TrimSides(u8, [u32; 4]),
     /// Overlay another image at (x, y) with an opacity (0-100).
     /// The URL is the percent-decoded watermark location; the
     /// server fetches it before the engine runs. Negative
@@ -1730,8 +1736,23 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
             }
             ("trim", None) => Filter::Trim(10),
             ("trim", Some(p)) => {
-                let tolerance: u8 = p.parse().map_err(|_| invalid())?;
-                Filter::Trim(tolerance)
+                // One argument is the tolerance alone; five
+                // add the per-side pixel amounts (issue #313).
+                // Any other count is malformed, not a partial
+                // form.
+                let parts: Vec<&str> = p.split(',').collect();
+                let tolerance: u8 = parts[0].parse().map_err(|_| invalid())?;
+                match parts.len() {
+                    1 => Filter::Trim(tolerance),
+                    5 => {
+                        let mut sides = [0u32; 4];
+                        for (slot, part) in sides.iter_mut().zip(&parts[1..]) {
+                            *slot = part.parse().map_err(|_| invalid())?;
+                        }
+                        Filter::TrimSides(tolerance, sides)
+                    }
+                    _ => return Err(invalid()),
+                }
             }
             ("watermark", Some(p)) => {
                 // <url>,<x>,<y>,<alpha>. The URL lives inside a
@@ -2630,6 +2651,7 @@ fn filter_text(filter: &Filter) -> String {
         Filter::Equalize => "equalize".to_string(),
         Filter::Rotate(v) => format!("rotate({})", format_angle(*v)),
         Filter::Trim(v) => format!("trim({v})"),
+        Filter::TrimSides(t, [l, tp, r, b]) => format!("trim({t},{l},{tp},{r},{b})"),
         Filter::Watermark { url, x, y, alpha } => {
             format!("watermark({},{x},{y},{alpha})", encode_arg(url))
         }
@@ -5012,6 +5034,47 @@ mod tests {
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::Trim(0)])]);
         assert!(parse_operations("filters:trim(256)/example.com/img.jpg").is_err());
         assert!(parse_operations("filters:trim(-1)/example.com/img.jpg").is_err());
+    }
+
+    #[test]
+    fn parses_trim_with_per_side_amounts() {
+        let (ops, _) = parse_operations("filters:trim(20,5,0,5,0)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::TrimSides(
+                20,
+                [5, 0, 5, 0]
+            )])]
+        );
+        // The largest side the grammar takes.
+        assert!(parse_operations("filters:trim(0,4294967295,0,0,0)/example.com/img.jpg").is_ok());
+        // Partial forms are malformed, not shorthand.
+        for seg in [
+            "filters:trim(20,5)",
+            "filters:trim(20,5,0)",
+            "filters:trim(20,5,0,5)",
+            "filters:trim(20,5,0,5,0,1)",
+            "filters:trim(20,)",
+            "filters:trim(,5,0,5,0)",
+        ] {
+            assert!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")).is_err(),
+                "{seg}"
+            );
+        }
+        // The tolerance keeps its own bound inside the
+        // five-argument form, and the sides are unsigned.
+        for seg in [
+            "filters:trim(256,0,0,0,0)",
+            "filters:trim(20,-1,0,0,0)",
+            "filters:trim(20,4294967296,0,0,0)",
+            "filters:trim(20,1.5,0,0,0)",
+        ] {
+            assert!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")).is_err(),
+                "{seg}"
+            );
+        }
     }
 
     #[test]
