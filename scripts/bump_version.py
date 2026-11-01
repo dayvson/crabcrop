@@ -22,6 +22,8 @@ JSON_FILES = [
     "frameworks/nextjs/package.json",
     "frameworks/nuxt/package.json",
     "frameworks/hydrogen/package.json",
+    "frameworks/astro/package.json",
+    "frameworks/sveltekit/package.json",
 ]
 
 

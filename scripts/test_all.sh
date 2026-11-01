@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run every test suite in the repository: Rust (binary and
 # crate), the TypeScript SDK, the Python SDK, the MCP server,
-# the framework modules (Nuxt, Next.js, Hydrogen), the
-# WordPress plugin, and the playground (unit and integration).
+# the framework modules (Nuxt, Next.js, Hydrogen, Astro,
+# SvelteKit), the WordPress plugin, and the playground (unit
+# and integration).
 #
 # The integration suites need live servers; this script starts
 # and stops them:
@@ -58,6 +59,12 @@ step "Next.js module"
 
 step "Hydrogen module"
 (cd frameworks/hydrogen && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+
+step "Astro module"
+(cd frameworks/astro && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+
+step "SvelteKit module"
+(cd frameworks/sveltekit && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
 
 step "WordPress plugin"
 (cd plugins/wordpress && php tests/run.php)

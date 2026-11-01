@@ -599,7 +599,7 @@ The URL grammar and signing scheme are specified in [`spec/url-signing.md`](spec
 
 All three take an optional expiry (emitted as a leading `exp:` segment) and a null secret for the `unsafe` form used by unsafe and presets-only deployments.
 
-Framework integrations in [`frameworks/`](frameworks) sit on the TypeScript builder: a [Next.js](frameworks/nextjs) custom loader for `next/image`, a [Nuxt](frameworks/nuxt) provider for `@nuxt/image`, and a [Hydrogen](frameworks/hydrogen) loader for external (non-Shopify-CDN) images. All three recommend presets as the configuration, so client-side URL building never needs the secret.
+Framework integrations in [`frameworks/`](frameworks) sit on the TypeScript builder: a [Next.js](frameworks/nextjs) custom loader for `next/image`, a [Nuxt](frameworks/nuxt) provider for `@nuxt/image`, a [Hydrogen](frameworks/hydrogen) loader for external (non-Shopify-CDN) images, an [Astro](frameworks/astro) image service for `astro:assets`, and a [SvelteKit](frameworks/sveltekit) loader factory for components and load functions. All five recommend presets as the configuration, so client-side URL building never needs the secret.
 
 A [WordPress plugin](plugins/wordpress) rewrites a WordPress site's media URLs (featured images, post content, and srcset) to a self-hosted instance, with WordPress sizes mapped to transforms. Presets-only mode is the recommended configuration there too: the plugin builds `unsafe` preset URLs for an instance running `CRABCROP_ONLY_PRESETS=1` with `CRABCROP_ALLOW_UNSAFE=1`, so no secret ever lives in WordPress; an optional signed mode instead signs per-size operations with a secret held in the plugin settings. Its PHP URL builder runs the same spec test vectors as every other implementation.
 

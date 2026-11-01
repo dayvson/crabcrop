@@ -64,6 +64,8 @@ def sites():
         "frameworks/nextjs/package.json": json_version("frameworks/nextjs/package.json"),
         "frameworks/nuxt/package.json": json_version("frameworks/nuxt/package.json"),
         "frameworks/hydrogen/package.json": json_version("frameworks/hydrogen/package.json"),
+        "frameworks/astro/package.json": json_version("frameworks/astro/package.json"),
+        "frameworks/sveltekit/package.json": json_version("frameworks/sveltekit/package.json"),
         "sdks/python/pyproject.toml": pyproject_version("sdks/python/pyproject.toml"),
     }
     found["sdks/mcp/src/index.ts SERVER.version"] = mcp_server_info_version("sdks/mcp/src/index.ts")
