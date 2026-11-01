@@ -7412,6 +7412,224 @@ mod tests {
         assert_eq!(probe_source(&avif).kind, "avif");
     }
 
+    // -----------------------------------------------------
+    // TIFF sources (issue #313). The fixtures are written
+    // byte by byte: one strip, 8-bit channels, chunky
+    // planar layout, no compression, so the tests owe
+    // nothing to any encoder's habits.
+    // -----------------------------------------------------
+
+    fn tiff_put16(out: &mut Vec<u8>, v: u16, be: bool) {
+        out.extend_from_slice(&if be { v.to_be_bytes() } else { v.to_le_bytes() });
+    }
+
+    fn tiff_put32(out: &mut Vec<u8>, v: u32, be: bool) {
+        out.extend_from_slice(&if be { v.to_be_bytes() } else { v.to_le_bytes() });
+    }
+
+    /// A TIFF header pointing at a first IFD at offset 8.
+    fn tiff_header(be: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if be {
+            out.extend_from_slice(b"MM\0*");
+        } else {
+            out.extend_from_slice(b"II*\0");
+        }
+        tiff_put32(&mut out, 8, be);
+        out
+    }
+
+    /// One page's IFD block (the IFD itself, the out-of-line
+    /// BitsPerSample array for RGB, then the strip pixels),
+    /// laid out to sit at absolute offset `ifd_at` in the
+    /// file, chaining to `next` (0 ends the chain). `samples`
+    /// is 3 (RGB, photometric 2) or 1 (gray, photometric 1).
+    fn tiff_page(
+        w: u32,
+        h: u32,
+        samples: u16,
+        pixels: &[u8],
+        be: bool,
+        ifd_at: u32,
+        next: u32,
+    ) -> Vec<u8> {
+        // A SHORT value sits in the first two bytes of the
+        // four-byte value field, in file byte order.
+        let short_val = |v: u16| -> u32 { if be { u32::from(v) << 16 } else { u32::from(v) } };
+        let bits_at = ifd_at + 2 + 12 * 10 + 4;
+        let pixels_at = bits_at + if samples == 3 { 6 } else { 0 };
+        let mut out = Vec::new();
+        tiff_put16(&mut out, 10, be);
+        let entry = |out: &mut Vec<u8>, tag: u16, kind: u16, count: u32, value: u32| {
+            tiff_put16(out, tag, be);
+            tiff_put16(out, kind, be);
+            tiff_put32(out, count, be);
+            tiff_put32(out, value, be);
+        };
+        entry(&mut out, 256, 4, 1, w);
+        entry(&mut out, 257, 4, 1, h);
+        if samples == 3 {
+            entry(&mut out, 258, 3, 3, bits_at);
+        } else {
+            entry(&mut out, 258, 3, 1, short_val(8));
+        }
+        entry(&mut out, 259, 3, 1, short_val(1));
+        entry(
+            &mut out,
+            262,
+            3,
+            1,
+            short_val(if samples == 3 { 2 } else { 1 }),
+        );
+        entry(&mut out, 273, 4, 1, pixels_at);
+        entry(&mut out, 277, 3, 1, short_val(samples));
+        entry(&mut out, 278, 4, 1, h);
+        entry(&mut out, 279, 4, 1, pixels.len() as u32);
+        entry(&mut out, 284, 3, 1, short_val(1));
+        tiff_put32(&mut out, next, be);
+        if samples == 3 {
+            for _ in 0..3 {
+                tiff_put16(&mut out, 8, be);
+            }
+        }
+        out.extend_from_slice(pixels);
+        out
+    }
+
+    fn tiff_file(w: u32, h: u32, samples: u16, pixels: &[u8], be: bool) -> Vec<u8> {
+        let mut out = tiff_header(be);
+        out.extend_from_slice(&tiff_page(w, h, samples, pixels, be, 8, 0));
+        out
+    }
+
+    /// Rewrite the value field of `tag` in the IFD at
+    /// `ifd_at`, and read fields back, for the hostile
+    /// variants below.
+    fn tiff_patch_tag(bytes: &mut [u8], ifd_at: usize, tag: u16, value: u32) {
+        let be = &bytes[0..2] == b"MM";
+        let put32 = |bytes: &mut [u8], at: usize, v: u32| {
+            bytes[at..at + 4].copy_from_slice(&if be { v.to_be_bytes() } else { v.to_le_bytes() });
+        };
+        let count = {
+            let raw: [u8; 2] = bytes[ifd_at..ifd_at + 2].try_into().unwrap();
+            if be {
+                u16::from_be_bytes(raw)
+            } else {
+                u16::from_le_bytes(raw)
+            }
+        };
+        for i in 0..count as usize {
+            let at = ifd_at + 2 + 12 * i;
+            let raw: [u8; 2] = bytes[at..at + 2].try_into().unwrap();
+            let found = if be {
+                u16::from_be_bytes(raw)
+            } else {
+                u16::from_le_bytes(raw)
+            };
+            if found == tag {
+                put32(bytes, at + 8, value);
+                return;
+            }
+        }
+        panic!("tag {tag} not in the fixture IFD");
+    }
+
+    #[test]
+    fn tiff_sources_decode_in_both_byte_orders() {
+        // Little-endian RGB, four distinct pixels.
+        let pixels: [u8; 12] = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+        let img = decode_image(&tiff_file(2, 2, 3, &pixels, false)).unwrap();
+        assert_eq!((img.width(), img.height()), (2, 2));
+        let rgb = img.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(rgb.get_pixel(1, 0).0, [0, 255, 0]);
+        assert_eq!(rgb.get_pixel(0, 1).0, [0, 0, 255]);
+        assert_eq!(rgb.get_pixel(1, 1).0, [255, 255, 0]);
+        // The same file big-endian decodes identically.
+        let img_be = decode_image(&tiff_file(2, 2, 3, &pixels, true)).unwrap();
+        assert_eq!(img_be.to_rgb8(), rgb);
+        // Grayscale too.
+        let img = decode_image(&tiff_file(3, 1, 1, &[10, 128, 250], false)).unwrap();
+        let rgb = img.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0).0, [10, 10, 10]);
+        assert_eq!(rgb.get_pixel(2, 0).0, [250, 250, 250]);
+    }
+
+    #[test]
+    fn tiff_flows_through_the_pipeline() {
+        let engine = Engine;
+        let src = tiff_file(4, 2, 3, &[200, 30, 30].repeat(8), false);
+        assert_eq!(probe_source(&src).kind, "tiff");
+        let prepared = prepare_upload(&src).unwrap();
+        assert_eq!(prepared.media, UploadMedia::Tiff);
+        let out = engine
+            .process(
+                &src,
+                &[
+                    Operation::Size(ImageSize {
+                        width: Dimension::Pixels(2),
+                        height: Dimension::Pixels(1),
+                        flip_horizontal: false,
+                        flip_vertical: false,
+                    }),
+                    Operation::Filters(vec![Filter::Format(ImageFormat::Png)]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(dims_of(&out), (2, 1));
+        let decoded = image::load_from_memory(&out.bytes).unwrap();
+        assert_eq!(decoded.to_rgb8().get_pixel(0, 0).0, [200, 30, 30]);
+    }
+
+    #[test]
+    fn tiff_multipage_renders_the_first_page() {
+        let page1 = tiff_page(2, 1, 3, &[255, 0, 0, 0, 255, 0], false, 8, 0);
+        let page2_at = 8 + page1.len() as u32;
+        let mut src = tiff_header(false);
+        src.extend_from_slice(&tiff_page(
+            2,
+            1,
+            3,
+            &[255, 0, 0, 0, 255, 0],
+            false,
+            8,
+            page2_at,
+        ));
+        src.extend_from_slice(&tiff_page(1, 1, 3, &[0, 0, 255], false, page2_at, 0));
+        let img = decode_image(&src).unwrap();
+        assert_eq!((img.width(), img.height()), (2, 1));
+        assert_eq!(img.to_rgb8().get_pixel(1, 0).0, [0, 255, 0]);
+    }
+
+    #[test]
+    fn tiff_hostile_inputs_fail_bounded_and_clean() {
+        let good = tiff_file(2, 2, 3, &[1, 2, 3].repeat(4), false);
+        // Announced dimensions past the decode bounds are
+        // refused by the header probe, before any decode
+        // allocation is sized by them.
+        let mut huge = good.clone();
+        tiff_patch_tag(&mut huge, 8, 256, 20_000);
+        tiff_patch_tag(&mut huge, 8, 257, 20_000);
+        assert!(decode_image(&huge).is_err());
+        // A cyclic next-IFD chain (the first page points at
+        // itself) is refused by the decoder itself, which
+        // reports the cycle: a clean error, never a hang.
+        let mut cyclic = good.clone();
+        let next_at = 8 + 2 + 12 * 10;
+        cyclic[next_at..next_at + 4].copy_from_slice(&8u32.to_le_bytes());
+        let err = decode_image(&cyclic).unwrap_err();
+        assert!(err.to_string().contains("cycle"), "{err}");
+        // A strip that ends early is an error, not a panic
+        // or a padded read.
+        let truncated = &good[..good.len() - 5];
+        assert!(decode_image(truncated).is_err());
+        // A header with no IFD behind it, and random bytes
+        // with the magic, fail the same way.
+        assert!(decode_image(&tiff_header(false)).is_err());
+        assert!(decode_image(b"II*\0").is_err());
+        assert!(decode_image(&[]).is_err());
+    }
+
     #[test]
     fn frame_percentage_without_a_duration_is_unsupported() {
         let engine = Engine;
