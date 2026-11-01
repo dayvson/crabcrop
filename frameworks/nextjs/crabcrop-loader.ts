@@ -24,7 +24,7 @@
  *
  * Signing: a custom loader also runs in the browser, where a
  * secret must never ship. Use a preset (with the server's
- * unsafe or presets-only mode) as the normal configuration.
+ * unsafe mode) as the normal configuration.
  * If CRABCROP_SECRET is set, it is used for the loader calls
  * that happen during server rendering only; browser-side
  * calls fall back to unsigned URLs.

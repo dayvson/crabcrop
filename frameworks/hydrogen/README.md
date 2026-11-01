@@ -30,7 +30,7 @@ const loader = createCrabcropLoader({
 `createCrabcropLoader({ base, preset?, secret?, expires? })`:
 
 - `base` (required): the crabcrop origin.
-- `preset`: a server-side preset name. Recommended when URLs are generated anywhere near the client: the transform policy stays on the server and no secret is involved. Pair with the server's unsafe or presets-only mode.
+- `preset`: a server-side preset name. Recommended when URLs are generated anywhere near the client: the transform policy stays on the server and no secret is involved. Pair with the server running `CRABCROP_ALLOW_UNSAFE=1`. (`CRABCROP_ONLY_PRESETS=1` goes further and rejects the sizing appended after the preset; it fits URLs that carry a preset reference alone.)
 - `secret`: signs the URLs. Only pass it from server-side code.
 - `expires`: a unix-seconds expiry applied to every URL.
 

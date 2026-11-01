@@ -26,7 +26,7 @@ export default defineNuxtConfig({
 });
 ```
 
-Provider options: `base` (required), `preset` (recommended: the transform policy stays server-side and no secret is needed client-side; pair with the server's unsafe or presets-only mode), `secret` (optional, server-only contexts).
+Provider options: `base` (required), `preset` (recommended: the transform policy stays server-side and no secret is needed client-side; pair with the server running `CRABCROP_ALLOW_UNSAFE=1`, since presets-only mode rejects the geometry and filters appended after the preset), `secret` (optional, server-only contexts).
 
 ## Modifier mapping
 
