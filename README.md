@@ -1127,7 +1127,7 @@ For the AI features, build `Dockerfile.ai` on top of that image; see [AI feature
 | AWS | [ECS Fargate](deploy/ecs-fargate/README.md) | `task-definition.json`, plus the service commands in the recipe | Secrets Manager | A Fargate service behind an Application Load Balancer |
 | GCP | [Cloud Run](deploy/cloud-run/README.md) | `service.yaml` | Secret Manager | A managed service; the recipe keeps one instance warm |
 | Azure | [Container Apps](deploy/container-apps/README.md) | `containerapp.yaml` | The app secret store, or a Key Vault reference | A managed app with ingress; the recipe keeps one replica warm |
-| Single host | [Docker Compose](deploy/compose/README.md) | `docker-compose.yml` | An environment variable | One host, for evaluation |
+| Single host | [Docker Compose](deploy/compose/README.md) | `docker-compose.yml` for evaluation, `docker-compose.prod.yml` for production | An environment variable (evaluation) or an owner-only environment file (production) | One host: an evaluation run, or a production run with Caddy and TLS in front and persistent result storage |
 | Single host | [Binary on a VM](deploy/vm/README.md) | The release binary, `crabcrop.service`, and a proxy config | A root-only environment file | One host, for production: systemd plus a TLS proxy |
 
 ### Put a CDN in front

@@ -1,0 +1,88 @@
+# Production values for the crabcrop chart.
+#
+#   helm install crabcrop deploy/helm/crabcrop \
+#     -f deploy/helm/crabcrop/values-production.yaml
+#
+# Everything production needs is set here or overridable
+# with --set; no chart file needs editing. Two things are
+# yours to provide:
+#
+#   1. The Secret named below (existingSecret), holding the
+#      signing secret and the metrics token as two keys of
+#      one Secret you manage:
+#
+#        kubectl create secret generic crabcrop-secret \
+#          --from-literal=CRABCROP_SECRET="$(openssl rand -hex 32)" \
+#          --from-literal=CRABCROP_METRICS_TOKEN="$(openssl rand -hex 32)"
+#
+#   2. A result bucket, once you scale past one replica:
+#      add --set resultBucket.name=<your-bucket> (see the
+#      resultBucket block below).
+#
+# Sizing follows the shape the project runs itself: a
+# 2-CPU-class workload whose memory budget is mostly the
+# result cache. The memory tier is 512 MB of the 2 GiB
+# limit, leaving the rest for decode and encode working
+# set; the disk tier holds 8 GiB on a 10 Gi volume. Health
+# probes (/health, liveness and readiness) are part of the
+# chart defaults and stay on.
+
+# Pinned to the current release image. Bump with releases,
+# or set image.digest to pin the exact build.
+image:
+  tag: "0.9.6"
+
+replicaCount: 1
+
+existingSecret: crabcrop-secret
+
+# The metrics token rides in the same Secret, as its own
+# key. /metrics answers 403 without one and 401 for a
+# wrong bearer token, so production always sets it.
+metricsToken:
+  existingSecret: crabcrop-secret
+  secretKey: CRABCROP_METRICS_TOKEN
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+env:
+  # Memory result tier, sized against the memory limit
+  # above. Per replica: with several replicas each one
+  # holds its own tier (see values-multireplica.yaml).
+  CRABCROP_CACHE_MAX_MB: "512"
+  # One long-running render at a time (animated encodes,
+  # video, PDF pages) on permits stills never use, so a
+  # saturated slow lane cannot slow a still. Raise on
+  # hosts with cores to spare for animation or video
+  # traffic.
+  CRABCROP_SLOW_LANE_PERMITS: "1"
+  # Hard wall-clock limit on processing one request.
+  CRABCROP_PROCESS_TIMEOUT_SECS: "30"
+  # Refuse sources that resolve to non-public addresses.
+  CRABCROP_BLOCK_PRIVATE_SOURCES: "1"
+
+# Disk result tier on its own persistent volume: renders
+# survive pod restarts and reschedules. Per pod, not
+# shared; the shared tier is resultBucket below.
+resultStorage:
+  enabled: true
+  sizeLimitMb: 8192
+  pvc:
+    size: 10Gi
+
+# Shared result tier. Leave name empty for a single
+# replica (the two local tiers are enough) and set it
+# when you scale out: with several replicas this bucket
+# is what keeps the aggregate hit rate whole, because
+# every replica reads and writes it. Set with --set
+# resultBucket.name=<your-bucket>, or edit this block in
+# your own copy of this file.
+resultBucket:
+  name: ""
+  prefix: "results"

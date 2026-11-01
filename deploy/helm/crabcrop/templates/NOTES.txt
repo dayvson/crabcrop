@@ -9,6 +9,11 @@ point existingSecret at it:
   kubectl create secret generic crabcrop-secret \
     --from-literal=CRABCROP_SECRET="$(openssl rand -hex 32)"
   helm upgrade {{ .Release.Name }} {{ .Chart.Name }} --set existingSecret=crabcrop-secret
+
+Production installs also put a CRABCROP_METRICS_TOKEN key in
+the same Secret and set metricsToken.existingSecret to it, so
+GET /metrics requires the bearer <redacted>; see
+values-production.yaml.
 {{- end }}
 {{- if and .Values.ai.enabled (not .Values.ai.models.existingClaim) }}
 

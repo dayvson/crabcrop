@@ -1,0 +1,24 @@
+# crabcrop behind Caddy, the Compose production shape.
+# Same posture as the VM recipe's Caddyfile: Caddy obtains
+# and renews the TLS certificate for the hostname
+# automatically once its DNS points at this host, everything
+# proxies to the app on the compose network, and /health
+# (unauthenticated) and /metrics (traffic and error
+# counters) are not served on the public face at all. Check
+# health from inside instead:
+#   docker compose -f docker-compose.prod.yml exec crabcrop \
+#     curl -s http://localhost:3000/health
+# /metrics requires its bearer <redacted> from inside too (see
+# the README smoke checklist).
+{$CRABCROP_HOST} {
+	@internal path /health /metrics
+	handle @internal {
+		@local remote_ip 127.0.0.1 ::1
+		reverse_proxy @local crabcrop:3000
+		respond 403
+	}
+
+	handle {
+		reverse_proxy crabcrop:3000
+	}
+}

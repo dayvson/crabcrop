@@ -24,6 +24,14 @@ secretKey: CRABCROP_SECRET
 # value instead. Do not use for anything real.
 secret: ""
 
+# -- The metrics token (CRABCROP_METRICS_TOKEN), the bearer
+# token GET /metrics requires. Without one, /metrics answers
+# 403 to everyone. Preferred: a key in an existing Secret,
+# the same one as the signing secret in production.
+metricsToken:
+  existingSecret: ""
+  secretKey: CRABCROP_METRICS_TOKEN
+
 # Port the server listens on (the PORT environment variable).
 containerPort: 3000
 
@@ -56,6 +64,24 @@ resultStorage:
     size: 1Gi
     storageClass: ""
     accessMode: ReadWriteOnce
+
+# The shared result cache tier: one S3 bucket (or an
+# S3-compatible endpoint) behind the per-replica memory and
+# disk tiers, read and written by every replica. This is
+# the tier that keeps the cache hit rate whole once you run
+# more than one replica. Set name to enable it. Requests
+# are signed with the ambient AWS credentials (the pod's
+# IAM role, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# in the pod environment); the chart carries no bucket
+# credentials of its own.
+resultBucket:
+  name: ""
+  # Object prefix namespacing this deployment's entries.
+  prefix: ""
+  # Base URL of an S3-compatible store; empty means AWS.
+  s3Endpoint: ""
+  # AWS region; empty means the server default (us-east-1).
+  s3Region: ""
 
 # AI variant (Dockerfile.ai): switch the image, mount the
 # models volume, and point the model env vars at it through

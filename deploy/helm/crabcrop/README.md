@@ -2,34 +2,72 @@
 
 Deploys the crabcrop image service. The chart is deliberately thin: the server is configured entirely through the environment, so the chart wires the common settings structurally (secret, presets, storage, AI models) and passes everything else through a free-form `env` map.
 
+Two install shapes ship with the chart:
+
+- **Production**: `values-production.yaml`, the shape to run for real. It is the first recipe below.
+- **Evaluation**: the chart defaults, enough to try the service with one command. It is labelled as such where it appears; do not mistake it for the production shape (no resource limits, no disk tier, no metrics token).
+
 ## Prerequisites
 
 - A Kubernetes cluster, with kubectl and Helm configured against it.
 - An Ingress controller, only if you enable the chart's Ingress (`ingress.enabled`).
 
-## The signing secret
+## Production install
 
-Create the signing secret (16+ bytes; it signs and verifies every URL):
+### 1. The secrets
+
+One Secret you manage holds both credentials, as two keys: the signing secret (16+ bytes; it signs and verifies every URL) and the metrics token (the bearer <redacted> `GET /metrics` requires):
 
 ```bash
 kubectl create secret generic crabcrop-secret \
-  --from-literal=CRABCROP_SECRET="$(openssl rand -hex 32)"
+  --from-literal=CRABCROP_SECRET="$(openssl rand -hex 32)" \
+  --from-literal=CRABCROP_METRICS_TOKEN="$(openssl rand -hex 32)"
 ```
 
-For a quick trial only, `--set secret=<value>` lets the chart create the Secret itself.
+### 2. Install with the production values
 
-## Install
+```bash
+helm install crabcrop deploy/helm/crabcrop \
+  -f deploy/helm/crabcrop/values-production.yaml
+```
 
-Release images are published to GHCR as `ghcr.io/dayvson/crabcrop`, tagged with the release version; the chart defaults point there. To pin the exact image, set `image.digest` (and `ai.image.digest` for the AI variant) to a `sha256:...` digest. To run your own build instead:
+`values-production.yaml` sets the production shape, and everything in it is a value, so nothing in the chart needs editing:
+
+- The current release image, pinned by tag (set `image.digest` to pin the exact build).
+- Resource requests and limits (500m CPU and 512Mi requested; 2 CPU and 2Gi at the limit).
+- The disk result tier on its own persistent volume (8GiB budget on a 10Gi claim), so renders survive pod restarts.
+- Both credentials wired from the Secret above: the signing secret, and the metrics token through `metricsToken.existingSecret`, so `/metrics` is never answerable without its bearer <redacted>.
+- The production environment: a 512 MB memory result tier sized against the memory limit, the slow lane at one permit (long-running renders, such as animated encodes, never starve stills), the 30-second processing limit stated, and private-address sources refused.
+- Health probes are part of the chart itself: liveness and readiness both read `/health`, and every install gets them.
+
+Serving traffic takes the usual extra step: enable the Ingress (`ingress.enabled`, with your host and TLS) or front the Service your own way.
+
+### 3. The shared result bucket (when you scale out)
+
+A single replica is complete with the two local tiers. Before you run several replicas, wire the shared tier so they read and write one result store instead of diverging:
+
+```bash
+helm upgrade crabcrop deploy/helm/crabcrop \
+  -f deploy/helm/crabcrop/values-production.yaml \
+  --set resultBucket.name=<your-bucket>
+```
+
+`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with the ambient AWS credentials (the pod's IAM role, for example); the chart carries no bucket credentials. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
+
+## Evaluation install
+
+For a trial, the chart defaults plus a secret are enough:
+
+```bash
+helm install crabcrop deploy/helm/crabcrop \
+  --set existingSecret=crabcrop-secret
+```
+
+Release images are published to GHCR as `ghcr.io/dayvson/crabcrop`, tagged with the release version; the chart defaults point there. For a quick trial only, `--set secret=<value>` lets the chart create the Secret itself; do not use that route for anything real. To run your own build instead:
 
 ```bash
 docker build -t your-registry/crabcrop:0.9.5 .
 docker push your-registry/crabcrop:0.9.5
-```
-
-Install:
-
-```bash
 helm install crabcrop deploy/helm/crabcrop \
   --set image.repository=your-registry/crabcrop \
   --set image.tag=0.9.5 \
@@ -76,31 +114,35 @@ env:
   CRABCROP_ALLOWED_SOURCES: "images.example.com,upload.wikimedia.org"
 ```
 
-See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
+The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer <redacted>, from an existing Secret), `resultStorage` (the disk tier and its claim), and `resultBucket` (the shared tier). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
 
 ## Smoke checklist
 
-With the service reachable at `<host>` (your Ingress host, or `kubectl port-forward svc/crabcrop 3000:80` and then `http://localhost:3000`):
+Run against the production install, with the service reachable at `<host>` (your Ingress host, or `kubectl port-forward svc/crabcrop 3000:80` and then `http://localhost:3000`):
 
 1. Health: `curl https://<host>/health` returns 200 with the body `ok`.
 2. Sign one request with the same secret and fetch it: `CRABCROP_SECRET=<secret> crabcrop sign "300x200/https://example.com/photo.jpg"`, then `curl -i "https://<host><signed-path>"` returns 200 and image bytes.
 3. Fetch the same signed URL again. The `Cache-Status` response header reports a hit.
-4. Update the Secret and restart the deployment (`kubectl rollout restart deployment/crabcrop`) and the pods pick it up on their next start; for zero-downtime rotation use the key ID flow in the main README (`CRABCROP_SECRET_PREVIOUS` plus key IDs).
+4. Purge it: `CRABCROP_BASE=https://<host> CRABCROP_SECRET=<secret> crabcrop purge "300x200/https://example.com/photo.jpg"` answers `purged 1` (or more, counting variants), and the next fetch of the signed URL is a miss again.
+5. Metrics auth: `curl https://<host>/metrics` without a token returns 401, and `curl -H "Authorization: Bearer <metrics-token>" https://<host>/metrics` returns 200 with the Prometheus counters. (On an install with no metrics token configured, `/metrics` answers 403 to everyone; that is the evaluation shape, not production.)
+6. Update the Secret and restart the deployment (`kubectl rollout restart deployment/crabcrop`) and the pods pick it up on their next start; for zero-downtime rotation use the key ID flow in the main README (`CRABCROP_SECRET_PREVIOUS` plus key IDs).
 
 ## Scaling and cache notes
 
 ```bash
 helm install crabcrop deploy/helm/crabcrop \
+  -f deploy/helm/crabcrop/values-production.yaml \
   -f deploy/helm/crabcrop/values-multireplica.yaml \
-  --set existingSecret=crabcrop-secret
+  --set resultBucket.name=<your-bucket>
 ```
 
-**Read this before scaling out.** crabcrop caches processed results in two tiers, and both are local:
+**Read this before scaling out.** crabcrop caches processed results in three tiers, and the first two are local:
 
 - The in-memory tier is **per replica**. A request served by replica B does not see what replica A already processed.
 - The disk tier (`resultStorage`) is **per pod**, on that pod's volume. It is not shared unless you point every pod at a genuinely shared (ReadWriteMany) filesystem.
+- The bucket tier (`resultBucket`) is **shared**: every replica reads and writes it, and a shared hit promotes into the local tiers.
 
-Replicas therefore trade cache efficiency, never correctness: every replica produces identical bytes for a signed URL, so a cache miss just costs a re-fetch and re-process. Expect the aggregate hit rate of N replicas to be lower than one replica with the same total memory, and size each replica's `CRABCROP_CACHE_MAX_MB` (default 256) for its own share of the working set.
+Replicas therefore trade cache efficiency, never correctness: every replica produces identical bytes for a signed URL, so a cache miss just costs a re-fetch and re-process. Expect the aggregate hit rate of N replicas to be lower than one replica with the same total memory on the local tiers alone; the shared bucket is what keeps it whole. The multi-replica overlay lowers the per-replica memory tier to 256 MB for exactly this reason: size each replica's `CRABCROP_CACHE_MAX_MB` for its own share of the working set, and let the bucket hold the full set once.
 
 ## Teardown
 

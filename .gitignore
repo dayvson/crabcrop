@@ -1,5 +1,6 @@
 /target/
 .env
+deploy/compose/crabcrop.env
 node_modules/
 dist/
 __pycache__/

@@ -50,6 +50,13 @@ spec:
                   name: {{ include "crabcrop.secretName" . }}
                   key: {{ .Values.secretKey }}
             {{- end }}
+            {{- if .Values.metricsToken.existingSecret }}
+            - name: CRABCROP_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.metricsToken.existingSecret }}
+                  key: {{ .Values.metricsToken.secretKey }}
+            {{- end }}
             {{- if .Values.presets }}
             - name: CRABCROP_PRESETS_FILE
               value: /etc/crabcrop/presets.txt
@@ -63,6 +70,22 @@ spec:
               value: {{ .Values.resultStorage.mountPath }}
             - name: CRABCROP_RESULT_STORAGE_MAX_MB
               value: {{ .Values.resultStorage.sizeLimitMb | quote }}
+            {{- end }}
+            {{- if .Values.resultBucket.name }}
+            - name: CRABCROP_RESULT_BUCKET
+              value: {{ .Values.resultBucket.name | quote }}
+            {{- if .Values.resultBucket.prefix }}
+            - name: CRABCROP_RESULT_PREFIX
+              value: {{ .Values.resultBucket.prefix | quote }}
+            {{- end }}
+            {{- if .Values.resultBucket.s3Endpoint }}
+            - name: CRABCROP_S3_ENDPOINT
+              value: {{ .Values.resultBucket.s3Endpoint | quote }}
+            {{- end }}
+            {{- if .Values.resultBucket.s3Region }}
+            - name: CRABCROP_S3_REGION
+              value: {{ .Values.resultBucket.s3Region | quote }}
+            {{- end }}
             {{- end }}
             {{- $allEnv := dict }}
             {{- range $k, $v := .Values.env }}

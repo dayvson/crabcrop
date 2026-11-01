@@ -1,11 +1,20 @@
 # Example overlay: three replicas behind the Service.
 #
+# Layer it on the production values, do not use it alone:
+#
+#   helm install crabcrop deploy/helm/crabcrop \
+#     -f deploy/helm/crabcrop/values-production.yaml \
+#     -f deploy/helm/crabcrop/values-multireplica.yaml \
+#     --set resultBucket.name=<your-bucket>
+#
 # Read the cache note in the chart README first. The result
 # cache is per-replica (memory) and per-pod (disk tier), so
 # replicas trade cache efficiency, never correctness: expect
 # a lower hit rate than a single replica with the same total
 # memory, and do not share one disk-tier volume between pods
-# unless it is a genuinely shared (RWX) filesystem.
+# unless it is a genuinely shared (RWX) filesystem. The
+# shared bucket tier (resultBucket, set above) is what keeps
+# the aggregate hit rate whole across replicas.
 replicaCount: 3
 
 resources:
@@ -15,6 +24,14 @@ resources:
   limits:
     cpu: "2"
     memory: 1Gi
+
+env:
+  # The memory tier is per replica: three replicas at the
+  # production file's 512 MB would spend 1.5 GB of cluster
+  # memory on three partial copies of the working set.
+  # Size each replica for its share instead; the bucket
+  # tier behind them holds the full set once.
+  CRABCROP_CACHE_MAX_MB: "256"
 
 # Spread replicas across nodes when the cluster allows it.
 affinity:

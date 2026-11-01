@@ -1,0 +1,76 @@
+# crabcrop production run on one host: the evaluation
+# file's service behind Caddy with TLS, secrets in an
+# environment file, and the disk result tier on a named
+# volume.
+#
+#   cp crabcrop.env.example crabcrop.env   # then edit it:
+#                                           # secret, metrics
+#                                           # token, host name
+#   chmod 600 crabcrop.env
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# The app port is not published: Caddy is the only public
+# face (80 and 443), and it proxies to the app over the
+# compose network. /health and /metrics stay off the
+# public face (see the Caddyfile in this directory).
+services:
+  crabcrop:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: crabcrop:latest
+    # The whole configuration, secrets included, comes
+    # from this one file. The server refuses to start
+    # without CRABCROP_SECRET in it.
+    env_file:
+      - ./crabcrop.env
+    environment:
+      CRABCROP_RESULT_STORAGE_DIR: /var/cache/crabcrop
+    volumes:
+      - results:/var/cache/crabcrop
+    # Reachable only on the compose network (Caddy, and
+    # docker compose exec for the smoke checklist).
+    expose:
+      - "3000"
+    restart: unless-stopped
+    # The same shape as the Helm production values: the
+    # memory tier (512 MB, set in crabcrop.env) sits well
+    # inside the memory limit, with two CPUs for decode
+    # and encode.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  caddy:
+    image: caddy:2
+    # Caddy serves the name in CRABCROP_HOST and obtains
+    # and renews its TLS certificate automatically once
+    # the name points at this host. The name is public
+    # configuration, not a secret, so it comes from the
+    # compose environment (the shell, or a one-line .env
+    # file in this directory), never from crabcrop.env:
+    # the signing secret does not belong in the proxy's
+    # environment.
+    environment:
+      CRABCROP_HOST: ${CRABCROP_HOST:-images.example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      crabcrop:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  results:
+  caddy-data:
+  caddy-config:
