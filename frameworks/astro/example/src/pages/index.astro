@@ -1,0 +1,25 @@
+---
+// Renders one image through the crabcrop service configured
+// in astro.config.mjs. The page names no crabcrop operations:
+// the "card" preset on the server carries the policy, and the
+// service appends only the geometry and srcset widths below.
+import { Image } from "astro:assets";
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>crabcrop for Astro: example</title>
+  </head>
+  <body>
+    <h1>crabcrop for Astro</h1>
+    <Image
+      src="https://images.unsplash.com/photo-1502680390469-be75c86b636f"
+      width={800}
+      height={600}
+      widths={[320, 640, 800]}
+      sizes="(min-width: 800px) 800px, 100vw"
+      alt="A surfer riding a wave"
+    />
+  </body>
+</html>
