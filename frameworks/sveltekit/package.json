@@ -1,0 +1,1 @@
+{"dependencies":{"@crabcrop/url":"file:../../sdks/typescript"},"name":"@crabcrop/framework-sveltekit","private":true,"scripts":{"test":"node --test test/*.test.ts"},"type":"module","version":"0.9.6"}
