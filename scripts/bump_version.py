@@ -69,6 +69,11 @@ def edits(version):
     if count != 2:
         raise SystemExit(f"sdks/mcp/server.json: version matched {count} times, expected 2")
     out["sdks/mcp/server.json"] = manifest
+    out["plugins/wordpress/crabcrop.php"] = sub_once(
+        "plugins/wordpress/crabcrop.php",
+        r"(\* Version:\s+)[0-9]+\.[0-9]+\.[0-9]+",
+        rf"\g<1>{version}",
+    )
     chart = sub_once(
         "deploy/helm/crabcrop/Chart.yaml", r"^version:\s*\S+", f"version: {version}", re.M
     )

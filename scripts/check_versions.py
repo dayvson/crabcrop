@@ -50,6 +50,11 @@ def mcp_server_info_version(rel):
     return match.group(1) if match else None
 
 
+def wp_plugin_version(rel):
+    match = re.search(r"^\s*\* Version:\s+(\S+)", read(rel), re.M)
+    return match.group(1) if match else None
+
+
 def sites():
     found = {
         "Cargo.toml (server)": cargo_package_version("Cargo.toml"),
@@ -65,6 +70,7 @@ def sites():
     manifest, manifest_pkg = mcp_manifest_versions("sdks/mcp/server.json")
     found["sdks/mcp/server.json version"] = manifest
     found["sdks/mcp/server.json packages[0].version"] = manifest_pkg
+    found["plugins/wordpress/crabcrop.php"] = wp_plugin_version("plugins/wordpress/crabcrop.php")
     chart, app = chart_versions("deploy/helm/crabcrop/Chart.yaml")
     found["deploy/helm/crabcrop/Chart.yaml version"] = chart
     found["deploy/helm/crabcrop/Chart.yaml appVersion"] = app
