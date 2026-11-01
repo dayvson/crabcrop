@@ -1,6 +1,6 @@
 {
   "name": "@crabcrop/framework-hydrogen",
-  "version": "0.9.6",
+  "version": "0.9.7",
   "private": true,
   "type": "module",
   "scripts": { "test": "node --test test/*.test.ts" },

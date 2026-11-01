@@ -3,7 +3,7 @@
  * Plugin Name:       Crabcrop
  * Plugin URI:        https://crabcrop.org
  * Description:       Serve this site's media through a self-hosted crabcrop instance. Rewrites media URLs (featured images, post content, and srcset) to crabcrop URLs; the media library itself is untouched, and unmapped sizes and any misconfiguration fall back to the original URLs.
- * Version:           0.9.6
+ * Version:           0.9.7
  * Author:            crabcrop contributors
  * License:           MIT
  * License URI:       https://opensource.org/licenses/MIT

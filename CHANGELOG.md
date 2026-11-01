@@ -2,7 +2,7 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
-## [Unreleased]
+## [0.9.7] - 2026-11-01
 
 ### Added
 
@@ -19,6 +19,20 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 - Per-side trim (issue #313). `trim` gains a five-argument form, `trim(tolerance,left,top,right,bottom)`: the tolerance pass runs first, exactly as before, and the named pixel amounts then come off the left, top, right, and bottom of what remains, clamped so at least one pixel survives on each axis (the near side takes from the dimension first, the far side from what is left). The one-argument and bare forms are unchanged. The TypeScript SDK gains a `trimSides` builder.
 
 - Gamma correction (issue #313). A new `gamma(g)` filter applies the levels-style midtone gamma: each channel value `v` becomes `255 * (v / 255)^(1 / g)`, with `0 < g <= 10`; 1 is unchanged, values above 1 brighten the midtones, and values below 1 darken them. Black and white are fixed points at every setting and alpha is untouched. The scale is called out because the rest of the adjustment family speaks in percents and offsets: gamma's scale is the exponent itself, the one scale the comparable tools agree on, so a gamma value from another tool carries over as written where `curve` would have needed translated control points. The TypeScript SDK gains a `gamma` builder.
+
+- Self-host production defaults (issue #315). The Helm chart gains `values-production.yaml`, the production shape as a values file: resource requests and limits, the disk result tier on a persistent volume, health probes from the chart defaults, the `/metrics` token wired through an existing Secret (`metricsToken.existingSecret`), and a shared result bucket (`resultBucket`). `values-multireplica.yaml` is now a documented overlay on the production file instead of a standalone shape, with the per-replica memory tier sized where the value is set. Compose gains the matching production profile, `docker-compose.prod.yml`: Caddy with automatic TLS as the only published service, secrets and settings in one owner-only environment file templated by `crabcrop.env.example`, the disk result tier on a named volume, and restart policies; the app port is not published, and the host name reaches Caddy through the compose environment so the signing secret never enters the proxy's environment. Both recipe READMEs lead with the production shape and label the previous default path as evaluation, and both smoke checklists cover a signed request, a cache hit on repeat, a purge, and metrics auth.
+
+### Fixed
+
+- Source-not-found answers 404 (issue #325). A source that cannot resolve inside the configured roots now returns one identical 404 "source not found": a file missing under a root, a path resolving outside every root, and an origin answering 404 all take the new `NotFound` path on both the render route and the explain route. Before, a missing file and an origin 404 surfaced as 502, and the out-of-root case answered differently from the missing case, which leaked what exists on disk. Genuine transport failures (DNS, connect, TLS, stream errors) still answer 502 "source fetch failed".
+
+- Upscale no longer fails with a 500 when the input dimensions are not multiples of 8 (issue #326). The Swin2SR provider pads its input to a multiple of 8 with edge pixels replicated (the model's internal window padding then has nothing to add) and crops the result back, deriving the factor from the returned output shape: 101x53 upscales to exactly 202x106 at 2x and 404x212 at 4x, where the request previously died in the model's reshape. Inputs already on the grid take the previous path unchanged.
+
+- Lossy WebP encoding of images with real alpha, verified fixed (issue #227). The acceptance cases were replayed against the current encoder path (lossy WebP encode has run through libwebp since issue #292 in 0.9.5, superseding the earlier wait-for-upstream decision): the 2000x1334 transparent render that panicked inside the old pure-Rust encoder now returns 200 in 0.97 s with its alpha range intact, and the 1000x667 alpha encode that took 85 to 90 s now takes 0.18 to 0.24 s.
+
+- Animated WebP renders, verified fixed (issue #231). The closing replay on current code: a bare render of a 12-frame 480x320 animated WebP answers 200 in 0.44 s against 754 s in the original report, and a still render fired during four concurrent cold animated renders answers in 0.03 s with no shedding. The fixes themselves shipped in 0.9.6 (issues #322, #323, #324); this entry records the verification that closed the issue.
+
+- CI repairs. The AI models workflow installs nasm again (its rav1e build had failed on every run since Oct 24, 2026), and its real-model tests now skip cleanly when the model they need is not provisioned instead of panicking on the missing environment variable, so the workflow runs green end to end; provisioning the remaining models deliberately is tracked in issue #328. The functional suite's animated WebP byte baselines were re-blessed against the libwebp encoder after independent verification: outputs byte-identical across two builds, frames, durations and loop identical, per-frame channel means within 1.11 of the source against a tolerance of 7.
 
 ## [0.9.6] - 2026-11-01
 
