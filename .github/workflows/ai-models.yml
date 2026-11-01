@@ -205,11 +205,11 @@ jobs:
 
       - name: Install nasm (rav1e SIMD build)
         run: sudo apt-get install -y -qq nasm
-              
+
       - name: Run the real-model AI tests
         env:
           CRABCROP_TEST_ORT_DYLIB: ${{ env.AI_ASSETS }}/libonnxruntime.so
-          CRABCROP_TEST_FACE_MODEL: ${{ env.AI_ASSETS }}/yune
+          CRABCROP_TEST_FACE_MODEL: ${{ env.AI_ASSETS }}/yunet.onnx
           CRABCROP_TEST_REMOVEBG_MODEL: ${{ env.AI_ASSETS }}/u2netp.onnx
           CRABCROP_TEST_UPSCALE_MODEL: ${{ env.AI_ASSETS }}/sr-x2.onnx
           CRABCROP_TEST_DETECT_MODEL: ${{ env.AI_ASSETS }}/yolov8n.onnx
