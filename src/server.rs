@@ -219,6 +219,50 @@ impl Drop for MetaLeaderGuard {
     }
 }
 
+/// A bounded concurrency gate with a known capacity: a
+/// semaphore plus the permit count it was built with, so
+/// `/metrics` can report lane occupancy as in-use against
+/// capacity instead of only the permits left.
+#[derive(Debug, Clone)]
+pub struct Gate {
+    sem: Arc<tokio::sync::Semaphore>,
+    permits: usize,
+}
+
+impl Gate {
+    pub fn new(permits: usize) -> Self {
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(permits)),
+            permits,
+        }
+    }
+
+    /// The permit count the gate was built with.
+    pub fn capacity(&self) -> usize {
+        self.permits
+    }
+
+    /// Permits currently free.
+    pub fn available_permits(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    /// Permits currently held: capacity minus free.
+    pub fn in_use(&self) -> usize {
+        self.permits.saturating_sub(self.available_permits())
+    }
+
+    /// Take one permit, owned so it can move across an
+    /// await or into a detached guard.
+    pub fn acquire_owned(
+        self: Arc<Self>,
+    ) -> impl std::future::Future<
+        Output = Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>,
+    > {
+        self.sem.clone().acquire_owned()
+    }
+}
+
 /// Shared state for the handlers.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -347,8 +391,22 @@ pub struct AppState {
     pub ai_gate: Arc<tokio::sync::Semaphore>,
     /// Bounds concurrent engine runs (audit E-5): cache misses
     /// process on blocking threads under this gate, sized to
-    /// the core count at boot.
-    pub process_gate: Arc<tokio::sync::Semaphore>,
+    /// the core count at boot. This is the stills lane
+    /// (issue #324): ordinary still renders and upload
+    /// validation take their permits here, and long-running
+    /// work never does, so a saturated slow lane cannot
+    /// shrink still capacity at all.
+    pub process_gate: Arc<Gate>,
+    /// The slow lane (issue #324): a separately bounded
+    /// gate for long-running engine work, animated WebP
+    /// encodes and the external-tool work behind the video
+    /// gate (video encodes, frame extraction, page
+    /// renders). Sized by `CRABCROP_SLOW_LANE_PERMITS`
+    /// (default 1, sane for a 2 vCPU host: one long encode
+    /// leaves the stills lane and a core for stills).
+    /// Overflow sheds with the same 503 semantics as the
+    /// other gates; it never spills onto the process gate.
+    pub slow_gate: Arc<Gate>,
     /// SSIMULACRA2 target for verified `quality(auto)` encodes,
     /// from `CRABCROP_SSIM_TARGET`.
     pub ssim_target: f64,
@@ -418,13 +476,14 @@ pub struct AppState {
     /// Bounds concurrent video encodes: the subprocess is
     /// the server's most expensive and least predictable
     /// work, so it gets its own small gate (2 permits, like
-    /// the AI gate) on top of the process gate.
+    /// the AI gate) on top of the slow lane (issue #324).
     pub video_gate: Arc<tokio::sync::Semaphore>,
     /// Bounds concurrent animated WebP encodes to one
-    /// (issue #231): the lossless animation encode is the
+    /// (issue #231): the animation encode is among the
     /// slowest work the engine does, minutes for a modest
-    /// file, so it gets a single-permit gate of its own
-    /// instead of holding process permits while it runs.
+    /// file, so it gets a single-permit gate of its own on
+    /// top of the slow lane (issue #324), which is what
+    /// keeps it from holding stills permits while it runs.
     pub anim_gate: Arc<tokio::sync::Semaphore>,
     /// In-flight miss coalescing (audit R2-09): concurrent
     /// misses for one cache key share one fetch and one
@@ -534,9 +593,39 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
     }
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.metrics.render(),
+        format!("{}{}", state.metrics.render(), lane_metrics(&state)),
     )
         .into_response()
+}
+
+/// Per-lane occupancy for `/metrics` (issue #324): how
+/// many permits of each processing lane are in use,
+/// against the lane's capacity. Read live from the gates
+/// at scrape time, so a lane saturated by long encodes
+/// shows itself here while the stills lane stays free.
+fn lane_metrics(state: &AppState) -> String {
+    let mut out = String::new();
+    out.push_str("# HELP crabcrop_lane_in_use Processing lane permits currently in use.\n");
+    out.push_str("# TYPE crabcrop_lane_in_use gauge\n");
+    out.push_str(&format!(
+        "crabcrop_lane_in_use{{lane=\"process\"}} {}\n",
+        state.process_gate.in_use()
+    ));
+    out.push_str(&format!(
+        "crabcrop_lane_in_use{{lane=\"slow\"}} {}\n",
+        state.slow_gate.in_use()
+    ));
+    out.push_str("# HELP crabcrop_lane_capacity Processing lane permit capacity.\n");
+    out.push_str("# TYPE crabcrop_lane_capacity gauge\n");
+    out.push_str(&format!(
+        "crabcrop_lane_capacity{{lane=\"process\"}} {}\n",
+        state.process_gate.capacity()
+    ));
+    out.push_str(&format!(
+        "crabcrop_lane_capacity{{lane=\"slow\"}} {}\n",
+        state.slow_gate.capacity()
+    ));
+    out
 }
 
 /// The `DPR` client hint, when it names one of the settled
@@ -1519,6 +1608,59 @@ enum ProcessFailure {
 /// before the server sheds it with a 503.
 const PROCESS_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Which processing lane an engine run takes its permit
+/// from (issue #324). The lanes are fully separate: a run
+/// holds a permit from exactly one of them, so saturation
+/// of one cannot reduce the other's capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// The stills lane (the process gate): ordinary still
+    /// renders, the common and fast case.
+    Process,
+    /// The slow lane: long-running work, animated WebP
+    /// encodes and the external-tool work behind the
+    /// video gate (video encodes, frame extraction, page
+    /// renders), whose runs last seconds to minutes.
+    Slow,
+}
+
+/// The slow lane's default size (issue #324), from
+/// `CRABCROP_SLOW_LANE_PERMITS`: one long-running encode
+/// at a time, sane for a 2 vCPU host, where one slow
+/// encode leaves a core and the whole stills lane free.
+pub const DEFAULT_SLOW_LANE_PERMITS: usize = 1;
+
+/// How long a slow-lane run may wait for a slow slot
+/// before the server sheds it with a 503 (issue #324).
+/// The animation and video gates' wait: long enough to
+/// absorb a hiccup, far shorter than queueing behind a
+/// minutes-long encode.
+const SLOW_LANE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether this miss belongs in the slow lane (issue
+/// #324): it will encode an animated WebP (the animation
+/// gate's own predicate), or it is external-tool work
+/// behind the video gate, a video encode, a `frame:`
+/// extraction, or a `page:` render, all subprocess work
+/// that runs for seconds and is unpredictable in the
+/// same way. Everything else, still renders in
+/// particular, stays in the process lane. AI transforms
+/// stay there too: they are still renders behind the AI
+/// gate, not encodes, and the AI gate already bounds
+/// them separately. Animated GIF output stays there as
+/// well: its encoder is chunked per frame with deadline
+/// checks inside the loop (issue #322), not one opaque
+/// long call like the animated WebP encoder.
+fn wants_slow_lane(
+    bytes: &[u8],
+    directives: &crate::url::RequestDirectives,
+    wants_video: bool,
+    wants_frame: bool,
+    wants_page: bool,
+) -> bool {
+    wants_animation_gate(bytes, directives) || wants_video || wants_frame || wants_page
+}
+
 /// The grace bound past the processing deadline (issue
 /// #322): how long the runner keeps waiting for a job
 /// whose deadline has passed before it answers 504,
@@ -1574,21 +1716,27 @@ fn wants_animation_gate(bytes: &[u8], directives: &crate::url::RequestDirectives
         && matches!(directives.explicit_format, None | Some(ImageFormat::WebP))
 }
 
-/// Run the engine under the process gate on a blocking
-/// thread, so CPU-bound work neither stalls the async
-/// workers nor multiplies unboundedly under a burst of
-/// cache misses. Cache hits never reach this function.
+/// Run the engine under its lane's gate (issue #324) on
+/// a blocking thread, so CPU-bound work neither stalls
+/// the async workers nor multiplies unboundedly under a
+/// burst of cache misses. Cache hits never reach this
+/// function.
 async fn run_process(
     state: &AppState,
     job: &ProcessJob,
     bytes: &[u8],
+    lane: Lane,
 ) -> Result<crate::engine::ProcessedImage, ProcessFailure> {
-    let permit = match tokio::time::timeout(
-        PROCESS_GATE_WAIT,
-        state.process_gate.clone().acquire_owned(),
-    )
-    .await
-    {
+    // The run takes its permit from its lane's gate only
+    // (issue #324): a slow-lane run never touches a
+    // stills permit, and a still never waits behind the
+    // slow lane. Overflow in either lane is the same
+    // honest Busy shed, after that lane's wait.
+    let (gate, wait) = match lane {
+        Lane::Process => (state.process_gate.clone(), PROCESS_GATE_WAIT),
+        Lane::Slow => (state.slow_gate.clone(), SLOW_LANE_WAIT),
+    };
+    let permit = match tokio::time::timeout(wait, gate.acquire_owned()).await {
         Ok(Ok(permit)) => permit,
         _ => return Err(ProcessFailure::Busy),
     };
@@ -2506,11 +2654,13 @@ async fn serve_miss(
         None
     };
     // Video work sits behind its own gate, on top of the
-    // process gate inside `run_process`: the external
-    // encoder is the server's most expensive and least
-    // predictable work (seconds per job, a subprocess), so
-    // a burst of video requests sheds here instead of
-    // queueing unboundedly behind the transform pipeline.
+    // slow lane inside `run_process` (issue #324): the
+    // external encoder is the server's most expensive and
+    // least predictable work (seconds per job, a
+    // subprocess), so a burst of video requests sheds here
+    // instead of queueing unboundedly behind the transform
+    // pipeline, and its lane permit comes from the slow
+    // lane, never from the stills pool.
     // Frame extraction (issue #214) takes the same gate:
     // it runs the same class of subprocess. Page
     // rendering (issue #215) takes it too: it is the
@@ -2537,11 +2687,12 @@ async fn serve_miss(
     // Animated WebP encodes sit behind a single-permit
     // gate of their own (issue #231): one encode can run
     // for minutes, so without this gate duplicate or
-    // distinct animated renders stack encodes until they
-    // hold every process permit and unrelated stills shed.
-    // Behind the gate, a second animated request sheds
-    // here with an explanation instead of stacking, and
-    // the still pool keeps its permits throughout.
+    // distinct animated renders stack encodes until the
+    // stills pool is drained. Behind the gate, a second
+    // animated request sheds here with an explanation
+    // instead of stacking, and the encode's lane permit
+    // comes from the slow lane (issue #324), so the still
+    // pool keeps every permit throughout.
     let _anim_permit = if wants_animation_gate(&bytes, &directives) {
         match tokio::time::timeout(ANIM_GATE_WAIT, state.anim_gate.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Some(permit),
@@ -2607,13 +2758,30 @@ async fn serve_miss(
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
     };
-    let processed = match run_process(state, &job, &bytes).await {
+    // The lane this run draws its permit from (issue
+    // #324): long-running work goes to the slow lane, so
+    // its saturation sheds slow requests only and stills
+    // keep their full capacity; everything else takes
+    // the stills lane as before.
+    let lane = if wants_slow_lane(&bytes, &directives, wants_video, wants_frame, wants_page) {
+        Lane::Slow
+    } else {
+        Lane::Process
+    };
+    let processed = match run_process(state, &job, &bytes, lane).await {
         Ok(p) => p,
         Err(ProcessFailure::Busy) => {
             return (
                 sealed_or(
                     sealed,
-                    busy_response("server busy: too many images processing at once", 1),
+                    match lane {
+                        Lane::Slow => {
+                            busy_response("server busy: long-running processing lane is full", 5)
+                        }
+                        Lane::Process => {
+                            busy_response("server busy: too many images processing at once", 1)
+                        }
+                    },
                 ),
                 record,
             );
@@ -2646,7 +2814,7 @@ async fn serve_miss(
             // not of the source, and stay honest.
             let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
                 match fallback_source_bytes(state).await {
-                    Some(fb) => run_process(state, &job, &fb).await.ok(),
+                    Some(fb) => run_process(state, &job, &fb, lane).await.ok(),
                     None => None,
                 }
             } else {
@@ -4274,7 +4442,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -4290,6 +4458,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -4401,7 +4570,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -4417,6 +4586,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate,
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -4485,7 +4655,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -4501,6 +4671,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -4572,7 +4743,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -4588,6 +4759,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -4805,7 +4977,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -4821,6 +4993,7 @@ mod tests {
             pdf_renderer: Some(Arc::new(renderer)),
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -5162,7 +5335,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -5179,6 +5352,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -5227,7 +5401,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -5243,6 +5417,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -5295,7 +5470,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -5311,6 +5486,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -6178,7 +6354,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -6194,6 +6370,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -7004,7 +7181,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -7020,6 +7197,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -7134,7 +7312,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -7150,6 +7328,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -7358,7 +7537,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -7374,6 +7553,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -7704,7 +7884,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -7720,6 +7900,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -7926,7 +8107,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -7942,6 +8123,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -7986,7 +8168,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -8002,6 +8184,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -8046,7 +8229,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -8062,6 +8245,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -8138,7 +8322,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -8154,6 +8338,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -8508,7 +8693,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -8524,6 +8709,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -8582,7 +8768,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -8598,6 +8784,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -9885,7 +10072,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -9901,6 +10088,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -9961,7 +10149,7 @@ mod tests {
             ))),
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -9977,6 +10165,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -10472,7 +10661,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -10488,6 +10677,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: Some(crate::provenance::test_signer()),
             config_fingerprint: "test".to_string(),
@@ -10598,7 +10788,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            process_gate: Arc::new(Gate::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -10614,6 +10804,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -10648,7 +10839,7 @@ mod tests {
         };
         let held = state.process_gate.clone().acquire_owned().await.unwrap();
         let png = test_png();
-        let waiting = run_process(&state, &job, &png);
+        let waiting = run_process(&state, &job, &png, Lane::Process);
         tokio::pin!(waiting);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
@@ -10726,7 +10917,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            process_gate: Arc::new(Gate::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -10742,6 +10933,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -10786,12 +10978,12 @@ mod tests {
         let png = test_png();
         let started = Instant::now();
         let (first, (follow_elapsed, follow)) =
-            tokio::join!(run_process(&state, &stuck_job, &gif), async {
+            tokio::join!(run_process(&state, &stuck_job, &gif, Lane::Slow), async {
                 // Arrive while the first encode is stuck,
                 // well past its 300 ms deadline.
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 let follow_start = Instant::now();
-                let result = run_process(&state, &follow_job, &png).await;
+                let result = run_process(&state, &follow_job, &png, Lane::Process).await;
                 (follow_start.elapsed(), result)
             });
         assert!(
@@ -10811,7 +11003,399 @@ mod tests {
             "the follow-up must not shed on the gate the dead request held"
         );
         assert_eq!(state.process_gate.available_permits(), 1);
+        // Issue #324: the stuck video encode drew its
+        // permit from the slow lane, and that permit is
+        // back too once the deadline plus grace releases it.
+        assert_eq!(state.slow_gate.available_permits(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state for the slow-lane tests (issue #324): the
+    /// two lanes sized explicitly, everything else the
+    /// defaults the other test states use.
+    fn lane_test_state(
+        process_timeout: std::time::Duration,
+        process_permits: usize,
+        slow_permits: usize,
+    ) -> AppState {
+        AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            process_timeout,
+            metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: None,
+            segment: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            ocr: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate: Arc::new(Gate::new(process_permits)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(slow_permits)),
+            inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
+            config_fingerprint: "test".to_string(),
+        }
+    }
+
+    /// A job for the slow-lane tests: the parsed ops, and
+    /// a video encoder when the job is the stuck encode.
+    fn lane_test_job(
+        video_encoder: Option<Arc<crate::video::VideoEncoder>>,
+        ops_str: &str,
+    ) -> ProcessJob {
+        let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
+        ProcessJob {
+            save_data: false,
+            preserve_metadata: false,
+            brand_color: None,
+            ops,
+            preferred: None,
+            watermark_sources: Vec::new(),
+            placeholders: false,
+            mask_provider: None,
+            upscale_provider: None,
+            inpaint_provider: None,
+            segment_provider: None,
+            face_provider: None,
+            detect_provider: None,
+            declared_detect_providers: Vec::new(),
+            focal_provider: None,
+            text_renderer: None,
+            video_encoder,
+            frame_extractor: None,
+            pdf_renderer: None,
+            provenance_signer: None,
+            ai_edited: false,
+            want_provenance: false,
+            dpr: None,
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+        }
+    }
+
+    /// The fake external encoder of the #322 tests: drains
+    /// stdin, sleeps, only then answers, so one run is a
+    /// deterministic long encode inside a single opaque
+    /// stage.
+    fn fake_long_encoder(dir: &std::path::Path, sleep_secs: u32) -> crate::video::VideoEncoder {
+        use std::io::Write as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let script_path = dir.join("encoder.sh");
+        let mut file = std::fs::File::create(&script_path).unwrap();
+        file.write_all(
+            format!("#!/bin/sh\ncat > /dev/null\nsleep {sleep_secs}\nprintf 'x'\n").as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        crate::video::VideoEncoder::new(
+            script_path,
+            std::time::Duration::from_secs(30),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn slow_lane_predicate_routes_long_work_only() {
+        // Issue #324: the lane classification. Animated
+        // WebP encodes and the external-tool work (video,
+        // frame, page) are slow; stills, and animated GIF
+        // output (a chunked per-frame encode), are not.
+        let directives = |ops_str: &str| {
+            let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
+            crate::url::RequestDirectives::analyze(&ops)
+        };
+        let slow = |bytes: &[u8], ops_str: &str| {
+            let d = directives(ops_str);
+            wants_slow_lane(
+                bytes,
+                &d,
+                d.explicit_format.is_some_and(|f| f.is_video()),
+                d.frame.is_some(),
+                d.page.is_some(),
+            )
+        };
+        let anim_webp = animated_webp_bytes();
+        let anim_gif = animated_gif_bytes();
+        assert!(slow(&anim_webp, "example.com/i.webp"));
+        assert!(slow(&anim_webp, "filters:format(webp)/example.com/i.webp"));
+        assert!(slow(&anim_gif, "filters:format(mp4)/example.com/i.gif"));
+        assert!(slow(&anim_gif, "frame:poster/example.com/v.mp4"));
+        assert!(slow(&test_png(), "page:1/example.com/doc.pdf"));
+        assert!(!slow(&test_png(), "example.com/i.png"));
+        assert!(!slow(&anim_gif, "example.com/i.gif"));
+        assert!(!slow(&anim_webp, "filters:format(gif)/example.com/i.webp"));
+        assert!(!slow(&anim_webp, "filters:format(png)/example.com/i.webp"));
+    }
+
+    #[tokio::test]
+    async fn slow_lane_saturation_leaves_stills_at_full_capacity() {
+        // Issue #324, the acceptance shape: the slow lane
+        // is saturated by a deadline-length encode (the
+        // fake encoder sleeps 9 s inside one opaque stage;
+        // the deadline is 300 ms), and a still render
+        // arriving during the saturation still renders
+        // promptly on the untouched stills lane, where
+        // before this issue the encode's process permit
+        // was one of the stills pool's own.
+        let dir =
+            std::env::temp_dir().join(format!("crabcrop-server-slow-lane-{}", std::process::id()));
+        let encoder = fake_long_encoder(&dir, 9);
+        let state = lane_test_state(std::time::Duration::from_millis(300), 2, 1);
+        let stuck_job = lane_test_job(
+            Some(Arc::new(encoder)),
+            "filters:format(mp4)/example.com/i.gif",
+        );
+        let follow_job = lane_test_job(None, "example.com/i.png");
+        let gif = animated_gif_bytes();
+        let png = test_png();
+        let (first, (follow_elapsed, follow)) =
+            tokio::join!(run_process(&state, &stuck_job, &gif, Lane::Slow), async {
+                // Arrive while the encode is stuck, and
+                // prove the saturation is the slow lane's
+                // alone before rendering the still.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                assert_eq!(state.slow_gate.in_use(), 1);
+                assert_eq!(state.process_gate.in_use(), 0);
+                let follow_start = Instant::now();
+                let result = run_process(&state, &follow_job, &png, Lane::Process).await;
+                (follow_start.elapsed(), result)
+            });
+        assert!(
+            matches!(first, Err(ProcessFailure::TimedOut)),
+            "the stuck encode must answer TimedOut at its deadline, got {first:?}"
+        );
+        let processed = follow.unwrap_or_else(|e| {
+            panic!("the still must render under slow-lane saturation, got {e:?}")
+        });
+        assert_eq!((processed.width, processed.height), (100, 60));
+        assert!(
+            follow_elapsed < PROCESS_GATE_WAIT,
+            "the still must not wait on the slow lane, took {follow_elapsed:?}"
+        );
+        // The timed-out run released its slow permit at
+        // the deadline plus grace (#322), so the lane is
+        // free for the next slow request too.
+        assert_eq!(state.slow_gate.available_permits(), 1);
+        assert_eq!(state.process_gate.available_permits(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn slow_lane_overflow_waits_in_its_own_lane() {
+        // Issue #324: with the slow lane's only permit
+        // held, a slow run waits in its own lane (it does
+        // not spill onto a stills permit), a still renders
+        // meanwhile, and once the lane drains the slow run
+        // proceeds: the wait is a queue in the right lane,
+        // not a detour through the stills pool.
+        let state = lane_test_state(std::time::Duration::from_secs(30), 1, 1);
+        let job = lane_test_job(None, "example.com/i.png");
+        let png = test_png();
+        let held = state.slow_gate.clone().acquire_owned().await.unwrap();
+        let waiting = run_process(&state, &job, &png, Lane::Slow);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "the slow run must wait while the slow lane is saturated"
+        );
+        assert_eq!(state.process_gate.in_use(), 0);
+        let still = run_process(&state, &job, &png, Lane::Process)
+            .await
+            .unwrap();
+        assert_eq!((still.width, still.height), (100, 60));
+        drop(held);
+        let processed = waiting.await.unwrap();
+        assert_eq!((processed.width, processed.height), (100, 60));
+    }
+
+    /// An app whose two lane gates the test keeps handles
+    /// to (issue #324), with the metrics token set so the
+    /// lane occupancy exposition can be read back.
+    async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
+            metrics: Arc::new(Metrics::default()),
+            metrics_token: Some(TEST_METRICS_TOKEN.to_string()),
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: None,
+            segment: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            ocr: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            process_gate,
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate,
+            inflight: Arc::new(Inflight::default()),
+            provenance_signer: None,
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_per_lane_occupancy() {
+        // Issue #324: /metrics reports each lane's in-use
+        // permits against its capacity, read live from the
+        // gates: holding permits by hand moves the gauges.
+        let process_gate = Arc::new(Gate::new(4));
+        let slow_gate = Arc::new(Gate::new(2));
+        let base = spawn_app_with_lane_gates(process_gate.clone(), slow_gate.clone()).await;
+        let _held_process = process_gate.clone().acquire_owned().await.unwrap();
+        let held_slow = slow_gate.clone().acquire_owned().await.unwrap();
+        let _held_slow2 = slow_gate.clone().acquire_owned().await.unwrap();
+        let body = metrics_text(&base).await;
+        assert!(
+            body.contains("crabcrop_lane_in_use{lane=\"process\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("crabcrop_lane_capacity{lane=\"process\"} 4"),
+            "{body}"
+        );
+        assert!(
+            body.contains("crabcrop_lane_in_use{lane=\"slow\"} 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("crabcrop_lane_capacity{lane=\"slow\"} 2"),
+            "{body}"
+        );
+        drop(held_slow);
+        let body = metrics_text(&base).await;
+        assert!(
+            body.contains("crabcrop_lane_in_use{lane=\"slow\"} 1"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_lane_saturation_sheds_slow_requests_and_serves_stills() {
+        // Issue #324 at the HTTP seam: with the slow lane
+        // saturated (its only permit held, as a long
+        // encode holds it), a still renders promptly, and
+        // an animated WebP request waits out the slow-lane
+        // wait and sheds with the lane's own 503 and
+        // Retry-After instead of spilling onto the stills
+        // lane or queueing silently.
+        let process_gate = Arc::new(Gate::new(2));
+        let slow_gate = Arc::new(Gate::new(1));
+        let base = spawn_app_with_lane_gates(process_gate.clone(), slow_gate.clone()).await;
+        let _held_slow = slow_gate.clone().acquire_owned().await.unwrap();
+        // The still renders promptly on its own lane.
+        let src = spawn_image_server().await;
+        let remainder = format!("20x15/{src}");
+        let sig = sign(&remainder);
+        let started = Instant::now();
+        let resp = client()
+            .get(format!("{base}/{sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            started.elapsed() < SLOW_LANE_WAIT,
+            "a still render must not wait on the slow lane"
+        );
+        // The animated request sheds honestly.
+        let anim_src = spawn_bytes_server(animated_webp_bytes()).await;
+        let sig = sign(&anim_src);
+        let started = Instant::now();
+        let resp = client()
+            .get(format!("{base}/{sig}/{anim_src}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("long-running processing lane is full"),
+            "{body}"
+        );
+        assert!(
+            started.elapsed() >= SLOW_LANE_WAIT,
+            "the shed must come only after the lane wait elapses"
+        );
     }
 
     #[tokio::test]
@@ -10852,7 +11436,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            process_gate: Arc::new(Gate::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -10868,6 +11452,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -10905,7 +11490,7 @@ mod tests {
         };
         let held = state.process_gate.clone().acquire_owned().await.unwrap();
         let png = test_png();
-        let waiting = run_process(&state, &job, &png);
+        let waiting = run_process(&state, &job, &png, Lane::Process);
         tokio::pin!(waiting);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
@@ -11335,20 +11920,14 @@ mod tests {
         max_bytes: u64,
         allow_overwrite: bool,
     ) -> String {
-        spawn_app_with_upload_gate(
-            dir,
-            max_bytes,
-            allow_overwrite,
-            Arc::new(tokio::sync::Semaphore::new(4)),
-        )
-        .await
+        spawn_app_with_upload_gate(dir, max_bytes, allow_overwrite, Arc::new(Gate::new(4))).await
     }
 
     async fn spawn_app_with_upload_gate(
         dir: &std::path::Path,
         max_bytes: u64,
         allow_overwrite: bool,
-        process_gate: Arc<tokio::sync::Semaphore>,
+        process_gate: Arc<Gate>,
     ) -> String {
         std::fs::create_dir_all(dir).unwrap();
         let dir = std::fs::canonicalize(dir).unwrap();
@@ -11406,6 +11985,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
@@ -11924,7 +12504,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -11940,6 +12520,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: fingerprint.to_string(),
@@ -12217,7 +12798,7 @@ mod tests {
         // `processing_gate_bounds_concurrency` pattern, at
         // the HTTP seam.
         let dir = upload_dir("gated");
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let gate = Arc::new(Gate::new(1));
         let base = spawn_app_with_upload_gate(&dir, 10 * 1024 * 1024, false, gate.clone()).await;
         let name = "cat.png";
         let sig = crate::url::upload_signature(SECRET, name);
@@ -12248,7 +12829,7 @@ mod tests {
         // wait elapses, instead of decoding ungated, and
         // nothing is stored (issue #187).
         let dir = upload_dir("shed");
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let gate = Arc::new(Gate::new(1));
         let base = spawn_app_with_upload_gate(&dir, 10 * 1024 * 1024, false, gate.clone()).await;
         let name = "cat.png";
         let sig = crate::url::upload_signature(SECRET, name);
@@ -12776,7 +13357,7 @@ mod tests {
             shared_store: None,
             upload: None,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            process_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
             jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
@@ -12792,6 +13373,7 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),

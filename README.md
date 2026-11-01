@@ -650,7 +650,7 @@ Crabcrop ships no video decoder either. Extraction runs in an external program y
 
 The bounds mirror the encoder's, because the work is the same class:
 
-- At most two extractions run at a time behind the video gate (shared with encodes), on top of the process gate; a request that waits more than 10 s for a slot sheds with `503`.
+- At most two extractions run at a time behind the video gate (shared with encodes), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
 - Each run (probe and extraction alike) is bounded by the same wall-clock timeout as encodes (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a frame whose PNG passes 256 MiB, the decode allocation budget, is refused).
 - The source itself flows through the ordinary loader first, with the same allowlist, size cap, and redirect rules as any source. Only a URL carrying a `frame:` segment may fetch a `video/*` Content-Type; every other request keeps the image-only rule.
 
@@ -681,7 +681,7 @@ Because the tools receive only bytes over stdin, nothing inside a document has a
 
 The bounds mirror the frame extractor's, because the work is the same class:
 
-- Page work takes the video gate (at most two runs at a time, shared with encodes and frame extractions), on top of the process gate; a request that waits more than 10 s for a slot sheds with `503`.
+- Page work takes the video gate (at most two runs at a time, shared with encodes and frame extractions), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
 - Each run is bounded by `CRABCROP_PDF_TIMEOUT_SECS` (default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a page whose PNG passes 256 MiB, the decode allocation budget, is refused).
 
 ### Errors
@@ -802,7 +802,7 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 | `500` | Encoding the output failed, or an AI model failed at inference time (the runtime errored, or a model session lock was poisoned by an earlier failure). A model that cannot be loaded at all fails startup instead of answering requests. |
 | `501` | The URL is valid but this server was not configured for it: an AI filter with no model, a text overlay with no font, a video format with no encoder configured. |
 | `502` | The source could not be fetched (network error, a non-2xx answer from the origin, or a non-image `Content-Type`), the source is larger than the 10 MiB fetch limit, or the fetched bytes could not be decoded as an image, including AVIF sources in builds without AVIF decoding, corrupt HEIC sources, and undecodable formats. A watermark that fails to load also lands here, and so does a configured AI model that ran but produced output the server cannot use (no outputs, an unreadable tensor, an unexpected shape). A configured video encoder that fails, times out, or exceeds its output cap also lands here. |
-| `503` | The server shed the request because a processing, AI, video, or animation gate waited past its timeout; the response carries `Retry-After`. |
+| `503` | The server shed the request because a processing, slow-lane, AI, video, or animation gate waited past its timeout; the response carries `Retry-After`. |
 | `504` | The source fetch timed out (10 seconds per request), or processing ran past the `CRABCROP_PROCESS_TIMEOUT_SECS` limit (30 seconds by default). |
 
 For example, a `removebg` request to a server with no background-removal model returns `501` with the body `removebg is not configured on this server`.
@@ -812,7 +812,7 @@ For example, a `removebg` request to a server with no background-removal model r
 | Route | Description |
 | --- | --- |
 | `GET /health` | Health check. Returns `200` with the body `ok`. |
-| `GET /metrics` | Prometheus metrics in text format: request counts by status class (`crabcrop_requests_total`), request/load/process durations, cache hit and miss counters, loader and engine error counters, and byte totals. Gated by `CRABCROP_METRICS_TOKEN`: with no token configured it answers `403`; with one, requests must carry it as a bearer token, and a missing or wrong token answers `401`. |
+| `GET /metrics` | Prometheus metrics in text format: request counts by status class (`crabcrop_requests_total`), request/load/process durations, cache hit and miss counters, loader and engine error counters, and byte totals, and per-lane occupancy (`crabcrop_lane_in_use` against `crabcrop_lane_capacity`, with `lane="process"` for the stills lane and `lane="slow"` for the slow lane). Gated by `CRABCROP_METRICS_TOKEN`: with no token configured it answers `403`; with one, requests must carry it as a bearer token, and a missing or wrong token answers `401`. |
 | `POST /purge/<signature>/<path>` | Invalidate every stored variant of one result, across all cache tiers. See below. |
 | `POST /purge-group/<signature>/<group>` | Invalidate every stored result in a cache group, across all cache tiers. See below. |
 | `PUT /upload/<signature>/<name>` | Store one original in the configured upload destination. Only exists when uploads are configured. See [Upload an original](#upload-an-original). |
@@ -977,6 +977,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_VIDEO_ENCODER` | unset | Path to the external video encoder program for `format(mp4)` / `format(webm)`, validated at startup. Unset disables video output. See [Video output](#video-output). |
 | `CRABCROP_VIDEO_DECODER` | unset | Path to the external video decoder program for `frame:` extraction from video sources, validated at startup. Unset disables frame selection. See [Video frames](#video-frames). |
 | `CRABCROP_PROCESS_TIMEOUT_SECS` | `30` | Hard wall-clock limit on processing one request, 1 to 600 seconds. A request that exceeds it answers `504` and releases every processing gate it holds, at the limit plus a two-second grace at the latest; chunked encode loops (animated frames, quality ladders) check the limit inside the encode, and a single encoder call that cannot be interrupted is detached and aborts at the first check after it returns. |
+| `CRABCROP_SLOW_LANE_PERMITS` | `1` | Size of the slow lane, 1 to 64: how many long-running renders may run at once on permits stills never use. Animated WebP encodes and the external-tool work behind the video gate (video encodes, `frame:` extractions, `page:` renders) draw from this lane instead of the stills process gate, so a saturated slow lane cannot slow or shed a still render at all; slow-lane overflow waits up to 10 seconds, then sheds with a `503` and `Retry-After`, and never spills onto the stills lane. The default 1 suits a small host (one long encode at a time, a core and the whole stills lane left for stills); raise it on larger hosts that run video or animation traffic in parallel. `/metrics` reports both lanes as `crabcrop_lane_in_use` against `crabcrop_lane_capacity` (`lane="process"` and `lane="slow"`). |
 | `CRABCROP_VIDEO_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external video tool run (one encode, or one frame probe/extraction), 1 to 600 seconds. |
 | `CRABCROP_PDF_RENDERER` | unset | Path to the external PDF renderer program for `page:` rendering from PDF sources (its `pdfinfo` sibling is derived and validated alongside), validated at startup. Unset disables page selection. See [PDF pages](#pdf-pages). |
 | `CRABCROP_C2PA_CERT` | unset | Path to a PEM certificate chain: the C2PA signing identity for output provenance. Set together with `CRABCROP_C2PA_KEY`; a partial set is a startup error, and the identity is proven at boot. Unset disables output signing. See [Provenance (C2PA)](#provenance-c2pa). |

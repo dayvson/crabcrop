@@ -267,6 +267,16 @@
 //!   processing gate it holds, and the detached work
 //!   aborts at the first deadline check after the call
 //!   returns.
+//! - `CRABCROP_SLOW_LANE_PERMITS`: size of the slow lane
+//!   (default 1, 1 to 64), the separately bounded permits
+//!   long-running work draws from instead of the stills
+//!   process gate (issue #324): animated WebP encodes
+//!   and the external-tool work behind the video gate
+//!   (video encodes, frame extraction, page renders).
+//!   A saturated slow lane sheds its own requests with a
+//!   503 after a 10 second wait and never slows or sheds
+//!   a still render. `/metrics` reports both lanes'
+//!   occupancy.
 //! - `PORT`: listen port, default 3000.
 
 #![forbid(unsafe_code)]
@@ -870,6 +880,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    // The slow lane's size (issue #324): how many
+    // long-running encodes (animated WebP, video, frame
+    // and page work) may run at once, on permits stills
+    // never wait for. The default 1 suits a small host:
+    // one long encode at a time, with the stills lane and
+    // a core left for stills.
+    let slow_lane_permits: usize = parse_env(
+        "CRABCROP_SLOW_LANE_PERMITS",
+        crate::server::DEFAULT_SLOW_LANE_PERMITS,
+    )?;
+    if !(1..=64).contains(&slow_lane_permits) {
+        return Err(format!(
+            "CRABCROP_SLOW_LANE_PERMITS must be between 1 and 64, got {slow_lane_permits}"
+        )
+        .into());
+    }
     let avif_speed: u8 = parse_env("CRABCROP_AVIF_SPEED", crate::engine::DEFAULT_AVIF_SPEED)?;
     if !(1..=10).contains(&avif_speed) {
         return Err(
@@ -1067,11 +1093,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         shared_store,
         upload,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(tokio::sync::Semaphore::new(
+        process_gate: Arc::new(crate::server::Gate::new(
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
         )),
+        slow_gate: Arc::new(crate::server::Gate::new(slow_lane_permits)),
         ssim_target,
         avif_speed,
         jxl_speed,
