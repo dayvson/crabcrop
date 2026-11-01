@@ -16,6 +16,9 @@ pub struct EncodeOptions {
     pub format: Option<ImageFormat>,
     /// Encoding quality directive. `None` means the encoder default.
     pub quality: Option<Quality>,
+    /// Color budget for indexed PNG output (issue #313).
+    /// `None` writes the usual full-color PNG.
+    pub palette: Option<u16>,
     /// Cap every resize at the source dimensions.
     pub no_upscale: bool,
     /// Background color for flattening transparency at encode time.
@@ -37,6 +40,9 @@ impl EncodeOptions {
         }
         if other.quality.is_some() {
             self.quality = other.quality;
+        }
+        if other.palette.is_some() {
+            self.palette = other.palette;
         }
         if other.fill.is_some() {
             self.fill = other.fill;
@@ -213,6 +219,7 @@ pub fn apply_filters_filled(
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::KeepProfile => options.keep_profile = true,
             Filter::Quality(q) => options.quality = Some(*q),
+            Filter::Palette(n) => options.palette = Some(*n),
             Filter::NoUpscale => options.no_upscale = true,
             Filter::Format(f) => options.format = Some(*f),
         }
@@ -2889,6 +2896,7 @@ mod tests {
             EncodeOptions {
                 format: Some(ImageFormat::Jpeg),
                 quality: Some(Quality::Value(90)),
+                palette: None,
                 no_upscale: false,
                 fill: None,
                 max_bytes: None,
@@ -3046,6 +3054,7 @@ mod tests {
         base.absorb(EncodeOptions {
             format: Some(ImageFormat::Png),
             quality: None,
+            palette: Some(64),
             no_upscale: true,
             fill: None,
             max_bytes: Some(100),
@@ -3054,6 +3063,7 @@ mod tests {
         base.absorb(EncodeOptions {
             format: None,
             quality: Some(Quality::Value(50)),
+            palette: None,
             no_upscale: false,
             fill: None,
             max_bytes: None,
@@ -3065,6 +3075,7 @@ mod tests {
                 keep_profile: true,
                 format: Some(ImageFormat::Png),
                 quality: Some(Quality::Value(50)),
+                palette: Some(64),
                 no_upscale: true,
                 fill: None,
                 max_bytes: Some(100),
@@ -3248,6 +3259,22 @@ mod tests {
             assert_eq!(lut[200], 200, "gamma {bad}");
         }
         assert_eq!(gamma_lut(100.0), gamma_lut(MAX_GAMMA));
+    }
+
+    #[test]
+    fn palette_filter_sets_the_encode_directive() {
+        let (_, opts) = apply_filters(solid(10, 20, 30), &[Filter::Palette(64)]);
+        assert_eq!(opts.palette, Some(64));
+        // The last one in the chain wins, like quality.
+        let (_, opts) = apply_filters(
+            solid(10, 20, 30),
+            &[Filter::Palette(64), Filter::Palette(16)],
+        );
+        assert_eq!(opts.palette, Some(16));
+        // And the pixels pass through untouched: the
+        // directive only steers the encoder.
+        let (img, _) = apply_filters(solid(10, 20, 30), &[Filter::Palette(2)]);
+        assert_eq!(first_pixel(&img), [10, 20, 30]);
     }
 
     #[test]

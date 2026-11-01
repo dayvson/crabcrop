@@ -399,6 +399,7 @@ curl "http://localhost:3000/unsafe/600x400/filters:sharpen(1.2):saturation(1.1)/
 | --- | --- | --- | --- |
 | `format` | `format(webp)`, `jpeg` (or `jpg`), `png`, `webp`, `jxl`, `avif`, `gif`, `mp4`, `webm` | Output format. Overrides `Accept` negotiation. The video formats are explicit-only (never negotiated) and need an animated source plus a configured encoder; see [Video output](#video-output). | `filters:format(avif)` |
 | `quality` | `quality(80)`, 1 to 100, or `quality(auto)` | Encoding quality for JPEG, JPEG XL, AVIF, and WebP. Default 80. | `filters:quality(auto)` |
+| `palette` | `palette(64)`, colors from 2 to 256 | Write PNG output as an indexed (palette) image with at most that many colors, quantized and dithered with the same quantizer the GIF encoder uses. Palette entries keep their alpha (carried in the file's `tRNS` chunk), so translucency survives, unlike GIF's binarized transparency. Other formats ignore the directive, the same stance `quality` takes on PNG. This is the PNG8 form other tools select: `palette(256)` is a full PNG8 palette. | `filters:format(png):palette(64)` |
 | `max_bytes` | `max_bytes(50000)`, byte budget, at least 1 | Re-encode at decreasing quality until the output fits the budget. | `filters:max_bytes(50000)` |
 | `fill` | `fill(ff0000)`, six hex digits, RGB | Background color used to flatten transparency when encoding to JPEG. | `filters:fill(ffffff)` |
 | `no_upscale` | none | Cap every resize in the request at the source dimensions. | `filters:no_upscale` |

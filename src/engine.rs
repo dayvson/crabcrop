@@ -1403,6 +1403,7 @@ impl Engine {
                         format,
                         Some(q),
                         encode_opts.fill,
+                        encode_opts.palette,
                         ctx.avif_speed,
                         ctx.jxl_speed,
                     )?;
@@ -1422,6 +1423,7 @@ impl Engine {
                 format,
                 encode_quality,
                 encode_opts.fill,
+                encode_opts.palette,
                 ctx.avif_speed,
                 ctx.jxl_speed,
             )?;
@@ -1467,6 +1469,7 @@ impl Engine {
                     format,
                     Some(current),
                     encode_opts.fill,
+                    encode_opts.palette,
                     ctx.avif_speed,
                     ctx.jxl_speed,
                 )?;
@@ -3429,12 +3432,15 @@ fn gif_frame_quantized(
 /// Encode `src.img` to `format`. `quality` applies to JPEG,
 /// JPEG XL, AVIF, and WebP (where 100 selects the lossless
 /// encode). `fill` composites transparency for formats without
-/// an alpha channel (only JPEG needs it here).
+/// an alpha channel (only JPEG needs it here). `palette` is
+/// the indexed-color budget for PNG output (issue #313); the
+/// other formats ignore it.
 fn encode(
     src: &EncodeBuffers<'_>,
     format: ImageFormat,
     quality: Option<u8>,
     fill: Option<[u8; 3]>,
+    palette: Option<u16>,
     avif_speed: u8,
     jxl_speed: jixel::Speed,
 ) -> Result<Vec<u8>, EngineError> {
@@ -3494,6 +3500,9 @@ fn encode(
             .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Png => {
+            if let Some(max_colors) = palette {
+                return encode_png_indexed(src, max_colors);
+            }
             image::codecs::png::PngEncoder::new(&mut buf)
                 .write_image(pixels, w, h, color)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
@@ -3524,6 +3533,62 @@ fn encode(
             unreachable!("video formats are encoded by process_video, never here")
         }
     }
+    Ok(buf)
+}
+
+/// Encode an indexed-color (palette) PNG (issue #313): the
+/// RGBA pixels are quantized to at most `max_colors` palette
+/// entries with quantizr (the GIF path's quantizer, dithering
+/// at full strength), and the palette becomes the file's PLTE
+/// chunk, with the entries' alphas carried in tRNS. Unlike
+/// the GIF path, alpha is not binarized: palette entries keep
+/// their own alpha, so translucent pixels map to translucent
+/// entries. The `png` crate writes the file directly because
+/// the image crate's PNG encoder has no indexed color type;
+/// the crate is the same one the image crate itself wraps.
+fn encode_png_indexed(src: &EncodeBuffers<'_>, max_colors: u16) -> Result<Vec<u8>, EngineError> {
+    let encode_err = |msg: &str| EngineError::Encode(format!("png: {msg}"));
+    let img = src.img;
+    let (w, h) = (img.width(), img.height());
+    let rgba = src.rgba();
+    let image = quantizr::Image::new(rgba.as_raw(), w as usize, h as usize)
+        .map_err(|e| encode_err(&e.to_string()))?;
+    let mut opts = quantizr::Options::default();
+    opts.set_max_colors(i32::from(max_colors))
+        .map_err(|e| encode_err(&e.to_string()))?;
+    let mut result = quantizr::QuantizeResult::quantize(&image, &opts);
+    result
+        .set_dithering_level(1.0)
+        .map_err(|e| encode_err(&e.to_string()))?;
+    let palette = result.get_palette();
+    let entries = &palette.entries[..palette.count as usize];
+    let mut indices = vec![0u8; w as usize * h as usize];
+    result
+        .remap_image(&image, &mut indices)
+        .map_err(|e| encode_err(&e.to_string()))?;
+    let mut palette_bytes = Vec::with_capacity(entries.len() * 3);
+    let mut trns_bytes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        palette_bytes.extend_from_slice(&[entry.r, entry.g, entry.b]);
+        trns_bytes.push(entry.a);
+    }
+    let mut buf = Vec::new();
+    let mut encoder = png::Encoder::new(&mut buf, w, h);
+    encoder.set_color(png::ColorType::Indexed);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_palette(palette_bytes);
+    // tRNS is omitted when every entry is opaque: the chunk
+    // would carry no information.
+    if trns_bytes.iter().any(|a| *a != 0xFF) {
+        encoder.set_trns(trns_bytes);
+    }
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| encode_err(&e.to_string()))?;
+    writer
+        .write_image_data(&indices)
+        .map_err(|e| encode_err(&e.to_string()))?;
+    writer.finish().map_err(|e| encode_err(&e.to_string()))?;
     Ok(buf)
 }
 
@@ -6852,6 +6917,7 @@ mod tests {
             ImageFormat::Jxl,
             Some(80),
             None,
+            None,
             DEFAULT_AVIF_SPEED,
             DEFAULT_JXL_SPEED,
         )
@@ -6859,6 +6925,115 @@ mod tests {
         assert!(check_jxl_dimensions(&bytes).is_ok());
         assert!(check_decoded_dimensions(20_000, 10).is_err());
         assert!(check_decoded_dimensions(16_384, 16_384).is_ok());
+    }
+
+    /// The (type, data length) of every PNG chunk, in order.
+    fn png_chunks(bytes: &[u8]) -> Vec<(String, usize)> {
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]));
+        let mut chunks = Vec::new();
+        let mut at = 8;
+        while at + 8 <= bytes.len() {
+            let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let kind = String::from_utf8_lossy(&bytes[at + 4..at + 8]).into_owned();
+            chunks.push((kind, len));
+            at += 12 + len;
+        }
+        chunks
+    }
+
+    #[test]
+    fn palette_writes_an_indexed_png_within_budget() {
+        let engine = Engine;
+        let src = png_bytes(&photo_like_rgb(96, 96));
+        let ops = [Operation::Filters(vec![
+            Filter::Format(ImageFormat::Png),
+            Filter::Palette(16),
+        ])];
+        let out = engine.process(&src, &ops).unwrap();
+        // IHDR color type 3 (indexed), a PLTE of at most 16
+        // entries, and no tRNS for an opaque source.
+        assert_eq!(out.bytes[25], 3);
+        let chunks = png_chunks(&out.bytes);
+        let plte = chunks
+            .iter()
+            .find(|(k, _)| k == "PLTE")
+            .expect("PLTE chunk");
+        assert!(
+            plte.1 <= 16 * 3 && plte.1.is_multiple_of(3),
+            "PLTE {}",
+            plte.1
+        );
+        assert!(chunks.iter().all(|(k, _)| k != "tRNS"));
+        // Decoded, the image holds at most 16 distinct colors.
+        let decoded = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        let mut colors = std::collections::HashSet::new();
+        for p in decoded.pixels() {
+            colors.insert(p.0);
+        }
+        assert!(colors.len() <= 16, "{} colors", colors.len());
+        assert_eq!((decoded.width(), decoded.height()), (96, 96));
+        // The directive also composes with the detected
+        // format: a PNG source needs no format() to go indexed.
+        let out = engine
+            .process(&src, &[Operation::Filters(vec![Filter::Palette(16)])])
+            .unwrap();
+        assert_eq!(out.bytes[25], 3);
+        // The full-color control is not indexed, and bigger.
+        let full = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+            )
+            .unwrap();
+        assert_ne!(full.bytes[25], 3);
+        assert!(out.bytes.len() < full.bytes.len());
+    }
+
+    #[test]
+    fn palette_keeps_alpha_in_trns() {
+        let engine = Engine;
+        let mut img = DynamicImage::new_rgba8(3, 1);
+        let rgba = img.as_mut_rgba8().unwrap();
+        rgba.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        rgba.put_pixel(1, 0, image::Rgba([0, 255, 0, 128]));
+        rgba.put_pixel(2, 0, image::Rgba([0, 0, 255, 0]));
+        let src = png_bytes(&img);
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::Png),
+                    Filter::Palette(16),
+                ])],
+            )
+            .unwrap();
+        let chunks = png_chunks(&out.bytes);
+        assert!(
+            chunks.iter().any(|(k, _)| k == "tRNS"),
+            "chunks: {chunks:?}"
+        );
+        // Three source colors in a budget of 16 survive
+        // exactly, alpha included (no GIF-style binarizing).
+        let decoded = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(1, 0).0, [0, 255, 0, 128]);
+        assert_eq!(decoded.get_pixel(2, 0).0[3], 0);
+    }
+
+    #[test]
+    fn palette_is_ignored_by_other_formats() {
+        let engine = Engine;
+        let src = png_bytes(&photo_like_rgb(32, 32));
+        let out = engine
+            .process(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Palette(16),
+                ])],
+            )
+            .unwrap();
+        assert!(out.bytes.starts_with(&[0xFF, 0xD8]), "not a JPEG");
     }
 
     fn decoded_gif_frames(bytes: &[u8]) -> Vec<image::Frame> {

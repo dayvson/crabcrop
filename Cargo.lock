@@ -1032,6 +1032,7 @@ dependencies = [
  "oxideav-h265",
  "oxideav-heif",
  "oxideav-webp",
+ "png",
  "quantizr",
  "reqwest 0.13.5",
  "resvg",

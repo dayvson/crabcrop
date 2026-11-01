@@ -751,6 +751,11 @@ pub enum Filter {
     MaxBytes(u64),
     /// Encoding quality.
     Quality(Quality),
+    /// Encoding directive: write PNG output as an indexed
+    /// (palette) image with at most this many colors, from
+    /// 2 to 256 (issue #313). The other formats ignore it,
+    /// the same stance `quality` takes on PNG.
+    Palette(u16),
     /// Output container.
     Format(ImageFormat),
     /// Cap every resize at the source dimensions.
@@ -1626,6 +1631,13 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     }
                     Filter::Quality(Quality::Value(q))
                 }
+            }
+            ("palette", Some(p)) => {
+                let colors: u16 = p.parse().map_err(|_| invalid())?;
+                if !(2..=256).contains(&colors) {
+                    return Err(invalid());
+                }
+                Filter::Palette(colors)
             }
             ("format", Some(p)) => Filter::Format(parse_format(p).ok_or_else(invalid)?),
             ("sharpen", Some(p)) => {
@@ -2811,6 +2823,7 @@ fn filter_text(filter: &Filter) -> String {
             Quality::Auto => "quality(auto)".to_string(),
             Quality::Value(v) => format!("quality({v})"),
         },
+        Filter::Palette(n) => format!("palette({n})"),
         Filter::Format(f) => format!("format({})", format_text(*f)),
         Filter::NoUpscale => "no_upscale".to_string(),
     }
@@ -4221,6 +4234,28 @@ mod tests {
     fn parses_gamma_filter() {
         let (ops, _) = parse_operations("filters:gamma(2.2)/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::Gamma(2.2)])]);
+    }
+
+    #[test]
+    fn parses_palette_filter() {
+        let (ops, _) = parse_operations("filters:palette(64)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Palette(64)])]);
+        // The endpoints of the color budget parse.
+        assert!(parse_operations("filters:palette(2)/example.com/img.jpg").is_ok());
+        assert!(parse_operations("filters:palette(256)/example.com/img.jpg").is_ok());
+        for seg in [
+            "filters:palette(0)",
+            "filters:palette(1)",
+            "filters:palette(257)",
+            "filters:palette(-8)",
+            "filters:palette()",
+            "filters:palette(64,64)",
+        ] {
+            assert!(
+                parse_operations(&format!("{seg}/example.com/img.jpg")).is_err(),
+                "{seg}"
+            );
+        }
     }
 
     #[test]

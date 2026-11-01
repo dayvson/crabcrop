@@ -120,6 +120,12 @@
     "signature": "c67db31f358adf845837ce865f04915592fdf186b815cfbf2838c1fcdf0056d8"
   },
   {
+    "description": "a palette-quantized PNG (issue #313)",
+    "remainder": "filters:format(png):palette(64)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "971306ae1da419c03dd8a49b1cb0523a5cb0e1b8d3ee074fedd0e50456aca1b9"
+  },
+  {
     "description": "sealed: a plain remainder under an injected nonce (AES-256-GCM, key HMAC_SHA256(secret, \"crabcrop/seal-key\"), AAD crabcrop/sealed/1)",
     "sealed": true,
     "secret": "s3cr3t",

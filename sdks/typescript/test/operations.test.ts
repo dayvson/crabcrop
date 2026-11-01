@@ -126,6 +126,8 @@ test("typed filters match the canonical spellings", () => {
     [filter.quality(80), "quality(80)"],
     [filter.quality(1), "quality(1)"],
     [filter.quality("auto"), "quality(auto)"],
+    [filter.palette(64), "palette(64)"],
+    [filter.palette(256), "palette(256)"],
     [filter.format("webp"), "format(webp)"],
     [filter.format("mp4"), "format(mp4)"],
     [filter.format("webm"), "format(webm)"],
@@ -228,6 +230,8 @@ test("typed builders reject what the server would reject", () => {
   const bad: (() => string)[] = [
     () => filter.quality(0),
     () => filter.quality(101),
+    () => filter.palette(1),
+    () => filter.palette(257),
     () => filter.brighten(256),
     () => filter.contrast(101),
     () => filter.contrast(-101),

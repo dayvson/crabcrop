@@ -58,7 +58,7 @@ Three operational differences matter. First, scope: Cloudflare signing is opt-in
 | `format=json` | Fetch the image URL with `Accept: application/json`, or `crabcrop meta` | Direct |
 | `quality=80` | `filters:quality(80)` | Direct: the values copy. The defaults do not (Cloudflare 85, crabcrop 80) |
 | `quality=high`, `medium-high`, `medium-low`, `low` (perceptual levels) | `filters:quality(auto)`, or pick a number | Approximate: the names do not convert to numbers (Cloudflare publishes no equivalents). `quality(auto)` is the nearest behavior: a per-image choice made by content analysis |
-| `quality` set on PNG output (selects the PNG8 palette variant) | No equivalent | Unsupported: crabcrop PNG is full-color and lossless at any setting |
+| `quality` set on PNG output (selects the PNG8 palette variant) | `filters:format(png):palette(256)` | Direct in effect: PNG8 is an indexed palette of up to 256 colors, which is what `palette(256)` writes; smaller budgets (`palette(64)`) also work. On crabcrop, `quality` itself stays a no-op on PNG, which is lossless within the palette |
 | `slow-connection-quality` / `scq` | Nothing | Approximate at best: crabcrop steps quality down when a client sends `Save-Data: on` and the URL carries no quality of its own. The `rtt`, `ect`, and `downlink` triggers, and a named override value, do not exist |
 | `metadata=none` | Nothing (the default) | Direct: crabcrop strips source metadata unless told otherwise |
 | `metadata=copyright` | No equivalent | Unsupported as spelled: crabcrop's strip drops the copyright tag too, and its preserve mode keeps everything. Copyright-only retention has no setting on either the URL or the server |

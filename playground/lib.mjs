@@ -90,6 +90,8 @@ const FILTER_BLURBS = {
   huerotate: "rotate the hue by the given degrees",
   rotate: "rotate by the given angle in degrees; the canvas expands to fit",
   quality: "output quality 1..100, or `auto` for perceptual targeting",
+  palette:
+    "write PNG output as an indexed (palette) image with at most this many colors, 2..256; ignored by the other formats",
   format: "force the output format",
   fill: "the background color other operations pad with",
   facepad: "how much a face crop expands around the face",
@@ -284,6 +286,8 @@ function validateFilter(name, args) {
         : bad;
     case "quality":
       return args === "auto" || (args !== null && isIntIn(args, 1, 100)) ? null : bad;
+    case "palette":
+      return args !== null && isIntIn(args, 2, 256) ? null : bad;
     case "format":
       return FORMAT_NAMES.has(args) ? null : bad;
     case "rgb": {

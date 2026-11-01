@@ -658,6 +658,9 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
             Quality::Auto => "quality(auto): encode quality".into(),
             Quality::Value(v) => format!("quality({v}): encode quality"),
         },
+        Filter::Palette(n) => {
+            format!("palette({n}): write PNG as an indexed image with at most {n} colors")
+        }
         Filter::Format(f) => format!("format({}): output as {}", format_name(*f), format_name(*f)),
         Filter::NoUpscale => "no_upscale: never enlarge past the source".into(),
     }

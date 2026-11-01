@@ -487,6 +487,10 @@ export const filter = {
     if (value === "auto") return "quality(auto)";
     return `quality(${intIn("quality", value, 1, 100)})`;
   },
+  /** Indexed PNG output with at most this many colors, 2..256; other formats ignore it. */
+  palette(colors: number): string {
+    return `palette(${intIn("palette colors", colors, 2, 256)})`;
+  },
   format(format: ImageFormat): string {
     if (!IMAGE_FORMATS.includes(format)) {
       fail("format", format, `one of ${IMAGE_FORMATS.join(", ")}`);
