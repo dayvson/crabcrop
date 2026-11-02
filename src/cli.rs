@@ -668,11 +668,49 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         Filter::Quality(q) => match q {
             Quality::Auto => "quality(auto): encode quality".into(),
             Quality::Value(v) => format!("quality({v}): encode quality"),
+            Quality::PerFormat(entries) => {
+                let mut parts: Vec<String> = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    let value = match value {
+                        crate::url::QualityValue::Auto => "auto".to_string(),
+                        crate::url::QualityValue::Value(v) => v.to_string(),
+                    };
+                    match key {
+                        Some(f) => parts.push(format!("{}:{value}", format_name(*f))),
+                        None => parts.push(value),
+                    }
+                }
+                format!("quality({}): encode quality per format", parts.join(","))
+            }
         },
         Filter::Palette(n) => {
             format!("palette({n}): write PNG as an indexed image with at most {n} colors")
         }
-        Filter::Format(f) => format!("format({}): output as {}", format_name(*f), format_name(*f)),
+        Filter::Format(spec) => {
+            let name = format_name(spec.format);
+            let o = &spec.options;
+            let mut notes: Vec<String> = Vec::new();
+            if o.jpeg_progressive {
+                notes.push("progressive encoding".to_string());
+            }
+            if let Some(sub) = o.jpeg_subsampling {
+                notes.push(format!("chroma subsampling {}", sub.name()));
+            }
+            if o.png_interlace {
+                notes.push("Adam7 interlacing".to_string());
+            }
+            if let Some(method) = o.webp_method {
+                notes.push(format!("compression method {method}"));
+            }
+            if let Some(sns) = o.webp_sns {
+                notes.push(format!("smart subsampling strength {sns}"));
+            }
+            if notes.is_empty() {
+                format!("format({name}): output as {name}")
+            } else {
+                format!("format({name}): output as {name} with {}", notes.join(", "))
+            }
+        }
         Filter::NoUpscale => "no_upscale: never enlarge past the source".into(),
     }
 }

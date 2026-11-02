@@ -351,12 +351,154 @@ impl ImageFormat {
 }
 
 /// Encoding quality from a `quality(...)` filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Quality {
     /// An explicit value, 0-100.
     Value(u8),
     /// Chosen per image by content analysis at encode time.
     Auto,
+    /// Per-format values from one `quality(...)` filter
+    /// (issue #319): `quality(80,jpeg:90,webp:75)` carries a
+    /// value per output format so one signed URL serves every
+    /// negotiated format at its intended quality. Entries are
+    /// `(format, value)` pairs; the `None` key is the fallback
+    /// for formats with no entry of their own. Resolution
+    /// happens after format negotiation, in
+    /// [`Quality::resolved_for`].
+    PerFormat(Vec<(Option<ImageFormat>, QualityValue)>),
+}
+
+/// One value inside a per-format `quality(...)` list: the
+/// same two forms a standalone quality takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityValue {
+    /// An explicit value, 1-100.
+    Value(u8),
+    /// Chosen per image by content analysis at encode time.
+    Auto,
+}
+
+impl QualityValue {
+    fn to_quality(self) -> Quality {
+        match self {
+            QualityValue::Value(v) => Quality::Value(v),
+            QualityValue::Auto => Quality::Auto,
+        }
+    }
+}
+
+impl Quality {
+    /// The quality in force once the output format is known:
+    /// a plain value or `auto` resolves to itself, a per-format
+    /// list resolves to the entry for `format`, else its
+    /// fallback, else `None` (no quality directive in force
+    /// for this format, so encoder defaults and the Save-Data
+    /// step-down apply as if quality were absent).
+    pub fn resolved_for(&self, format: ImageFormat) -> Option<Quality> {
+        match self {
+            Quality::Value(v) => Some(Quality::Value(*v)),
+            Quality::Auto => Some(Quality::Auto),
+            Quality::PerFormat(entries) => {
+                let mut fallback = None;
+                for (key, value) in entries {
+                    match key {
+                        Some(f) if *f == format => return Some(value.to_quality()),
+                        None => fallback = Some(value.to_quality()),
+                        _ => {}
+                    }
+                }
+                fallback
+            }
+        }
+    }
+}
+
+/// Chroma subsampling as spelled in `format(...)` options
+/// (`subsampling:444` and friends), the ratio notation the
+/// JPEG world uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subsampling {
+    /// 4:4:4, no subsampling.
+    S444,
+    /// 4:2:2, chroma halved horizontally.
+    S422,
+    /// 4:2:0, chroma halved in both directions.
+    S420,
+}
+
+impl Subsampling {
+    /// The canonical spelling, as written in the option.
+    pub fn name(self) -> &'static str {
+        match self {
+            Subsampling::S444 => "444",
+            Subsampling::S422 => "422",
+            Subsampling::S420 => "420",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Subsampling> {
+        Some(match s {
+            "444" => Subsampling::S444,
+            "422" => Subsampling::S422,
+            "420" => Subsampling::S420,
+            _ => return None,
+        })
+    }
+}
+
+/// Per-format encoder options carried as arguments on a
+/// `format(...)` filter (issue #319): `format(jpeg,progressive)`,
+/// `format(webp,method:6)`. Every field defaults to the
+/// encoder's standing behavior, so a format filter with no
+/// options renders byte for byte as it did before the options
+/// existed. Only the fields for the named format are ever
+/// set; the parser rejects an option its format cannot
+/// honour rather than letting it be silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FormatOptions {
+    /// JPEG: progressive (multi-scan) encoding.
+    pub jpeg_progressive: bool,
+    /// JPEG: chroma subsampling. `None` keeps the encoder's
+    /// standing 4:2:0.
+    pub jpeg_subsampling: Option<Subsampling>,
+    /// PNG: Adam7 interlacing.
+    pub png_interlace: bool,
+    /// WebP: libwebp compression method, 0-6. `None` keeps
+    /// the standing method 4.
+    pub webp_method: Option<u8>,
+    /// WebP: libwebp smart subsampling (spatial noise
+    /// shaping) strength, 0-100. `None` keeps the libwebp
+    /// default.
+    pub webp_sns: Option<u8>,
+}
+
+impl FormatOptions {
+    /// Whether no option is set: the filter renders exactly
+    /// as a bare `format(...)` always has.
+    pub fn is_empty(&self) -> bool {
+        *self == FormatOptions::default()
+    }
+}
+
+/// A `format(...)` filter: the output format plus its
+/// per-format encoder options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatSpec {
+    /// The output format.
+    pub format: ImageFormat,
+    /// The format's encoder options (all default when the
+    /// filter named no options).
+    pub options: FormatOptions,
+}
+
+impl FormatSpec {
+    /// A format with no options: every pre-options URL.
+    pub fn plain(format: ImageFormat) -> FormatSpec {
+        FormatSpec {
+            format,
+            options: FormatOptions::default(),
+        }
+    }
 }
 
 /// Which channels a `curve(...)` filter remaps.
@@ -806,7 +948,7 @@ pub enum Filter {
     /// the same stance `quality` takes on PNG.
     Palette(u16),
     /// Output container.
-    Format(ImageFormat),
+    Format(FormatSpec),
     /// Cap every resize at the source dimensions.
     NoUpscale,
 }
@@ -1558,6 +1700,120 @@ fn parse_format(s: &str) -> Option<ImageFormat> {
     }
 }
 
+/// Parse one quality value inside a `quality(...)` filter:
+/// `auto` or a number in 1..=100, the standing range.
+fn parse_quality_value(s: &str) -> Option<QualityValue> {
+    if s == "auto" {
+        return Some(QualityValue::Auto);
+    }
+    let q: u8 = s.parse().ok()?;
+    if !(1..=100).contains(&q) {
+        return None;
+    }
+    Some(QualityValue::Value(q))
+}
+
+/// Parse a `quality(...)` argument (issue #319): either the
+/// standing single form (`80`, `auto`) or a per-format list
+/// (`80,jpeg:90,webp:75`) with at most one bare fallback
+/// entry and at most one entry per format. Formats a quality
+/// cannot reach (the video outputs, whose encoding is an
+/// external tool's) are rejected, as are unknown format
+/// names: an entry that could never take effect is an error,
+/// never silently ignored.
+fn parse_quality(p: &str) -> Option<Quality> {
+    if !p.contains(',') && !p.contains(':') {
+        return match parse_quality_value(p)? {
+            QualityValue::Value(v) => Some(Quality::Value(v)),
+            QualityValue::Auto => Some(Quality::Auto),
+        };
+    }
+    let mut entries: Vec<(Option<ImageFormat>, QualityValue)> = Vec::new();
+    for part in p.split(',') {
+        if part.is_empty() {
+            return None;
+        }
+        match part.split_once(':') {
+            Some((name, value)) => {
+                let format = parse_format(name)?;
+                if format.is_video() {
+                    return None;
+                }
+                if entries.iter().any(|(k, _)| *k == Some(format)) {
+                    return None;
+                }
+                entries.push((Some(format), parse_quality_value(value)?));
+            }
+            None => {
+                if entries.iter().any(|(k, _)| k.is_none()) {
+                    return None;
+                }
+                entries.push((None, parse_quality_value(part)?));
+            }
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    Some(Quality::PerFormat(entries))
+}
+
+/// Parse a `format(...)` argument (issue #319): a format
+/// name plus its per-format encoder options as
+/// comma-separated arguments. An option the named format's
+/// encoder cannot honour is rejected here, at parse time:
+/// AVIF takes none (the ravif encoder writes 4:4:4 only and
+/// exposes no subsampling control, so a subsampling option
+/// would be a lie), and neither do JPEG XL, GIF, or the
+/// video formats.
+fn parse_format_spec(p: &str) -> Option<FormatSpec> {
+    let mut parts = p.split(',');
+    let format = parse_format(parts.next()?)?;
+    let mut spec = FormatSpec::plain(format);
+    let options = &mut spec.options;
+    for part in parts {
+        match format {
+            ImageFormat::Jpeg => match part {
+                "progressive" => {
+                    if options.jpeg_progressive {
+                        return None;
+                    }
+                    options.jpeg_progressive = true;
+                }
+                _ => {
+                    let value = part.strip_prefix("subsampling:")?;
+                    if options.jpeg_subsampling.is_some() {
+                        return None;
+                    }
+                    options.jpeg_subsampling = Some(Subsampling::parse(value)?);
+                }
+            },
+            ImageFormat::Png => {
+                if part != "interlace" || options.png_interlace {
+                    return None;
+                }
+                options.png_interlace = true;
+            }
+            ImageFormat::WebP => {
+                let (value, max, slot) = match part.strip_prefix("method:") {
+                    Some(v) => (v, 6, &mut options.webp_method),
+                    None => (part.strip_prefix("sns:")?, 100, &mut options.webp_sns),
+                };
+                if slot.is_some() {
+                    return None;
+                }
+                let parsed: u8 = value.parse().ok()?;
+                if parsed > max {
+                    return None;
+                }
+                *slot = Some(parsed);
+            }
+            _ => return None,
+        }
+    }
+    Some(spec)
+}
+
 /// Parse the filter list after `filters:`.
 /// A detection class name for the class filters
 /// (`blurclass` / `pixelateclass` / `recolorclass`):
@@ -1768,17 +2024,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 let degrees: i32 = p.parse().map_err(|_| invalid())?;
                 Filter::HueRotate(degrees)
             }
-            ("quality", Some(p)) => {
-                if p == "auto" {
-                    Filter::Quality(Quality::Auto)
-                } else {
-                    let q: u8 = p.parse().map_err(|_| invalid())?;
-                    if !(1..=100).contains(&q) {
-                        return Err(invalid());
-                    }
-                    Filter::Quality(Quality::Value(q))
-                }
-            }
+            ("quality", Some(p)) => Filter::Quality(parse_quality(p).ok_or_else(invalid)?),
             ("palette", Some(p)) => {
                 let colors: u16 = p.parse().map_err(|_| invalid())?;
                 if !(2..=256).contains(&colors) {
@@ -1786,7 +2032,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 }
                 Filter::Palette(colors)
             }
-            ("format", Some(p)) => Filter::Format(parse_format(p).ok_or_else(invalid)?),
+            ("format", Some(p)) => Filter::Format(parse_format_spec(p).ok_or_else(invalid)?),
             ("sharpen", Some(p)) => {
                 let amount: f32 = p.parse().map_err(|_| invalid())?;
                 if !amount.is_finite() || amount <= 0.0 {
@@ -2550,6 +2796,9 @@ fn parse_text_color(s: &str) -> Option<[u8; 4]> {
 pub struct RequestDirectives {
     /// The explicitly named output format, if any.
     pub explicit_format: Option<ImageFormat>,
+    /// The encoder options on the explicit format filter
+    /// (issue #319), all default when it named none.
+    pub format_options: FormatOptions,
     /// Any `no_upscale` directive.
     pub no_upscale: bool,
     /// The `fill(...)` directive color, if any.
@@ -2623,6 +2872,7 @@ impl RequestDirectives {
     pub fn analyze(ops: &[Operation]) -> Self {
         let mut d = RequestDirectives {
             explicit_format: None,
+            format_options: FormatOptions::default(),
             no_upscale: false,
             fill: None,
             removebg: false,
@@ -2672,7 +2922,10 @@ impl RequestDirectives {
             if let Operation::Filters(filters) = op {
                 for f in filters {
                     match f {
-                        Filter::Format(fmt) => d.explicit_format = Some(*fmt),
+                        Filter::Format(spec) => {
+                            d.explicit_format = Some(spec.format);
+                            d.format_options = spec.options;
+                        }
                         Filter::NoUpscale => d.no_upscale = true,
                         Filter::Fill(color) => d.fill = Some(*color),
                         Filter::RemoveBg => d.removebg = true,
@@ -2848,6 +3101,15 @@ pub(crate) fn format_text(format: ImageFormat) -> &'static str {
 
 /// The one canonical spelling of a filter: the grammar
 /// text the parser produces this exact value from.
+/// The canonical spelling of one quality value: `auto` or
+/// the number.
+fn quality_value_text(value: QualityValue) -> String {
+    match value {
+        QualityValue::Auto => "auto".to_string(),
+        QualityValue::Value(v) => v.to_string(),
+    }
+}
+
 fn filter_text(filter: &Filter) -> String {
     match filter {
         Filter::Grayscale => "grayscale".to_string(),
@@ -2991,9 +3253,56 @@ fn filter_text(filter: &Filter) -> String {
         Filter::Quality(q) => match q {
             Quality::Auto => "quality(auto)".to_string(),
             Quality::Value(v) => format!("quality({v})"),
+            Quality::PerFormat(entries) => {
+                // Canonical form: the fallback first, then one
+                // entry per format in format-name order, so
+                // the same set spells the same way however it
+                // was written.
+                let mut parts: Vec<String> = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    if key.is_none() {
+                        parts.push(quality_value_text(*value));
+                    }
+                }
+                let mut named: Vec<(ImageFormat, QualityValue)> = entries
+                    .iter()
+                    .filter_map(|(k, v)| k.map(|f| (f, *v)))
+                    .collect();
+                named.sort_by_key(|(f, _)| format_text(*f));
+                for (format, value) in named {
+                    parts.push(format!(
+                        "{}:{}",
+                        format_text(format),
+                        quality_value_text(value)
+                    ));
+                }
+                format!("quality({})", parts.join(","))
+            }
         },
         Filter::Palette(n) => format!("palette({n})"),
-        Filter::Format(f) => format!("format({})", format_text(*f)),
+        Filter::Format(spec) => {
+            let mut out = format!("format({}", format_text(spec.format));
+            // Canonical option order per format, whatever
+            // order the arguments were written in.
+            let o = &spec.options;
+            if o.jpeg_progressive {
+                out.push_str(",progressive");
+            }
+            if let Some(sub) = o.jpeg_subsampling {
+                out.push_str(&format!(",subsampling:{}", sub.name()));
+            }
+            if o.png_interlace {
+                out.push_str(",interlace");
+            }
+            if let Some(method) = o.webp_method {
+                out.push_str(&format!(",method:{method}"));
+            }
+            if let Some(sns) = o.webp_sns {
+                out.push_str(&format!(",sns:{sns}"));
+            }
+            out.push(')');
+            out
+        }
         Filter::NoUpscale => "no_upscale".to_string(),
     }
 }
@@ -4276,7 +4585,7 @@ mod tests {
             vec![Operation::Filters(vec![
                 Filter::Grayscale,
                 Filter::Quality(Quality::Value(80)),
-                Filter::Format(ImageFormat::WebP),
+                Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
             ])]
         );
     }
@@ -4903,7 +5212,9 @@ mod tests {
         let (ops, _) = parse_operations("filters:format(jxl)/example.com/img.jpg").unwrap();
         assert_eq!(
             ops,
-            vec![Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])]
+            vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                ImageFormat::Jxl
+            ))])]
         );
         // `removebg` parses, and takes no parameters.
         let (ops, _) = parse_operations("filters:removebg/example.com/img.png").unwrap();
@@ -4924,6 +5235,230 @@ mod tests {
         assert_eq!(
             ops,
             vec![Operation::Filters(vec![Filter::Quality(Quality::Auto)])]
+        );
+    }
+
+    #[test]
+    fn parses_format_options() {
+        let (ops, _) =
+            parse_operations("filters:format(jpeg,progressive,subsampling:444)/example.com/i.jpg")
+                .unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Format(FormatSpec {
+                format: ImageFormat::Jpeg,
+                options: FormatOptions {
+                    jpeg_progressive: true,
+                    jpeg_subsampling: Some(Subsampling::S444),
+                    ..FormatOptions::default()
+                },
+            })])]
+        );
+        let (ops, _) = parse_operations("filters:format(png,interlace)/example.com/i.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Format(FormatSpec {
+                format: ImageFormat::Png,
+                options: FormatOptions {
+                    png_interlace: true,
+                    ..FormatOptions::default()
+                },
+            })])]
+        );
+        let (ops, _) =
+            parse_operations("filters:format(webp,method:6,sns:20)/example.com/i.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Format(FormatSpec {
+                format: ImageFormat::WebP,
+                options: FormatOptions {
+                    webp_method: Some(6),
+                    webp_sns: Some(20),
+                    ..FormatOptions::default()
+                },
+            })])]
+        );
+        // A bare format is the plain spec every pre-options
+        // URL already means.
+        let (ops, _) = parse_operations("filters:format(webp)/example.com/i.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                ImageFormat::WebP
+            ))])]
+        );
+    }
+
+    #[test]
+    fn format_options_canonicalize_in_fixed_order() {
+        for (given, canonical) in [
+            (
+                "filters:format(webp,sns:20,method:6)",
+                "filters:format(webp,method:6,sns:20)",
+            ),
+            (
+                "filters:format(jpeg,subsampling:422,progressive)",
+                "filters:format(jpeg,progressive,subsampling:422)",
+            ),
+            (
+                "filters:format(png,interlace)",
+                "filters:format(png,interlace)",
+            ),
+            ("filters:format(jpeg)", "filters:format(jpeg)"),
+        ] {
+            let url = format!("{given}/example.com/i.jpg");
+            let (ops, source) = parse_operations(&url).unwrap();
+            assert_eq!(
+                canonical_form(&ops, source),
+                format!("{canonical}/example.com/i.jpg"),
+                "{given}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_options_reject_what_encoders_cannot_honour() {
+        for bad in [
+            // Options on formats whose encoders have none.
+            "filters:format(avif,subsampling:420)",
+            "filters:format(avif,progressive)",
+            "filters:format(jxl,method:4)",
+            "filters:format(gif,interlace)",
+            "filters:format(mp4,method:4)",
+            // Another format's options.
+            "filters:format(jpeg,interlace)",
+            "filters:format(jpeg,method:4)",
+            "filters:format(png,progressive)",
+            "filters:format(png,method:4)",
+            "filters:format(webp,progressive)",
+            "filters:format(webp,subsampling:420)",
+            // Unknown, duplicated, or out-of-range options.
+            "filters:format(jpeg,fast)",
+            "filters:format(jpeg,progressive,progressive)",
+            "filters:format(jpeg,subsampling:421)",
+            "filters:format(jpeg,subsampling:)",
+            "filters:format(webp,method:7)",
+            "filters:format(webp,method:-1)",
+            "filters:format(webp,method:99999999999999999999)",
+            "filters:format(webp,method:4,method:5)",
+            "filters:format(webp,sns:101)",
+            "filters:format(webp,sns:4.5)",
+            "filters:format(webp,)",
+            "filters:format(,method:4)",
+            "filters:format(webp,m\u{e9}thod:4)",
+        ] {
+            assert!(
+                parse_operations(&format!("{bad}/example.com/i.jpg")).is_err(),
+                "{bad} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_per_format_quality() {
+        let (ops, _) =
+            parse_operations("filters:quality(jpeg:80,webp:75)/example.com/i.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Quality(
+                Quality::PerFormat(vec![
+                    (Some(ImageFormat::Jpeg), QualityValue::Value(80)),
+                    (Some(ImageFormat::WebP), QualityValue::Value(75)),
+                ],)
+            )])]
+        );
+        // Fallback plus entries, with an auto entry.
+        let (ops, _) =
+            parse_operations("filters:quality(70,jpeg:auto,avif:60)/example.com/i.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::Quality(
+                Quality::PerFormat(vec![
+                    (None, QualityValue::Value(70)),
+                    (Some(ImageFormat::Jpeg), QualityValue::Auto),
+                    (Some(ImageFormat::Avif), QualityValue::Value(60)),
+                ],)
+            )])]
+        );
+        // A single named entry is a list of one.
+        let (ops, _) = parse_operations("filters:quality(webp:75)/example.com/i.jpg").unwrap();
+        assert!(matches!(
+            ops[0],
+            Operation::Filters(ref f) if matches!(f[0], Filter::Quality(Quality::PerFormat(_)))
+        ));
+    }
+
+    #[test]
+    fn per_format_quality_canonicalizes_sorted_with_fallback_first() {
+        for (given, canonical) in [
+            (
+                "filters:quality(webp:75,jpeg:80)",
+                "filters:quality(jpeg:80,webp:75)",
+            ),
+            (
+                "filters:quality(jpeg:90,70,avif:60)",
+                "filters:quality(70,avif:60,jpeg:90)",
+            ),
+            ("filters:quality(jpg:80)", "filters:quality(jpeg:80)"),
+        ] {
+            let url = format!("{given}/example.com/i.jpg");
+            let (ops, source) = parse_operations(&url).unwrap();
+            assert_eq!(
+                canonical_form(&ops, source),
+                format!("{canonical}/example.com/i.jpg"),
+                "{given}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_format_quality_rejects_bad_lists() {
+        for bad in [
+            "filters:quality(jpeg:80,jpeg:90)",
+            "filters:quality(70,80)",
+            "filters:quality(70,auto)",
+            "filters:quality(unknown:80)",
+            "filters:quality(mp4:80)",
+            "filters:quality(webm:80)",
+            "filters:quality(jpeg:0)",
+            "filters:quality(jpeg:101)",
+            "filters:quality(jpeg:)",
+            "filters:quality(:80)",
+            "filters:quality(jpeg:80,)",
+            "filters:quality(,jpeg:80)",
+            "filters:quality(jpeg:80,,webp:75)",
+            "filters:quality(jpeg:80:90)",
+            "filters:quality(jpeg:99999999999999999999)",
+        ] {
+            assert!(
+                parse_operations(&format!("{bad}/example.com/i.jpg")).is_err(),
+                "{bad} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn per_format_quality_resolves_for_the_negotiated_format() {
+        let q = Quality::PerFormat(vec![
+            (None, QualityValue::Value(70)),
+            (Some(ImageFormat::Jpeg), QualityValue::Value(90)),
+            (Some(ImageFormat::WebP), QualityValue::Auto),
+        ]);
+        assert_eq!(q.resolved_for(ImageFormat::Jpeg), Some(Quality::Value(90)));
+        assert_eq!(q.resolved_for(ImageFormat::WebP), Some(Quality::Auto));
+        // Unlisted formats fall back.
+        assert_eq!(q.resolved_for(ImageFormat::Avif), Some(Quality::Value(70)));
+        // No entry and no fallback: no directive in force.
+        let q = Quality::PerFormat(vec![(Some(ImageFormat::Jpeg), QualityValue::Value(90))]);
+        assert_eq!(q.resolved_for(ImageFormat::WebP), None);
+        // Plain forms resolve to themselves for every format.
+        assert_eq!(
+            Quality::Value(55).resolved_for(ImageFormat::Png),
+            Some(Quality::Value(55))
+        );
+        assert_eq!(
+            Quality::Auto.resolved_for(ImageFormat::Gif),
+            Some(Quality::Auto)
         );
     }
 
@@ -5168,7 +5703,9 @@ mod tests {
         let (ops, _) = parse_operations("filters:format(avif)/example.com/img.jpg").unwrap();
         assert_eq!(
             ops,
-            vec![Operation::Filters(vec![Filter::Format(ImageFormat::Avif)])]
+            vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                ImageFormat::Avif
+            ))])]
         );
     }
 
@@ -5178,7 +5715,12 @@ mod tests {
             let (ops, _) =
                 parse_operations(&format!("filters:format({spelling})/example.com/img.gif"))
                     .unwrap();
-            assert_eq!(ops, vec![Operation::Filters(vec![Filter::Format(format)])]);
+            assert_eq!(
+                ops,
+                vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    format
+                ))])]
+            );
             assert!(format.is_video());
             // The canonical form spells them back unchanged.
             assert_eq!(
@@ -5502,7 +6044,9 @@ mod tests {
         let (ops, _) = parse_operations("filters:format(gif)/example.com/img.jpg").unwrap();
         assert_eq!(
             ops,
-            vec![Operation::Filters(vec![Filter::Format(ImageFormat::Gif)])]
+            vec![Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                ImageFormat::Gif
+            ))])]
         );
     }
 

@@ -10,7 +10,10 @@ use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
 use crate::filters::{EncodeOptions, WatermarkImages};
 use crate::quality::auto_quality;
-use crate::url::{Align, Dimension, Filter, ImageFormat, ImageSize, Operation, PadFill, Quality};
+use crate::url::{
+    Align, Dimension, Filter, FormatOptions, ImageFormat, ImageSize, Operation, PadFill, Quality,
+    Subsampling,
+};
 
 /// Register the JPEG XL decoder with the image crate, once.
 ///
@@ -1412,13 +1415,25 @@ impl Engine {
             )));
         }
         // Resolve the quality directive against the final image.
+        // A per-format quality (issue #319) resolves here, now
+        // that format negotiation has settled: the entry for
+        // this format, else the list's fallback, else no
+        // directive in force for this format.
         // `quality(auto)` is reported back: it is the one the caller
         // did not choose themselves.
-        let (encode_quality, mut chosen_quality) = match encode_opts.quality {
+        let resolved_quality = encode_opts
+            .quality
+            .as_ref()
+            .and_then(|q| q.resolved_for(format));
+        let (encode_quality, mut chosen_quality) = match resolved_quality {
             Some(Quality::Value(q)) => (Some(q), None),
             Some(Quality::Auto) => {
                 let q = auto_quality(&img);
                 (Some(q), Some(q))
+            }
+            // resolved_for never returns the list itself.
+            Some(Quality::PerFormat(_)) => {
+                unreachable!("resolved_for resolves per-format quality to a single value")
             }
             // Save-Data steps the default quality down one
             // notch (80 to 70) on the formats that carry a
@@ -1439,7 +1454,7 @@ impl Engine {
         // score with SSIMULACRA2, and bisect on quality until the
         // score lands in the target band. The heuristic pick is
         // the first guess. Other formats keep the one-shot pick.
-        let perceptual = matches!(encode_opts.quality, Some(Quality::Auto))
+        let perceptual = matches!(resolved_quality, Some(Quality::Auto))
             && matches!(format, ImageFormat::Jpeg | ImageFormat::Jxl);
         let mut ssim: Option<f64> = None;
         let enc_src = EncodeBuffers::new(&img);
@@ -1462,6 +1477,7 @@ impl Engine {
                         Some(q),
                         encode_opts.fill,
                         encode_opts.palette,
+                        encode_opts.format_options,
                         ctx.avif_speed,
                         ctx.jxl_speed,
                     )?;
@@ -1482,6 +1498,7 @@ impl Engine {
                 encode_quality,
                 encode_opts.fill,
                 encode_opts.palette,
+                encode_opts.format_options,
                 ctx.avif_speed,
                 ctx.jxl_speed,
             )?;
@@ -1528,6 +1545,7 @@ impl Engine {
                     Some(current),
                     encode_opts.fill,
                     encode_opts.palette,
+                    encode_opts.format_options,
                     ctx.avif_speed,
                     ctx.jxl_speed,
                 )?;
@@ -1645,7 +1663,11 @@ impl Engine {
         // unspecified quality down one notch. GIF output has no
         // quality lever, so nothing resolves for it.
         let (encode_quality, chosen_quality) = if format == ImageFormat::WebP {
-            match encode_opts.quality {
+            match encode_opts
+                .quality
+                .as_ref()
+                .and_then(|q| q.resolved_for(format))
+            {
                 Some(Quality::Value(q)) => (Some(q), None),
                 Some(Quality::Auto) => {
                     let first = out_frames
@@ -1653,6 +1675,10 @@ impl Engine {
                         .expect("process_animated is called with at least one frame");
                     let q = auto_quality(&DynamicImage::ImageRgba8(first.buffer().clone()));
                     (Some(q), Some(q))
+                }
+                // resolved_for never returns the list itself.
+                Some(Quality::PerFormat(_)) => {
+                    unreachable!("resolved_for resolves per-format quality to a single value")
                 }
                 None if ctx.save_data => (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY)),
                 None => (None, None),
@@ -1723,6 +1749,7 @@ impl Engine {
                 out_frames,
                 loop_count.unwrap_or(0),
                 encode_quality,
+                encode_opts.format_options,
                 ctx.deadline,
             )?,
             _ => unreachable!("process_animated is only called for GIF and WebP"),
@@ -1969,6 +1996,7 @@ fn encode_animated_webp(
     frames: Vec<image::Frame>,
     loop_count: u16,
     quality: Option<u8>,
+    format_options: FormatOptions,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, EngineError> {
     let first = frames
@@ -1986,7 +2014,10 @@ fn encode_animated_webp(
         EngineError::Encode("webp: libwebp rejected its default configuration".into())
     })?;
     config.quality = q as f32;
-    config.method = 4;
+    config.method = format_options.webp_method.map(i32::from).unwrap_or(4);
+    if let Some(sns) = format_options.webp_sns {
+        config.sns_strength = i32::from(sns);
+    }
     if q >= 100 {
         config.lossless = 1;
     }
@@ -3605,12 +3636,14 @@ fn gif_frame_quantized(
 /// an alpha channel (only JPEG needs it here). `palette` is
 /// the indexed-color budget for PNG output (issue #313); the
 /// other formats ignore it.
+#[allow(clippy::too_many_arguments)]
 fn encode(
     src: &EncodeBuffers<'_>,
     format: ImageFormat,
     quality: Option<u8>,
     fill: Option<[u8; 3]>,
     palette: Option<u16>,
+    format_options: FormatOptions,
     avif_speed: u8,
     jxl_speed: jixel::Speed,
 ) -> Result<Vec<u8>, EngineError> {
@@ -3630,7 +3663,7 @@ fn encode(
         return encoded.map_err(|e| EngineError::Encode(e.to_string()));
     }
     if format == ImageFormat::WebP {
-        return encode_webp(src, quality);
+        return encode_webp(src, quality, format_options);
     }
     let mut buf = Vec::new();
     let (pixels, color) = (img.as_bytes(), ExtendedColorType::from(img.color()));
@@ -3660,7 +3693,16 @@ fn encode(
                 ));
             }
             let mut enc = jpeg_encoder::Encoder::new(&mut buf, quality.unwrap_or(80));
-            enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+            enc.set_sampling_factor(match format_options.jpeg_subsampling {
+                Some(Subsampling::S444) => jpeg_encoder::SamplingFactor::F_1_1,
+                Some(Subsampling::S422) => jpeg_encoder::SamplingFactor::F_2_1,
+                // The standing behavior: 4:2:0, also what an
+                // explicit subsampling:420 spells.
+                Some(Subsampling::S420) | None => jpeg_encoder::SamplingFactor::F_2_2,
+            });
+            if format_options.jpeg_progressive {
+                enc.set_progressive(true);
+            }
             enc.encode(
                 rgb.as_raw(),
                 w as u16,
@@ -3671,7 +3713,10 @@ fn encode(
         }
         ImageFormat::Png => {
             if let Some(max_colors) = palette {
-                return encode_png_indexed(src, max_colors);
+                return encode_png_indexed(src, max_colors, format_options.png_interlace);
+            }
+            if format_options.png_interlace {
+                return encode_png_interlaced(src);
             }
             image::codecs::png::PngEncoder::new(&mut buf)
                 .write_image(pixels, w, h, color)
@@ -3716,7 +3761,11 @@ fn encode(
 /// entries. The `png` crate writes the file directly because
 /// the image crate's PNG encoder has no indexed color type;
 /// the crate is the same one the image crate itself wraps.
-fn encode_png_indexed(src: &EncodeBuffers<'_>, max_colors: u16) -> Result<Vec<u8>, EngineError> {
+fn encode_png_indexed(
+    src: &EncodeBuffers<'_>,
+    max_colors: u16,
+    interlace: bool,
+) -> Result<Vec<u8>, EngineError> {
     let encode_err = |msg: &str| EngineError::Encode(format!("png: {msg}"));
     let img = src.img;
     let (w, h) = (img.width(), img.height());
@@ -3742,15 +3791,32 @@ fn encode_png_indexed(src: &EncodeBuffers<'_>, max_colors: u16) -> Result<Vec<u8
         palette_bytes.extend_from_slice(&[entry.r, entry.g, entry.b]);
         trns_bytes.push(entry.a);
     }
+    // tRNS is omitted when every entry is opaque: the chunk
+    // would carry no information.
+    let trns = if trns_bytes.iter().any(|a| *a != 0xFF) {
+        Some(trns_bytes)
+    } else {
+        None
+    };
+    if interlace {
+        return assemble_interlaced_png(
+            w,
+            h,
+            png::ColorType::Indexed,
+            png::BitDepth::Eight,
+            Some(&palette_bytes),
+            trns.as_deref(),
+            1,
+            |y| &indices[y as usize * w as usize..(y as usize + 1) * w as usize],
+        );
+    }
     let mut buf = Vec::new();
     let mut encoder = png::Encoder::new(&mut buf, w, h);
     encoder.set_color(png::ColorType::Indexed);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_palette(palette_bytes);
-    // tRNS is omitted when every entry is opaque: the chunk
-    // would carry no information.
-    if trns_bytes.iter().any(|a| *a != 0xFF) {
-        encoder.set_trns(trns_bytes);
+    if let Some(trns) = trns {
+        encoder.set_trns(trns);
     }
     let mut writer = encoder
         .write_header()
@@ -3760,6 +3826,196 @@ fn encode_png_indexed(src: &EncodeBuffers<'_>, max_colors: u16) -> Result<Vec<u8
         .map_err(|e| encode_err(&e.to_string()))?;
     writer.finish().map_err(|e| encode_err(&e.to_string()))?;
     Ok(buf)
+}
+
+/// The seven Adam7 passes as (first x, first y, x step,
+/// y step): the order interlaced PNG data is stored in.
+const ADAM7_PASSES: [(u32, u32, u32, u32); 7] = [
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+];
+
+/// The filtered data stream of an interlaced PNG: Adam7
+/// pass rows in storage order, each prefixed with its
+/// filter byte. Rows use the Sub filter (each byte stored
+/// as the difference from the byte one pixel back), the
+/// simple choice that keeps interlaced output compact
+/// without a per-row search. `row` returns the full row
+/// `y` of the source at `bytes_per_pixel` per pixel.
+fn adam7_filtered_stream<'a>(
+    w: u32,
+    h: u32,
+    bytes_per_pixel: usize,
+    row: impl Fn(u32) -> &'a [u8],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let mut pass_row: Vec<u8> = Vec::new();
+    for (x0, y0, dx, dy) in ADAM7_PASSES {
+        if w <= x0 || h <= y0 {
+            continue;
+        }
+        let mut y = y0;
+        while y < h {
+            let full = row(y);
+            pass_row.clear();
+            let mut x = x0;
+            while x < w {
+                let start = x as usize * bytes_per_pixel;
+                pass_row.extend_from_slice(&full[start..start + bytes_per_pixel]);
+                x += dx;
+            }
+            stream.push(1u8); // Sub
+            for (i, byte) in pass_row.iter().enumerate() {
+                let left = if i >= bytes_per_pixel {
+                    pass_row[i - bytes_per_pixel]
+                } else {
+                    0
+                };
+                stream.push(byte.wrapping_sub(left));
+            }
+            y += dy;
+        }
+    }
+    stream
+}
+
+/// The PNG chunk CRC (CRC-32 over the chunk type and data),
+/// table-driven.
+const fn png_crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+}
+
+fn png_crc32(kind: &[u8; 4], data: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = png_crc_table();
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in kind.iter().chain(data.iter()) {
+        crc = TABLE[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&png_crc32(kind, data).to_be_bytes());
+}
+
+/// Assemble an interlaced PNG by hand (issue #319). The
+/// png crate's encoder cannot write one: it stamps the
+/// IHDR interlace byte but lays filter bytes out at
+/// full-width row boundaries, which corrupts the pass
+/// stream (proven by the round-trip test). Here the file
+/// is signature, IHDR (interlace method 1), the optional
+/// palette chunks, one IDAT with the deflated pass stream
+/// from [`adam7_filtered_stream`], and IEND.
+#[allow(clippy::too_many_arguments)]
+fn assemble_interlaced_png<'a>(
+    w: u32,
+    h: u32,
+    color: png::ColorType,
+    depth: png::BitDepth,
+    palette: Option<&[u8]>,
+    trns: Option<&[u8]>,
+    bytes_per_pixel: usize,
+    row: impl Fn(u32) -> &'a [u8],
+) -> Result<Vec<u8>, EngineError> {
+    use std::io::Write;
+    let encode_err = |msg: &str| EngineError::Encode(format!("png: {msg}"));
+    let stream = adam7_filtered_stream(w, h, bytes_per_pixel, row);
+    let mut idat = Vec::new();
+    {
+        let mut compressor =
+            flate2::write::ZlibEncoder::new(&mut idat, flate2::Compression::default());
+        compressor
+            .write_all(&stream)
+            .map_err(|e| encode_err(&e.to_string()))?;
+        compressor
+            .finish()
+            .map_err(|e| encode_err(&e.to_string()))?;
+    }
+    let color_byte = match color {
+        png::ColorType::Grayscale => 0,
+        png::ColorType::Rgb => 2,
+        png::ColorType::Indexed => 3,
+        png::ColorType::GrayscaleAlpha => 4,
+        png::ColorType::Rgba => 6,
+    };
+    let depth_byte = match depth {
+        png::BitDepth::One => 1,
+        png::BitDepth::Two => 2,
+        png::BitDepth::Four => 4,
+        png::BitDepth::Eight => 8,
+        png::BitDepth::Sixteen => 16,
+    };
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[depth_byte, color_byte, 0, 0, 1]);
+    let mut out = Vec::with_capacity(idat.len() + 64);
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    write_png_chunk(&mut out, b"IHDR", &ihdr);
+    if let Some(palette) = palette {
+        write_png_chunk(&mut out, b"PLTE", palette);
+    }
+    if let Some(trns) = trns {
+        write_png_chunk(&mut out, b"tRNS", trns);
+    }
+    write_png_chunk(&mut out, b"IDAT", &idat);
+    write_png_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+/// Encode an interlaced (Adam7) PNG (issue #319), assembled
+/// by hand through [`assemble_interlaced_png`]: neither the
+/// image crate's PNG encoder nor the png crate's writer can
+/// lay out an interlaced data stream.
+fn encode_png_interlaced(src: &EncodeBuffers<'_>) -> Result<Vec<u8>, EngineError> {
+    let encode_err = |msg: &str| EngineError::Encode(format!("png: {msg}"));
+    let img = src.img;
+    let (w, h) = (img.width(), img.height());
+    let color = ExtendedColorType::from(img.color());
+    let (png_color, depth, bytes_per_pixel) = match color {
+        ExtendedColorType::L8 => (png::ColorType::Grayscale, png::BitDepth::Eight, 1),
+        ExtendedColorType::La8 => (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight, 2),
+        ExtendedColorType::Rgb8 => (png::ColorType::Rgb, png::BitDepth::Eight, 3),
+        ExtendedColorType::Rgba8 => (png::ColorType::Rgba, png::BitDepth::Eight, 4),
+        ExtendedColorType::L16 => (png::ColorType::Grayscale, png::BitDepth::Sixteen, 2),
+        ExtendedColorType::La16 => (png::ColorType::GrayscaleAlpha, png::BitDepth::Sixteen, 4),
+        ExtendedColorType::Rgb16 => (png::ColorType::Rgb, png::BitDepth::Sixteen, 6),
+        ExtendedColorType::Rgba16 => (png::ColorType::Rgba, png::BitDepth::Sixteen, 8),
+        other => {
+            return Err(encode_err(&format!(
+                "interlace is not available for color type {other:?}"
+            )));
+        }
+    };
+    let pixels = img.as_bytes();
+    let row_len = w as usize * bytes_per_pixel;
+    assemble_interlaced_png(w, h, png_color, depth, None, None, bytes_per_pixel, |y| {
+        &pixels[y as usize * row_len..(y as usize + 1) * row_len]
+    })
 }
 
 /// Encode WebP. Quality below 100 is a lossy VP8 encode via
@@ -3775,9 +4031,41 @@ fn encode_png_indexed(src: &EncodeBuffers<'_>, max_colors: u16) -> Result<Vec<u8
 /// the image crate's lossless VP8L encode (libwebp lossless
 /// measured about 92x slower, so it stays). The default
 /// quality is 80, like the other lossy formats.
-fn encode_webp(src: &EncodeBuffers<'_>, quality: Option<u8>) -> Result<Vec<u8>, EngineError> {
+fn encode_webp(
+    src: &EncodeBuffers<'_>,
+    quality: Option<u8>,
+    format_options: FormatOptions,
+) -> Result<Vec<u8>, EngineError> {
     let img = src.img;
     let q = quality.unwrap_or(80);
+    if q >= 100 && !format_options.is_empty() {
+        // Options were named, so the lossless encode goes
+        // through libwebp too: its method is the effort
+        // control the image crate's lossless encoder does not
+        // expose. Without options the standing image-crate
+        // lossless encode stands (the comment above has the
+        // measurement behind that split).
+        if img.width() > 16383 || img.height() > 16383 {
+            return Err(EngineError::Encode(
+                "webp: dimension exceeds the 16383 format limit".into(),
+            ));
+        }
+        let encoder = if img.color().has_alpha() {
+            webp::Encoder::from_rgba(src.rgba().as_raw(), img.width(), img.height())
+        } else {
+            webp::Encoder::from_rgb(src.rgb().as_raw(), img.width(), img.height())
+        };
+        let mut config = webp::WebPConfig::new().map_err(|_| {
+            EngineError::Encode("webp: libwebp rejected its default configuration".into())
+        })?;
+        config.lossless = 1;
+        config.quality = 100.0;
+        config.method = format_options.webp_method.map(i32::from).unwrap_or(4);
+        let encoded = encoder
+            .encode_advanced(&config)
+            .map_err(|e| EngineError::Encode(format!("webp: {e:?}")))?;
+        return Ok(encoded.to_vec());
+    }
     if q >= 100 {
         let mut buf = Vec::new();
         image::codecs::webp::WebPEncoder::new_lossless(&mut buf)
@@ -3807,7 +4095,10 @@ fn encode_webp(src: &EncodeBuffers<'_>, quality: Option<u8>) -> Result<Vec<u8>, 
         EngineError::Encode("webp: libwebp rejected its default configuration".into())
     })?;
     config.quality = q as f32;
-    config.method = 4;
+    config.method = format_options.webp_method.map(i32::from).unwrap_or(4);
+    if let Some(sns) = format_options.webp_sns {
+        config.sns_strength = i32::from(sns);
+    }
     let encoded = encoder
         .encode_advanced(&config)
         .map_err(|e| EngineError::Encode(format!("webp: {e:?}")))?;
@@ -4328,6 +4619,7 @@ fn apply_fit_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::url::FormatSpec;
     use crate::url::{Align, Filter, ImageFormat, Quality};
     use image::GenericImageView;
 
@@ -4584,7 +4876,7 @@ mod tests {
         let engine = Engine;
         let filters = |q| {
             vec![Operation::Filters(vec![
-                Filter::Format(ImageFormat::Jpeg),
+                Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                 Filter::Quality(Quality::Value(q)),
             ])]
         };
@@ -4686,7 +4978,7 @@ mod tests {
                 &src,
                 &[Operation::Filters(vec![
                     Filter::Radius([10, 10, 10, 10]),
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                 ])],
             )
             .unwrap_err();
@@ -4700,7 +4992,7 @@ mod tests {
                 &src,
                 &[Operation::Filters(vec![
                     Filter::Mask(crate::url::MaskShape::Circle),
-                    Filter::Format(ImageFormat::Gif),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Gif)),
                 ])],
             )
             .unwrap_err();
@@ -4715,7 +5007,7 @@ mod tests {
                 &src,
                 &[Operation::Filters(vec![
                     Filter::Radius([10, 10, 10, 10]),
-                    Filter::Format(ImageFormat::Png),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Png)),
                 ])],
             )
             .unwrap();
@@ -4728,7 +5020,7 @@ mod tests {
                 &src,
                 &[Operation::Filters(vec![
                     Filter::Border(3, [0, 255, 0]),
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                 ])],
             )
             .unwrap();
@@ -4742,7 +5034,9 @@ mod tests {
         let out = engine
             .process(
                 &solid_png(100, 60, [10, 20, 30]),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jpeg,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Jpeg);
@@ -4755,7 +5049,9 @@ mod tests {
         let out = engine
             .process(
                 &jpeg.into_inner(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Png,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Png);
@@ -4770,7 +5066,10 @@ mod tests {
                 &gradient_png(),
                 &[
                     size_op(Dimension::Pixels(32), Dimension::Pixels(32)),
-                    Operation::Filters(vec![Filter::Grayscale, Filter::Format(ImageFormat::Jpeg)]),
+                    Operation::Filters(vec![
+                        Filter::Grayscale,
+                        Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
+                    ]),
                 ],
             )
             .unwrap();
@@ -4790,7 +5089,7 @@ mod tests {
                 &[Operation::Filters(vec![
                     Filter::Blur(1.5),
                     Filter::Invert,
-                    Filter::Format(ImageFormat::Png),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Png)),
                 ])],
             )
             .unwrap();
@@ -4815,19 +5114,28 @@ mod tests {
         };
         // The filter composes with resize and a format
         // directive like any other pixel filter.
-        let noisy = run(vec![Filter::Noise(60), Filter::Format(ImageFormat::Png)]);
+        let noisy = run(vec![
+            Filter::Noise(60),
+            Filter::Format(FormatSpec::plain(ImageFormat::Png)),
+        ]);
         assert_eq!(noisy.format, ImageFormat::Png);
         let decoded = image::load_from_memory(&noisy.bytes).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (32, 32));
         // The same request renders the same bytes on a
         // second run: the field is seeded from content.
-        let again = run(vec![Filter::Noise(60), Filter::Format(ImageFormat::Png)]);
+        let again = run(vec![
+            Filter::Noise(60),
+            Filter::Format(FormatSpec::plain(ImageFormat::Png)),
+        ]);
         assert_eq!(noisy.bytes, again.bytes);
         // And it is not the clean image.
-        let clean = run(vec![Filter::Format(ImageFormat::Png)]);
+        let clean = run(vec![Filter::Format(FormatSpec::plain(ImageFormat::Png))]);
         assert_ne!(noisy.bytes, clean.bytes);
         // Amount 0 is a byte-identical no-op end to end.
-        let zero = run(vec![Filter::Noise(0), Filter::Format(ImageFormat::Png)]);
+        let zero = run(vec![
+            Filter::Noise(0),
+            Filter::Format(FormatSpec::plain(ImageFormat::Png)),
+        ]);
         assert_eq!(zero.bytes, clean.bytes);
     }
 
@@ -4837,7 +5145,9 @@ mod tests {
         let out = engine
             .process(
                 &gradient_png(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jxl,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Jxl);
@@ -4851,7 +5161,9 @@ mod tests {
         let jxl = engine
             .process(
                 &gradient_png(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jxl,
+                ))])],
             )
             .unwrap();
         // The JXL output becomes the source: resize with no format
@@ -4876,7 +5188,7 @@ mod tests {
                     &gradient_png(),
                     &[Operation::Filters(vec![
                         Filter::Quality(Quality::Value(q)),
-                        Filter::Format(ImageFormat::Jxl),
+                        Filter::Format(FormatSpec::plain(ImageFormat::Jxl)),
                     ])],
                 )
                 .unwrap()
@@ -4907,7 +5219,7 @@ mod tests {
         let engine = Engine;
         let ops = &[Operation::Filters(vec![
             Filter::Quality(Quality::Auto),
-            Filter::Format(ImageFormat::Jpeg),
+            Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
         ])];
         let flat = engine.process(&flat_png(), ops).unwrap();
         assert_eq!(flat.quality, Some(50));
@@ -4944,7 +5256,9 @@ mod tests {
         let out = engine
             .process(
                 &p3_png(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Png,
+                ))])],
             )
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
@@ -4972,7 +5286,7 @@ mod tests {
                 &p3_png(),
                 &[Operation::Filters(vec![
                     Filter::KeepProfile,
-                    Filter::Format(ImageFormat::Png),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Png)),
                 ])],
             )
             .unwrap();
@@ -4997,7 +5311,9 @@ mod tests {
         let out = engine
             .process(
                 &jpg,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Png,
+                ))])],
             )
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
@@ -5108,7 +5424,9 @@ mod tests {
         let out = engine
             .process_preferred(
                 &gradient_png(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jpeg,
+                ))])],
                 ctx,
             )
             .unwrap();
@@ -5119,7 +5437,7 @@ mod tests {
             .process_preferred(
                 &gradient_png(),
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                     Filter::Quality(Quality::Value(90)),
                 ])],
                 ProcessContext {
@@ -5133,7 +5451,9 @@ mod tests {
         let out = engine
             .process_preferred(
                 &gradient_png(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Png,
+                ))])],
                 ProcessContext {
                     save_data: true,
                     ..Default::default()
@@ -5163,7 +5483,7 @@ mod tests {
         let engine = Engine;
         let ops = &[Operation::Filters(vec![
             Filter::Quality(Quality::Auto),
-            Filter::Format(ImageFormat::Jpeg),
+            Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
         ])];
         // The photo surrogate is ordinary content for the metric:
         // the loop must land it at or above the target.
@@ -5188,7 +5508,7 @@ mod tests {
                 &photo_like_png(),
                 &[Operation::Filters(vec![
                     Filter::Quality(Quality::Auto),
-                    Filter::Format(ImageFormat::Jxl),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jxl)),
                 ])],
             )
             .unwrap();
@@ -5208,7 +5528,7 @@ mod tests {
                 &gradient_png(),
                 &[Operation::Filters(vec![
                     Filter::Quality(Quality::Auto),
-                    Filter::Format(ImageFormat::WebP),
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
                 ])],
             )
             .unwrap();
@@ -5343,7 +5663,9 @@ mod tests {
         let out = engine
             .process(
                 &gradient_png(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Avif)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Avif,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Avif);
@@ -5395,7 +5717,7 @@ mod tests {
                     &gradient_png(),
                     &[Operation::Filters(vec![
                         Filter::Quality(Quality::Value(q)),
-                        Filter::Format(ImageFormat::Avif),
+                        Filter::Format(FormatSpec::plain(ImageFormat::Avif)),
                     ])],
                 )
                 .unwrap()
@@ -5420,7 +5742,9 @@ mod tests {
         let out = engine
             .process_preferred(
                 &gradient_png(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Png,
+                ))])],
                 ProcessContext {
                     preferred: Some(ImageFormat::WebP),
                     ..Default::default()
@@ -6444,7 +6768,7 @@ mod tests {
                 &src,
                 &[
                     Operation::DebugFocal,
-                    Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)]),
+                    Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::Mp4))]),
                 ],
                 ProcessContext {
                     video_encoder: Some(&encoder),
@@ -6548,7 +6872,9 @@ mod tests {
         let control = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jpeg,
+                ))])],
             )
             .unwrap();
         assert!(
@@ -6560,7 +6886,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                     Filter::MaxBytes(5000),
                 ])],
             )
@@ -6589,7 +6915,9 @@ mod tests {
         let out = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::WebP)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::WebP,
+                ))])],
             )
             .unwrap();
         assert_eq!(webp_chunk(&out.bytes), "VP8 ");
@@ -6599,7 +6927,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::WebP),
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
                     Filter::Quality(Quality::Value(100)),
                 ])],
             )
@@ -6621,7 +6949,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::WebP),
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
                     Filter::Quality(Quality::Value(100)),
                 ])],
             )
@@ -6640,7 +6968,7 @@ mod tests {
                 .process(
                     &src,
                     &[Operation::Filters(vec![
-                        Filter::Format(ImageFormat::WebP),
+                        Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
                         Filter::Quality(Quality::Value(q)),
                     ])],
                 )
@@ -6665,7 +6993,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::WebP),
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
                     Filter::Quality(Quality::Value(80)),
                 ])],
             )
@@ -6687,7 +7015,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::WebP),
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
                     Filter::Quality(Quality::Value(80)),
                 ])],
             )
@@ -6717,7 +7045,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::WebP),
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
                     Filter::Quality(Quality::Value(90)),
                 ])],
             )
@@ -6743,7 +7071,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::WebP),
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
                     Filter::MaxBytes(4000),
                 ])],
             )
@@ -6785,7 +7113,9 @@ mod tests {
         let out = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jpeg,
+                ))])],
             )
             .unwrap();
         let sampling = jpeg_sof_sampling(&out.bytes);
@@ -6860,7 +7190,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                     Filter::Fill([0, 0, 255]),
                 ])],
             )
@@ -6872,7 +7202,9 @@ mod tests {
         let out = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jpeg,
+                ))])],
             )
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
@@ -7008,7 +7340,9 @@ mod tests {
         let engine = Engine;
         let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
         let mut ops = aggregate_overflow_ops();
-        ops.push(Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)]));
+        ops.push(Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+            ImageFormat::Mp4,
+        ))]));
         let err = engine
             .process_preferred(
                 &aggregate_overflow_gif(),
@@ -7080,6 +7414,363 @@ mod tests {
         assert!(engine.process(&src, &at_cap).is_ok());
     }
 
+    /// A varied 48x32 RGB image: flat images make encoder
+    /// options invisible, gradients and edges do not.
+    fn gradient_image() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(48, 32, |x, y| {
+            image::Rgb([
+                ((x * 5 + y * 3) % 256) as u8,
+                ((x * x + y * 7) % 256) as u8,
+                ((x * 11 + y * y) % 256) as u8,
+            ])
+        }))
+    }
+
+    fn gradient_png_small() -> Vec<u8> {
+        let mut buf = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(
+                gradient_image().as_bytes(),
+                48,
+                32,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn default_format_options_reproduce_the_standing_encoders() {
+        // Byte identity for existing URLs, proven against the
+        // encoders configured exactly as the pre-options code
+        // configured them (issue #319's defaults rule).
+        let img = gradient_image();
+        let src = EncodeBuffers::new(&img);
+
+        // JPEG: jpeg-encoder at quality 80, 4:2:0, baseline.
+        let rgb = img.to_rgb8();
+        let mut legacy = Vec::new();
+        let mut enc = jpeg_encoder::Encoder::new(&mut legacy, 80);
+        enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+        enc.encode(rgb.as_raw(), 48, 32, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        let now = encode(
+            &src,
+            ImageFormat::Jpeg,
+            Some(80),
+            None,
+            None,
+            FormatOptions::default(),
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        assert_eq!(now, legacy, "jpeg default encode changed");
+
+        // WebP lossy: libwebp, quality 80, method 4, no SNS
+        // override.
+        let mut config = webp::WebPConfig::new().unwrap();
+        config.quality = 80.0;
+        config.method = 4;
+        let legacy = webp::Encoder::from_rgb(rgb.as_raw(), 48, 32)
+            .encode_advanced(&config)
+            .unwrap()
+            .to_vec();
+        let now = encode(
+            &src,
+            ImageFormat::WebP,
+            Some(80),
+            None,
+            None,
+            FormatOptions::default(),
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        assert_eq!(now, legacy, "webp default encode changed");
+
+        // PNG: the image crate's encoder, untouched.
+        let mut legacy = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut legacy)
+            .write_image(img.as_bytes(), 48, 32, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let now = encode(
+            &src,
+            ImageFormat::Png,
+            None,
+            None,
+            None,
+            FormatOptions::default(),
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        assert_eq!(now, legacy, "png default encode changed");
+    }
+
+    #[test]
+    fn jpeg_options_change_the_encode() {
+        let img = gradient_image();
+        let src = EncodeBuffers::new(&img);
+        let encode_with = |options: FormatOptions| {
+            encode(
+                &src,
+                ImageFormat::Jpeg,
+                Some(80),
+                None,
+                None,
+                options,
+                DEFAULT_AVIF_SPEED,
+                DEFAULT_JXL_SPEED,
+            )
+            .unwrap()
+        };
+        let baseline = encode_with(FormatOptions::default());
+        let progressive = encode_with(FormatOptions {
+            jpeg_progressive: true,
+            ..FormatOptions::default()
+        });
+        assert_ne!(progressive, baseline);
+        // Progressive output is still a JPEG of the same size
+        // class and dimensions.
+        assert_eq!(decode_dims(&progressive), (48, 32));
+        let s444 = encode_with(FormatOptions {
+            jpeg_subsampling: Some(Subsampling::S444),
+            ..FormatOptions::default()
+        });
+        assert_ne!(s444, baseline);
+        assert_eq!(decode_dims(&s444), (48, 32));
+        let s422 = encode_with(FormatOptions {
+            jpeg_subsampling: Some(Subsampling::S422),
+            ..FormatOptions::default()
+        });
+        assert_ne!(s422, baseline);
+        assert_ne!(s422, s444);
+        // Spelling the standing behavior changes nothing.
+        let s420 = encode_with(FormatOptions {
+            jpeg_subsampling: Some(Subsampling::S420),
+            ..FormatOptions::default()
+        });
+        assert_eq!(s420, baseline);
+    }
+
+    #[test]
+    fn png_interlace_marks_the_file_and_round_trips() {
+        let img = gradient_image();
+        let src = EncodeBuffers::new(&img);
+        let plain = encode(
+            &src,
+            ImageFormat::Png,
+            None,
+            None,
+            None,
+            FormatOptions::default(),
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        // IHDR: 8 signature + 4 length + 4 type + 4 width +
+        // 4 height + 1 depth + 1 color type, then interlace.
+        assert_eq!(plain[28], 0);
+        let interlaced = encode(
+            &src,
+            ImageFormat::Png,
+            None,
+            None,
+            None,
+            FormatOptions {
+                png_interlace: true,
+                ..FormatOptions::default()
+            },
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        assert_eq!(interlaced[28], 1, "IHDR interlace byte must be Adam7");
+        let decoded = image::load_from_memory(&interlaced).unwrap();
+        assert_eq!(decoded.to_rgb8(), img.to_rgb8());
+        // The indexed path interlaces too.
+        let indexed = encode_png_indexed(&src, 64, true).unwrap();
+        assert_eq!(indexed[28], 1);
+        let decoded = image::load_from_memory(&indexed).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (48, 32));
+    }
+
+    #[test]
+    fn webp_options_change_the_encode() {
+        let img = gradient_image();
+        let src = EncodeBuffers::new(&img);
+        let encode_with = |options: FormatOptions| {
+            encode(
+                &src,
+                ImageFormat::WebP,
+                Some(80),
+                None,
+                None,
+                options,
+                DEFAULT_AVIF_SPEED,
+                DEFAULT_JXL_SPEED,
+            )
+            .unwrap()
+        };
+        let baseline = encode_with(FormatOptions::default());
+        let method0 = encode_with(FormatOptions {
+            webp_method: Some(0),
+            ..FormatOptions::default()
+        });
+        assert_ne!(method0, baseline);
+        let method6 = encode_with(FormatOptions {
+            webp_method: Some(6),
+            ..FormatOptions::default()
+        });
+        assert_ne!(method6, baseline);
+        assert_ne!(method6, method0);
+        let sns0 = encode_with(FormatOptions {
+            webp_sns: Some(0),
+            ..FormatOptions::default()
+        });
+        let sns100 = encode_with(FormatOptions {
+            webp_sns: Some(100),
+            ..FormatOptions::default()
+        });
+        assert_ne!(sns0, sns100);
+        // Lossless with a method option goes through libwebp
+        // and still decodes to the same pixels.
+        let lossless = encode(
+            &src,
+            ImageFormat::WebP,
+            Some(100),
+            None,
+            None,
+            FormatOptions {
+                webp_method: Some(6),
+                ..FormatOptions::default()
+            },
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        let decoded = image::load_from_memory(&lossless).unwrap();
+        assert_eq!(decoded.to_rgb8(), img.to_rgb8());
+    }
+
+    #[test]
+    fn format_options_do_not_leak_across_formats() {
+        let img = gradient_image();
+        let src = EncodeBuffers::new(&img);
+        // WebP and PNG fields set while encoding a JPEG: the
+        // JPEG encode must be the default one.
+        let jpeg = encode(
+            &src,
+            ImageFormat::Jpeg,
+            Some(80),
+            None,
+            None,
+            FormatOptions {
+                webp_method: Some(0),
+                webp_sns: Some(0),
+                png_interlace: true,
+                ..FormatOptions::default()
+            },
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        let jpeg_default = encode(
+            &src,
+            ImageFormat::Jpeg,
+            Some(80),
+            None,
+            None,
+            FormatOptions::default(),
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        assert_eq!(jpeg, jpeg_default);
+        // JPEG fields set while encoding a PNG.
+        let png = encode(
+            &src,
+            ImageFormat::Png,
+            None,
+            None,
+            None,
+            FormatOptions {
+                jpeg_progressive: true,
+                jpeg_subsampling: Some(Subsampling::S444),
+                ..FormatOptions::default()
+            },
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        let png_default = encode(
+            &src,
+            ImageFormat::Png,
+            None,
+            None,
+            None,
+            FormatOptions::default(),
+            DEFAULT_AVIF_SPEED,
+            DEFAULT_JXL_SPEED,
+        )
+        .unwrap();
+        assert_eq!(png, png_default);
+    }
+
+    #[test]
+    fn per_format_quality_applies_after_format_negotiation() {
+        let engine = Engine;
+        let source = gradient_png_small();
+        let quality = Filter::Quality(Quality::PerFormat(vec![
+            (Some(ImageFormat::Jpeg), crate::url::QualityValue::Value(30)),
+            (Some(ImageFormat::WebP), crate::url::QualityValue::Value(95)),
+        ]));
+        let as_webp = engine
+            .process(
+                &source,
+                &[
+                    Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::WebP))]),
+                    Operation::Filters(vec![quality.clone()]),
+                ],
+            )
+            .unwrap()
+            .bytes;
+        let webp_95 = engine
+            .process(
+                &source,
+                &[Operation::Filters(vec![
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
+                    Filter::Quality(Quality::Value(95)),
+                ])],
+            )
+            .unwrap()
+            .bytes;
+        assert_eq!(as_webp, webp_95, "webp entry must win for webp output");
+        let as_jpeg = engine
+            .process(
+                &source,
+                &[
+                    Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::Jpeg))]),
+                    Operation::Filters(vec![quality]),
+                ],
+            )
+            .unwrap()
+            .bytes;
+        let jpeg_30 = engine
+            .process(
+                &source,
+                &[Operation::Filters(vec![
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
+                    Filter::Quality(Quality::Value(30)),
+                ])],
+            )
+            .unwrap()
+            .bytes;
+        assert_eq!(as_jpeg, jpeg_30, "jpeg entry must win for jpeg output");
+        assert_ne!(as_jpeg, as_webp);
+    }
+
     #[test]
     fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
         let img = DynamicImage::ImageRgb8(image::RgbImage::new(24, 16));
@@ -7089,6 +7780,7 @@ mod tests {
             Some(80),
             None,
             None,
+            FormatOptions::default(),
             DEFAULT_AVIF_SPEED,
             DEFAULT_JXL_SPEED,
         )
@@ -7117,7 +7809,7 @@ mod tests {
         let engine = Engine;
         let src = png_bytes(&photo_like_rgb(96, 96));
         let ops = [Operation::Filters(vec![
-            Filter::Format(ImageFormat::Png),
+            Filter::Format(FormatSpec::plain(ImageFormat::Png)),
             Filter::Palette(16),
         ])];
         let out = engine.process(&src, &ops).unwrap();
@@ -7153,7 +7845,9 @@ mod tests {
         let full = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Png,
+                ))])],
             )
             .unwrap();
         assert_ne!(full.bytes[25], 3);
@@ -7173,7 +7867,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::Png),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Png)),
                     Filter::Palette(16),
                 ])],
             )
@@ -7199,7 +7893,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                     Filter::Palette(16),
                 ])],
             )
@@ -7235,7 +7929,9 @@ mod tests {
         let out = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Gif)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Gif,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Gif);
@@ -7275,7 +7971,9 @@ mod tests {
         let out = engine
             .process(
                 &colorful_transparent_png(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Gif)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Gif,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Gif);
@@ -7371,7 +8069,9 @@ mod tests {
         let out = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Png)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Png,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Png);
@@ -7402,7 +8102,9 @@ mod tests {
         let out = engine
             .process_preferred(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jxl,
+                ))])],
                 ProcessContext {
                     preferred: Some(ImageFormat::Jxl),
                     ..Default::default()
@@ -7743,7 +8445,7 @@ mod tests {
                         flip_horizontal: false,
                         flip_vertical: false,
                     }),
-                    Operation::Filters(vec![Filter::Format(ImageFormat::Png)]),
+                    Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::Png))]),
                 ],
             )
             .unwrap();
@@ -7977,7 +8679,9 @@ mod tests {
         let out = engine
             .process_preferred(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Mp4,
+                ))])],
                 ProcessContext {
                     video_encoder: Some(&encoder),
                     ..Default::default()
@@ -7998,7 +8702,9 @@ mod tests {
         let out = engine
             .process_preferred(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::WebM)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::WebM,
+                ))])],
                 ProcessContext {
                     video_encoder: Some(&encoder),
                     ..Default::default()
@@ -8019,7 +8725,7 @@ mod tests {
                 &src,
                 &[
                     size_op(Dimension::Pixels(20), Dimension::Pixels(10)),
-                    Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)]),
+                    Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::Mp4))]),
                 ],
                 ProcessContext {
                     video_encoder: Some(&encoder),
@@ -8051,7 +8757,9 @@ mod tests {
             let err = engine
                 .process_preferred(
                     &src,
-                    &[Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)])],
+                    &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                        ImageFormat::Mp4,
+                    ))])],
                     ctx.clone(),
                 )
                 .unwrap_err();
@@ -8068,7 +8776,9 @@ mod tests {
         let err = engine
             .process(
                 &animated_gif_bytes(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Mp4,
+                ))])],
             )
             .unwrap_err();
         assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
@@ -8079,7 +8789,9 @@ mod tests {
         let err = engine
             .process(
                 &png_bytes(&DynamicImage::new_rgb8(20, 12)),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::WebM)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::WebM,
+                ))])],
             )
             .unwrap_err();
         assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
@@ -8093,7 +8805,9 @@ mod tests {
         let err = engine
             .process_preferred(
                 &animated_gif_bytes(),
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Mp4)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Mp4,
+                ))])],
                 ProcessContext {
                     video_encoder: Some(&encoder),
                     ..Default::default()
@@ -8291,6 +9005,7 @@ mod tests {
             frames,
             0,
             None,
+            FormatOptions::default(),
             Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
         )
         .unwrap_err();
@@ -8359,7 +9074,9 @@ mod tests {
         let out = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Gif)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Gif,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Gif);
@@ -8376,7 +9093,9 @@ mod tests {
         let out = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jpeg)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jpeg,
+                ))])],
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Jpeg);
@@ -8409,7 +9128,9 @@ mod tests {
         let out = engine
             .process_preferred(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Jxl)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Jxl,
+                ))])],
                 ProcessContext {
                     preferred: Some(ImageFormat::Jxl),
                     ..Default::default()
@@ -8826,7 +9547,7 @@ mod tests {
                 &red_source(),
                 &[Operation::Filters(vec![
                     Filter::RemoveBg,
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                 ])],
                 ctx(),
             )
@@ -8939,7 +9660,7 @@ mod tests {
                 &product_source(),
                 &[Operation::Filters(vec![
                     Filter::Studio(studio_spec()),
-                    Filter::Format(ImageFormat::Png),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Png)),
                 ])],
                 ProcessContext {
                     mask_provider: Some(&SquareMask),
@@ -8999,7 +9720,7 @@ mod tests {
                         mode: crate::url::StudioMode::Scene,
                         ..crate::url::StudioSpec::default()
                     }),
-                    Filter::Format(ImageFormat::Png),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Png)),
                 ])],
                 ProcessContext {
                     mask_provider: Some(&SquareMask),
@@ -9034,7 +9755,7 @@ mod tests {
                 &product_source(),
                 &[Operation::Filters(vec![
                     Filter::Studio(studio_spec()),
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                 ])],
                 ProcessContext {
                     mask_provider: Some(&SquareMask),
@@ -11259,7 +11980,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                     Filter::Quality(Quality::Value(1)),
                 ])],
             )
@@ -11268,7 +11989,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                     Filter::Quality(Quality::Value(95)),
                     Filter::MaxBytes(1),
                 ])],
@@ -11289,7 +12010,7 @@ mod tests {
                 .process(
                     &src,
                     &[Operation::Filters(vec![
-                        Filter::Format(ImageFormat::Jpeg),
+                        Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                         Filter::Quality(Quality::Value(q)),
                     ])],
                 )
@@ -11303,7 +12024,7 @@ mod tests {
             .process(
                 &src,
                 &[Operation::Filters(vec![
-                    Filter::Format(ImageFormat::Jpeg),
+                    Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
                     Filter::Quality(Quality::Value(95)),
                     Filter::MaxBytes(budget),
                 ])],
@@ -11336,7 +12057,9 @@ mod tests {
         let out = engine
             .process(
                 &src,
-                &[Operation::Filters(vec![Filter::Format(ImageFormat::Avif)])],
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::Avif,
+                ))])],
             )
             .unwrap();
         eprintln!(

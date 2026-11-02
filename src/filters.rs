@@ -8,14 +8,19 @@
 use image::DynamicImage;
 
 use crate::url::{
-    CurveChannel, Filter, ImageFormat, MAX_BLUR_SIGMA, MAX_EXPOSURE, MAX_GAMMA, Quality,
+    CurveChannel, Filter, FormatOptions, ImageFormat, MAX_BLUR_SIGMA, MAX_EXPOSURE, MAX_GAMMA,
+    Quality,
 };
 
 /// Encoding directives collected from filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EncodeOptions {
     /// Output container override. `None` keeps the detected source format.
     pub format: Option<ImageFormat>,
+    /// Encoder options from the format filter (issue #319).
+    /// Meaningful only when `format` is set by the same
+    /// filter; absorb keeps the two together.
+    pub format_options: FormatOptions,
     /// Encoding quality directive. `None` means the encoder default.
     pub quality: Option<Quality>,
     /// Color budget for indexed PNG output (issue #313).
@@ -39,6 +44,7 @@ impl EncodeOptions {
     pub fn absorb(&mut self, other: EncodeOptions) {
         if other.format.is_some() {
             self.format = other.format;
+            self.format_options = other.format_options;
         }
         if other.quality.is_some() {
             self.quality = other.quality;
@@ -232,10 +238,13 @@ pub fn apply_filters_filled(
             Filter::Fill(color) => options.fill = Some(*color),
             Filter::MaxBytes(n) => options.max_bytes = Some(*n),
             Filter::KeepProfile => options.keep_profile = true,
-            Filter::Quality(q) => options.quality = Some(*q),
+            Filter::Quality(q) => options.quality = Some(q.clone()),
             Filter::Palette(n) => options.palette = Some(*n),
             Filter::NoUpscale => options.no_upscale = true,
-            Filter::Format(f) => options.format = Some(*f),
+            Filter::Format(spec) => {
+                options.format = Some(spec.format);
+                options.format_options = spec.options;
+            }
         }
     }
     (img, options)
@@ -2361,6 +2370,7 @@ fn equalize(img: image::RgbImage) -> image::RgbImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::url::FormatSpec;
     use image::Rgb;
 
     fn alpha_at(img: &DynamicImage, x: u32, y: u32) -> u8 {
@@ -3109,8 +3119,8 @@ mod tests {
             &[
                 Filter::Quality(Quality::Value(10)),
                 Filter::Quality(Quality::Value(90)),
-                Filter::Format(ImageFormat::Png),
-                Filter::Format(ImageFormat::Jpeg),
+                Filter::Format(FormatSpec::plain(ImageFormat::Png)),
+                Filter::Format(FormatSpec::plain(ImageFormat::Jpeg)),
             ],
         );
         assert_eq!((img.width(), img.height()), (64, 64));
@@ -3118,6 +3128,7 @@ mod tests {
             opts,
             EncodeOptions {
                 format: Some(ImageFormat::Jpeg),
+                format_options: FormatOptions::default(),
                 quality: Some(Quality::Value(90)),
                 palette: None,
                 no_upscale: false,
@@ -3276,6 +3287,7 @@ mod tests {
         let mut base = EncodeOptions::default();
         base.absorb(EncodeOptions {
             format: Some(ImageFormat::Png),
+            format_options: FormatOptions::default(),
             quality: None,
             palette: Some(64),
             no_upscale: true,
@@ -3285,6 +3297,7 @@ mod tests {
         });
         base.absorb(EncodeOptions {
             format: None,
+            format_options: FormatOptions::default(),
             quality: Some(Quality::Value(50)),
             palette: None,
             no_upscale: false,
@@ -3297,6 +3310,7 @@ mod tests {
             EncodeOptions {
                 keep_profile: true,
                 format: Some(ImageFormat::Png),
+                format_options: FormatOptions::default(),
                 quality: Some(Quality::Value(50)),
                 palette: Some(64),
                 no_upscale: true,
