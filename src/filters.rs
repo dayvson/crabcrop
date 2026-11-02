@@ -117,6 +117,9 @@ pub fn apply_filters_filled(
             Filter::Exposure(stops) => {
                 img = exposure_correct(&img, *stops);
             }
+            Filter::HighlightsShadows(highlights, shadows) => {
+                img = highlights_shadows(&img, *highlights, *shadows);
+            }
             Filter::HueRotate(degrees) => img = huerotate_fast(img, *degrees),
             Filter::Sharpen(amount) => {
                 // Unsharp mask as a 3x3 convolution: the center is
@@ -1259,6 +1262,51 @@ fn exposure_correct(img: &DynamicImage, stops: f32) -> DynamicImage {
             lut[usize::from(r)],
             lut[usize::from(g)],
             lut[usize::from(b)],
+        ]
+    })
+}
+
+/// Clamp a tonal percent into the grammar's -100..=100
+/// range: the sanitization the tonal filters apply to
+/// values built away from the parser, mirroring how
+/// `gamma_lut` sanitizes its divisor. A non-finite value
+/// becomes 0, the identity.
+fn percent_sanitized(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-100.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
+/// Highlights and shadows (issue #317): one tonal filter
+/// with a percent argument per end of the scale. Each
+/// pixel moves by a single offset shared by its three
+/// channels (so hue survives; alpha is untouched, the
+/// `map_rgb` contract), sized by where the pixel's
+/// luminance sits: the shadows weight is `(1 - Y)^2` and
+/// the highlights weight `Y^2`, with `Y` the Rec. 601
+/// luma in 0..1. Either argument at its full 100 moves a
+/// pixel at its own end of the scale by a quarter of full
+/// scale (63.75 levels), reached only by pure black under
+/// shadows or pure white under highlights; midtones move
+/// by the blend of the two weights. The two ranges are
+/// independent by construction: the shadows argument
+/// cannot move white, nor highlights black.
+fn highlights_shadows(img: &DynamicImage, highlights: f32, shadows: f32) -> DynamicImage {
+    let highlights = percent_sanitized(highlights);
+    let shadows = percent_sanitized(shadows);
+    map_rgb(img.clone(), |r, g, b| {
+        let y = luma(r, g, b) / 255.0;
+        let shadow_weight = (1.0 - y) * (1.0 - y);
+        let highlight_weight = y * y;
+        let offset =
+            ((shadows / 100.0) * shadow_weight + (highlights / 100.0) * highlight_weight) * 63.75;
+        let shift = offset.round() as i32;
+        [
+            (i32::from(r) + shift).clamp(0, 255) as u8,
+            (i32::from(g) + shift).clamp(0, 255) as u8,
+            (i32::from(b) + shift).clamp(0, 255) as u8,
         ]
     })
 }
@@ -3399,6 +3447,114 @@ mod tests {
         }
         assert_eq!(exposure_lut(100.0), exposure_lut(MAX_EXPOSURE));
         assert_eq!(exposure_lut(-100.0), exposure_lut(-MAX_EXPOSURE));
+    }
+
+    #[test]
+    fn highlights_shadows_zero_zero_is_the_identity() {
+        let (img, _) = apply_filters(solid(200, 100, 50), &[Filter::HighlightsShadows(0.0, 0.0)]);
+        assert_eq!(first_pixel(&img), [200, 100, 50]);
+    }
+
+    #[test]
+    fn highlights_shadows_move_their_own_ends() {
+        // Pure black under full shadows lifts by the full
+        // quarter scale, 64 levels; under full highlights
+        // it does not move at all.
+        let (img, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(0.0, 100.0)]);
+        assert_eq!(first_pixel(&img), [64, 64, 64]);
+        let (img, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(100.0, 0.0)]);
+        assert_eq!(first_pixel(&img), [0, 0, 0]);
+        // Pure white under full negative highlights gives
+        // back the same 64 levels; under full shadows it
+        // does not move.
+        let (img, _) = apply_filters(
+            solid(255, 255, 255),
+            &[Filter::HighlightsShadows(-100.0, 0.0)],
+        );
+        assert_eq!(first_pixel(&img), [191, 191, 191]);
+        let (img, _) = apply_filters(
+            solid(255, 255, 255),
+            &[Filter::HighlightsShadows(0.0, 100.0)],
+        );
+        assert_eq!(first_pixel(&img), [255, 255, 255]);
+        // A mid gray feels both ends at about a quarter of
+        // their full strength (its weights are near 0.25):
+        // full shadows move 128 to 144, full negative
+        // highlights to 112.
+        let (img, _) = apply_filters(
+            solid(128, 128, 128),
+            &[Filter::HighlightsShadows(0.0, 100.0)],
+        );
+        assert_eq!(first_pixel(&img), [144, 144, 144]);
+        let (img, _) = apply_filters(
+            solid(128, 128, 128),
+            &[Filter::HighlightsShadows(-100.0, 0.0)],
+        );
+        assert_eq!(first_pixel(&img), [112, 112, 112]);
+    }
+
+    #[test]
+    fn highlights_shadows_weight_by_luminance() {
+        // A dark pixel (32) is a shadow pixel: full shadows
+        // move it 49 levels, full highlights only 1. A
+        // bright pixel (224) is the mirror image.
+        let (img, _) = apply_filters(solid(32, 32, 32), &[Filter::HighlightsShadows(0.0, 100.0)]);
+        assert_eq!(first_pixel(&img), [81, 81, 81]);
+        let (img, _) = apply_filters(solid(32, 32, 32), &[Filter::HighlightsShadows(100.0, 0.0)]);
+        assert_eq!(first_pixel(&img), [33, 33, 33]);
+        let (img, _) = apply_filters(
+            solid(224, 224, 224),
+            &[Filter::HighlightsShadows(0.0, 100.0)],
+        );
+        assert_eq!(first_pixel(&img), [225, 225, 225]);
+        let (img, _) = apply_filters(
+            solid(224, 224, 224),
+            &[Filter::HighlightsShadows(-100.0, 0.0)],
+        );
+        assert_eq!(first_pixel(&img), [175, 175, 175]);
+        // The offset is shared by the channels: a color
+        // pixel keeps its channel order and gaps up to
+        // clamping (luma of (200, 100, 50) is about 124, so
+        // full shadows shift by 17 and full highlights
+        // by 15).
+        let (img, _) = apply_filters(
+            solid(200, 100, 50),
+            &[Filter::HighlightsShadows(0.0, 100.0)],
+        );
+        assert_eq!(first_pixel(&img), [217, 117, 67]);
+        let (img, _) = apply_filters(
+            solid(200, 100, 50),
+            &[Filter::HighlightsShadows(100.0, 0.0)],
+        );
+        assert_eq!(first_pixel(&img), [215, 115, 65]);
+    }
+
+    #[test]
+    fn highlights_shadows_preserves_alpha() {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([0, 0, 0, 128]),
+        ));
+        let (out, _) = apply_filters(img, &[Filter::HighlightsShadows(0.0, 100.0)]);
+        let px = out.to_rgba8().get_pixel(0, 0).0;
+        assert_eq!(px[3], 128);
+        assert_eq!(px[0], 64);
+    }
+
+    #[test]
+    fn highlights_shadows_sanitizes_out_of_contract_values() {
+        // The parser never produces these; the engine still
+        // clamps instead of shifting by a non-finite or
+        // out-of-range amount.
+        let (img, _) = apply_filters(
+            solid(128, 128, 128),
+            &[Filter::HighlightsShadows(f32::NAN, f32::INFINITY)],
+        );
+        assert_eq!(first_pixel(&img), [128, 128, 128]);
+        let (clamped, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(0.0, 250.0)]);
+        let (at_cap, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(0.0, 100.0)]);
+        assert_eq!(first_pixel(&clamped), first_pixel(&at_cap));
     }
 
     #[test]

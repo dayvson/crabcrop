@@ -384,6 +384,10 @@ export const filter = {
     }
     return `exposure(${num(stops)})`;
   },
+  /** Highlights and shadows: two percents, each -100..100 (0 unchanged). */
+  highlightsShadows(highlights: number, shadows: number): string {
+    return `highlights_shadows(${num(floatIn("highlights_shadows highlights", highlights, -100, 100))},${num(floatIn("highlights_shadows shadows", shadows, -100, 100))})`;
+  },
   /** Rotate the hue by integer degrees. */
   hueRotate(degrees: number): string {
     return `huerotate(${intIn("huerotate degrees", degrees, -2147483648, 2147483647)})`;

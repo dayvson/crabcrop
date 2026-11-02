@@ -114,6 +114,12 @@
     "signature": "154396fc90f5357c7e9992a6ac16d23e2c988a2c759ad447b687c2e66bbb9b9a"
   },
   {
+    "description": "a highlights and shadows filter chain (issue #317)",
+    "remainder": "filters:highlights_shadows(30,-20)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "a827b69d8e70c782a1a1ff316d22b4d1fded2aeaa0e22a63a8b83f03d84f4bcb"
+  },
+  {
     "description": "a per-side trim (issue #313)",
     "remainder": "filters:trim(20,5,0,5,0)/https://example.com/photo.jpg",
     "secret": "s3cr3t",

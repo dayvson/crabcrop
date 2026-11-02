@@ -8,6 +8,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Exposure in stops (issue #317). A new `exposure(stops)` filter performs the EV-style linear-light multiply the adjustment family was missing: each channel value is decoded to linear light, multiplied by `2^stops`, and encoded back, with -10 to 10 stops accepted and 0 unchanged. A stop multiplies rather than shifts, so it behaves the same at every brightness, where `brighten` adds a fixed amount and lifts black along with everything else. The scale is stated in the open because it is not a percent: it is the photographic stop, the unit exposure is set in on a camera, so a value from a photo editor carries over as written. Black stays black at every setting and alpha is untouched. The TypeScript SDK gains an `exposure` builder, and the imgix migration guide's exposure row now converts.
 
+- Highlights and shadows (issue #317). A new `highlights_shadows(highlights,shadows)` filter adjusts the two ends of the tonal scale independently, one percent argument per end in the adjustment family's usual -100 to 100, where `contrast` moves both ends together. Each pixel moves by a single offset shared by its three channels, weighted by the pixel's luminance: the shadows weight is (1 - Y)^2 and the highlights weight is Y^2, so the shadows argument moves black most and cannot move white, the highlights argument is the mirror, and the largest shift either end can produce is a quarter of full scale. The TypeScript SDK gains a `highlightsShadows` builder, and the imgix migration guide's shadow and highlight rows now convert.
+
 ## [0.9.7] - 2026-11-01
 
 ### Added

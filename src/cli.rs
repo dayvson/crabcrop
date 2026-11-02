@@ -534,6 +534,9 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         Filter::Contrast(v) => format!("contrast({v}): adjust contrast"),
         Filter::Gamma(v) => format!("gamma({v}): apply gamma correction"),
         Filter::Exposure(v) => format!("exposure({v}): adjust exposure in stops"),
+        Filter::HighlightsShadows(h, s) => {
+            format!("highlights_shadows({h},{s}): adjust highlights and shadows")
+        }
         Filter::HueRotate(v) => format!("huerotate({v}): rotate the hue"),
         Filter::Sharpen(v) => format!("sharpen({v}): sharpen"),
         Filter::Saturation(v) => format!("saturation({v}): adjust saturation"),

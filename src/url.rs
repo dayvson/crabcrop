@@ -592,6 +592,16 @@ pub enum Filter {
     /// whose shift is additive, a stop multiplies, so it
     /// behaves the same at every brightness.
     Exposure(f32),
+    /// Highlights and shadows: one tonal filter with a
+    /// percent argument per end of the tonal scale, each
+    /// -100..=100 in the adjustment family's percent
+    /// convention (issue #317). The first argument moves
+    /// bright pixels most, the second dark pixels most,
+    /// each weighted by the pixel's luminance, so the two
+    /// ranges lift or compress independently; `contrast`
+    /// cannot express this, because it moves both ends
+    /// together. 0 in both is the identity.
+    HighlightsShadows(f32, f32),
     /// Rotate the hue, in degrees.
     HueRotate(i32),
     /// Sharpen by this amount (unsharp mask strength, > 0).
@@ -1642,6 +1652,22 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     return Err(invalid());
                 }
                 Filter::Exposure(stops)
+            }
+            ("highlights_shadows", Some(p)) => {
+                let parts: Vec<&str> = p.split(',').collect();
+                if parts.len() != 2 {
+                    return Err(invalid());
+                }
+                let highlights: f32 = parts[0].parse().map_err(|_| invalid())?;
+                let shadows: f32 = parts[1].parse().map_err(|_| invalid())?;
+                if !highlights.is_finite()
+                    || !shadows.is_finite()
+                    || !(-100.0..=100.0).contains(&highlights)
+                    || !(-100.0..=100.0).contains(&shadows)
+                {
+                    return Err(invalid());
+                }
+                Filter::HighlightsShadows(highlights, shadows)
             }
             ("huerotate", Some(p)) => {
                 let degrees: i32 = p.parse().map_err(|_| invalid())?;
@@ -2718,6 +2744,7 @@ fn filter_text(filter: &Filter) -> String {
         Filter::Contrast(v) => format!("contrast({v})"),
         Filter::Gamma(v) => format!("gamma({v})"),
         Filter::Exposure(v) => format!("exposure({v})"),
+        Filter::HighlightsShadows(h, s) => format!("highlights_shadows({h},{s})"),
         Filter::HueRotate(v) => format!("huerotate({v})"),
         Filter::Sharpen(v) => format!("sharpen({v})"),
         Filter::Saturation(v) => format!("saturation({v})"),
@@ -3520,6 +3547,10 @@ mod tests {
             ("filters:gamma(2.20)", "filters:gamma(2.2)"),
             ("filters:exposure(1.50)", "filters:exposure(1.5)"),
             ("filters:exposure(-2.0)", "filters:exposure(-2)"),
+            (
+                "filters:highlights_shadows(30.0,-20.50)",
+                "filters:highlights_shadows(30,-20.5)",
+            ),
             // Six-digit text colors gain an opaque alpha.
             (
                 "filters:text(Hi,20,ffaa00,center)",
@@ -4250,6 +4281,8 @@ mod tests {
             "filters:exposure(10)",
             "filters:exposure(-10)",
             "filters:exposure(0)",
+            "filters:highlights_shadows(100,100)",
+            "filters:highlights_shadows(-100,-100)",
             "filters:saturation(0)",
             "filters:saturation(255)",
             "filters:quality(1)",
@@ -4279,6 +4312,28 @@ mod tests {
         let (ops, _) = parse_operations("filters:exposure(-2)/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::Exposure(-2.0)])]);
         assert!(parse_operations("filters:exposure(0)/example.com/img.jpg").is_ok());
+    }
+
+    #[test]
+    fn parses_highlights_shadows_filter() {
+        let (ops, _) =
+            parse_operations("filters:highlights_shadows(30,-20)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::HighlightsShadows(
+                30.0, -20.0
+            )])]
+        );
+        // Both at 0 are the identity and parse, like
+        // contrast at 0.
+        let (ops, _) =
+            parse_operations("filters:highlights_shadows(0,0)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Filters(vec![Filter::HighlightsShadows(
+                0.0, 0.0
+            )])]
+        );
     }
 
     #[test]
@@ -4338,6 +4393,12 @@ mod tests {
             "filters:exposure(nan)",
             "filters:exposure(inf)",
             "filters:exposure()",
+            "filters:highlights_shadows(101,0)",
+            "filters:highlights_shadows(0,-101)",
+            "filters:highlights_shadows(30)",
+            "filters:highlights_shadows(1,2,3)",
+            "filters:highlights_shadows(nan,0)",
+            "filters:highlights_shadows()",
             "filters:saturation(256)",
             "filters:saturation(-1)",
             "filters:quality()",

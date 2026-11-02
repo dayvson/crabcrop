@@ -89,6 +89,8 @@ const FILTER_BLURBS = {
     "gamma correction with divisor g, 0 < g <= 10: each channel becomes 255 * (v / 255)^(1 / g) (1 is unchanged, above 1 brightens midtones)",
   exposure:
     "exposure in stops, -10..10: multiply the linear light by 2^stops (0 is unchanged, positive brightens, negative darkens)",
+  highlights_shadows:
+    "adjust the highlights and shadows ranges independently: two percents, each -100..100 (0 is unchanged)",
   huerotate: "rotate the hue by the given degrees",
   rotate: "rotate by the given angle in degrees; the canvas expands to fit",
   quality: "output quality 1..100, or `auto` for perceptual targeting",
@@ -286,6 +288,14 @@ function validateFilter(name, args) {
       return args !== null && isFloat(args) && Number(args) >= -10 && Number(args) <= 10
         ? null
         : bad;
+    case "highlights_shadows": {
+      if (args === null) return bad;
+      const parts = args.split(",");
+      return parts.length === 2 &&
+        parts.every((p) => isFloat(p) && Number(p) >= -100 && Number(p) <= 100)
+        ? null
+        : bad;
+    }
     case "saturation":
       return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 255
         ? null
