@@ -602,6 +602,15 @@ pub enum Filter {
     /// cannot express this, because it moves both ends
     /// together. 0 in both is the identity.
     HighlightsShadows(f32, f32),
+    /// Vibrance: saturation weighted inversely to the
+    /// saturation a pixel already has, in the adjustment
+    /// family's percent convention, -100..=100 (issue
+    /// #317). Muted colors gain (or lose) the most and
+    /// already-vivid colors barely move, the gentler,
+    /// skin-tone-friendly sibling of `saturation`, which
+    /// scales every pixel by the same factor. 0 is the
+    /// identity.
+    Vibrance(f32),
     /// Rotate the hue, in degrees.
     HueRotate(i32),
     /// Sharpen by this amount (unsharp mask strength, > 0).
@@ -1668,6 +1677,13 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     return Err(invalid());
                 }
                 Filter::HighlightsShadows(highlights, shadows)
+            }
+            ("vibrance", Some(p)) => {
+                let amount: f32 = p.parse().map_err(|_| invalid())?;
+                if !amount.is_finite() || !(-100.0..=100.0).contains(&amount) {
+                    return Err(invalid());
+                }
+                Filter::Vibrance(amount)
             }
             ("huerotate", Some(p)) => {
                 let degrees: i32 = p.parse().map_err(|_| invalid())?;
@@ -2745,6 +2761,7 @@ fn filter_text(filter: &Filter) -> String {
         Filter::Gamma(v) => format!("gamma({v})"),
         Filter::Exposure(v) => format!("exposure({v})"),
         Filter::HighlightsShadows(h, s) => format!("highlights_shadows({h},{s})"),
+        Filter::Vibrance(v) => format!("vibrance({v})"),
         Filter::HueRotate(v) => format!("huerotate({v})"),
         Filter::Sharpen(v) => format!("sharpen({v})"),
         Filter::Saturation(v) => format!("saturation({v})"),
@@ -3551,6 +3568,7 @@ mod tests {
                 "filters:highlights_shadows(30.0,-20.50)",
                 "filters:highlights_shadows(30,-20.5)",
             ),
+            ("filters:vibrance(40.0)", "filters:vibrance(40)"),
             // Six-digit text colors gain an opaque alpha.
             (
                 "filters:text(Hi,20,ffaa00,center)",
@@ -4283,6 +4301,8 @@ mod tests {
             "filters:exposure(0)",
             "filters:highlights_shadows(100,100)",
             "filters:highlights_shadows(-100,-100)",
+            "filters:vibrance(100)",
+            "filters:vibrance(-100)",
             "filters:saturation(0)",
             "filters:saturation(255)",
             "filters:quality(1)",
@@ -4334,6 +4354,16 @@ mod tests {
                 0.0, 0.0
             )])]
         );
+    }
+
+    #[test]
+    fn parses_vibrance_filter() {
+        let (ops, _) = parse_operations("filters:vibrance(40)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Vibrance(40.0)])]);
+        // Zero is the identity and parses, like contrast
+        // at 0.
+        let (ops, _) = parse_operations("filters:vibrance(0)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Vibrance(0.0)])]);
     }
 
     #[test]
@@ -4399,6 +4429,11 @@ mod tests {
             "filters:highlights_shadows(1,2,3)",
             "filters:highlights_shadows(nan,0)",
             "filters:highlights_shadows()",
+            "filters:vibrance(101)",
+            "filters:vibrance(-100.5)",
+            "filters:vibrance(nan)",
+            "filters:vibrance(inf)",
+            "filters:vibrance()",
             "filters:saturation(256)",
             "filters:saturation(-1)",
             "filters:quality()",

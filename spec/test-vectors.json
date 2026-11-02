@@ -120,6 +120,12 @@
     "signature": "a827b69d8e70c782a1a1ff316d22b4d1fded2aeaa0e22a63a8b83f03d84f4bcb"
   },
   {
+    "description": "a vibrance filter chain (issue #317)",
+    "remainder": "filters:vibrance(40)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "d2a8ce83c787b6590070c99a927fba250a96a1d59c3637bd97918bb479eaa2aa"
+  },
+  {
     "description": "a per-side trim (issue #313)",
     "remainder": "filters:trim(20,5,0,5,0)/https://example.com/photo.jpg",
     "secret": "s3cr3t",

@@ -91,6 +91,8 @@ const FILTER_BLURBS = {
     "exposure in stops, -10..10: multiply the linear light by 2^stops (0 is unchanged, positive brightens, negative darkens)",
   highlights_shadows:
     "adjust the highlights and shadows ranges independently: two percents, each -100..100 (0 is unchanged)",
+  vibrance:
+    "saturation weighted toward the muted colors: percent, -100..100 (0 is unchanged; vivid colors and skin tones are protected)",
   huerotate: "rotate the hue by the given degrees",
   rotate: "rotate by the given angle in degrees; the canvas expands to fit",
   quality: "output quality 1..100, or `auto` for perceptual targeting",
@@ -296,6 +298,10 @@ function validateFilter(name, args) {
         ? null
         : bad;
     }
+    case "vibrance":
+      return args !== null && isFloat(args) && Number(args) >= -100 && Number(args) <= 100
+        ? null
+        : bad;
     case "saturation":
       return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 255
         ? null

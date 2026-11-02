@@ -131,6 +131,9 @@ pub fn apply_filters_filled(
             Filter::Saturation(amount) => {
                 img = map_rgb_image(img, |rgb| saturate(rgb, *amount));
             }
+            Filter::Vibrance(amount) => {
+                img = map_rgb_image(img, |rgb| vibrance(rgb, *amount));
+            }
             Filter::Rgb(r, g, b) => {
                 img = map_rgb(img, |pr, pg, pb| {
                     [
@@ -2210,6 +2213,35 @@ fn saturate(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
     out
 }
 
+/// Vibrance (issue #317): like [`saturate`], but the
+/// factor is per pixel: `1 + (amount / 100) * (1 - s)`,
+/// where `s` is the pixel's HSV saturation in 0..1. A
+/// muted pixel (s near 0) takes nearly the full percent
+/// as its factor change; a fully saturated pixel does
+/// not move at all, which is what protects vivid colors
+/// and skin tones relative to the flat `saturation`
+/// scale. Negative percents run the same weighting in
+/// reverse, draining the muted colors first. The finish
+/// matches `saturate`: scale the distance from luma,
+/// clamp, truncate.
+fn vibrance(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
+    let amount = percent_sanitized(amount);
+    let w = out.width() as usize;
+    map_rgb_bands::<3>(out.as_mut(), w, &|r, g, b| {
+        let max = r.max(g).max(b) as f32;
+        let min = r.min(g).min(b) as f32;
+        let s = if max > 0.0 { (max - min) / max } else { 0.0 };
+        let factor = 1.0 + (amount / 100.0) * (1.0 - s);
+        let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        [
+            (luma + (r as f32 - luma) * factor).clamp(0.0, 255.0) as u8,
+            (luma + (g as f32 - luma) * factor).clamp(0.0, 255.0) as u8,
+            (luma + (b as f32 - luma) * factor).clamp(0.0, 255.0) as u8,
+        ]
+    });
+    out
+}
+
 /// Histogram equalization, independently per channel.
 fn equalize(img: image::RgbImage) -> image::RgbImage {
     let total = (img.width() * img.height()) as u64;
@@ -3554,6 +3586,61 @@ mod tests {
         assert_eq!(first_pixel(&img), [128, 128, 128]);
         let (clamped, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(0.0, 250.0)]);
         let (at_cap, _) = apply_filters(solid(0, 0, 0), &[Filter::HighlightsShadows(0.0, 100.0)]);
+        assert_eq!(first_pixel(&clamped), first_pixel(&at_cap));
+    }
+
+    #[test]
+    fn vibrance_zero_is_the_identity() {
+        let (img, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(0.0)]);
+        assert_eq!(first_pixel(&img), [140, 120, 110]);
+    }
+
+    #[test]
+    fn vibrance_weights_muted_colors_most() {
+        // (140, 120, 110) has HSV saturation about 0.214,
+        // so at +100 its factor is about 1.786 and at -100
+        // about 0.214: the full swing, in both directions.
+        let (img, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(100.0)]);
+        assert_eq!(first_pixel(&img), [151, 116, 98]);
+        let (img, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(-100.0)]);
+        assert_eq!(first_pixel(&img), [128, 123, 121]);
+        // A fully saturated pixel does not move at either
+        // extreme: its weight is zero.
+        for amount in [-100.0, 100.0] {
+            let (img, _) = apply_filters(solid(255, 0, 0), &[Filter::Vibrance(amount)]);
+            assert_eq!(first_pixel(&img), [255, 0, 0], "amount {amount}");
+        }
+        // A gray pixel has no chroma to scale and does not
+        // move either.
+        let (img, _) = apply_filters(solid(100, 100, 100), &[Filter::Vibrance(100.0)]);
+        assert_eq!(first_pixel(&img), [100, 100, 100]);
+        // Between the extremes, the more saturated pixel
+        // moves proportionally less: (200, 80, 40) has
+        // saturation 0.8, so its factor is only 1.2, where
+        // the muted pixel above took 1.786.
+        let (img, _) = apply_filters(solid(200, 80, 40), &[Filter::Vibrance(100.0)]);
+        assert_eq!(first_pixel(&img), [217, 73, 25]);
+    }
+
+    #[test]
+    fn vibrance_preserves_alpha() {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([140, 120, 110, 128]),
+        ));
+        let (out, _) = apply_filters(img, &[Filter::Vibrance(100.0)]);
+        let px = out.to_rgba8().get_pixel(0, 0).0;
+        assert_eq!(px[3], 128);
+        assert_eq!(&px[..3], &[151, 116, 98]);
+    }
+
+    #[test]
+    fn vibrance_sanitizes_out_of_contract_values() {
+        let (img, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(f32::NAN)]);
+        assert_eq!(first_pixel(&img), [140, 120, 110]);
+        let (clamped, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(250.0)]);
+        let (at_cap, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(100.0)]);
         assert_eq!(first_pixel(&clamped), first_pixel(&at_cap));
     }
 

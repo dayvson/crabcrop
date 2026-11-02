@@ -10,6 +10,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Highlights and shadows (issue #317). A new `highlights_shadows(highlights,shadows)` filter adjusts the two ends of the tonal scale independently, one percent argument per end in the adjustment family's usual -100 to 100, where `contrast` moves both ends together. Each pixel moves by a single offset shared by its three channels, weighted by the pixel's luminance: the shadows weight is (1 - Y)^2 and the highlights weight is Y^2, so the shadows argument moves black most and cannot move white, the highlights argument is the mirror, and the largest shift either end can produce is a quarter of full scale. The TypeScript SDK gains a `highlightsShadows` builder, and the imgix migration guide's shadow and highlight rows now convert.
 
+- Vibrance (issue #317). A new `vibrance(percent)` filter is the gentler sibling of `saturation`: where saturation scales every pixel's distance from its luma by one factor, vibrance weights the change by how unsaturated each pixel already is, with the factor 1 + (percent / 100) x (1 - s) for the pixel's HSV saturation s. Muted colors gain the most, already-vivid colors barely move (a fully saturated pixel does not move at all), and negative percents drain the muted colors first, which is what makes the filter the skin-tone-friendly member of the family. The scale is the adjustment family's percent, -100 to 100 with 0 unchanged. The TypeScript SDK gains a `vibrance` builder, and the imgix migration guide's vibrance row now converts directly.
+
 ## [0.9.7] - 2026-11-01
 
 ### Added

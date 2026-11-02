@@ -388,6 +388,10 @@ export const filter = {
   highlightsShadows(highlights: number, shadows: number): string {
     return `highlights_shadows(${num(floatIn("highlights_shadows highlights", highlights, -100, 100))},${num(floatIn("highlights_shadows shadows", shadows, -100, 100))})`;
   },
+  /** Vibrance percent: -100..100 (0 unchanged; muted colors move most, vivid colors are protected). */
+  vibrance(percent: number): string {
+    return `vibrance(${num(floatIn("vibrance", percent, -100, 100))})`;
+  },
   /** Rotate the hue by integer degrees. */
   hueRotate(degrees: number): string {
     return `huerotate(${intIn("huerotate degrees", degrees, -2147483648, 2147483647)})`;
