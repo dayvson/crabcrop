@@ -23,3 +23,10 @@ features = ["avif-decode"]
 # registry publishing) beyond what dist generates, so the generated
 # file is not expected to match byte for byte.
 allow-dirty = ["ci"]
+
+# GitHub retires the macos-14 runner image on 2026-11-02 and its
+# capacity reached zero before that date, which stranded the
+# aarch64-apple-darwin leg of the v0.9.7 release. Pin that target
+# to macos-15 explicitly instead of taking dist's default.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
