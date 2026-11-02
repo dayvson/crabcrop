@@ -549,6 +549,13 @@ pub struct ProcessedImage {
     /// when no class operation segmented anything (or on
     /// the animated paths).
     pub segments: Option<SegmentRecord>,
+    /// The objects-crop record (issue #318) when an
+    /// `objects` crop ran on the still pipeline: the
+    /// classes it named, the detections it used, and the
+    /// union box it framed (or the fallback it took), for
+    /// meta responses. `None` when no objects crop ran
+    /// (or on the animated paths).
+    pub objects_crop: Option<ObjectsCropRecord>,
     /// The SSIMULACRA2 score of the returned bytes against the
     /// processed source, set when `quality(auto)` verified its
     /// encode (JPEG and JXL). `None` when nothing was scored.
@@ -637,6 +644,33 @@ pub struct SegmentObject {
     /// The silhouette's center of mass, in image
     /// coordinates.
     pub centroid: (u32, u32),
+}
+
+/// The objects-crop record (issue #318): what an `objects`
+/// crop decided, for meta responses. Recorded wherever the
+/// crop ran on the still pipeline, whichever path it took:
+/// the classes it named, the detections it used, and the
+/// union box it framed, or the fallback it took instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectsCropRecord {
+    /// The classes the crop named, in request order, in
+    /// the URL's own spellings.
+    pub classes: Vec<String>,
+    /// The detections the crop used (the named classes'
+    /// boxes), in the pixel coordinates in effect where
+    /// the crop ran. Empty on the fallback path.
+    pub objects: Vec<crate::ai::Detection>,
+    /// The union box the crop framed, (x, y, w, h) in the
+    /// same coordinates; `None` on the fallback path.
+    pub union: Option<(u32, u32, u32, u32)>,
+    /// The scale factor the crop applied around the union
+    /// box.
+    pub scale: f32,
+    /// Whether the crop fell back to the plain crop of the
+    /// same size (no detection matched, or detection
+    /// failed): the record states the path, never just the
+    /// outcome's shape.
+    pub fallback: bool,
 }
 
 /// Facts about a PDF source, probed at page rendering
@@ -899,6 +933,7 @@ fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), 
         || directives.upscale
         || directives.needs_face_model
         || directives.has_class_redaction()
+        || directives.objects_crop
         || directives.debug_focal;
     if inference_bound {
         return Err(EngineError::Unsupported(
@@ -1156,6 +1191,29 @@ impl Engine {
                 }
             }
         }
+        // The objects crop is validated the same way (issue
+        // #318): the URL is fine but the deployment has no
+        // detection model, or the model does not know a
+        // named class. Both refuse before any work: the
+        // mode is never a silent plain crop when detections
+        // were requested and the feature is off. The plain
+        // crop fallback covers "the model ran and found
+        // none of the classes", decided in the crop itself.
+        if directives.objects_crop {
+            let providers = detection_providers(&ctx);
+            if providers.is_empty() {
+                return Err(EngineError::NotConfigured(
+                    "object crop is not configured on this server (no detection model)".to_string(),
+                ));
+            }
+            for class in &directives.object_classes {
+                if resolve_detector(&providers, class).is_none() {
+                    return Err(EngineError::Unsupported(format!(
+                        "unknown detection class {class:?}: not in the detection model's vocabulary"
+                    )));
+                }
+            }
+        }
         // Source metadata, read from the raw bytes once:
         // the ICC profile drives color conversion below and
         // (policy permitting) the metadata injection at the
@@ -1313,7 +1371,7 @@ impl Engine {
             None
         };
         ctx.check_deadline()?;
-        let (img, encode_opts, studio, inpaint, segments) = apply_operations(
+        let (img, encode_opts, studio, inpaint, segments, objects_crop) = apply_operations(
             img,
             ops,
             cap,
@@ -1526,6 +1584,7 @@ impl Engine {
             studio,
             inpaint,
             segments,
+            objects_crop,
             ssimulacra2: ssim,
             video: video_meta,
             pdf: pdf_meta,
@@ -1571,7 +1630,7 @@ impl Engine {
             ctx.check_deadline()?;
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, opts, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, opts, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             if out_frames.is_empty() {
                 encode_opts = opts;
             }
@@ -1680,6 +1739,7 @@ impl Engine {
             studio: None,
             inpaint: None,
             segments: None,
+            objects_crop: None,
             ssimulacra2: None,
             video: None,
             pdf: None,
@@ -1729,7 +1789,7 @@ impl Engine {
             ctx.check_deadline()?;
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, _, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(crate::video::VideoFrame {
                 pixels: img.to_rgba8(),
@@ -1766,6 +1826,7 @@ impl Engine {
             studio: None,
             inpaint: None,
             segments: None,
+            objects_crop: None,
             ssimulacra2: None,
             video: None,
             pdf: None,
@@ -2302,6 +2363,7 @@ type ApplyOutcome = (
     Option<crate::studio::StudioRecord>,
     Option<InpaintRecord>,
     Option<SegmentRecord>,
+    Option<ObjectsCropRecord>,
 );
 
 /// A crop+resize fusion the chain qualifies for (issue
@@ -2463,6 +2525,11 @@ fn apply_operations(
     // of what was segmented, in chain order.
     let mut segment_memo: SegmentMemo = None;
     let mut segment_objects: Vec<SegmentObject> = Vec::new();
+    // The objects-crop record (issue #318): the last
+    // `objects` crop in the chain wins, like the studio
+    // record, since its framing is the one the response
+    // carries.
+    let mut objects_crop_record: Option<ObjectsCropRecord> = None;
     // The crop+resize fusion plan (issue #287): when the
     // chain qualifies, the crop-rect arm records its window
     // instead of materializing it, and the resize arm
@@ -2615,6 +2682,7 @@ fn apply_operations(
                             focal_rect: Some(rect),
                             window,
                             faces: Vec::new(),
+                            objects: Vec::new(),
                         });
                         cropped
                     } else {
@@ -2635,6 +2703,7 @@ fn apply_operations(
                             focal_rect: None,
                             window,
                             faces: Vec::new(),
+                            objects: Vec::new(),
                         });
                         cropped
                     } else {
@@ -2671,6 +2740,7 @@ fn apply_operations(
                                     )),
                                     window,
                                     faces,
+                                    objects: Vec::new(),
                                 });
                                 cropped
                             } else {
@@ -2713,12 +2783,109 @@ fn apply_operations(
                         }
                         Err(e) => return Err(e),
                     }
+                } else if let Align::Objects { classes, scale } = align {
+                    // Crop to the union of the detected
+                    // objects of the named classes (issue
+                    // #318). Preflight already refused the
+                    // request when no detection provider is
+                    // configured or a named class is unknown,
+                    // so what remains is the model's answer:
+                    // a union to frame, or none. None (and a
+                    // detection failure, downgraded exactly
+                    // like the face crop's) falls back to the
+                    // plain crop of the same size; the record
+                    // states which path was taken either way.
+                    let mut used: Vec<crate::ai::Detection> = Vec::new();
+                    let mut answered = true;
+                    for class in classes {
+                        match detect_for_class(&mut detection_memos, &detect_providers, &img, class)
+                        {
+                            Ok(found) => used.extend(found),
+                            Err(EngineError::Inference(_)) => {
+                                answered = false;
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    let union = if answered {
+                        crate::crop::union_box(&used)
+                    } else {
+                        None
+                    };
+                    match union {
+                        Some(union) => {
+                            objects_crop_record = Some(ObjectsCropRecord {
+                                classes: classes.clone(),
+                                objects: used.clone(),
+                                union: Some((
+                                    union.0,
+                                    union.1,
+                                    union.2 - union.0,
+                                    union.3 - union.1,
+                                )),
+                                scale: *scale,
+                                fallback: false,
+                            });
+                            if want_trace {
+                                let (cropped, window) = crate::crop::crop_around_objects_traced(
+                                    img, tw, th, union, *scale,
+                                );
+                                debug_capture = Some(crate::debugview::FocalCapture {
+                                    canvas: canvas.expect("want_trace clones the canvas"),
+                                    focal: Some(((union.0 + union.2) / 2, (union.1 + union.3) / 2)),
+                                    focal_rect: Some(union),
+                                    window,
+                                    faces: Vec::new(),
+                                    objects: used,
+                                });
+                                cropped
+                            } else {
+                                crate::crop::crop_around_objects(img, tw, th, union, *scale)
+                            }
+                        }
+                        None => {
+                            objects_crop_record = Some(ObjectsCropRecord {
+                                classes: classes.clone(),
+                                objects: Vec::new(),
+                                union: None,
+                                scale: *scale,
+                                fallback: true,
+                            });
+                            if want_trace {
+                                let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                                    img,
+                                    tw,
+                                    th,
+                                    Align::Center,
+                                    None,
+                                    None,
+                                );
+                                if let Some(trace) = trace {
+                                    debug_capture = Some(capture_from_trace(
+                                        canvas.expect("want_trace clones the canvas"),
+                                        trace,
+                                    ));
+                                }
+                                cropped
+                            } else {
+                                crate::crop::crop_to_aspect_with(
+                                    img,
+                                    tw,
+                                    th,
+                                    Align::Center,
+                                    None,
+                                    None,
+                                )
+                            }
+                        }
+                    }
                 } else if want_trace {
                     let (cropped, trace) = crate::crop::crop_to_aspect_traced(
                         img,
                         tw,
                         th,
-                        *align,
+                        align.clone(),
                         ctx.face_provider,
                         ctx.focal_provider,
                     );
@@ -2734,7 +2901,7 @@ fn apply_operations(
                         img,
                         tw,
                         th,
-                        *align,
+                        align.clone(),
                         ctx.face_provider,
                         ctx.focal_provider,
                     )
@@ -3032,6 +3199,7 @@ fn apply_operations(
                     focal_rect: None,
                     window: None,
                     faces,
+                    objects: Vec::new(),
                 }
             }
         };
@@ -3061,6 +3229,7 @@ fn apply_operations(
         studio_record,
         inpaint_record,
         segment_record,
+        objects_crop_record,
     ))
 }
 
@@ -3084,6 +3253,7 @@ fn capture_from_trace(
         focal_rect: None,
         window: Some(trace.window),
         faces: trace.faces,
+        objects: Vec::new(),
     }
 }
 
@@ -6869,7 +7039,8 @@ mod tests {
         // A quarter turn keeps the pixel count and passes.
         let ops = [Operation::Filters(vec![Filter::Rotate(90.0)])];
         let directives = crate::url::RequestDirectives::analyze(&ops);
-        let (out, _, _, _, _) = apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
+        let (out, _, _, _, _, _) =
+            apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
         assert_eq!((out.width(), out.height()), (8000, 8000));
     }
 
@@ -9586,6 +9757,265 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A detector that knows person and bicycle but only
+    /// ever finds the person: the no-match witness for the
+    /// objects crop fallback (issue #318).
+    #[derive(Debug)]
+    struct SparseObjects;
+
+    impl crate::ai::DetectionProvider for SparseObjects {
+        fn knows_class(&self, name: &str) -> bool {
+            ["person", "bicycle"]
+                .iter()
+                .any(|c| name.eq_ignore_ascii_case(c))
+        }
+        fn describe(&self) -> Vec<String> {
+            vec!["person".to_string(), "bicycle".to_string()]
+        }
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
+            Ok(vec![crate::ai::Detection {
+                label: "person".to_string(),
+                score: 0.9,
+                x: 10,
+                y: 10,
+                w: 60,
+                h: 80,
+            }])
+        }
+    }
+
+    fn objects_crop_op(w: u32, h: u32, classes: &[&str], scale: f32) -> Operation {
+        Operation::Crop {
+            size: ImageSize {
+                width: Dimension::Pixels(w),
+                height: Dimension::Pixels(h),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            align: Align::Objects {
+                classes: classes.iter().map(|c| c.to_string()).collect(),
+                scale,
+            },
+        }
+    }
+
+    /// 200x100 where pixel (x, y) reads back as [x, y, 0],
+    /// so a crop's window is visible in its pixels (the
+    /// crop module's coords pattern).
+    fn coords_scene() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(200, 100, |x, y| image::Rgb([x as u8, y as u8, 0]));
+        png_bytes(&DynamicImage::ImageRgb8(img))
+    }
+
+    #[test]
+    fn objects_crop_frames_the_named_class() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &coords_scene(),
+                &[objects_crop_op(60, 80, &["person"], 1.0)],
+                detect_ctx(&KnownObjects),
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (60, 80));
+        // The record names the path, the detections used,
+        // and the union box framed.
+        let record = out.objects_crop.expect("an objects crop record");
+        assert_eq!(record.classes, ["person"]);
+        assert!(!record.fallback);
+        assert_eq!(record.scale, 1.0);
+        assert_eq!(record.union, Some((10, 10, 60, 80)));
+        assert_eq!(record.objects.len(), 1);
+        assert_eq!(record.objects[0].label, "person");
+        // The window is the person box itself: the corner
+        // pixels are the box's own corners (the resize to
+        // the same size leaves them in place).
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        assert_eq!(result.get_pixel(0, 0), &image::Rgb([10, 10, 0]));
+        assert_eq!(result.get_pixel(59, 79), &image::Rgb([69, 89, 0]));
+    }
+
+    #[test]
+    fn objects_crop_unions_several_classes_and_shares_one_detection() {
+        let engine = Engine;
+        let counter = CountingObjects::default();
+        let out = engine
+            .process_preferred(
+                &coords_scene(),
+                &[objects_crop_op(170, 80, &["person", "car"], 1.0)],
+                detect_ctx(&counter),
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (170, 80));
+        let record = out.objects_crop.expect("an objects crop record");
+        assert!(!record.fallback);
+        // The union spans both boxes: x 10..180, y 10..90.
+        assert_eq!(record.union, Some((10, 10, 170, 80)));
+        assert_eq!(record.objects.len(), 2);
+        // Both classes resolve to the one provider, whose
+        // memoized detection serves the second class too.
+        assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn objects_crop_with_no_match_falls_back_to_the_plain_crop() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &coords_scene(),
+                &[objects_crop_op(100, 100, &["bicycle"], 1.5)],
+                detect_ctx(&SparseObjects),
+            )
+            .unwrap();
+        // The record states the fallback plainly.
+        let record = out.objects_crop.expect("an objects crop record");
+        assert!(record.fallback);
+        assert_eq!(record.classes, ["bicycle"]);
+        assert_eq!(record.scale, 1.5);
+        assert_eq!(record.union, None);
+        assert!(record.objects.is_empty());
+        // And the render is the plain center crop of the
+        // same size, byte for byte.
+        let plain = engine
+            .process_preferred(
+                &coords_scene(),
+                &[crop_op(100, 100, Align::Center)],
+                detect_ctx(&SparseObjects),
+            )
+            .unwrap();
+        assert_eq!(out.bytes, plain.bytes);
+    }
+
+    #[test]
+    fn objects_crop_with_a_failing_detector_falls_back_to_the_plain_crop() {
+        // The face crop's downgrade rule: a detection
+        // failure degrades the mode, never the request.
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &coords_scene(),
+                &[objects_crop_op(100, 100, &["person"], 1.0)],
+                detect_ctx(&FailingObjects),
+            )
+            .unwrap();
+        let record = out.objects_crop.expect("an objects crop record");
+        assert!(record.fallback);
+        let plain = engine
+            .process_preferred(
+                &coords_scene(),
+                &[crop_op(100, 100, Align::Center)],
+                detect_ctx(&FailingObjects),
+            )
+            .unwrap();
+        assert_eq!(out.bytes, plain.bytes);
+    }
+
+    #[test]
+    fn objects_crop_without_a_model_is_not_configured() {
+        // Never a silent plain crop when detections were
+        // requested and the feature is off (issue #318).
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                &coords_scene(),
+                &[objects_crop_op(100, 100, &["person"], 1.0)],
+                ProcessContext::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("object crop is not configured"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn objects_crop_with_an_unknown_class_is_refused() {
+        let engine = Engine;
+        let err = engine
+            .process_preferred(
+                &coords_scene(),
+                &[objects_crop_op(100, 100, &["hovercraft"], 1.0)],
+                detect_ctx(&KnownObjects),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("unknown detection class"), "{err}");
+    }
+
+    #[test]
+    fn debug_focal_objects_crop_marks_the_objects_and_the_union() {
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &coords_scene(),
+                &[
+                    Operation::DebugFocal,
+                    objects_crop_op(100, 100, &["person", "car"], 1.0),
+                ],
+                detect_ctx(&KnownObjects),
+            )
+            .unwrap();
+        // The canvas is the 200x100 scene, not the crop.
+        assert_eq!(dims_of(&out), (200, 100));
+        // A used detection box edge carries the amber
+        // detection color where nothing overdraws it: the
+        // person box's right edge at (69, 50).
+        assert_eq!(debug_px(&out, 69, 50), crate::debugview::FACE_COLOR);
+        // The union rectangle is the focal rectangle: its
+        // corner (10, 10) is magenta, over the person box's
+        // own corner.
+        assert_eq!(debug_px(&out, 10, 10), crate::debugview::FOCAL_COLOR);
+        // The crosshair sits at the union's center (95, 50).
+        assert_eq!(debug_px(&out, 95, 50), crate::debugview::FOCAL_COLOR);
+        // The window the crop cut is (45, 0, 100, 100): its
+        // corner carries the window color.
+        assert_eq!(debug_px(&out, 45, 0), crate::debugview::WINDOW_COLOR);
+    }
+
+    #[test]
+    fn objects_crop_with_a_real_model_frames_the_dog() {
+        // Env-gated like the ai.rs live checks: without the
+        // ONNX runtime and a detection model the test skips
+        // (the CI ai-models workflow provisions both).
+        use crate::ai::DetectionProvider as _;
+        let (Some(dylib), Some(model)) = (
+            crate::ai::env_or_skip("CRABCROP_TEST_ORT_DYLIB"),
+            crate::ai::env_or_skip("CRABCROP_TEST_DETECT_MODEL"),
+        ) else {
+            return;
+        };
+        let labels = std::env::var("CRABCROP_TEST_DETECT_LABELS").ok();
+        let provider =
+            crate::ai::OnnxDetectionProvider::load(Some(&dylib), &model, labels.as_deref(), 0.35)
+                .unwrap();
+        assert!(provider.knows_class("dog"));
+        let bytes = include_bytes!("../tests/functional/corpus/dog.jpg");
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                bytes,
+                &[objects_crop_op(200, 200, &["dog"], 1.5)],
+                detect_ctx(&provider),
+            )
+            .unwrap();
+        assert_eq!((out.width, out.height), (200, 200));
+        let record = out.objects_crop.expect("an objects crop record");
+        assert!(!record.fallback, "the dog must be found: {record:?}");
+        assert!(!record.objects.is_empty());
+        assert!(
+            record
+                .objects
+                .iter()
+                .all(|d| d.label.eq_ignore_ascii_case("dog"))
+        );
+        let (x, y, w, h) = record.union.expect("a union box");
+        assert!(x + w <= out.source_width && y + h <= out.source_height);
     }
 
     /// A declared detector (issue #166) whose vocabulary is

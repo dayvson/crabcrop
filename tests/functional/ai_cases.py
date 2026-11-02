@@ -751,6 +751,15 @@ def nc_redaction_501s():
     rec("nc-redaction-501s", "not-configured", "redaction filters on bare server", "dog.jpg",
         "PASS" if ok else "FAIL", {"status": 501 if ok else 0}, f"{outs}")
 
+@cell
+def nc_objects_crop_501():
+    # Issue #318: with no detection model configured the
+    # objects crop is unavailable with the AI features'
+    # shared 501, never a silent plain crop.
+    f = render("nc-objects-crop", "crop:200x200:objects(person)", "dog.jpg", base="B")
+    check("nc-objects-crop-501", "not-configured", "crop:200x200:objects(person) on bare server", "dog.jpg",
+          f["status"] == 501, f, f"status={f['status']} body={f['body'][:110]}")
+
 # ---------------------------------------------------------------- moderation signals (server C: CLIP + labels, no model)
 @cell
 def sig_moderation_signals():
@@ -820,6 +829,65 @@ def det_blurclass_case():
     check("det-blurclass-case", "detect", "filters:blurclass(Person)", "person-portrait.jpg",
           f2["status"] == 200 and bool(same), f2,
           f"status={f2['status']} pixel_identical_to_lowercase={same} (docs: class matching is case-insensitive)")
+
+@cell
+def det_objects_crop_dog():
+    # Issue #318: the objects crop frames the detected dog.
+    # The meta record is the proof: it names the objects
+    # path, the detections used, and the union box framed.
+    f = render("det-objects-crop-dog", "crop:200x200:objects(dog)/filters:format(png)", "dog.jpg")
+    s, j = meta("crop:200x200:objects(dog)", "dog.jpg")
+    recd = j.get("objects_crop") or {}
+    objs = recd.get("objects") or []
+    union = recd.get("union") or []
+    dims_ok = bool(f["path"]) and open_img(f["path"]).size == (200, 200)
+    ok = (f["status"] == 200 and dims_ok and s == 200
+          and recd.get("path") == "objects" and recd.get("classes") == ["dog"]
+          and len(objs) >= 1 and all(o.get("label") == "dog" for o in objs)
+          and len(union) == 4)
+    check("det-objects-crop-dog", "detect", "crop:200x200:objects(dog)", "dog.jpg",
+          ok, f, f"status={f['status']} dims_ok={dims_ok} record={json.dumps(recd)[:260]}")
+
+@cell
+def det_objects_crop_multi():
+    # Several classes in one list: the crop frames the
+    # union of whatever named classes are present (the car
+    # is; a truck may or may not be), at a 1.5 scale.
+    f = render("det-objects-crop-multi", "crop:200x200:objects(car,truck):1.5/filters:format(png)", "car.jpg")
+    s, j = meta("crop:200x200:objects(car,truck):1.5", "car.jpg")
+    recd = j.get("objects_crop") or {}
+    objs = recd.get("objects") or []
+    union = recd.get("union") or []
+    ok = (f["status"] == 200 and s == 200
+          and recd.get("path") == "objects" and recd.get("classes") == ["car", "truck"]
+          and recd.get("scale") == 1.5 and len(union) == 4
+          and any(o.get("label") == "car" for o in objs)
+          and all(o.get("label") in ("car", "truck") for o in objs))
+    check("det-objects-crop-multi", "detect", "crop:200x200:objects(car,truck):1.5", "car.jpg",
+          ok, f, f"status={f['status']} record={json.dumps(recd)[:260]}")
+
+@cell
+def det_objects_crop_nomatch():
+    # No person in the dog photo (the blurclass nomatch
+    # precedent): the mode falls back to the plain center
+    # crop of the same size, pixel for pixel, and the
+    # record states the fallback.
+    f = render("det-objects-crop-nomatch", "crop:200x200:objects(person)/filters:format(png)", "dog.jpg")
+    fb = render("det-objects-crop-nomatch-base", "crop:200x200/filters:format(png)", "dog.jpg")
+    s, j = meta("crop:200x200:objects(person)", "dog.jpg")
+    recd = j.get("objects_crop") or {}
+    same = f["path"] and fb["path"] and mean_diff(f["path"], fb["path"]) == 0.0
+    ok = (f["status"] == 200 and bool(same) and s == 200
+          and recd.get("path") == "fallback" and recd.get("union") is None
+          and recd.get("objects") == [])
+    check("det-objects-crop-nomatch", "detect", "crop:200x200:objects(person)", "dog.jpg",
+          ok, f, f"status={f['status']} pixel_identical_to_center_crop={same} record={json.dumps(recd)[:200]}")
+
+@cell
+def det_objects_crop_unknown():
+    f = render("det-objects-crop-unknown", "crop:200x200:objects(hovercraft)", "dog.jpg")
+    check("det-objects-crop-unknown", "detect", "crop:200x200:objects(hovercraft)", "dog.jpg",
+          f["status"] == 400, f, f"status={f['status']} body={f['body'][:110]} (docs: unknown class is a 400)")
 
 # ---------------------------------------------------------------- AI gate
 @cell

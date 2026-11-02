@@ -348,6 +348,36 @@
   "tier": "local"
  },
  {
+  "id": "det-objects-crop-dog",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "det-objects-crop-multi",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "det-objects-crop-nomatch",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "det-objects-crop-unknown",
+  "group": "detect",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
+  "id": "nc-objects-crop-501",
+  "group": "not-configured",
+  "kind": "scripted",
+  "tier": "local"
+ },
+ {
   "id": "gate-ai-concurrent",
   "group": "gate",
   "kind": "scripted",

@@ -239,7 +239,7 @@ pub enum PadFill {
 }
 
 /// Where the crop keeps the image when aspect ratios differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Align {
     /// Center the crop (default).
     Center,
@@ -264,6 +264,16 @@ pub enum Align {
     Smart,
     /// Crop around the largest detected face.
     Face,
+    /// Crop to the union of the detected objects of the
+    /// named classes (issue #318): the crop window frames
+    /// the union box, scaled by `scale` around the box's
+    /// center (1 is the tight union; larger values add
+    /// context around it), and resolves to the target
+    /// aspect the way the face crop resolves around its
+    /// subject. When detection finds none of the classes
+    /// the crop falls back to the plain center crop of the
+    /// same size.
+    Objects { classes: Vec<String>, scale: f32 },
 }
 
 /// Where a text overlay anchors: one of the nine grid points
@@ -1021,6 +1031,21 @@ pub const MAX_EXPOSURE: f32 = 10.0;
 /// pixels on any canvas the output budget allows.
 pub const MAX_FOCAL_ZOOM: f32 = 100.0;
 
+/// The largest `objects` crop scale the grammar accepts
+/// (issue #318): the same bound as the focal zoom, and
+/// equally theoretical, since a scale past the point where
+/// the scaled union box covers the frame changes nothing.
+/// The bound exists so every implementation of the grammar
+/// accepts the same spellings.
+pub const MAX_OBJECTS_SCALE: f32 = 100.0;
+
+/// The most classes one `objects` crop may name (issue
+/// #318). Detection vocabularies run to tens of classes;
+/// 32 names in one crop is past any real framing decision,
+/// and the bound keeps a single segment from carrying an
+/// unbounded list into every implementation.
+pub const MAX_OBJECTS_CLASSES: usize = 32;
+
 fn parse_dimension(part: &str) -> Result<(Dimension, bool), ()> {
     let (flip, digits) = match part.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -1426,6 +1451,50 @@ fn parse_align(s: &str) -> Option<Align> {
     }
 }
 
+/// The alignment after `crop:<WxH>:`. Every historical
+/// alignment is a bare keyword; the `objects` mode (issue
+/// #318) is the one parameterized form,
+/// `objects(<class>[,<class>...])[:<scale>]`: the classes
+/// spell exactly like the class filters' argument (the
+/// charset excludes commas, so the comma is a safe list
+/// separator, and percent-decoding runs per class, as
+/// there). The scale is a positive multiplier of the union
+/// box, bounded by [`MAX_OBJECTS_SCALE`]; it is optional on
+/// input and always spelled in the canonical form, the
+/// `focalpoint` zoom precedent. A class named twice (in
+/// any case: vocabulary matching is case-insensitive)
+/// names one class, so the canonical form keeps the first
+/// spelling of each.
+fn parse_crop_align(s: &str) -> Option<Align> {
+    let Some(args) = s.strip_prefix("objects") else {
+        return parse_align(s);
+    };
+    let inner = args.strip_prefix('(')?;
+    let close = inner.find(')')?;
+    let (list, tail) = (&inner[..close], &inner[close + 1..]);
+    let scale = match tail {
+        "" => 1.0,
+        _ => {
+            let value: f32 = tail.strip_prefix(':')?.parse().ok()?;
+            if !value.is_finite() || value <= 0.0 || value > MAX_OBJECTS_SCALE {
+                return None;
+            }
+            value
+        }
+    };
+    let mut classes: Vec<String> = Vec::new();
+    for raw in list.split(',') {
+        let name = parse_class_name(&percent_decode(raw)?)?;
+        if !classes.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+            classes.push(name);
+        }
+    }
+    if classes.is_empty() || classes.len() > MAX_OBJECTS_CLASSES {
+        return None;
+    }
+    Some(Align::Objects { classes, scale })
+}
+
 /// The size contract for `crop:` and `pad:`: an exact box,
 /// pixels on both axes and no flips. The general size
 /// grammar also spells proportional and original sizes,
@@ -1443,7 +1512,7 @@ fn exact_box(size: &ImageSize) -> bool {
 fn parse_crop(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidCrop(seg.to_string());
     let (dims, align) = match rest.split_once(':') {
-        Some((d, a)) => (d, parse_align(a).ok_or_else(invalid)?),
+        Some((d, a)) => (d, parse_crop_align(a).ok_or_else(invalid)?),
         None => (rest, Align::Center),
     };
     let size = parse_size(dims).map_err(|_| invalid())?;
@@ -2522,6 +2591,13 @@ pub struct RequestDirectives {
     /// redaction filters and `recolorclass`), in request
     /// order.
     pub classes: Vec<String>,
+    /// Any `objects` crop (issue #318): it runs object
+    /// detection, so it takes an AI permit and needs the
+    /// provider preflight, like the class operations.
+    pub objects_crop: bool,
+    /// Class names requested by `objects` crops, in
+    /// request order.
+    pub object_classes: Vec<String>,
     /// Padding for a face-aligned crop, as a fraction of the
     /// face size added on every side. Defaults to 0.5.
     pub face_padding: f32,
@@ -2562,6 +2638,8 @@ impl RequestDirectives {
             text: false,
             needs_face_model: false,
             classes: Vec::new(),
+            objects_crop: false,
+            object_classes: Vec::new(),
             face_padding: 0.5,
             watermark_urls: Vec::new(),
             debug_focal: false,
@@ -2584,6 +2662,10 @@ impl RequestDirectives {
                 match align {
                     Align::Smart => d.smart_crop = true,
                     Align::Face => d.needs_face_model = true,
+                    Align::Objects { classes, .. } => {
+                        d.objects_crop = true;
+                        d.object_classes.extend(classes.iter().cloned());
+                    }
                     _ => {}
                 }
             }
@@ -2635,9 +2717,9 @@ impl RequestDirectives {
     /// This is the ONE predicate behind both the server's AI
     /// gate and the engine's expectations: background removal,
     /// studio mode, region removal, upscale, face operations,
-    /// and class redaction always infer; smart crops infer
-    /// when a face provider is configured, so they are gated
-    /// too.
+    /// class redaction, and object crops always infer; smart
+    /// crops infer when a face provider is configured, so they
+    /// are gated too.
     pub fn uses_ai(&self) -> bool {
         self.removebg
             || self.studio
@@ -2646,6 +2728,7 @@ impl RequestDirectives {
             || self.needs_face_model
             || self.smart_crop
             || self.has_class_redaction()
+            || self.objects_crop
             // `debug:focal` runs the face and focal providers
             // and bypasses the cache in both directions, so
             // it takes an AI permit like the work it runs
@@ -2717,7 +2800,7 @@ fn size_text(size: &ImageSize) -> String {
     )
 }
 
-fn align_text(align: Align) -> Option<&'static str> {
+fn align_text(align: &Align) -> Option<&'static str> {
     match align {
         Align::Center => None,
         Align::Smart => Some("smart"),
@@ -2730,6 +2813,9 @@ fn align_text(align: Align) -> Option<&'static str> {
         Align::TopRight => Some("top-right"),
         Align::BottomLeft => Some("bottom-left"),
         Align::BottomRight => Some("bottom-right"),
+        // The objects alignment carries its classes and
+        // scale; `operation_text` spells it in full.
+        Align::Objects { .. } => None,
     }
 }
 
@@ -2915,9 +3001,20 @@ fn filter_text(filter: &Filter) -> String {
 fn operation_text(op: &Operation) -> String {
     match op {
         Operation::Size(size) => size_text(size),
-        Operation::Crop { size, align } => match align_text(*align) {
-            Some(name) => format!("crop:{}:{name}", size_text(size)),
-            None => format!("crop:{}", size_text(size)),
+        Operation::Crop { size, align } => match align {
+            Align::Objects { classes, scale } => format!(
+                "crop:{}:objects({}):{scale}",
+                size_text(size),
+                classes
+                    .iter()
+                    .map(|c| encode_arg(c))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            _ => match align_text(align) {
+                Some(name) => format!("crop:{}:{name}", size_text(size)),
+                None => format!("crop:{}", size_text(size)),
+            },
         },
         Operation::FitIn { size, adaptive } => {
             if *adaptive {
@@ -4130,8 +4227,8 @@ mod tests {
             let (ops, _) = parse_operations(&path).unwrap();
             assert!(
                 matches!(
-                    ops[0],
-                    Operation::Crop { align, .. } if align == want
+                    &ops[0],
+                    Operation::Crop { align, .. } if align == &want
                 ),
                 "spelling: {spelling}"
             );
@@ -5496,6 +5593,143 @@ mod tests {
         ] {
             assert!(parse_operations(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn parses_objects_crop_alignment() {
+        // Issue #318: one class, the scale defaulted.
+        let (ops, _) =
+            parse_operations("crop:300x200:objects(person)/example.com/img.jpg").unwrap();
+        assert_eq!(
+            ops,
+            vec![Operation::Crop {
+                size: ImageSize {
+                    width: Dimension::Pixels(300),
+                    height: Dimension::Pixels(200),
+                    flip_horizontal: false,
+                    flip_vertical: false,
+                },
+                align: Align::Objects {
+                    classes: vec!["person".to_string()],
+                    scale: 1.0,
+                },
+            }]
+        );
+        // The mode takes the detection preflight and the AI
+        // gate, through its own directive fields: it is not
+        // class redaction and not a face operation.
+        let d = RequestDirectives::analyze(&ops);
+        assert!(d.objects_crop);
+        assert_eq!(d.object_classes, ["person"]);
+        assert!(d.uses_ai());
+        assert!(!d.has_class_redaction());
+        assert!(!d.needs_face_model);
+
+        // Several classes and an explicit scale; class names
+        // percent-decode like the class filters' argument.
+        let (ops, _) = parse_operations(
+            "crop:300x200:objects(person,traffic%20light,car):1.5/example.com/img.jpg",
+        )
+        .unwrap();
+        assert!(matches!(
+            &ops[0],
+            Operation::Crop {
+                align: Align::Objects { classes, scale },
+                ..
+            } if classes == &["person", "traffic light", "car"] && *scale == 1.5
+        ));
+        let d = RequestDirectives::analyze(&ops);
+        assert_eq!(d.object_classes, ["person", "traffic light", "car"]);
+
+        // A class named twice names one class: the first
+        // spelling stands (matching itself is
+        // case-insensitive, like the vocabulary checks).
+        let (ops, _) =
+            parse_operations("crop:300x200:objects(Person,person,car)/example.com/img.jpg")
+                .unwrap();
+        assert!(matches!(
+            &ops[0],
+            Operation::Crop {
+                align: Align::Objects { classes, .. },
+                ..
+            } if classes == &["Person", "car"]
+        ));
+    }
+
+    #[test]
+    fn objects_crop_canonical_form() {
+        // The scale is optional on input and always spelled
+        // in the canonical form, the focalpoint zoom rule;
+        // class names re-encode deterministically.
+        assert_eq!(
+            canonical_key_form("crop:300x200:objects(person)/example.com/img.jpg"),
+            "crop:300x200:objects(person):1/example.com/img.jpg"
+        );
+        assert_eq!(
+            canonical_key_form("crop:300x200:objects(person):1.50/example.com/img.jpg"),
+            "crop:300x200:objects(person):1.5/example.com/img.jpg"
+        );
+        assert_eq!(
+            canonical_key_form(
+                "crop:300x200:objects(traffic%20light,person):2/example.com/img.jpg"
+            ),
+            "crop:300x200:objects(traffic%20light,person):2/example.com/img.jpg"
+        );
+        // The canonical form parses back to the same ops.
+        let (ops, _) =
+            parse_operations("crop:300x200:objects(traffic%20light,person):2/example.com/img.jpg")
+                .unwrap();
+        assert!(matches!(
+            &ops[0],
+            Operation::Crop {
+                align: Align::Objects { classes, scale },
+                ..
+            } if classes == &["traffic light", "person"] && *scale == 2.0
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_objects_crops() {
+        for bad in [
+            // No classes, or an empty one.
+            "crop:300x200:objects()/example.com/img.jpg",
+            "crop:300x200:objects( )/example.com/img.jpg",
+            "crop:300x200:objects(person,)/example.com/img.jpg",
+            "crop:300x200:objects(,person)/example.com/img.jpg",
+            // The class charset is the class filters' own.
+            "crop:300x200:objects(per%24on)/example.com/img.jpg",
+            "crop:300x200:objects(per%2Con)/example.com/img.jpg",
+            // The parameterized form must be complete.
+            "crop:300x200:objects/example.com/img.jpg",
+            "crop:300x200:objects(person/example.com/img.jpg",
+            "crop:300x200:objects(person)junk/example.com/img.jpg",
+            "crop:300x200:objects(person):/example.com/img.jpg",
+            "crop:300x200:objects(person):1.5:extra/example.com/img.jpg",
+            // The scale is a positive multiplier up to the cap.
+            "crop:300x200:objects(person):0/example.com/img.jpg",
+            "crop:300x200:objects(person):-1/example.com/img.jpg",
+            "crop:300x200:objects(person):100.5/example.com/img.jpg",
+            "crop:300x200:objects(person):NaN/example.com/img.jpg",
+            "crop:300x200:objects(person):inf/example.com/img.jpg",
+            "crop:300x200:objects(person):wide/example.com/img.jpg",
+            // The exact-box contract still applies.
+            "crop:300:objects(person)/example.com/img.jpg",
+            "crop:0x200:objects(person)/example.com/img.jpg",
+            "crop:-300x200:objects(person)/example.com/img.jpg",
+        ] {
+            assert!(parse_operations(bad).is_err(), "{bad}");
+        }
+        // The class list is bounded: 32 names parse, 33 do not.
+        let names = |n: usize| {
+            (0..n)
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let ok = format!("crop:300x200:objects({})/example.com/img.jpg", names(32));
+        assert!(parse_operations(&ok).is_ok());
+        let too_many = format!("crop:300x200:objects({})/example.com/img.jpg", names(33));
+        assert!(parse_operations(&too_many).is_err());
     }
 
     #[test]

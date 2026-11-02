@@ -4008,6 +4008,48 @@ fn meta_response(
             objects.join(",")
         ));
     }
+    if !sealed && let Some(record) = &processed.objects_crop {
+        // The objects-crop record (issue #318): the
+        // classes the crop named, the scale it applied,
+        // the path it took, and on the objects path the
+        // detections it used and the union box it framed,
+        // in the coordinates in effect where the crop ran
+        // (the output is the resized window, so the box is
+        // stated against the crop's canvas, like the
+        // segmentation record's geometry).
+        let classes: Vec<String> = record
+            .classes
+            .iter()
+            .map(|c| serde_json::to_string(c).unwrap_or_default())
+            .collect();
+        let objects: Vec<String> = record
+            .objects
+            .iter()
+            .map(|d| {
+                format!(
+                    "{{\"label\":{},\"score\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                    serde_json::to_string(&d.label).unwrap_or_default(),
+                    d.score,
+                    d.x,
+                    d.y,
+                    d.w,
+                    d.h
+                )
+            })
+            .collect();
+        let union = match record.union {
+            Some((x, y, w, h)) => format!("[{x},{y},{w},{h}]"),
+            None => "null".to_string(),
+        };
+        body.push_str(&format!(
+            ",\"objects_crop\":{{\"classes\":[{}],\"scale\":{},\"path\":\"{}\",\"objects\":[{}],\"union\":{}}}",
+            classes.join(","),
+            record.scale,
+            if record.fallback { "fallback" } else { "objects" },
+            objects.join(","),
+            union
+        ));
+    }
     if let Some(ocr) = ocr {
         // The OCR field (issue #177): the model identity
         // (the recognition model: it fixes the script),
@@ -8448,6 +8490,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn meta_includes_the_objects_crop_record() {
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_segment().await;
+        // The fake detector finds one person at (1, 2)
+        // sized 30x20: the record names the classes, the
+        // scale, the path taken, the detection used, and
+        // the union box framed (issue #318).
+        let remainder = format!("crop:100x100:objects(person):1.5/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let record = &meta["objects_crop"];
+        assert_eq!(record["classes"], serde_json::json!(["person"]));
+        assert_eq!(record["scale"], 1.5);
+        assert_eq!(record["path"], "objects");
+        assert_eq!(record["union"], serde_json::json!([1, 2, 30, 20]));
+        let objects = record["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["label"], "person");
+        assert_eq!(objects[0]["x"], 1);
+        assert_eq!(objects[0]["y"], 2);
+        assert_eq!(objects[0]["w"], 30);
+        assert_eq!(objects[0]["h"], 20);
+        // No objects crop, no record.
+        let remainder = format!("40x24/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(meta.get("objects_crop").is_none());
+    }
+
+    #[tokio::test]
+    async fn objects_crop_without_a_detector_is_501() {
+        let src = spawn_image_server().await;
+        // No detector anywhere: the mode is unavailable
+        // with the AI features' shared clean 501, never a
+        // silent plain crop (issue #318).
+        let base = spawn_app(false).await;
+        let remainder = format!("crop:100x100:objects(person)/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("object crop is not configured"),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn recolorclass_renders_and_needs_a_detector() {
         let src = spawn_image_server().await;
         // Configured: the recolor renders.
@@ -10583,6 +10687,7 @@ mod tests {
             studio: None,
             inpaint: None,
             segments: None,
+            objects_crop: None,
             ssimulacra2: None,
             video: None,
             pdf: None,

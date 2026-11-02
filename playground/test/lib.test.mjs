@@ -171,6 +171,15 @@ test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
     ["crop:300x0/" + SRC, true, SRC], // crop is an exact box: pixels on both axes
     ["crop:-300x200/" + SRC, true, SRC], // flips are invalid in crop
     ["crop:origx100/" + SRC, true, SRC], // orig is invalid in crop
+    ["crop:100x100:objects(person)/" + SRC, false, SRC], // objects crop, tight box
+    ["crop:100x100:objects(person,car):1.5/" + SRC, false, SRC], // multi-class with a scale
+    ["crop:100x100:objects(traffic%20light)/" + SRC, false, SRC], // encoded class name
+    ["crop:100x100:objects()/" + SRC, true, SRC], // at least one class is required
+    ["crop:100x100:objects(person,)/" + SRC, true, SRC], // no empty class slots
+    ["crop:100x100:objects(person/" + SRC, true, SRC], // the paren must close
+    ["crop:100x100:objects(person):0/" + SRC, true, SRC], // scale is above 0
+    ["crop:100x100:objects(person):101/" + SRC, true, SRC], // scale caps at 100
+    ["crop:100x100:objects(bad;name)/" + SRC, true, SRC], // class names are the class charset
     ["pad:300xorig/" + SRC, true, SRC], // pad is an exact box too
     ["pad:-200x100/" + SRC, true, SRC], // flips are invalid in pad
     ["filters:quality(999)/" + SRC, true, SRC], // quality caps at 100
