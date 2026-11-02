@@ -464,10 +464,15 @@ fn describe_operation(segment: &str, op: &Operation) -> Vec<String> {
 pub(crate) fn describe_operation_text(op: &Operation) -> Vec<String> {
     match op {
         Operation::Size(size) => vec![format!("resize to {}", size_text(size))],
-        Operation::Crop { size, align } => vec![format!(
-            "crop to {}, aligned {align:?}",
-            size_text(size)
-        )],
+        Operation::Crop { size, align } => vec![match align {
+            crate::url::Align::Objects { classes, scale } => format!(
+                "crop to {}, aligned on the union of the detected {} at scale {scale} \
+                 (falls back to the plain crop when none are detected)",
+                size_text(size),
+                classes.join(", ")
+            ),
+            _ => format!("crop to {}, aligned {align:?}", size_text(size)),
+        }],
         Operation::FitIn { size, adaptive } => vec![format!(
             "fit inside {}{}",
             size_text(size),

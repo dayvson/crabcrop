@@ -13,7 +13,8 @@
 //! - the focal crosshair and the focal rectangle outline are
 //!   magenta, [`FOCAL_COLOR`];
 //! - the crop window outline is cyan-blue, [`WINDOW_COLOR`];
-//! - face boxes that fed the decision are amber,
+//! - detection boxes that fed the decision (faces, or the
+//!   objects an `objects` crop framed) are amber,
 //!   [`FACE_COLOR`].
 //!
 //! Rectangles are drawn as border bands of `thickness`
@@ -49,12 +50,17 @@ pub struct FocalCapture {
     pub window: Option<(u32, u32, u32, u32)>,
     /// Detected face boxes that fed the focal decision.
     pub faces: Vec<crate::ai::FaceBox>,
+    /// Detected object boxes that fed the decision (an
+    /// `objects` crop, issue #318): drawn in the same amber
+    /// as face boxes, the detection color.
+    pub objects: Vec<crate::ai::Detection>,
 }
 
 /// Draw the capture's markers on its canvas and return the
-/// diagnostic image. Draw order is faces, focal rectangle,
-/// crop window, crosshair last, so the point itself is never
-/// hidden under an outline that passes through it.
+/// diagnostic image. Draw order is detection boxes, focal
+/// rectangle, crop window, crosshair last, so the point
+/// itself is never hidden under an outline that passes
+/// through it.
 pub fn render(capture: &FocalCapture) -> DynamicImage {
     let mut img = capture.canvas.to_rgba8();
     let (w, h) = (img.width(), img.height());
@@ -68,6 +74,19 @@ pub fn render(capture: &FocalCapture) -> DynamicImage {
                 face.y,
                 face.x.saturating_add(face.w),
                 face.y.saturating_add(face.h),
+            ),
+            FACE_COLOR,
+            thickness,
+        );
+    }
+    for object in &capture.objects {
+        draw_rect(
+            &mut img,
+            (
+                object.x,
+                object.y,
+                object.x.saturating_add(object.w),
+                object.y.saturating_add(object.h),
             ),
             FACE_COLOR,
             thickness,
@@ -135,6 +154,7 @@ mod tests {
             focal_rect: None,
             window: None,
             faces: Vec::new(),
+            objects: Vec::new(),
         }
     }
 
@@ -188,6 +208,25 @@ mod tests {
         assert_eq!(px(&out, 35, 35), FACE_COLOR);
         assert_eq!(px(&out, 54, 54), FACE_COLOR);
         // A face interior is not an outline.
+        assert_eq!(px(&out, 45, 45), Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn object_boxes_draw_in_the_detection_color() {
+        // Issue #318: an objects crop's feeding detections
+        // are amber, like face boxes.
+        let mut cap = capture(60, 60);
+        cap.objects = vec![crate::ai::Detection {
+            label: "dog".to_string(),
+            score: 0.9,
+            x: 35,
+            y: 35,
+            w: 20,
+            h: 20,
+        }];
+        let out = render(&cap);
+        assert_eq!(px(&out, 35, 35), FACE_COLOR);
+        assert_eq!(px(&out, 54, 54), FACE_COLOR);
         assert_eq!(px(&out, 45, 45), Rgba([0, 0, 0, 0]));
     }
 
