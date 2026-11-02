@@ -229,6 +229,38 @@ export const ops = {
     return align === "center" ? `crop:${box}` : `crop:${box}:${align}`;
   },
 
+  /**
+   * `crop:300x200:objects(person,car):1.5`; crops to the
+   * union of every detection of the named classes, the
+   * union box scaled about its center by `scale` (1 is the
+   * tight box; the crop stays centered on the union).
+   * Needs a detection model configured on the server; when
+   * none of the classes is detected the render falls back
+   * to the plain center crop of the same size. Duplicate
+   * classes (case-insensitive) are spelled once, as the
+   * server's canonical form spells them.
+   */
+  cropObjects(width: number, height: number, classes: string[], scale = 1): string {
+    if (!Array.isArray(classes) || classes.length < 1 || classes.length > 32) {
+      fail("crop objects classes", classes, "an array of 1 to 32 class names");
+    }
+    const seen = new Set<string>();
+    const names: string[] = [];
+    for (const name of classes) {
+      const encoded = className("crop objects class", name);
+      const key = typeof name === "string" ? name.trim().toLowerCase() : "";
+      if (!seen.has(key)) {
+        seen.add(key);
+        names.push(encoded);
+      }
+    }
+    if (!Number.isFinite(scale) || scale <= 0 || scale > 100) {
+      fail("crop objects scale", scale, "a number above 0 and at most 100");
+    }
+    const box = pixelBox("crop", width, height);
+    return `crop:${box}:objects(${names.join(",")}):${num(scale)}`;
+  },
+
   /** `crop-rect:10x20:110x220` (left x top : right x bottom). */
   cropRect(left: number, top: number, right: number, bottom: number): string {
     intIn("crop-rect left", left, 0, 4294967295);

@@ -547,6 +547,52 @@ function explainFilters(rest: string): { detail?: string; error?: string } {
 const ALIGN_NAMES = new Set(["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"]);
 const U64_MAX = 18446744073709551615n;
 
+/**
+ * The objects crop alignment (url.rs parse_objects, ported):
+ * `objects(<class>[,<class>...])[:<scale>]`. Returns the
+ * decoded class names (duplicates folded, first spelling
+ * kept, as the server's canonical form folds them) and the
+ * scale, or null when the server would reject the form.
+ */
+function parseObjectsAlign(align: string): { classes: string[]; scale: number } | null {
+  if (!align.startsWith("objects(")) return null;
+  const inner = align.slice("objects(".length);
+  const close = inner.indexOf(")");
+  if (close < 0) return null;
+  const list = inner.slice(0, close);
+  const tail = inner.slice(close + 1);
+  let scale = 1;
+  if (tail !== "") {
+    if (!tail.startsWith(":")) return null;
+    const text = tail.slice(1);
+    if (!isFloat(text)) return null;
+    scale = Number(text);
+    if (!(scale > 0) || scale > 100) return null;
+  }
+  const parts = list.split(",");
+  if (parts.length > 32) return null;
+  const classes: string[] = [];
+  const seen = new Set<string>();
+  for (const part of parts) {
+    const decoded = percentDecodable(part);
+    if (decoded === null) return null;
+    const name = decoded.trim();
+    if (
+      name.length < 1 ||
+      new TextEncoder().encode(name).length > 64 ||
+      !/^[\p{L}\p{N} _.\-/]+$/u.test(name)
+    ) {
+      return null;
+    }
+    const key = name.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      classes.push(name);
+    }
+  }
+  return classes.length > 0 ? { classes, scale } : null;
+}
+
 function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment, "raw"> | null {
   if (seg.startsWith("exp:")) {
     const value = seg.slice(4);
@@ -615,7 +661,7 @@ function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment,
       kind: "debug",
       title: "Debug view",
       detail:
-        "the response is a diagnostic image instead of the transform result: the canvas the next crop operates on, with the chosen focal point (magenta crosshair), the focal rectangle when one is in play, detected face boxes (amber), and the crop window outline (blue); with no crop it shows the focal analysis of the final image; debug responses are never cached and are served with Cache-Control: no-store; animated sources and video formats are refused with 400",
+        "the response is a diagnostic image instead of the transform result: the canvas the next crop operates on, with the chosen focal point (magenta crosshair), the focal rectangle when one is in play, the detection boxes that fed the decision (amber), and the crop window outline (blue); with no crop it shows the focal analysis of the final image; debug responses are never cached and are served with Cache-Control: no-store; animated sources and video formats are refused with 400",
     };
   }
   if (seg.startsWith("preset:")) {
@@ -698,11 +744,19 @@ function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment,
     const dims = idx === -1 ? rest : rest.slice(0, idx);
     const align = idx === -1 ? "center" : rest.slice(idx + 1);
     const cropSize = parseSizeSegment(dims);
-    if (!cropSize || !isExactBox(cropSize) || !ALIGN_NAMES.has(align)) {
+    const objects = align.startsWith("objects") ? parseObjectsAlign(align) : null;
+    if (!cropSize || !isExactBox(cropSize) || (!ALIGN_NAMES.has(align) && objects === null)) {
       return {
         kind: "operation",
         title: "Crop",
-        error: `malformed crop segment: ${seg} (want crop:<w>x<h>[:center|smart|face|top|bottom|left|right|top-left|top-right|bottom-left|bottom-right], pixels only, no flips)`,
+        error: `malformed crop segment: ${seg} (want crop:<w>x<h>[:center|smart|face|top|bottom|left|right|top-left|top-right|bottom-left|bottom-right|objects(<class>[,<class>...])[:<scale>]], pixels only, no flips)`,
+      };
+    }
+    if (objects !== null) {
+      return {
+        kind: "operation",
+        title: "Crop",
+        detail: `crop to the aspect of ${dims} and resize to it; alignment: objects (${objects.classes.join(", ")}): frame the union of every detection of the named classes, the union box scaled by ${objects.scale} about its center and the crop centered on it; needs a detection model on the server, and falls back to the plain center crop of the same size when none of the classes is detected`,
       };
     }
     return { kind: "operation", title: "Crop", detail: `crop to the aspect of ${dims} and resize to it; alignment: ${align === "center" ? "center (or the focal point for smart)" : align}` };

@@ -401,6 +401,40 @@ test("explainUrl explains studio filters instead of calling them unknown", () =>
   assert.ok(bad.errors.length > 0);
 });
 
+test("explainUrl explains objects crops and rejects their malformed forms", () => {
+  const SIG = "a".repeat(64);
+  const SRC = "https://example.com/a.jpg";
+  const good = explainUrl(
+    `https://img.example.com/${SIG}/crop:400x300:objects(person,car):1.5/${SRC}`,
+  );
+  assert.deepEqual(good.errors, []);
+  assert.equal(good.source, SRC);
+  assert.match(good.segments[0].detail ?? "", /alignment: objects \(person, car\)/);
+  assert.match(good.segments[0].detail ?? "", /scaled by 1\.5/);
+  // The scale may be omitted (it defaults to 1), and a
+  // percent-encoded class name decodes in the explanation.
+  const tight = explainUrl(
+    `https://img.example.com/${SIG}/crop:400x300:objects(traffic%20light)/${SRC}`,
+  );
+  assert.deepEqual(tight.errors, []);
+  assert.match(tight.segments[0].detail ?? "", /objects \(traffic light\)/);
+  // Malformed objects forms are errors, not silent crops.
+  for (const bad of [
+    "crop:400x300:objects()",
+    "crop:400x300:objects(person,)",
+    "crop:400x300:objects(person",
+    "crop:400x300:objects(person)junk",
+    "crop:400x300:objects(person):0",
+    "crop:400x300:objects(person):101",
+    "crop:400x300:objects(bad;name)",
+    "crop:400x300:objects",
+    "crop:-400x300:objects(person)",
+  ]) {
+    const out = explainUrl(`https://img.example.com/${SIG}/${bad}/${SRC}`);
+    assert.ok(out.errors.length > 0, bad);
+  }
+});
+
 test("purge signatures match the published vectors", () => {
   // The same pinned literals the Rust crate asserts: one
   // wire scheme across every implementation.

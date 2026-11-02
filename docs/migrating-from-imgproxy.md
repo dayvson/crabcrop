@@ -26,6 +26,7 @@ imgproxy and crabcrop sign and shape their URLs differently enough that there is
 | `rs:fill-down` / `rs:fit-down` | The same, plus `filters:no_upscale` | The `-down` variants never upscale |
 | `w:300` alone | `300x0` | One axis set, the other proportional, in both |
 | `g:sm` | `:smart` on the crop | Smart gravity becomes the crop alignment |
+| `g:obj:<class>` | `:objects(<class>)` on the crop | Object gravity becomes the crop alignment: the union of the named class's detections, with an optional `:<scale>` after the class list |
 | `g:no`, `g:ea`, ... | `:top`, `:right`, ... | Compass gravities collapse to crabcrop's single-axis alignment; corners are approximated |
 | `g:fp:0.5:0.25` | No equivalent | Focal-point coordinates do not convert; `smart` and `face` alignments are the alternatives |
 | `dpr:2` | Send `DPR: 2` or `Sec-CH-DPR: 2` | crabcrop treats device pixel ratio as a request signal, not a URL option |
