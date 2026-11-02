@@ -47,10 +47,12 @@ export const FILTER_DESCRIPTIONS: Record<string, string> = {
     "saturation weighted toward the muted colors: percent, -100..100 (0 is unchanged; vivid colors and skin tones are protected)",
   huerotate: "rotate the hue by the given degrees",
   rotate: "rotate by the given angle in degrees; the canvas expands to fit",
-  quality: "output quality 1..100, or `auto` for perceptual targeting",
+  quality:
+    "output quality 1..100, or `auto` for perceptual targeting; or per-format values in one list (quality(80,jpeg:90,webp:75)), resolved after format negotiation",
   palette:
     "write PNG output as an indexed (palette) image with at most this many colors, 2..256; ignored by the other formats",
-  format: "force the output format",
+  format:
+    "force the output format; a format also takes its encoder options (format(jpeg,progressive), format(png,interlace), format(webp,method:6,sns:50)); an option its encoder cannot honour is refused",
   fill: "the background color other operations pad with",
   facepad: "how much a face crop expands around the face",
   pixelatefaces: "pixelate detected faces (needs a face model on the server)",
@@ -274,12 +276,63 @@ function validateFilter(name: string, args: string | null): string | null {
       return args !== null && isFloat(args) && Number(args) >= 0 && Number(args) <= 255
         ? null
         : bad;
-    case "quality":
-      return args === "auto" || (args !== null && isIntIn(args, 1, 100)) ? null : bad;
+    case "quality": {
+      if (args === null) return bad;
+      if (args === "auto" || isIntIn(args, 1, 100)) return null;
+      // Per-format list (issue #319): at most one bare
+      // fallback, at most one entry per format, no video
+      // formats (their quality is not the server's to set).
+      const seen = new Set<string>();
+      let fallbackSeen = false;
+      for (const part of args.split(",")) {
+        const colon = part.indexOf(":");
+        if (colon === -1) {
+          if (fallbackSeen || !(part === "auto" || isIntIn(part, 1, 100))) return bad;
+          fallbackSeen = true;
+        } else {
+          const name = part.slice(0, colon);
+          const value = part.slice(colon + 1);
+          if (!FORMAT_NAMES.has(name) || name === "mp4" || name === "webm") return bad;
+          const canonical = name === "jpg" ? "jpeg" : name;
+          if (seen.has(canonical)) return bad;
+          seen.add(canonical);
+          if (!(value === "auto" || isIntIn(value, 1, 100))) return bad;
+        }
+      }
+      return seen.size + (fallbackSeen ? 1 : 0) > 0 ? null : bad;
+    }
     case "palette":
       return args !== null && isIntIn(args, 2, 256) ? null : bad;
-    case "format":
-      return args !== null && FORMAT_NAMES.has(args) ? null : bad;
+    case "format": {
+      if (args === null) return bad;
+      // A format name plus its encoder options (issue #319),
+      // each validated against the format it belongs to.
+      const parts = args.split(",");
+      const [name, ...options] = parts;
+      if (!FORMAT_NAMES.has(name)) return bad;
+      const seen = new Set<string>();
+      for (const option of options) {
+        const key = option.includes(":") ? option.slice(0, option.indexOf(":")) : option;
+        if (seen.has(key)) return bad;
+        seen.add(key);
+        if (name === "jpeg" || name === "jpg") {
+          if (option === "progressive") continue;
+          if (/^subsampling:(444|422|420)$/.test(option)) continue;
+          return bad;
+        }
+        if (name === "png") {
+          if (option === "interlace") continue;
+          return bad;
+        }
+        if (name === "webp") {
+          if (/^method:[0-6]$/.test(option)) continue;
+          if (/^sns:\d+$/.test(option) && isIntIn(option.slice(4), 0, 100)) continue;
+          return bad;
+        }
+        return bad;
+      }
+      return null;
+    }
     case "rgb": {
       if (args === null) return bad;
       const parts = args.split(",");

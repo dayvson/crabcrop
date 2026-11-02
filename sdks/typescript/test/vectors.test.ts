@@ -435,6 +435,30 @@ test("explainUrl explains objects crops and rejects their malformed forms", () =
   }
 });
 
+test("encoder options and per-format quality explain (issue #319)", () => {
+  const SIG = "a".repeat(64);
+  const good = explainUrl(
+    `https://x/${SIG}/filters:format(jpeg,progressive,subsampling:444):quality(80,webp:75,jpeg:90)/https://e.com/a.jpg`,
+  );
+  assert.equal(good.errors.length, 0);
+  const webp = explainUrl(
+    `https://x/${SIG}/filters:format(webp,method:6,sns:20)/https://e.com/a.jpg`,
+  );
+  assert.equal(webp.errors.length, 0);
+  const avif = explainUrl(
+    `https://x/${SIG}/filters:format(avif,subsampling:420)/https://e.com/a.jpg`,
+  );
+  assert.ok(avif.errors.length > 0);
+  const dup = explainUrl(
+    `https://x/${SIG}/filters:quality(jpeg:80,jpeg:90)/https://e.com/a.jpg`,
+  );
+  assert.ok(dup.errors.length > 0);
+  const video = explainUrl(
+    `https://x/${SIG}/filters:quality(mp4:80)/https://e.com/a.jpg`,
+  );
+  assert.ok(video.errors.length > 0);
+});
+
 test("purge signatures match the published vectors", () => {
   // The same pinned literals the Rust crate asserts: one
   // wire scheme across every implementation.

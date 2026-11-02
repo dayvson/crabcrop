@@ -15,6 +15,32 @@
 /** Output formats the `format(...)` filter accepts. */
 export type ImageFormat = "jpeg" | "jpg" | "png" | "webp" | "jxl" | "avif" | "gif" | "mp4" | "webm";
 
+/** Formats a per-format quality entry can name (the video formats take no quality). */
+export type PerFormatQualityFormat = "jpeg" | "png" | "webp" | "jxl" | "avif" | "gif";
+
+const PER_FORMAT_QUALITY_FORMATS: PerFormatQualityFormat[] = [
+  "avif",
+  "gif",
+  "jpeg",
+  "jxl",
+  "png",
+  "webp",
+];
+
+/** Per-format encoder options for the `format(...)` filter (issue #319). */
+export interface FormatOptions {
+  /** JPEG: progressive (multi-scan) encoding. */
+  progressive?: boolean;
+  /** JPEG: chroma subsampling, 444, 422, or 420. */
+  subsampling?: 444 | 422 | 420;
+  /** PNG: Adam7 interlacing. */
+  interlace?: boolean;
+  /** WebP: libwebp compression method, 0..6. */
+  method?: number;
+  /** WebP: smart subsampling strength, 0..100. */
+  sns?: number;
+}
+
 /** Crop alignments; `center` is the bare `crop:WxH` spelling. */
 export type CropAlign = "center" | "smart" | "face" | "top" | "bottom" | "left" | "right" | "top-left" | "top-right" | "bottom-left" | "bottom-right";
 
@@ -537,15 +563,87 @@ export const filter = {
     if (value === "auto") return "quality(auto)";
     return `quality(${intIn("quality", value, 1, 100)})`;
   },
+  /**
+   * Per-format quality in one URL: a map of format to value
+   * (1..100 or "auto"), plus an optional fallback for
+   * formats with no entry. Resolved by the server after
+   * format negotiation; entries spell in canonical
+   * (format-name) order with the fallback first.
+   */
+  qualityPerFormat(
+    entries: Partial<Record<PerFormatQualityFormat, number | "auto">>,
+    fallback?: number | "auto",
+  ): string {
+    const names = Object.keys(entries) as PerFormatQualityFormat[];
+    if (names.length === 0 && fallback === undefined) {
+      fail("quality", "{}", "at least one entry or a fallback");
+    }
+    const parts: string[] = [];
+    if (fallback !== undefined) {
+      parts.push(fallback === "auto" ? "auto" : String(intIn("quality", fallback, 1, 100)));
+    }
+    for (const name of names.sort()) {
+      if (!PER_FORMAT_QUALITY_FORMATS.includes(name)) {
+        fail("quality", name, `one of ${PER_FORMAT_QUALITY_FORMATS.join(", ")}`);
+      }
+      const value = entries[name]!;
+      parts.push(`${name}:${value === "auto" ? "auto" : intIn("quality", value, 1, 100)}`);
+    }
+    return `quality(${parts.join(",")})`;
+  },
   /** Indexed PNG output with at most this many colors, 2..256; other formats ignore it. */
   palette(colors: number): string {
     return `palette(${intIn("palette colors", colors, 2, 256)})`;
   },
-  format(format: ImageFormat): string {
+  /**
+   * Output format, with its encoder options (issue #319):
+   * `progressive` and `subsampling` (444, 422, or 420) for
+   * JPEG, `interlace` for PNG, `method` (0..6) and `sns`
+   * (smart subsampling, 0..100) for WebP. An option its
+   * format cannot honour throws here, like the server's 400.
+   */
+  format(format: ImageFormat, options: FormatOptions = {}): string {
     if (!IMAGE_FORMATS.includes(format)) {
       fail("format", format, `one of ${IMAGE_FORMATS.join(", ")}`);
     }
-    return `format(${format})`;
+    const args: string[] = [format];
+    const used = (key: keyof FormatOptions) => options[key] !== undefined;
+    if (format === "jpeg" || format === "jpg") {
+      if (used("interlace") || used("method") || used("sns")) {
+        fail("format", JSON.stringify(options), "jpeg takes progressive and subsampling only");
+      }
+      if (options.progressive) args.push("progressive");
+      if (options.subsampling !== undefined) {
+        if (![444, 422, 420].includes(options.subsampling)) {
+          fail("subsampling", options.subsampling, "one of 444, 422, 420");
+        }
+        args.push(`subsampling:${options.subsampling}`);
+      }
+    } else if (format === "png") {
+      if (used("progressive") || used("subsampling") || used("method") || used("sns")) {
+        fail("format", JSON.stringify(options), "png takes interlace only");
+      }
+      if (options.interlace) args.push("interlace");
+    } else if (format === "webp") {
+      if (used("progressive") || used("subsampling") || used("interlace")) {
+        fail("format", JSON.stringify(options), "webp takes method and sns only");
+      }
+      if (options.method !== undefined) {
+        args.push(`method:${intIn("method", options.method, 0, 6)}`);
+      }
+      if (options.sns !== undefined) {
+        args.push(`sns:${intIn("sns", options.sns, 0, 100)}`);
+      }
+    } else if (
+      used("progressive") ||
+      used("subsampling") ||
+      used("interlace") ||
+      used("method") ||
+      used("sns")
+    ) {
+      fail("format", JSON.stringify(options), `${format} takes no encoder options`);
+    }
+    return `format(${args.join(",")})`;
   },
   /** The background color other operations pad with (RRGGBB). */
   fill(color: string): string {
