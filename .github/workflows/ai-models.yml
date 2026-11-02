@@ -56,7 +56,7 @@ jobs:
           # It is a Git LFS object, so its sha256 is also its LFS
           # object id; the official Ultralytics release asset is a
           # different export and is deliberately not used.
-          fetch yolov8n.onnx https://media.githubusercontent.com/media/hnlyf168/SimdYolo/main/models/onnx/yolov8n.onnx
+          fetch yolov8n.onnx https://media.githubusercontent.com/media/donet-org-cn/SimdYolo/main/models/onnx/yolov8n.onnx
           # CLIP ViT-B/32 (quantized ONNX) and its tokenizer.
           fetch vision_model_quantized.onnx https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model_quantized.onnx
           fetch text_model_quantized.onnx https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/text_model_quantized.onnx
