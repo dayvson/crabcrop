@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Added
+
+- Exposure in stops (issue #317). A new `exposure(stops)` filter performs the EV-style linear-light multiply the adjustment family was missing: each channel value is decoded to linear light, multiplied by `2^stops`, and encoded back, with -10 to 10 stops accepted and 0 unchanged. A stop multiplies rather than shifts, so it behaves the same at every brightness, where `brighten` adds a fixed amount and lifts black along with everything else. The scale is stated in the open because it is not a percent: it is the photographic stop, the unit exposure is set in on a camera, so a value from a photo editor carries over as written. Black stays black at every setting and alpha is untouched. The TypeScript SDK gains an `exposure` builder, and the imgix migration guide's exposure row now converts.
+
 ## [0.9.7] - 2026-11-01
 
 ### Added

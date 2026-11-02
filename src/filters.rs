@@ -7,7 +7,9 @@
 
 use image::DynamicImage;
 
-use crate::url::{CurveChannel, Filter, ImageFormat, MAX_BLUR_SIGMA, MAX_GAMMA, Quality};
+use crate::url::{
+    CurveChannel, Filter, ImageFormat, MAX_BLUR_SIGMA, MAX_EXPOSURE, MAX_GAMMA, Quality,
+};
 
 /// Encoding directives collected from filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -111,6 +113,9 @@ pub fn apply_filters_filled(
             }
             Filter::Gamma(gamma) => {
                 img = gamma_correct(&img, *gamma);
+            }
+            Filter::Exposure(stops) => {
+                img = exposure_correct(&img, *stops);
             }
             Filter::HueRotate(degrees) => img = huerotate_fast(img, *degrees),
             Filter::Sharpen(amount) => {
@@ -1186,6 +1191,69 @@ fn gamma_lut(gamma: f32) -> [u8; 256] {
 /// filters).
 fn gamma_correct(img: &DynamicImage, gamma: f32) -> DynamicImage {
     let lut = gamma_lut(gamma);
+    map_rgb(img.clone(), |r, g, b| {
+        [
+            lut[usize::from(r)],
+            lut[usize::from(g)],
+            lut[usize::from(b)],
+        ]
+    })
+}
+
+/// The sRGB electro-optical transfer function and its
+/// inverse (the standard piecewise forms): encoded value
+/// to linear light, and back.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The 256-entry lookup table for one exposure value in
+/// stops: entry `v` is the sRGB encoding of `v`'s linear
+/// value multiplied by `2^stops`, rounded to the nearest
+/// value. The table is monotone, 0 is a fixed point at
+/// every setting (zero light times any factor is zero),
+/// and 255 is a fixed point for non-negative stops. A
+/// stops value outside the grammar's contract is
+/// sanitized like the gamma table sanitizes its divisor:
+/// a non-finite value becomes 0 stops (the identity) and
+/// the magnitude clamps to [`MAX_EXPOSURE`]. Zero stops
+/// short-circuits to the identity table, so the no-op is
+/// exact by construction rather than by round-trip luck.
+fn exposure_lut(stops: f32) -> [u8; 256] {
+    let stops = if stops.is_finite() {
+        stops.clamp(-MAX_EXPOSURE, MAX_EXPOSURE)
+    } else {
+        0.0
+    };
+    if stops == 0.0 {
+        return std::array::from_fn(|i| i as u8);
+    }
+    let factor = 2f32.powf(stops);
+    let mut lut = [0u8; 256];
+    for (i, entry) in lut.iter_mut().enumerate() {
+        let linear = srgb_to_linear(i as f32 / 255.0) * factor;
+        *entry = (255.0 * linear_to_srgb(linear)).round().clamp(0.0, 255.0) as u8;
+    }
+    lut
+}
+
+/// Exposure (issue #317): remap every channel through the
+/// stops lookup table, the EV-style linear-light multiply.
+/// Alpha is never touched (the `map_rgb` contract).
+fn exposure_correct(img: &DynamicImage, stops: f32) -> DynamicImage {
+    let lut = exposure_lut(stops);
     map_rgb(img.clone(), |r, g, b| {
         [
             lut[usize::from(r)],
@@ -3259,6 +3327,78 @@ mod tests {
             assert_eq!(lut[200], 200, "gamma {bad}");
         }
         assert_eq!(gamma_lut(100.0), gamma_lut(MAX_GAMMA));
+    }
+
+    #[test]
+    fn exposure_zero_stops_is_the_identity() {
+        let lut = exposure_lut(0.0);
+        for (i, entry) in lut.iter().enumerate() {
+            assert_eq!(*entry, i as u8);
+        }
+        let (img, _) = apply_filters(solid(37, 128, 250), &[Filter::Exposure(0.0)]);
+        assert_eq!(first_pixel(&img), [37, 128, 250]);
+    }
+
+    #[test]
+    fn exposure_multiplies_in_linear_light() {
+        // One stop doubles the light: a mid gray at 128 has
+        // linear value about 0.216, doubled to 0.432, which
+        // encodes back to 176. Minus one stop halves it and
+        // lands on 92. Two stops on 64 (linear about 0.051)
+        // land on 125, and minus two stops on 200 land on
+        // 106: the same stop count moves shadows less than
+        // highlights in encoded values, which is the point
+        // of working in linear light.
+        let (img, _) = apply_filters(solid(128, 128, 128), &[Filter::Exposure(1.0)]);
+        assert_eq!(first_pixel(&img), [176, 176, 176]);
+        let (img, _) = apply_filters(solid(128, 128, 128), &[Filter::Exposure(-1.0)]);
+        assert_eq!(first_pixel(&img), [92, 92, 92]);
+        let (img, _) = apply_filters(solid(64, 64, 64), &[Filter::Exposure(2.0)]);
+        assert_eq!(first_pixel(&img), [125, 125, 125]);
+        let (img, _) = apply_filters(solid(200, 200, 200), &[Filter::Exposure(-2.0)]);
+        assert_eq!(first_pixel(&img), [106, 106, 106]);
+        // Black stays black at any setting; white stays
+        // white under brightening and gives ground only
+        // under darkening (255 at minus one stop is 188).
+        for stops in [-10.0, -1.0, 0.5, 3.0, 10.0] {
+            let (img, _) = apply_filters(solid(0, 0, 0), &[Filter::Exposure(stops)]);
+            assert_eq!(first_pixel(&img), [0, 0, 0], "stops {stops}");
+        }
+        let (img, _) = apply_filters(solid(255, 255, 255), &[Filter::Exposure(1.0)]);
+        assert_eq!(first_pixel(&img), [255, 255, 255]);
+        let (img, _) = apply_filters(solid(255, 255, 255), &[Filter::Exposure(-1.0)]);
+        assert_eq!(first_pixel(&img), [188, 188, 188]);
+        // The table is monotone across the range.
+        for stops in [-10.0, -0.5, 0.5, 10.0] {
+            let lut = exposure_lut(stops);
+            assert!(lut.windows(2).all(|w| w[0] <= w[1]), "stops {stops}");
+        }
+    }
+
+    #[test]
+    fn exposure_preserves_alpha() {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([128, 64, 32, 128]),
+        ));
+        let (out, _) = apply_filters(img, &[Filter::Exposure(1.0)]);
+        let px = out.to_rgba8().get_pixel(0, 0).0;
+        assert_eq!(px[3], 128);
+        assert_eq!(px[0], 176);
+    }
+
+    #[test]
+    fn exposure_lut_sanitizes_out_of_contract_values() {
+        // The parser never produces these; the table builder
+        // still refuses to reach powf with them.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let lut = exposure_lut(bad);
+            assert_eq!(lut[64], 64, "stops {bad}");
+            assert_eq!(lut[200], 200, "stops {bad}");
+        }
+        assert_eq!(exposure_lut(100.0), exposure_lut(MAX_EXPOSURE));
+        assert_eq!(exposure_lut(-100.0), exposure_lut(-MAX_EXPOSURE));
     }
 
     #[test]

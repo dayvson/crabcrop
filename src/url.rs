@@ -582,6 +582,16 @@ pub enum Filter {
     /// (issue #313); the scale is the exponent itself, the
     /// one scale comparable products agree on for gamma.
     Gamma(f32),
+    /// Exposure adjustment in stops: each channel value is
+    /// converted to linear light, multiplied by `2^stops`,
+    /// and converted back. 0 is identity, positive stops
+    /// brighten, negative stops darken. The grammar accepts
+    /// -10 to 10 stops ([`MAX_EXPOSURE`]). The scale is the
+    /// photographic stop itself, stated explicitly because
+    /// it is not a percent (issue #317); unlike `brighten`,
+    /// whose shift is additive, a stop multiplies, so it
+    /// behaves the same at every brightness.
+    Exposure(f32),
     /// Rotate the hue, in degrees.
     HueRotate(i32),
     /// Sharpen by this amount (unsharp mask strength, > 0).
@@ -966,6 +976,15 @@ pub const MAX_BLUR_SIGMA: f32 = 512.0;
 /// curve crushes all but a handful of input values to the
 /// endpoints, so the cap costs no real image.
 pub const MAX_GAMMA: f32 = 10.0;
+
+/// The largest `exposure` adjustment the grammar accepts,
+/// in stops (issue #317). Ten stops is a factor of 1024 in
+/// linear light, far past the point where every channel
+/// but the darkest has clamped to an endpoint, so the cap
+/// costs no real image; the bound exists so a hostile
+/// value cannot size the multiply into the non-finite
+/// range.
+pub const MAX_EXPOSURE: f32 = 10.0;
 
 /// The largest `focalpoint:` zoom the grammar accepts
 /// (issue #313). At 100 the crop window is one hundredth of
@@ -1616,6 +1635,13 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                     return Err(invalid());
                 }
                 Filter::Gamma(value)
+            }
+            ("exposure", Some(p)) => {
+                let stops: f32 = p.parse().map_err(|_| invalid())?;
+                if !stops.is_finite() || stops.abs() > MAX_EXPOSURE {
+                    return Err(invalid());
+                }
+                Filter::Exposure(stops)
             }
             ("huerotate", Some(p)) => {
                 let degrees: i32 = p.parse().map_err(|_| invalid())?;
@@ -2691,6 +2717,7 @@ fn filter_text(filter: &Filter) -> String {
         Filter::Brighten(v) => format!("brighten({v})"),
         Filter::Contrast(v) => format!("contrast({v})"),
         Filter::Gamma(v) => format!("gamma({v})"),
+        Filter::Exposure(v) => format!("exposure({v})"),
         Filter::HueRotate(v) => format!("huerotate({v})"),
         Filter::Sharpen(v) => format!("sharpen({v})"),
         Filter::Saturation(v) => format!("saturation({v})"),
@@ -3491,6 +3518,8 @@ mod tests {
             // Float spellings.
             ("filters:contrast(1.50)", "filters:contrast(1.5)"),
             ("filters:gamma(2.20)", "filters:gamma(2.2)"),
+            ("filters:exposure(1.50)", "filters:exposure(1.5)"),
+            ("filters:exposure(-2.0)", "filters:exposure(-2)"),
             // Six-digit text colors gain an opaque alpha.
             (
                 "filters:text(Hi,20,ffaa00,center)",
@@ -4218,6 +4247,9 @@ mod tests {
             "filters:contrast(-100)",
             "filters:gamma(10)",
             "filters:gamma(0.1)",
+            "filters:exposure(10)",
+            "filters:exposure(-10)",
+            "filters:exposure(0)",
             "filters:saturation(0)",
             "filters:saturation(255)",
             "filters:quality(1)",
@@ -4234,6 +4266,19 @@ mod tests {
     fn parses_gamma_filter() {
         let (ops, _) = parse_operations("filters:gamma(2.2)/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::Gamma(2.2)])]);
+    }
+
+    #[test]
+    fn parses_exposure_filter() {
+        let (ops, _) = parse_operations("filters:exposure(1.5)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Exposure(1.5)])]);
+        // Zero stops is the identity and parses, like
+        // contrast at 0; the endpoints of the stops range
+        // parse too (one step past them is pinned in
+        // rejects_bad_filters).
+        let (ops, _) = parse_operations("filters:exposure(-2)/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Exposure(-2.0)])]);
+        assert!(parse_operations("filters:exposure(0)/example.com/img.jpg").is_ok());
     }
 
     #[test]
@@ -4288,6 +4333,11 @@ mod tests {
             "filters:gamma(nan)",
             "filters:gamma(inf)",
             "filters:gamma()",
+            "filters:exposure(10.5)",
+            "filters:exposure(-10.5)",
+            "filters:exposure(nan)",
+            "filters:exposure(inf)",
+            "filters:exposure()",
             "filters:saturation(256)",
             "filters:saturation(-1)",
             "filters:quality()",

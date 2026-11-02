@@ -39,6 +39,8 @@ export const FILTER_DESCRIPTIONS: Record<string, string> = {
   contrast: "contrast in percent, -100..100 (0 is unchanged, -100 is flat)",
   gamma:
     "gamma correction with divisor g, 0 < g <= 10: each channel becomes 255 * (v / 255)^(1 / g) (1 is unchanged, above 1 brightens midtones)",
+  exposure:
+    "exposure in stops, -10..10: multiply the linear light by 2^stops (0 is unchanged, positive brightens, negative darkens)",
   huerotate: "rotate the hue by the given degrees",
   rotate: "rotate by the given angle in degrees; the canvas expands to fit",
   quality: "output quality 1..100, or `auto` for perceptual targeting",
@@ -244,6 +246,10 @@ function validateFilter(name: string, args: string | null): string | null {
         : bad;
     case "gamma":
       return args !== null && isFloat(args) && Number(args) > 0 && Number(args) <= 10
+        ? null
+        : bad;
+    case "exposure":
+      return args !== null && isFloat(args) && Number(args) >= -10 && Number(args) <= 10
         ? null
         : bad;
     case "saturation":

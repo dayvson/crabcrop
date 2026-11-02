@@ -108,6 +108,12 @@
     "signature": "30139aa29597be221216319d43f0b4d98db2206823b0b7564bf4bf76e62b86b9"
   },
   {
+    "description": "an exposure filter chain (issue #317)",
+    "remainder": "filters:exposure(1.5)/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "154396fc90f5357c7e9992a6ac16d23e2c988a2c759ad447b687c2e66bbb9b9a"
+  },
+  {
     "description": "a per-side trim (issue #313)",
     "remainder": "filters:trim(20,5,0,5,0)/https://example.com/photo.jpg",
     "secret": "s3cr3t",

@@ -377,6 +377,13 @@ export const filter = {
     }
     return `gamma(${num(value)})`;
   },
+  /** Exposure in stops: -10..10 (0 unchanged; +1 doubles the light, -1 halves it). */
+  exposure(stops: number): string {
+    if (!Number.isFinite(stops) || stops < -10 || stops > 10) {
+      fail("exposure", stops, "a number between -10 and 10");
+    }
+    return `exposure(${num(stops)})`;
+  },
   /** Rotate the hue by integer degrees. */
   hueRotate(degrees: number): string {
     return `huerotate(${intIn("huerotate degrees", degrees, -2147483648, 2147483647)})`;

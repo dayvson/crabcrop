@@ -74,7 +74,7 @@ imgix adjustments mostly run -100 to 100 with 0 as unchanged. crabcrop's adjustm
 | `sat=-30` | `filters:saturation(0.7)` | Value changes meaning: imgix is a percent (0 unchanged, -100 grayscale), crabcrop a factor (1 unchanged, 0 grayscale). Convert with `1 + sat/100`; copying the number renders a different image |
 | `bri=10` | `filters:brighten(26)` | Approximate: imgix scales brightness, crabcrop adds a channel shift, so rescale with `bri x 2.55` and expect a close match, not an identical one |
 | `hue=15` | `filters:huerotate(15)` | Direct: degrees on both; small rendering differences between any two hue implementations are normal |
-| `exp=20` (exposure) | No equivalent | Unsupported: `filters:curve(...)` is the closest tool for an exposure-like lift. Note the name collision in the differences below |
+| `exp=20` (exposure) | `filters:exposure(0.2)` | Approximate: imgix takes a percent from -100 to 100 and does not publish its curve; crabcrop takes stops directly, so dividing by 100 is a reasonable place to start tuning rather than an exact conversion. Note the name collision in the differences below |
 | `gam`, `shad`, `high` | No equivalent | Unsupported as parameters: all three are tone-curve shapes, approximated per image with `filters:curve(...)` |
 | `vib` | No equivalent | Unsupported: `saturation(...)` is the blunt substitute and does not protect skin tones |
 | `sharp=40` | `filters:sharpen(0.4)` | Approximate: a 0 to 100 luminance-sharpening strength becomes an unsharp strength, rescaled by 100 |
