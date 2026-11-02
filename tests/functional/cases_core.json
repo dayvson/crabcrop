@@ -1001,6 +1001,118 @@
   "tier": "full"
  },
  {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": "image/jpeg",
+    "t": "ct"
+   },
+   {
+    "fmt": "jpeg",
+    "t": "magic"
+   }
+  ],
+  "group": "format",
+  "id": "format-jpeg-progressive",
+  "ops": "800x0/filters:format(jpeg,progressive)",
+  "src": "car.jpg",
+  "tier": "full",
+  "why": "issue #319: JPEG progressive encoding is a per-request format option"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": "image/jpeg",
+    "t": "ct"
+   }
+  ],
+  "group": "format",
+  "id": "format-jpeg-subsampling",
+  "ops": "800x0/filters:format(jpeg,subsampling:444)",
+  "src": "car.jpg",
+  "tier": "full",
+  "why": "issue #319: JPEG chroma subsampling is a per-request format option"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": "image/png",
+    "t": "ct"
+   },
+   {
+    "fmt": "png",
+    "t": "magic"
+   }
+  ],
+  "group": "format",
+  "id": "format-png-interlace",
+  "ops": "300x0/filters:format(png,interlace)",
+  "src": "dog.jpg",
+  "tier": "full",
+  "why": "issue #319: PNG Adam7 interlacing is a per-request format option"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": "image/webp",
+    "t": "ct"
+   },
+   {
+    "fmt": "webp",
+    "t": "magic"
+   }
+  ],
+  "group": "format",
+  "id": "format-webp-options",
+  "ops": "800x0/filters:format(webp,method:6,sns:20)",
+  "src": "car.jpg",
+  "tier": "full",
+  "why": "issue #319: WebP method and smart subsampling are per-request format options"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "format",
+  "id": "format-avif-subsampling-rejected",
+  "ops": "800x0/filters:format(avif,subsampling:420)",
+  "src": "car.jpg",
+  "tier": "full",
+  "why": "issue #319: the AVIF encoder exposes no subsampling control, so the option is a clear 400, never silently ignored"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "format",
+  "id": "format-webp-progressive-rejected",
+  "ops": "800x0/filters:format(webp,progressive)",
+  "src": "car.jpg",
+  "tier": "full",
+  "why": "issue #319: an option belonging to another format is a 400"
+ },
+ {
   "accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
   "assert": [
    {
@@ -1270,6 +1382,56 @@
   "src": "car.jpg",
   "why": "unreachable budget: docs promise the smallest encode rather than an error; record bytes and quality used",
   "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": "image/webp",
+    "t": "ct"
+   }
+  ],
+  "group": "quality",
+  "id": "quality-per-format-webp",
+  "ops": "800x0/filters:format(webp):quality(jpeg:30,webp:95)",
+  "src": "car.jpg",
+  "tier": "full",
+  "why": "issue #319: per-format quality resolves to the negotiated format's entry"
+ },
+ {
+  "assert": [
+   {
+    "eq": 200,
+    "t": "status"
+   },
+   {
+    "eq": "image/jpeg",
+    "t": "ct"
+   }
+  ],
+  "group": "quality",
+  "id": "quality-per-format-fallback",
+  "ops": "800x0/filters:format(jpeg):quality(70,webp:95)",
+  "src": "car.jpg",
+  "tier": "full",
+  "why": "issue #319: a format with no entry uses the list's bare fallback value"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "quality",
+  "id": "quality-per-format-video-rejected",
+  "ops": "800x0/filters:quality(mp4:80)",
+  "src": "car.jpg",
+  "tier": "full",
+  "why": "issue #319: a quality entry for a video format can never take effect and is a 400"
  },
  {
   "assert": [
