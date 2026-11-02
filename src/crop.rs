@@ -113,7 +113,7 @@ fn crop_to_aspect_impl(
         // (and runs no detection, exactly as before). The
         // traced path still reports the focal analysis: a
         // full-frame window positioned on the point.
-        let traced = trace.then(|| focal_for(align, &img, faces, declared));
+        let traced = trace.then(|| focal_for(&align, &img, faces, declared));
         return (
             img,
             traced.map(|(point, face_boxes)| CropTrace {
@@ -214,7 +214,7 @@ fn faces_inside(faces: &[crate::ai::FaceBox], window: (u32, u32, u32, u32)) -> u
 /// estimate, `Center` is the image center by definition, and
 /// directional alignments have no point.
 fn focal_for(
-    align: Align,
+    align: &Align,
     img: &DynamicImage,
     faces: Option<&dyn crate::ai::FaceProvider>,
     declared: Option<&dyn crate::ai::FocalProvider>,
@@ -398,15 +398,109 @@ pub fn crop_around_face_traced(
     face: &crate::ai::FaceBox,
     padding: f32,
 ) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
+    let pad = padding.max(0.0) as f64;
+    crop_region_traced(
+        img,
+        target_w,
+        target_h,
+        face.x as f64 + face.w as f64 / 2.0,
+        face.y as f64 + face.h as f64 / 2.0,
+        face.w as f64 * (1.0 + 2.0 * pad),
+        face.h as f64 * (1.0 + 2.0 * pad),
+    )
+}
+
+/// The union of detected object boxes, as (left, top,
+/// right, bottom) edges: the smallest rectangle holding
+/// every box. `None` for an empty set.
+pub fn union_box(detections: &[crate::ai::Detection]) -> Option<(u32, u32, u32, u32)> {
+    let mut iter = detections.iter();
+    let first = iter.next()?;
+    let (mut left, mut top) = (first.x, first.y);
+    let (mut right, mut bottom) = (
+        first.x.saturating_add(first.w),
+        first.y.saturating_add(first.h),
+    );
+    for d in iter {
+        left = left.min(d.x);
+        top = top.min(d.y);
+        right = right.max(d.x.saturating_add(d.w));
+        bottom = bottom.max(d.y.saturating_add(d.h));
+    }
+    Some((left, top, right, bottom))
+}
+
+/// Crop `img` to the `target_w:target_h` aspect ratio,
+/// framing the detected-objects union box `union` (edges:
+/// left, top, right, bottom) scaled by `scale` around the
+/// box's center (issue #318): the smallest region with
+/// that aspect which contains the scaled box, centered on
+/// the box's center and clamped into the image, the face
+/// crop's rule with the union as its subject. The engine
+/// resizes the result to the exact target, like every
+/// other crop.
+pub fn crop_around_objects(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    union: (u32, u32, u32, u32),
+    scale: f32,
+) -> DynamicImage {
+    crop_around_objects_traced(img, target_w, target_h, union, scale).0
+}
+
+/// [`crop_around_objects`], also reporting the window it
+/// cut, as (left, top, width, height): `None` when no crop
+/// ran (a zero target or an empty image).
+pub fn crop_around_objects_traced(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    union: (u32, u32, u32, u32),
+    scale: f32,
+) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
+    // The grammar guarantees the scale range; sanitize the
+    // same way the point crop sanitizes its zoom, so a
+    // hand-built call cannot invert the window math.
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale.min(crate::url::MAX_OBJECTS_SCALE)
+    } else {
+        1.0
+    };
+    let (left, top, right, bottom) = union;
+    crop_region_traced(
+        img,
+        target_w,
+        target_h,
+        (left as f64 + right as f64) / 2.0,
+        (top as f64 + bottom as f64) / 2.0,
+        right.saturating_sub(left) as f64 * scale as f64,
+        bottom.saturating_sub(top) as f64 * scale as f64,
+    )
+}
+
+/// The shared subject-region crop behind the face and
+/// objects crops: the smallest `target_w:target_h` region
+/// holding a `pw` by `ph` subject box centered at
+/// (`cx`, `cy`), clamped into the image. When the subject
+/// cannot fit (the image is too small on one axis) the
+/// region shrinks to fit and the subject fills more of
+/// the frame.
+fn crop_region_traced(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    cx: f64,
+    cy: f64,
+    pw: f64,
+    ph: f64,
+) -> (DynamicImage, Option<(u32, u32, u32, u32)>) {
     if target_w == 0 || target_h == 0 || img.width() == 0 || img.height() == 0 {
         return (img, None);
     }
     let (w, h) = (img.width() as f64, img.height() as f64);
     let (tw, th) = (target_w as f64, target_h as f64);
-    let pad = padding.max(0.0) as f64;
-    let pw = face.w as f64 * (1.0 + 2.0 * pad);
-    let ph = face.h as f64 * (1.0 + 2.0 * pad);
-    // The smallest target-aspect region holding the padded face.
+    // The smallest target-aspect region holding the subject.
     let scale = (pw / tw).max(ph / th);
     let (mut rw, mut rh) = (tw * scale, th * scale);
     // Shrink to fit the image, keeping the aspect.
@@ -418,8 +512,6 @@ pub fn crop_around_face_traced(
         rh = h;
         rw = rh * tw / th;
     }
-    let cx = face.x as f64 + face.w as f64 / 2.0;
-    let cy = face.y as f64 + face.h as f64 / 2.0;
     let ox = (cx - rw / 2.0).clamp(0.0, (w - rw).max(0.0));
     let oy = (cy - rh / 2.0).clamp(0.0, (h - rh).max(0.0));
     let cw = (rw.round() as u32).clamp(1, img.width());
@@ -820,6 +912,120 @@ mod tests {
         assert_eq!((out.width(), out.height()), (120, 120));
         assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
         assert_eq!(rgb(&out, 119, 119), [128, 128, 128]);
+    }
+
+    fn det(x: u32, y: u32, w: u32, h: u32) -> crate::ai::Detection {
+        crate::ai::Detection {
+            label: "thing".to_string(),
+            score: 0.9,
+            x,
+            y,
+            w,
+            h,
+        }
+    }
+
+    #[test]
+    fn union_box_spans_every_detection() {
+        assert_eq!(union_box(&[]), None);
+        assert_eq!(union_box(&[det(10, 20, 30, 40)]), Some((10, 20, 40, 60)));
+        // The union takes the extremes on both axes, in
+        // either order.
+        let boxes = [
+            det(100, 50, 20, 20),
+            det(10, 200, 30, 30),
+            det(60, 90, 10, 10),
+        ];
+        assert_eq!(union_box(&boxes), Some((10, 50, 120, 230)));
+        let mut reversed = boxes;
+        reversed.reverse();
+        assert_eq!(union_box(&reversed), Some((10, 50, 120, 230)));
+        // A box at the coordinate edge saturates instead of
+        // overflowing.
+        assert_eq!(
+            union_box(&[det(u32::MAX - 5, 0, 30, 10)]),
+            Some((u32::MAX - 5, 0, u32::MAX, 10))
+        );
+    }
+
+    #[test]
+    fn objects_crop_tight_frames_the_union() {
+        // The face canvas's red block is x 300..360,
+        // y 20..80: a tight square crop on that union is
+        // exactly the block.
+        let (out, window) =
+            crop_around_objects_traced(face_canvas(), 1, 1, (300, 20, 360, 80), 1.0);
+        assert_eq!(window, Some((300, 20, 60, 60)));
+        assert_eq!((out.width(), out.height()), (60, 60));
+        assert_eq!(rgb(&out, 0, 0), [255, 0, 0]);
+        assert_eq!(rgb(&out, 59, 59), [255, 0, 0]);
+    }
+
+    #[test]
+    fn objects_crop_scale_expands_around_the_union_center() {
+        // Scale 2 on the 60x60 union makes a 120x120
+        // subject, clamped to y=0: origin (270, 0), the
+        // face crop's padding-0.5 window on the same box.
+        let (out, window) =
+            crop_around_objects_traced(face_canvas(), 1, 1, (300, 20, 360, 80), 2.0);
+        assert_eq!(window, Some((270, 0, 120, 120)));
+        assert_eq!((out.width(), out.height()), (120, 120));
+        // The union lands at (30..90, 20..80) of the crop.
+        assert_eq!(rgb(&out, 60, 50), [255, 0, 0]);
+        assert_eq!(rgb(&out, 0, 0), [128, 128, 128]);
+        // Scale below 1 tightens past the union: a 30x30
+        // window centered on the same center (330, 50).
+        let (_, window) = crop_around_objects_traced(face_canvas(), 1, 1, (300, 20, 360, 80), 0.5);
+        assert_eq!(window, Some((315, 35, 30, 30)));
+    }
+
+    #[test]
+    fn objects_crop_frames_the_union_of_scattered_objects() {
+        // Two red blocks at opposite ends of a 400x300
+        // canvas; the union spans x 40..360, y 40..120.
+        let mut img = DynamicImage::new_rgb8(400, 300);
+        for (x, y, p) in img.as_mut_rgb8().unwrap().enumerate_pixels_mut() {
+            *p = if ((40..80).contains(&x) && (40..80).contains(&y))
+                || ((320..360).contains(&x) && (80..120).contains(&y))
+            {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([128, 128, 128])
+            };
+        }
+        let union = union_box(&[det(40, 40, 40, 40), det(320, 80, 40, 40)]).unwrap();
+        assert_eq!(union, (40, 40, 360, 120));
+        // A square region holding the 320-wide union is
+        // 320x320, taller than the canvas: it shrinks to
+        // 300x300, centered on the union's center x=200.
+        let (out, window) = crop_around_objects_traced(img, 1, 1, union, 1.0);
+        assert_eq!(window, Some((50, 0, 300, 300)));
+        // Both blocks survive inside the crop.
+        assert!(has_pure_red(&out));
+        assert_eq!(rgb(&out, 0, 40), [255, 0, 0]);
+        assert_eq!(rgb(&out, 299, 100), [255, 0, 0]);
+    }
+
+    #[test]
+    fn objects_crop_clamps_into_the_corner() {
+        let (_, window) = crop_around_objects_traced(face_canvas(), 1, 1, (0, 0, 40, 40), 3.0);
+        assert_eq!(window, Some((0, 0, 120, 120)));
+    }
+
+    #[test]
+    fn objects_crop_sanitizes_a_hand_built_scale() {
+        let canvas = face_canvas();
+        let tight = crop_around_objects_traced(canvas.clone(), 1, 1, (300, 20, 360, 80), 1.0).1;
+        // NaN, zero, and negative scales act as 1; the
+        // window never inverts.
+        for bad in [f32::NAN, 0.0, -2.0] {
+            let got = crop_around_objects_traced(canvas.clone(), 1, 1, (300, 20, 360, 80), bad).1;
+            assert_eq!(got, tight, "scale {bad}");
+        }
+        // A zero target runs no crop.
+        let (out, window) = crop_around_objects_traced(canvas, 0, 1, (300, 20, 360, 80), 1.0);
+        assert_eq!(window, None);
+        assert_eq!((out.width(), out.height()), (400, 300));
     }
 
     #[test]
