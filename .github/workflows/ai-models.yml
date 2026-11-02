@@ -5,7 +5,7 @@ name: AI models (real inference)
 # artifacts and never committed. This job downloads the pinned
 # artifacts, verifies them against the same sha256 pins as
 # Dockerfile.ai (plus the pins recorded for the test-only models),
-# recreates the three tiny authored fixture models, and runs the
+# recreates the tiny authored fixture models, and runs the
 # ignored AI tests for real. Manual dispatch plus a weekly run.
 
 on:
@@ -35,7 +35,7 @@ jobs:
         with:
           path: ${{ env.AI_ASSETS }}
           # Bump the trailing version when any pin below changes.
-          key: ai-assets-v1-ort1.31.0-u2netp309c84-yunet8f238-yoloabc0dd-clip583fd1-bus-c02019
+          key: ai-assets-v2-ort1.31.0-u2netp309c84-yunet8f238-yoloabc0dd-clip583fd1-bus-c02019-mod971a21-lama7df918-samenc51e08-samdec2542b8-ocrdet090f04-ocrrec6f3272-dictb5f2bf-aesb32c7b14c-aesl142cd4e6
 
       - name: Download the pinned assets
         run: |
@@ -64,6 +64,33 @@ jobs:
           # Test photo for the live CLIP/detection tests: people
           # and a bus, the classes the detection test asserts.
           fetch bus.jpg https://github.com/ultralytics/assets/releases/download/v0.0.0/bus.jpg
+          # Moderation: the d0gr conversion of the Falconsai
+          # nsfw_image_detection classifier (Apache-2.0), an
+          # int8 export; it is the artifact the moderation
+          # tests were built against in the #171 spike.
+          fetch moderation.onnx https://huggingface.co/d0gr/falconsai-nsfw-detector-onnx/resolve/main/nsfw_classifier/model.onnx
+          # Inpainting: the OpenCV zoo export of big-lama,
+          # from the same collection as YuNet above.
+          fetch lama.onnx https://github.com/opencv/opencv_zoo/raw/main/models/inpainting_lama/inpainting_lama_2025jan.onnx
+          # Segmentation: a MobileSAM encoder/decoder pair
+          # in the SamOnnxModel export shape (Apache-2.0),
+          # pinned to a commit of the Kazuhito00 export.
+          # The pair the tests were authored against has no
+          # canonical mirror; this export passes the same
+          # segment tests and is pinned by checksum below.
+          fetch mobile_sam_encoder.onnx https://github.com/Kazuhito00/MobileSAM-ONNX-Sample/raw/9ab69f40447402f4c677b44fae76c6e54ea288bd/onnx_model/vit_t_encoder.onnx
+          fetch mobile_sam_decoder.onnx https://github.com/Kazuhito00/MobileSAM-ONNX-Sample/raw/9ab69f40447402f4c677b44fae76c6e54ea288bd/onnx_model/vit_t_decoder.onnx
+          # OCR: the RapidOCR exports of PP-OCRv6 small
+          # (Apache-2.0) and the dictionary the recognizer
+          # was trained with, from the RapidOCR model
+          # collection on ModelScope.
+          fetch PP-OCRv6_det_small.onnx https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx
+          fetch PP-OCRv6_rec_small.onnx https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx
+          fetch ppocrv6_dict.txt https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt
+          # Aesthetic heads: the LAION sa_0_4 linear heads
+          # for the CLIP ViT-B/32 and ViT-L/14 encoders.
+          fetch sa_0_4_vit_b_32_linear.pth https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_b_32_linear.pth
+          fetch sa_0_4_vit_l_14_linear.pth https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_l_14_linear.pth
 
       - name: Extract the ONNX Runtime library
         run: |
@@ -84,18 +111,29 @@ jobs:
           8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  yunet.onnx
           abc0ddbab9f194039ff41216a8cc6c8b0b2133f1bdadeb6591d4fee7ad270aa7  yolov8n.onnx
           583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299  vision_model_quantized.onnx
-          73baab855d406190da9faa498cfedf65cf309f4cc7385b7b032e6d08e5c3a  text_model_quantized.onnx
+          73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a  text_model_quantized.onnx
           f7f3b7af117d467b58374797691a6438d3e6b9e9cef800dfd5dced7f697a90cd  tokenizer.json
           c02019c4979c191eb739ddd944445ef408dad5679acab6fd520ef9d434bfbc63  bus.jpg
+          971a219a105edea0f219bcf471d5d14452022d621e0f59e160ef6c9cf2358f1d  moderation.onnx
+          7df918ac3921d3daf0aae1d219776cf0dc4e4935f035af81841b40adcf74fdf2  lama.onnx
+          c51e08124f9ec76a6033251b627dfc930d66016ec5d80a30e2e8015ac3dc517c  mobile_sam_encoder.onnx
+          2542b80880d35c8ed7ea104873b5df0ba15499c325f135eb52d616182039baf8  mobile_sam_decoder.onnx
+          090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f  PP-OCRv6_det_small.onnx
+          6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884  PP-OCRv6_rec_small.onnx
+          b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d  ppocrv6_dict.txt
+          c7b14cead230694acc7b9447974d3cad78003c72da032e402a303b6c2429e85f  sa_0_4_vit_b_32_linear.pth
+          2cd4e60f4f24ae3bcd57b847b13c1f3ba27edc28cc1a7f9ce74ee9f421243cba  sa_0_4_vit_l_14_linear.pth
           EOF
 
       - name: Generate the authored fixture models
         run: |
           set -euo pipefail
-          # Three fixtures have no upstream download: they were
-          # authored for the load tests (issue #179 item 2), so CI
-          # recreates them. IR 8 / opset 13 throughout: the current
-          # onnx package defaults to an IR that ORT 1.31 rejects.
+          # Four fixtures have no upstream download: they
+          # were authored for the load tests (issue #179
+          # item 2) and the focal tests (issue #166), so CI
+          # recreates them. IR 8 / opset 13 throughout: the
+          # current onnx package defaults to an IR that ORT
+          # 1.31 rejects.
           python3 -m venv "$RUNNER_TEMP/ai-venv"
           "$RUNNER_TEMP/ai-venv/bin/pip" install --quiet onnx==1.23.2
           "$RUNNER_TEMP/ai-venv/bin/python" - "$AI_ASSETS" <<'PYEOF'
@@ -157,6 +195,20 @@ jobs:
           )
           save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
                "sr-x2.onnx")
+
+          # Luma heatmap: the focal provider's test model
+          # (issue #166): a ReduceMean over the channel axis
+          # of a fixed [1, 3, 32, 32] input, so the single
+          # output is the per-pixel luma grid and its argmax
+          # is the brightest input pixel.
+          graph = helper.make_graph(
+              [helper.make_node("ReduceMean", ["image"], ["heatmap"], axes=[1], keepdims=1)],
+              "luma-heatmap",
+              [helper.make_tensor_value_info("image", TensorProto.FLOAT, [1, 3, 32, 32])],
+              [helper.make_tensor_value_info("heatmap", TensorProto.FLOAT, [1, 1, 32, 32])],
+          )
+          save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+               "luma-heatmap.onnx")
           print("fixtures generated")
           PYEOF
 
@@ -220,6 +272,16 @@ jobs:
           CRABCROP_TEST_CLIP_TOKENIZER: ${{ env.AI_ASSETS }}/tokenizer.json
           CRABCROP_TEST_CLIP_LABELS: ${{ env.AI_ASSETS }}/labels.txt
           CRABCROP_TEST_IMAGE: ${{ env.AI_ASSETS }}/bus.jpg
+          CRABCROP_TEST_MODERATION_MODEL: ${{ env.AI_ASSETS }}/moderation.onnx
+          CRABCROP_TEST_INPAINT_MODEL: ${{ env.AI_ASSETS }}/lama.onnx
+          CRABCROP_TEST_SEGMENT_ENCODER_MODEL: ${{ env.AI_ASSETS }}/mobile_sam_encoder.onnx
+          CRABCROP_TEST_SEGMENT_DECODER_MODEL: ${{ env.AI_ASSETS }}/mobile_sam_decoder.onnx
+          CRABCROP_TEST_OCR_DETECT_MODEL: ${{ env.AI_ASSETS }}/PP-OCRv6_det_small.onnx
+          CRABCROP_TEST_OCR_RECOGNIZE_MODEL: ${{ env.AI_ASSETS }}/PP-OCRv6_rec_small.onnx
+          CRABCROP_TEST_OCR_DICT: ${{ env.AI_ASSETS }}/ppocrv6_dict.txt
+          CRABCROP_TEST_AESTHETIC_HEAD: ${{ env.AI_ASSETS }}/sa_0_4_vit_b_32_linear.pth
+          CRABCROP_TEST_AESTHETIC_HEAD_L14: ${{ env.AI_ASSETS }}/sa_0_4_vit_l_14_linear.pth
+          CRABCROP_TEST_FOCAL_MODEL: ${{ env.AI_ASSETS }}/luma-heatmap.onnx
           # CRABCROP_TEST_DETECT_LABELS is deliberately unset: the
           # detection tests then read the class names embedded in
           # the YOLO export, which is the production path.
