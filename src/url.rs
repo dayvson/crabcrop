@@ -643,6 +643,16 @@ pub enum Filter {
     Noise(u8),
     /// Histogram equalization per channel.
     Equalize,
+    /// Gentle per-channel auto-levels: each channel's
+    /// 0.5th percentile maps to 0 and its 99.5th to 255
+    /// (issue #317), the conservative clipping the studio
+    /// scene correction uses, with a channel whose
+    /// percentile span is too small left unmapped.
+    /// Deliberately weaker than `equalize`, which
+    /// redistributes the whole histogram: enhance
+    /// stretches a compressed range toward the ends and
+    /// leaves a well-exposed image nearly alone.
+    Enhance,
     /// Rotate by the given angle in degrees (issue #144):
     /// multiples of 90 take the exact quarter-turn path, any
     /// other angle rotates geometrically onto an expanded
@@ -1800,6 +1810,7 @@ fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
                 Filter::Noise(amount)
             }
             ("equalize", None) => Filter::Equalize,
+            ("enhance", None) => Filter::Enhance,
             ("removebg", None) => Filter::RemoveBg,
             ("studio", Some(p)) => Filter::Studio(parse_studio(p).ok_or_else(invalid)?),
             ("keep_profile", None) => Filter::KeepProfile,
@@ -2787,6 +2798,7 @@ fn filter_text(filter: &Filter) -> String {
         }
         Filter::Noise(v) => format!("noise({v})"),
         Filter::Equalize => "equalize".to_string(),
+        Filter::Enhance => "enhance".to_string(),
         Filter::Rotate(v) => format!("rotate({})", format_angle(*v)),
         Filter::Trim(v) => format!("trim({v})"),
         Filter::TrimSides(t, [l, tp, r, b]) => format!("trim({t},{l},{tp},{r},{b})"),
@@ -4367,6 +4379,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_enhance_filter() {
+        let (ops, _) = parse_operations("filters:enhance/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Enhance])]);
+        // Empty parentheses spell the same filter, like
+        // every no-argument filter.
+        let (ops, _) = parse_operations("filters:enhance()/example.com/img.jpg").unwrap();
+        assert_eq!(ops, vec![Operation::Filters(vec![Filter::Enhance])]);
+    }
+
+    #[test]
     fn parses_palette_filter() {
         let (ops, _) = parse_operations("filters:palette(64)/example.com/img.jpg").unwrap();
         assert_eq!(ops, vec![Operation::Filters(vec![Filter::Palette(64)])]);
@@ -4439,6 +4461,7 @@ mod tests {
             "filters:quality()",
             "filters:quality(autoo)",
             "filters:grayscale(1)",
+            "filters:enhance(1)",
             "filters:format(bmp)",
             "filters:quality(80",
             "filters:radius()",

@@ -126,6 +126,12 @@
     "signature": "d2a8ce83c787b6590070c99a927fba250a96a1d59c3637bd97918bb479eaa2aa"
   },
   {
+    "description": "an enhance filter chain (issue #317)",
+    "remainder": "filters:enhance/https://example.com/photo.jpg",
+    "secret": "s3cr3t",
+    "signature": "114970e70a6e88f2a7ca849d8c305e26929bdb1a81c06ba32bb6b49d8bd02be8"
+  },
+  {
     "description": "a per-side trim (issue #313)",
     "remainder": "filters:trim(20,5,0,5,0)/https://example.com/photo.jpg",
     "secret": "s3cr3t",

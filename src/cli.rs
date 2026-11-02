@@ -564,6 +564,7 @@ pub(crate) fn describe_filter(filter: &Filter) -> String {
         }
         Filter::Noise(v) => format!("noise({v}): add deterministic film grain"),
         Filter::Equalize => "equalize: histogram equalization".into(),
+        Filter::Enhance => "enhance: gentle auto-levels".into(),
         Filter::Rotate(v) => format!("rotate({v}): rotate by a multiple of 90 degrees"),
         Filter::Trim(v) => format!("trim({v}): trim near-uniform borders"),
         Filter::TrimSides(t, [l, tp, r, b]) => {

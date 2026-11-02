@@ -345,6 +345,8 @@ test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
     ["filters:vibrance(-100)/" + SRC, false, SRC],
     ["filters:vibrance(101)/" + SRC, true, SRC],
     ["filters:vibrance(nan)/" + SRC, true, SRC],
+    ["filters:enhance/" + SRC, false, SRC],
+    ["filters:enhance(1)/" + SRC, true, SRC],
     ["filters:trim(20,5,0,5,0)/" + SRC, false, SRC],
     ["filters:trim(20,5)/" + SRC, true, SRC],
     ["filters:trim(20,5,0,5,-1)/" + SRC, true, SRC],

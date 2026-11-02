@@ -155,6 +155,9 @@ pub fn apply_filters_filled(
             Filter::Equalize => {
                 img = map_rgb_image(img, equalize);
             }
+            Filter::Enhance => {
+                img = map_rgb_image(img, auto_levels);
+            }
             Filter::Rotate(degrees) => {
                 let normalized = ((degrees % 360.0) + 360.0) % 360.0;
                 img = if normalized == 90.0 {
@@ -2242,6 +2245,78 @@ fn vibrance(mut out: image::RgbImage, amount: f32) -> image::RgbImage {
     out
 }
 
+/// The smallest percentile span [`auto_levels`] will
+/// stretch: a channel whose 0.5th and 99.5th percentiles
+/// sit closer than this is left unmapped, because
+/// stretching a near-flat channel mostly amplifies
+/// noise. The studio scene correction uses the same
+/// floor for the same reason.
+const AUTO_LEVELS_MIN_SPAN: u8 = 16;
+
+/// The value at percentile `num / den` of a channel
+/// histogram: the smallest value whose cumulative count
+/// reaches that share of the total (the studio scene
+/// correction's percentile, same definition).
+fn channel_percentile(hist: &[u64; 256], total: u64, num: u64, den: u64) -> u8 {
+    let target = (total * num).div_ceil(den).max(1);
+    let mut acc = 0u64;
+    for (v, n) in hist.iter().enumerate() {
+        acc += n;
+        if acc >= target {
+            return v as u8;
+        }
+    }
+    255
+}
+
+/// Auto-enhance (issue #317): a gentle per-channel
+/// auto-levels. Each channel's 0.5th percentile maps to
+/// 0 and its 99.5th percentile to 255, with the values
+/// between stretched linearly: a compressed range opens
+/// toward the ends, a color cast fades (each channel
+/// stretches on its own percentiles), and an image that
+/// already spans the range is left nearly alone. The
+/// clipping percentiles are deliberately conservative,
+/// which is what keeps the filter gentle next to
+/// [`equalize`] and its full redistribution. A channel
+/// whose percentile span is under
+/// [`AUTO_LEVELS_MIN_SPAN`] is left unmapped.
+fn auto_levels(img: image::RgbImage) -> image::RgbImage {
+    let total = (img.width() * img.height()) as u64;
+    let mut hists = [[0u64; 256]; 3];
+    for p in img.pixels() {
+        hists[0][p[0] as usize] += 1;
+        hists[1][p[1] as usize] += 1;
+        hists[2][p[2] as usize] += 1;
+    }
+    let mut maps: [[u8; 256]; 3] = [[0; 256]; 3];
+    for c in 0..3 {
+        let lo = channel_percentile(&hists[c], total, 1, 200);
+        let hi = channel_percentile(&hists[c], total, 199, 200);
+        let (lo, hi) = if hi.saturating_sub(lo) < AUTO_LEVELS_MIN_SPAN {
+            (0usize, 255usize)
+        } else {
+            (usize::from(lo), usize::from(hi))
+        };
+        for (v, slot) in maps[c].iter_mut().enumerate() {
+            *slot = if v <= lo {
+                0
+            } else if v >= hi {
+                255
+            } else {
+                ((v - lo) * 255 + (hi - lo) / 2) / (hi - lo)
+            } as u8;
+        }
+    }
+    let mut out = img;
+    for p in out.pixels_mut() {
+        for c in 0..3 {
+            p[c] = maps[c][p[c] as usize];
+        }
+    }
+    out
+}
+
 /// Histogram equalization, independently per channel.
 fn equalize(img: image::RgbImage) -> image::RgbImage {
     let total = (img.width() * img.height()) as u64;
@@ -3642,6 +3717,119 @@ mod tests {
         let (clamped, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(250.0)]);
         let (at_cap, _) = apply_filters(solid(140, 120, 110), &[Filter::Vibrance(100.0)]);
         assert_eq!(first_pixel(&clamped), first_pixel(&at_cap));
+    }
+
+    /// A gray image from a value census: `counts` pairs of
+    /// (value, pixels), laid out in order.
+    fn census_image(counts: &[(u8, usize)], w: u32) -> DynamicImage {
+        let total: usize = counts.iter().map(|c| c.1).sum();
+        let h = (total as u32).div_ceil(w);
+        let mut img = DynamicImage::new_rgb8(w, h);
+        let rgb = img.as_mut_rgb8().unwrap();
+        let mut pixels = rgb.pixels_mut();
+        for &(value, n) in counts {
+            for _ in 0..n {
+                if let Some(p) = pixels.next() {
+                    *p = image::Rgb([value, value, value]);
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn enhance_stretches_a_compressed_range() {
+        // 1% of pixels at 30, 98% at 100, 1% at 220: the
+        // 0.5th percentile is 30 and the 99.5th is 220, so
+        // 30 maps to 0, 220 to 255, and 100 lands on
+        // ((100 - 30) * 255 + 95) / 190 = 94.
+        let img = census_image(&[(30, 100), (100, 9800), (220, 100)], 100);
+        let (out, _) = apply_filters(img, &[Filter::Enhance]);
+        let rgb = out.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0)[0], 0);
+        assert_eq!(rgb.get_pixel(50, 50)[0], 94);
+        assert_eq!(rgb.get_pixel(99, 99)[0], 255);
+    }
+
+    #[test]
+    fn enhance_leaves_flat_and_full_range_images_alone() {
+        // A flat channel has no span to stretch.
+        let (out, _) = apply_filters(solid(100, 100, 100), &[Filter::Enhance]);
+        assert_eq!(first_pixel(&out), [100, 100, 100]);
+        // A near-flat channel (span 10, under the floor of
+        // 16) is left unmapped too.
+        let img = census_image(&[(100, 5000), (110, 5000)], 100);
+        let (out, _) = apply_filters(img, &[Filter::Enhance]);
+        let rgb = out.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0)[0], 100);
+        assert_eq!(rgb.get_pixel(99, 99)[0], 110);
+        // An image already spanning the range maps its
+        // percentiles to the same ends and stays put.
+        let img = census_image(&[(0, 5000), (255, 5000)], 100);
+        let (out, _) = apply_filters(img, &[Filter::Enhance]);
+        let rgb = out.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0)[0], 0);
+        assert_eq!(rgb.get_pixel(99, 99)[0], 255);
+    }
+
+    #[test]
+    fn enhance_is_gentler_than_equalize() {
+        // A quarter black, half mid, a quarter white: the
+        // percentiles already sit at the ends, so enhance
+        // leaves the mid value at 100, while equalize
+        // redistributes it to 170.
+        let img = census_image(&[(0, 2500), (100, 5000), (255, 2500)], 100);
+        let (out, _) = apply_filters(img.clone(), &[Filter::Enhance]);
+        assert_eq!(out.to_rgb8().get_pixel(50, 50)[0], 100);
+        let (out, _) = apply_filters(img, &[Filter::Equalize]);
+        assert_eq!(out.to_rgb8().get_pixel(50, 50)[0], 170);
+    }
+
+    #[test]
+    fn enhance_stretches_channels_independently() {
+        // The red channel carries the compressed census;
+        // green and blue are flat and must not move.
+        let mut img = DynamicImage::new_rgb8(100, 100);
+        {
+            let rgb = img.as_mut_rgb8().unwrap();
+            for (i, p) in rgb.pixels_mut().enumerate() {
+                let r = if i < 100 {
+                    30
+                } else if i >= 9900 {
+                    220
+                } else {
+                    100
+                };
+                *p = image::Rgb([r, 90, 200]);
+            }
+        }
+        let (out, _) = apply_filters(img, &[Filter::Enhance]);
+        let rgb = out.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0).0, [0, 90, 200]);
+        assert_eq!(rgb.get_pixel(50, 50).0, [94, 90, 200]);
+        assert_eq!(rgb.get_pixel(99, 99).0, [255, 90, 200]);
+    }
+
+    #[test]
+    fn enhance_preserves_alpha() {
+        let mut img = DynamicImage::new_rgba8(100, 100);
+        {
+            let rgba = img.as_mut_rgba8().unwrap();
+            for (i, p) in rgba.pixels_mut().enumerate() {
+                let v = if i < 100 {
+                    30
+                } else if i >= 9900 {
+                    220
+                } else {
+                    100
+                };
+                *p = image::Rgba([v, v, v, 128]);
+            }
+        }
+        let (out, _) = apply_filters(img, &[Filter::Enhance]);
+        let px = out.to_rgba8().get_pixel(50, 50).0;
+        assert_eq!(px[3], 128);
+        assert_eq!(px[0], 94);
     }
 
     #[test]

@@ -81,7 +81,7 @@ imgix adjustments mostly run -100 to 100 with 0 as unchanged. crabcrop's adjustm
 | `sharp=40` | `filters:sharpen(0.4)` | Approximate: a 0 to 100 luminance-sharpening strength becomes an unsharp strength, rescaled by 100 |
 | `usm=2` with `usmrad` | `filters:sharpen(2)` | Approximate: both are unsharp masks, but the radius has no equivalent; crabcrop's kernel is fixed |
 | `invert=true` | `filters:invert` | Direct |
-| `auto=enhance` | No equivalent | Unsupported: `filters:equalize` is a different, stronger operation, not a match |
+| `auto=enhance` | `filters:enhance` | Close: both are the one-shot correction. crabcrop's enhance is a per-channel auto-levels only, with conservative clipping; imgix's enhance also adjusts saturation as part of its correction, so color can land slightly differently |
 | `auto=redeye` | No equivalent | Unsupported: crabcrop's face filters (`blurfaces`, `pixelatefaces`) are redaction, not correction |
 
 ## Effects, overlays, and text

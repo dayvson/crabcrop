@@ -338,6 +338,9 @@ export const filter = {
   equalize(): string {
     return "equalize";
   },
+  enhance(): string {
+    return "enhance";
+  },
   removeBg(): string {
     return "removebg";
   },

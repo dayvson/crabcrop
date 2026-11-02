@@ -93,7 +93,7 @@ Gumlet's adjustment family runs on imgix-style scales: -100 to 100 with 0 as unc
 | `threshold=128` | `filters:curve(rgb,0,0,127,0,128,255,255,255)` | Approximate: there is no threshold filter. A two-step curve (flat 0 up to the threshold, flat 255 above it) reproduces the binarize on the combined channel |
 | `opacity=50` (`o`) | No equivalent | Unsupported: opacity exists here only per overlay (`watermark` and `overlay` alpha), never on the base image |
 | `tint=<color>` | `filters:monochrome(<hex>)` | Approximate at best: monochrome is luminance scaled by one color at full strength. A Gumlet tint is a lighter touch over the colors, and CSS color names do not carry; crabcrop colors are RRGGBB hex |
-| `enhance=true` | `filters:equalize` | Approximate at best: equalize is per-channel histogram equalization, a stronger and different operation than stretching luminance to the full range. Treat it as the blunt substitute and compare renders |
+| `enhance=true` | `filters:enhance` | Direct: both are the gentle auto-levels correction, crabcrop's per channel with conservative clipping percentiles. (`filters:equalize` remains available as the stronger, different operation: a full per-channel histogram redistribution) |
 | `greyscale=true` (or `grayscale=true`) | `filters:grayscale` | Direct |
 | `invert=true` | `filters:invert` | Direct |
 | `rotate=90` | `filters:rotate(90)` | Approximate, on one unverified point: Gumlet accepts only 0, 90, 180, and 270, and its docs never state the direction. crabcrop counts clockwise and takes any angle, expanding the canvas off the quarter turns. Verify one asymmetric render before bulk translation |

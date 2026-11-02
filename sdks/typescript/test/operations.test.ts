@@ -47,6 +47,7 @@ test("typed filters match the canonical spellings", () => {
     [filter.invert(), "invert"],
     [filter.noUpscale(), "no_upscale"],
     [filter.equalize(), "equalize"],
+    [filter.enhance(), "enhance"],
     [filter.removeBg(), "removebg"],
     [filter.keepProfile(), "keep_profile"],
     [filter.sepia(), "sepia"],

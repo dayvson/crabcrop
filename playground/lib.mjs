@@ -111,6 +111,7 @@ const FILTER_BLURBS = {
   studio:
     "studio mode: product composites the subject onto a backdrop (white, a RRGGBB color, brand, or none) with a synthesized contact shadow, scene reframes the photo on its subject with light and color correction (needs an AI model on the server)",
   equalize: "histogram equalization",
+  enhance: "gentle per-channel auto-levels (0.5th percentile to 0, 99.5th to 255)",
   saturation: "saturation factor, 0..255 (0 is grayscale, 1 is identity)",
   sharpen: "sharpen by the given amount",
   text: "draw a text overlay (needs a font on the server)",
@@ -193,6 +194,7 @@ const NO_ARG_FILTERS = new Set([
   "invert",
   "no_upscale",
   "equalize",
+  "enhance",
   "removebg",
   "keep_profile",
   "sepia",
