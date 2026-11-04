@@ -199,7 +199,9 @@ pub struct SourceConfig {
     /// GCS HMAC credentials, when configured.
     pub gcs_creds: Option<Credentials>,
     /// Bucket names the bucket schemes may read. An entry of
-    /// `*` allows every bucket. Boot refuses the combination of
+    /// `*` allows every bucket. An empty list refuses every
+    /// bucket at fetch time, with or without credentials;
+    /// boot additionally refuses the combination of
     /// configured credentials and an empty list (audit L-1).
     pub allowed_buckets: Vec<String>,
     /// Canonicalized root that `file://` sources must stay
@@ -406,12 +408,19 @@ impl Loader {
                 "bucket or object key contains a dot segment".to_string(),
             ));
         }
-        if !self.sources.allowed_buckets.is_empty()
-            && !self
-                .sources
-                .allowed_buckets
-                .iter()
-                .any(|b| b == bucket || b == "*")
+        // Bucket sources are opt-in: the bucket name is
+        // request input while the endpoint it is fetched
+        // from is operator configuration, so the host
+        // allowlist cannot speak for it. An entry naming
+        // the bucket (or `*`) is required whether or not
+        // credentials are configured; an empty list refuses
+        // every bucket, the same fail-closed stance boot
+        // takes for the credentialed combination.
+        if !self
+            .sources
+            .allowed_buckets
+            .iter()
+            .any(|b| b == bucket || b == "*")
         {
             return Err(LoadError::Forbidden(format!(
                 "bucket {bucket} is not an allowed source"
@@ -1319,6 +1328,7 @@ mod tests {
         let (base, captured) = spawn_capturing_server().await;
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             s3_endpoint: Some(base),
+            allowed_buckets: vec!["photos".to_string()],
             ..Default::default()
         });
         let body = loader.load("s3://photos/dir/pic.jpg").await.unwrap();
@@ -1335,6 +1345,7 @@ mod tests {
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             s3_endpoint: Some(base),
             aws_creds: Some(test_creds()),
+            allowed_buckets: vec!["photos".to_string()],
             ..Default::default()
         });
         // The key's space is encoded for both the URL and the
@@ -1364,6 +1375,7 @@ mod tests {
         let (base, captured) = spawn_capturing_server().await;
         let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
             gcs_endpoint: base,
+            allowed_buckets: vec!["media".to_string()],
             ..Default::default()
         });
         let body = loader.load("gs://media/pic.jpg").await.unwrap();
@@ -1382,6 +1394,35 @@ mod tests {
         for url in ["s3://other/pic.jpg", "gs://other/pic.jpg"] {
             let err = loader.load(url).await.unwrap_err();
             assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_sources_need_an_allowlist_entry() {
+        // No credentials and no allowlist: every bucket is
+        // refused, for both schemes, before any request is
+        // made. The bucket allowlist is the only gate that
+        // can speak for a bucket source, since the endpoint
+        // is operator configuration, not request input.
+        let loader = Loader::with_defaults().unwrap();
+        for url in ["s3://photos/pic.jpg", "gs://photos/pic.jpg"] {
+            let err = loader.load(url).await.unwrap_err();
+            assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
+        }
+        // The `*` entry is the deliberate any-bucket opt-in:
+        // with it, the same loads go through. (The capturing
+        // fixture serves one connection, so each scheme gets
+        // its own.)
+        for scheme in ["s3", "gs"] {
+            let (base, _captured) = spawn_capturing_server().await;
+            let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
+                s3_endpoint: Some(base.clone()),
+                gcs_endpoint: base,
+                allowed_buckets: vec!["*".to_string()],
+                ..Default::default()
+            });
+            let body = loader.load(&format!("{scheme}://photos/pic.jpg")).await.unwrap();
+            assert_eq!(body, b"\xff\xd8\xff\xd9", "{scheme}");
         }
     }
 
@@ -1461,6 +1502,7 @@ mod tests {
             let (base, captured) = spawn_capturing_server().await;
             let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
                 s3_endpoint: Some(base),
+                allowed_buckets: vec!["photos".to_string()],
                 ..Default::default()
             });
             let body = loader.load(&format!("s3://photos/{key}")).await.unwrap();
@@ -1472,6 +1514,7 @@ mod tests {
             let (base, captured) = spawn_capturing_server().await;
             let loader = Loader::with_defaults().unwrap().with_sources(SourceConfig {
                 gcs_endpoint: base,
+                allowed_buckets: vec!["photos".to_string()],
                 ..Default::default()
             });
             let body = loader.load(&format!("gs://photos/{key}")).await.unwrap();

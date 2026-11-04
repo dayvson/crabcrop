@@ -62,7 +62,7 @@
 //!   both or neither.
 //! - `CRABCROP_ALLOWED_BUCKETS`: comma-separated bucket
 //!   names the `s3://` and `gs://` schemes may read; unset
-//!   allows every bucket.
+//!   allows no bucket. `*` allows every bucket.
 //! - `CRABCROP_FILE_ROOT`: directory that `file://` sources
 //!   must stay under, canonicalized at boot. Unset disables
 //!   file sources.
@@ -614,6 +614,18 @@ fn build_source_config(get: impl Fn(&str) -> Option<String>) -> Result<SourceCon
         sources.aws_creds.is_some() || sources.gcs_creds.is_some(),
         &sources.allowed_buckets,
     )?;
+    // A configured store endpoint is where every bucket
+    // fetch goes, whatever host it names: the source
+    // allowlist governs HTTP sources only, and the bucket
+    // allowlist is the gate for bucket sources. Say so at
+    // boot, where the endpoint is set, rather than leaving
+    // the split implicit.
+    if sources.s3_endpoint.is_some() || nonempty("CRABCROP_GCS_ENDPOINT").is_some() {
+        println!(
+            "note: bucket sources fetch from the configured store endpoints; \
+             CRABCROP_ALLOWED_BUCKETS gates them, the host allowlist does not"
+        );
+    }
     if let Some(root) = nonempty("CRABCROP_FILE_ROOT") {
         let canonical = std::fs::canonicalize(&root)
             .map_err(|e| format!("CRABCROP_FILE_ROOT is not usable: {e}"))?;
@@ -840,17 +852,16 @@ fn build_upload_store(
             )))
         }
         (None, Some(bucket)) => {
-            // Signed bucket fetches must not silently gain
-            // a readable bucket (audit L-1's rule, applied
-            // to serving the uploads back): with credentials
-            // configured, the destination bucket must be
-            // in the readable allowlist the boot already
-            // required to be explicit.
-            if sources.aws_creds.is_some()
-                && !sources
-                    .allowed_buckets
-                    .iter()
-                    .any(|b| b == &bucket || b == "*")
+            // Bucket fetches must not silently gain a
+            // readable bucket (audit L-1's rule, applied to
+            // serving the uploads back): the destination
+            // bucket must be in the readable allowlist,
+            // which bucket loads require with or without
+            // credentials.
+            if !sources
+                .allowed_buckets
+                .iter()
+                .any(|b| b == &bucket || b == "*")
             {
                 return Err(format!(
                     "CRABCROP_UPLOAD_BUCKET {bucket:?} is not in CRABCROP_ALLOWED_BUCKETS: \
@@ -2814,6 +2825,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(store.source_ref("a/b.jpg"), "s3://photos/orig/a/b.jpg");
+        // The same rule without credentials: bucket loads
+        // require an allowlist entry either way, so an
+        // upload bucket outside the list could never serve
+        // back.
+        let err = expect_err(build_upload_store(
+            env_of(&[("CRABCROP_UPLOAD_BUCKET", "uploads")]),
+            &plain,
+        ));
+        assert!(err.contains("CRABCROP_ALLOWED_BUCKETS"), "{err}");
     }
 
     #[test]
