@@ -1863,16 +1863,22 @@ impl Engine {
 }
 
 /// Collect an animation decoder's frames under the shared
-/// limits: a frame cap and a total-decoded-pixels budget, so a
-/// small file cannot expand into gigabytes of frames. Errors
-/// when the source is malformed, over budget, or carries no
-/// frames. `format` names the source format in error messages.
+/// limits: a frame cap, a total-decoded-pixels budget, and
+/// the decode allocation budget charged on the retained
+/// RGBA bytes, so a small file cannot expand into gigabytes
+/// of frames. The pixel budget alone is not a memory bound:
+/// at its 100M-pixel cap the retained frames are 400 MiB,
+/// well past the 256 MiB allocation budget every still
+/// decode honors. Errors when the source is malformed, over
+/// budget, or carries no frames. `format` names the source
+/// format in error messages.
 fn collect_frames(
     frames: impl Iterator<Item = Result<image::Frame, image::ImageError>>,
     format: &str,
 ) -> Result<Vec<image::Frame>, EngineError> {
     let mut collected = Vec::new();
     let mut total_pixels: u64 = 0;
+    let mut total_bytes: u64 = 0;
     for frame in frames {
         let frame = frame.map_err(|e| EngineError::Decode(e.to_string()))?;
         if collected.len() >= MAX_ANIMATED_FRAMES {
@@ -1880,10 +1886,17 @@ fn collect_frames(
                 "{format} has more than {MAX_ANIMATED_FRAMES} frames"
             )));
         }
-        total_pixels += frame.buffer().width() as u64 * frame.buffer().height() as u64;
+        let frame_pixels = frame.buffer().width() as u64 * frame.buffer().height() as u64;
+        total_pixels += frame_pixels;
         if total_pixels > MAX_ANIMATED_PIXELS {
             return Err(EngineError::Decode(format!(
                 "{format} frames exceed the {MAX_ANIMATED_PIXELS} decoded-pixel limit"
+            )));
+        }
+        total_bytes += frame_pixels * 4;
+        if total_bytes > MAX_DECODE_ALLOC {
+            return Err(EngineError::Decode(format!(
+                "{format} frames exceed the {MAX_DECODE_ALLOC} byte decode allocation limit"
             )));
         }
         collected.push(frame);
@@ -7249,6 +7262,40 @@ mod tests {
         };
         assert!(decode_gif_frames(&make(201)).is_err());
         assert_eq!(decode_gif_frames(&make(3)).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn animated_frames_charge_bytes_against_the_decode_budget() {
+        // A 1000x500 frame is 500k pixels, 2 MiB retained as
+        // RGBA: 200 of them sit exactly at the pixel budget
+        // (100M) but reach 400 MiB of frames, past the
+        // 256 MiB decode allocation budget. Collection must
+        // refuse on the bytes, not sail past on the pixels.
+        let delay = image::Delay::from_numer_denom_ms(100, 1);
+        let frames = (0..200).map(|_| {
+            Ok::<image::Frame, image::ImageError>(image::Frame::from_parts(
+                image::RgbaImage::new(1000, 500),
+                0,
+                0,
+                delay,
+            ))
+        });
+        let err = match collect_frames(frames, "GIF") {
+            Ok(_) => panic!("collection should refuse on the byte budget"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("decode allocation"), "{err}");
+        // A shorter run of the same frames is inside every
+        // budget and collects fully.
+        let frames = (0..100).map(|_| {
+            Ok::<image::Frame, image::ImageError>(image::Frame::from_parts(
+                image::RgbaImage::new(1000, 500),
+                0,
+                0,
+                delay,
+            ))
+        });
+        assert_eq!(collect_frames(frames, "GIF").unwrap().len(), 100);
     }
 
     #[test]
