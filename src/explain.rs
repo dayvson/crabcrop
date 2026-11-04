@@ -79,8 +79,13 @@ pub struct ReportInput {
     pub source_root: Option<String>,
     /// Header facts about the probed source.
     pub probe: SourceProbe,
-    /// The probed body's encoded size in bytes.
-    pub source_bytes: usize,
+    /// The source body's encoded size in bytes, when it is
+    /// known from the fetch itself (a declared length, a
+    /// file's size, or a body that ended inside the probed
+    /// head). The probe never reads a whole body just to
+    /// count it, so a large source can honestly report no
+    /// size; `None` is never a partial count.
+    pub source_bytes: Option<usize>,
     /// The request's own operations, presets expanded.
     pub ops: Vec<Operation>,
     pub presets: Vec<PresetEntry>,
@@ -437,11 +442,13 @@ impl Report {
             Some((w, h)) => format!(", {w}x{h}"),
             None => String::new(),
         };
+        let size = match input.source_bytes {
+            Some(bytes) => format!(", {bytes} bytes"),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "<li>{}{}, {} bytes</li>\n",
-            escape_html(input.probe.kind),
-            dims,
-            input.source_bytes
+            "<li>{}{dims}{size}</li>\n",
+            escape_html(input.probe.kind)
         ));
         out.push_str("</ul>\n");
 
@@ -599,7 +606,7 @@ mod tests {
             source_url: source.to_string(),
             source_root: None,
             probe,
-            source_bytes: 412_000,
+            source_bytes: Some(412_000),
             presets: Vec::new(),
             canonical: crate::url::canonical_form(&ops, source),
             cache_group: None,
@@ -682,6 +689,36 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_source_size_reports_no_size() {
+        // The probe does not read a whole body just to count
+        // it: when the fetch could not state the size, the
+        // report carries none, in either form, rather than a
+        // partial head count dressed as the total.
+        let (ops, source, expiry, _) =
+            parse_operations_with_expiry("100x50/https://example.com/photo.jpg").unwrap();
+        let report = Report::new(ReportInput {
+            signed: true,
+            key_id: None,
+            expiry,
+            now: 1_700_000_000,
+            source_url: source.to_string(),
+            source_root: None,
+            probe: png_probe(),
+            source_bytes: None,
+            presets: Vec::new(),
+            canonical: crate::url::canonical_form(&ops, source),
+            cache_group: None,
+            image_path: "/sig/100x50/https://example.com/photo.jpg".to_string(),
+            ops,
+        });
+        let json = report.to_json();
+        assert!(json["source"]["bytes"].is_null());
+        assert_eq!(json["source"]["kind"], "png");
+        let html = report.to_html();
+        assert!(html.contains("<li>png, 2400x1600</li>"), "{html}");
+    }
+
+    #[test]
     fn a_root_source_reports_its_name_and_never_a_base() {
         let (ops, source, expiry, _) =
             parse_operations_with_expiry("100x50/root:photos/cat.jpg").unwrap();
@@ -693,7 +730,7 @@ mod tests {
             source_url: source.to_string(),
             source_root: Some("photos".to_string()),
             probe: png_probe(),
-            source_bytes: 10,
+            source_bytes: Some(10),
             presets: Vec::new(),
             canonical: crate::url::canonical_form(&ops, source),
             cache_group: None,
@@ -723,7 +760,7 @@ mod tests {
             source_url: source.to_string(),
             source_root: None,
             probe: png_probe(),
-            source_bytes: 10,
+            source_bytes: Some(10),
             presets: vec![PresetEntry {
                 name: "<img src=x onerror=alert(1)>".to_string(),
                 operations: op_entries(&ops),

@@ -712,6 +712,17 @@ async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
 }
 
 /// `GET /explain/<signature>/<operations...>/<image-url>`:
+/// Whether a probe head settles the explain report's
+/// source facts: the probe knows the kind, and it either
+/// has the dimensions or the kind is one whose dimensions
+/// never live in headers (video, PDF). Anything else means
+/// the identifying header may still be on its way.
+fn probe_settled(head: &[u8]) -> bool {
+    let probe = crate::engine::probe_source(head);
+    probe.kind != "unknown"
+        && (probe.dimensions.is_some() || matches!(probe.kind, "video" | "pdf"))
+}
+
 /// the self-explaining URL report (issue #196; the report
 /// itself is built in [`crate::explain`]).
 ///
@@ -830,11 +841,21 @@ async fn explain_handle(
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Page(_))),
     };
-    let bytes = match state.loader.load_media(&fetch_url, admission).await {
-        Ok(bytes) => bytes,
+    // The report reads the source's headers only, so the
+    // fetch is a probe load: it stops as soon as the head
+    // identifies the source instead of downloading the
+    // whole body (which also keeps this route off the
+    // result cache's coalescing path by construction: it
+    // never held a whole body to share).
+    let fetched = match state
+        .loader
+        .load_probe(&fetch_url, admission, &probe_settled)
+        .await
+    {
+        Ok(fetched) => fetched,
         Err(e) => return explain_load_error(e),
     };
-    let probe = crate::engine::probe_source(&bytes);
+    let probe = crate::engine::probe_source(&fetched.head);
 
     // Each referenced preset with the operations its
     // definition expands to. Definitions were validated at
@@ -870,7 +891,7 @@ async fn explain_handle(
         source_url: source_url.to_string(),
         source_root: root_ref.map(|r| r.name),
         probe,
-        source_bytes: bytes.len(),
+        source_bytes: fetched.total_bytes.map(|n| n as usize),
         ops,
         presets,
         canonical,

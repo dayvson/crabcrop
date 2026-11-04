@@ -231,6 +231,38 @@ enum StoreKind {
     Gcs,
 }
 
+/// How much of a body a probe load reads at most: enough
+/// for a header probe to identify any source the pipeline
+/// reads, with room to spare for header-rich formats, and
+/// no more.
+const PROBE_HEAD_BYTES: usize = 256 * 1024;
+
+/// What a probe load learned about a source: the head of
+/// the body, and the body's total size when it is known
+/// without reading the rest (a declared Content-Length, a
+/// file's size, or a body that ended inside the head).
+/// `None` means the size is genuinely unknown, never a
+/// partial count dressed as a total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeLoad {
+    pub head: Vec<u8>,
+    pub total_bytes: Option<u64>,
+}
+
+/// Which body read a load performs: the full body, or a
+/// probe that stops as soon as the caller's predicate
+/// settles on the head (or the head cap is reached).
+enum BodyMode<'a> {
+    Full,
+    Probe(&'a (dyn Fn(&[u8]) -> bool + Sync)),
+}
+
+/// A load's result, in the shape its mode asked for.
+enum LoadBody {
+    Full(Vec<u8>),
+    Probe(ProbeLoad),
+}
+
 impl Loader {
     /// Build a loader with an explicit byte limit and total timeout.
     pub fn new(max_bytes: u64, timeout: Duration) -> Result<Self, LoadError> {
@@ -290,38 +322,84 @@ impl Loader {
         url: &str,
         admission: MediaAdmission,
     ) -> Result<Vec<u8>, LoadError> {
-        match tokio::time::timeout(self.timeout, self.load_dispatch(url, admission)).await {
+        match self.load_timed(url, admission, BodyMode::Full).await? {
+            LoadBody::Full(bytes) => Ok(bytes),
+            LoadBody::Probe(_) => Err(LoadError::Network(
+                "internal: probe result for a full load".to_string(),
+            )),
+        }
+    }
+
+    /// Fetch only what a probe of the source needs: the
+    /// head of the body, read incrementally and stopped as
+    /// soon as `settled` accepts the head (or the probe
+    /// head cap is reached), under the same guards and the
+    /// same total timeout as a full load. For a caller
+    /// that only reads the source's headers (the explain
+    /// report), so a slow or large origin cannot make the
+    /// probe download a whole body it will never use.
+    pub async fn load_probe(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+        settled: &(dyn Fn(&[u8]) -> bool + Sync),
+    ) -> Result<ProbeLoad, LoadError> {
+        match self
+            .load_timed(url, admission, BodyMode::Probe(settled))
+            .await?
+        {
+            LoadBody::Probe(probe) => Ok(probe),
+            LoadBody::Full(_) => Err(LoadError::Network(
+                "internal: full result for a probe load".to_string(),
+            )),
+        }
+    }
+
+    /// Run one load under the loader's total timeout.
+    async fn load_timed(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+        mode: BodyMode<'_>,
+    ) -> Result<LoadBody, LoadError> {
+        match tokio::time::timeout(self.timeout, self.load_dispatch(url, admission, mode)).await {
             Ok(result) => result,
             Err(_) => Err(LoadError::Timeout),
         }
     }
 
-    /// The scheme dispatch behind [`Loader::load_media`],
-    /// run under that call's total timeout.
+    /// The scheme dispatch behind the public loads, run
+    /// under the caller's total timeout.
     async fn load_dispatch(
         &self,
         url: &str,
         admission: MediaAdmission,
-    ) -> Result<Vec<u8>, LoadError> {
+        mode: BodyMode<'_>,
+    ) -> Result<LoadBody, LoadError> {
         if let Some(rest) = url.strip_prefix("s3://") {
             let (bucket, key) = split_bucket_key(rest, "s3")?;
             return self
-                .load_object(StoreKind::S3, bucket, key, admission)
+                .load_object(StoreKind::S3, bucket, key, admission, mode)
                 .await;
         }
         if let Some(rest) = url.strip_prefix("gs://") {
             let (bucket, key) = split_bucket_key(rest, "gs")?;
             return self
-                .load_object(StoreKind::Gcs, bucket, key, admission)
+                .load_object(StoreKind::Gcs, bucket, key, admission, mode)
                 .await;
         }
         if url.starts_with("file://") {
-            return self.load_file(url).await;
+            return self.load_file(url, mode).await;
         }
-        self.load_http(url, admission).await
+        self.load_http(url, admission, mode).await
     }
 
-    async fn load_http(&self, url: &str, admission: MediaAdmission) -> Result<Vec<u8>, LoadError> {
+    async fn load_http(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+        mode: BodyMode<'_>,
+    ) -> Result<LoadBody, LoadError> {
         let mut parsed =
             Url::parse(url).map_err(|e| LoadError::Network(format!("invalid url: {e}")))?;
         let mut hops = 0;
@@ -358,21 +436,38 @@ impl Loader {
                     .map_err(|e| LoadError::Network(format!("invalid redirect: {e}")))?;
                 continue;
             }
-            return self.read_checked_body(resp, admission).await;
+            return self.read_body(resp, admission, &mode).await;
         }
     }
 
-    /// Status, content-type, and bounded-body handling shared by
-    /// the HTTP path and the object stores. A non-2xx status
-    /// (including a store redirect, which is not followed) is an
-    /// error. The Content-Type must be `image/*`, or one of the
-    /// non-image types this request admits (see
-    /// [`MediaAdmission`]).
-    async fn read_checked_body(
+    /// Read a response body in the shape the load's mode
+    /// asked for (see [`BodyMode`]).
+    async fn read_body(
         &self,
-        mut resp: reqwest::Response,
+        resp: reqwest::Response,
         admission: MediaAdmission,
-    ) -> Result<Vec<u8>, LoadError> {
+        mode: &BodyMode<'_>,
+    ) -> Result<LoadBody, LoadError> {
+        match mode {
+            BodyMode::Full => Ok(LoadBody::Full(
+                self.read_checked_body(resp, admission).await?,
+            )),
+            BodyMode::Probe(settled) => Ok(LoadBody::Probe(
+                self.read_probe_body(resp, admission, settled).await?,
+            )),
+        }
+    }
+
+    /// The status and Content-Type checks both body reads
+    /// share. A non-2xx status (including a store redirect,
+    /// which is not followed) is an error. The Content-Type
+    /// must be `image/*`, or one of the non-image types this
+    /// request admits (see [`MediaAdmission`]). Returns the
+    /// declared body length when the response carries one.
+    fn check_response_head(
+        resp: &reqwest::Response,
+        admission: MediaAdmission,
+    ) -> Result<Option<u64>, LoadError> {
         let status = resp.status();
         if status.as_u16() == 404 {
             // A missing object is not a gateway fault, and it
@@ -392,6 +487,17 @@ impl Loader {
                 ));
             }
         }
+        Ok(resp.content_length())
+    }
+
+    /// Status, content-type, and bounded-body handling shared by
+    /// the HTTP path and the object stores.
+    async fn read_checked_body(
+        &self,
+        mut resp: reqwest::Response,
+        admission: MediaAdmission,
+    ) -> Result<Vec<u8>, LoadError> {
+        Self::check_response_head(&resp, admission)?;
         let mut body = Vec::new();
         loop {
             let chunk = resp.chunk().await.map_err(map_request_error)?;
@@ -406,6 +512,49 @@ impl Loader {
         Ok(body)
     }
 
+    /// The probe body read: the same head checks as a full
+    /// load, then just enough of the body for the caller's
+    /// probe to settle, under the same size cap. A declared
+    /// length past the cap keeps the full load's too-large
+    /// answer, so the probe never reports facts about a
+    /// source a real request would refuse for its size.
+    async fn read_probe_body(
+        &self,
+        mut resp: reqwest::Response,
+        admission: MediaAdmission,
+        settled: &(dyn Fn(&[u8]) -> bool + Sync),
+    ) -> Result<ProbeLoad, LoadError> {
+        let declared = Self::check_response_head(&resp, admission)?;
+        if declared.is_some_and(|total| total > self.max_bytes) {
+            return Err(LoadError::TooLarge {
+                limit: self.max_bytes,
+            });
+        }
+        let mut head = Vec::new();
+        let mut received: u64 = 0;
+        let mut ended = false;
+        loop {
+            if settled(&head) || head.len() >= PROBE_HEAD_BYTES {
+                break;
+            }
+            let chunk = resp.chunk().await.map_err(map_request_error)?;
+            let Some(bytes) = chunk else {
+                ended = true;
+                break;
+            };
+            received += bytes.len() as u64;
+            if received > self.max_bytes {
+                return Err(LoadError::TooLarge {
+                    limit: self.max_bytes,
+                });
+            }
+            let room = PROBE_HEAD_BYTES - head.len();
+            head.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        }
+        let total_bytes = declared.or_else(|| ended.then_some(received));
+        Ok(ProbeLoad { head, total_bytes })
+    }
+
     /// Fetch one object from S3 or GCS, signing with SigV4 when
     /// credentials are configured for the store.
     async fn load_object(
@@ -414,7 +563,8 @@ impl Loader {
         bucket: &str,
         key: &str,
         admission: MediaAdmission,
-    ) -> Result<Vec<u8>, LoadError> {
+        mode: BodyMode<'_>,
+    ) -> Result<LoadBody, LoadError> {
         // The request URL places the key after the bucket, and
         // URL parsing collapses dot segments, so a key carrying
         // them would move the request outside the allowlisted
@@ -509,13 +659,13 @@ impl Loader {
             }
         }
         let resp = request.send().await.map_err(map_request_error)?;
-        self.read_checked_body(resp, admission).await
+        self.read_body(resp, admission, &mode).await
     }
 
     /// Fetch a local file under the configured root. The
     /// candidate path is canonicalized before the containment
     /// check, so `..` segments and symlink escapes are refused.
-    async fn load_file(&self, url: &str) -> Result<Vec<u8>, LoadError> {
+    async fn load_file(&self, url: &str, mode: BodyMode<'_>) -> Result<LoadBody, LoadError> {
         use tokio::io::AsyncReadExt;
         let Some(root) = &self.sources.file_root else {
             return Err(LoadError::Forbidden(
@@ -550,6 +700,31 @@ impl Loader {
         let mut file = tokio::fs::File::open(&canonical)
             .await
             .map_err(map_file_error)?;
+        if matches!(mode, BodyMode::Probe(_)) {
+            // A probe of a file needs only its head; the
+            // total is the file's own size. The size cap
+            // keeps the full load's too-large answer.
+            let total = file.metadata().await.map_err(map_file_error)?.len();
+            if total > self.max_bytes {
+                return Err(LoadError::TooLarge {
+                    limit: self.max_bytes,
+                });
+            }
+            let mut head = Vec::new();
+            let mut buf = [0u8; 8192];
+            while head.len() < PROBE_HEAD_BYTES {
+                let n = file.read(&mut buf).await.map_err(map_file_error)?;
+                if n == 0 {
+                    break;
+                }
+                let room = PROBE_HEAD_BYTES - head.len();
+                head.extend_from_slice(&buf[..n.min(room)]);
+            }
+            return Ok(LoadBody::Probe(ProbeLoad {
+                head,
+                total_bytes: Some(total),
+            }));
+        }
         let mut body = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -564,7 +739,7 @@ impl Loader {
                 });
             }
         }
-        Ok(body)
+        Ok(LoadBody::Full(body))
     }
 
     /// Build a client whose DNS for the pinned host is forced
@@ -1174,6 +1349,101 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Spawn a server that answers with the given headers
+    /// and head bytes, then holds the connection open: the
+    /// rest of the declared body never arrives.
+    async fn spawn_drip_head_server(headers: &str, head: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = head.to_vec();
+        let headers = headers.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n").as_bytes(),
+                )
+                .await;
+            let _ = socket.write_all(&head).await;
+            sleep(Duration::from_secs(3600)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn probe_load_stops_once_the_head_settles() {
+        // The origin declares a 1 MiB body, sends 64 bytes,
+        // then drips forever. A full load would hang to the
+        // loader timeout; the probe returns as soon as its
+        // predicate settles on the head, with the declared
+        // total.
+        let mut head = b"\x89PNG\r\n\x1a\n".to_vec();
+        head.resize(64, 0);
+        let base = spawn_drip_head_server(
+            "Content-Type: image/png\r\nContent-Length: 1048576\r\n",
+            &head,
+        )
+        .await;
+        let loader = Loader::new(10 * 1024 * 1024, Duration::from_secs(30)).unwrap();
+        let started = std::time::Instant::now();
+        let probe = loader
+            .load_probe(
+                &format!("{base}/img.png"),
+                MediaAdmission::default(),
+                &|head: &[u8]| head.len() >= 33 && head.starts_with(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(probe.head.len() >= 33);
+        assert_eq!(probe.total_bytes, Some(1_048_576));
+    }
+
+    #[tokio::test]
+    async fn probe_load_counts_a_body_that_ends_inside_the_head() {
+        // No declared length: a body that ends inside the
+        // head states its total by having ended.
+        let body = b"\xff\xd8\xff\xd9";
+        let resp = response("200 OK", "Content-Type: image/jpeg\r\n", body);
+        let base = spawn_server(Respond::Bytes(resp)).await;
+        let loader = Loader::with_defaults().unwrap();
+        let probe = loader
+            .load_probe(
+                &format!("{base}/img.jpg"),
+                MediaAdmission::default(),
+                &|_head: &[u8]| false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(probe.head, body);
+        assert_eq!(probe.total_bytes, Some(4));
+    }
+
+    #[tokio::test]
+    async fn probe_load_keeps_the_too_large_answer() {
+        // A declared length past the cap is the full load's
+        // too-large refusal, answered from the headers
+        // without waiting for the body.
+        let base = spawn_drip_head_server(
+            "Content-Type: image/png\r\nContent-Length: 200\r\n",
+            b"\x89PNG\r\n\x1a\n",
+        )
+        .await;
+        let loader = Loader::new(100, Duration::from_secs(30)).unwrap();
+        let started = std::time::Instant::now();
+        let result = loader
+            .load_probe(
+                &format!("{base}/img.png"),
+                MediaAdmission::default(),
+                &|_head: &[u8]| false,
+            )
+            .await;
+        assert_eq!(result, Err(LoadError::TooLarge { limit: 100 }));
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[tokio::test]
