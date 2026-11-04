@@ -279,8 +279,26 @@ impl Loader {
     /// [`MediaAdmission`]). All other guards (allowlist,
     /// dot segments, size cap, redirects, SSRF checks) are
     /// identical either way, and file sources never had a
-    /// Content-Type to check.
+    /// Content-Type to check. The loader's timeout is one
+    /// total budget for the whole load: it spans every
+    /// redirect hop and the body read, rather than
+    /// restarting per request the way the HTTP client's own
+    /// per-request timeout does, so a chain of individually
+    /// fast hops cannot stretch a fetch past the total.
     pub async fn load_media(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+    ) -> Result<Vec<u8>, LoadError> {
+        match tokio::time::timeout(self.timeout, self.load_dispatch(url, admission)).await {
+            Ok(result) => result,
+            Err(_) => Err(LoadError::Timeout),
+        }
+    }
+
+    /// The scheme dispatch behind [`Loader::load_media`],
+    /// run under that call's total timeout.
+    async fn load_dispatch(
         &self,
         url: &str,
         admission: MediaAdmission,
@@ -1115,6 +1133,66 @@ mod tests {
         let base = spawn_server(Respond::Hang).await;
         let loader = Loader::new(1024, Duration::from_millis(100)).unwrap();
         assert_eq!(fetch(&loader, &base).await, Err(LoadError::Timeout));
+    }
+
+    /// Spawn a server that answers every request after a
+    /// fixed delay with a redirect to the next hop, ending
+    /// in an image after `hops` redirects.
+    async fn spawn_redirect_chain(hops: u32, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let request = String::from_utf8_lossy(&buf);
+                    let n: u32 = request
+                        .split("?n=")
+                        .nth(1)
+                        .and_then(|rest| {
+                            rest.split(|c: char| !c.is_ascii_digit())
+                                .next()
+                                .and_then(|digits| digits.parse().ok())
+                        })
+                        .unwrap_or(0);
+                    sleep(delay).await;
+                    let resp = if n < hops {
+                        response(
+                            "302 Found",
+                            &format!("Location: /hop?n={}\r\nContent-Length: 0\r\n", n + 1),
+                            b"",
+                        )
+                    } else {
+                        ok_image_response()
+                    };
+                    let _ = socket.write_all(&resp).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_timeout_is_a_total_across_redirect_hops() {
+        // Five hops at 300 ms each: every individual request
+        // answers well inside a 1-second per-request budget,
+        // so a per-hop timeout would let the chain run to
+        // ~1.8 s and succeed. The loader timeout is a total:
+        // the load fails as a timeout at ~1 s instead.
+        let base = spawn_redirect_chain(5, Duration::from_millis(300)).await;
+        let loader = Loader::new(1024, Duration::from_secs(1)).unwrap();
+        let started = std::time::Instant::now();
+        let result = loader.load(&format!("{base}/hop?n=0")).await;
+        assert_eq!(result, Err(LoadError::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "chain ran for {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

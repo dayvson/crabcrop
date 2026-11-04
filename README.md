@@ -148,7 +148,7 @@ Every cacheable image response also carries a strong `ETag`, derived from the re
 
 The loader fetches the source under fixed limits, for every source kind:
 
-- 10 seconds per HTTP request; a redirect hop is a new request with its own 10 seconds.
+- 10 seconds per source fetch in total: one budget spans the whole redirect chain and the body read, so a chain of fast hops cannot stretch a fetch past it.
 - 10 MiB maximum body; larger sources fail with `502` (the request was fine; the origin object is too big).
 - If an HTTP response carries a `Content-Type` header, it must start with `image/`. The exceptions are the media selections: when the URL carries a `frame:` segment, a `video/*` Content-Type is accepted too (see [Video frames](#video-frames)), and when it carries a `page:` segment, `application/pdf` is accepted (see [PDF pages](#pdf-pages)). Both admissions belong to the request, never to the response alone.
 
