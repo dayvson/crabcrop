@@ -1748,6 +1748,8 @@ async fn run_process(
     job: &ProcessJob,
     bytes: &[u8],
     lane: Lane,
+    deadline: std::time::Instant,
+    ai_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<crate::engine::ProcessedImage, ProcessFailure> {
     // The run takes its permit from its lane's gate only
     // (issue #324): a slow-lane run never touches a
@@ -1765,12 +1767,16 @@ async fn run_process(
     let job = job.clone();
     let bytes = bytes.to_vec();
     let engine = state.engine;
-    // The processing deadline (issue #260): the engine
+    // The processing deadline (issue #260) is the
+    // caller's: serve_miss stamps it when the process
+    // phase starts, so the gate waits above share the
+    // request's one process budget instead of the run
+    // starting a fresh timeout after them. The engine
     // checks it between stages (operations, frames) and
     // inside its chunked encode loops and aborts chained
     // work promptly. The runner's own wait is bounded by
     // the deadline plus the grace bound (issue #322).
-    // The process permit deliberately stays here, on the
+    // The lane permit deliberately stays here, on the
     // async side, instead of moving into the blocking
     // closure as it used to: when the wait times out, the
     // permit drops with this function's answer and the
@@ -1780,8 +1786,19 @@ async fn run_process(
     // difference: the permit is held for exactly the span
     // the caller is waiting on the work.
     let _permit = permit;
-    let deadline = std::time::Instant::now() + state.process_timeout;
     let handle = tokio::task::spawn_blocking(move || {
+        // The AI permit is accounted the other way: it
+        // moves into the blocking closure and drops only
+        // when the job actually finishes. Inference is
+        // serialized inside each provider, so a run the
+        // runner has already shed would otherwise free
+        // its gate slot while its inference is still
+        // draining, and new AI work would stack onto a
+        // session the gate believes is idle, each run
+        // going to completion invisibly. Held here, an
+        // over-budget run keeps its slot while it drains
+        // and new AI work sheds at the gate instead.
+        let _ai_permit = ai_permit;
         let declared_refs: Vec<&dyn crate::ai::DetectionProvider> = job
             .declared_detect_providers
             .iter()
@@ -2654,9 +2671,15 @@ async fn serve_miss(
 
     record.process_ran = true;
     let process_start = Instant::now();
+    // The request's one process deadline starts here, so
+    // the gate waits below and the run itself share a
+    // single budget (run_process takes it as a parameter).
+    let process_deadline = process_start + state.process_timeout;
     // AI inference is gated process-wide: a burst of removebg
-    // requests must not starve the transform pipeline.
-    let _ai_permit = if directives.uses_ai() {
+    // requests must not starve the transform pipeline. The
+    // permit travels with the process job (run_process
+    // holds it until the job actually finishes).
+    let ai_permit = if directives.uses_ai() {
         // The wait is bounded (audit PL-14): a burst of AI
         // requests sheds with a 503 instead of parking
         // unbounded tasks on the gate.
@@ -2790,7 +2813,8 @@ async fn serve_miss(
     } else {
         Lane::Process
     };
-    let processed = match run_process(state, &job, &bytes, lane).await {
+    let processed = match run_process(state, &job, &bytes, lane, process_deadline, ai_permit).await
+    {
         Ok(p) => p,
         Err(ProcessFailure::Busy) => {
             return (
@@ -2836,7 +2860,41 @@ async fn serve_miss(
             // not of the source, and stay honest.
             let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
                 match fallback_source_bytes(state).await {
-                    Some(fb) => run_process(state, &job, &fb, lane).await.ok(),
+                    Some(fb) => {
+                        // The fallback run draws on the same
+                        // gates as the first: AI work
+                        // re-acquires the AI permit (the first
+                        // run's permit drained with its job),
+                        // and a full gate leaves the original
+                        // engine error standing.
+                        let mut retry_permit = None;
+                        let mut may_retry = true;
+                        if directives.uses_ai() {
+                            match tokio::time::timeout(
+                                AI_GATE_WAIT,
+                                state.ai_gate.clone().acquire_owned(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(p)) => retry_permit = Some(p),
+                                _ => may_retry = false,
+                            }
+                        }
+                        if may_retry {
+                            run_process(
+                                state,
+                                &job,
+                                &fb,
+                                lane,
+                                process_deadline,
+                                retry_permit,
+                            )
+                            .await
+                            .ok()
+                        } else {
+                            None
+                        }
+                    }
                     None => None,
                 }
             } else {
@@ -2885,12 +2943,14 @@ async fn serve_miss(
         }
     }
     record.bytes_out = processed.bytes.len();
-    // When this request already holds an AI permit (an AI
-    // transform that is also a meta request), the annotation
-    // paths run under it instead of queueing for a second
-    // permit that cannot free until this request returns
-    // (audit R2-29).
-    let ai_gated = _ai_permit.is_some();
+    // The render's AI permit drained with its job:
+    // run_process holds it until the work finishes, which
+    // on this success path has already happened, so the
+    // gate is free and the annotation paths acquire it per
+    // section like any other request. (They once ran under
+    // the request's own held permit, audit R2-29; that
+    // permit no longer outlives the run.)
+    let ai_gated = false;
     let annotation = if meta {
         annotate_meta(state, &processed, ai_gated).await
     } else {
@@ -8725,12 +8785,13 @@ mod tests {
     #[tokio::test]
     async fn meta_annotations_reuse_the_requests_ai_permit() {
         // A removebg request (AI use) answering meta on a
-        // one-permit AI gate: the request holds the only
-        // permit while its annotations run. They must run
-        // under the held permit; queueing for a second one
-        // would wait out the full gate timeout and silently
-        // drop both the tags and the detections (audit
-        // R2-29).
+        // one-permit AI gate: the annotations must not wait
+        // out the full gate timeout and silently drop both
+        // the tags and the detections (audit R2-29). They
+        // once ran under the permit the request held for
+        // its render; that permit now drains with the
+        // render job itself, so by annotation time the gate
+        // is free and the sections acquire it directly.
         let src = spawn_image_server().await;
         let base = spawn_app_with_ai_and_meta().await;
         let remainder = format!("filters:removebg:format(png)/{src}");
@@ -11048,7 +11109,7 @@ mod tests {
         };
         let held = state.process_gate.clone().acquire_owned().await.unwrap();
         let png = test_png();
-        let waiting = run_process(&state, &job, &png, Lane::Process);
+        let waiting = run_process(&state, &job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None);
         tokio::pin!(waiting);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
@@ -11187,12 +11248,12 @@ mod tests {
         let png = test_png();
         let started = Instant::now();
         let (first, (follow_elapsed, follow)) =
-            tokio::join!(run_process(&state, &stuck_job, &gif, Lane::Slow), async {
+            tokio::join!(run_process(&state, &stuck_job, &gif, Lane::Slow, std::time::Instant::now() + state.process_timeout, None), async {
                 // Arrive while the first encode is stuck,
                 // well past its 300 ms deadline.
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 let follow_start = Instant::now();
-                let result = run_process(&state, &follow_job, &png, Lane::Process).await;
+                let result = run_process(&state, &follow_job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None).await;
                 (follow_start.elapsed(), result)
             });
         assert!(
@@ -11217,6 +11278,96 @@ mod tests {
         // back too once the deadline plus grace releases it.
         assert_eq!(state.slow_gate.available_permits(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upscale fake that blocks until the test lets it
+    /// through, then really doubles the image: the drain
+    /// test's stand-in for a long inference run.
+    #[derive(Debug)]
+    struct BlockingUpscale {
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl crate::ai::UpscaleProvider for BlockingUpscale {
+        fn factor(&self) -> u32 {
+            2
+        }
+
+        fn upscale(
+            &self,
+            img: &image::DynamicImage,
+        ) -> Result<image::DynamicImage, crate::ai::AiError> {
+            let (lock, cvar) = &*self.release;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cvar.wait(open).unwrap();
+            }
+            Ok(image::DynamicImage::ImageRgba8(image::imageops::resize(
+                &img.to_rgba8(),
+                img.width() * 2,
+                img.height() * 2,
+                image::imageops::FilterType::Nearest,
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ai_permit_is_held_until_the_job_actually_finishes() {
+        // The client is shed at the deadline (plus grace)
+        // while the inference is still blocked. The AI
+        // permit the run drew must stay with the detached
+        // job until the job itself finishes: freed at the
+        // shed, it would let new AI work stack onto a
+        // provider the gate believes is idle. Only when
+        // the job drains does the permit come back.
+        let state = lane_test_state(std::time::Duration::from_millis(300), 1, 1);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut job = lane_test_job(None, "filters:upscale(2)/example.com/i.png");
+        job.upscale_provider = Some(Arc::new(BlockingUpscale {
+            release: release.clone(),
+        }));
+        let png = test_png();
+        let permit = state
+            .ai_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        assert_eq!(state.ai_gate.available_permits(), 1);
+        let result = run_process(
+            &state,
+            &job,
+            &png,
+            Lane::Process,
+            std::time::Instant::now() + state.process_timeout,
+            Some(permit),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ProcessFailure::TimedOut)),
+            "the blocked run must answer TimedOut at its deadline, got {result:?}"
+        );
+        assert_eq!(
+            state.ai_gate.available_permits(),
+            1,
+            "the permit must stay with the detached job after the shed"
+        );
+        // Let the inference through: the job finishes and
+        // the permit comes back.
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        let mut back = false;
+        for _ in 0..100 {
+            if state.ai_gate.available_permits() == 2 {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(back, "the permit must return when the job drains");
     }
 
     /// A state for the slow-lane tests (issue #324): the
@@ -11398,7 +11549,7 @@ mod tests {
         let gif = animated_gif_bytes();
         let png = test_png();
         let (first, (follow_elapsed, follow)) =
-            tokio::join!(run_process(&state, &stuck_job, &gif, Lane::Slow), async {
+            tokio::join!(run_process(&state, &stuck_job, &gif, Lane::Slow, std::time::Instant::now() + state.process_timeout, None), async {
                 // Arrive while the encode is stuck, and
                 // prove the saturation is the slow lane's
                 // alone before rendering the still.
@@ -11406,7 +11557,7 @@ mod tests {
                 assert_eq!(state.slow_gate.in_use(), 1);
                 assert_eq!(state.process_gate.in_use(), 0);
                 let follow_start = Instant::now();
-                let result = run_process(&state, &follow_job, &png, Lane::Process).await;
+                let result = run_process(&state, &follow_job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None).await;
                 (follow_start.elapsed(), result)
             });
         assert!(
@@ -11441,7 +11592,7 @@ mod tests {
         let job = lane_test_job(None, "example.com/i.png");
         let png = test_png();
         let held = state.slow_gate.clone().acquire_owned().await.unwrap();
-        let waiting = run_process(&state, &job, &png, Lane::Slow);
+        let waiting = run_process(&state, &job, &png, Lane::Slow, std::time::Instant::now() + state.process_timeout, None);
         tokio::pin!(waiting);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
@@ -11450,7 +11601,7 @@ mod tests {
             "the slow run must wait while the slow lane is saturated"
         );
         assert_eq!(state.process_gate.in_use(), 0);
-        let still = run_process(&state, &job, &png, Lane::Process)
+        let still = run_process(&state, &job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None)
             .await
             .unwrap();
         assert_eq!((still.width, still.height), (100, 60));
@@ -11699,7 +11850,7 @@ mod tests {
         };
         let held = state.process_gate.clone().acquire_owned().await.unwrap();
         let png = test_png();
-        let waiting = run_process(&state, &job, &png, Lane::Process);
+        let waiting = run_process(&state, &job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None);
         tokio::pin!(waiting);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
