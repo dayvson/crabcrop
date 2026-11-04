@@ -7600,6 +7600,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn meta_model_fields_report_file_names_not_paths() {
+        // Providers are built from the operator's
+        // configured paths (that is what main passes);
+        // the meta response must name the model file,
+        // never the filesystem layout it lives in.
+        let src = spawn_image_server().await;
+        let fallback = crate::ai::ClipModerationProvider::new(
+            Arc::new(FakeTagger),
+            "/srv/models/clip_vision.onnx".to_string(),
+        );
+        let base = spawn_app_with_moderation(Some(Arc::new(fallback))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; moderation=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = resp.text().await.unwrap();
+        assert!(
+            !text.contains("/srv/models"),
+            "the configured path must not appear in the response: {text}"
+        );
+        let meta: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(meta["moderation"]["model"], "clip_vision.onnx");
+    }
+
+    #[tokio::test]
     async fn meta_moderation_reports_unavailable_without_a_provider() {
         let src = spawn_image_server().await;
         let base = spawn_app_with_moderation(None).await;
