@@ -2943,18 +2943,51 @@ async fn serve_miss(
     // the request's own held permit, audit R2-29; that
     // permit no longer outlives the run.)
     let ai_gated = false;
+    // The annotation sections share one deadline, the
+    // same process budget the render ran under: a
+    // section that has not answered when it passes is
+    // left out (tags, detections) or reports itself
+    // unavailable with the "timed_out" reason
+    // (moderation, embedding, OCR), and the response
+    // goes out with the sections that made it. OCR also
+    // gets the deadline inside the run, so its per-line
+    // recognition stops gathering instead of only being
+    // cut off at the response.
+    let annotation_deadline = Instant::now() + state.process_timeout;
     let annotation = if meta {
-        annotate_meta(state, &processed, ai_gated).await
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(annotation_deadline),
+            annotate_meta(state, &processed, ai_gated),
+        )
+        .await
+        .ok()
+        .flatten()
     } else {
         None
     };
     let detections = if meta && wants_detections(accept) {
-        detect_meta(state, &processed, ai_gated).await
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(annotation_deadline),
+            detect_meta(state, &processed, ai_gated),
+        )
+        .await
+        .ok()
+        .flatten()
     } else {
         None
     };
     let moderation = if meta && wants_moderation(accept) {
-        Some(moderate_meta(state, &processed, ai_gated).await)
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                moderate_meta(state, &processed, ai_gated),
+            )
+            .await
+            {
+                Ok(m) => m,
+                Err(_) => ModerationMeta::Unavailable("timed_out"),
+            },
+        )
     } else {
         None
     };
@@ -2964,13 +2997,33 @@ async fn serve_miss(
     // head is configured. One run feeds both.
     let want_embedding = meta && wants_embeddings(accept);
     let embedding_run = if meta && (want_embedding || state.aesthetic.is_some()) {
-        Some(embed_meta(state, &processed, ai_gated).await)
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                embed_meta(state, &processed, ai_gated),
+            )
+            .await
+            {
+                Ok(e) => e,
+                Err(_) => EmbeddingMeta::Unavailable("timed_out"),
+            },
+        )
     } else {
         None
     };
     let aesthetic = compose_aesthetic(state, embedding_run.as_ref());
     let ocr = if meta && wants_ocr(accept) {
-        Some(ocr_meta(state, &processed, ai_gated).await)
+        Some(
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(annotation_deadline),
+                ocr_meta(state, &processed, ai_gated, annotation_deadline),
+            )
+            .await
+            {
+                Ok(o) => o,
+                Err(_) => OcrMeta::Unavailable("timed_out"),
+            },
+        )
     } else {
         None
     };
@@ -3561,6 +3614,7 @@ async fn ocr_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
     ai_gated: bool,
+    deadline: Instant,
 ) -> OcrMeta {
     let Some(provider) = state.ocr.as_ref() else {
         return OcrMeta::Unavailable("not_configured");
@@ -3578,7 +3632,7 @@ async fn ocr_meta(
         Err(_) => return OcrMeta::Unavailable("inference_failed"),
     };
     let provider = provider.clone();
-    match tokio::task::spawn_blocking(move || provider.recognize(&img)).await {
+    match tokio::task::spawn_blocking(move || provider.recognize_deadline(&img, deadline)).await {
         Ok(Ok(report)) => OcrMeta::Report(compose_ocr(&report)),
         Ok(Err(e)) => {
             eprintln!("OCR error: {e}");
@@ -7719,13 +7773,40 @@ mod tests {
         }
     }
 
+    /// An OCR provider that takes five seconds to
+    /// answer: the annotation deadline tests run it
+    /// against a far shorter budget.
+    #[derive(Debug)]
+    struct SlowOcr;
+
+    impl crate::ai::OcrProvider for SlowOcr {
+        fn recognize(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::OcrReport, crate::ai::AiError> {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            Ok(crate::ai::OcrReport {
+                model: "slow-recognizer".to_string(),
+                language: "en".to_string(),
+                lines: Vec::new(),
+            })
+        }
+    }
+
     async fn spawn_app_with_ocr(provider: Option<Arc<dyn crate::ai::OcrProvider>>) -> String {
+        spawn_app_with_ocr_timeout(provider, std::time::Duration::from_secs(30)).await
+    }
+
+    async fn spawn_app_with_ocr_timeout(
+        provider: Option<Arc<dyn crate::ai::OcrProvider>>,
+        process_timeout: std::time::Duration,
+    ) -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
             engine: Engine,
-            process_timeout: std::time::Duration::from_secs(30),
+            process_timeout,
             metrics: Arc::new(Metrics::default()),
             metrics_token: None,
             cache: Arc::new(Cache::new(16 * 1024 * 1024)),
@@ -7856,6 +7937,40 @@ mod tests {
         let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert_eq!(meta["ocr"]["available"], false);
         assert_eq!(meta["ocr"]["reason"], "inference_failed");
+    }
+
+    #[tokio::test]
+    async fn meta_ocr_reports_timed_out_at_the_annotation_deadline() {
+        // The annotation sections share one deadline,
+        // the process budget: an OCR run that would take
+        // five seconds against a 300 ms budget must not
+        // hold the response. The section reports itself
+        // unavailable with the timed_out reason and the
+        // meta answer goes out on time.
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_ocr_timeout(
+            Some(Arc::new(SlowOcr)),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let started = Instant::now();
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; ocr=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the meta response must not wait out the OCR run: {:?}",
+            started.elapsed()
+        );
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["ocr"]["available"], false);
+        assert_eq!(meta["ocr"]["reason"], "timed_out");
     }
 
     #[tokio::test]
