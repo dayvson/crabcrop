@@ -1398,7 +1398,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(probe.head.len() >= 33);
         assert_eq!(probe.total_bytes, Some(1_048_576));
     }
@@ -1443,7 +1447,11 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(LoadError::TooLarge { limit: 100 }));
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1769,7 +1777,10 @@ mod tests {
                 allowed_buckets: vec!["*".to_string()],
                 ..Default::default()
             });
-            let body = loader.load(&format!("{scheme}://photos/pic.jpg")).await.unwrap();
+            let body = loader
+                .load(&format!("{scheme}://photos/pic.jpg"))
+                .await
+                .unwrap();
             assert_eq!(body, b"\xff\xd8\xff\xd9", "{scheme}");
         }
     }

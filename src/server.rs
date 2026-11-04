@@ -719,8 +719,7 @@ async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
 /// the identifying header may still be on its way.
 fn probe_settled(head: &[u8]) -> bool {
     let probe = crate::engine::probe_source(head);
-    probe.kind != "unknown"
-        && (probe.dimensions.is_some() || matches!(probe.kind, "video" | "pdf"))
+    probe.kind != "unknown" && (probe.dimensions.is_some() || matches!(probe.kind, "video" | "pdf"))
 }
 
 /// the self-explaining URL report (issue #196; the report
@@ -2881,16 +2880,9 @@ async fn serve_miss(
                             }
                         }
                         if may_retry {
-                            run_process(
-                                state,
-                                &job,
-                                &fb,
-                                lane,
-                                process_deadline,
-                                retry_permit,
-                            )
-                            .await
-                            .ok()
+                            run_process(state, &job, &fb, lane, process_deadline, retry_permit)
+                                .await
+                                .ok()
                         } else {
                             None
                         }
@@ -11109,7 +11101,14 @@ mod tests {
         };
         let held = state.process_gate.clone().acquire_owned().await.unwrap();
         let png = test_png();
-        let waiting = run_process(&state, &job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None);
+        let waiting = run_process(
+            &state,
+            &job,
+            &png,
+            Lane::Process,
+            std::time::Instant::now() + state.process_timeout,
+            None,
+        );
         tokio::pin!(waiting);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
@@ -11247,15 +11246,32 @@ mod tests {
         let gif = animated_gif_bytes();
         let png = test_png();
         let started = Instant::now();
-        let (first, (follow_elapsed, follow)) =
-            tokio::join!(run_process(&state, &stuck_job, &gif, Lane::Slow, std::time::Instant::now() + state.process_timeout, None), async {
+        let (first, (follow_elapsed, follow)) = tokio::join!(
+            run_process(
+                &state,
+                &stuck_job,
+                &gif,
+                Lane::Slow,
+                std::time::Instant::now() + state.process_timeout,
+                None
+            ),
+            async {
                 // Arrive while the first encode is stuck,
                 // well past its 300 ms deadline.
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 let follow_start = Instant::now();
-                let result = run_process(&state, &follow_job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None).await;
+                let result = run_process(
+                    &state,
+                    &follow_job,
+                    &png,
+                    Lane::Process,
+                    std::time::Instant::now() + state.process_timeout,
+                    None,
+                )
+                .await;
                 (follow_start.elapsed(), result)
-            });
+            }
+        );
         assert!(
             matches!(first, Err(ProcessFailure::TimedOut)),
             "the stuck encode must answer TimedOut at its deadline, got {first:?}"
@@ -11327,12 +11343,7 @@ mod tests {
             release: release.clone(),
         }));
         let png = test_png();
-        let permit = state
-            .ai_gate
-            .clone()
-            .acquire_owned()
-            .await
-            .unwrap();
+        let permit = state.ai_gate.clone().acquire_owned().await.unwrap();
         assert_eq!(state.ai_gate.available_permits(), 1);
         let result = run_process(
             &state,
@@ -11548,8 +11559,16 @@ mod tests {
         let follow_job = lane_test_job(None, "example.com/i.png");
         let gif = animated_gif_bytes();
         let png = test_png();
-        let (first, (follow_elapsed, follow)) =
-            tokio::join!(run_process(&state, &stuck_job, &gif, Lane::Slow, std::time::Instant::now() + state.process_timeout, None), async {
+        let (first, (follow_elapsed, follow)) = tokio::join!(
+            run_process(
+                &state,
+                &stuck_job,
+                &gif,
+                Lane::Slow,
+                std::time::Instant::now() + state.process_timeout,
+                None
+            ),
+            async {
                 // Arrive while the encode is stuck, and
                 // prove the saturation is the slow lane's
                 // alone before rendering the still.
@@ -11557,9 +11576,18 @@ mod tests {
                 assert_eq!(state.slow_gate.in_use(), 1);
                 assert_eq!(state.process_gate.in_use(), 0);
                 let follow_start = Instant::now();
-                let result = run_process(&state, &follow_job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None).await;
+                let result = run_process(
+                    &state,
+                    &follow_job,
+                    &png,
+                    Lane::Process,
+                    std::time::Instant::now() + state.process_timeout,
+                    None,
+                )
+                .await;
                 (follow_start.elapsed(), result)
-            });
+            }
+        );
         assert!(
             matches!(first, Err(ProcessFailure::TimedOut)),
             "the stuck encode must answer TimedOut at its deadline, got {first:?}"
@@ -11592,7 +11620,14 @@ mod tests {
         let job = lane_test_job(None, "example.com/i.png");
         let png = test_png();
         let held = state.slow_gate.clone().acquire_owned().await.unwrap();
-        let waiting = run_process(&state, &job, &png, Lane::Slow, std::time::Instant::now() + state.process_timeout, None);
+        let waiting = run_process(
+            &state,
+            &job,
+            &png,
+            Lane::Slow,
+            std::time::Instant::now() + state.process_timeout,
+            None,
+        );
         tokio::pin!(waiting);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
@@ -11601,9 +11636,16 @@ mod tests {
             "the slow run must wait while the slow lane is saturated"
         );
         assert_eq!(state.process_gate.in_use(), 0);
-        let still = run_process(&state, &job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None)
-            .await
-            .unwrap();
+        let still = run_process(
+            &state,
+            &job,
+            &png,
+            Lane::Process,
+            std::time::Instant::now() + state.process_timeout,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!((still.width, still.height), (100, 60));
         drop(held);
         let processed = waiting.await.unwrap();
@@ -11850,7 +11892,14 @@ mod tests {
         };
         let held = state.process_gate.clone().acquire_owned().await.unwrap();
         let png = test_png();
-        let waiting = run_process(&state, &job, &png, Lane::Process, std::time::Instant::now() + state.process_timeout, None);
+        let waiting = run_process(
+            &state,
+            &job,
+            &png,
+            Lane::Process,
+            std::time::Instant::now() + state.process_timeout,
+            None,
+        );
         tokio::pin!(waiting);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)

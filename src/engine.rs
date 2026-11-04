@@ -10118,8 +10118,7 @@ mod tests {
         }
 
         fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, crate::ai::AiError> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(300));
             Ok(DynamicImage::ImageRgba8(image::imageops::resize(
                 &img.to_rgba8(),
@@ -10159,12 +10158,7 @@ mod tests {
             )
             .expect_err("the segment must stop at the deadline");
         assert_eq!(err, EngineError::Timeout);
-        assert_eq!(
-            provider
-                .calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
