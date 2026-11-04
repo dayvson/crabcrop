@@ -3093,6 +3093,18 @@ pub struct OnnxModerationProvider {
     model: String,
 }
 
+/// The name meta reports for a configured model file:
+/// the file name, never the operator's filesystem
+/// layout. The OCR providers have always reported it
+/// this way (issue #268); every model identity in a
+/// meta response follows the same rule.
+fn model_display_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
 impl OnnxModerationProvider {
     /// Load the model and probe it on a blank image: the
     /// probe fixes the output count the configured
@@ -3108,7 +3120,7 @@ impl OnnxModerationProvider {
             session: Mutex::new(session),
             input_name,
             labels: Vec::new(),
-            model: model_path.to_string(),
+            model: model_display_name(model_path),
         };
         let probe = provider
             .logits(&DynamicImage::new_rgb8(8, 8))
@@ -3188,9 +3200,13 @@ pub struct ClipModerationProvider {
 
 impl ClipModerationProvider {
     /// Wrap a tag provider; `model` is the identity the
-    /// meta response reports (the CLIP image model path).
+    /// meta response reports: the CLIP image model's
+    /// file name (callers pass the configured path).
     pub fn new(tagger: std::sync::Arc<dyn TagProvider>, model: String) -> Self {
-        Self { tagger, model }
+        Self {
+            tagger,
+            model: model_display_name(&model),
+        }
     }
 }
 
@@ -3220,7 +3236,7 @@ impl ModerationProvider for ClipModerationProvider {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageEmbedding {
     /// The configured encoder identity reported in
-    /// meta: the CLIP image model path. A vector is
+    /// meta: the CLIP image model's file name. A vector is
     /// meaningless without the encoder that made it,
     /// so the identity is part of the value, not
     /// metadata about it.
@@ -3250,10 +3266,14 @@ pub struct ClipEmbeddingProvider {
 
 impl ClipEmbeddingProvider {
     /// Wrap a tag provider; `model` is the identity
-    /// the meta response reports (the CLIP image model
+    /// the meta response reports: the CLIP image
+    /// model's file name (callers pass the configured
     /// path).
     pub fn new(tagger: std::sync::Arc<dyn TagProvider>, model: String) -> Self {
-        Self { tagger, model }
+        Self {
+            tagger,
+            model: model_display_name(&model),
+        }
     }
 }
 
@@ -3294,7 +3314,7 @@ impl EmbeddingProvider for ClipEmbeddingProvider {
 pub struct AestheticHead {
     weights: Vec<f32>,
     bias: f32,
-    /// The configured path, reported in meta as the
+    /// The head file's name, reported in meta as the
     /// head's identity.
     identity: String,
 }
@@ -3317,7 +3337,7 @@ impl AestheticHead {
         }
         let (weights, bias) = parse_aesthetic_head(&bytes)
             .map_err(|e| AiError::Load(format!("the aesthetic head {path} is not usable: {e}")))?;
-        Self::from_weights(weights, bias, path.to_string())
+        Self::from_weights(weights, bias, model_display_name(path))
     }
 
     /// Assemble a head from parsed weights: at least
@@ -3341,7 +3361,7 @@ impl AestheticHead {
     }
 
     /// The head's identity, reported in meta: the
-    /// configured path it was loaded from.
+    /// file name it was loaded from.
     pub fn identity(&self) -> &str {
         &self.identity
     }
@@ -4242,6 +4262,30 @@ mod moderation_tests {
             ClipModerationProvider::new(std::sync::Arc::new(tagger), "clip.onnx".to_string());
         let err = provider.moderate(&solid()).unwrap_err();
         assert!(matches!(err, AiError::Inference(_)), "{err}");
+    }
+
+    #[test]
+    fn model_identities_report_file_names_not_paths() {
+        // Meta names a model by its file name: the
+        // configured path is the operator's filesystem
+        // layout and never reaches a response. Every
+        // provider that reports a model identity follows
+        // the rule the OCR provider set (issue #268).
+        assert_eq!(
+            model_display_name("/srv/models/clip_vision.onnx"),
+            "clip_vision.onnx"
+        );
+        assert_eq!(model_display_name("clip_vision.onnx"), "clip_vision.onnx");
+        let tagger = StubTagger(Ok(vec![TagScore {
+            label: "x".to_string(),
+            score: 0.5,
+        }]));
+        let provider = ClipModerationProvider::new(
+            std::sync::Arc::new(tagger),
+            "/srv/models/clip_vision.onnx".to_string(),
+        );
+        let report = provider.moderate(&solid()).unwrap();
+        assert_eq!(report.model, "clip_vision.onnx");
     }
 
     /// Write bytes to a fresh temp file and return its
@@ -5920,6 +5964,16 @@ mod embedding_tests {
         );
         let path = temp_file("head-ok", &archive);
         let head = AestheticHead::load(&path).unwrap();
+        // The identity meta reports is the file name,
+        // never the path it was loaded from.
+        assert_eq!(
+            head.identity(),
+            std::path::Path::new(&path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert!(!head.identity().contains('/'));
         assert_eq!(head.expected_dim(), 3);
         let score = head.score(&[2.0, 4.0, 0.5]).unwrap();
         assert!((score - 1.75).abs() < 1e-6, "score {score}");
