@@ -2292,12 +2292,54 @@ fn channel_percentile(hist: &[u64; 256], total: u64, num: u64, den: u64) -> u8 {
 /// [`AUTO_LEVELS_MIN_SPAN`] is left unmapped.
 fn auto_levels(img: image::RgbImage) -> image::RgbImage {
     let total = (img.width() * img.height()) as u64;
-    let mut hists = [[0u64; 256]; 3];
-    for p in img.pixels() {
-        hists[0][p[0] as usize] += 1;
-        hists[1][p[1] as usize] += 1;
-        hists[2][p[2] as usize] += 1;
-    }
+    // Banded histogram: per-band local counts merged by integer
+    // addition, which is order-independent, so the merged counts
+    // are exactly the sequential pass's counts. Small frames count
+    // sequentially over the raw buffer.
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let raw = img.as_raw();
+    let row = w * 3;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4);
+    let hists: [[u64; 256]; 3] = if threads < 2 || h < 256 || raw.len() < 3_000_000 {
+        let mut hists = [[0u64; 256]; 3];
+        for p in raw.as_chunks::<3>().0 {
+            hists[0][p[0] as usize] += 1;
+            hists[1][p[1] as usize] += 1;
+            hists[2][p[2] as usize] += 1;
+        }
+        hists
+    } else {
+        let band_rows = h.div_ceil(threads);
+        let locals: Vec<[[u64; 256]; 3]> = std::thread::scope(|s| {
+            let handles: Vec<_> = raw
+                .chunks(band_rows * row)
+                .map(|band| {
+                    s.spawn(move || {
+                        let mut hists = [[0u64; 256]; 3];
+                        for p in band.as_chunks::<3>().0 {
+                            hists[0][p[0] as usize] += 1;
+                            hists[1][p[1] as usize] += 1;
+                            hists[2][p[2] as usize] += 1;
+                        }
+                        hists
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut hists = [[0u64; 256]; 3];
+        for local in locals {
+            for c in 0..3 {
+                for v in 0..256 {
+                    hists[c][v] += local[c][v];
+                }
+            }
+        }
+        hists
+    };
     let mut maps: [[u8; 256]; 3] = [[0; 256]; 3];
     for c in 0..3 {
         let lo = channel_percentile(&hists[c], total, 1, 200);
@@ -2318,11 +2360,14 @@ fn auto_levels(img: image::RgbImage) -> image::RgbImage {
         }
     }
     let mut out = img;
-    for p in out.pixels_mut() {
-        for c in 0..3 {
-            p[c] = maps[c][p[c] as usize];
-        }
-    }
+    let w = out.width() as usize;
+    map_rgb_bands::<3>(out.as_mut(), w, &|r, g, b| {
+        [
+            maps[0][usize::from(r)],
+            maps[1][usize::from(g)],
+            maps[2][usize::from(b)],
+        ]
+    });
     out
 }
 
@@ -4425,6 +4470,99 @@ mod w3proofs {
                     "rotate {deg} rgba {w}x{h}"
                 );
             }
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// Wave-4 proofs. The tonal winners change only plumbing:
+// `auto_levels` counts its histogram in row bands (integer
+// counts merge exactly) and applies its maps through
+// `map_rgb_bands`. Each is pinned here against a frozen copy
+// of the pre-change implementation.
+// ----------------------------------------------------------------
+
+#[cfg(test)]
+mod w4proofs {
+    use super::*;
+
+    fn photo(w: u32, h: u32) -> DynamicImage {
+        let mut buf = vec![0u8; (w * h * 3) as usize];
+        let mut state: u64 = 0x0fed_cba9_8765_4321;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                buf[i] = ((x * 255) / w.max(1)) as u8 ^ (next() >> 3);
+                buf[i + 1] = ((y * 255) / h.max(1)) as u8 ^ (next() >> 3);
+                buf[i + 2] = (((x + y) * 255) / (w + h).max(1)) as u8 ^ (next() >> 3);
+            }
+        }
+        DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, buf).unwrap())
+    }
+
+    fn seq_auto_levels_reference(img: image::RgbImage) -> image::RgbImage {
+        let total = (img.width() * img.height()) as u64;
+        let mut hists = [[0u64; 256]; 3];
+        for p in img.pixels() {
+            hists[0][p[0] as usize] += 1;
+            hists[1][p[1] as usize] += 1;
+            hists[2][p[2] as usize] += 1;
+        }
+        let mut maps: [[u8; 256]; 3] = [[0; 256]; 3];
+        for c in 0..3 {
+            let lo = channel_percentile(&hists[c], total, 1, 200);
+            let hi = channel_percentile(&hists[c], total, 199, 200);
+            let (lo, hi) = if hi.saturating_sub(lo) < AUTO_LEVELS_MIN_SPAN {
+                (0usize, 255usize)
+            } else {
+                (usize::from(lo), usize::from(hi))
+            };
+            for (v, slot) in maps[c].iter_mut().enumerate() {
+                *slot = if v <= lo {
+                    0
+                } else if v >= hi {
+                    255
+                } else {
+                    ((v - lo) * 255 + (hi - lo) / 2) / (hi - lo)
+                } as u8;
+            }
+        }
+        let mut out = img;
+        for p in out.pixels_mut() {
+            for c in 0..3 {
+                p[c] = maps[c][p[c] as usize];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn w4_auto_levels_banded_matches_sequential() {
+        // The 1200x900 case crosses the banding thresholds; the
+        // smaller ones stay sequential. A compressed-range frame
+        // exercises the stretch; a flat frame the span floor.
+        for (w, h) in [(64u32, 48u32), (333, 257), (1200, 900)] {
+            let rgb = photo(w, h).to_rgb8();
+            assert_eq!(
+                auto_levels(rgb.clone()).as_raw(),
+                seq_auto_levels_reference(rgb).as_raw(),
+                "auto_levels photo {w}x{h}"
+            );
+            let mut flat = image::RgbImage::new(w, h);
+            for p in flat.pixels_mut() {
+                *p = image::Rgb([100, 110, 120]);
+            }
+            assert_eq!(
+                auto_levels(flat.clone()).as_raw(),
+                seq_auto_levels_reference(flat).as_raw(),
+                "auto_levels flat {w}x{h}"
+            );
         }
     }
 }
