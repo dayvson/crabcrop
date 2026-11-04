@@ -49,7 +49,11 @@ onlyPresets: false
 #   env:
 #     CRABCROP_CACHE_MAX_MB: "512"
 #     CRABCROP_METADATA: "preserve"
-env: {}
+# The one default below is the evaluation source posture:
+# boot refuses to run with none at all (see the README's
+# Configuration section).
+env:
+  CRABCROP_BLOCK_PRIVATE_SOURCES: "1"
 
 # The disk-backed result cache tier. Off by default: the
 # in-memory tier alone serves a single replica well. See the

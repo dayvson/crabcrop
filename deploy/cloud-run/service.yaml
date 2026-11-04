@@ -27,6 +27,11 @@ spec:
                 secretKeyRef:
                   name: crabcrop-secret
                   key: latest
+            # Boot refuses to run with no source posture:
+            # refuse sources resolving to non-public
+            # addresses (or set CRABCROP_ALLOWED_SOURCES).
+            - name: CRABCROP_BLOCK_PRIVATE_SOURCES
+              value: "1"
           resources:
             limits:
               cpu: "1"

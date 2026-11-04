@@ -29,7 +29,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releas
 ```bash
 docker pull ghcr.io/dayvson/crabcrop:0.9.8
 docker pull ghcr.io/dayvson/crabcrop-ai:0.9.8
-docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.9.8
+docker run -e CRABCROP_SECRET=your-secret-change-me -e CRABCROP_BLOCK_PRIVATE_SOURCES=1 -p 3000:3000 ghcr.io/dayvson/crabcrop:0.9.8
 ```
 
 **Release binaries:** prebuilt tarballs for macOS and Linux, on x86_64 and arm64, are on the [releases page](https://github.com/dayvson/crabcrop/releases). To build from source instead, see [Deployment](#deployment).
@@ -40,10 +40,10 @@ docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson
 
 Step 1 builds from source. Beyond the Rust toolchain, a source build needs a C compiler (the tree vendors C libraries), nasm on x86_64 (the AVIF encoder's assembly; its build script fails without it), and, only for the vendored AVIF decode route (`--features avif-decode`), meson and ninja, or a system libdav1d 1.3 or newer found through pkg-config instead. The prebuilt routes in [Install](#install) need none of this.
 
-**1. Start the server.** A secret is required. For local development, also allow unsigned URLs:
+**1. Start the server.** A secret is required, and so is a source posture (see [Configuration](#configuration)): an allowlist, private-address blocking, or the deliberate any-source opt-in. For local development, also allow unsigned URLs and take the opt-in:
 
 ```bash
-CRABCROP_SECRET=local-dev-secret CRABCROP_ALLOW_UNSAFE=1 cargo run --release
+CRABCROP_SECRET=local-dev-secret CRABCROP_ALLOW_UNSAFE=1 CRABCROP_ALLOW_ANY_SOURCE=1 cargo run --release
 # crabcrop listening on port 3000
 ```
 
@@ -156,7 +156,7 @@ Decoding is bounded too, so a small file cannot expand into gigabytes: at most 1
 
 HTTP and HTTPS sources additionally allow up to 5 redirects, with the [source policy](#configuration) re-checked on every hop.
 
-When `CRABCROP_ALLOWED_SOURCES` is set, only the listed host suffixes may be fetched (a suffix matches the host itself or any subdomain of it); unset, all hosts are allowed. Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
+When `CRABCROP_ALLOWED_SOURCES` is set, only the listed host suffixes may be fetched (a suffix matches the host itself or any subdomain of it). The server refuses to boot with no source posture at all: configure an allowlist, or `CRABCROP_BLOCK_PRIVATE_SOURCES`, or `CRABCROP_ALLOW_ANY_SOURCE=1` to deliberately allow every host. Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
 
 With `CRABCROP_BLOCK_PRIVATE_SOURCES` on (off by default), the loader also refuses sources whose host is, or resolves to, a non-public address: loopback, private, link-local, unspecified, shared (CGNAT), reserved, multicast, broadcast, documentation, benchmarking, and the other special-purpose ranges, including IPv4-mapped, IPv4-compatible, and 6to4 spellings of them. The host is resolved and its addresses checked before connecting and again on every redirect hop, and the connection is pinned to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). A policy refusal answers `403`.
 
@@ -980,8 +980,9 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](#presets). |
 | `CRABCROP_ONLY_PRESETS` | off | Rejects free-form operations in requests; only preset references (and `exp:` / `maxage:` metadata) are allowed. Requires at least one preset. |
 | `CRABCROP_SOURCE_ROOTS_FILE` | unset | Path to a source roots file. See [Source roots](#source-roots). |
-| `CRABCROP_ALLOWED_SOURCES` | unset (all hosts allowed) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
+| `CRABCROP_ALLOWED_SOURCES` | unset (no allowlist) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
 | `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | Refuses sources whose host is, or resolves to, a non-public address: loopback, private, link-local, unspecified, shared (CGNAT), reserved, multicast, broadcast, documentation, benchmarking, and the other special-purpose ranges, including IPv4-mapped, IPv4-compatible, and 6to4 spellings of them. Checked before connecting and again on every redirect hop. |
+| `CRABCROP_ALLOW_ANY_SOURCE` | off | Deliberately allows every source. With no allowlist and private blocking off, the server refuses to boot unless this is on. |
 | `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |
 | `CRABCROP_GCS_ENDPOINT` | `https://storage.googleapis.com` | Base URL of the GCS XML API for `gs://` sources. `CRABCROP_GCS_REGION` (default `auto`) is the signing region; the HMAC pair is `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY`. |
 | `CRABCROP_ALLOWED_BUCKETS` | unset | Comma-separated bucket names the `s3://` and `gs://` schemes may read; `*` allows all. Required when bucket credentials are configured (the server refuses to boot without it); without credentials, unset means all buckets, fetched unsigned. |
@@ -1131,7 +1132,7 @@ The repo ships a multi-stage `Dockerfile` (the runtime image carries the binary,
 
 ```bash
 docker build -t crabcrop:latest .
-docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret-change-me crabcrop:latest
+docker run -p 3000:3000 -e CRABCROP_SECRET=your-secret-change-me -e CRABCROP_BLOCK_PRIVATE_SOURCES=1 crabcrop:latest
 ```
 
 For the AI features, build `Dockerfile.ai` on top of that image; see [AI features](#ai-features).

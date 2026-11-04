@@ -105,6 +105,7 @@ def main():
     # the source tree.
     env["CRABCROP_SECRET"] = "bench-gate-" + "secret" + "-0123456789"
     env["CRABCROP_ALLOW_UNSAFE"] = "1"
+    env["CRABCROP_ALLOWED_SOURCES"] = "127.0.0.1"
     env["PORT"] = str(SERVER_PORT)
     env["NO_PROXY"] = "127.0.0.1,localhost"
     server = subprocess.Popen(

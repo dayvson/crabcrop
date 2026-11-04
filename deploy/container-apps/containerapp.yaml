@@ -24,6 +24,11 @@ properties:
             value: "3000"
           - name: CRABCROP_SECRET
             secretRef: crabcrop-secret
+          # Boot refuses to run with no source posture:
+          # refuse sources resolving to non-public addresses
+          # (or set CRABCROP_ALLOWED_SOURCES).
+          - name: CRABCROP_BLOCK_PRIVATE_SOURCES
+            value: "1"
         probes:
           - type: Liveness
             httpGet:

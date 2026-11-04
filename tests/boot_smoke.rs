@@ -46,6 +46,9 @@ fn the_binary_boots_and_answers_health() {
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
         .env("PORT", port.to_string())
+        // The deliberate any-source opt-in: with no allowlist
+        // and no private blocking, this is what boot needs.
+        .env("CRABCROP_ALLOW_ANY_SOURCE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -79,6 +82,29 @@ fn the_binary_boots_and_answers_health() {
     );
 }
 
+#[test]
+fn boot_with_no_source_restrictions_is_refused() {
+    // With no allowlist, private blocking off, and no
+    // any-source opt-in, boot refuses and the diagnostic
+    // names the three settings that settle the posture.
+    let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+        .env_clear()
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+        .env("PORT", free_port().to_string())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("no source restrictions are configured"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("CRABCROP_ALLOWED_SOURCES"), "{stderr}");
+    assert!(stderr.contains("CRABCROP_ALLOW_ANY_SOURCE"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
 /// A model file that exists, so a boot failure is about
 /// the runtime, never about a missing model.
 fn configured_model() -> std::path::PathBuf {
@@ -102,6 +128,7 @@ fn boot_with_a_model_but_no_loadable_runtime_fails_with_the_diagnostic() {
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
         .env("PORT", free_port().to_string())
+        .env("CRABCROP_ALLOW_ANY_SOURCE", "1")
         .env("CRABCROP_REMOVEBG_MODEL", &model)
         .env("ORT_DYLIB_PATH", "/nonexistent/libonnxruntime.so")
         .output()
@@ -134,6 +161,7 @@ fn boot_with_a_model_but_no_runtime_anywhere_fails_with_the_diagnostic() {
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
         .env("PORT", free_port().to_string())
+        .env("CRABCROP_ALLOW_ANY_SOURCE", "1")
         .env("CRABCROP_REMOVEBG_MODEL", &model)
         .output()
         .unwrap();

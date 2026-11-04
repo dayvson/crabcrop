@@ -56,7 +56,7 @@ helm upgrade crabcrop deploy/helm/crabcrop \
 
 ## Evaluation install
 
-For a trial, the chart defaults plus a secret are enough:
+For a trial, the chart defaults plus a secret are enough (the defaults carry the evaluation source posture, private-address sources refused; boot refuses to run with no posture at all):
 
 ```bash
 helm install crabcrop deploy/helm/crabcrop \

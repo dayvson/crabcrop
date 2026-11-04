@@ -37,6 +37,11 @@ spec:
                 secretKeyRef:
                   name: crabcrop
                   key: CRABCROP_SECRET
+            # Boot refuses to run with no source posture:
+            # refuse sources resolving to non-public
+            # addresses (or set CRABCROP_ALLOWED_SOURCES).
+            - name: CRABCROP_BLOCK_PRIVATE_SOURCES
+              value: "1"
           livenessProbe:
             httpGet:
               path: /health

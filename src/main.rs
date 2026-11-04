@@ -39,10 +39,13 @@
 //!   one of ultrafast, fastest, fast, medium, slow, extraslow,
 //!   default fastest.
 //! - `CRABCROP_ALLOWED_SOURCES`: comma-separated host suffixes the
-//!   loader may fetch from; unset allows every host.
+//!   loader may fetch from; unset means no allowlist.
 //! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: `1` or `true` to refuse
 //!   sources resolving to loopback, private, or link-local
 //!   addresses. Off by default.
+//! - `CRABCROP_ALLOW_ANY_SOURCE`: `1` or `true` to deliberately
+//!   allow every source. With no allowlist, private blocking
+//!   off, and this unset, the server refuses to boot.
 //! - `CRABCROP_S3_ENDPOINT`: base URL of an S3-compatible
 //!   store for `s3://` sources (path-style addressing).
 //!   Unset means AWS S3 (virtual-hosted, region from
@@ -536,6 +539,29 @@ fn check_bucket_policy(has_credentials: bool, allowed_buckets: &[String]) -> Res
     Ok(())
 }
 
+/// Fail closed on the fetch posture: with no source
+/// allowlist and private-address blocking off, a signed URL
+/// can make the server fetch any host it can reach,
+/// including the non-public addresses of its own network.
+/// One of the two guards must be configured;
+/// `CRABCROP_ALLOW_ANY_SOURCE` is the deliberate any-source
+/// opt-in for deployments that want the open posture (a
+/// public demo, a bench rig).
+fn check_source_posture(policy: &SourcePolicy, allow_any: bool) -> Result<(), String> {
+    if policy.allowed_suffixes.is_empty() && !policy.block_private && !allow_any {
+        return Err(
+            "no source restrictions are configured: refusing to boot, because signed \
+             URLs could fetch any host this server can reach, including non-public \
+             addresses. Set CRABCROP_ALLOWED_SOURCES to a comma-separated host \
+             allowlist, or CRABCROP_BLOCK_PRIVATE_SOURCES=1 to refuse sources that \
+             resolve to non-public addresses, or CRABCROP_ALLOW_ANY_SOURCE=1 to \
+             deliberately allow every source."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn build_source_config(get: impl Fn(&str) -> Option<String>) -> Result<SourceConfig, String> {
     let mut sources = SourceConfig::default();
     let nonempty = |name: &str| get(name).filter(|v| !v.is_empty());
@@ -921,6 +947,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     let block_private = parse_bool("CRABCROP_BLOCK_PRIVATE_SOURCES", false)?;
     let policy = SourcePolicy::new(allowed_sources, block_private);
+    let allow_any_source = parse_bool("CRABCROP_ALLOW_ANY_SOURCE", false)?;
+    check_source_posture(&policy, allow_any_source)?;
     let mut sources = build_source_config(|name| env::var(name).ok())?;
     // The upload destination (issue #168), built after the
     // source configuration it reuses. A local destination
@@ -2339,6 +2367,24 @@ mod tests {
         assert!(check_bucket_policy(true, &["*".to_string()]).is_ok());
         let err = check_bucket_policy(true, &[]).unwrap_err();
         assert!(err.contains("CRABCROP_ALLOWED_BUCKETS"), "{err}");
+    }
+
+    #[test]
+    fn source_posture_needs_a_guard_or_the_opt_in() {
+        let open = SourcePolicy::new(vec![], false);
+        assert!(check_source_posture(&open, true).is_ok());
+        let err = check_source_posture(&open, false).unwrap_err();
+        assert!(err.contains("CRABCROP_ALLOWED_SOURCES"), "{err}");
+        assert!(err.contains("CRABCROP_BLOCK_PRIVATE_SOURCES"), "{err}");
+        assert!(err.contains("CRABCROP_ALLOW_ANY_SOURCE"), "{err}");
+        let allowlisted = SourcePolicy::new(vec!["example.com".to_string()], false);
+        assert!(check_source_posture(&allowlisted, false).is_ok());
+        let blocking = SourcePolicy::new(vec![], true);
+        assert!(check_source_posture(&blocking, false).is_ok());
+        // Blank allowlist entries normalize away, so they do
+        // not count as a configured guard.
+        let blank = SourcePolicy::new(vec![" ".to_string()], false);
+        assert!(check_source_posture(&blank, false).is_err());
     }
 
     #[test]

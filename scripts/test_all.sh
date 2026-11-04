@@ -84,7 +84,7 @@ trap cleanup EXIT
 (cd test-fixtures && python3 -m http.server 8909 >/dev/null 2>&1) &
 FIXTURE_PID=$!
 PLAYGROUND_SECRET=$(printf 'playground-%s' secret)
-CRABCROP_SECRET="$PLAYGROUND_SECRET" PORT=3321 ./target/debug/crabcrop >/dev/null 2>&1 &
+CRABCROP_SECRET="$PLAYGROUND_SECRET" CRABCROP_ALLOWED_SOURCES=127.0.0.1 PORT=3321 ./target/debug/crabcrop >/dev/null 2>&1 &
 SERVER_PID=$!
 for url in "http://127.0.0.1:8909/src00.jpg" "http://127.0.0.1:3321/health"; do
   ok=0
