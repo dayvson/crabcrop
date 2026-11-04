@@ -4248,9 +4248,16 @@ fn load_error_response(e: LoadError) -> Response {
     // The detailed cause (which can embed origin-controlled
     // strings and server-constructed store URLs) goes to the
     // server log; clients get a short generic message (PL-6).
+    // A policy refusal is genericized the same way the
+    // explain path does it (issue #196, requirement 3): the
+    // reason can name a resolved address or a bucket, which
+    // are the operator's facts, not the caller's.
     eprintln!("load error: {e}");
     let (status, message) = match e {
-        LoadError::Forbidden(reason) => (StatusCode::FORBIDDEN, reason),
+        LoadError::Forbidden(_) => (
+            StatusCode::FORBIDDEN,
+            "source refused by policy".to_string(),
+        ),
         LoadError::NotFound => (StatusCode::NOT_FOUND, "source not found".to_string()),
         LoadError::BadStatus(code) => (
             StatusCode::BAD_GATEWAY,
@@ -9044,6 +9051,22 @@ mod tests {
         // object is what is too big (review AP-11).
         let resp = load_error_response(LoadError::TooLarge { limit: 10 });
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn policy_refusal_body_names_no_resolution() {
+        // The refusal reason can carry a server-side DNS
+        // resolution; the image path answers with the same
+        // generic body as the explain path (issue #196,
+        // requirement 3), and the reason stays in the log.
+        let resp = load_error_response(LoadError::Forbidden(
+            "host localhost resolves to a non-public address (::1)".to_string(),
+        ));
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"source refused by policy");
     }
 
     #[test]
