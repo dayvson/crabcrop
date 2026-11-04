@@ -6153,6 +6153,23 @@ pub struct OcrReport {
 /// in production and by fakes in tests.
 pub trait OcrProvider: Send + Sync + std::fmt::Debug {
     fn recognize(&self, img: &DynamicImage) -> Result<OcrReport, AiError>;
+
+    /// Recognize, stopping at `deadline`: the report
+    /// carries the lines gathered before the deadline
+    /// instead of running to completion. A page can hold
+    /// hundreds of detected lines, each with its own
+    /// recognition run, so the aggregate is the cost, not
+    /// any single line. The default runs unbounded (the
+    /// plain `recognize` contract); the ONNX provider
+    /// checks the deadline between lines.
+    fn recognize_deadline(
+        &self,
+        img: &DynamicImage,
+        deadline: std::time::Instant,
+    ) -> Result<OcrReport, AiError> {
+        let _ = deadline;
+        self.recognize(img)
+    }
 }
 
 /// The detection stage's side limit: the image is scaled
@@ -6863,13 +6880,25 @@ impl std::fmt::Debug for OnnxOcrProvider {
     }
 }
 
-impl OcrProvider for OnnxOcrProvider {
-    fn recognize(&self, img: &DynamicImage) -> Result<OcrReport, AiError> {
+impl OnnxOcrProvider {
+    /// The recognition walk, with an optional
+    /// deadline: detection runs once, then each
+    /// detected line costs a recognition run, so the
+    /// deadline is checked between lines and the
+    /// report carries the lines gathered so far.
+    fn recognize_within(
+        &self,
+        img: &DynamicImage,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<OcrReport, AiError> {
         let (prob, map_w, map_h) = self.detect_probs(img)?;
         let quads = ocr_det_quads(&prob, map_w, map_h, img.width(), img.height());
         let rgb = img.to_rgb8();
         let mut lines = Vec::new();
         for quad in &quads {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                break;
+            }
             if lines.len() >= OCR_MAX_LINES {
                 break;
             }
@@ -6913,6 +6942,20 @@ impl OcrProvider for OnnxOcrProvider {
             language: self.language.clone(),
             lines,
         })
+    }
+}
+
+impl OcrProvider for OnnxOcrProvider {
+    fn recognize(&self, img: &DynamicImage) -> Result<OcrReport, AiError> {
+        self.recognize_within(img, None)
+    }
+
+    fn recognize_deadline(
+        &self,
+        img: &DynamicImage,
+        deadline: std::time::Instant,
+    ) -> Result<OcrReport, AiError> {
+        self.recognize_within(img, Some(deadline))
     }
 }
 
