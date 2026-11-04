@@ -2433,6 +2433,16 @@ pub struct OnnxClipProvider {
     /// each row L2-normalized.
     label_embeddings: Vec<f32>,
     dim: usize,
+    /// The last image embedding computed, keyed by the exact
+    /// preprocessed tensor that produced it: one meta request
+    /// asks this provider for tag scores and for the embedding
+    /// itself (and an aesthetic score off the same vector) as
+    /// separate calls on the same image, and the vision run is
+    /// the expensive half of both. The comparison is exact
+    /// slice equality, so a hit returns precisely the vector
+    /// a fresh run would: the model is a pure function of the
+    /// tensor. A miss on any byte runs the model as before.
+    last_embedding: Mutex<Option<(Vec<f32>, Vec<f32>)>>,
 }
 
 impl OnnxClipProvider {
@@ -2477,6 +2487,7 @@ impl OnnxClipProvider {
             labels,
             label_embeddings,
             dim,
+            last_embedding: Mutex::new(None),
         };
         // Fail fast on a mismatched pair: embed a black
         // image once and check the projection size agrees
@@ -2502,15 +2513,29 @@ impl OnnxClipProvider {
 
     fn embed_image(&self, img: &DynamicImage) -> Result<Vec<f32>, AiError> {
         let input = preprocess_clip(img);
+        if let Some((tensor, embedding)) = self
+            .last_embedding
+            .lock()
+            .map_err(|_| AiError::LockPoisoned)?
+            .as_ref()
+            && *tensor == input
+        {
+            return Ok(embedding.clone());
+        }
         let tensor =
-            ort::value::Tensor::from_array(([1, 3, 224, 224], input.into_boxed_slice()))
+            ort::value::Tensor::from_array(([1, 3, 224, 224], input.clone().into_boxed_slice()))
                 .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
         let mut session = self.vision.lock().map_err(|_| AiError::LockPoisoned)?;
         let outputs = session
             .run(ort::inputs![self.vision_input.as_str() => tensor])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
         let outputs = collect_outputs(outputs)?;
-        pick_embedding(&outputs, None)
+        let embedding = pick_embedding(&outputs, None)?;
+        *self
+            .last_embedding
+            .lock()
+            .map_err(|_| AiError::LockPoisoned)? = Some((input, embedding.clone()));
+        Ok(embedding)
     }
 }
 
