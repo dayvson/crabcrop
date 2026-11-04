@@ -2966,8 +2966,15 @@ fn apply_operations(
                 // One filter at a time, in order: watermark
                 // filters resolve against the server-fetched
                 // images, everything else goes through
-                // `apply_filters` as before.
+                // `apply_filters` as before. The deadline is
+                // checked between filters, not only between
+                // operations: a segment is one operation to
+                // the per-operation check, so without this a
+                // long segment (a hundred blurs in one
+                // `filters:`) runs far past the deadline the
+                // runner already reported to the client.
                 for filter in filters {
+                    ctx.check_deadline()?;
                     match filter {
                         Filter::Watermark { url, x, y, alpha } => {
                             let wm = ctx.watermarks.and_then(|m| m.get(url)).ok_or_else(|| {
@@ -10094,6 +10101,70 @@ mod tests {
                 image::imageops::FilterType::Nearest,
             )))
         }
+    }
+
+    /// A fake upscale provider that takes its time and
+    /// counts its runs: the deadline tests use it to make
+    /// the clock pass mid-segment and to observe how far
+    /// the segment got.
+    #[derive(Debug, Default)]
+    struct SlowCountingUpscale {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::ai::UpscaleProvider for SlowCountingUpscale {
+        fn factor(&self) -> u32 {
+            2
+        }
+
+        fn upscale(&self, img: &DynamicImage) -> Result<DynamicImage, crate::ai::AiError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(DynamicImage::ImageRgba8(image::imageops::resize(
+                &img.to_rgba8(),
+                img.width() * 2,
+                img.height() * 2,
+                image::imageops::FilterType::Nearest,
+            )))
+        }
+    }
+
+    #[test]
+    fn a_filters_segment_checks_the_deadline_between_filters() {
+        // The deadline passes while the segment's first
+        // (slow) filter runs. The per-operation check alone
+        // cannot stop the segment: it is one operation, so
+        // without a check inside it the second filter runs
+        // too, and the request only fails later, at an
+        // encode check if there is one. With the check, the
+        // segment stops before the second filter: one
+        // provider run, and a Timeout error.
+        let engine = Engine;
+        let src = red_source();
+        let provider = SlowCountingUpscale::default();
+        let ctx = ProcessContext {
+            upscale_provider: Some(&provider),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let err = engine
+            .process_preferred(
+                &src,
+                &[Operation::Filters(vec![
+                    Filter::Upscale(2),
+                    Filter::Upscale(2),
+                ])],
+                ctx,
+            )
+            .expect_err("the segment must stop at the deadline");
+        assert_eq!(err, EngineError::Timeout);
+        assert_eq!(
+            provider
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]
