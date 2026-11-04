@@ -38,6 +38,7 @@ ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
 jxl-image-rs-integration = "0.8"
 jxl = "0.8"
 flate2 = "1"
+fdeflate = "0.3"
 kamadak-exif = "0.6"
 moxcms = "0.8"
 # Default features off: the crate's `deflate` feature would let a

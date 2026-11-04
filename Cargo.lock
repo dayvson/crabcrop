@@ -1017,6 +1017,7 @@ dependencies = [
  "crabcrop-url",
  "fast-ssim2",
  "fast_image_resize",
+ "fdeflate",
  "flate2",
  "gif",
  "hex",

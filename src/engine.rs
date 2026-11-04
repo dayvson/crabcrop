@@ -3941,20 +3941,11 @@ fn assemble_interlaced_png<'a>(
     bytes_per_pixel: usize,
     row: impl Fn(u32) -> &'a [u8],
 ) -> Result<Vec<u8>, EngineError> {
-    use std::io::Write;
-    let encode_err = |msg: &str| EngineError::Encode(format!("png: {msg}"));
     let stream = adam7_filtered_stream(w, h, bytes_per_pixel, row);
-    let mut idat = Vec::new();
-    {
-        let mut compressor =
-            flate2::write::ZlibEncoder::new(&mut idat, flate2::Compression::default());
-        compressor
-            .write_all(&stream)
-            .map_err(|e| encode_err(&e.to_string()))?;
-        compressor
-            .finish()
-            .map_err(|e| encode_err(&e.to_string()))?;
-    }
+    // fdeflate, the same compressor the png crate's Fast
+    // setting ships: the previous flate2 level-6 pass cost
+    // about 90% of this encode (issue #338).
+    let idat = fdeflate::compress_to_vec(&stream);
     let color_byte = match color {
         png::ColorType::Grayscale => 0,
         png::ColorType::Rgb => 2,
