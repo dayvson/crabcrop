@@ -30,13 +30,13 @@ fi
 step() { printf '\n=== %s ===\n' "$1"; }
 
 step "Build (debug binary: the MCP suite spawns it)"
-cargo build
+cargo build --locked
 
 if [ "$SKIP_RUST" -eq 0 ]; then
   step "Rust: binary tests"
-  cargo test
+  cargo test --locked
   step "Rust: crabcrop-url crate tests"
-  cargo test -p crabcrop-url
+  cargo test --locked -p crabcrop-url
 fi
 
 step "Upgrade test (previous-release corpus)"
@@ -100,6 +100,6 @@ done
 (cd playground && npm run test:integration)
 
 step "Fuzz smoke (parser invariants, corpus + mutations)"
-cargo test --manifest-path fuzz/Cargo.toml --lib --test smoke
+cargo test --locked --manifest-path fuzz/Cargo.toml --lib --test smoke
 
 step "All suites passed"
