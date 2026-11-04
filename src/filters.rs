@@ -118,7 +118,7 @@ pub fn apply_filters_filled(
                 img = map_rgb_image(img, |rgb| contrast_in_place(rgb, *amount));
             }
             Filter::Gamma(gamma) => {
-                img = gamma_correct(&img, *gamma);
+                img = gamma_correct(img, *gamma);
             }
             Filter::Exposure(stops) => {
                 img = exposure_correct(img, *stops);
@@ -1207,9 +1207,9 @@ fn gamma_lut(gamma: f32) -> [u8; 256] {
 /// through the divisor's lookup table. Alpha is never
 /// touched (the `map_rgb` contract, like the other color
 /// filters).
-fn gamma_correct(img: &DynamicImage, gamma: f32) -> DynamicImage {
+fn gamma_correct(img: DynamicImage, gamma: f32) -> DynamicImage {
     let lut = gamma_lut(gamma);
-    map_rgb(img.clone(), |r, g, b| {
+    map_rgb(img, |r, g, b| {
         [
             lut[usize::from(r)],
             lut[usize::from(g)],
@@ -4530,6 +4530,18 @@ mod w4proofs {
         })
     }
 
+    // Frozen pre-wave-4 reference: the clone-into-map_rgb form.
+    fn seq_gamma_reference(img: &DynamicImage, gamma: f32) -> DynamicImage {
+        let lut = gamma_lut(gamma);
+        map_rgb(img.clone(), |r, g, b| {
+            [
+                lut[usize::from(r)],
+                lut[usize::from(g)],
+                lut[usize::from(b)],
+            ]
+        })
+    }
+
     fn seq_auto_levels_reference(img: image::RgbImage) -> image::RgbImage {
         let total = (img.width() * img.height()) as u64;
         let mut hists = [[0u64; 256]; 3];
@@ -4608,6 +4620,28 @@ mod w4proofs {
                     bytes(&exposure_correct(rgba.clone(), stops)),
                     bytes(&seq_exposure_reference(&rgba, stops)),
                     "exposure {stops} rgba {w}x{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w4_gamma_owned_matches_cloned() {
+        // Same threshold-straddling sizes as the exposure proof,
+        // in RGB and RGBA variants.
+        for (w, h) in [(64u32, 48u32), (333, 257), (1200, 900)] {
+            let rgb = photo(w, h);
+            let rgba = DynamicImage::ImageRgba8(rgb.to_rgba8());
+            for gamma in [0.5f32, 1.0, 2.2, 4.0] {
+                assert_eq!(
+                    bytes(&gamma_correct(rgb.clone(), gamma)),
+                    bytes(&seq_gamma_reference(&rgb, gamma)),
+                    "gamma {gamma} rgb {w}x{h}"
+                );
+                assert_eq!(
+                    bytes(&gamma_correct(rgba.clone(), gamma)),
+                    bytes(&seq_gamma_reference(&rgba, gamma)),
+                    "gamma {gamma} rgba {w}x{h}"
                 );
             }
         }
