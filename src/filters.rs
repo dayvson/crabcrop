@@ -121,7 +121,7 @@ pub fn apply_filters_filled(
                 img = gamma_correct(&img, *gamma);
             }
             Filter::Exposure(stops) => {
-                img = exposure_correct(&img, *stops);
+                img = exposure_correct(img, *stops);
             }
             Filter::HighlightsShadows(highlights, shadows) => {
                 img = highlights_shadows(&img, *highlights, *shadows);
@@ -1270,9 +1270,9 @@ fn exposure_lut(stops: f32) -> [u8; 256] {
 /// Exposure (issue #317): remap every channel through the
 /// stops lookup table, the EV-style linear-light multiply.
 /// Alpha is never touched (the `map_rgb` contract).
-fn exposure_correct(img: &DynamicImage, stops: f32) -> DynamicImage {
+fn exposure_correct(img: DynamicImage, stops: f32) -> DynamicImage {
     let lut = exposure_lut(stops);
-    map_rgb(img.clone(), |r, g, b| {
+    map_rgb(img, |r, g, b| {
         [
             lut[usize::from(r)],
             lut[usize::from(g)],
@@ -4475,11 +4475,12 @@ mod w3proofs {
 }
 
 // ----------------------------------------------------------------
-// Wave-4 proofs. The tonal winners change only plumbing:
-// `auto_levels` counts its histogram in row bands (integer
-// counts merge exactly) and applies its maps through
-// `map_rgb_bands`. Each is pinned here against a frozen copy
-// of the pre-change implementation.
+// Wave-4 proofs. The tonal winners change only plumbing: exposure
+// and gamma take the frame by value instead of cloning it into
+// `map_rgb`, and `auto_levels` counts its histogram in row bands
+// (integer counts merge exactly) and applies its maps through
+// `map_rgb_bands`. Each is pinned here against a frozen copy of
+// the pre-change implementation.
 // ----------------------------------------------------------------
 
 #[cfg(test)]
@@ -4504,6 +4505,29 @@ mod w4proofs {
             }
         }
         DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, buf).unwrap())
+    }
+
+    fn bytes(img: &DynamicImage) -> (std::mem::Discriminant<DynamicImage>, Vec<u8>) {
+        let raw: Vec<u8> = match img {
+            DynamicImage::ImageLuma8(i) => i.as_raw().clone(),
+            DynamicImage::ImageLumaA8(i) => i.as_raw().clone(),
+            DynamicImage::ImageRgb8(i) => i.as_raw().clone(),
+            DynamicImage::ImageRgba8(i) => i.as_raw().clone(),
+            other => other.to_rgba8().as_raw().clone(),
+        };
+        (std::mem::discriminant(img), raw)
+    }
+
+    // Frozen pre-wave-4 reference: the clone-into-map_rgb form.
+    fn seq_exposure_reference(img: &DynamicImage, stops: f32) -> DynamicImage {
+        let lut = exposure_lut(stops);
+        map_rgb(img.clone(), |r, g, b| {
+            [
+                lut[usize::from(r)],
+                lut[usize::from(g)],
+                lut[usize::from(b)],
+            ]
+        })
     }
 
     fn seq_auto_levels_reference(img: image::RgbImage) -> image::RgbImage {
@@ -4563,6 +4587,29 @@ mod w4proofs {
                 seq_auto_levels_reference(flat).as_raw(),
                 "auto_levels flat {w}x{h}"
             );
+        }
+    }
+
+    #[test]
+    fn w4_exposure_owned_matches_cloned() {
+        // Sizes straddle the map_rgb_bands thresholds (rows >= 256
+        // and buf >= 3 MB) so both the sequential and banded paths
+        // are exercised, in RGB and RGBA variants.
+        for (w, h) in [(64u32, 48u32), (333, 257), (1200, 900)] {
+            let rgb = photo(w, h);
+            let rgba = DynamicImage::ImageRgba8(rgb.to_rgba8());
+            for stops in [-2.0f32, -0.7, 0.0, 1.0, 3.5] {
+                assert_eq!(
+                    bytes(&exposure_correct(rgb.clone(), stops)),
+                    bytes(&seq_exposure_reference(&rgb, stops)),
+                    "exposure {stops} rgb {w}x{h}"
+                );
+                assert_eq!(
+                    bytes(&exposure_correct(rgba.clone(), stops)),
+                    bytes(&seq_exposure_reference(&rgba, stops)),
+                    "exposure {stops} rgba {w}x{h}"
+                );
+            }
         }
     }
 }
