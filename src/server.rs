@@ -278,10 +278,10 @@ pub struct AppState {
     /// `CRABCROP_PROCESS_TIMEOUT_SECS`: the engine checks
     /// it between stages and inside chunked encode loops
     /// and aborts chained work with a 504, and the runner
-    /// stops waiting and releases every gate at the
-    /// deadline plus `DEADLINE_GRACE` even when a single
-    /// opaque stage cannot be interrupted mid-call (issue
-    /// #322).
+    /// stops waiting at the deadline plus `DEADLINE_GRACE`
+    /// even when a single opaque stage cannot be
+    /// interrupted mid-call (issue #322); the job's gates
+    /// stay with it until it finishes (issue #357).
     pub process_timeout: std::time::Duration,
     /// Request metrics, shared behind an `Arc` so clones agree.
     pub metrics: Arc<Metrics>,
@@ -1702,9 +1702,9 @@ fn wants_slow_lane(
 
 /// The grace bound past the processing deadline (issue
 /// #322): how long the runner keeps waiting for a job
-/// whose deadline has passed before it answers 504,
-/// releases every gate the request holds, and detaches
-/// the job. The engine checks the deadline between
+/// whose deadline has passed before it answers 504 and
+/// detaches the job; the job's gates stay with it until
+/// it finishes (issue #357). The engine checks the deadline between
 /// stages and inside its chunked encode loops (per frame
 /// for animated GIF and WebP, per attempt for the
 /// quality ladders), so a checkpointed job aborts on its
@@ -1720,6 +1720,11 @@ fn wants_slow_lane(
 /// cap instead, and the detached job kept the process
 /// permit with it, so one stuck encode shed every
 /// follow-up request with a gate 503 until it finished.
+/// Issue #357 gives the detached job its permits back
+/// deliberately: with the deadline machinery in place
+/// the hold is bounded (the deadline plus the longest
+/// single opaque call), where the ten-minute cap made
+/// it open-ended.
 const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long an AI-backed request may wait for an inference
@@ -1755,6 +1760,19 @@ fn wants_animation_gate(bytes: &[u8], directives: &crate::url::RequestDirectives
         && matches!(directives.explicit_format, None | Some(ImageFormat::WebP))
 }
 
+/// The gate permits a request acquired before its run,
+/// beyond the lane permit `run_process` takes itself
+/// (issue #357): the AI, video, and animation permits.
+/// `run_process` moves them into the blocking job, so
+/// each is held until the job actually finishes, even
+/// when the runner has already shed the request.
+#[derive(Default)]
+struct JobPermits {
+    ai: Option<tokio::sync::OwnedSemaphorePermit>,
+    video: Option<tokio::sync::OwnedSemaphorePermit>,
+    anim: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// Run the engine under its lane's gate (issue #324) on
 /// a blocking thread, so CPU-bound work neither stalls
 /// the async workers nor multiplies unboundedly under a
@@ -1766,7 +1784,7 @@ async fn run_process(
     bytes: &[u8],
     lane: Lane,
     deadline: std::time::Instant,
-    ai_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    permits: JobPermits,
 ) -> Result<crate::engine::ProcessedImage, ProcessFailure> {
     // The run takes its permit from its lane's gate only
     // (issue #324): a slow-lane run never touches a
@@ -1793,29 +1811,30 @@ async fn run_process(
     // inside its chunked encode loops and aborts chained
     // work promptly. The runner's own wait is bounded by
     // the deadline plus the grace bound (issue #322).
-    // The lane permit deliberately stays here, on the
-    // async side, instead of moving into the blocking
-    // closure as it used to: when the wait times out, the
-    // permit drops with this function's answer and the
-    // gate is free for the next request at once, however
-    // long the detached job takes to unwind. Jobs that
-    // finish or abort before the wait ends never see the
-    // difference: the permit is held for exactly the span
-    // the caller is waiting on the work.
-    let _permit = permit;
     let handle = tokio::task::spawn_blocking(move || {
-        // The AI permit is accounted the other way: it
-        // moves into the blocking closure and drops only
-        // when the job actually finishes. Inference is
-        // serialized inside each provider, so a run the
-        // runner has already shed would otherwise free
-        // its gate slot while its inference is still
-        // draining, and new AI work would stack onto a
-        // session the gate believes is idle, each run
-        // going to completion invisibly. Held here, an
-        // over-budget run keeps its slot while it drains
-        // and new AI work sheds at the gate instead.
-        let _ai_permit = ai_permit;
+        // Every permit the run holds is accounted the
+        // same way (issue #357): the lane permit and the
+        // AI, video, and animation permits all live here,
+        // in the blocking closure, and drop only when the
+        // job actually finishes. A run the runner has
+        // already shed therefore keeps its slots while it
+        // drains, so the gates count work still executing
+        // and not only requests still waiting, and new
+        // work sheds at a gate instead of stacking onto
+        // capacity that is still busy. The hold a shed
+        // run leaves behind is bounded: the job carries
+        // the deadline, the engine checks it between
+        // stages and inside its chunked loops, and a job
+        // inside one opaque call (a still encode,
+        // libwebp's animated encode, an inference, the
+        // external video encoder) unwinds at the first
+        // check after that call returns, so a permit is
+        // held for the deadline plus the longest single
+        // call, never open-endedly.
+        let _lane_permit = permit;
+        let _ai_permit = permits.ai;
+        let _video_permit = permits.video;
+        let _anim_permit = permits.anim;
         let declared_refs: Vec<&dyn crate::ai::DetectionProvider> = job
             .declared_detect_providers
             .iter()
@@ -1870,12 +1889,13 @@ async fn run_process(
     });
     // Past the deadline plus the grace bound the runner
     // stops waiting and sheds the request with a 504
-    // (issue #322). The detached job keeps no permit: the
-    // process permit above drops as this function
-    // returns, and the caller's AI, video, and animation
-    // permits drop as the handler answers, so a follow-up
-    // request gets a genuine encode attempt instead of
-    // the gate 503s the #310 soak produced. The detached
+    // (issue #322), unchanged. What the shed leaves
+    // behind changed with issue #357: the detached job
+    // keeps every permit it holds until it finishes, so
+    // a follow-up request waits at the gate for the
+    // bounded drain and sheds there if the drain outlasts
+    // its gate wait, rather than starting work the
+    // server has no free capacity for. The detached
     // job's result is dropped; it aborts at the engine's
     // next deadline check, or, when it is stuck inside a
     // single opaque encoder call, as soon as that call
@@ -2863,8 +2883,10 @@ async fn serve_miss(
     // rendering (issue #215) takes it too: it is the
     // external-tool gate in everything but name, and a
     // second gate for the same class of work would only
-    // split the protection.
-    let _video_permit = if wants_video || wants_frame || wants_page {
+    // split the protection. Like the AI permit, it
+    // travels with the process job and drains with it
+    // (issue #357).
+    let video_permit = if wants_video || wants_frame || wants_page {
         match tokio::time::timeout(VIDEO_GATE_WAIT, state.video_gate.clone().acquire_owned()).await
         {
             Ok(Ok(permit)) => Some(permit),
@@ -2890,8 +2912,10 @@ async fn serve_miss(
     // animated request sheds here with an explanation
     // instead of stacking, and the encode's lane permit
     // comes from the slow lane (issue #324), so the still
-    // pool keeps every permit throughout.
-    let _anim_permit = if wants_animation_gate(&bytes, &directives) {
+    // pool keeps every permit throughout. Like the AI
+    // permit, it travels with the process job and drains
+    // with it (issue #357).
+    let anim_permit = if wants_animation_gate(&bytes, &directives) {
         match tokio::time::timeout(ANIM_GATE_WAIT, state.anim_gate.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Some(permit),
             _ => {
@@ -2967,8 +2991,12 @@ async fn serve_miss(
     } else {
         Lane::Process
     };
-    let processed = match run_process(state, &job, &bytes, lane, process_deadline, ai_permit).await
-    {
+    let permits = JobPermits {
+        ai: ai_permit,
+        video: video_permit,
+        anim: anim_permit,
+    };
+    let processed = match run_process(state, &job, &bytes, lane, process_deadline, permits).await {
         Ok(p) => p,
         Err(ProcessFailure::Busy) => {
             return (
@@ -3019,12 +3047,12 @@ async fn serve_miss(
                 match fallback_source_bytes(state).await {
                     Some(fb) => {
                         // The fallback run draws on the same
-                        // gates as the first: AI work
-                        // re-acquires the AI permit (the first
-                        // run's permit drained with its job),
-                        // and a full gate leaves the original
-                        // engine error standing.
-                        let mut retry_permit = None;
+                        // gates as the first: each kind of
+                        // work re-acquires its permit (the
+                        // first run's permits drained with
+                        // its job), and a full gate leaves
+                        // the original engine error standing.
+                        let mut retry_permits = JobPermits::default();
                         let mut may_retry = true;
                         if directives.uses_ai() {
                             match tokio::time::timeout(
@@ -3033,12 +3061,34 @@ async fn serve_miss(
                             )
                             .await
                             {
-                                Ok(Ok(p)) => retry_permit = Some(p),
+                                Ok(Ok(p)) => retry_permits.ai = Some(p),
+                                _ => may_retry = false,
+                            }
+                        }
+                        if may_retry && (wants_video || wants_frame || wants_page) {
+                            match tokio::time::timeout(
+                                VIDEO_GATE_WAIT,
+                                state.video_gate.clone().acquire_owned(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(p)) => retry_permits.video = Some(p),
+                                _ => may_retry = false,
+                            }
+                        }
+                        if may_retry && wants_animation_gate(&bytes, &directives) {
+                            match tokio::time::timeout(
+                                ANIM_GATE_WAIT,
+                                state.anim_gate.clone().acquire_owned(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(p)) => retry_permits.anim = Some(p),
                                 _ => may_retry = false,
                             }
                         }
                         if may_retry {
-                            run_process(state, &job, &fb, lane, process_deadline, retry_permit)
+                            run_process(state, &job, &fb, lane, process_deadline, retry_permits)
                                 .await
                                 .ok()
                         } else {
@@ -3514,7 +3564,15 @@ async fn annotate_meta(
     ai_gated: bool,
 ) -> Option<Annotation> {
     let tagger = state.tagger.as_ref()?;
-    let _permit = if ai_gated {
+    // The permit moves into the blocking task below and
+    // drops when the inference returns (issue #357): the
+    // caller wraps this helper in the annotation deadline
+    // and drops the future when it fires, and a permit
+    // held on this side of the await would be freed at
+    // that moment while the detached inference runs on
+    // unaccounted. Every meta helper holds its permit
+    // this way.
+    let permit = if ai_gated {
         None
     } else {
         Some(
@@ -3526,7 +3584,12 @@ async fn annotate_meta(
     };
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
     let tagger = tagger.clone();
-    match tokio::task::spawn_blocking(move || tagger.scores(&img)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        tagger.scores(&img)
+    })
+    .await
+    {
         Ok(Ok(scores)) => match check_finite_scores("the tagger", scores.iter().map(|s| s.score)) {
             Ok(()) => Some(compose_annotation(&scores, state.tag_threshold)),
             Err(e) => {
@@ -3573,7 +3636,12 @@ async fn detect_meta(
     // Same permit rule as `annotate_meta`: a request that
     // already holds an AI permit runs its detections under
     // it instead of queueing for a second one (audit R2-29).
-    let _permit = if ai_gated {
+    // The permit itself is shared with each provider's
+    // blocking task (issue #357), so the slot stays
+    // accounted until the inference that is actually
+    // running returns, even if the caller has already
+    // timed the section out.
+    let permit = if ai_gated {
         None
     } else {
         Some(
@@ -3583,12 +3651,19 @@ async fn detect_meta(
                 .ok()?,
         )
     };
+    let permit = Arc::new(permit);
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
     let mut aggregated: Vec<(String, crate::ai::Detection)> = Vec::new();
     let mut any_answered = false;
     for (name, provider) in providers {
         let provider_img = img.clone();
-        match tokio::task::spawn_blocking(move || provider.detect(&provider_img)).await {
+        let task_permit = permit.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = task_permit;
+            provider.detect(&provider_img)
+        })
+        .await
+        {
             Ok(Ok(detections)) => {
                 match check_finite_scores("a detector", detections.iter().map(|d| d.score)) {
                     Ok(()) => {
@@ -3677,7 +3752,10 @@ async fn moderate_meta(
     let Some(provider) = state.moderation.as_ref() else {
         return ModerationMeta::Unavailable("not_configured");
     };
-    let _permit = if ai_gated {
+    // The permit moves into the blocking task and drops
+    // when the inference returns, as in `annotate_meta`
+    // (issue #357).
+    let permit = if ai_gated {
         None
     } else {
         match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
@@ -3690,7 +3768,12 @@ async fn moderate_meta(
         Err(_) => return ModerationMeta::Unavailable("inference_failed"),
     };
     let provider = provider.clone();
-    match tokio::task::spawn_blocking(move || provider.moderate(&img)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        provider.moderate(&img)
+    })
+    .await
+    {
         Ok(Ok(report)) => match check_finite_scores(
             "the moderation provider",
             report
@@ -3770,7 +3853,10 @@ async fn embed_meta(
     let Some(provider) = state.embeddings.as_ref() else {
         return EmbeddingMeta::Unavailable("not_configured");
     };
-    let _permit = if ai_gated {
+    // The permit moves into the blocking task and drops
+    // when the inference returns, as in `annotate_meta`
+    // (issue #357).
+    let permit = if ai_gated {
         None
     } else {
         match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
@@ -3783,7 +3869,12 @@ async fn embed_meta(
         Err(_) => return EmbeddingMeta::Unavailable("inference_failed"),
     };
     let provider = provider.clone();
-    match tokio::task::spawn_blocking(move || provider.embed(&img)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        provider.embed(&img)
+    })
+    .await
+    {
         Ok(Ok(embedding)) => {
             match check_finite_scores("the embedding provider", embedding.vector.iter().copied()) {
                 Ok(()) => EmbeddingMeta::Report(embedding),
@@ -3853,7 +3944,10 @@ async fn ocr_meta(
     let Some(provider) = state.ocr.as_ref() else {
         return OcrMeta::Unavailable("not_configured");
     };
-    let _permit = if ai_gated {
+    // The permit moves into the blocking task and drops
+    // when the inference returns, as in `annotate_meta`
+    // (issue #357).
+    let permit = if ai_gated {
         None
     } else {
         match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
@@ -3866,7 +3960,12 @@ async fn ocr_meta(
         Err(_) => return OcrMeta::Unavailable("inference_failed"),
     };
     let provider = provider.clone();
-    match tokio::task::spawn_blocking(move || provider.recognize_deadline(&img, deadline)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        provider.recognize_deadline(&img, deadline)
+    })
+    .await
+    {
         Ok(Ok(report)) => {
             match check_finite_scores("the OCR provider", report.lines.iter().map(|l| l.score)) {
                 Ok(()) => OcrMeta::Report(compose_ocr(&report)),
@@ -11845,7 +11944,7 @@ mod tests {
             &png,
             Lane::Process,
             std::time::Instant::now() + state.process_timeout,
-            None,
+            JobPermits::default(),
         );
         tokio::pin!(waiting);
         assert!(
@@ -11992,7 +12091,7 @@ mod tests {
                 &gif,
                 Lane::Slow,
                 std::time::Instant::now() + state.process_timeout,
-                None
+                JobPermits::default()
             ),
             async {
                 // Arrive while the first encode is stuck,
@@ -12005,7 +12104,7 @@ mod tests {
                     &png,
                     Lane::Process,
                     std::time::Instant::now() + state.process_timeout,
-                    None,
+                    JobPermits::default(),
                 )
                 .await;
                 (follow_start.elapsed(), result)
@@ -12028,10 +12127,22 @@ mod tests {
             "the follow-up must not shed on the gate the dead request held"
         );
         assert_eq!(state.process_gate.available_permits(), 1);
-        // Issue #324: the stuck video encode drew its
-        // permit from the slow lane, and that permit is
-        // back too once the deadline plus grace releases it.
-        assert_eq!(state.slow_gate.available_permits(), 2);
+        // Issue #357: the stuck video encode drew its
+        // permit from the slow lane, and the permit stays
+        // with the detached job while it drains, so one
+        // of the two is still out at this point. It comes
+        // back when the job itself finishes (the encoder
+        // script exits at nine seconds).
+        assert_eq!(state.slow_gate.available_permits(), 1);
+        let mut back = false;
+        for _ in 0..200 {
+            if state.slow_gate.available_permits() == 2 {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(back, "the slow permit must return when the job drains");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12090,7 +12201,10 @@ mod tests {
             &png,
             Lane::Process,
             std::time::Instant::now() + state.process_timeout,
-            Some(permit),
+            JobPermits {
+                ai: Some(permit),
+                ..Default::default()
+            },
         )
         .await;
         assert!(
@@ -12118,6 +12232,383 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(back, "the permit must return when the job drains");
+    }
+
+    #[tokio::test]
+    async fn video_and_animation_permits_are_held_until_the_job_finishes() {
+        // Issue #357: the video and animation permits
+        // serve_miss acquired before the run are accounted
+        // like the AI permit: they travel with the job and
+        // drop only when it finishes, so a request shed at
+        // its deadline leaves them held while the detached
+        // encode drains instead of freeing them for a
+        // second encode to stack onto.
+        let dir = std::env::temp_dir().join(format!(
+            "crabcrop-server-held-permits-{}",
+            std::process::id()
+        ));
+        let encoder = fake_long_encoder(&dir, 9);
+        let state = lane_test_state(std::time::Duration::from_millis(300), 2, 1);
+        let job = lane_test_job(
+            Some(Arc::new(encoder)),
+            "filters:format(mp4)/example.com/i.gif",
+        );
+        let gif = animated_gif_bytes();
+        let video_permit = state.video_gate.clone().acquire_owned().await.unwrap();
+        let anim_permit = state.anim_gate.clone().acquire_owned().await.unwrap();
+        assert_eq!(state.video_gate.available_permits(), 1);
+        assert_eq!(state.anim_gate.available_permits(), 0);
+        let result = run_process(
+            &state,
+            &job,
+            &gif,
+            Lane::Slow,
+            std::time::Instant::now() + state.process_timeout,
+            JobPermits {
+                ai: None,
+                video: Some(video_permit),
+                anim: Some(anim_permit),
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ProcessFailure::TimedOut)),
+            "the stuck encode must answer TimedOut at its deadline, got {result:?}"
+        );
+        assert_eq!(
+            state.video_gate.available_permits(),
+            1,
+            "the video permit must stay with the detached job after the shed"
+        );
+        assert_eq!(
+            state.anim_gate.available_permits(),
+            0,
+            "the animation permit must stay with the detached job after the shed"
+        );
+        // Both come back when the job itself finishes
+        // (the encoder script exits at nine seconds).
+        let mut back = false;
+        for _ in 0..200 {
+            if state.video_gate.available_permits() == 2 && state.anim_gate.available_permits() == 1
+            {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(back, "the permits must return when the job drains");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
+        // Issue #357 acceptance, at the lane seam: two
+        // runs in a row time out against a slow encode.
+        // The fake encoder logs a start and an end marker
+        // per run, so the worst overlap in the log is the
+        // number of live jobs itself: it must never exceed
+        // the slow lane's single permit, even though the
+        // first run's answer is long gone while its encode
+        // is still executing. The timings are chosen so
+        // the scenario is real: the encode (6 s) outlasts
+        // the first run's deadline plus grace (3.5 + 2 s),
+        // so the first run detaches mid-encode, and the
+        // second run, arriving at 3 s with the same 3.5 s
+        // budget, still has budget left when the lane
+        // drains at 6 s, so it enters its own encode
+        // instead of aborting at its first checkpoint.
+        use std::io::Write as _;
+        let dir =
+            std::env::temp_dir().join(format!("crabcrop-server-lane-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("runs.log");
+        let script_path = dir.join("encoder.sh");
+        let mut file = std::fs::File::create(&script_path).unwrap();
+        file.write_all(
+            format!(
+                "#!/bin/sh\ncat > /dev/null\necho S >> {}\nsleep 6\necho E >> {}\nprintf 'x'\n",
+                log_path.display(),
+                log_path.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let encoder = crate::video::VideoEncoder::new(
+            script_path,
+            std::time::Duration::from_secs(30),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let state = lane_test_state(std::time::Duration::from_millis(3500), 2, 1);
+        let job = lane_test_job(
+            Some(Arc::new(encoder)),
+            "filters:format(mp4)/example.com/i.gif",
+        );
+        let gif = animated_gif_bytes();
+        let (first, second) = tokio::join!(
+            run_process(
+                &state,
+                &job,
+                &gif,
+                Lane::Slow,
+                std::time::Instant::now() + state.process_timeout,
+                JobPermits::default()
+            ),
+            async {
+                // Arrive while the first encode is running
+                // and queue behind it at the lane gate.
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                run_process(
+                    &state,
+                    &job,
+                    &gif,
+                    Lane::Slow,
+                    std::time::Instant::now() + state.process_timeout,
+                    JobPermits::default(),
+                )
+                .await
+            }
+        );
+        assert!(
+            matches!(first, Err(ProcessFailure::TimedOut)),
+            "the first run must answer TimedOut at its deadline, got {first:?}"
+        );
+        assert!(
+            matches!(second, Err(ProcessFailure::TimedOut)),
+            "the second run must answer TimedOut at its deadline, got {second:?}"
+        );
+        // Both encodes run their course (six seconds
+        // each, back to back): wait for the log to close.
+        let mut log = String::new();
+        for _ in 0..200 {
+            log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log.matches('E').count() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut live = 0i32;
+        let mut worst = 0i32;
+        for marker in log.chars() {
+            match marker {
+                'S' => {
+                    live += 1;
+                    worst = worst.max(live);
+                }
+                'E' => live -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            log.matches('S').count(),
+            2,
+            "both encodes must have run; log: {log}"
+        );
+        assert_eq!(
+            worst, 1,
+            "live jobs must never exceed the lane permit count; log: {log}"
+        );
+        assert_eq!(state.slow_gate.available_permits(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Open the release the blocking provider doubles
+    /// below wait behind (the `BlockingUpscale` pattern,
+    /// shared).
+    fn open_release(release: &Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>) {
+        let (lock, cvar) = &**release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    fn wait_for_open(release: &Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>) {
+        let (lock, cvar) = &**release;
+        let mut open = lock.lock().unwrap();
+        // Bounded on purpose: if a test fails before it
+        // opens the release, the double still returns, so
+        // the suite reports the failure instead of parking
+        // a blocking thread (and the runtime's shutdown)
+        // forever.
+        while !*open {
+            let (guard, waited) = cvar
+                .wait_timeout(open, std::time::Duration::from_secs(120))
+                .unwrap();
+            open = guard;
+            if waited.timed_out() {
+                break;
+            }
+        }
+    }
+
+    /// A tagger double whose inference blocks until the
+    /// test opens its release: the meta drain tests'
+    /// stand-in for a slow model run.
+    #[derive(Debug)]
+    struct BlockingTagger {
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl crate::ai::TagProvider for BlockingTagger {
+        fn scores(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<Vec<crate::ai::TagScore>, crate::ai::AiError> {
+            wait_for_open(&self.release);
+            Ok(vec![crate::ai::TagScore {
+                label: "ocean".to_string(),
+                score: 0.3,
+            }])
+        }
+    }
+
+    /// A moderation double in the same shape.
+    #[derive(Debug)]
+    struct BlockingModeration {
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl crate::ai::ModerationProvider for BlockingModeration {
+        fn moderate(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::ModerationScores, crate::ai::AiError> {
+            wait_for_open(&self.release);
+            Ok(crate::ai::ModerationScores {
+                model: "blocking-model".to_string(),
+                scores: vec![crate::ai::TagScore {
+                    label: "normal".to_string(),
+                    score: 0.99,
+                }],
+                signals: Vec::new(),
+            })
+        }
+    }
+
+    /// A detection double in the same shape.
+    #[derive(Debug)]
+    struct BlockingDetector {
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl crate::ai::DetectionProvider for BlockingDetector {
+        fn knows_class(&self, _name: &str) -> bool {
+            true
+        }
+
+        fn describe(&self) -> Vec<String> {
+            vec!["object".to_string()]
+        }
+
+        fn detect(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<Vec<crate::ai::Detection>, crate::ai::AiError> {
+            wait_for_open(&self.release);
+            Ok(Vec::new())
+        }
+    }
+
+    /// Assert the meta drain property for one timed-out
+    /// section: its AI gate slot stays accounted while
+    /// the inference is still blocked, and returns when
+    /// the inference returns. Called by the three tests
+    /// below, one per helper shape.
+    async fn assert_meta_slot_drains_with_inference(
+        state: &AppState,
+        release: &Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        timed_out: bool,
+    ) {
+        assert!(
+            timed_out,
+            "the section must stop waiting at the caller's deadline"
+        );
+        assert_eq!(
+            state.ai_gate.available_permits(),
+            0,
+            "the slot must stay accounted while the inference drains"
+        );
+        open_release(release);
+        let mut back = false;
+        for _ in 0..100 {
+            if state.ai_gate.available_permits() == 1 {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(back, "the slot must return when the inference returns");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_annotation_keeps_its_ai_gate_slot() {
+        // Issue #357 acceptance, at the meta seam: the
+        // caller's annotation deadline drops the helper
+        // future while its inference is still blocked.
+        // The section's gate slot must stay accounted
+        // until the inference itself returns: freed at
+        // the deadline, it would let the next section
+        // stack onto a provider the gate believes idle.
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
+        state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        state.tagger = Some(Arc::new(BlockingTagger {
+            release: release.clone(),
+        }));
+        let processed = still_processed(test_png(), ImageFormat::Png);
+        let timed_out = tokio::time::timeout_at(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+            annotate_meta(&state, &processed, false),
+        )
+        .await
+        .is_err();
+        assert_meta_slot_drains_with_inference(&state, &release, timed_out).await;
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_moderation_keeps_its_ai_gate_slot() {
+        // The same property for the explicit-outcome
+        // helpers (moderation here; embedding and OCR
+        // hold their permits in the same shape).
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
+        state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        state.moderation = Some(Arc::new(BlockingModeration {
+            release: release.clone(),
+        }));
+        let processed = still_processed(test_png(), ImageFormat::Png);
+        let timed_out = tokio::time::timeout_at(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+            moderate_meta(&state, &processed, false),
+        )
+        .await
+        .is_err();
+        assert_meta_slot_drains_with_inference(&state, &release, timed_out).await;
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_detection_keeps_its_ai_gate_slot() {
+        // The same property for detection, whose permit
+        // is shared across a sequence of provider tasks.
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
+        state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        state.detect = Some(Arc::new(BlockingDetector {
+            release: release.clone(),
+        }));
+        let processed = still_processed(test_png(), ImageFormat::Png);
+        let timed_out = tokio::time::timeout_at(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+            detect_meta(&state, &processed, false),
+        )
+        .await
+        .is_err();
+        assert_meta_slot_drains_with_inference(&state, &release, timed_out).await;
     }
 
     /// A state for the slow-lane tests (issue #324): the
@@ -12306,7 +12797,7 @@ mod tests {
                 &gif,
                 Lane::Slow,
                 std::time::Instant::now() + state.process_timeout,
-                None
+                JobPermits::default()
             ),
             async {
                 // Arrive while the encode is stuck, and
@@ -12322,7 +12813,7 @@ mod tests {
                     &png,
                     Lane::Process,
                     std::time::Instant::now() + state.process_timeout,
-                    None,
+                    JobPermits::default(),
                 )
                 .await;
                 (follow_start.elapsed(), result)
@@ -12340,11 +12831,22 @@ mod tests {
             follow_elapsed < PROCESS_GATE_WAIT,
             "the still must not wait on the slow lane, took {follow_elapsed:?}"
         );
-        // The timed-out run released its slow permit at
-        // the deadline plus grace (#322), so the lane is
-        // free for the next slow request too.
-        assert_eq!(state.slow_gate.available_permits(), 1);
+        // The timed-out run's slow permit stays with its
+        // detached job while it drains (issue #357), so
+        // the lane is not free for the next slow request
+        // yet; it returns when the job finishes (the
+        // encoder script exits at nine seconds).
+        assert_eq!(state.slow_gate.available_permits(), 0);
         assert_eq!(state.process_gate.available_permits(), 2);
+        let mut back = false;
+        for _ in 0..200 {
+            if state.slow_gate.available_permits() == 1 {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(back, "the slow permit must return when the job drains");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12366,7 +12868,7 @@ mod tests {
             &png,
             Lane::Slow,
             std::time::Instant::now() + state.process_timeout,
-            None,
+            JobPermits::default(),
         );
         tokio::pin!(waiting);
         assert!(
@@ -12382,7 +12884,7 @@ mod tests {
             &png,
             Lane::Process,
             std::time::Instant::now() + state.process_timeout,
-            None,
+            JobPermits::default(),
         )
         .await
         .unwrap();
@@ -12640,7 +13142,7 @@ mod tests {
             &png,
             Lane::Process,
             std::time::Instant::now() + state.process_timeout,
-            None,
+            JobPermits::default(),
         );
         tokio::pin!(waiting);
         assert!(
