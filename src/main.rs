@@ -1189,24 +1189,47 @@ async fn shutdown_signal() {
 }
 
 /// Fingerprint the configuration that shapes rendered
-/// output (audit R2-08): the metadata policy, the quality
-/// tuning knobs, the width-hint step, and the file-based
-/// inputs whose contents change results (the AI models,
-/// the CLIP set, the overlay font, the video encoder, and
-/// the detector declarations, hashed by content), plus the
-/// brand color, whose value shapes studio composites. The
-/// fingerprint is embedded in every cache key (see
-/// `serve`), so a restart under changed settings starts a
-/// fresh cache epoch instead of serving the old settings'
-/// renders from the persistent tiers. Settings that are
-/// already visible in the key (presets, default ops: both
-/// change the canonical form) are deliberately excluded.
+/// The rendering version: bumped deliberately in any
+/// release that changes rendered output for the same
+/// inputs under the same configuration, so an upgraded
+/// server starts a fresh cache epoch instead of serving
+/// the previous build's renders from the persistent
+/// tiers. Configuration alone cannot express that
+/// change, so it travels as its own fingerprint
+/// component.
+const RENDERING_VERSION: u32 = 1;
+
+/// Fingerprint the configuration that shapes rendered
+/// output (audit R2-08): the rendering version, the
+/// metadata policy, the quality tuning knobs, the
+/// width-hint step, the AI behavior thresholds, and the
+/// file-based inputs whose contents change results (the
+/// AI models, the CLIP set, the overlay font, the video
+/// and PDF tools, the detector declarations and the
+/// models they name), plus the brand color, whose value
+/// shapes studio composites. A file input is identified
+/// by a digest of its contents, never by its path alone:
+/// replacing a model or a font in place at the same path
+/// must start a fresh epoch, and the same contents under
+/// a new path must not. The fingerprint is embedded in
+/// every cache key (see `serve`), so a restart under
+/// changed settings starts a fresh cache epoch instead
+/// of serving the old settings' renders from the
+/// persistent tiers. Settings that are already visible
+/// in the key (presets, default ops: both change the
+/// canonical form) are deliberately excluded, and so is
+/// the fallback image, whose responses are never cached.
 ///
 /// Resolved through `get` (a name to value lookup, so
 /// tests can drive it without the process environment).
-/// An unreadable detectors file contributes its path only:
-/// boot fails on it later, in the AI preload, with the
-/// precise error.
+/// An unreadable file contributes a marker in place of
+/// its digest: boot fails on it later, in the matching
+/// builder, with the precise error. The one file never
+/// read here is the C2PA signing key: it is named, like
+/// any other setting, because its identity is bound to
+/// the certificate chain, which is hashed by content (a
+/// rotated key pairs with a rotated certificate, and a
+/// mismatched pair fails the signer build).
 fn config_fingerprint(
     get: impl Fn(&str) -> Option<String>,
     preserve_metadata: bool,
@@ -1223,6 +1246,7 @@ fn config_fingerprint(
         hasher.update(value.as_bytes());
         hasher.update(b"\n");
     };
+    part("rendering_version", &RENDERING_VERSION.to_string());
     part(
         "preserve_metadata",
         if preserve_metadata { "1" } else { "0" },
@@ -1231,8 +1255,35 @@ fn config_fingerprint(
     part("avif_speed", &avif_speed.to_string());
     part("jxl_speed", &format!("{jxl_speed:?}"));
     part("width_step", &width_step.to_string());
+    // The AI behavior thresholds, at their effective
+    // values (the builders' defaults when unset): both
+    // gate what detection and tagging report, and
+    // detection drives redaction in rendered output.
+    part(
+        "detect_threshold",
+        &effective_threshold(&get, "CRABCROP_DETECT_THRESHOLD", 0.5),
+    );
+    part(
+        "clip_threshold",
+        &effective_threshold(&get, "CRABCROP_CLIP_THRESHOLD", 0.05),
+    );
+    // Settings whose identity is the configured string
+    // itself: the brand color, the OCR language, the
+    // timestamp authority, and the C2PA key, which is
+    // named but never read (see the note above).
     for name in [
         "CRABCROP_BRAND_COLOR",
+        "CRABCROP_OCR_LANGUAGE",
+        "CRABCROP_C2PA_TSA_URL",
+        "CRABCROP_C2PA_KEY",
+    ] {
+        if let Some(value) = get(name).filter(|v| !v.is_empty()) {
+            part(name, &value);
+        }
+    }
+    // File-based inputs, each identified by the digest
+    // of its contents.
+    for name in [
         "CRABCROP_REMOVEBG_MODEL",
         "CRABCROP_UPSCALE_MODEL",
         "CRABCROP_INPAINT_MODEL",
@@ -1240,6 +1291,7 @@ fn config_fingerprint(
         "CRABCROP_SEGMENT_DECODER_MODEL",
         "CRABCROP_FACE_MODEL",
         "CRABCROP_DETECT_MODEL",
+        "CRABCROP_DETECT_LABELS",
         "CRABCROP_CLIP_IMAGE_MODEL",
         "CRABCROP_CLIP_TEXT_MODEL",
         "CRABCROP_CLIP_TOKENIZER",
@@ -1250,50 +1302,105 @@ fn config_fingerprint(
         "CRABCROP_OCR_DETECT_MODEL",
         "CRABCROP_OCR_RECOGNIZE_MODEL",
         "CRABCROP_OCR_DICT",
-        "CRABCROP_OCR_LANGUAGE",
         "CRABCROP_FONT_PATH",
         "CRABCROP_VIDEO_ENCODER",
         "CRABCROP_VIDEO_DECODER",
         "CRABCROP_PDF_RENDERER",
-        "CRABCROP_C2PA_KEY",
-        "CRABCROP_C2PA_TSA_URL",
+        "CRABCROP_C2PA_CERT",
     ] {
-        if let Some(value) = get(name).filter(|v| !v.is_empty()) {
-            part(name, &value);
+        if let Some(path) = get(name).filter(|v| !v.is_empty()) {
+            part(name, &content_identity(&path));
         }
     }
     if let Some(path) = get("CRABCROP_DETECTORS_FILE").filter(|v| !v.is_empty()) {
-        let digest = std::fs::read(&path)
-            .map(|bytes| {
-                sha2::Sha256::digest(&bytes)
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|_| "unreadable".to_string());
-        part("CRABCROP_DETECTORS_FILE", &format!("{path}:{digest}"));
-    }
-    // The signing certificate is hashed like the
-    // detectors file (issue #173): the chain is embedded
-    // in every signed output, so rotating the certificate
-    // at the same path still starts a fresh cache epoch.
-    // An unreadable file contributes its path only: boot
-    // fails on it later, in the signer build, with the
-    // precise error. The key file is never read here, only
-    // named in the list above.
-    if let Some(path) = get("CRABCROP_C2PA_CERT").filter(|v| !v.is_empty()) {
-        let digest = std::fs::read(&path)
-            .map(|bytes| {
-                sha2::Sha256::digest(&bytes)
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|_| "unreadable".to_string());
-        part("CRABCROP_C2PA_CERT", &format!("{path}:{digest}"));
+        // The declarations file is small and is read
+        // whole at boot anyway (it is capped), so its
+        // digest comes from the same read that names the
+        // further files to identify: each declared
+        // detector's model and labels file, whose
+        // contents shape output exactly like the models
+        // configured directly above. An unparseable file
+        // contributes its own digest only: boot fails on
+        // it later, in the detector build, with the
+        // precise error.
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                part(
+                    "CRABCROP_DETECTORS_FILE",
+                    &sha2::Sha256::digest(&bytes)
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                );
+                if let Ok(text) = std::str::from_utf8(&bytes)
+                    && let Ok(decls) = parse_detector_declarations(text)
+                {
+                    for decl in &decls {
+                        part(
+                            &format!("CRABCROP_DETECTORS_FILE:{}:model", decl.name),
+                            &content_identity(&decl.model),
+                        );
+                        if let Some(LabelsDecl::Path(labels)) = &decl.labels {
+                            part(
+                                &format!("CRABCROP_DETECTORS_FILE:{}:labels", decl.name),
+                                &content_identity(labels),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(_) => part("CRABCROP_DETECTORS_FILE", &format!("unreadable:{path}")),
+        }
     }
     let digest = hasher.finalize();
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The fingerprint identity of one file-based input: the
+/// hex digest of its contents, streamed through the
+/// hasher so a model file is never held in memory just
+/// to be identified. An unreadable file degrades to a
+/// marker carrying its path (see `config_fingerprint`).
+fn content_identity(path: &str) -> String {
+    use sha2::Digest;
+    let digest = (|| {
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer).ok()?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Some(
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        )
+    })();
+    digest.unwrap_or_else(|| format!("unreadable:{path}"))
+}
+
+/// The effective value of an AI behavior threshold for
+/// the fingerprint: the parsed value when one is
+/// configured, the builder's default otherwise, formatted
+/// the same either way, so setting a threshold to its
+/// default changes nothing. An unparseable or
+/// out-of-range value contributes its raw text: boot
+/// fails on it later, in the matching builder, with the
+/// precise error.
+fn effective_threshold(get: &impl Fn(&str) -> Option<String>, name: &str, default: f32) -> String {
+    match get(name).filter(|v| !v.is_empty()) {
+        Some(raw) => match raw.parse::<f32>() {
+            Ok(value) if (0.0..=1.0).contains(&value) => value.to_string(),
+            _ => raw,
+        },
+        None => default.to_string(),
+    }
 }
 
 /// The CLIP annotation configuration from the environment:
@@ -2600,10 +2707,9 @@ mod tests {
             ),
             "serving knobs do not shape output"
         );
-        // The detectors file is hashed by content: editing
-        // a declaration changes the fingerprint, renaming
-        // alone does too (the path is an input), and an
-        // unchanged file is stable.
+        // The detectors file is identified by content:
+        // editing a declaration changes the fingerprint,
+        // and an unchanged file is stable.
         let file = temp_file("fp-detectors", br#"[{"name":"a"}]"#);
         let fp_file = config_fingerprint(
             env_of(&[("CRABCROP_DETECTORS_FILE", file.as_str())]),
@@ -2625,6 +2731,166 @@ mod tests {
         );
         assert_ne!(fp_file, fp_edited, "edited declarations, new epoch");
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn config_fingerprint_identifies_files_by_content() {
+        // File-based inputs are identified by a digest of
+        // their contents, not by their paths (issue #348):
+        // replacing a file in place at the same path starts
+        // a fresh epoch, and the same contents under a
+        // different path do not.
+        let speed = crate::engine::DEFAULT_JXL_SPEED;
+        let base = config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 100);
+        let model = temp_file("fp-model", b"model weights, first build");
+        let fp_model = config_fingerprint(
+            env_of(&[("CRABCROP_REMOVEBG_MODEL", model.as_str())]),
+            false,
+            90.0,
+            6,
+            speed,
+            100,
+        );
+        assert_ne!(base, fp_model);
+        std::fs::write(&model, b"model weights, second build").unwrap();
+        let fp_replaced = config_fingerprint(
+            env_of(&[("CRABCROP_REMOVEBG_MODEL", model.as_str())]),
+            false,
+            90.0,
+            6,
+            speed,
+            100,
+        );
+        assert_ne!(fp_model, fp_replaced, "replaced in place, new epoch");
+        std::fs::write(&model, b"model weights, first build").unwrap();
+        let moved = temp_file("fp-model-moved", b"model weights, first build");
+        assert_eq!(
+            fp_model,
+            config_fingerprint(
+                env_of(&[("CRABCROP_REMOVEBG_MODEL", moved.as_str())]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "same contents under a new path keep the epoch"
+        );
+        // The overlay font follows the same rule.
+        let font = temp_file("fp-font", b"font bytes, first build");
+        let fp_font = config_fingerprint(
+            env_of(&[("CRABCROP_FONT_PATH", font.as_str())]),
+            false,
+            90.0,
+            6,
+            speed,
+            100,
+        );
+        std::fs::write(&font, b"font bytes, second build").unwrap();
+        assert_ne!(
+            fp_font,
+            config_fingerprint(
+                env_of(&[("CRABCROP_FONT_PATH", font.as_str())]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "a replaced font starts a fresh epoch"
+        );
+        // A declared detector's model is identified by
+        // content too: replacing it leaves the declarations
+        // untouched and still starts a fresh epoch.
+        let declared = temp_file("fp-declared-model", b"declared weights, first");
+        let decls = temp_file(
+            "fp-declared-file",
+            format!(r#"[{{"name":"things","model":{declared:?},"kind":"boxes"}}]"#).as_bytes(),
+        );
+        let fp_declared = config_fingerprint(
+            env_of(&[("CRABCROP_DETECTORS_FILE", decls.as_str())]),
+            false,
+            90.0,
+            6,
+            speed,
+            100,
+        );
+        std::fs::write(&declared, b"declared weights, second").unwrap();
+        assert_ne!(
+            fp_declared,
+            config_fingerprint(
+                env_of(&[("CRABCROP_DETECTORS_FILE", decls.as_str())]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "a replaced declared model starts a fresh epoch"
+        );
+        let _ = std::fs::remove_file(&model);
+        let _ = std::fs::remove_file(&moved);
+        let _ = std::fs::remove_file(&font);
+        let _ = std::fs::remove_file(&declared);
+        let _ = std::fs::remove_file(&decls);
+    }
+
+    #[test]
+    fn config_fingerprint_tracks_ai_thresholds() {
+        // The AI behavior thresholds shape output at their
+        // effective values (issue #348): changing one
+        // starts a fresh epoch, and setting one to its
+        // default changes nothing.
+        let speed = crate::engine::DEFAULT_JXL_SPEED;
+        let base = config_fingerprint(env_of(&[]), false, 90.0, 6, speed, 100);
+        assert_ne!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_DETECT_THRESHOLD", "0.2")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "the detection threshold shapes redaction"
+        );
+        assert_eq!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_DETECT_THRESHOLD", "0.5")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "the default detection threshold is the unset fingerprint"
+        );
+        assert_ne!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_CLIP_THRESHOLD", "0.2")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "the tagging threshold shapes annotations"
+        );
+        assert_eq!(
+            base,
+            config_fingerprint(
+                env_of(&[("CRABCROP_CLIP_THRESHOLD", "0.05")]),
+                false,
+                90.0,
+                6,
+                speed,
+                100
+            ),
+            "the default tagging threshold is the unset fingerprint"
+        );
     }
 
     #[test]
