@@ -247,6 +247,14 @@ impl S3Store {
         let _ = self.request("PUT", &object, &[], data).await;
     }
 
+    /// Delete the single entry stored under `key`, if any:
+    /// the one-object counterpart of the purge walk, for a
+    /// caller that knows the exact key it wrote.
+    pub async fn remove(&self, key: &str) {
+        let object = self.object_key(&key_stem(key));
+        self.delete_object(&object).await;
+    }
+
     /// Store raw bytes under `name`, verbatim (issue #168):
     /// the object key is the store prefix plus `name`, with
     /// no cache-entry serialization and no `.bin` suffix.
@@ -806,6 +814,21 @@ mod tests {
         assert_eq!(got.bytes, bytes::Bytes::from_static(b"pixels"));
         assert_eq!(got.groups, vec!["hero".to_string()]);
         assert_eq!(got.quality, Some(80));
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_exactly_one_entry() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("one", &image(b"1", &[])).await;
+        s.put("one#avif", &image(b"2", &[])).await;
+        s.remove("one").await;
+        assert!(s.get("one").await.is_none());
+        // The variant is a different key: untouched.
+        assert!(s.get("one#avif").await.is_some());
+        // Removing an absent key is a quiet no-op.
+        s.remove("one").await;
+        s.remove("missing").await;
     }
 
     #[tokio::test]

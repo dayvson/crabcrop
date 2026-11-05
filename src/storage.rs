@@ -292,6 +292,23 @@ impl DiskStore {
         }
     }
 
+    /// Remove the single entry stored under `key`, if
+    /// any: its index record and its file. Returns whether
+    /// an entry was removed.
+    pub fn remove(&self, key: &str) -> bool {
+        let stem = {
+            let mut inner = self.inner.lock().unwrap();
+            evict_entry(&mut inner, key).map(|(stem, _)| stem)
+        };
+        match stem {
+            Some(stem) => {
+                let _ = std::fs::remove_file(self.file_for(&stem));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Remove every entry for `base`: the bare key plus its
     /// `#`-suffixed variants (Accept class, DPR). Returns how
     /// many entries were removed.
@@ -772,6 +789,21 @@ mod tests {
         let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
         assert_eq!(store.get("300x200/http://x/a.png"), Some(img));
         assert_eq!(store.stats().0, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_drops_exactly_one_entry() {
+        let dir = temp_dir("remove");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.put("a", &image(b"one"));
+        store.put("a#avif", &image(b"two"));
+        assert!(store.remove("a"));
+        assert_eq!(store.get("a"), None);
+        // The variant is a different key: untouched.
+        assert!(store.get("a#avif").is_some());
+        assert!(!store.remove("a"));
+        assert!(!store.remove("missing"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -74,6 +74,135 @@ pub(crate) fn union_groups(existing: &[String], extra: &[String]) -> Vec<String>
     out
 }
 
+/// How many tombstones of one kind the guard retains.
+/// Purges are operator actions, so the distinct targets
+/// stay few in practice; the cap only bounds the
+/// pathological, and a write old enough to outlive this
+/// many later purges is far outside any render's
+/// lifetime (renders are bounded by the process timeout,
+/// not by operator patience).
+const MAX_TOMBSTONES: usize = 1024;
+
+/// Purge generations and tombstones (issue #350): the
+/// coordination that keeps a cache write begun before a
+/// purge from restoring what the purge removed.
+///
+/// A writer (a render populating the tiers, a hit
+/// promoting or merging an entry) takes a `snapshot` of
+/// the generation when it starts. A purge records a
+/// tombstone for its target at a fresh generation before
+/// it touches any tier. A write whose snapshot predates
+/// a tombstone covering its key or groups is stale: it
+/// must not land, and if it already landed (the purge
+/// arrived while the write was in flight) it is removed
+/// again. A write that starts after the purge snapshots
+/// the newer generation and is unaffected, so the guard
+/// costs a fresh render nothing.
+///
+/// The guard tracks purges, not entries: it holds no
+/// image data and its maps stay proportional to how many
+/// distinct targets were purged, capped above.
+#[derive(Debug, Default)]
+pub struct PurgeGuard {
+    inner: Mutex<PurgeGuardInner>,
+}
+
+#[derive(Debug, Default)]
+struct PurgeGuardInner {
+    /// Bumped by every recorded purge; a snapshot is a
+    /// reading of this counter.
+    generation: u64,
+    /// Base cache key -> generation of its purge. Matches
+    /// the key itself and its `#`-suffixed variants, the
+    /// same rule `Cache::purge_matching` removes by.
+    keys: HashMap<String, u64>,
+    /// Group name -> generation of its purge.
+    groups: HashMap<String, u64>,
+    /// Source -> generation of its purge. Matches the
+    /// keys that derive from the source, the rule
+    /// `Cache::purge_source` removes by.
+    sources: HashMap<String, u64>,
+}
+
+impl PurgeGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current purge generation: a writer snapshots
+    /// this when it starts, before it reads or renders
+    /// anything it might later write back.
+    pub fn snapshot(&self) -> u64 {
+        self.inner.lock().unwrap().generation
+    }
+
+    /// Record a purge of the entries keyed at `base` (the
+    /// bare key and its variants). Returns the purge's
+    /// generation.
+    pub fn record_key(&self, base: &str) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.generation += 1;
+        let generation = inner.generation;
+        inner.keys.insert(base.to_string(), generation);
+        trim_tombstones(&mut inner.keys);
+        generation
+    }
+
+    /// Record a purge of `group`'s member entries.
+    /// Returns the purge's generation.
+    pub fn record_group(&self, group: &str) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.generation += 1;
+        let generation = inner.generation;
+        inner.groups.insert(group.to_string(), generation);
+        trim_tombstones(&mut inner.groups);
+        generation
+    }
+
+    /// Record a purge of every entry derived from
+    /// `source`. Returns the purge's generation.
+    pub fn record_source(&self, source: &str) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.generation += 1;
+        let generation = inner.generation;
+        inner.sources.insert(source.to_string(), generation);
+        trim_tombstones(&mut inner.sources);
+        generation
+    }
+
+    /// Whether a purge recorded after `snapshot` covers
+    /// an entry stored under `key` with `groups`: such a
+    /// write began before the purge and must not stand.
+    pub fn purge_covers(&self, snapshot: u64, key: &str, groups: &[String]) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.keys.iter().any(|(base, purge_gen)| {
+            *purge_gen > snapshot && (key == base || key.starts_with(&format!("{base}#")))
+        }) || inner
+            .groups
+            .iter()
+            .any(|(group, purge_gen)| *purge_gen > snapshot && groups.iter().any(|g| g == group))
+            || inner.sources.iter().any(|(source, purge_gen)| {
+                *purge_gen > snapshot && key_belongs_to_source(key, source)
+            })
+    }
+}
+
+/// Drop the oldest tombstones until the map is back at
+/// the cap: the ones a still-running write could
+/// predate are the recent ones.
+fn trim_tombstones(map: &mut HashMap<String, u64>) {
+    while map.len() > MAX_TOMBSTONES {
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, purge_gen)| *purge_gen)
+            .map(|(target, _)| target.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     entries: HashMap<String, CachedImage>,
@@ -130,6 +259,18 @@ impl Cache {
             removed += 1;
         }
         removed
+    }
+
+    /// Remove the single entry stored under `key`, if
+    /// any. Returns whether an entry was removed.
+    pub fn remove(&self, key: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(old) = inner.entries.remove(key) else {
+            return false;
+        };
+        inner.total_bytes -= old.bytes.len();
+        inner.stamps.remove(key);
+        true
     }
 
     /// Remove every entry belonging to `group` (RFC 9875
@@ -363,5 +504,72 @@ mod tests {
         cache.put("other".to_string(), img(50));
         assert_eq!(cache.get("k"), None);
         assert_eq!(cache.get("other"), Some(img(50)));
+    }
+
+    #[test]
+    fn remove_drops_exactly_one_entry() {
+        let cache = Cache::new(1024);
+        cache.put("a".to_string(), img(10));
+        cache.put("a#avif".to_string(), img(10));
+        assert!(cache.remove("a"));
+        assert_eq!(cache.get("a"), None);
+        // The variant is a different key: untouched.
+        assert!(cache.get("a#avif").is_some());
+        assert!(!cache.remove("a"));
+        assert!(!cache.remove("missing"));
+    }
+
+    #[test]
+    fn purge_guard_covers_only_writes_that_predate_the_purge() {
+        let guard = PurgeGuard::new();
+        let before = guard.snapshot();
+        guard.record_key("30x20/http://x/cat.jpg");
+        // A write begun before the purge is covered, under
+        // the bare key and under a variant spelling.
+        assert!(guard.purge_covers(before, "30x20/http://x/cat.jpg", &[]));
+        assert!(guard.purge_covers(before, "30x20/http://x/cat.jpg#avif", &[]));
+        // A prefix that is not a variant boundary is a
+        // different key.
+        assert!(!guard.purge_covers(before, "30x20/http://x/cat.jpg2", &[]));
+        // An unrelated key is not covered.
+        assert!(!guard.purge_covers(before, "30x20/http://x/dog.jpg", &[]));
+        // A write begun after the purge is not covered.
+        let after = guard.snapshot();
+        assert!(!guard.purge_covers(after, "30x20/http://x/cat.jpg", &[]));
+    }
+
+    #[test]
+    fn purge_guard_matches_groups_and_sources() {
+        let guard = PurgeGuard::new();
+        let before = guard.snapshot();
+        guard.record_group("hero");
+        guard.record_source("file:///heroes/cat.jpg");
+        assert!(guard.purge_covers(before, "any/key", &["hero".to_string()]));
+        assert!(!guard.purge_covers(before, "any/key", &["thumb".to_string()]));
+        assert!(!guard.purge_covers(before, "any/key", &[]));
+        // Source purges cover every derivative key of the
+        // source, and nothing else.
+        assert!(guard.purge_covers(before, "300x200/file:///heroes/cat.jpg", &[]));
+        assert!(guard.purge_covers(before, "300x200/file:///heroes/cat.jpg#cfg1", &[]));
+        assert!(!guard.purge_covers(before, "300x200/file:///heroes/cat.jpg2", &[]));
+        // Later purges of other targets do not retroactively
+        // cover a snapshot taken after them.
+        let mid = guard.snapshot();
+        guard.record_group("thumb");
+        assert!(!guard.purge_covers(mid, "any/key", &["hero".to_string()]));
+        assert!(guard.purge_covers(mid, "any/key", &["thumb".to_string()]));
+    }
+
+    #[test]
+    fn purge_guard_keeps_only_recent_tombstones() {
+        let guard = PurgeGuard::new();
+        let start = guard.snapshot();
+        for i in 0..(MAX_TOMBSTONES + 5) {
+            guard.record_key(&format!("key-{i}"));
+        }
+        // The newest tombstones are retained...
+        assert!(guard.purge_covers(start, &format!("key-{}", MAX_TOMBSTONES + 4), &[]));
+        // ...and the oldest have been trimmed away.
+        assert!(!guard.purge_covers(start, "key-0", &[]));
     }
 }

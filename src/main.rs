@@ -1157,6 +1157,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         inflight: Arc::new(crate::server::Inflight::default()),
+        purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
         config_fingerprint,
     };
     println!("configuration fingerprint: {}", state.config_fingerprint);

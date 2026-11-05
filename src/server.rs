@@ -490,6 +490,13 @@ pub struct AppState {
     /// encode instead of stampeding the origin and the
     /// process gate.
     pub inflight: Arc<Inflight>,
+    /// Purge generations and tombstones (issue #350):
+    /// every purge records its target here before it
+    /// touches a tier, and every tier write carries the
+    /// generation it started under, so a render or
+    /// promotion that began before a purge cannot restore
+    /// what the purge removed when its writes land.
+    pub purge_guard: Arc<crate::cache::PurgeGuard>,
     /// Fingerprint of the output-shaping configuration
     /// (audit R2-08), computed at boot in `main`: embedded
     /// in every cache key, so changing the metadata
@@ -1062,6 +1069,11 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
             Err(_) => crate::url::canonical_key_form(target),
         }
     };
+    // The tombstone lands before any tier is touched
+    // (issue #350): a write begun before this purge can
+    // then see it whenever it tries to land, including
+    // after this handler has finished.
+    state.purge_guard.record_key(&key_form);
     let mut removed = state.cache.purge_matching(&key_form);
     if let Some(store) = &state.store {
         removed += store.purge_matching(&key_form);
@@ -1113,6 +1125,9 @@ async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri)
         purge_log("purge-group", &target, None);
         return (StatusCode::FORBIDDEN, "bad signature").into_response();
     }
+    // Tombstone first, tiers second (issue #350), as in
+    // the per-URL purge.
+    state.purge_guard.record_group(group);
     let mut removed = state.cache.purge_group(group);
     if let Some(store) = &state.store {
         removed += store.purge_group(group);
@@ -1221,6 +1236,9 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
 /// overwrite path (audit R2-07) shares this with any
 /// future source-replacement flow.
 async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
+    // Tombstone first, tiers second (issue #350), as in
+    // the per-URL purge.
+    state.purge_guard.record_source(source);
     let mut removed = state.cache.purge_source(source);
     if let Some(store) = &state.store {
         removed += store.purge_source(source);
@@ -2496,6 +2514,84 @@ async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta
 /// sheds with a 503 (audit R2-09).
 const MAX_FLIGHT_WAITS: u32 = 3;
 
+/// Whether a purge recorded after `snapshot` covers
+/// `entry` (issue #350): the write that carries this
+/// snapshot began before that purge, so its result must
+/// not stand in any tier.
+fn write_is_stale(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) -> bool {
+    state.purge_guard.purge_covers(snapshot, key, &entry.groups)
+}
+
+/// Store `entry` in the memory tier under the purge
+/// guard (issue #350). The write is skipped when a purge
+/// covering it already landed; a purge that lands while
+/// the write is in flight is reconciled right after: the
+/// entry just written is removed again, so the purge
+/// wins however the two interleave. The removal matches
+/// on the entry's ETag, so an entry a fresher write has
+/// already replaced under the same key is left alone.
+fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
+    if write_is_stale(state, snapshot, key, entry) {
+        return;
+    }
+    state.cache.put(key.to_string(), entry.clone());
+    if write_is_stale(state, snapshot, key, entry)
+        && state
+            .cache
+            .get(key)
+            .is_some_and(|held| held.etag == entry.etag)
+    {
+        state.cache.remove(key);
+    }
+}
+
+/// Store `entry` in the disk tier under the purge guard
+/// (issue #350): the same skip-and-reconcile discipline
+/// as [`put_memory_tier`].
+fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
+    let Some(store) = &state.store else {
+        return;
+    };
+    if write_is_stale(state, snapshot, key, entry) {
+        return;
+    }
+    store.put(key, entry);
+    if write_is_stale(state, snapshot, key, entry)
+        && store.get(key).is_some_and(|held| held.etag == entry.etag)
+    {
+        store.remove(key);
+    }
+}
+
+/// Write `entry` through to the shared tier in the
+/// background under the purge guard (issue #350): the
+/// same skip-and-reconcile discipline as the local
+/// tiers, applied inside the spawned task, because the
+/// purge it must lose to can land at any point during
+/// the network write.
+fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedImage) {
+    let Some(shared) = &state.shared_store else {
+        return;
+    };
+    let guard = state.purge_guard.clone();
+    let shared = shared.clone();
+    let key = key.to_string();
+    tokio::spawn(async move {
+        if guard.purge_covers(snapshot, &key, &entry.groups) {
+            return;
+        }
+        shared.put(&key, &entry).await;
+        if guard.purge_covers(snapshot, &key, &entry.groups)
+            && shared
+                .get(&key)
+                .await
+                .is_some_and(|held| held.etag == entry.etag)
+        {
+            shared.remove(&key).await;
+        }
+    });
+}
+
 /// The tier lookup chain for one key: memory, then disk
 /// (a hit promotes into memory), then the shared tier (a
 /// hit promotes into both local tiers). On any hit, the
@@ -2503,7 +2599,14 @@ const MAX_FLIGHT_WAITS: u32 = 3;
 /// entry (audit R2-15): provenance accumulates, so an
 /// entry first stored through a group-free spelling is
 /// still removed by a later group purge once any grouped
-/// spelling of the same URL has been served. Returns the
+/// spelling of the same URL has been served. The union
+/// reaches every tier that holds the entry, not just the
+/// one that served the hit (issue #350): membership that
+/// stayed in memory alone would be lost at restart,
+/// leaving the persistent copies invisible to the group
+/// purge. Every write this chain makes (promotions,
+/// merge write-backs) runs under the purge guard, under
+/// the generation the lookup started with. Returns the
 /// image and the `Cache-Status` value for the tier that
 /// served it.
 async fn lookup_tiers(
@@ -2511,9 +2614,36 @@ async fn lookup_tiers(
     cache_key: &str,
     groups: &[String],
 ) -> Option<(CachedImage, &'static str)> {
+    let snapshot = state.purge_guard.snapshot();
     if let Some(hit) = state.cache.get(cache_key) {
-        if !groups.is_empty() {
-            state.cache.merge_groups(cache_key, groups);
+        if !groups.is_empty() && state.cache.merge_groups(cache_key, groups) {
+            // The memory set grew: propagate the new
+            // membership to the persistent tiers. A group
+            // the memory entry already carried needs no
+            // propagation; it reached them when it was
+            // first learned.
+            let merged = crate::cache::union_groups(&hit.groups, groups);
+            if let Some(store) = &state.store {
+                store.merge_groups(cache_key, groups);
+                // A purge that landed during the merge
+                // removed the entry as it was; the merged
+                // copy must not be left behind (the same
+                // reconcile the tier writes run).
+                let mut entry = hit.clone();
+                entry.groups = merged.clone();
+                if write_is_stale(state, snapshot, cache_key, &entry)
+                    && store
+                        .get(cache_key)
+                        .is_some_and(|held| held.etag == entry.etag)
+                {
+                    store.remove(cache_key);
+                }
+            }
+            if merged != hit.groups {
+                let mut entry = hit.clone();
+                entry.groups = merged;
+                spawn_shared_put(state, snapshot, cache_key, entry);
+            }
         }
         return Some((hit, "crabcrop; hit"));
     }
@@ -2522,8 +2652,22 @@ async fn lookup_tiers(
     {
         if !groups.is_empty() && store.merge_groups(cache_key, groups) {
             image.groups = crate::cache::union_groups(&image.groups, groups);
+            // A purge that landed during the merge removed
+            // the entry as it was; the merged copy must not
+            // be left behind (the same reconcile the tier
+            // writes run).
+            if write_is_stale(state, snapshot, cache_key, &image)
+                && store
+                    .get(cache_key)
+                    .is_some_and(|held| held.etag == image.etag)
+            {
+                store.remove(cache_key);
+            }
+            // The merge grew the disk entry's set; the
+            // shared tier's copy learns it too (issue #350).
+            spawn_shared_put(state, snapshot, cache_key, image.clone());
         }
-        state.cache.put(cache_key.to_string(), image.clone());
+        put_memory_tier(state, snapshot, cache_key, &image);
         return Some((image, "crabcrop; hit; detail=\"disk\""));
     }
     if let Some(shared) = &state.shared_store
@@ -2535,16 +2679,11 @@ async fn lookup_tiers(
                 image.groups = merged;
                 // Best-effort, off the response path, like
                 // the write-through put.
-                let shared = shared.clone();
-                let key = cache_key.to_string();
-                let entry = image.clone();
-                tokio::spawn(async move { shared.put(&key, &entry).await });
+                spawn_shared_put(state, snapshot, cache_key, image.clone());
             }
         }
-        state.cache.put(cache_key.to_string(), image.clone());
-        if let Some(store) = &state.store {
-            store.put(cache_key, &image);
-        }
+        put_memory_tier(state, snapshot, cache_key, &image);
+        put_disk_tier(state, snapshot, cache_key, &image);
         return Some((image, "crabcrop; hit; detail=\"shared\""));
     }
     None
@@ -2592,6 +2731,11 @@ async fn serve_miss(
     work: MissWork,
     mut record: RequestRecord,
 ) -> (Response, RequestRecord, Option<String>) {
+    // The purge generation this render starts under
+    // (issue #350), taken before the load: a purge that
+    // lands while the render runs must not be undone by
+    // the population writes at its end.
+    let write_snapshot = state.purge_guard.snapshot();
     let MissWork {
         ops,
         source_url,
@@ -2945,18 +3089,15 @@ async fn serve_miss(
             groups: groups.clone(),
             etag: render_etag.clone(),
         };
-        state.cache.put(cache_key.clone(), entry.clone());
-        if let Some(store) = &state.store {
-            store.put(&cache_key, &entry);
-        }
-        if let Some(shared) = &state.shared_store {
-            // Write-through off the response path: the local
-            // tiers already hold the entry, and the shared
-            // tier is best-effort by design.
-            let shared = shared.clone();
-            let key = cache_key.clone();
-            tokio::spawn(async move { shared.put(&key, &entry).await });
-        }
+        // Population runs under the purge guard (issue
+        // #350): a purge that landed while this render was
+        // running keeps the entry out of every tier, while
+        // the response below still serves the render
+        // itself. The shared tier's write stays off the
+        // response path, as before.
+        put_memory_tier(state, write_snapshot, &cache_key, &entry);
+        put_disk_tier(state, write_snapshot, &cache_key, &entry);
+        spawn_shared_put(state, write_snapshot, &cache_key, entry);
     }
     record.bytes_out = processed.bytes.len();
     // The render's AI permit drained with its job:
@@ -4814,6 +4955,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -4942,6 +5084,7 @@ mod tests {
             anim_gate,
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -5027,6 +5170,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -5115,6 +5259,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -5407,6 +5552,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -5766,6 +5912,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -5831,6 +5978,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -5900,6 +6048,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -6847,6 +6996,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -7698,6 +7848,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -7876,6 +8027,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -8206,6 +8358,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -8625,6 +8778,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -8890,6 +9044,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -8951,6 +9106,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -9012,6 +9168,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -9105,6 +9262,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -9539,6 +9697,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -9614,6 +9773,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -10925,6 +11085,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -11002,6 +11163,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -11515,6 +11677,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: Some(crate::provenance::test_signer()),
             config_fingerprint: "test".to_string(),
         };
@@ -11642,6 +11805,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -11778,6 +11942,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -12010,6 +12175,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(slow_permits)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         }
@@ -12277,6 +12443,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate,
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -12430,6 +12597,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -12970,6 +13138,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
@@ -13450,6 +13619,165 @@ mod tests {
         assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
     }
 
+    #[tokio::test]
+    async fn group_membership_learned_on_a_hit_survives_a_restart() {
+        // Issue #350: membership learned on a memory hit
+        // propagates to the persistent tier, so a group
+        // purge after a restart still finds the entry.
+        // Before the fix the union lived only in the first
+        // instance's memory and the purge below removed 0.
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-gprop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_full(preset_test_map(), Some(&dir), 16 * 1024 * 1024).await;
+        // The plain spelling stores the entry group-free
+        // in memory and on disk.
+        let plain = format!("30x20/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{plain}", sign(&plain)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The preset spelling is the same canonical entry:
+        // a memory hit that unions the preset's group in.
+        let preset = format!("preset:small/{src}");
+        let resp = client()
+            .get(format!("{base}/{}/{preset}", sign(&preset)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Restart: a fresh instance over the same
+        // directory, its memory cold. The group purge can
+        // only see the persistent tier, and it finds the
+        // entry there by the membership the first
+        // instance's memory learned.
+        let base2 = spawn_app_full(preset_test_map(), Some(&dir), 16 * 1024 * 1024).await;
+        let sig = crate::url::purge_group_signature(SECRET, "small");
+        let resp = client()
+            .post(format!("{base2}/purge-group/{sig}/small"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        let resp = client()
+            .get(format!("{base2}/{}/{plain}", sign(&plain)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn purge_during_a_render_keeps_the_entry_out_of_every_tier() {
+        // Issue #350: a purge that lands while a render is
+        // in flight is recorded before the render's writes,
+        // so the finished render cannot restore the entry
+        // to any tier.
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-pdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, hits) = spawn_slow_counting_server(test_png(), 1200).await;
+        let base = spawn_app_with_shared(Some(&dir), &fake.endpoint).await;
+        let remainder = format!("25x25/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        // Start the render; it blocks in the origin load.
+        let pending = tokio::spawn(async move { client().get(&url).send().await.unwrap() });
+        // Wait until the fetch is actually in flight.
+        for _ in 0..50 {
+            if hits.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the render never started");
+        // Purge the key mid-render. Nothing is stored yet,
+        // so the count is 0; the purge still counts.
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("purged 0"));
+        // The render completes and answers its client with
+        // the render itself; only its writes are refused.
+        let resp = pending.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Give the background shared-tier write every
+        // chance to land: it must never appear.
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            fake.objects.lock().unwrap().is_empty(),
+            "the shared tier holds the purged render"
+        );
+        let on_disk = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(on_disk, 0, "the disk tier holds the purged render");
+        // And no tier serves it: the next request misses
+        // and renders again.
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn group_purge_during_a_render_keeps_the_entry_out() {
+        // Issue #350, the group form: a group purge that
+        // lands while a grouped render is in flight keeps
+        // the finished render out of the tiers.
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-gpdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, hits) = spawn_slow_counting_server(test_png(), 1200).await;
+        let base = spawn_app_full(preset_test_map(), Some(&dir), 16 * 1024 * 1024).await;
+        let preset = format!("preset:small/{src}");
+        let url = format!("{base}/{}/{preset}", sign(&preset));
+        let pending = tokio::spawn(async move { client().get(&url).send().await.unwrap() });
+        for _ in 0..50 {
+            if hits.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the render never started");
+        let sig = crate::url::purge_group_signature(SECRET, "small");
+        let resp = client()
+            .post(format!("{base}/purge-group/{sig}/small"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.text().await.unwrap().contains("purged 0"));
+        let resp = pending.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The local writes land before the response, so
+        // the outcome is already settled: the next request
+        // misses and renders again.
+        let resp = client()
+            .get(format!("{base}/{}/{preset}", sign(&preset)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An app over a disk tier under a chosen
     /// configuration fingerprint (the epoch tests).
     async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &str) -> String {
@@ -13507,6 +13835,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: fingerprint.to_string(),
         };
@@ -14360,6 +14689,7 @@ mod tests {
             anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
         };
