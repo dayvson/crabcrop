@@ -29,6 +29,15 @@ fi
 
 step() { printf '\n=== %s ===\n' "$1"; }
 
+step "Workflow mirrors (docs copies match the live workflows)"
+for pair in "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml" "release.yml release-workflow.yml" "rust.yml rust-workflow.yml"; do
+  set -- $pair
+  if ! cmp -s ".github/workflows/$1" "docs/$2"; then
+    echo "workflow mirror drift: docs/$2 differs from .github/workflows/$1; sync the mirror to the live workflow" >&2
+    exit 1
+  fi
+done
+
 step "Build (debug binary: the MCP suite spawns it)"
 cargo build --locked
 
@@ -43,28 +52,28 @@ step "Upgrade test (previous-release corpus)"
 python3 tests/upgrade/run_upgrade.py --bin target/debug/crabcrop
 
 step "TypeScript SDK"
-(cd sdks/typescript && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm run build && npm test)
+(cd sdks/typescript && npm ci --no-audit --no-fund && npm run build && npm test)
 
 step "Python SDK"
 (cd sdks/python && python3 -m unittest discover -s tests)
 
 step "MCP server"
-(cd sdks/mcp && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+(cd sdks/mcp && npm ci --no-audit --no-fund && npm test)
 
 step "Nuxt module"
-(cd frameworks/nuxt && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+(cd frameworks/nuxt && npm ci --no-audit --no-fund && npm test)
 
 step "Next.js module"
-(cd frameworks/nextjs && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+(cd frameworks/nextjs && npm ci --no-audit --no-fund && npm test)
 
 step "Hydrogen module"
-(cd frameworks/hydrogen && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+(cd frameworks/hydrogen && npm ci --no-audit --no-fund && npm test)
 
 step "Astro module"
-(cd frameworks/astro && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+(cd frameworks/astro && npm ci --no-audit --no-fund && npm test)
 
 step "SvelteKit module"
-(cd frameworks/sveltekit && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm test)
+(cd frameworks/sveltekit && npm ci --no-audit --no-fund && npm test)
 
 step "WordPress plugin"
 (cd plugins/wordpress && php tests/run.php)
