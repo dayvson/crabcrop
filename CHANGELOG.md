@@ -2,6 +2,30 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [0.9.9] - 2026-11-05
+
+### Changed
+
+- Source checking is on by default, and the server boots with it. A fresh install configured with only a secret now starts and serves; the earlier startup posture check is gone. Sources that resolve to loopback, private, link-local, or other non-public addresses are refused, unless the host is on the source allowlist: an allowlist match exempts a host from the address check, and connection pinning is scoped to hosts that are not allowlisted. `CRABCROP_ALLOW_ANY_SOURCE` remains available as the deliberate opt-out that turns the address check off entirely. A source the policy refuses is answered with a fixed short message.
+
+- One fetch budget covers the whole redirect chain. Following a redirect used to restart the fetch timeout at every hop, so a chain of slow sources could hold a request open for a multiple of the configured budget. The budget now spans the chain from the first request to the final response, and a chain that outlives it is answered 504.
+
+- AI work shares the request deadline. One deadline is stamped when a request starts and is shared by the AI concurrency gate and the inference behind it: a request whose budget runs out while it waits gives up its place instead of starting work that can no longer finish in time, and metadata annotations that cannot complete inside the budget report themselves unavailable with a `timed_out` reason instead of answering late.
+
+### Fixed
+
+- Cloud storage sources honor the source policy. `s3://` and `gs://` sources are checked against the same bucket allowlist as every other source before anything is fetched; a bucket that is not allowlisted is refused, the same answer an unlisted upload target gets.
+
+- `/explain` bounds its probe. Explaining a URL used to download up to 10 MiB of the source before answering. It now reads a bounded head probe of 256 KiB and answers from that, and a source whose size cannot be learned from the probe is reported as null instead of being fetched to be measured.
+
+- Animated decoding honors the decode byte budget. Animated WebP and GIF sources used to decode outside the configured byte budget, so a many-frame source could allocate several times the limit before anything refused it. Frames now count against the budget as they decode, and a source that would exceed it is refused with 502.
+
+- Long single operations honor the request deadline. The deadline used to be checked between `filters:` segments, so one expensive segment could run well past it and keep working after the client had its answer. Segments now check the deadline as they go, and an operation that reaches it stops instead of running on detached.
+
+- Metadata responses carry file names, not filesystem paths. The model fields in metadata responses (`moderation.model`, `embedding_model`, `aesthetic.head`, `ocr.model`) report the model's file name rather than the absolute path it was loaded from.
+
+- The local gate runs its cargo commands with `--locked` (`build`, `test`, and the fuzz smoke test in `scripts/test_all.sh`), matching the lockfile rule the repository already states for CI.
+
 ## [0.9.8] - 2026-11-04
 
 ### Added
