@@ -68,10 +68,20 @@ pub struct DiskStore {
 /// HMAC-SHA256 over the entry under a key derived from
 /// the server secret (issue #190, audit R2-13 part a),
 /// so persistent entries are authenticated, not merely
-/// self-consistent. Older files do not parse and are
-/// deleted on sight at scan, the store's standing upgrade
-/// behavior for a cache.
-const MAGIC: &str = "CRABDISK4";
+/// self-consistent. CRABDISK5 adds the entry's ETag (a
+/// digest of its payload bytes) to the header, so a hit
+/// answers conditional requests without rehashing the
+/// body. CRABDISK4 files still parse: the payload is in
+/// hand, so their ETag is derived from it on read, and
+/// entries written by the previous build keep serving
+/// instead of being dropped. Anything older does not
+/// parse and is deleted on sight at scan, the store's
+/// standing upgrade behavior for a cache.
+const MAGIC: &str = "CRABDISK5";
+
+/// The previous entry format: identical but for the
+/// missing ETag line. Readable, never written.
+const MAGIC_V4: &str = "CRABDISK4";
 
 /// The largest serialized entry the shared (S3) tier will
 /// read back, mirroring the disk tier's default total
@@ -470,11 +480,12 @@ pub(crate) fn serialize_entry(key: &str, image: &CachedImage, entry_key: &[u8]) 
     // The MAC covers everything after its own line, so the
     // body is assembled first and the MAC computed over it.
     let head = format!(
-        "{}\n{quality}\n{}\n{}\n{}\n",
+        "{}\n{quality}\n{}\n{}\n{}\n{}\n",
         format_name(image.format),
         image.groups.len(),
         key.len(),
-        image.bytes.len()
+        image.bytes.len(),
+        image.etag
     );
     let mut body =
         Vec::with_capacity(head.len() + key.len() + 1 + groups_block.len() + image.bytes.len());
@@ -527,13 +538,19 @@ struct EntryHeader {
     /// (everything after the MAC line) begins.
     mac: [u8; 32],
     covered_start: usize,
+    /// The entry's stored ETag (CRABDISK5). CRABDISK4
+    /// entries carry none: `None`, and the reader derives
+    /// the value from the payload instead.
+    etag: Option<String>,
 }
 
 fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
     let mut pos = 0;
-    if take_line(data, &mut pos)? != MAGIC.as_bytes() {
-        return None;
-    }
+    let version5 = match take_line(data, &mut pos)? {
+        line if line == MAGIC.as_bytes() => true,
+        line if line == MAGIC_V4.as_bytes() => false,
+        _ => return None,
+    };
     let mac_line = take_line(data, &mut pos)?;
     if mac_line.len() != 64 || !mac_line.iter().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -562,6 +579,22 @@ fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
         .ok()?
         .parse()
         .ok()?;
+    // The CRABDISK5 ETag line: a quoted 32-digit hex digest.
+    // The MAC authenticates it like every other field, so
+    // the shape check here is framing, not trust.
+    let etag = if version5 {
+        let line = take_line(data, &mut pos)?;
+        if line.len() != 34
+            || line.first() != Some(&b'"')
+            || line.last() != Some(&b'"')
+            || !line[1..33].iter().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(String::from_utf8(line.to_vec()).ok()?)
+    } else {
+        None
+    };
     // Every offset below is checked arithmetic: the header
     // fields are untrusted counts, and a length near
     // usize::MAX must fail the parse, not wrap or panic.
@@ -605,6 +638,7 @@ fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
         payload_offset,
         mac,
         covered_start,
+        etag,
     })
 }
 
@@ -633,6 +667,13 @@ pub(crate) fn parse_entry(data: &[u8], entry_key: &[u8]) -> Option<(String, Cach
     if payload.is_empty() {
         return None;
     }
+    // A CRABDISK4 entry carries no stored ETag: derive it
+    // from the payload in hand, which is exactly the value
+    // the stored line would have carried.
+    let etag = match header.etag {
+        Some(etag) => etag,
+        None => crate::cache::etag_for_bytes(payload),
+    };
     Some((
         header.key,
         CachedImage {
@@ -640,6 +681,7 @@ pub(crate) fn parse_entry(data: &[u8], entry_key: &[u8]) -> Option<(String, Cach
             format: header.format,
             quality: header.quality,
             groups: header.groups,
+            etag,
         },
     ))
 }
@@ -702,6 +744,7 @@ mod tests {
             format: ImageFormat::Png,
             quality: Some(80),
             groups: Vec::new(),
+            etag: crate::cache::etag_for_bytes(bytes),
         }
     }
 
@@ -729,6 +772,61 @@ mod tests {
         let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
         assert_eq!(store.get("300x200/http://x/a.png"), Some(img));
         assert_eq!(store.stats().0, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serialize the way the previous build did: the
+    /// CRABDISK4 layout, the current body minus the ETag
+    /// line, MAC'd the same way. Only group-free entries:
+    /// that is all the compatibility test stores.
+    fn serialize_entry_v4(key: &str, image: &CachedImage, entry_key: &[u8]) -> Vec<u8> {
+        assert!(image.groups.is_empty());
+        let quality = image
+            .quality
+            .map(|q| q.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let head = format!(
+            "{}\n{quality}\n{}\n{}\n{}\n",
+            format_name(image.format),
+            image.groups.len(),
+            key.len(),
+            image.bytes.len()
+        );
+        let mut body = Vec::new();
+        body.extend_from_slice(head.as_bytes());
+        body.extend_from_slice(key.as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(&image.bytes);
+        let mac = entry_mac(entry_key, &body);
+        let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC_V4.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(mac_hex.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn previous_format_entries_parse_with_a_derived_etag() {
+        let key = test_entry_key();
+        let img = image(b"payload");
+        let data = serialize_entry_v4("k", &img, &key);
+        // Direct parse: the entry serves, with the ETag the
+        // payload derives (the helper etags by the same
+        // rule, so the whole entry compares equal).
+        let (stored_key, parsed) = parse_entry(&data, &key).unwrap();
+        assert_eq!(stored_key, "k");
+        assert_eq!(parsed, img);
+        // Through the store: the boot scan indexes the file
+        // instead of deleting it, and the entry serves.
+        let dir = temp_dir("v4");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{}.bin", key_stem("k"))), &data).unwrap();
+        let store = DiskStore::open(&dir, 1_000_000, key).unwrap();
+        assert_eq!(store.stats().0, 1);
+        assert_eq!(store.get("k"), Some(img));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -797,7 +895,10 @@ mod tests {
     /// is computed correctly over the crafted body, so the
     /// field checks are what reject these, never the MAC.
     fn crafted_entry(group_count: &str, key_len: &str, payload_len: &str, tail: &[u8]) -> Vec<u8> {
-        let mut body = format!("png\n-\n{group_count}\n{key_len}\n{payload_len}\n").into_bytes();
+        let mut body = format!(
+            "png\n-\n{group_count}\n{key_len}\n{payload_len}\n\"00000000000000000000000000000000\"\n"
+        )
+        .into_bytes();
         body.extend_from_slice(tail);
         let mac = entry_mac(&test_entry_key(), &body);
         let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();

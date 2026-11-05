@@ -79,7 +79,7 @@ Like `exp`, the segment sits inside the signed remainder and repeated segments r
 
 ### Revalidation
 
-Every cacheable image response also carries a strong `ETag`, derived from the response's canonical cache key, so it identifies the exact bytes of the variant that key selects. A client or CDN holding a copy can revalidate with `If-None-Match`: when the value matches (an exact match, a weak `W/` spelling, one entry of a comma list, or `*`), the answer is `304 Not Modified` with no body, on cache hits and fresh renders alike; anything else gets the full `200`. The validator applies only to public `200` image responses: meta responses (`private, no-store`), fallbacks, and errors carry no `ETag` and are never answered with a `304`. It pairs with `maxage:0` for URLs whose copies should be checked before every reuse.
+Every cacheable image response also carries a strong `ETag`: a digest of the response's exact bytes, computed when the render is produced and stored with its cache entry. If a re-render under the same URL produces different bytes (the source changed and the old entry was purged), the ETag changes with them. A client or CDN holding a copy can revalidate with `If-None-Match`: when the value matches (an exact match, a weak `W/` spelling, one entry of a comma list, or `*`), the answer is `304 Not Modified` with no body, on cache hits and fresh renders alike; anything else gets the full `200`. The validator applies only to public `200` image responses: meta responses (`private, no-store`), fallbacks, and errors carry no `ETag` and are never answered with a `304`. It pairs with `maxage:0` for URLs whose copies should be checked before every reuse.
 
 ### Source images
 

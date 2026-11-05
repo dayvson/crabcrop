@@ -31,7 +31,7 @@ use axum::{
     routing::get,
 };
 
-use crate::cache::{Cache, CachedImage};
+use crate::cache::{Cache, CachedImage, etag_for_bytes};
 use crate::engine::{Engine, EngineError};
 use crate::loader::{LoadError, Loader};
 use crate::observe::{FailStage, Metrics, RequestRecord};
@@ -2265,9 +2265,7 @@ async fn serve(
     if effective_dpr != 1.0 {
         cache_key = format!("{cache_key}#dpr{effective_dpr}");
     }
-    let etag = etag_for(&cache_key);
-
-    // The verified path is content-addressed: a stored response can
+    // The key fully determines the lookup: a stored response can
     // be served without touching the loader or the engine. Meta
     // requests bypass the cache in both directions: they must
     // never be answered with image bytes, and their JSON is never
@@ -2299,7 +2297,8 @@ async fn serve(
     // Debug requests keep bypassing everything, per
     // request, as before.
     if debug {
-        return serve_miss(state, work, record).await;
+        let (response, record, _) = serve_miss(state, work, record).await;
+        return (response, record);
     }
     // Meta requests coalesce through their own flights
     // (issue #295): the flight key is the cache key plus
@@ -2337,6 +2336,7 @@ async fn serve(
         if let Some((hit, cache_status)) = lookup_tiers(state, &cache_key, &groups).await {
             record.cache_hit = true;
             record.bytes_out = hit.bytes.len();
+            let etag = hit.etag.clone();
             let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
             attach_cache_headers(&mut response, cache_status, &groups);
             finalize_validators(&mut response, &etag, if_none_match);
@@ -2344,9 +2344,11 @@ async fn serve(
         }
         match state.inflight.lead(&cache_key) {
             Flight::Leader(guard) => {
-                let (mut response, record) = serve_miss(state, work, record).await;
+                let (mut response, record, render_etag) = serve_miss(state, work, record).await;
                 drop(guard);
-                finalize_validators(&mut response, &etag, if_none_match);
+                if let Some(etag) = &render_etag {
+                    finalize_validators(&mut response, etag, if_none_match);
+                }
                 return (response, record);
             }
             Flight::Follower(mut changed) => {
@@ -2410,7 +2412,7 @@ async fn serve_meta_flight(
     loop {
         match state.inflight.lead_meta(key) {
             MetaFlight::Leader(guard, slot) => {
-                let (response, record) = serve_miss(state, work, record).await;
+                let (response, record, _) = serve_miss(state, work, record).await;
                 if response.status() == StatusCode::OK {
                     let (response, shared) = share_meta_response(response).await;
                     if let Some(shared) = shared {
@@ -2424,7 +2426,8 @@ async fn serve_meta_flight(
             }
             MetaFlight::Follower(mut changed, slot) => {
                 if waits >= MAX_FLIGHT_WAITS {
-                    return serve_miss(state, work, record).await;
+                    let (response, record, _) = serve_miss(state, work, record).await;
+                    return (response, record);
                 }
                 waits += 1;
                 // The leader always signals on drop; the
@@ -2579,11 +2582,16 @@ struct MissWork {
 /// the tiers, and respond (a meta document when asked).
 /// Runs at most once per key at a time, led by one
 /// request while its duplicates wait (see `serve`).
+/// The third return value is the ETag of the rendered
+/// bytes when the response serves a render, so the
+/// caller can answer conditional requests against the
+/// bytes themselves; it is `None` for a meta document
+/// and for every error.
 async fn serve_miss(
     state: &AppState,
     work: MissWork,
     mut record: RequestRecord,
-) -> (Response, RequestRecord) {
+) -> (Response, RequestRecord, Option<String>) {
     let MissWork {
         ops,
         source_url,
@@ -2638,7 +2646,7 @@ async fn serve_miss(
                 }
                 None => {
                     record.fail = FailStage::Load;
-                    return (sealed_or(sealed, load_error_response(e)), record);
+                    return (sealed_or(sealed, load_error_response(e)), record, None);
                 }
             }
         }
@@ -2662,7 +2670,7 @@ async fn serve_miss(
             Ok(b) => b,
             Err(e) => {
                 record.fail = FailStage::Load;
-                return (sealed_or(sealed, load_error_response(e)), record);
+                return (sealed_or(sealed, load_error_response(e)), record, None);
             }
         };
         watermark_sources.push((wm_url.to_string(), wm_bytes));
@@ -2691,6 +2699,7 @@ async fn serve_miss(
                         busy_response("server busy: AI processing queue is full", 5),
                     ),
                     record,
+                    None,
                 );
             }
         }
@@ -2722,6 +2731,7 @@ async fn serve_miss(
                         busy_response("server busy: video processing queue is full", 5),
                     ),
                     record,
+                    None,
                 );
             }
         }
@@ -2747,6 +2757,7 @@ async fn serve_miss(
                         busy_response("server busy: animation encoding queue is full", 5),
                     ),
                     record,
+                    None,
                 );
             }
         }
@@ -2829,6 +2840,7 @@ async fn serve_miss(
                     },
                 ),
                 record,
+                None,
             );
         }
         Err(ProcessFailure::Panicked) => {
@@ -2839,6 +2851,7 @@ async fn serve_miss(
                     (StatusCode::INTERNAL_SERVER_ERROR, "image processing failed").into_response(),
                 ),
                 record,
+                None,
             );
         }
         Err(ProcessFailure::TimedOut) => {
@@ -2849,6 +2862,7 @@ async fn serve_miss(
                     (StatusCode::GATEWAY_TIMEOUT, "processing timed out").into_response(),
                 ),
                 record,
+                None,
             );
         }
         Err(ProcessFailure::Engine(e)) => {
@@ -2900,12 +2914,21 @@ async fn serve_miss(
                 }
                 None => {
                     record.fail = FailStage::Engine;
-                    return (sealed_or(sealed, engine_error_response(e)), record);
+                    return (sealed_or(sealed, engine_error_response(e)), record, None);
                 }
             }
         }
     };
     record.process = process_start.elapsed();
+    // The validator for this render is a digest of its
+    // bytes, computed once here: it is stored with the
+    // cache entry and returned to the caller, so a hit and
+    // a fresh render answer conditional requests against
+    // the same value, and a re-render under the same key
+    // whose bytes differ (the source changed, the old entry
+    // was purged) answers with a different one instead of
+    // the key's old validator.
+    let render_etag = etag_for_bytes(&processed.bytes);
 
     // Only successful responses are cached; errors never are.
     // Meta responses are not image entries and are not cached.
@@ -2920,6 +2943,7 @@ async fn serve_miss(
             format: processed.format,
             quality: processed.quality,
             groups: groups.clone(),
+            etag: render_etag.clone(),
         };
         state.cache.put(cache_key.clone(), entry.clone());
         if let Some(store) = &state.store {
@@ -3072,7 +3096,11 @@ async fn serve_miss(
             .headers_mut()
             .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     }
-    (response, record)
+    // A meta response serves a document about the render,
+    // not the render: it carries no validator for the
+    // image bytes (and is no-store besides).
+    let render_etag = if meta { None } else { Some(render_etag) };
+    (response, record, render_etag)
 }
 
 /// Pick a format from the client's `Accept` header. Among
@@ -4415,12 +4443,6 @@ fn respond(
     (headers, bytes).into_response()
 }
 
-fn etag_for(cache_key: &str) -> String {
-    use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(cache_key.as_bytes());
-    format!("\"{}\"", hex::encode(&digest[..16]))
-}
-
 fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
     let inm = if_none_match.trim();
     if inm == "*" {
@@ -4696,6 +4718,46 @@ mod tests {
             }
         });
         (format!("http://{addr}/src.png"), hits)
+    }
+
+    fn test_png_red() -> Vec<u8> {
+        let img =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(80, 40, image::Rgb([255, 0, 0])));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    /// Persistent source server whose body can be swapped
+    /// between requests, counting its hits: the origin half
+    /// of a source that changes under a stable URL.
+    async fn spawn_swappable_server(
+        body: Vec<u8>,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let current = Arc::new(std::sync::Mutex::new(body));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = hits.clone();
+        let served = current.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let body = served.lock().unwrap().clone();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        (format!("http://{addr}/src.png"), hits, current)
     }
 
     const TEST_METRICS_TOKEN: &str = "test-metrics-token";
@@ -6075,6 +6137,69 @@ mod tests {
         assert_eq!(header(&plain, "cache-status"), "crabcrop; hit");
         assert_eq!(plain.bytes().await.unwrap(), sealed_bytes);
         assert_eq!(hits2.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_changed_source_rerenders_with_a_new_etag_after_purge() {
+        // The ETag names the rendered bytes, not the cache
+        // key: when the source changes and the entry is
+        // purged, a request revalidating with the previous
+        // ETag must get the new render in full (200, new
+        // bytes, a new ETag), never a 304 for an image it
+        // does not hold.
+        let (src, hits, current) = spawn_swappable_server(test_png()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("300x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let first = client().get(&url).send().await.unwrap();
+        assert_eq!(first.status(), 200);
+        let etag1 = header(&first, "etag");
+        let bytes1 = first.bytes().await.unwrap();
+        // The stored entry validates as usual.
+        let resp = client()
+            .get(&url)
+            .header("if-none-match", etag1.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 304);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The source changes under the same URL, and the
+        // entry is purged.
+        *current.lock().unwrap() = test_png_red();
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("purged 1"));
+        // Revalidating with the previous ETag gets the new
+        // render in full.
+        let second = client()
+            .get(&url)
+            .header("if-none-match", etag1.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 200, "a changed render is never a 304");
+        let etag2 = header(&second, "etag");
+        assert_ne!(etag2, etag1);
+        assert_ne!(second.bytes().await.unwrap(), bytes1);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the purge forced a re-render"
+        );
+        // And the new ETag is the validator now.
+        let resp = client()
+            .get(&url)
+            .header("if-none-match", etag2.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 304);
     }
 
     #[tokio::test]
@@ -9619,15 +9744,6 @@ mod tests {
     }
 
     #[test]
-    fn etag_for_is_a_stable_quoted_digest_of_the_cache_key() {
-        let etag = etag_for("some-cache-key");
-        assert!(etag.starts_with('"') && etag.ends_with('"'));
-        assert_eq!(etag.len(), 34);
-        assert_eq!(etag, etag_for("some-cache-key"));
-        assert_ne!(etag, etag_for("another-cache-key"));
-    }
-
-    #[test]
     fn if_none_match_matching_rules() {
         let etag = "\"abc123\"";
         assert!(if_none_match_matches("\"abc123\"", etag));
@@ -9641,7 +9757,7 @@ mod tests {
 
     #[tokio::test]
     async fn validators_attach_the_etag_and_answer_304_on_a_match() {
-        let etag = etag_for("key");
+        let etag = etag_for_bytes(b"rendered bytes");
         // No conditional header: the ETag is attached and the
         // response is otherwise untouched.
         let mut resp = respond(
@@ -9686,7 +9802,7 @@ mod tests {
 
     #[test]
     fn validators_skip_meta_and_error_responses() {
-        let etag = etag_for("key");
+        let etag = etag_for_bytes(b"rendered bytes");
         // Meta responses are private, no-store: no ETag is
         // attached and a matching conditional never 304s them.
         let mut resp = respond(ImageFormat::Png, None, bytes::Bytes::from(vec![1]), None);

@@ -1,9 +1,13 @@
 //! Server-side result cache: processed responses keyed by the
 //! verified request path.
 //!
-//! Signed URLs are content-addressed and responses are immutable, so
-//! a repeat request can be served from memory safely. The cache is
-//! bounded by total bytes with least-recently-used eviction. Only
+//! A cache key names a request (a transformation of a source
+//! locator), not the bytes it produced: if the source changes,
+//! a re-render under the same key yields different bytes. Each
+//! entry therefore carries the strong ETag of its own bytes,
+//! computed at render time, so conditional requests validate
+//! against what was actually rendered. The cache is bounded
+//! by total bytes with least-recently-used eviction. Only
 //! successful responses are stored; errors are never cached.
 
 use std::collections::HashMap;
@@ -22,6 +26,26 @@ pub struct CachedImage {
     /// preset names its URL referenced, empty for preset-free
     /// requests. Group purge matches on these.
     pub groups: Vec<String>,
+    /// The strong ETag of `bytes`, computed when the render
+    /// was produced and stored with the entry, so a cache hit
+    /// answers conditional requests without rehashing the
+    /// body. Because it derives from the bytes, a re-render
+    /// under the same key whose bytes differ (the source
+    /// changed, the old entry was purged) carries a different
+    /// validator.
+    pub etag: String,
+}
+
+/// The strong ETag for a body of rendered bytes: a quoted
+/// SHA-256 digest truncated to 128 bits, the shape the
+/// validators have always had. It is computed over the bytes
+/// themselves, never over the cache key: a key names a
+/// transformation of a source locator, and the source can
+/// change under it.
+pub(crate) fn etag_for_bytes(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    format!("\"{}\"", hex::encode(&digest[..16]))
 }
 
 /// Whether a cache key's result derives from `source`.
@@ -211,8 +235,10 @@ mod tests {
     use super::*;
 
     fn img(n: usize) -> CachedImage {
+        let bytes = vec![7; n];
         CachedImage {
-            bytes: bytes::Bytes::from(vec![7; n]),
+            etag: etag_for_bytes(&bytes),
+            bytes: bytes::Bytes::from(bytes),
             format: ImageFormat::Png,
             quality: None,
             groups: Vec::new(),
@@ -224,6 +250,15 @@ mod tests {
             groups: groups.iter().map(|g| g.to_string()).collect(),
             ..img(n)
         }
+    }
+
+    #[test]
+    fn etag_for_bytes_is_a_stable_quoted_digest_of_the_bytes() {
+        let etag = etag_for_bytes(b"some rendered bytes");
+        assert!(etag.starts_with('"') && etag.ends_with('"'));
+        assert_eq!(etag.len(), 34);
+        assert_eq!(etag, etag_for_bytes(b"some rendered bytes"));
+        assert_ne!(etag, etag_for_bytes(b"other rendered bytes"));
     }
 
     #[test]

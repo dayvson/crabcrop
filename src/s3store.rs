@@ -789,6 +789,7 @@ mod tests {
             format: ImageFormat::WebP,
             quality: Some(80),
             groups: groups.iter().map(|g| g.to_string()).collect(),
+            etag: crate::cache::etag_for_bytes(bytes),
         }
     }
 
@@ -876,7 +877,7 @@ mod tests {
     async fn oversized_and_poisoned_objects_degrade_to_misses() {
         let fake = start_fake().await;
         let mut s = store(&fake.endpoint);
-        s.max_entry_bytes = 128;
+        s.max_entry_bytes = 256;
         // Under the ceiling, entries round trip as before.
         s.put("small", &image(b"x", &["hero"])).await;
         assert!(s.get("small").await.is_some());

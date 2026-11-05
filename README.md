@@ -73,7 +73,7 @@ GET /<signature>/<operations>/<source-url>
 
 The signature is an HMAC-SHA256 (hex) of everything after it, or the literal `unsafe` on a server that allows it. Operations are zero or more segments, applied in path order. The source is a full URL, a bucket or file locator, or a short `root:` reference the server expands against origins it keeps to itself.
 
-Signed URLs are content addressed. A render is cached under the canonical form of its operations, so equivalent spellings share one entry, and successful responses carry a one year immutable cache lifetime. A `preset:` segment names an operation string held on the server, so templates stay short and the transformation menu stays operator controlled.
+A signed URL names a transformation of a source locator, not the source's contents: the cache key is built from the operations and the locator, so if the image at a source changes, a purged entry re-renders the new image under the same URL. Because successful responses carry a one year immutable cache lifetime, a source that must stay fixed under its URL should be versioned or immutable itself (a content hash in the source path is the usual way). A render is cached under the canonical form of its operations, so equivalent spellings share one entry. A `preset:` segment names an operation string held on the server, so templates stay short and the transformation menu stays operator controlled.
 
 ## One URL, decoded
 
