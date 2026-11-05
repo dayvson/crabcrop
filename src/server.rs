@@ -3256,6 +3256,28 @@ pub struct Annotation {
     pub alt_text: String,
 }
 
+/// Model output the meta path cannot carry honestly
+/// (issue #352): a NaN or infinite score has no JSON
+/// representation, and every composition downstream
+/// (softmax, rounding, ranking) would propagate it
+/// into the response body. A provider answers as a
+/// unit, so one non-finite value rejects the whole
+/// answer as bad model output; the meta helpers then
+/// degrade the section exactly like an inference
+/// failure.
+fn check_finite_scores(
+    producer: &str,
+    values: impl IntoIterator<Item = f32>,
+) -> Result<(), crate::ai::AiError> {
+    if values.into_iter().all(|v| v.is_finite()) {
+        Ok(())
+    } else {
+        Err(crate::ai::AiError::BadOutput(format!(
+            "{producer} produced a non-finite score"
+        )))
+    }
+}
+
 /// The zero-shot logit scale the composition applies to
 /// raw scores before the softmax.
 const TAG_LOGIT_SCALE: f32 = 100.0;
@@ -3336,7 +3358,13 @@ async fn annotate_meta(
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
     let tagger = tagger.clone();
     match tokio::task::spawn_blocking(move || tagger.scores(&img)).await {
-        Ok(Ok(scores)) => Some(compose_annotation(&scores, state.tag_threshold)),
+        Ok(Ok(scores)) => match check_finite_scores("the tagger", scores.iter().map(|s| s.score)) {
+            Ok(()) => Some(compose_annotation(&scores, state.tag_threshold)),
+            Err(e) => {
+                eprintln!("annotation error: {e}");
+                None
+            }
+        },
         Ok(Err(e)) => {
             eprintln!("annotation error: {e}");
             None
@@ -3393,8 +3421,15 @@ async fn detect_meta(
         let provider_img = img.clone();
         match tokio::task::spawn_blocking(move || provider.detect(&provider_img)).await {
             Ok(Ok(detections)) => {
-                any_answered = true;
-                aggregated.extend(detections.into_iter().map(|d| (name.clone(), d)));
+                match check_finite_scores("a detector", detections.iter().map(|d| d.score)) {
+                    Ok(()) => {
+                        any_answered = true;
+                        aggregated.extend(detections.into_iter().map(|d| (name.clone(), d)));
+                    }
+                    Err(e) => {
+                        eprintln!("detection error from {name}: {e}");
+                    }
+                }
             }
             Ok(Err(e)) => {
                 eprintln!("detection error from {name}: {e}");
@@ -3487,7 +3522,20 @@ async fn moderate_meta(
     };
     let provider = provider.clone();
     match tokio::task::spawn_blocking(move || provider.moderate(&img)).await {
-        Ok(Ok(report)) => ModerationMeta::Report(compose_moderation(&report)),
+        Ok(Ok(report)) => match check_finite_scores(
+            "the moderation provider",
+            report
+                .scores
+                .iter()
+                .chain(report.signals.iter())
+                .map(|s| s.score),
+        ) {
+            Ok(()) => ModerationMeta::Report(compose_moderation(&report)),
+            Err(e) => {
+                eprintln!("moderation error: {e}");
+                ModerationMeta::Unavailable("inference_failed")
+            }
+        },
         Ok(Err(e)) => {
             eprintln!("moderation error: {e}");
             ModerationMeta::Unavailable("inference_failed")
@@ -3500,8 +3548,17 @@ async fn moderate_meta(
 }
 
 /// Render a score list the way meta carries it:
-/// `[{"label":...,"score":...}, ...]`.
-fn score_list_json(scores: &[crate::ai::TagScore]) -> String {
+/// `[{"label":...,"score":...}, ...]`. A non-finite
+/// score has no JSON representation, so the list
+/// refuses as a whole (issue #352): the caller
+/// degrades the section rather than emit a malformed
+/// body. The meta helpers reject non-finite model
+/// output before composition, so this is the
+/// serializer's own guard for any future caller.
+fn score_list_json(scores: &[crate::ai::TagScore]) -> Option<String> {
+    if scores.iter().any(|s| !s.score.is_finite()) {
+        return None;
+    }
     let items: Vec<String> = scores
         .iter()
         .map(|s| {
@@ -3512,7 +3569,7 @@ fn score_list_json(scores: &[crate::ai::TagScore]) -> String {
             )
         })
         .collect();
-    format!("[{}]", items.join(","))
+    Some(format!("[{}]", items.join(",")))
 }
 
 /// The embedding field of a meta response that asked
@@ -3558,7 +3615,15 @@ async fn embed_meta(
     };
     let provider = provider.clone();
     match tokio::task::spawn_blocking(move || provider.embed(&img)).await {
-        Ok(Ok(embedding)) => EmbeddingMeta::Report(embedding),
+        Ok(Ok(embedding)) => {
+            match check_finite_scores("the embedding provider", embedding.vector.iter().copied()) {
+                Ok(()) => EmbeddingMeta::Report(embedding),
+                Err(e) => {
+                    eprintln!("embedding error: {e}");
+                    EmbeddingMeta::Unavailable("inference_failed")
+                }
+            }
+        }
         Ok(Err(e)) => {
             eprintln!("embedding error: {e}");
             EmbeddingMeta::Unavailable("inference_failed")
@@ -3633,7 +3698,15 @@ async fn ocr_meta(
     };
     let provider = provider.clone();
     match tokio::task::spawn_blocking(move || provider.recognize_deadline(&img, deadline)).await {
-        Ok(Ok(report)) => OcrMeta::Report(compose_ocr(&report)),
+        Ok(Ok(report)) => {
+            match check_finite_scores("the OCR provider", report.lines.iter().map(|l| l.score)) {
+                Ok(()) => OcrMeta::Report(compose_ocr(&report)),
+                Err(e) => {
+                    eprintln!("OCR error: {e}");
+                    OcrMeta::Unavailable("inference_failed")
+                }
+            }
+        }
         Ok(Err(e)) => {
             eprintln!("OCR error: {e}");
             OcrMeta::Unavailable("inference_failed")
@@ -3679,7 +3752,14 @@ fn compose_aesthetic(state: &AppState, run: Option<&EmbeddingMeta>) -> Option<Ae
     let (model, outcome) = match run {
         Some(EmbeddingMeta::Report(embedding)) => {
             let outcome = match head.score(&embedding.vector) {
-                Some(score) => AestheticOutcome::Score((score * 1000.0).round() / 1000.0),
+                Some(score) if score.is_finite() => {
+                    AestheticOutcome::Score((score * 1000.0).round() / 1000.0)
+                }
+                // A non-finite head score is bad model
+                // output, not a number the response can
+                // carry (issue #352); it degrades like
+                // an inference failure.
+                Some(_) => AestheticOutcome::Unavailable("inference_failed"),
                 None => AestheticOutcome::DimensionMismatch {
                     expected: head.expected_dim(),
                     got: embedding.vector.len(),
@@ -3809,24 +3889,20 @@ fn meta_response(
         body.push_str(",\"sealed\":true");
     }
     if let Some(a) = annotation {
-        let tags: Vec<String> = a
-            .tags
-            .iter()
-            .map(|t| {
-                format!(
-                    "{{\"label\":{},\"score\":{}}}",
-                    serde_json::to_string(&t.label).unwrap_or_default(),
-                    t.score
-                )
-            })
-            .collect();
-        body.push_str(&format!(
-            ",\"tags\":[{}],\"alt_text\":{}",
-            tags.join(","),
-            serde_json::to_string(&a.alt_text).unwrap_or_default()
-        ));
+        // Tags serialize through the same guarded
+        // list as the moderation scores (issue #352):
+        // if a score ever arrived non-finite, the
+        // section omits instead of corrupting the
+        // body, the annotation failure stance.
+        if let Some(tags) = score_list_json(&a.tags) {
+            body.push_str(&format!(
+                ",\"tags\":{},\"alt_text\":{}",
+                tags,
+                serde_json::to_string(&a.alt_text).unwrap_or_default()
+            ));
+        }
     }
-    if let Some(detections) = detections {
+    if let Some(detections) = detections.filter(|ds| ds.iter().all(|(_, d)| d.score.is_finite())) {
         // Each box keeps its original fields and gains a
         // trailing `detector`: the provider that produced
         // it (`builtin`, or a declared detector's name from
@@ -3858,20 +3934,43 @@ fn meta_response(
         // the client opted in by name.
         match moderation {
             ModerationMeta::Report(report) => {
-                body.push_str(&format!(
-                    ",\"moderation\":{{\"model\":{}",
-                    serde_json::to_string(&report.model).unwrap_or_default()
-                ));
-                if !report.scores.is_empty() {
-                    body.push_str(&format!(",\"scores\":{}", score_list_json(&report.scores)));
+                // Each list renders through the guarded
+                // serializer (issue #352): an absent list
+                // is a present section with no field, a
+                // refused list degrades the whole field
+                // to the unavailable form.
+                let scores = if report.scores.is_empty() {
+                    Some(None)
+                } else {
+                    score_list_json(&report.scores).map(Some)
+                };
+                let signals = if report.signals.is_empty() {
+                    Some(None)
+                } else {
+                    score_list_json(&report.signals).map(Some)
+                };
+                match (scores, signals) {
+                    (Some(scores), Some(signals)) => {
+                        body.push_str(&format!(
+                            ",\"moderation\":{{\"model\":{}",
+                            serde_json::to_string(&report.model).unwrap_or_default()
+                        ));
+                        if let Some(scores) = scores {
+                            body.push_str(&format!(",\"scores\":{scores}"));
+                        }
+                        if let Some(signals) = signals {
+                            body.push_str(&format!(
+                                ",\"signals\":{{\"review_only\":true,\"scores\":{signals}}}"
+                            ));
+                        }
+                        body.push('}');
+                    }
+                    _ => {
+                        body.push_str(
+                            ",\"moderation\":{\"available\":false,\"reason\":\"inference_failed\"}",
+                        );
+                    }
                 }
-                if !report.signals.is_empty() {
-                    body.push_str(&format!(
-                        ",\"signals\":{{\"review_only\":true,\"scores\":{}}}",
-                        score_list_json(&report.signals)
-                    ));
-                }
-                body.push('}');
             }
             ModerationMeta::Unavailable(reason) => {
                 body.push_str(&format!(
@@ -3925,7 +4024,15 @@ fn meta_response(
         }
         match &aesthetic.outcome {
             AestheticOutcome::Score(score) => {
-                body.push_str(&format!(",\"score\":{score}"));
+                // The serializer's own guard (issue
+                // #352): a non-finite score degrades to
+                // the unavailable shape rather than
+                // corrupt the body.
+                if score.is_finite() {
+                    body.push_str(&format!(",\"score\":{score}"));
+                } else {
+                    body.push_str(",\"score\":null,\"reason\":\"inference_failed\"");
+                }
             }
             AestheticOutcome::DimensionMismatch { expected, got } => {
                 body.push_str(&format!(
@@ -3938,7 +4045,7 @@ fn meta_response(
         }
         body.push('}');
     }
-    if let Some(score) = processed.ssimulacra2 {
+    if let Some(score) = processed.ssimulacra2.filter(|s| s.is_finite()) {
         body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
     }
     if let Some(facts) = &processed.provenance {
@@ -4186,7 +4293,11 @@ fn meta_response(
         // text content. An unavailable OCR is explicit
         // too, since the client opted in by name.
         match ocr {
-            OcrMeta::Report(report) => {
+            // A report whose line scores are not all
+            // finite falls through to the unavailable
+            // form below (issue #352): the serializer
+            // never writes a non-finite number.
+            OcrMeta::Report(report) if report.lines.iter().all(|l| l.score.is_finite()) => {
                 let lines: Vec<String> = report
                     .lines
                     .iter()
@@ -4215,6 +4326,9 @@ fn meta_response(
                     lines.join(","),
                     serde_json::to_string(&content).unwrap_or_default()
                 ));
+            }
+            OcrMeta::Report(_) => {
+                body.push_str(",\"ocr\":{\"available\":false,\"reason\":\"inference_failed\"}");
             }
             OcrMeta::Unavailable(reason) => {
                 body.push_str(&format!(
@@ -7350,6 +7464,30 @@ mod tests {
         }
     }
 
+    /// A tagger double whose raw scores are not
+    /// finite (issue #352): the composition must
+    /// never see them.
+    #[derive(Debug)]
+    struct NonFiniteTagger;
+
+    impl crate::ai::TagProvider for NonFiniteTagger {
+        fn scores(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<Vec<crate::ai::TagScore>, crate::ai::AiError> {
+            Ok(vec![
+                crate::ai::TagScore {
+                    label: "ocean".to_string(),
+                    score: f32::NEG_INFINITY,
+                },
+                crate::ai::TagScore {
+                    label: "sky".to_string(),
+                    score: 0.05,
+                },
+            ])
+        }
+    }
+
     /// A mask fake: everything is foreground, so a removebg
     /// render keeps the source image.
     #[derive(Debug)]
@@ -7387,7 +7525,7 @@ mod tests {
         }
     }
 
-    async fn spawn_app_with_tagger() -> String {
+    async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> String {
         let state = AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
@@ -7402,7 +7540,7 @@ mod tests {
             inpaint: None,
             segment: None,
             face: None,
-            tagger: Some(Arc::new(FakeTagger)),
+            tagger: Some(tagger),
             tag_threshold: 0.05,
             moderation: None,
             embeddings: None,
@@ -7447,12 +7585,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn meta_non_finite_tag_scores_omit_the_annotation() {
+        // A tagger answering with a non-finite raw
+        // score (issue #352) produced bad model
+        // output: the annotation omits, and the body
+        // still parses as JSON.
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_tagger(Arc::new(NonFiniteTagger)).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(meta.get("tags").is_none());
+        assert!(meta.get("alt_text").is_none());
+    }
+
+    #[tokio::test]
     async fn meta_includes_tags_only_with_a_tagger() {
         let src = spawn_image_server().await;
         let remainder = format!("40x24/{src}");
         let url_path = format!("/{}/{remainder}", sign(&remainder));
         // With a tagger: tags and alt text are present.
-        let base = spawn_app_with_tagger().await;
+        let base = spawn_app_with_tagger(Arc::new(FakeTagger)).await;
         let resp = client()
             .get(format!("{base}{url_path}"))
             .header("Accept", "application/json")
@@ -7513,6 +7673,31 @@ mod tests {
             _img: &image::DynamicImage,
         ) -> Result<crate::ai::ModerationScores, crate::ai::AiError> {
             Err(crate::ai::AiError::Inference("model exploded".to_string()))
+        }
+    }
+
+    /// A moderation double whose output is not
+    /// finite (issue #352): a NaN verdict score and
+    /// an infinite signal.
+    #[derive(Debug)]
+    struct NonFiniteModeration;
+
+    impl crate::ai::ModerationProvider for NonFiniteModeration {
+        fn moderate(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::ModerationScores, crate::ai::AiError> {
+            Ok(crate::ai::ModerationScores {
+                model: "fake-model".to_string(),
+                scores: vec![crate::ai::TagScore {
+                    label: "normal".to_string(),
+                    score: f32::NAN,
+                }],
+                signals: vec![crate::ai::TagScore {
+                    label: "lead".to_string(),
+                    score: f32::INFINITY,
+                }],
+            })
         }
     }
 
@@ -7713,6 +7898,29 @@ mod tests {
         assert_eq!(meta["moderation"]["reason"], "inference_failed");
     }
 
+    #[tokio::test]
+    async fn meta_moderation_non_finite_scores_report_unavailable() {
+        // Non-finite model output (issue #352) is
+        // bad output, not a number: the field reports
+        // unavailable like an inference failure, and
+        // the body parses as JSON (a bare NaN in the
+        // body would fail this parse).
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_moderation(Some(Arc::new(NonFiniteModeration))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; moderation=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["moderation"]["available"], false);
+        assert_eq!(meta["moderation"]["reason"], "inference_failed");
+    }
+
     #[test]
     fn moderation_opt_in_takes_exact_tokens() {
         // The #151 rule, for the moderation parameter.
@@ -7770,6 +7978,31 @@ mod tests {
             _img: &image::DynamicImage,
         ) -> Result<crate::ai::OcrReport, crate::ai::AiError> {
             Err(crate::ai::AiError::Inference("model exploded".to_string()))
+        }
+    }
+
+    /// An OCR double whose line score is not finite
+    /// (issue #352).
+    #[derive(Debug)]
+    struct NonFiniteOcr;
+
+    impl crate::ai::OcrProvider for NonFiniteOcr {
+        fn recognize(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::OcrReport, crate::ai::AiError> {
+            Ok(crate::ai::OcrReport {
+                model: "fake-recognizer".to_string(),
+                language: "en".to_string(),
+                lines: vec![crate::ai::OcrLine {
+                    text: "CRABCROP MARKET".to_string(),
+                    score: f32::INFINITY,
+                    x: 41,
+                    y: 37,
+                    w: 490,
+                    h: 42,
+                }],
+            })
         }
     }
 
@@ -7925,6 +8158,27 @@ mod tests {
     async fn meta_ocr_failure_reports_unavailable() {
         let src = spawn_image_server().await;
         let base = spawn_app_with_ocr(Some(Arc::new(FailingOcr))).await;
+        let remainder = format!("40x24/{src}");
+        let url_path = format!("/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}{url_path}"))
+            .header("Accept", "application/json; ocr=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(meta["ocr"]["available"], false);
+        assert_eq!(meta["ocr"]["reason"], "inference_failed");
+    }
+
+    #[tokio::test]
+    async fn meta_ocr_non_finite_scores_report_unavailable() {
+        // A non-finite line score (issue #352) is
+        // bad model output: the field reports
+        // unavailable and the body parses as JSON.
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_ocr(Some(Arc::new(NonFiniteOcr))).await;
         let remainder = format!("40x24/{src}");
         let url_path = format!("/{}/{remainder}", sign(&remainder));
         let resp = client()
@@ -8174,6 +8428,23 @@ mod tests {
         }
     }
 
+    /// An embedding double whose vector is not
+    /// finite (issue #352).
+    #[derive(Debug)]
+    struct NonFiniteEmbedding;
+
+    impl crate::ai::EmbeddingProvider for NonFiniteEmbedding {
+        fn embed(
+            &self,
+            _img: &image::DynamicImage,
+        ) -> Result<crate::ai::ImageEmbedding, crate::ai::AiError> {
+            Ok(crate::ai::ImageEmbedding {
+                model: "fake-encoder".to_string(),
+                vector: vec![0.5, f32::NAN, 0.25, 0.5],
+            })
+        }
+    }
+
     /// Spawn the app with an embedding provider and,
     /// optionally, an aesthetic head, for the meta
     /// tests (issue #172). Mirrors
@@ -8253,6 +8524,19 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         serde_json::from_str(&resp.text().await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn meta_non_finite_embedding_reports_unavailable() {
+        // A non-finite vector (issue #352) is bad
+        // model output: the embedding reports
+        // unavailable, and meta_with's parse proves
+        // the body is valid JSON.
+        let src = spawn_image_server().await;
+        let base = spawn_app_with_embeddings(Some(Arc::new(NonFiniteEmbedding)), None).await;
+        let meta = meta_with(&base, &src, "application/json; embeddings=1").await;
+        assert!(meta["embedding"].is_null(), "{meta}");
+        assert_eq!(meta["embedding_reason"], "inference_failed");
     }
 
     #[tokio::test]
@@ -8355,6 +8639,35 @@ mod tests {
         assert_eq!(aesthetic["reason"], "inference_failed", "{meta}");
         // No vector, so no encoder identity either.
         assert!(aesthetic.get("model").is_none(), "{meta}");
+    }
+
+    #[test]
+    fn score_list_json_refuses_non_finite_scores() {
+        // The serializer's own guard (issue #352):
+        // finite lists render as before, and any
+        // non-finite score refuses the whole list.
+        let finite = vec![
+            crate::ai::TagScore {
+                label: "a".to_string(),
+                score: 0.5,
+            },
+            crate::ai::TagScore {
+                label: "b".to_string(),
+                score: 0.25,
+            },
+        ];
+        assert_eq!(
+            score_list_json(&finite).as_deref(),
+            Some("[{\"label\":\"a\",\"score\":0.5},{\"label\":\"b\",\"score\":0.25}]")
+        );
+        assert_eq!(score_list_json(&[]).as_deref(), Some("[]"));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let scores = vec![crate::ai::TagScore {
+                label: "a".to_string(),
+                score: bad,
+            }];
+            assert!(score_list_json(&scores).is_none(), "{bad}");
+        }
     }
 
     #[test]
