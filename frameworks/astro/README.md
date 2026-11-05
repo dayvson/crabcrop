@@ -49,7 +49,7 @@ Service config (under `image.service.config`):
 
 ## Presets are the recommended configuration
 
-Define the transform policy as a server-side [preset](../../README.md#presets) (crop, format, quality), name it in the service config, and run the server with `CRABCROP_ALLOW_UNSAFE=1` so the unsigned URLs verify. The service then emits `preset:<name>` plus the geometry Astro asks for, so widths still vary per `srcset` entry while the policy stays on the server, and no secret is needed anywhere. (`CRABCROP_ONLY_PRESETS=1` goes further and rejects the geometry and filters appended after the preset; it fits URLs that carry a preset reference alone.)
+Define the transform policy as a server-side [preset](../../docs/operations.md#presets) (crop, format, quality), name it in the service config, and run the server with `CRABCROP_ALLOW_UNSAFE=1` so the unsigned URLs verify. The service then emits `preset:<name>` plus the geometry Astro asks for, so widths still vary per `srcset` entry while the policy stays on the server, and no secret is needed anywhere. (`CRABCROP_ONLY_PRESETS=1` goes further and rejects the geometry and filters appended after the preset; it fits URLs that carry a preset reference alone.)
 
 ## Transform mapping
 

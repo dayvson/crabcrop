@@ -1,0 +1,50 @@
+# Meta and provenance
+
+## Meta responses
+
+Send `Accept: application/json` with any image URL to get metadata about the processed image instead of the image bytes:
+
+```bash
+curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
+```
+
+```json
+{"width":300,"height":200,"format":"jpeg","bytes":18234,"source_width":1200,"source_height":800}
+```
+
+| Field | Description |
+| --- | --- |
+| `width`, `height` | Output dimensions in pixels. |
+| `format` | Output format: `jpeg`, `png`, `webp`, `jxl`, `avif`, or `gif`. |
+| `bytes` | Size of the processed image in bytes. |
+| `source_width`, `source_height` | Source dimensions in pixels, after EXIF orientation. |
+| `ssimulacra2` | The verified perceptual score of the output, present when `quality(auto)` verified a JPEG or JPEG XL encode. 100 is identical. |
+| `studio` | Present when a `studio(...)` filter ran, with a `mode` (`product` or `scene`). Product runs report the resolved backdrop (`bg`, spelled `#rrggbb`, or `none` for transparency) and its source (`bg_from`: `argument`, `brand`, or `default`), the `shadow` and `pad` applied. Scene runs report the `pad` and a `scene` object: the winning `subject` box (or `null`), the candidate `subjects` count, the `crop` window applied, the per-channel `levels` stretch, and the `saturation` factor. Both report the expansion `steps` that ran, the `fallbacks` taken, and `mask_confidence` when the mask provider exposes one. See [Studio mode](filters.md#studio-mode). |
+| `video` | Present when the source was a video and a `frame:` segment selected the frame: the video stream's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. See [Video frames](media.md#video-frames). |
+| `pdf` | Present when the source was a PDF and a `page:` segment selected the page: the document's `pages` count, the `page` rendered, and the page size as `page_width` and `page_height` in points. See [PDF pages](media.md#pdf-pages). |
+| `provenance` | The C2PA facts for this render: whether output signing is configured on this server (`signing_configured`), and a summary of the manifest the source carried and the manifest the output carries (`source` and `output`, each `null` when the asset carries none, else `{state, signer, manifests, ingredients}` with `state` one of `valid`, `trusted`, `invalid`). See [Provenance (C2PA)](#provenance-c2pa). |
+
+Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other.
+
+Add the `placeholders` parameter to the media type to also get placeholder data, computed from the final processed pixels. The parameter opts in when it is bare (`; placeholders`), set to `1`, or set to `true` (case-insensitive); any other value, including `0` and `false`, does not. The `detections` parameter below follows the same rule. On the CLI, `crabcrop meta --placeholders` and `crabcrop meta --detections` set them for you:
+
+```bash
+curl -H "Accept: application/json; placeholders=1" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
+```
+
+This adds four fields: `dominant_color`, the image's average color as `#rrggbb`; `placeholder`, a 16 px-wide blurred JPEG preview as a base64 data URI; `palette`, the five most prominent colors as `#rrggbb`, most prominent first; and `thumbhash`, a ThumbHash string that ThumbHash client libraries decode into an aspect-correct blurred preview. Handy for rendering a preview while the real image loads. When a CLIP model is configured (see [AI features](ai-features.md#ai-features)), meta responses also carry `tags` (labels with zero-shot scores) and `alt_text` composed from the best labels, whether or not placeholders were asked for. With a detection model configured, adding `detections=1` to the same `Accept` entry adds `detections`: the objects found in the processed image as `{label, score, x, y, w, h, detector}` in pixels, best first per detector; `detector` names the provider that produced the box (`builtin`, or a declared detector's name, see [Declared detectors](ai-features.md#declared-detectors)). With moderation configured (see [AI features](ai-features.md#ai-features)), adding `moderation=1` to the same `Accept` entry adds `moderation`: the configured model's per-category verdict scores as `{model, scores: [{label, score}]}`, or, when only a labels file is configured, zero-shot `signals` scored by CLIP and marked `review_only`, because signals are leads for review, never verdicts. When the opt-in cannot be answered (nothing configured, a busy inference gate, a failed run), the field reports `{"available": false, "reason": ...}` and the meta request still succeeds. Verdicts annotate meta only: no score ever changes what the image URL serves. With a CLIP model configured, adding `embeddings=1` to the same `Accept` entry adds the tagger's image embedding: `embedding`, the vector packed as float16 little-endian and base64-encoded, with `embedding_model`, `embedding_dim`, `embedding_encoding` (`f16le-base64`), and `embedding_normalized: true` alongside, so a stored vector stays interpretable after the encoder is swapped. When that opt-in cannot be answered, `embedding` is `null` with an `embedding_reason`, and the meta request still succeeds. With `CRABCROP_AESTHETIC_HEAD` set (see [AI features](ai-features.md#ai-features)), meta responses also carry `aesthetic`: the head's score of that same embedding as `{head, model, score}`, or a `null` score with a reason when the head and the encoder disagree on dimension (the field then names `expected` and `got`) or no vector could be produced. The aesthetic score is descriptive only: it never gates, ranks, or alters what a URL serves. With OCR configured (see [AI features](ai-features.md#ai-features)), adding `ocr=1` to the same `Accept` entry adds `ocr`: the text read from the processed image as `{model, language, text: [{text, score, x, y, w, h}], text_content}`, the lines in reading order with their boxes in the image's pixels and a confidence score each, plus the lines joined into one `text_content`. `model` names the recognition model (it fixes the script the text is read in) and `language` is the operator-declared language that model serves, so the field describes itself. When the opt-in cannot be answered (nothing configured, a busy inference gate, a failed run), the field reports `{"available": false, "reason": ...}` like the moderation field, and the meta request still succeeds. The text annotates meta only: an OCR request builds and caches exactly the image entry any other request for the URL would, byte for byte. All of the annotation sections share one deadline, the `CRABCROP_PROCESS_TIMEOUT_SECS` budget: a section that has not answered when it passes is left out (tags, detections) or reports `{"available": false, "reason": "timed_out"}` (moderation, embedding, OCR), the response goes out with the sections that made it, and OCR returns the lines it read before the deadline rather than none. Meta requests are never cached. One refusal: a meta request on a video URL answers `400`, because a video result is not an image (see [Video output](media.md#video-output)). Errors in meta mode keep the usual status codes, and grammar failures answer with the JSON error envelope described in [Errors](responses.md#errors).
+
+## Provenance (C2PA)
+
+Crabcrop reads and writes [C2PA](https://c2pa.org/) Content Credentials. Two halves, independently useful:
+
+**Verify, always on.** Every meta response carries a `provenance` object reporting what the source asset carried: whether it has a manifest, whether that manifest validates (`valid`, `trusted`, or `invalid`), who signed it, and how the store is composed. No configuration is needed, and verification runs on the c2pa-rs 0.91 line, the first that enforces the specification's exclusion rules.
+
+**Sign, when you configure an identity.** Set `CRABCROP_C2PA_CERT` and `CRABCROP_C2PA_KEY` to a PEM certificate chain and its private key, and still JPEG, PNG, WebP, and AVIF outputs are signed as they are produced. A manifest cannot survive a transform byte for byte (decoding and re-encoding drop the segments it lives in), so the source itself is recorded in the output's manifest as a parent ingredient: its hash, and its own manifest store whenever it carries one, so the chain stays walkable end to end. Video and PDF sources are the exception: a frame or page render starts a fresh chain, and no source ingredient is recorded for them. Outputs of the AI edits (background removal, studio mode, region removal, upscale, class and face edits) record the edit with the IPTC `compositeWithTrainedAlgorithmicMedia` source type. GIF, JPEG XL, video, and animated WebP outputs are served unsigned in this version.
+
+The identity is yours, like the models and the secret: the server holds no certificate of its own. It is proven at boot with a sign-and-verify round trip, so a broken identity (a bare self-signed certificate, a key that does not match, a chain outside the C2PA certificate profile) is a startup error with the reason named, never a first-request surprise. `CRABCROP_C2PA_TSA_URL` optionally adds a timestamp authority.
+
+Two honesty rules, stated plainly:
+
+- A valid credential proves **origin, not untouched pixels**. It attests that this server produced the output from the ingredient it names, under the identity that signed it. It does not claim the image is unedited; the manifest itself records that it was transformed.
+- Whether verifiers call the result **trusted** depends on your certificate, not on this software. A chain issued by a CA on the C2PA trust list (commercial CAs sell these, and at least one offers a free tier) reads as trusted. A private CA chain signs and validates, and verifiers show it as valid but not trusted, with the signer named. Both are useful; pick with your eyes open.

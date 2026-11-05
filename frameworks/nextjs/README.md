@@ -26,7 +26,7 @@ export default {
 
 ## Presets are the recommended configuration
 
-A custom loader also runs in the browser, where a secret must never ship. Define the transform policy as a server-side [preset](../../README.md#presets) (crop, format, quality) and set `NEXT_PUBLIC_CRABCROP_PRESET` to its name; run the server with `CRABCROP_ALLOW_UNSAFE=1` so the unsigned URLs verify. The loader then emits `preset:<name>` plus the `{width}x0` sizing `next/image` asks for per srcset entry, so widths still vary while the policy stays on the server. (`CRABCROP_ONLY_PRESETS=1` goes further and rejects the sizing appended after the preset; it fits URLs that carry a preset reference alone.)
+A custom loader also runs in the browser, where a secret must never ship. Define the transform policy as a server-side [preset](../../docs/operations.md#presets) (crop, format, quality) and set `NEXT_PUBLIC_CRABCROP_PRESET` to its name; run the server with `CRABCROP_ALLOW_UNSAFE=1` so the unsigned URLs verify. The loader then emits `preset:<name>` plus the `{width}x0` sizing `next/image` asks for per srcset entry, so widths still vary while the policy stays on the server. (`CRABCROP_ONLY_PRESETS=1` goes further and rejects the sizing appended after the preset; it fits URLs that carry a preset reference alone.)
 
 Without a preset, the loader emits `{width}x0` and maps the `quality` prop to `filters:quality(...)`; sign with `CRABCROP_SECRET` for server-rendered calls if your deployment requires signatures.
 

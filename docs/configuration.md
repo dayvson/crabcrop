@@ -1,0 +1,95 @@
+# Configuration
+
+All configuration comes from environment variables. Invalid values are startup errors, booleans included, the server refuses to start rather than run with a wrong port, cache budget, or safety flag. Boolean variables accept `1`, `true`, `yes`, `on` (any case) for on and `0`, `false`, `no`, `off` for off; anything else fails the boot with the variable named. Names follow one pattern: `*_MODEL` is an AI model artifact, `*_FILE` is a file read at boot, `*_DIR` is a directory, and `*_MAX_MB` is a size budget in megabytes.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CRABCROP_SECRET` | required | The HMAC secret used to verify signed URLs, at least 16 bytes. The server will not start without it. |
+| `CRABCROP_SECRET_KEY_ID` | `current` | The current secret's key ID, named by keyed signature segments (`<key-id>:<tag>`). |
+| `CRABCROP_SECRET_PREVIOUS` | unset | The outgoing secret during a rotation window; the server verifies it alongside the current one. Same minimum length. |
+| `CRABCROP_SECRET_PREVIOUS_KEY_ID` | `previous` | The previous secret's key ID. Must differ from the current one. |
+| `CRABCROP_METRICS_TOKEN` | unset | Bearer token for `GET /metrics`. Unset, `/metrics` answers `403` to everyone; set, the request must carry `Authorization: Bearer <token>`, and a missing or wrong token answers `401`. |
+| `CRABCROP_DEFAULT_OPS` | unset | Operations prepended to every request (a house format, quality, or watermark), validated at boot. See [Server-wide default operations](#server-wide-default-operations). |
+| `PORT` | `3000` | Listen port. `CRABCROP_PORT` is the namespaced alias and wins when both are set. |
+| `CRABCROP_ALLOW_UNSAFE` | off | Honors `unsafe` URLs (for the boolean spellings, see above). |
+| `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
+| `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
+| `CRABCROP_METADATA` | `strip` | `preserve` copies source EXIF/XMP (and IPTC for JPEG) into JPEG and PNG outputs; see [Color management and metadata](responses.md#color-management-and-metadata). |
+| `CRABCROP_WIDTH_STEP` | `100` | Quantization step in pixels for width client hints: hinted widths round up to a multiple of this. |
+| `CRABCROP_AVIF_SPEED` | `9` | ravif speed tier for AVIF encodes, 1 (slowest, smallest output) to 10 (fastest). At 800w and quality 80, the default speed 9 encodes about 1.8x faster than speed 8 for about 15% more bytes; speed 10 is roughly 3x quicker than speed 8 for about 44% more bytes. Set 8 for the smallest files of the fast tiers. |
+| `CRABCROP_JXL_SPEED` | `fastest` | jixel speed tier for JPEG XL encodes: `ultrafast`, `fastest`, `fast`, `medium`, `slow`, or `extraslow`. The default `fastest` encodes about 2x faster than `fast` for about 18% more bytes at 800w. Slower tiers shrink output with steep latency costs (`slow` is about 8x the latency of `fast` for about 18% fewer bytes at 800w). |
+| `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](operations.md#presets). |
+| `CRABCROP_ONLY_PRESETS` | off | Rejects free-form operations in requests; only preset references (and `exp:` / `maxage:` metadata) are allowed. Requires at least one preset. |
+| `CRABCROP_SOURCE_ROOTS_FILE` | unset | Path to a source roots file. See [Source roots](url-grammar.md#source-roots). |
+| `CRABCROP_ALLOWED_SOURCES` | unset (no allowlist) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. A listed host is exempt from the non-public address refusal in the next row. |
+| `CRABCROP_BLOCK_PRIVATE_SOURCES` | on | Refuses sources whose host is, or resolves to, a non-public address: loopback, private, link-local, unspecified, shared (CGNAT), reserved, multicast, broadcast, documentation, benchmarking, and the other special-purpose ranges, including IPv4-mapped, IPv4-compatible, and 6to4 spellings of them. Checked before connecting and again on every redirect hop. Allowlisted hosts are exempt. |
+| `CRABCROP_ALLOW_ANY_SOURCE` | off | Deliberately allows every source: switches the non-public address refusal off. A configured allowlist still applies. |
+| `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |
+| `CRABCROP_GCS_ENDPOINT` | `https://storage.googleapis.com` | Base URL of the GCS XML API for `gs://` sources. `CRABCROP_GCS_REGION` (default `auto`) is the signing region; the HMAC pair is `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY`. |
+| `CRABCROP_ALLOWED_BUCKETS` | unset | Comma-separated bucket names the `s3://` and `gs://` schemes may read; `*` allows all. Unset refuses every bucket fetch, with or without credentials; with bucket credentials configured the server also refuses to boot without it. |
+| `CRABCROP_FILE_ROOT` | unset | Directory that `file://` sources must stay under, canonicalized at boot and per request. Unset disables file sources. |
+| `CRABCROP_REMOVEBG_MODEL` | unset | Path to a U²-Net-family ONNX model for the `removebg` filter. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_BRAND_COLOR` | unset | Brand color for `studio(...)` composites, six hex digits (a leading `#` is allowed). An unnamed backdrop and `bg:brand` resolve to it; unset means white. Changing it starts a fresh cache epoch, like the other output-shaping settings. See [Studio mode](filters.md#studio-mode). |
+| `CRABCROP_UPSCALE_MODEL` | unset | Path to a super-resolution ONNX model for the `upscale` filter. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_INPAINT_MODEL` | unset | Path to a LaMa-family ONNX model (image plus mask inputs, fixed 512×512) for the `remove_region` filter. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_SEGMENT_ENCODER_MODEL` / `CRABCROP_SEGMENT_DECODER_MODEL` | unset | A MobileSAM ONNX pair (image encoder, box-prompt decoder) for mask-tight class operations. Both paths are required together. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_FACE_MODEL` | unset | Path to a YuNet ONNX model for face-aware `smart` crops, `crop:...:face`, and the face redaction filters. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_CLIP_IMAGE_MODEL` / `CRABCROP_CLIP_TEXT_MODEL` | unset | A CLIP ONNX model pair for meta `tags` and `alt_text`. All four CLIP paths are required together. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_CLIP_TOKENIZER` | unset | The CLIP export's `tokenizer.json`. |
+| `CRABCROP_CLIP_LABELS` | unset | Text file with one tag label per line. |
+| `CRABCROP_CLIP_THRESHOLD` | `0.05` | Minimum zero-shot score for a label to appear in `tags`. |
+| `CRABCROP_MODERATION_MODEL` | unset | Path to a ViT classifier ONNX model (the Falconsai nsfw_image_detection shape) for meta moderation verdicts. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_MODERATION_LABELS` | unset | Text file with one label per line: the verdict model's output names (in output order) when a model is set, or zero-shot prompt labels for the CLIP fallback when it is not. |
+| `CRABCROP_AESTHETIC_HEAD` | unset | Path to a LAION-style linear aesthetic head (the PyTorch save) scored against the CLIP embedding in meta. Requires the `CRABCROP_CLIP_*` set. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_OCR_DETECT_MODEL` / `CRABCROP_OCR_RECOGNIZE_MODEL` | unset | A PP-OCR-family ONNX model pair (DB detection plus CTC recognition) for meta OCR text. All three OCR paths are required together. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_OCR_DICT` | unset | The recognition model's character dictionary: one character per line, in class order. |
+| `CRABCROP_OCR_LANGUAGE` | `und` | The language tag the recognition model serves, echoed in meta OCR responses. |
+| `CRABCROP_DETECT_MODEL` | unset | Path to a YOLOv8-family ONNX model for `blurclass` / `pixelateclass` / `recolorclass` and meta detections. Operator-supplied; Ultralytics' own YOLO weights are AGPL-3.0. See [AI features](ai-features.md#ai-features). |
+| `CRABCROP_DETECT_LABELS` | unset | Class names file (one per line, in index order) for detection exports that carry no `names` metadata. |
+| `CRABCROP_DETECT_THRESHOLD` | `0.5` | Minimum detection score. |
+| `CRABCROP_DETECTORS_FILE` | unset | Path to a JSON file declaring additional detectors (`boxes` and `focal` contracts) from your own models. See [Declared detectors](ai-features.md#declared-detectors). |
+| `CRABCROP_ORT_DYLIB` | unset | Path to the ONNX Runtime shared library, when it is not on the library search path. |
+| `CRABCROP_FONT_PATH` | unset | Path to a TTF/OTF font for the `text(...)` overlay filter, loaded at startup. Unset disables the filter. |
+| `CRABCROP_VIDEO_ENCODER` | unset | Path to the external video encoder program for `format(mp4)` / `format(webm)`, validated at startup. Unset disables video output. See [Video output](media.md#video-output). |
+| `CRABCROP_VIDEO_DECODER` | unset | Path to the external video decoder program for `frame:` extraction from video sources, validated at startup. Unset disables frame selection. See [Video frames](media.md#video-frames). |
+| `CRABCROP_PROCESS_TIMEOUT_SECS` | `30` | Hard wall-clock limit on processing one request, 1 to 600 seconds. The limit starts when the process phase does, so the gate waits and the run share one budget. A request that exceeds it answers `504`, at the limit plus a two-second grace at the latest, and releases its processing lane at once; chunked encode loops (animated frames, quality ladders) check the limit inside the encode, and a single encoder call that cannot be interrupted is detached and aborts at the first check after it returns. An AI run is the one exception to the instant release: a model run cannot be interrupted, so the run keeps its AI gate slot until the inference itself finishes, and new AI work sheds at the gate while it drains instead of stacking onto a session that is still busy. |
+| `CRABCROP_SLOW_LANE_PERMITS` | `1` | Size of the slow lane, 1 to 64: how many long-running renders may run at once on permits stills never use. Animated WebP encodes and the external-tool work behind the video gate (video encodes, `frame:` extractions, `page:` renders) draw from this lane instead of the stills process gate, so a saturated slow lane cannot slow or shed a still render at all; slow-lane overflow waits up to 10 seconds, then sheds with a `503` and `Retry-After`, and never spills onto the stills lane. The default 1 suits a small host (one long encode at a time, a core and the whole stills lane left for stills); raise it on larger hosts that run video or animation traffic in parallel. `/metrics` reports both lanes as `crabcrop_lane_in_use` against `crabcrop_lane_capacity` (`lane="process"` and `lane="slow"`). |
+| `CRABCROP_VIDEO_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external video tool run (one encode, or one frame probe/extraction), 1 to 600 seconds. |
+| `CRABCROP_PDF_RENDERER` | unset | Path to the external PDF renderer program for `page:` rendering from PDF sources (its `pdfinfo` sibling is derived and validated alongside), validated at startup. Unset disables page selection. See [PDF pages](media.md#pdf-pages). |
+| `CRABCROP_C2PA_CERT` | unset | Path to a PEM certificate chain: the C2PA signing identity for output provenance. Set together with `CRABCROP_C2PA_KEY`; a partial set is a startup error, and the identity is proven at boot. Unset disables output signing. See [Provenance (C2PA)](meta.md#provenance-c2pa). |
+| `CRABCROP_C2PA_KEY` | unset | Path to the private key for `CRABCROP_C2PA_CERT`, in PKCS#8 PEM form (`BEGIN PRIVATE KEY`; convert a traditional key with `openssl pkcs8 -topk8 -nocrypt`). |
+| `CRABCROP_C2PA_TSA_URL` | unset | Optional timestamp authority URL recorded in output signatures. Requires the certificate pair. |
+| `CRABCROP_PDF_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external PDF tool run (one probe or one page render), 1 to 600 seconds. |
+| `CRABCROP_VIDEO_MAX_MB` | `64` | Output cap per video encode in megabytes, 1 to 1024. The encode aborts the moment it is crossed. |
+| `CRABCROP_FALLBACK_IMAGE` | unset | URL or local file path of the fallback image served when a source cannot be fetched or decoded. See [Fallback image](responses.md#fallback-image). |
+| `CRABCROP_RESULT_STORAGE_DIR` | unset | Directory for the disk-backed result store. Unset disables the second cache tier. |
+| `CRABCROP_RESULT_BUCKET` | unset | S3 bucket for the shared result store (multi-replica third tier). Unset disables it. |
+| `CRABCROP_RESULT_PREFIX` | empty | Object prefix namespacing the shared result store's entries. |
+| `CRABCROP_RESULT_STORAGE_MAX_MB` | `512` | Disk result store budget in megabytes. `0` disables storage even with a directory set. |
+| `CRABCROP_UPLOAD_DIR` | unset | Local directory destination for the upload endpoint. Exactly one of this and `CRABCROP_UPLOAD_BUCKET` may be set; neither disables uploads (the route is a 404). Also becomes the `file://` source root when no `CRABCROP_FILE_ROOT` is set, and must sit under one that is. See [Upload an original](endpoints.md#upload-an-original). |
+| `CRABCROP_UPLOAD_BUCKET` | unset | S3 bucket destination for the upload endpoint, reusing the source S3 endpoint, region, and ambient AWS credentials. |
+| `CRABCROP_UPLOAD_PREFIX` | empty | Object prefix namespacing the upload bucket's objects. |
+| `CRABCROP_UPLOAD_MAX_MB` | `10` | Cap on one upload in megabytes, 1 to 10 (the source fetch cap: a stored original must stay servable). |
+| `CRABCROP_UPLOAD_ALLOW_OVERWRITE` | off | Lets an upload `PUT` replace an existing object. Off, an existing name is a `409`. |
+
+With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves each host that is not on the allowlist to check its addresses and pins the connection to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
+
+### Server-wide default operations
+
+`CRABCROP_DEFAULT_OPS` holds an operations string (the same grammar as a URL's operations, `preset:` references included) that the server prepends to every request, for a house format, quality, or watermark you do not want baked into every URL. The decisions, once:
+
+- **The signature never covers the defaults.** They are operator configuration, applied after verification, like preset expansion.
+- **Defaults sit before the URL's own operations**, and for the singleton directives (format, quality, fill, dpr, max_bytes) the URL wins by the default being dropped from the merged list. A bare request under defaults and the same request spelled out in full therefore produce the same operations and share a cache entry. Everything else (sizes, filters, watermarks) applies from both, in order: a default blur and a URL blur stack.
+- **Cache entries key on the merged operations**, exactly like presets, so changing the defaults changes the keys and old entries age out unused. Purges account for the merge too: purging a URL removes its merged entry.
+- **Presets-only mode is unaffected in what it rejects** (the URL's own operations), and the defaults still apply: they are not URL content.
+- Cache groups stay the URL's own presets; a preset referenced only by the defaults does not join entries to its group.
+
+### Rotating the secret
+
+Rotation never invalidates a URL that is already in the wild, in three steps:
+
+1. **Open the window.** Generate the new secret. Set `CRABCROP_SECRET` to it with `CRABCROP_SECRET_KEY_ID` naming it (say `2026-10`), and move the outgoing secret to `CRABCROP_SECRET_PREVIOUS` with `CRABCROP_SECRET_PREVIOUS_KEY_ID` naming it (say `2026-08`). Restart. The server now verifies both keys: a URL whose signature segment carries a key ID (`2026-08:<tag>`) is checked against that key only, and a URL with no ID is checked against both, so everything minted before key IDs existed keeps working too. Purge signatures route the same way.
+2. **Mint with the new key.** Point your builders at the new secret and stamp its ID: `buildURL(..., { keyId: "2026-10" })` in TypeScript, `build_url(..., key_id="2026-10")` in Python, `sign_with_key_id` / `build_url_with_key_id` in Rust, or `crabcrop sign --key-id 2026-10` on the CLI. New cache entries accumulate under the new key from here on.
+3. **Close the window.** When the old key's URLs have aged out of your caches and pages (the result cache's `max-age` is one year, but in practice your own TTLs and page lifetimes govern), remove `CRABCROP_SECRET_PREVIOUS` and restart. From that moment the old secret verifies nothing: its remaining URLs answer `403`, which is the point of rotating.
+
+An unknown key ID is indistinguishable from a bad signature, by design: `403`, no hint about which IDs exist.

@@ -1,0 +1,17 @@
+# Clients and SDKs
+
+The URL grammar and signing scheme are specified in [`spec/url-signing.md`](../spec/url-signing.md), with a canonical set of test vectors in [`spec/test-vectors.json`](../spec/test-vectors.json) that every implementation runs as its test suite. Builders on top of the spec:
+
+- **Rust**: the `crabcrop-url` crate in this workspace (`crates/crabcrop-url`) with `sign`, `verify`, `build_url`, `build_srcset`, and the purge helpers `purge_signature` and `purge_group_signature`. The server verifies with this same crate, so client and server cannot drift.
+- **TypeScript**: [`sdks/typescript`](../sdks/typescript), `@crabcrop/url`, with `sign`, `verifyUrlSignature`, `buildURL`, `buildSrcSet`, `purgeSignature`, and `purgeGroupSignature`, plus typed operation builders (`ops`, `filter`) that validate against the grammar and compile to the same canonical strings. Standard library only; tests run on `node --test`.
+- **Python**: [`sdks/python`](../sdks/python), `crabcrop_url`, with `sign`, `verify`, `build_url`, `build_srcset`, `purge_signature`, and `purge_group_signature`. Standard library only, except that sealing needs the `crabcrop-url[seal]` extra; tests run on `python3 -m unittest`.
+
+All three take an optional expiry (emitted as a leading `exp:` segment) and a null secret for the `unsafe` form used by unsafe and presets-only deployments.
+
+Framework integrations in [`frameworks/`](../frameworks) sit on the TypeScript builder: a [Next.js](../frameworks/nextjs) custom loader for `next/image`, a [Nuxt](../frameworks/nuxt) provider for `@nuxt/image`, a [Hydrogen](../frameworks/hydrogen) loader for external (non-Shopify-CDN) images, an [Astro](../frameworks/astro) image service for `astro:assets`, and a [SvelteKit](../frameworks/sveltekit) loader factory for components and load functions. All five recommend presets as the configuration, so client-side URL building never needs the secret.
+
+A [WordPress plugin](../plugins/wordpress) rewrites a WordPress site's media URLs (featured images, post content, and srcset) to a self-hosted instance, with WordPress sizes mapped to transforms. Presets-only mode is the recommended configuration there too: the plugin builds `unsafe` preset URLs for an instance running `CRABCROP_ONLY_PRESETS=1` with `CRABCROP_ALLOW_UNSAFE=1`, so no secret ever lives in WordPress; an optional signed mode instead signs per-size operations with a secret held in the plugin settings. Its PHP URL builder runs the same spec test vectors as every other implementation.
+
+The [playground](../playground) is a static page (no build step, no server state) for building, signing, previewing, and debugging URLs in the browser: the secret never leaves the page, signatures verify locally, and pasted URLs are explained segment by segment with errors highlighted.
+
+For coding agents, [`sdks/mcp`](../sdks/mcp) is a first-party MCP server (stdio; it bundles the `@crabcrop/url` SDK it is built on) exposing `sign_url`, `explain_url`, `fetch_meta`, and `purge_result` over the same SDK and HTTP surface, configured with `CRABCROP_BASE` / `CRABCROP_SECRET`. Client setup snippets are in its README.
