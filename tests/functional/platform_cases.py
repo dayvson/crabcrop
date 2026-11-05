@@ -182,12 +182,12 @@ def preset_maxage():
 
 
 def boot_with_presets(fname):
-    # The opt-in keeps the boot's only failure the
-    # definition under test: these cells exercise preset
-    # validation, not the source posture.
+    # These cells exercise preset validation, not the
+    # source posture: boot sets no posture configuration,
+    # so the definition under test is the boot's only
+    # failure.
     env = dict(os.environ, CRABCROP_SECRET=SECRET, CRABCROP_PORT=str(PORTS["BOOT"]),
                CRABCROP_PRESETS_FILE=os.path.join(FUNC_DIR, "badpresets", fname),
-               CRABCROP_ALLOW_ANY_SOURCE="1",
                NO_PROXY="127.0.0.1,localhost")
     logf = open(os.path.join(OUT, "logs", f"boot-{fname}.log"), "w")
     p = subprocess.Popen([BIN], env=env, stdout=logf, stderr=subprocess.STDOUT)
@@ -372,11 +372,10 @@ def roots_explain():
 
 
 def boot_with_roots(fname):
-    # Same opt-in as the preset boots: the roots
-    # validation is the failure under test.
+    # Same as the preset boots: the roots validation is
+    # the failure under test.
     env = dict(os.environ, CRABCROP_SECRET=SECRET, CRABCROP_PORT=str(PORTS["BOOT"]),
                CRABCROP_SOURCE_ROOTS_FILE=os.path.join(FUNC_DIR, "badroots", fname),
-               CRABCROP_ALLOW_ANY_SOURCE="1",
                NO_PROXY="127.0.0.1,localhost")
     logf = open(os.path.join(OUT, "logs", f"boot-roots-{fname}.log"), "w")
     p = subprocess.Popen([BIN], env=env, stdout=logf, stderr=subprocess.STDOUT)

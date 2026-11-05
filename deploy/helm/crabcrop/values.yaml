@@ -49,9 +49,8 @@ onlyPresets: false
 #   env:
 #     CRABCROP_CACHE_MAX_MB: "512"
 #     CRABCROP_METADATA: "preserve"
-# The one default below is the evaluation source posture:
-# boot refuses to run with none at all (see the README's
-# Configuration section).
+# The one default below is the evaluation source posture
+# (see the README's Configuration section).
 env:
   CRABCROP_BLOCK_PRIVATE_SOURCES: "1"
 

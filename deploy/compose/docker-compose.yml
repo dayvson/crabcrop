@@ -22,9 +22,8 @@ services:
     environment:
       CRABCROP_SECRET: "${CRABCROP_SECRET:?CRABCROP_SECRET must be set to a signing secret of 16+ bytes (see README.md)}"
       # The evaluation posture: any public source, nothing
-      # that resolves to a non-public address. Boot refuses
-      # to run with no posture at all (see the README's
-      # Configuration section).
+      # that resolves to a non-public address (see the
+      # README's Configuration section).
       CRABCROP_BLOCK_PRIVATE_SOURCES: "1"
       CRABCROP_CACHE_MAX_MB: "256"
     # Presets: drop a presets file next to this compose file

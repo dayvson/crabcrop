@@ -139,9 +139,13 @@ impl MediaAdmission {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourcePolicy {
     /// Host suffixes an URL's host must match (exactly, or as a
-    /// subdomain). Empty means no allowlist.
+    /// subdomain). Empty means no allowlist. A listed host is
+    /// exempt from the private-address check: the allowlist is
+    /// how an operator vouches for a loopback or internal
+    /// source.
     pub allowed_suffixes: Vec<String>,
-    /// Refuse hosts resolving to non-public addresses.
+    /// Refuse hosts resolving to non-public addresses, except
+    /// allowlisted hosts.
     pub block_private: bool,
 }
 
@@ -773,18 +777,23 @@ impl Loader {
         let host = url
             .host_str()
             .ok_or_else(|| LoadError::Forbidden("source URL has no host".to_string()))?;
-        if !self.policy.allowed_suffixes.is_empty()
-            && !self
-                .policy
-                .allowed_suffixes
-                .iter()
-                .any(|s| suffix_matches(host, s))
-        {
+        let allowlisted = self
+            .policy
+            .allowed_suffixes
+            .iter()
+            .any(|s| suffix_matches(host, s));
+        if !self.policy.allowed_suffixes.is_empty() && !allowlisted {
             return Err(LoadError::Forbidden(format!(
                 "host {host} is not an allowed source"
             )));
         }
-        if self.policy.block_private {
+        // An allowlisted host is the operator's exception:
+        // listing a host is how a deployment vouches for a
+        // loopback or internal source, so the private-address
+        // check (and the connection pinning that comes with
+        // it) applies to every host the operator has not
+        // listed.
+        if self.policy.block_private && !allowlisted {
             // IPv6 literals arrive bracketed from the URL parser.
             let bare = host.trim_start_matches('[').trim_end_matches(']');
             let ips: Vec<IpAddr> = match bare.parse::<IpAddr>() {
@@ -1610,6 +1619,43 @@ mod tests {
         // server is still there for an unblocked loader.
         let open = Loader::with_defaults().unwrap();
         assert!(fetch(&open, &base).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn allowlisted_hosts_are_exempt_from_private_blocking() {
+        // The allowlist is the operator's exception path: a
+        // listed host may resolve to a non-public address
+        // even with private blocking on (loopback and
+        // internal sources are the point of listing them).
+        let base = spawn_server(Respond::Bytes(ok_image_response())).await;
+        let listed = Loader::with_defaults()
+            .unwrap()
+            .with_policy(SourcePolicy::new(vec!["127.0.0.1".to_string()], true));
+        assert!(fetch(&listed, &base).await.is_ok());
+
+        // The exemption is the listing, not the address
+        // class: the same loopback server under a policy
+        // that lists some other host is still refused.
+        let base = spawn_server(Respond::Bytes(ok_image_response())).await;
+        let unlisted = Loader::with_defaults()
+            .unwrap()
+            .with_policy(SourcePolicy::new(vec!["example.com".to_string()], true));
+        let err = fetch(&unlisted, &base).await.unwrap_err();
+        assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn private_blocking_admits_public_literals() {
+        // The gate itself is what is pinned here: a public
+        // literal passes the policy check under blocking
+        // (the load itself would need a reachable host).
+        let blocking = Loader::with_defaults()
+            .unwrap()
+            .with_policy(SourcePolicy::new(vec![], true));
+        for url in ["http://8.8.8.8/img.jpg", "http://1.1.1.1/img.jpg"] {
+            let parsed = Url::parse(url).unwrap();
+            assert!(blocking.check_policy(&parsed).await.is_ok(), "{url}");
+        }
     }
 
     #[tokio::test]

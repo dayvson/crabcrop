@@ -46,9 +46,6 @@ fn the_binary_boots_and_answers_health() {
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
         .env("PORT", port.to_string())
-        // The deliberate any-source opt-in: with no allowlist
-        // and no private blocking, this is what boot needs.
-        .env("CRABCROP_ALLOW_ANY_SOURCE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -83,26 +80,48 @@ fn the_binary_boots_and_answers_health() {
 }
 
 #[test]
-fn boot_with_no_source_restrictions_is_refused() {
-    // With no allowlist, private blocking off, and no
-    // any-source opt-in, boot refuses and the diagnostic
-    // names the three settings that settle the posture.
-    let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+fn boot_with_no_source_configuration_serves_health() {
+    // No allowlist, no private-blocking setting, no
+    // any-source opt-in: boot succeeds on the defaults
+    // (private-address blocking on) and answers health.
+    // The posture lives in the fetch policy, not in a
+    // boot gate.
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-        .env("PORT", free_port().to_string())
-        .output()
+        .env("PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert!(out.stdout.is_empty());
-    let stderr = String::from_utf8(out.stderr).unwrap();
+    let mut server = ServerGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut status_line = String::new();
+    while Instant::now() < deadline {
+        if let Some(status) = server.0.try_wait().unwrap() {
+            panic!("the binary exited before serving: {status}");
+        }
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            if stream
+                .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+                .is_ok()
+            {
+                let mut response = String::new();
+                if stream.read_to_string(&mut response).is_ok() && !response.is_empty() {
+                    status_line = response.lines().next().unwrap_or("").to_string();
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(
-        stderr.contains("no source restrictions are configured"),
-        "{stderr}"
+        status_line.contains("200"),
+        "no 200 from /health before the deadline; got status line {status_line:?}"
     );
-    assert!(stderr.contains("CRABCROP_ALLOWED_SOURCES"), "{stderr}");
-    assert!(stderr.contains("CRABCROP_ALLOW_ANY_SOURCE"), "{stderr}");
-    assert!(!stderr.contains("panicked"), "{stderr}");
 }
 
 /// A model file that exists, so a boot failure is about
@@ -128,7 +147,6 @@ fn boot_with_a_model_but_no_loadable_runtime_fails_with_the_diagnostic() {
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
         .env("PORT", free_port().to_string())
-        .env("CRABCROP_ALLOW_ANY_SOURCE", "1")
         .env("CRABCROP_REMOVEBG_MODEL", &model)
         .env("ORT_DYLIB_PATH", "/nonexistent/libonnxruntime.so")
         .output()
@@ -161,7 +179,6 @@ fn boot_with_a_model_but_no_runtime_anywhere_fails_with_the_diagnostic() {
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
         .env("PORT", free_port().to_string())
-        .env("CRABCROP_ALLOW_ANY_SOURCE", "1")
         .env("CRABCROP_REMOVEBG_MODEL", &model)
         .output()
         .unwrap();

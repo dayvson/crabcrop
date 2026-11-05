@@ -40,10 +40,10 @@ docker run -e CRABCROP_SECRET=your-secret-change-me -e CRABCROP_BLOCK_PRIVATE_SO
 
 Step 1 builds from source. Beyond the Rust toolchain, a source build needs a C compiler (the tree vendors C libraries), nasm on x86_64 (the AVIF encoder's assembly; its build script fails without it), and, only for the vendored AVIF decode route (`--features avif-decode`), meson and ninja, or a system libdav1d 1.3 or newer found through pkg-config instead. The prebuilt routes in [Install](#install) need none of this.
 
-**1. Start the server.** A secret is required, and so is a source posture (see [Configuration](#configuration)): an allowlist, private-address blocking, or the deliberate any-source opt-in. For local development, also allow unsigned URLs and take the opt-in:
+**1. Start the server.** A secret is required. For local development, also allow unsigned URLs:
 
 ```bash
-CRABCROP_SECRET=local-dev-secret CRABCROP_ALLOW_UNSAFE=1 CRABCROP_ALLOW_ANY_SOURCE=1 cargo run --release
+CRABCROP_SECRET=local-dev-secret CRABCROP_ALLOW_UNSAFE=1 cargo run --release
 # crabcrop listening on port 3000
 ```
 
@@ -156,9 +156,9 @@ Decoding is bounded too, so a small file cannot expand into gigabytes: at most 1
 
 HTTP and HTTPS sources additionally allow up to 5 redirects, with the [source policy](#configuration) re-checked on every hop.
 
-When `CRABCROP_ALLOWED_SOURCES` is set, only the listed host suffixes may be fetched (a suffix matches the host itself or any subdomain of it). The server refuses to boot with no source posture at all: configure an allowlist, or `CRABCROP_BLOCK_PRIVATE_SOURCES`, or `CRABCROP_ALLOW_ANY_SOURCE=1` to deliberately allow every host. Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
+When `CRABCROP_ALLOWED_SOURCES` is set, only the listed host suffixes may be fetched (a suffix matches the host itself or any subdomain of it); unset, every host may be fetched, subject to the private-address refusal below. Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
 
-With `CRABCROP_BLOCK_PRIVATE_SOURCES` on (off by default), the loader also refuses sources whose host is, or resolves to, a non-public address: loopback, private, link-local, unspecified, shared (CGNAT), reserved, multicast, broadcast, documentation, benchmarking, and the other special-purpose ranges, including IPv4-mapped, IPv4-compatible, and 6to4 spellings of them. The host is resolved and its addresses checked before connecting and again on every redirect hop, and the connection is pinned to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). A policy refusal answers `403`.
+`CRABCROP_BLOCK_PRIVATE_SOURCES` is on by default: the loader refuses sources whose host is, or resolves to, a non-public address: loopback, private, link-local, unspecified, shared (CGNAT), reserved, multicast, broadcast, documentation, benchmarking, and the other special-purpose ranges, including IPv4-mapped, IPv4-compatible, and 6to4 spellings of them. A host on the `CRABCROP_ALLOWED_SOURCES` allowlist is exempt, which is how a deployment serves loopback or internal sources. For every other host, the host is resolved and its addresses checked before connecting and again on every redirect hop, and the connection is pinned to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). Set `CRABCROP_BLOCK_PRIVATE_SOURCES=0`, or `CRABCROP_ALLOW_ANY_SOURCE=1`, to switch the refusal off. A policy refusal answers `403`.
 
 Beyond a plain HTTP or HTTPS URL, a source can take four more forms:
 
@@ -828,7 +828,7 @@ Error bodies are plain text with a short message. Send `Accept: application/json
 | --- | --- |
 | `400` | The path or operations do not parse, or the operation is not supported: a malformed segment, an unknown filter or parameter, `removebg` into a format without alpha, `upscale` past the 4096 px output cap or the 262,144 px per-run input budget, a `crop-rect` or `remove_region` outside the image, a video format asked of a still source. |
 | `401` | `GET /metrics` with a missing or wrong `CRABCROP_METRICS_TOKEN` bearer. |
-| `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address while `CRABCROP_BLOCK_PRIVATE_SOURCES` is on). |
+| `403` | Bad signature, an expired `exp:` URL, or the source URL was refused by the source policy (host not in `CRABCROP_ALLOWED_SOURCES`, or resolving to a non-public address refused under `CRABCROP_BLOCK_PRIVATE_SOURCES`). |
 | `404` | The source was not found: a file missing under a source root, a source path that resolves outside every root, or an origin (an object store included) that answered 404. All three answer with the same `source not found` body, so the response does not reveal what exists. Also a `PUT` to `/upload/...` when uploads are not configured, or a `PUT` to any path that is not the upload route. |
 | `409` | An upload to a name that already exists, while `CRABCROP_UPLOAD_ALLOW_OVERWRITE` is off. |
 | `413` | An upload body larger than the `CRABCROP_UPLOAD_MAX_MB` cap. |
@@ -980,9 +980,9 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_PRESETS_FILE` | unset | Path to a presets file. See [Presets](#presets). |
 | `CRABCROP_ONLY_PRESETS` | off | Rejects free-form operations in requests; only preset references (and `exp:` / `maxage:` metadata) are allowed. Requires at least one preset. |
 | `CRABCROP_SOURCE_ROOTS_FILE` | unset | Path to a source roots file. See [Source roots](#source-roots). |
-| `CRABCROP_ALLOWED_SOURCES` | unset (no allowlist) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. |
-| `CRABCROP_BLOCK_PRIVATE_SOURCES` | off | Refuses sources whose host is, or resolves to, a non-public address: loopback, private, link-local, unspecified, shared (CGNAT), reserved, multicast, broadcast, documentation, benchmarking, and the other special-purpose ranges, including IPv4-mapped, IPv4-compatible, and 6to4 spellings of them. Checked before connecting and again on every redirect hop. |
-| `CRABCROP_ALLOW_ANY_SOURCE` | off | Deliberately allows every source. With no allowlist and private blocking off, the server refuses to boot unless this is on. |
+| `CRABCROP_ALLOWED_SOURCES` | unset (no allowlist) | Comma-separated host suffixes the loader may fetch from. A suffix matches the host itself or any subdomain of it. A listed host is exempt from the non-public address refusal in the next row. |
+| `CRABCROP_BLOCK_PRIVATE_SOURCES` | on | Refuses sources whose host is, or resolves to, a non-public address: loopback, private, link-local, unspecified, shared (CGNAT), reserved, multicast, broadcast, documentation, benchmarking, and the other special-purpose ranges, including IPv4-mapped, IPv4-compatible, and 6to4 spellings of them. Checked before connecting and again on every redirect hop. Allowlisted hosts are exempt. |
+| `CRABCROP_ALLOW_ANY_SOURCE` | off | Deliberately allows every source: switches the non-public address refusal off. A configured allowlist still applies. |
 | `CRABCROP_S3_ENDPOINT` | unset (AWS) | Base URL of an S3-compatible store for `s3://` sources, path-style. `CRABCROP_S3_REGION` sets the AWS region (default `us-east-1`). Signing credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`; unset means unsigned. |
 | `CRABCROP_GCS_ENDPOINT` | `https://storage.googleapis.com` | Base URL of the GCS XML API for `gs://` sources. `CRABCROP_GCS_REGION` (default `auto`) is the signing region; the HMAC pair is `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY`. |
 | `CRABCROP_ALLOWED_BUCKETS` | unset | Comma-separated bucket names the `s3://` and `gs://` schemes may read; `*` allows all. Unset refuses every bucket fetch, with or without credentials; with bucket credentials configured the server also refuses to boot without it. |
@@ -1031,7 +1031,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_UPLOAD_MAX_MB` | `10` | Cap on one upload in megabytes, 1 to 10 (the source fetch cap: a stored original must stay servable). |
 | `CRABCROP_UPLOAD_ALLOW_OVERWRITE` | off | Lets an upload `PUT` replace an existing object. Off, an existing name is a `409`. |
 
-With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves the host to check its addresses and pins the connection to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
+With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves each host that is not on the allowlist to check its addresses and pins the connection to the validated address, so the address that was checked is the address that gets connected (no DNS-rebinding gap). Source URLs with userinfo (`http://user:pass@host/...`) are always refused: the loader never presents Basic credentials to an origin.
 
 ### Server-wide default operations
 

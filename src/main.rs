@@ -39,13 +39,14 @@
 //!   one of ultrafast, fastest, fast, medium, slow, extraslow,
 //!   default fastest.
 //! - `CRABCROP_ALLOWED_SOURCES`: comma-separated host suffixes the
-//!   loader may fetch from; unset means no allowlist.
-//! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: `1` or `true` to refuse
-//!   sources resolving to loopback, private, or link-local
-//!   addresses. Off by default.
+//!   loader may fetch from; unset means no allowlist. A listed
+//!   host is exempt from the private-address refusal below.
+//! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: refuse sources resolving
+//!   to loopback, private, or link-local addresses. On by
+//!   default; `0` or `false` allows non-public sources.
 //! - `CRABCROP_ALLOW_ANY_SOURCE`: `1` or `true` to deliberately
-//!   allow every source. With no allowlist, private blocking
-//!   off, and this unset, the server refuses to boot.
+//!   allow every source: switches the private-address refusal
+//!   off (a configured allowlist still applies).
 //! - `CRABCROP_S3_ENDPOINT`: base URL of an S3-compatible
 //!   store for `s3://` sources (path-style addressing).
 //!   Unset means AWS S3 (virtual-hosted, region from
@@ -539,27 +540,34 @@ fn check_bucket_policy(has_credentials: bool, allowed_buckets: &[String]) -> Res
     Ok(())
 }
 
-/// Fail closed on the fetch posture: with no source
-/// allowlist and private-address blocking off, a signed URL
-/// can make the server fetch any host it can reach,
-/// including the non-public addresses of its own network.
-/// One of the two guards must be configured;
-/// `CRABCROP_ALLOW_ANY_SOURCE` is the deliberate any-source
-/// opt-in for deployments that want the open posture (a
-/// public demo, a bench rig).
-fn check_source_posture(policy: &SourcePolicy, allow_any: bool) -> Result<(), String> {
-    if policy.allowed_suffixes.is_empty() && !policy.block_private && !allow_any {
-        return Err(
-            "no source restrictions are configured: refusing to boot, because signed \
-             URLs could fetch any host this server can reach, including non-public \
-             addresses. Set CRABCROP_ALLOWED_SOURCES to a comma-separated host \
-             allowlist, or CRABCROP_BLOCK_PRIVATE_SOURCES=1 to refuse sources that \
-             resolve to non-public addresses, or CRABCROP_ALLOW_ANY_SOURCE=1 to \
-             deliberately allow every source."
-                .to_string(),
-        );
-    }
-    Ok(())
+/// The source policy from the environment. Private-address
+/// blocking is on by default: a source that is, or resolves
+/// to, a non-public address is refused unless its host is on
+/// the allowlist (the operator's exception for loopback and
+/// internal sources) or the check is turned off with
+/// `CRABCROP_BLOCK_PRIVATE_SOURCES=0`.
+/// `CRABCROP_ALLOW_ANY_SOURCE` is the deliberate full
+/// opt-out: it switches the private-address check off
+/// entirely. A configured allowlist still applies either
+/// way.
+fn build_source_policy(get: impl Fn(&str) -> Option<String>) -> Result<SourcePolicy, String> {
+    let allowed_sources: Vec<String> = get("CRABCROP_ALLOWED_SOURCES")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let block_private = parse_bool_value(
+        "CRABCROP_BLOCK_PRIVATE_SOURCES",
+        get("CRABCROP_BLOCK_PRIVATE_SOURCES"),
+        true,
+    )?;
+    let allow_any = parse_bool_value(
+        "CRABCROP_ALLOW_ANY_SOURCE",
+        get("CRABCROP_ALLOW_ANY_SOURCE"),
+        false,
+    )?;
+    Ok(SourcePolicy::new(
+        allowed_sources,
+        block_private && !allow_any,
+    ))
 }
 
 fn build_source_config(get: impl Fn(&str) -> Option<String>) -> Result<SourceConfig, String> {
@@ -953,13 +961,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cache_bytes = cache_mb
         .checked_mul(1024 * 1024)
         .ok_or("CRABCROP_CACHE_MAX_MB is too large")?;
-    let allowed_sources: Vec<String> = env::var("CRABCROP_ALLOWED_SOURCES")
-        .map(|v| v.split(',').map(str::to_string).collect())
-        .unwrap_or_default();
-    let block_private = parse_bool("CRABCROP_BLOCK_PRIVATE_SOURCES", false)?;
-    let policy = SourcePolicy::new(allowed_sources, block_private);
-    let allow_any_source = parse_bool("CRABCROP_ALLOW_ANY_SOURCE", false)?;
-    check_source_posture(&policy, allow_any_source)?;
+    let policy = build_source_policy(|name| env::var(name).ok())?;
     let mut sources = build_source_config(|name| env::var(name).ok())?;
     // The upload destination (issue #168), built after the
     // source configuration it reuses. A local destination
@@ -2381,21 +2383,44 @@ mod tests {
     }
 
     #[test]
-    fn source_posture_needs_a_guard_or_the_opt_in() {
-        let open = SourcePolicy::new(vec![], false);
-        assert!(check_source_posture(&open, true).is_ok());
-        let err = check_source_posture(&open, false).unwrap_err();
-        assert!(err.contains("CRABCROP_ALLOWED_SOURCES"), "{err}");
+    fn source_policy_blocks_private_addresses_by_default() {
+        let get = |pairs: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |name: &str| map.get(name).cloned()
+        };
+        // No configuration: no allowlist, blocking on. Boot
+        // needs no posture setting.
+        let policy = build_source_policy(get(&[])).unwrap();
+        assert!(policy.allowed_suffixes.is_empty());
+        assert!(policy.block_private);
+        // The explicit switch turns blocking off.
+        let policy = build_source_policy(get(&[("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")])).unwrap();
+        assert!(!policy.block_private);
+        // The any-source opt-out turns blocking off even
+        // with the switch on.
+        let policy = build_source_policy(get(&[
+            ("CRABCROP_BLOCK_PRIVATE_SOURCES", "1"),
+            ("CRABCROP_ALLOW_ANY_SOURCE", "1"),
+        ]))
+        .unwrap();
+        assert!(!policy.block_private);
+        // The allowlist passes through normalized, and blank
+        // entries normalize away.
+        let policy = build_source_policy(get(&[(
+            "CRABCROP_ALLOWED_SOURCES",
+            " Example.com , ,127.0.0.1 ",
+        )]))
+        .unwrap();
+        assert_eq!(policy.allowed_suffixes, ["example.com", "127.0.0.1"]);
+        assert!(policy.block_private);
+        // A bad boolean is a startup error naming the
+        // variable, never a silent default.
+        let err =
+            build_source_policy(get(&[("CRABCROP_BLOCK_PRIVATE_SOURCES", "ture")])).unwrap_err();
         assert!(err.contains("CRABCROP_BLOCK_PRIVATE_SOURCES"), "{err}");
-        assert!(err.contains("CRABCROP_ALLOW_ANY_SOURCE"), "{err}");
-        let allowlisted = SourcePolicy::new(vec!["example.com".to_string()], false);
-        assert!(check_source_posture(&allowlisted, false).is_ok());
-        let blocking = SourcePolicy::new(vec![], true);
-        assert!(check_source_posture(&blocking, false).is_ok());
-        // Blank allowlist entries normalize away, so they do
-        // not count as a configured guard.
-        let blank = SourcePolicy::new(vec![" ".to_string()], false);
-        assert!(check_source_posture(&blank, false).is_err());
     }
 
     #[test]
