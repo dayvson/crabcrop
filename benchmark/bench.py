@@ -252,7 +252,7 @@ def main():
 
     if "crabcrop" not in skip:
         crab_bin = os.environ.get(
-            "CRABCROP_BIN", os.path.join(WORK, "crabcrop-v0.9.5", "target", "release", "crabcrop")
+            "CRABCROP_BIN", os.path.join(WORK, "crabcrop-v0.9.9", "target", "release", "crabcrop")
         )
 
         def start_crab():
@@ -260,6 +260,9 @@ def main():
                 os.environ,
                 CRABCROP_SECRET="bench-secret-0123456789",
                 CRABCROP_ALLOW_UNSAFE="1",
+                # 0.9.9 refuses non-public sources by default;
+                # the benchmark origin is loopback, so allowlist it.
+                CRABCROP_ALLOWED_SOURCES="127.0.0.1",
                 PORT="3310",
             )
             return subprocess.Popen(

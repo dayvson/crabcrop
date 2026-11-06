@@ -3,9 +3,13 @@
 A reproducible comparison of three self-hosted image servers on the
 same host, the same origin, and the same operations:
 
-- crabcrop 0.9.5 (release build from the `v0.9.5` tag)
+- crabcrop 0.9.9 (release build from the `v0.9.9` tag)
 - Thumbor 7.8.0 (pip, venv)
 - imgproxy 3.31.4 (official source build, see the version notes)
+
+A second script, `bench_cache.py`, measures crabcrop's result
+cache under churn and accounts for its memory; see the cache
+scenarios section below.
 
 This harness began as the October 2026 comparison that measured
 crabcrop against Thumbor only (imgproxy could not be measured then:
@@ -18,6 +22,7 @@ releases instead of living in chat notes.
 ```bash
 bash benchmark/setup.sh
 python3 benchmark/bench.py
+python3 benchmark/bench_cache.py
 ```
 
 `setup.sh` pins every version in one place at the top of the file
@@ -25,15 +30,20 @@ and prepares `benchmark/.work/` with the three servers. It installs
 system packages with apt (libvips and build tools), installs a Go
 toolchain under `~/.local`, builds imgproxy from its release tag,
 creates the Thumbor venv, and builds crabcrop in release mode from
-the `v0.9.5` tag in a detached worktree.
+the `v0.9.9` tag in a detached worktree.
 
 `bench.py` then starts a local origin server for the fixtures,
 starts each service in turn, measures it alone, stops it, and
 writes raw results to `benchmark/.work/results.json`. Committed
 runs are copied into `benchmark/results/` next to a write-up.
+Published runs since 2026-11-06 repeat the run and report medians
+across runs rather than a single run's samples; the write-ups say
+how many runs each table rests on.
 
 Set `BENCH_SKIP_SERVICES=crabcrop,thumbor,imgproxy` (any subset)
-to run only some services while debugging.
+to run only some services while debugging. `bench_cache.py` takes
+`BENCH_SKIP_SCENARIOS=churn,memory` the same way and writes
+`benchmark/.work/cache-results.json`.
 
 ## Fixtures
 
@@ -74,9 +84,11 @@ runs.
 
 The exact configuration for each service is in `configs/`:
 
-- `configs/crabcrop.env`: secret set, unsafe mode on, port 3310.
-  Everything else is the server default, including its in-memory
-  result cache.
+- `configs/crabcrop.env`: secret set, unsafe mode on, port 3310,
+  and `CRABCROP_ALLOWED_SOURCES=127.0.0.1` (0.9.9 refuses
+  non-public sources by default, so the loopback origin is
+  allowlisted explicitly). Everything else is the server default,
+  including its in-memory result cache.
 - `configs/thumbor.conf`: the October config. HTTP loader, unsafe
   URLs, everything else at Thumbor defaults (no result storage).
 - `configs/imgproxy.env`: bind on 127.0.0.1:8080,
@@ -136,10 +148,40 @@ Mapping notes, where a mapping is not exact:
   numbers do not promise equal fidelity or equal bytes. The
   byte tables are part of the results for exactly that reason.
 
+## Cache scenarios
+
+`bench_cache.py` measures crabcrop alone, against the same
+local origin, in two scenario families the comparison set does
+not reach:
+
+- Churn: 1,200 distinct resize URLs (about 10 MB of output)
+  rotated against a 4 MiB cache budget, sequential and at 8
+  workers, with per-key purges of resident entries partway
+  through. It reports hit rates from the `Cache-Status`
+  response header (cross-checked against the server's
+  `/metrics` counters), miss latency under turnover against
+  a cache-disabled baseline over the same set, and purge
+  latency.
+- Memory accounting: fills of known payloads (3,000 small
+  renders with no groups, 3,000 carrying one preset group,
+  batches of 100 large renders) compared against the server
+  process's RSS growth, so the memory held by cache keys,
+  group names, and indexes is measured rather than assumed;
+  a budget-plateau drive that pushes several budgets' worth
+  of renders through a 4 MiB budget while sampling RSS; and
+  a purge run that measures what the purge tombstone maps
+  retain. Purges are signed with the repository's Python SDK
+  (`sdks/python`), the same helpers an operator uses.
+
+The scenarios run crabcrop with the disk and shared result
+tiers off (their defaults), so they describe the in-memory
+tier that the budget configures. Results are written up in
+`results/` beside the comparison numbers.
+
 ## Version notes
 
-- crabcrop 0.9.5, tag `v0.9.5`, commit
-  5a1674f4908ccc8ca83f64c134e98a60744fcd24. Built with
+- crabcrop 0.9.9, tag `v0.9.9`, commit
+  37761360c33a4c1b21004152a779963e396c0d13. Built with
   `cargo build --release --locked` from the tag.
 - Thumbor 7.8.0, pip package `thumbor==7.8.0`, Python venv.
 - imgproxy 3.31.4, tag `v3.31.4`, commit
@@ -167,5 +209,6 @@ Mapping notes, where a mapping is not exact:
   configured in `configs/`. Thumbor's production caching story
   is normally a CDN in front, which this harness does not
   simulate for any product.
-- One run per operation set per service, 25 samples each.
-  Treat small deltas as noise.
+- Each run takes 25 samples per operation set per service,
+  and published runs repeat the measurement and report
+  medians. Treat small deltas as noise either way.
