@@ -328,6 +328,29 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
     })
 }
 
+/// The Content-Type the sniff half of upload validation
+/// assigns to `bytes` (issue #366): the same classification
+/// [`prepare_upload`] walks, spelled as a media type. The
+/// upload store records it on the object it writes, because
+/// the loader admits store responses by content type and a
+/// store that defaults headerless objects to a binary type
+/// would otherwise make every upload unloadable. `None`
+/// when the bytes match nothing the pipeline reads.
+pub(crate) fn sniff_content_type(bytes: &[u8]) -> Option<&'static str> {
+    if crate::svg::is_svg(bytes) {
+        return Some("image/svg+xml");
+    }
+    if is_heic(bytes) {
+        return Some("image/heic");
+    }
+    if is_jxl(bytes) {
+        return Some("image/jxl");
+    }
+    image::guess_format(bytes)
+        .ok()
+        .map(|format| format.to_mime_type())
+}
+
 pub(crate) fn check_decoded_dimensions(width: u64, height: u64) -> Result<(), EngineError> {
     if width > MAX_DECODE_DIMENSION as u64 || height > MAX_DECODE_DIMENSION as u64 {
         return Err(EngineError::Decode(format!(

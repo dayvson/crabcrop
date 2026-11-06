@@ -264,7 +264,16 @@ impl S3Store {
     /// Returns whether the store accepted the object.
     pub async fn put_raw(&self, name: &str, bytes: Vec<u8>) -> bool {
         let object = format!("{}{name}", self.prefix);
-        match self.request("PUT", &object, &[], bytes).await {
+        // The object carries the content type the bytes
+        // sniff as (issue #366): the loader admits store
+        // responses by content type, so an object stored
+        // without one is only as readable as the store's
+        // default for headerless objects.
+        let headers: Vec<(&str, &str)> = match crate::engine::sniff_content_type(&bytes) {
+            Some(content_type) => vec![("content-type", content_type)],
+            None => Vec::new(),
+        };
+        match self.request_h("PUT", &object, &[], bytes, &headers).await {
             Some(resp) => resp.status().is_success(),
             None => false,
         }
@@ -310,10 +319,13 @@ impl S3Store {
     /// and answer `412` for a name already taken.
     pub async fn put_raw_if_absent(&self, name: &str, bytes: Vec<u8>) -> RawPut {
         let object = format!("{}{name}", self.prefix);
-        match self
-            .request_h("PUT", &object, &[], bytes, &[("if-none-match", "*")])
-            .await
-        {
+        // The content type rides along with the conditional
+        // write, as in `put_raw` (issue #366).
+        let mut headers: Vec<(&str, &str)> = vec![("if-none-match", "*")];
+        if let Some(content_type) = crate::engine::sniff_content_type(&bytes) {
+            headers.push(("content-type", content_type));
+        }
+        match self.request_h("PUT", &object, &[], bytes, &headers).await {
             Some(resp) if resp.status().is_success() => RawPut::Stored,
             Some(resp) if resp.status() == reqwest::StatusCode::PRECONDITION_FAILED => {
                 RawPut::AlreadyExists
@@ -550,8 +562,10 @@ pub(crate) mod test_support {
         pub fail: Arc<StdMutex<FailFlags>>,
         /// One line per request served, `"<METHOD> <key>"`
         /// (plus the conditional-write marker when the
-        /// request carried one), so tests can assert how a
-        /// lookup was answered, not just what it returned.
+        /// request carried one, and the content type when
+        /// the request carried one), so tests can assert
+        /// how a lookup was answered, not just what it
+        /// returned.
         pub requests: Arc<StdMutex<Vec<String>>>,
         pub endpoint: String,
     }
@@ -591,10 +605,14 @@ pub(crate) mod test_support {
                     let mut content_length: usize = 0;
                     let mut range_end: Option<usize> = None;
                     let mut if_none_match: Option<String> = None;
+                    let mut content_type: Option<String> = None;
                     for line in lines {
                         let lower = line.to_ascii_lowercase();
                         if let Some(v) = lower.strip_prefix("content-length:") {
                             content_length = v.trim().parse().unwrap_or(0);
+                        }
+                        if let Some(v) = lower.strip_prefix("content-type:") {
+                            content_type = Some(v.trim().to_string());
                         }
                         if let Some(v) = lower.strip_prefix("range:") {
                             range_end = v
@@ -628,6 +646,9 @@ pub(crate) mod test_support {
                         let mut line = format!("{method} {key}");
                         if if_none_match.is_some() {
                             line.push_str(" if-none-match");
+                        }
+                        if let Some(content_type) = &content_type {
+                            line.push_str(&format!(" content-type={content_type}"));
                         }
                         requests.lock().unwrap().push(line);
                     }
@@ -814,6 +835,35 @@ mod tests {
         assert_eq!(got.bytes, bytes::Bytes::from_static(b"pixels"));
         assert_eq!(got.groups, vec!["hero".to_string()]);
         assert_eq!(got.quality, Some(80));
+    }
+
+    #[tokio::test]
+    async fn raw_puts_carry_the_sniffed_content_type() {
+        // Issue #366: both raw write paths record the
+        // content type the bytes sniff as, so a store whose
+        // default for headerless objects is a binary type
+        // still serves the upload back as an image. The
+        // cache entry path is unchanged: its objects are
+        // framed entries, not originals.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0u8; 16]);
+        assert!(s.put_raw("photo.png", png.clone()).await);
+        assert_eq!(s.put_raw_if_absent("photo2.png", png).await, RawPut::Stored);
+        s.put("key", &image(b"pixels", &[])).await;
+        let requests = fake.requests.lock().unwrap().clone();
+        let raw_lines: Vec<&String> = requests.iter().filter(|r| r.contains("photo")).collect();
+        assert_eq!(raw_lines.len(), 2, "{requests:?}");
+        for line in raw_lines {
+            assert!(line.contains("content-type=image/png"), "{line}");
+        }
+        assert!(
+            requests
+                .iter()
+                .all(|r| !r.contains(".bin") || !r.contains("content-type")),
+            "{requests:?}"
+        );
     }
 
     #[tokio::test]
