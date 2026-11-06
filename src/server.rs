@@ -386,6 +386,13 @@ pub struct AppState {
     /// endpoint does not exist on this server (the route is
     /// never registered, so a PUT is a 404, not a refusal).
     pub upload: Option<Arc<crate::upload::UploadStore>>,
+    /// Whether meta mode is enabled (issue #390):
+    /// `CRABCROP_META_MODE`, on by default. A meta request
+    /// bypasses every cache tier and runs a fresh render
+    /// plus its annotation inferences on every call, so a
+    /// deployment that does not use it can close the most
+    /// expensive request shape a signed URL can trigger.
+    pub meta_enabled: bool,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
     pub ai_gate: Arc<tokio::sync::Semaphore>,
@@ -2445,6 +2452,24 @@ async fn serve(
     // so neither ever enters it.
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);
+    if meta && !state.meta_enabled {
+        // Meta mode is switched off on this deployment
+        // (issue #390): refuse specifically, like the
+        // metrics endpoint does, rather than serving a
+        // render the caller did not ask for.
+        if sealed {
+            return sealed_refusal(record);
+        }
+        return (
+            error_response(
+                StatusCode::FORBIDDEN,
+                "meta_disabled",
+                "meta mode is disabled on this server".to_string(),
+                accept,
+            ),
+            record,
+        );
+    }
     let placeholders = meta && wants_placeholders(accept);
     let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
     // Meta describes an image; a video result is not one.
@@ -5386,6 +5411,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -5515,6 +5541,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -5575,7 +5602,69 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate,
+            process_gate: Arc::new(Gate::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slow_gate: Arc::new(Gate::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+            provenance_signer: None,
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
+            metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: None,
+            segment: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            ocr: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            meta_enabled,
+            ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
             avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
@@ -5661,6 +5750,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -5750,6 +5840,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -6043,6 +6134,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -6402,6 +6494,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -6469,6 +6562,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -6539,6 +6633,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -8017,6 +8112,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -9224,6 +9320,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -9403,6 +9500,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -9734,6 +9832,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -10154,6 +10253,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -10420,6 +10520,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -10482,6 +10583,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -10544,6 +10646,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -10638,6 +10741,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -11073,6 +11177,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -11149,6 +11254,7 @@ mod tests {
             }),
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -12464,6 +12570,7 @@ mod tests {
             )),
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -12542,6 +12649,7 @@ mod tests {
                 crate::url::entry_key(b"disk-key-test"),
             ))),
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -13137,6 +13245,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -13265,6 +13374,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -13402,6 +13512,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -14027,6 +14138,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(process_permits)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -14306,6 +14418,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -14460,6 +14573,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(1)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -15001,6 +15115,7 @@ mod tests {
                 max_bytes,
                 allow_overwrite,
             ))),
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate,
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -15393,6 +15508,29 @@ mod tests {
             },
         )]);
         assert!(!ai_gate_applies(&plain, true, true));
+    }
+
+    #[tokio::test]
+    async fn meta_mode_disabled_refuses_meta_and_still_serves_the_render() {
+        // Issue #390: with meta mode switched off, a meta
+        // request answers 403 meta_disabled, and the same
+        // signed URL without the meta Accept still serves
+        // its render.
+        let src = spawn_bytes_server(test_png()).await;
+        let base = spawn_app_with_meta_enabled(false).await;
+        let remainder = format!("100x0/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("meta_disabled"), "{body}");
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -15809,6 +15947,7 @@ mod tests {
             )),
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
@@ -16663,6 +16802,7 @@ mod tests {
             store: None,
             shared_store: None,
             upload: None,
+            meta_enabled: true,
             ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             process_gate: Arc::new(Gate::new(4)),
             ssim_target: crate::quality::DEFAULT_SSIM_TARGET,

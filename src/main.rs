@@ -33,6 +33,15 @@
 //! - `CRABCROP_METADATA`: `strip` (default) drops embedded
 //!   EXIF/XMP/IPTC on output; `preserve` copies them into
 //!   JPEG and PNG outputs.
+//! - `CRABCROP_META_MODE`: meta mode (a JSON document
+//!   describing a render, requested with an
+//!   `application/json` Accept header). On by default;
+//!   `0` or `false` disables it, and meta requests then
+//!   answer `403 meta_disabled`. Meta mode bypasses every
+//!   cache tier and runs a fresh render plus its
+//!   annotation inferences on every request, so a
+//!   deployment that does not use it can close that cost
+//!   off.
 //! - `CRABCROP_WIDTH_STEP`: quantization step in pixels for
 //!   width client hints, 1 to 2000, default 100.
 //! - `CRABCROP_JXL_SPEED`: jixel speed tier for JPEG XL encodes,
@@ -1101,6 +1110,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let frame_extractor = build_video_decoder(|name| env::var(name).ok())?;
     let pdf_renderer = build_pdf_renderer(|name| env::var(name).ok())?;
     let provenance_signer = build_provenance_signer(|name| env::var(name).ok())?;
+    // Meta mode stays on unless the operator switches it
+    // off (issue #390): it is the most expensive request
+    // shape a signed URL can trigger (an uncached render
+    // plus its annotation inferences, on every call).
+    let meta_enabled = parse_bool_value(
+        "CRABCROP_META_MODE",
+        env::var("CRABCROP_META_MODE").ok(),
+        true,
+    )?;
 
     let state = AppState {
         keyring,
@@ -1133,6 +1151,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         store,
         shared_store,
         upload,
+        meta_enabled,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         process_gate: Arc::new(crate::server::Gate::new(
             std::thread::available_parallelism()
