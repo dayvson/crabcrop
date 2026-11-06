@@ -59,6 +59,11 @@ pub struct DiskStore {
     /// directory by anyone without the secret is a miss.
     entry_key: Vec<u8>,
     inner: Mutex<Inner>,
+    /// Write failures, counted and logged as they happen
+    /// (issue #367): a cache stays best-effort, but a tier
+    /// that cannot write must be visible in the logs and
+    /// on /metrics instead of failing silently forever.
+    errors: std::sync::atomic::AtomicU64,
 }
 
 /// Entry format version. CRABDISK2 adds the entry's cache
@@ -123,6 +128,26 @@ fn tmp_name(stem: &str) -> String {
     format!("{stem}.tmp-{}-{n}", std::process::id())
 }
 
+/// One boot-time writability probe (issue #367): write a
+/// scratch file into `dir` and remove it, so a directory
+/// the process cannot write to (a read-only mount, an
+/// unprivileged container user with no pre-created
+/// directory) fails at store open with a clear message
+/// instead of being discovered per request, silently, on
+/// every put. The scratch name never matches the entry
+/// scan's stem pattern and is removed on success anyway.
+fn probe_writable(dir: &Path) -> Result<(), String> {
+    let probe = dir.join(".crabcrop-write-probe");
+    std::fs::write(&probe, b"").map_err(|e| {
+        format!(
+            "the result storage directory {} is not writable: {e}",
+            dir.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 impl DiskStore {
     /// Open (creating if needed) the store rooted at `dir`,
     /// indexing whatever entries a previous run left behind.
@@ -132,14 +157,31 @@ impl DiskStore {
     pub fn open(dir: &Path, max_bytes: usize, entry_key: Vec<u8>) -> Result<Self, String> {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create the result storage directory: {e}"))?;
+        probe_writable(dir)?;
         let store = Self {
             dir: dir.to_path_buf(),
             max_bytes,
             entry_key,
             inner: Mutex::new(Inner::default()),
+            errors: std::sync::atomic::AtomicU64::new(0),
         };
         store.scan()?;
         Ok(store)
+    }
+
+    /// Write failures so far (issue #367), surfaced on
+    /// /metrics as `crabcrop_cache_tier_errors_total`.
+    pub fn errors(&self) -> u64 {
+        self.errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count and log one write failure. The store stays
+    /// best-effort (the write is dropped, the pipeline
+    /// continues), but never silently (issue #367).
+    fn note_error(&self, what: &str, e: &std::io::Error) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("result storage: {what}: {e}");
     }
 
     /// Index existing entry files, oldest first, so the LRU
@@ -252,10 +294,12 @@ impl DiskStore {
         }
         let stem = key_stem(key);
         let tmp = self.dir.join(tmp_name(&stem));
-        if std::fs::write(&tmp, &data).is_err() {
+        if let Err(e) = std::fs::write(&tmp, &data) {
+            self.note_error("cannot write a cache entry", &e);
             return;
         }
-        if std::fs::rename(&tmp, self.file_for(&stem)).is_err() {
+        if let Err(e) = std::fs::rename(&tmp, self.file_for(&stem)) {
+            self.note_error("cannot move a cache entry into place", &e);
             let _ = std::fs::remove_file(&tmp);
             return;
         }
@@ -735,6 +779,24 @@ fn read_header(path: &Path, cap: usize, entry_key: &[u8]) -> Option<(String, Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_write_probe_accepts_writable_and_rejects_unwritable_dirs() {
+        // Issue #367: the probe an open() runs so an
+        // unwritable directory fails at boot. /proc is not
+        // writable even for a privileged process, which
+        // makes it the portable unwritable fixture.
+        let dir = temp_dir("probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        probe_writable(&dir).unwrap();
+        assert!(
+            !dir.join(".crabcrop-write-probe").exists(),
+            "the probe cleans up after itself"
+        );
+        let err = probe_writable(Path::new("/proc/self")).unwrap_err();
+        assert!(err.contains("not writable"), "probe error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn temp_names_are_unique_per_put() {

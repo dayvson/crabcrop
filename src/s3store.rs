@@ -64,6 +64,12 @@ pub struct S3Store {
     /// not turn a lookup or a purge walk into an unbounded
     /// allocation.
     max_entry_bytes: usize,
+    /// Tier failures, counted and logged as they happen
+    /// (issue #367): the shared tier stays best-effort,
+    /// but a store that rejects every write must be
+    /// visible in the logs and on /metrics instead of
+    /// failing silently forever.
+    errors: std::sync::atomic::AtomicU64,
 }
 
 impl S3Store {
@@ -93,7 +99,23 @@ impl S3Store {
             creds,
             entry_key,
             max_entry_bytes: MAX_ENTRY_BYTES,
+            errors: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Tier failures so far (issue #367), surfaced on
+    /// /metrics as `crabcrop_cache_tier_errors_total`.
+    pub fn errors(&self) -> u64 {
+        self.errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count and log one tier failure. The operation
+    /// keeps its best-effort result (a dropped write, a
+    /// miss), but never silently (issue #367).
+    fn note_error(&self, what: &str, detail: &str) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("shared storage: {what}: {detail}");
     }
 
     /// Read a response body under the entry size ceiling,
@@ -224,10 +246,19 @@ impl S3Store {
     }
 
     /// Look up `key`. Any failure (missing object, unreadable
-    /// entry, transport error) is a miss.
+    /// entry, transport error) is a miss. A transport failure
+    /// is counted and logged (issue #367): a missing object
+    /// is an ordinary miss, but a store that cannot be
+    /// reached at all must not look like one.
     pub async fn get(&self, key: &str) -> Option<CachedImage> {
         let object = self.object_key(&key_stem(key));
-        let resp = self.request("GET", &object, &[], Vec::new()).await?;
+        let resp = match self.request("GET", &object, &[], Vec::new()).await {
+            Some(resp) => resp,
+            None => {
+                self.note_error("cannot reach the store for a lookup", "transport error");
+                return None;
+            }
+        };
         if !resp.status().is_success() {
             return None;
         }
@@ -239,12 +270,21 @@ impl S3Store {
         Some(image)
     }
 
-    /// Store `image` under `key`. Errors are dropped silently:
-    /// the local tiers already hold the entry.
+    /// Store `image` under `key`. The write stays
+    /// best-effort (the local tiers already hold the
+    /// entry), but a failure, transport or status, is
+    /// counted and logged (issue #367).
     pub async fn put(&self, key: &str, image: &CachedImage) {
         let object = self.object_key(&key_stem(key));
         let data = serialize_entry(key, image, &self.entry_key);
-        let _ = self.request("PUT", &object, &[], data).await;
+        match self.request("PUT", &object, &[], data).await {
+            Some(resp) if resp.status().is_success() => {}
+            Some(resp) => self.note_error(
+                "cannot store an entry",
+                &format!("status {}", resp.status()),
+            ),
+            None => self.note_error("cannot store an entry", "transport error"),
+        }
     }
 
     /// Delete the single entry stored under `key`, if any:
@@ -835,6 +875,21 @@ mod tests {
         assert_eq!(got.bytes, bytes::Bytes::from_static(b"pixels"));
         assert_eq!(got.groups, vec!["hero".to_string()]);
         assert_eq!(got.quality, Some(80));
+    }
+
+    #[tokio::test]
+    async fn tier_failures_are_counted_not_silent() {
+        // Issue #367: an unreachable store makes every
+        // operation fail at transport. The results stay
+        // best-effort (the put drops, the get misses), but
+        // each failure lands on the counter the metrics
+        // exposition reads.
+        let store = store("http://127.0.0.1:1");
+        assert_eq!(store.errors(), 0);
+        store.put("k", &image(b"payload", &[])).await;
+        assert_eq!(store.errors(), 1);
+        assert!(store.get("k").await.is_none());
+        assert_eq!(store.errors(), 2);
     }
 
     #[tokio::test]

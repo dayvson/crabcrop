@@ -619,7 +619,12 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
     }
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        format!("{}{}", state.metrics.render(), lane_metrics(&state)),
+        format!(
+            "{}{}{}",
+            state.metrics.render(),
+            lane_metrics(&state),
+            tier_metrics(&state)
+        ),
     )
         .into_response()
 }
@@ -651,6 +656,29 @@ fn lane_metrics(state: &AppState) -> String {
         "crabcrop_lane_capacity{{lane=\"slow\"}} {}\n",
         state.slow_gate.capacity()
     ));
+    out
+}
+
+/// Cache tier failures for `/metrics` (issue #367): the
+/// stores count their own failures as they log them; the
+/// exposition reads the counters live at scrape time,
+/// one series per configured tier.
+fn tier_metrics(state: &AppState) -> String {
+    let mut out = String::new();
+    out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
+    out.push_str("# TYPE crabcrop_cache_tier_errors_total counter\n");
+    if let Some(store) = &state.store {
+        out.push_str(&format!(
+            "crabcrop_cache_tier_errors_total{{tier=\"disk\"}} {}\n",
+            store.errors()
+        ));
+    }
+    if let Some(store) = &state.shared_store {
+        out.push_str(&format!(
+            "crabcrop_cache_tier_errors_total{{tier=\"shared\"}} {}\n",
+            store.errors()
+        ));
+    }
     out
 }
 
