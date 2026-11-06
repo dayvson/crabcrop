@@ -173,7 +173,24 @@ pub struct Loader {
     max_bytes: u64,
     policy: SourcePolicy,
     sources: SourceConfig,
+    /// Pinned clients, one per validated (host, address)
+    /// pair (issue #369): a pinned client forces its
+    /// host's DNS to the validated address, so clients
+    /// cannot be shared across pairs, but a redirect chain
+    /// (or the next fetch) that lands on a pair already
+    /// seen reuses its client, connection pool and TLS
+    /// configuration included, instead of rebuilding all
+    /// of it per hop. The map is capped; past the cap it
+    /// clears and rebuilds, which costs a rebuild, never
+    /// correctness. Behind an Arc so loader clones share
+    /// the cache.
+    pinned_clients: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<(String, std::net::SocketAddr), Client>>,
+    >,
 }
+
+/// Cap on the pinned-client cache (issue #369).
+const MAX_PINNED_CLIENTS: usize = 64;
 
 /// A hostname resolution the policy has already validated:
 /// the connection must go to one of these addresses (L-3).
@@ -283,6 +300,9 @@ impl Loader {
             max_bytes,
             policy: SourcePolicy::default(),
             sources: SourceConfig::default(),
+            pinned_clients: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -750,15 +770,29 @@ impl Loader {
     /// to the address the policy validated (audit L-3). TLS
     /// still authenticates the original hostname. Proxies are
     /// disabled: a proxied request resolves at the proxy, so
-    /// pinning through one would be meaningless.
+    /// pinning through one would be meaningless. Clients are
+    /// cached per (host, address) pair and reused across
+    /// hops and fetches (issue #369): the pair is the whole
+    /// key, so a client is only ever reused for the exact
+    /// pin it was built for.
     fn pinned_client(&self, pin: &PinnedResolution) -> Result<Client, LoadError> {
-        Client::builder()
+        let key = (pin.host.clone(), pin.addr);
+        if let Some(client) = self.pinned_clients.lock().unwrap().get(&key) {
+            return Ok(client.clone());
+        }
+        let client = Client::builder()
             .timeout(self.timeout)
             .redirect(redirect::Policy::none())
             .no_proxy()
             .resolve(&pin.host, pin.addr)
             .build()
-            .map_err(|e| LoadError::Network(e.to_string()))
+            .map_err(|e| LoadError::Network(e.to_string()))?;
+        let mut cache = self.pinned_clients.lock().unwrap();
+        if cache.len() >= MAX_PINNED_CLIENTS {
+            cache.clear();
+        }
+        cache.insert(key, client.clone());
+        Ok(client)
     }
 
     /// Run the source policy against `url`. No connection has been
@@ -1160,6 +1194,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[test]
+    fn pinned_clients_are_cached_per_host_and_address() {
+        // Issue #369: the same pin reuses one client; a
+        // different address for the same host (a fresh
+        // validation) is a different client, never the
+        // cached one.
+        let loader = Loader::with_defaults().unwrap();
+        let pin = |port: u16| PinnedResolution {
+            host: "pinned.invalid".to_string(),
+            addr: std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
+        };
+        loader.pinned_client(&pin(9101)).unwrap();
+        loader.pinned_client(&pin(9101)).unwrap();
+        assert_eq!(loader.pinned_clients.lock().unwrap().len(), 1);
+        loader.pinned_client(&pin(9102)).unwrap();
+        assert_eq!(loader.pinned_clients.lock().unwrap().len(), 2);
     }
 
     #[test]
