@@ -2903,6 +2903,23 @@ struct MissWork {
     sealed: bool,
 }
 
+/// Whether a request runs inference and so takes an AI
+/// gate permit (issue #379): every AI directive counts,
+/// except a smart crop, which runs a model only when a
+/// face or focal provider participates in it. Without
+/// either provider the crop's focal point is the built-in
+/// saliency statistic, no inference runs, and gating the
+/// request would let it consume permits and shed behind
+/// real AI work for nothing.
+fn ai_gate_applies(
+    directives: &crate::url::RequestDirectives,
+    face_provider: bool,
+    focal_provider: bool,
+) -> bool {
+    directives.uses_ai_beyond_smart_crop()
+        || (directives.smart_crop && (face_provider || focal_provider))
+}
+
 /// The cache-miss path: load the source, resolve
 /// watermarks, run the engine under the gates, populate
 /// the tiers, and respond (a meta document when asked).
@@ -3017,6 +3034,7 @@ async fn serve_miss(
 
     record.process_ran = true;
     let process_start = Instant::now();
+    let ai_gate_applies = ai_gate_applies(&directives, state.face.is_some(), state.focal.is_some());
     // The request's one process deadline starts here, so
     // the gate waits below and the run itself share a
     // single budget (run_process takes it as a parameter).
@@ -3025,7 +3043,7 @@ async fn serve_miss(
     // requests must not starve the transform pipeline. The
     // permit travels with the process job (run_process
     // holds it until the job actually finishes).
-    let ai_permit = if directives.uses_ai() {
+    let ai_permit = if ai_gate_applies {
         // The wait is bounded (audit PL-14): a burst of AI
         // requests sheds with a 503 instead of parking
         // unbounded tasks on the gate.
@@ -3243,7 +3261,7 @@ async fn serve_miss(
                         // the original engine error standing.
                         let mut retry_permits = JobPermits::default();
                         let mut may_retry = true;
-                        if directives.uses_ai() {
+                        if ai_gate_applies {
                             match tokio::time::timeout(
                                 AI_GATE_WAIT,
                                 state.ai_gate.clone().acquire_owned(),
@@ -5447,6 +5465,66 @@ mod tests {
             pdf_renderer: None,
             video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             anim_gate,
+            slow_gate: Arc::new(Gate::new(2)),
+            inflight: Arc::new(Inflight::default()),
+            purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+            provenance_signer: None,
+            config_fingerprint: "test".to_string(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String {
+        let state = AppState {
+            keyring: crate::url::Keyring::single(SECRET.to_vec()),
+            allow_unsafe: false,
+            loader: Loader::with_defaults().unwrap(),
+            engine: Engine,
+            process_timeout: std::time::Duration::from_secs(30),
+            metrics: Arc::new(Metrics::default()),
+            metrics_token: None,
+            cache: Arc::new(Cache::new(16 * 1024 * 1024)),
+            removebg: None,
+            upscale: None,
+            inpaint: None,
+            segment: None,
+            face: None,
+            tagger: None,
+            tag_threshold: 0.05,
+            moderation: None,
+            embeddings: None,
+            aesthetic: None,
+            ocr: None,
+            detect: None,
+            detectors: Vec::new(),
+            focal: None,
+            font: None,
+            fallback: None,
+            store: None,
+            shared_store: None,
+            upload: None,
+            ai_gate,
+            process_gate: Arc::new(Gate::new(4)),
+            ssim_target: crate::quality::DEFAULT_SSIM_TARGET,
+            avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
+            jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
+            width_step: 100,
+            preserve_metadata: false,
+            brand_color: None,
+            presets: std::collections::HashMap::new(),
+            only_presets: false,
+            source_roots: std::collections::HashMap::new(),
+            default_ops: Vec::new(),
+            video_encoder: None,
+            frame_extractor: None,
+            pdf_renderer: None,
+            video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             slow_gate: Arc::new(Gate::new(2)),
             inflight: Arc::new(Inflight::default()),
             purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -15213,6 +15291,61 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "one origin fetch for the whole burst"
+        );
+    }
+
+    #[test]
+    fn ai_gate_counts_a_smart_crop_only_when_a_provider_participates() {
+        // Issue #379: the predicate matrix. A smart crop
+        // alone gates only with a face or focal provider;
+        // real inference directives gate regardless.
+        let smart = crate::url::RequestDirectives::analyze(&[crate::url::Operation::Crop {
+            size: crate::url::ImageSize {
+                width: crate::url::Dimension::Pixels(50),
+                height: crate::url::Dimension::Pixels(50),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            align: crate::url::Align::Smart,
+        }]);
+        assert!(smart.smart_crop);
+        assert!(!ai_gate_applies(&smart, false, false));
+        assert!(ai_gate_applies(&smart, true, false));
+        assert!(ai_gate_applies(&smart, false, true));
+        let removebg =
+            crate::url::RequestDirectives::analyze(&[crate::url::Operation::Filters(vec![
+                crate::url::Filter::RemoveBg,
+            ])]);
+        assert!(ai_gate_applies(&removebg, false, false));
+        let plain = crate::url::RequestDirectives::analyze(&[crate::url::Operation::Size(
+            crate::url::ImageSize {
+                width: crate::url::Dimension::Pixels(50),
+                height: crate::url::Dimension::Pixels(50),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+        )]);
+        assert!(!ai_gate_applies(&plain, true, true));
+    }
+
+    #[tokio::test]
+    async fn a_provider_free_smart_crop_never_touches_the_ai_gate() {
+        // Issue #379 at the HTTP level: the app has no
+        // face or focal provider and an AI gate with no
+        // permits at all, so a gated request could only
+        // shed. The smart crop runs on built-in saliency
+        // and answers at once.
+        let src = spawn_bytes_server(test_png()).await;
+        let base = spawn_app_with_ai_gate(Arc::new(tokio::sync::Semaphore::new(0))).await;
+        let remainder = format!("crop:20x20:smart/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let started = std::time::Instant::now();
+        let resp = client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the crop answered without waiting on the gate, took {:?}",
+            started.elapsed()
         );
     }
 

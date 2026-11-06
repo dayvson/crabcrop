@@ -2980,14 +2980,26 @@ impl RequestDirectives {
     /// studio mode, region removal, upscale, face operations,
     /// class redaction, and object crops always infer; smart
     /// crops infer when a face provider is configured, so they
-    /// are gated too.
+    /// are gated too. The gate itself calls
+    /// `uses_ai_beyond_smart_crop` plus the provider check
+    /// (issue #379); this full form stays for the tests that
+    /// pin the directive classification.
+    #[allow(dead_code)]
     pub fn uses_ai(&self) -> bool {
+        self.uses_ai_beyond_smart_crop() || self.smart_crop
+    }
+
+    /// Every `uses_ai` term except the smart crop (issue
+    /// #379): the directives alone cannot say whether a
+    /// smart crop infers, since that depends on the
+    /// deployment's providers, so the server's gate
+    /// predicate combines this with the provider check.
+    pub fn uses_ai_beyond_smart_crop(&self) -> bool {
         self.removebg
             || self.studio
             || self.remove_region
             || self.upscale
             || self.needs_face_model
-            || self.smart_crop
             || self.has_class_redaction()
             || self.objects_crop
             // `debug:focal` runs the face and focal providers
