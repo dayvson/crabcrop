@@ -213,37 +213,67 @@ fn normalize(text: &str) -> String {
 /// pre-tokenizer does: contractions (`'s`, `'t`, `'re`,
 /// `'ve`, `'m`, `'ll`, `'d`) stand alone, letter runs
 /// group, each digit stands alone, punctuation runs
-/// group, and whitespace between them forms its own
-/// pieces.
+/// group, and a space prefixes the piece that follows
+/// it (the reference pattern's optional-space piece
+/// starts), so the space between two words joins the
+/// second word instead of forming a piece of its own.
+/// The splitter once emitted every whitespace run as
+/// its own piece, which encoded each space as a lone
+/// end-of-word space token and stripped the following
+/// word's space prefix, diverging from the reference
+/// tokenization of every multi-word text (issue #377).
+/// A run longer than one space leaves its extra spaces
+/// as a piece before the prefixed one, and a trailing
+/// run stands alone; the normalized text `encode` feeds
+/// here has runs of exactly one space, plus a possible
+/// leading or trailing one.
 fn pretokenize(text: &str) -> Vec<String> {
     const CONTRACTIONS: [&str; 7] = ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"];
     let chars: Vec<char> = text.chars().collect();
     let mut pieces: Vec<String> = Vec::new();
+    // A whitespace character waiting to prefix the next
+    // piece.
+    let mut prefix = String::new();
     let mut i = 0;
     while i < chars.len() {
         let ch = chars[i];
-        if ch == '\'' {
-            let rest: String = chars[i..].iter().collect();
-            if let Some(c) = CONTRACTIONS.iter().find(|c| rest.starts_with(**c)) {
-                pieces.push(c.to_string());
-                i += c.chars().count();
-                continue;
-            }
-        }
         if ch.is_whitespace() {
             let start = i;
             while i < chars.len() && chars[i].is_whitespace() {
                 i += 1;
             }
-            pieces.push(chars[start..i].iter().collect());
-        } else if ch.is_alphabetic() {
+            if i == chars.len() {
+                pieces.push(chars[start..i].iter().collect());
+                break;
+            }
+            if i - start > 1 {
+                pieces.push(chars[start..i - 1].iter().collect());
+            }
+            prefix = chars[i - 1].to_string();
+            continue;
+        }
+        if ch == '\'' {
+            let rest: String = chars[i..].iter().collect();
+            if let Some(c) = CONTRACTIONS.iter().find(|c| rest.starts_with(**c)) {
+                let mut piece = std::mem::take(&mut prefix);
+                piece.push_str(c);
+                pieces.push(piece);
+                i += c.chars().count();
+                continue;
+            }
+        }
+        if ch.is_alphabetic() {
             let start = i;
             while i < chars.len() && chars[i].is_alphabetic() {
                 i += 1;
             }
-            pieces.push(chars[start..i].iter().collect());
+            let mut piece = std::mem::take(&mut prefix);
+            piece.extend(&chars[start..i]);
+            pieces.push(piece);
         } else if ch.is_numeric() {
-            pieces.push(ch.to_string());
+            let mut piece = std::mem::take(&mut prefix);
+            piece.push(ch);
+            pieces.push(piece);
             i += 1;
         } else {
             let start = i;
@@ -254,7 +284,9 @@ fn pretokenize(text: &str) -> Vec<String> {
             {
                 i += 1;
             }
-            pieces.push(chars[start..i].iter().collect());
+            let mut piece = std::mem::take(&mut prefix);
+            piece.extend(&chars[start..i]);
+            pieces.push(piece);
         }
     }
     pieces
@@ -294,7 +326,7 @@ mod tests {
             r#"{"model": {"type": "BPE",
                 "vocab": {"<|startoftext|>": 0, "<|endoftext|>": 1,
                           "a</w>": 10, "b</w>": 11, "Ġ</w>": 12,
-                          "a": 13, "b": 14, "ab</w>": 15},
+                          "a": 13, "b": 14, "ab</w>": 15, "Ġ": 16},
                 "merges": ["a b</w>"]}}"#,
         )
         .unwrap()
@@ -318,9 +350,16 @@ mod tests {
         let t = toy();
         let (ids, _) = t.encode("ab").unwrap();
         assert_eq!(&ids[..3], &[0, 15, 1], "a + b</w> merge to ab</w>");
-        // No merge across pieces: "a b" is a, space, b.
+        // No merge across pieces, and the space prefixes
+        // the second word (issue #377): "a b" is a</w>,
+        // then the piece " b" as the bare space byte and
+        // b</w>, never a lone end-of-word space token.
         let (ids, _) = t.encode("a b").unwrap();
-        assert_eq!(&ids[..5], &[0, 10, 12, 11, 1]);
+        assert_eq!(&ids[..5], &[0, 10, 16, 11, 1]);
+        // A trailing space does stand alone, as the
+        // reference's trailing-whitespace piece.
+        let (ids, _) = t.encode("a ").unwrap();
+        assert_eq!(&ids[..4], &[0, 10, 12, 1]);
     }
 
     #[test]
@@ -368,15 +407,21 @@ mod tests {
     fn encode_lowercases_and_collapses_whitespace() {
         let t = toy();
         let (ids, _) = t.encode("A   B").unwrap();
-        assert_eq!(&ids[..5], &[0, 10, 12, 11, 1]);
+        assert_eq!(&ids[..5], &[0, 10, 16, 11, 1]);
     }
 
     #[test]
     fn pretokenize_splits_like_the_export() {
-        assert_eq!(pretokenize("kite surfing"), ["kite", " ", "surfing"]);
-        assert_eq!(pretokenize("top 10"), ["top", " ", "1", "0"]);
-        assert_eq!(pretokenize("it's me"), ["it", "'s", " ", "me"]);
+        // The space prefixes the following piece (issue
+        // #377); it is a piece of its own only when it
+        // trails, or as the extra spaces of a longer run.
+        assert_eq!(pretokenize("kite surfing"), ["kite", " surfing"]);
+        assert_eq!(pretokenize("top 10"), ["top", " 1", "0"]);
+        assert_eq!(pretokenize("it's me"), ["it", "'s", " me"]);
         assert_eq!(pretokenize("sun-set!"), ["sun", "-", "set", "!"]);
+        assert_eq!(pretokenize("kite "), ["kite", " "]);
+        assert_eq!(pretokenize("a  b"), ["a", " ", " b"]);
+        assert_eq!(pretokenize(" kite"), [" kite"]);
     }
 
     #[test]
