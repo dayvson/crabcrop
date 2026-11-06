@@ -528,6 +528,15 @@ fn crop_region_traced(
 /// the window stays fully inside it, and so the window stays
 /// inside the image either way.
 fn focal_start(rect_start: u32, rect_end: u32, window: u32, extent: u32) -> u32 {
+    // The rectangle was validated against the image as it
+    // stood when its segment ran; a resize between that
+    // segment and the crop leaves it in stale coordinates,
+    // possibly past the current frame (issue #371). Re-clamp
+    // it into the consuming space first: with both ends
+    // inside the frame, the fits branch below can no longer
+    // produce inverted clamp bounds.
+    let rect_start = rect_start.min(extent);
+    let rect_end = rect_end.min(extent).max(rect_start);
     let max_start = extent.saturating_sub(window) as i64;
     let preferred = (rect_start as i64 + rect_end as i64) / 2 - window as i64 / 2;
     let start = if rect_end - rect_start <= window {
@@ -1078,6 +1087,28 @@ mod tests {
         assert_eq!((out.width(), out.height()), (60, 60));
         assert_eq!(rgb(&out, 0, 0), [0, 255, 0]);
         assert_eq!(rgb(&out, 0, 59), [0, 0, 255]);
+    }
+
+    #[test]
+    fn focal_crop_survives_a_rectangle_left_in_stale_coordinates() {
+        // Issue #371: the rectangle below was valid for the
+        // 1000px wide source it was declared against; the
+        // crop consumes it after a resize to the 100x60
+        // frame, where both ends sit past the right edge.
+        // The fits branch used to build clamp bounds of
+        // (950, 50) and panic. Clamped into the consuming
+        // frame, the rectangle is the empty span at the
+        // right edge, and the window hugs that edge.
+        assert_eq!(focal_start(980, 1000, 50, 100), 50);
+        let out = crop_to_aspect_focal(vstripes(), 1, 1, (980, 0, 1000, 60));
+        assert_eq!((out.width(), out.height()), (60, 60));
+        assert_eq!(rgb(&out, 0, 0), [0, 255, 0]);
+        assert_eq!(rgb(&out, 59, 59), [0, 0, 255]);
+        // A rectangle only partly past the edge clamps to
+        // the part inside the frame.
+        let out = crop_to_aspect_focal(vstripes(), 1, 1, (85, 0, 1000, 60));
+        assert_eq!((out.width(), out.height()), (60, 60));
+        assert_eq!(rgb(&out, 59, 0), [0, 0, 255]);
     }
 
     #[test]
