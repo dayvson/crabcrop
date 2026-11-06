@@ -415,9 +415,12 @@ export const filter = {
     return "pixelatefaces";
   },
 
-  /** Gaussian blur by sigma (positive). */
+  /** Gaussian blur by sigma: positive, at most the server's 512 cap. */
   blur(sigma: number): string {
-    return `blur(${num(positiveFloat("blur sigma", sigma))})`;
+    if (!Number.isFinite(sigma) || sigma <= 0 || sigma > 512) {
+      fail("blur sigma", sigma, "a positive number up to 512");
+    }
+    return `blur(${num(sigma)})`;
   },
   /** Unsharp-mask strength (positive). */
   sharpen(amount: number): string {
@@ -606,7 +609,11 @@ export const filter = {
     if (!IMAGE_FORMATS.includes(format)) {
       fail("format", format, `one of ${IMAGE_FORMATS.join(", ")}`);
     }
-    const args: string[] = [format];
+    // The output segment is the canonical spelling: the
+    // `jpg` input alias spells as `jpeg`, like the server's
+    // canonical form.
+    const canonical = format === "jpg" ? "jpeg" : format;
+    const args: string[] = [canonical];
     const used = (key: keyof FormatOptions) => options[key] !== undefined;
     if (format === "jpeg" || format === "jpg") {
       if (used("interlace") || used("method") || used("sns")) {
@@ -721,9 +728,9 @@ export const filter = {
     for (const c of corners) intIn("radius", c, 0, MAX_DIMENSION);
     return `radius(${corners.join(",")})`;
   },
-  /** Paint an opaque border inside the frame (RRGGBB). */
+  /** Paint an opaque border inside the frame (RRGGBB); a width of 0 is a no-op. */
   border(width: number, color: string): string {
-    return `border(${intIn("border width", width, 1, MAX_DIMENSION)},${hex6("border color", color)})`;
+    return `border(${intIn("border width", width, 0, MAX_DIMENSION)},${hex6("border color", color)})`;
   },
   mask(shape: MaskShape): string {
     if (shape !== "circle" && shape !== "ellipse") {

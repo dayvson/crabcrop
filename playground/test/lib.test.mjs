@@ -148,180 +148,41 @@ test("empty-string secret signs; only null means unsafe (audit P-6)", async () =
   assert.ok(unsigned.includes("/unsafe/"));
 });
 
+// The explainer verdict corpus (audit P-3 / AP-23) is a
+// shared spec file, not a copy in this suite: the TypeScript
+// SDK suite and the server crate's differential tests run
+// the same entries (issue #353), so a verdict can only
+// change in one place and every surface re-checks it.
+const verdictCorpus = JSON.parse(
+  readFileSync(new URL("../../spec/explain-verdicts.json", import.meta.url), "utf8"),
+);
+
 test("explainer verdicts match the server grammar (audit P-3 corpus)", () => {
-  const SRC = "https://example.com/a.jpg";
-  // [remainder, expectError, expectSource]
-  const cases = [
-    ["exp:99999999999999999999999999/300x200/" + SRC, true, SRC], // u64 overflow: a clean error, not a crash
-    ["300x200/https://example.com/%2e%2e/a.jpg", false, "https://example.com/%2e%2e/a.jpg"], // dot segments stay literal
-    ["300x/" + SRC, false, SRC], // empty height is proportional
-    ["x200/" + SRC, false, SRC], // empty width is proportional
-    ["fit-in:300x/" + SRC, false, SRC],
-    ["fit-in:-300x200/" + SRC, true, SRC], // flips are invalid in fit-in
-    ["fit-in:300x200:adaptive/" + SRC, false, SRC], // the box swaps on orientation mismatch
-    ["fit-in:300x200:sideways/" + SRC, true, SRC], // adaptive is the only fit-in modifier
-    ["fit-in:300x200:adaptive:extra/" + SRC, true, SRC],
-    ["fit-in:adaptive/" + SRC, true, SRC], // adaptive is a modifier, never the box
-    ["pad:100x100:adaptive/" + SRC, true, SRC], // pad's canvas is explicit: no adaptive
-    ["crop:100x100:sideways/" + SRC, true, SRC], // align is an enumerated set
-    ["crop:100x100:smart/" + SRC, false, SRC],
-    ["crop:100x100:top-left/" + SRC, false, SRC], // corner alignments parse
-    ["crop:100x100:bottom-right/" + SRC, false, SRC],
-    ["crop:100x100:left-top/" + SRC, true, SRC], // corners are vertical-first
-    ["crop:300x0/" + SRC, true, SRC], // crop is an exact box: pixels on both axes
-    ["crop:-300x200/" + SRC, true, SRC], // flips are invalid in crop
-    ["crop:origx100/" + SRC, true, SRC], // orig is invalid in crop
-    ["crop:100x100:objects(person)/" + SRC, false, SRC], // objects crop, tight box
-    ["crop:100x100:objects(person,car):1.5/" + SRC, false, SRC], // multi-class with a scale
-    ["crop:100x100:objects(traffic%20light)/" + SRC, false, SRC], // encoded class name
-    ["crop:100x100:objects()/" + SRC, true, SRC], // at least one class is required
-    ["crop:100x100:objects(person,)/" + SRC, true, SRC], // no empty class slots
-    ["crop:100x100:objects(person/" + SRC, true, SRC], // the paren must close
-    ["crop:100x100:objects(person):0/" + SRC, true, SRC], // scale is above 0
-    ["crop:100x100:objects(person):101/" + SRC, true, SRC], // scale caps at 100
-    ["crop:100x100:objects(bad;name)/" + SRC, true, SRC], // class names are the class charset
-    ["pad:300xorig/" + SRC, true, SRC], // pad is an exact box too
-    ["pad:-200x100/" + SRC, true, SRC], // flips are invalid in pad
-    ["filters:quality(999)/" + SRC, true, SRC], // quality caps at 100
-    ["filters:quality(80):blur(2)/" + SRC, false, SRC],
-    ["filters:blur(-1)/" + SRC, true, SRC], // sigma must be positive
-    ["filters:dpr(7)/" + SRC, true, SRC], // dpr is an enumerated set
-    ["filters:dpr(1.5)/" + SRC, false, SRC],
-    ["pad:100x100:blur/" + SRC, false, SRC],
-    ["pad:100x100:ff00aa/" + SRC, false, SRC],
-    ["pad:100x100:red/" + SRC, true, SRC],
-    ["crop-rect:0x0:50x50/" + SRC, false, SRC],
-    ["crop-rect:0x0:50/" + SRC, true, SRC],
-    ["focal:0x0:50x50/" + SRC, false, SRC],
-    ["focal:0x0:50/" + SRC, true, SRC],
-    ["16384x10/" + SRC, false, "16384x10/" + SRC], // oversize bare size is not an op: the source starts there
-    ["exp:1893456000/300x200/" + SRC, false, SRC],
-    ["maxage:60/300x200/" + SRC, false, SRC], // cache lifetime is metadata too
-    ["maxage:0/300x200/" + SRC, false, SRC], // zero is a real lifetime
-    ["maxage:31536000/300x200/" + SRC, false, SRC], // the cap itself
-    ["maxage:31536001/300x200/" + SRC, true, SRC], // past the cap
-    ["maxage:soon/300x200/" + SRC, true, SRC], // not a number
-    ["debug:focal/crop:100x100:smart/" + SRC, false, SRC], // the debug view annotates the crop
-    ["debug:focal/" + SRC, false, SRC], // no crop: the final image's focal analysis
-    ["debug:banana/300x200/" + SRC, true, SRC], // unknown debug view
-    ["debug:/300x200/" + SRC, true, SRC], // empty debug view
-    ["filters:radius(12)/" + SRC, false, SRC],
-    ["filters:radius(1,2,3,4):mask(circle)/" + SRC, false, SRC],
-    ["filters:radius(1,2)/" + SRC, true, SRC],
-    ["filters:border(2,00ff00)/" + SRC, false, SRC],
-    ["filters:border(0,00ff00)/" + SRC, true, SRC],
-    ["filters:mask(square)/" + SRC, true, SRC],
-    ["filters:sepia:duotone(000000,ffffff):flip(h)/" + SRC, false, SRC],
-    ["filters:duotone(000000)/" + SRC, true, SRC],
-    ["filters:curve(rgb,0,0,255,255)/" + SRC, false, SRC], // the identity curve
-    ["filters:curve(r,0,64,255,255):curve(b,32,10,224,245)/" + SRC, false, SRC], // per-channel curves chain
-    ["filters:curve(x,0,0,255,255)/" + SRC, true, SRC], // unknown channel
-    ["filters:curve(rgb,0,0)/" + SRC, true, SRC], // fewer than 2 points
-    ["filters:curve(rgb,0,0,255)/" + SRC, true, SRC], // odd coordinate count
-    ["filters:curve(rgb,0,0,256,255)/" + SRC, true, SRC], // coordinate past 255
-    ["filters:curve(rgb,128,0,64,255)/" + SRC, true, SRC], // x decreasing
-    ["filters:curve(rgb,0,0,0,255)/" + SRC, true, SRC], // x repeated
-    ["filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)/" + SRC, false, SRC], // a 3x3 sharpen kernel
-    ["filters:convolution(0.0625,0.125,0.0625,0.125,0.25,0.125,0.0625,0.125,0.0625,1)/" + SRC, false, SRC], // a normalized gaussian
-    ["filters:convolution(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)/" + SRC, false, SRC], // a 5x5 identity kernel
-    ["filters:convolution(0,0,0,0,1,0,0,0,0)/" + SRC, true, SRC], // 8 values plus the flag
-    ["filters:convolution(0,0,0,0,1,0,0,0,0,0,0)/" + SRC, true, SRC], // 10 values plus the flag
-    ["filters:convolution(0,-1,0,-1,5,-1,0,-1,0,2)/" + SRC, true, SRC], // flag other than 0 or 1
-    ["filters:convolution(0,-1,0,-1,1e2,-1,0,-1,0,0)/" + SRC, true, SRC], // exponent spelling
-    ["filters:convolution(0,-1,0,-1,.5,-1,0,-1,0,0)/" + SRC, true, SRC], // leading dot
-    ["filters:convolution(0,-1,0,-1,1025,-1,0,-1,0,0)/" + SRC, true, SRC], // value past the 1024 bound
-    ["filters:noise(0)/" + SRC, false, SRC], // no grain
-    ["filters:noise(40)/" + SRC, false, SRC], // mid-strength grain
-    ["filters:noise(100)/" + SRC, false, SRC], // full-scale grain
-    ["filters:noise(101)/" + SRC, true, SRC], // past the 0..100 range
-    ["filters:noise(256)/" + SRC, true, SRC], // does not fit the amount either
-    ["filters:noise(-1)/" + SRC, true, SRC], // negative
-    ["filters:noise(1.5)/" + SRC, true, SRC], // not an integer
-    ["filters:monochrome(ff8000):pixelate(8)/" + SRC, false, SRC],
-    ["filters:pixelate(0)/" + SRC, true, SRC],
-    ["filters:flip(x)/" + SRC, true, SRC],
-    ["filters:blur_region(1,2,30,40):pixelate_region(0,0,5,5)/" + SRC, false, SRC],
-    ["filters:blur_region(1,2,0,40)/" + SRC, true, SRC],
-    ["filters:pixelate_region(0,0,10,16384)/" + SRC, true, SRC],
-    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,80,multiply)/" + SRC, false, SRC],
-    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,screen,25)/" + SRC, false, SRC],
-    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,darken)/" + SRC, true, SRC],
-    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,101,normal)/" + SRC, true, SRC],
-    ["filters:blurclass(person)/" + SRC, false, SRC],
-    ["filters:pixelateclass(traffic%20light)/" + SRC, false, SRC],
-    ["filters:blurclass()/" + SRC, true, SRC],
-    ["filters:blurclass(per%24on)/" + SRC, true, SRC],
-    ["filters:pixelateclass/" + SRC, true, SRC],
-    ["filters:keep_profile/" + SRC, false, SRC],
-    ["filters:format(mp4)/" + SRC, false, SRC], // video out (issue #162): explicit format only
-    ["filters:format(webm)/" + SRC, false, SRC],
-    ["filters:format(mov)/" + SRC, true, SRC],
-    // AP-23 parity cases: each verdict below is the Rust
-    // parser's, verified against src/url.rs.
-    ["crop-rect:50x50:0x0/" + SRC, true, SRC],
-    ["crop-rect:50x50:51x51/" + SRC, false, SRC],
-    ["focal:50x50:0x0/" + SRC, true, SRC],
-    ["focal:50x50:51x51/" + SRC, false, SRC],
-    ["focalpoint:0.75x0.4:2/" + SRC, false, SRC],
-    ["focalpoint:0.75x0.4/" + SRC, false, SRC],
-    ["focalpoint:0x0:100/" + SRC, false, SRC],
-    ["focalpoint:1.5x0.4/" + SRC, true, SRC],
-    ["focalpoint:0.75x-0.1/" + SRC, true, SRC],
-    ["focalpoint:0.75x0.4:0/" + SRC, true, SRC],
-    ["focalpoint:0.75x0.4:101/" + SRC, true, SRC],
-    ["focalpoint:0.75/" + SRC, true, SRC],
-    ["focalpoint:0.75x0.4:2:3/" + SRC, true, SRC],
-    ["filters:blur(0x10)/" + SRC, true, SRC],
-    ["filters:contrast(0x2)/" + SRC, true, SRC],
-    ["filters:gamma(2.2)/" + SRC, false, SRC],
-    ["filters:gamma(1e1)/" + SRC, false, SRC],
-    ["filters:gamma(0)/" + SRC, true, SRC],
-    ["filters:gamma(11)/" + SRC, true, SRC],
-    ["filters:exposure(1.5)/" + SRC, false, SRC],
-    ["filters:exposure(0)/" + SRC, false, SRC],
-    ["filters:exposure(-1e1)/" + SRC, false, SRC],
-    ["filters:exposure(10.5)/" + SRC, true, SRC],
-    ["filters:exposure(nan)/" + SRC, true, SRC],
-    ["filters:highlights_shadows(30,-20)/" + SRC, false, SRC],
-    ["filters:highlights_shadows(0,0)/" + SRC, false, SRC],
-    ["filters:highlights_shadows(101,0)/" + SRC, true, SRC],
-    ["filters:highlights_shadows(30)/" + SRC, true, SRC],
-    ["filters:highlights_shadows(1,2,3)/" + SRC, true, SRC],
-    ["filters:vibrance(40)/" + SRC, false, SRC],
-    ["filters:vibrance(-100)/" + SRC, false, SRC],
-    ["filters:vibrance(101)/" + SRC, true, SRC],
-    ["filters:vibrance(nan)/" + SRC, true, SRC],
-    ["filters:enhance/" + SRC, false, SRC],
-    ["filters:enhance(1)/" + SRC, true, SRC],
-    ["filters:trim(20,5,0,5,0)/" + SRC, false, SRC],
-    ["filters:trim(20,5)/" + SRC, true, SRC],
-    ["filters:trim(20,5,0,5,-1)/" + SRC, true, SRC],
-    ["filters:trim(256,0,0,0,0)/" + SRC, true, SRC],
-    ["filters:palette(64)/" + SRC, false, SRC],
-    ["filters:palette(2)/" + SRC, false, SRC],
-    ["filters:palette(256)/" + SRC, false, SRC],
-    ["filters:palette(1)/" + SRC, true, SRC],
-    ["filters:palette(257)/" + SRC, true, SRC],
-    ["filters:palette()/" + SRC, true, SRC],
-    ["filters:blur( 1.5)/" + SRC, true, SRC],
-    ["filters:blur(1e2)/" + SRC, false, SRC],
-    ["filters:blur(.5)/" + SRC, false, SRC],
-    ["filters:overlay(a,b.png,0,0,80,normal)/" + SRC, true, SRC],
-    ["filters:overlay(a,b.png,0,0,80,normal,25)/" + SRC, false, SRC],
-    ["300x200//" + SRC, true, SRC],
-    ["filters:blurclass(" + "é".repeat(40) + ")/" + SRC, true, SRC],
-    ["filters:blurclass(" + "é".repeat(32) + ")/" + SRC, false, SRC],
-    ["filters:brighten(+5)/" + SRC, false, SRC],
-    ["filters:quality(+80)/" + SRC, false, SRC],
-    ["filters:text(Hello,+12,ff8800,center)/" + SRC, false, SRC],
-    ["+300x200/" + SRC, false, SRC],
-    ["filters:radius(+12)/" + SRC, false, SRC],
-    ["filters:pixelate(+8)/" + SRC, false, SRC],
-  ];
-  for (const [remainder, expectError, expectSource] of cases) {
+  const SIG = "a".repeat(64);
+  for (const { remainder, error, source } of verdictCorpus.cases) {
     const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);
-    assert.equal(out.source, expectSource, remainder);
-    assert.equal(out.errors.length > 0, expectError, `${remainder}: ${JSON.stringify(out.errors)}`);
+    assert.equal(out.source, source, remainder);
+    assert.equal(out.errors.length > 0, error, `${remainder}: ${JSON.stringify(out.errors)}`);
+  }
+});
+
+// The generated-combination corpus (issue #353): generated
+// valid and invalid remainders whose verdicts the generator
+// pins from the grammar. The server crate checks the same
+// file against the Rust parser, including the canonical
+// forms and error codes this surface does not produce.
+const operationVectors = JSON.parse(
+  readFileSync(new URL("../../spec/operation-vectors.json", import.meta.url), "utf8"),
+);
+
+test("explainer verdicts match the generated combination corpus", () => {
+  for (const { remainder, ok, source } of operationVectors.cases) {
+    const out = explainUrl(
+      `https://img.example.com/${operationVectors.signature}/${remainder}`,
+      1700000000,
+    );
+    assert.equal(out.errors.length === 0, ok, `${remainder}: ${JSON.stringify(out.errors)}`);
+    assert.equal(out.source, source, remainder);
   }
 });
 

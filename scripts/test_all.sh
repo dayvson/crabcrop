@@ -38,6 +38,9 @@ for pair in "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml
   fi
 done
 
+step "Operation vectors (the generated corpus is current)"
+python3 spec/generate_operation_vectors.py --check
+
 step "Build (debug binary: the MCP suite spawns it)"
 cargo build --locked
 

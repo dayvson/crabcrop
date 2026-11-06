@@ -1,6 +1,6 @@
 # @crabcrop/url
 
-Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScript or JavaScript. Standard library only (`node:crypto`); the signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md). Signing is pinned by the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json), which this package runs as tests, and the explainer's verdicts are pinned by a grammar corpus mirrored in the playground's test suite.
+Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScript or JavaScript. Standard library only (`node:crypto`); the signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md). Signing is pinned by the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json), which this package runs as tests, and the explainer's verdicts and the typed builders are pinned by the shared grammar corpora in [`spec/explain-verdicts.json`](../../spec/explain-verdicts.json) and [`spec/operation-vectors.json`](../../spec/operation-vectors.json), which the playground's suite and the server crate's differential tests run as well.
 
 ## Usage
 

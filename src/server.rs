@@ -7890,6 +7890,361 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preset_urls_and_explicit_chains_serve_identical_bytes() {
+        // Issue #353: a preset spelling and the explicit
+        // chain it expands to are the same request: identical
+        // bytes either way, and the second spelling is served
+        // from the first's cache entry (one origin hit).
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let mut presets = preset_test_map();
+        presets.insert(
+            "card".to_string(),
+            "crop:40x30:smart/filters:quality(80)".to_string(),
+        );
+        let base = spawn_app_with_presets(presets, false).await;
+        let chains = [
+            ("preset:small", "30x20"),
+            ("preset:gray", "filters:grayscale"),
+            ("preset:card", "crop:40x30:smart/filters:quality(80)"),
+        ];
+        let mut want_hits = 0;
+        for (preset, chain) in chains {
+            want_hits += 1;
+            let via_preset = get_signed(&base, &format!("{preset}/{src}")).await;
+            assert_eq!(via_preset.status(), StatusCode::OK, "{preset}");
+            let preset_bytes = via_preset.bytes().await.unwrap();
+            let via_chain = get_signed(&base, &format!("{chain}/{src}")).await;
+            assert_eq!(via_chain.status(), StatusCode::OK, "{chain}");
+            let chain_bytes = via_chain.bytes().await.unwrap();
+            assert_eq!(preset_bytes, chain_bytes, "{preset} vs {chain}");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                want_hits,
+                "{preset} vs {chain}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_corpus_error_codes_match_the_http_envelope() {
+        // Issue #353: one generated remainder per error code
+        // in spec/operation-vectors.json, re-targeted at the
+        // test origin (the parse fails before any fetch): the
+        // HTTP layer must answer 400 with the same code the
+        // corpus pins for the parser.
+        let src = spawn_image_server().await;
+        let base = spawn_app(false).await;
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../spec/operation-vectors.json")).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut checked = 0;
+        for case in doc["cases"].as_array().unwrap() {
+            if case["ok"].as_bool().unwrap() {
+                continue;
+            }
+            let code = case["error"].as_str().unwrap();
+            if !seen.insert(code.to_string()) {
+                continue;
+            }
+            let remainder = case["remainder"].as_str().unwrap();
+            let ops = remainder
+                .strip_suffix("/https://example.com/a.jpg")
+                .unwrap_or_else(|| panic!("error case without the corpus source: {remainder}"));
+            let remainder = format!("{ops}/{src}");
+            let url = format!("{base}/{}/{remainder}", sign(&remainder));
+            let resp = client()
+                .get(&url)
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{remainder}");
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"], code, "{remainder}");
+            checked += 1;
+        }
+        assert!(checked >= 12, "only {checked} error codes sampled");
+    }
+
+    /// The differential corpora (issue #353): the
+    /// hand-written explainer verdicts in
+    /// `spec/explain-verdicts.json` and the generated
+    /// combinations in `spec/operation-vectors.json`. Every
+    /// surface that reads a remainder (the Rust parser, the
+    /// TypeScript explainer, the playground's copy) runs the
+    /// same files in its own suite; a disagreement anywhere
+    /// fails the gate here or there, and the mismatch list is
+    /// printed whole so one run shows every divergence.
+    /// These tests live here rather than in url.rs because
+    /// the fuzz crate includes url.rs textually, without the
+    /// explain module or serde_json in scope.
+    fn load_spec(name: &str) -> serde_json::Value {
+        let text = match name {
+            "explain-verdicts.json" => include_str!("../spec/explain-verdicts.json"),
+            "operation-vectors.json" => include_str!("../spec/operation-vectors.json"),
+            _ => unreachable!(),
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn differential_verdict_corpus_agrees_with_the_parser() {
+        let doc = load_spec("explain-verdicts.json");
+        let mut bad = Vec::new();
+        for case in doc["cases"].as_array().unwrap() {
+            let remainder = case["remainder"].as_str().unwrap();
+            let expect_error = case["error"].as_bool().unwrap();
+            let expect_source = case["source"].as_str().unwrap();
+            match crate::url::parse_operations_with_expiry(remainder) {
+                Ok((_, source, _, _)) => {
+                    if expect_error {
+                        bad.push(format!("{remainder}: corpus says error, parser accepts"));
+                    } else if source != expect_source {
+                        bad.push(format!(
+                            "{remainder}: source {source:?} != corpus {expect_source:?}"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if !expect_error {
+                        bad.push(format!(
+                            "{remainder}: corpus says ok, parser errors {}",
+                            e.code()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} mismatches:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// The explainer's per-operation segments for a parsed
+    /// chain, with adjacent `filters:` entries merged the way
+    /// [`canonical_form`] merges them, so the two walks over
+    /// the chain can be compared segment for segment.
+    fn explained_segments(ops: &[crate::url::Operation]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for entry in crate::explain::op_entries(ops) {
+            assert!(
+                entry.descriptions.iter().all(|d| !d.is_empty()),
+                "an operation with an empty gloss: {}",
+                entry.segment
+            );
+            match (out.last_mut(), entry.segment.strip_prefix("filters:")) {
+                (Some(last), Some(chain)) if last.starts_with("filters:") => {
+                    last.push(':');
+                    last.push_str(chain);
+                }
+                _ => out.push(entry.segment),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn differential_generated_cases_agree_across_surfaces() {
+        let doc = load_spec("operation-vectors.json");
+        let cases = doc["cases"].as_array().unwrap();
+        assert!(
+            cases.len() > 500,
+            "the generated corpus shrank: {}",
+            cases.len()
+        );
+        let mut bad = Vec::new();
+        for case in cases {
+            let remainder = case["remainder"].as_str().unwrap();
+            if case["ok"].as_bool().unwrap() {
+                let canonical = case["canonical"].as_str().unwrap();
+                match crate::url::parse_operations_with_expiry(remainder) {
+                    Ok((ops, source, _, _)) => {
+                        // Verdict and canonical form.
+                        let form = crate::url::canonical_form(&ops, source);
+                        if form != canonical {
+                            bad.push(format!(
+                                "{remainder}: canonical {form:?} != corpus {canonical:?}"
+                            ));
+                            continue;
+                        }
+                        // The canonical form is a fixed point:
+                        // parsing it changes nothing.
+                        match crate::url::parse_operations_with_expiry(canonical) {
+                            Ok((ops2, source2, _, _)) => {
+                                let form2 = crate::url::canonical_form(&ops2, source2);
+                                if form2 != canonical {
+                                    bad.push(format!(
+                                        "{canonical}: not a fixed point, re-canonicalizes to {form2:?}"
+                                    ));
+                                }
+                            }
+                            Err(e) => bad.push(format!(
+                                "{canonical}: canonical form fails to parse ({})",
+                                e.code()
+                            )),
+                        }
+                        // The explainer walks the same chain:
+                        // its segments, merged like the
+                        // canonicalizer merges, are the
+                        // canonical operation segments.
+                        let ops_part = if canonical == source {
+                            ""
+                        } else {
+                            canonical
+                                .strip_suffix(&format!("/{source}"))
+                                .unwrap_or(canonical)
+                        };
+                        let explained = explained_segments(&ops).join("/");
+                        if explained != ops_part {
+                            bad.push(format!(
+                                "{remainder}: explainer segments {explained:?} != canonical operations {ops_part:?}"
+                            ));
+                        }
+                    }
+                    Err(e) => bad.push(format!(
+                        "{remainder}: corpus says ok, parser errors {}",
+                        e.code()
+                    )),
+                }
+            } else {
+                let code = case["error"].as_str().unwrap();
+                match crate::url::parse_operations_with_expiry(remainder) {
+                    Ok(_) => bad.push(format!("{remainder}: corpus says {code}, parser accepts")),
+                    Err(e) => {
+                        if e.code() != code {
+                            bad.push(format!(
+                                "{remainder}: corpus says {code}, parser errors {}",
+                                e.code()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} mismatches:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn differential_builder_segments_parse_to_their_canonical_form() {
+        // The TypeScript builders promise the canonical
+        // spelling; the SDK suite checks each call's output
+        // against `segment`, and here the same segments must
+        // parse to the recorded canonical form (or fail with
+        // the recorded code, for calls the builder refuses).
+        let doc = load_spec("operation-vectors.json");
+        let src = "https://example.com/a.jpg";
+        let mut bad = Vec::new();
+        for case in doc["builder_cases"].as_array().unwrap() {
+            if case["rust"].as_bool() == Some(false) {
+                continue;
+            }
+            let call = case["call"].as_str().unwrap();
+            let segment = case["segment"].as_str().unwrap();
+            let wrap = |text: &str| {
+                if call.starts_with("filter.") {
+                    format!("filters:{text}")
+                } else {
+                    text.to_string()
+                }
+            };
+            let remainder = format!("{}/{src}", wrap(segment));
+            if case["throws"].as_bool() == Some(true) {
+                let code = case["error"].as_str().unwrap();
+                match crate::url::parse_operations_with_expiry(&remainder) {
+                    Ok(_) => bad.push(format!(
+                        "{call} {segment}: corpus says {code}, parser accepts"
+                    )),
+                    Err(e) => {
+                        if e.code() != code {
+                            bad.push(format!(
+                                "{call} {segment}: corpus says {code}, parser errors {}",
+                                e.code()
+                            ));
+                        }
+                    }
+                }
+            } else {
+                let canonical = case["canonical"].as_str().unwrap();
+                let want = if canonical.is_empty() {
+                    src.to_string()
+                } else {
+                    format!("{}/{src}", wrap(canonical))
+                };
+                match crate::url::parse_operations_with_expiry(&remainder) {
+                    Ok((ops, source, _, _)) => {
+                        let form = crate::url::canonical_form(&ops, source);
+                        if form != want {
+                            bad.push(format!(
+                                "{call} {segment}: canonical {form:?} != corpus {want:?}"
+                            ));
+                        }
+                    }
+                    Err(e) => bad.push(format!(
+                        "{call} {segment}: corpus says ok, parser errors {}",
+                        e.code()
+                    )),
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} mismatches:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn preset_spellings_and_their_expansions_share_one_cache_key() {
+        // A preset reference and the explicit chain it
+        // expands to are one request: the server expands
+        // before keying, so both spellings canonicalize to
+        // the same cache key form.
+        let presets: std::collections::HashMap<String, String> = [
+            ("small".to_string(), "30x20".to_string()),
+            ("gray".to_string(), "filters:grayscale".to_string()),
+            (
+                "card".to_string(),
+                "crop:1200x630:smart/filters:quality(80)".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let src = "https://example.com/a.jpg";
+        for (name, definition) in &presets {
+            let spelled = format!("preset:{name}/{src}");
+            let expanded = crate::url::expand_presets(&spelled, &presets, false).unwrap();
+            assert_eq!(expanded, format!("{definition}/{src}"));
+        }
+        // A preset followed by more chain composes with it,
+        // and the composed spelling keys like the fully
+        // explicit one (adjacent filter segments merge).
+        let spelled = format!("preset:gray/filters:blur(2)/{src}");
+        let expanded = crate::url::expand_presets(&spelled, &presets, false).unwrap();
+        assert_eq!(expanded, format!("filters:grayscale/filters:blur(2)/{src}"));
+        assert_eq!(
+            crate::url::canonical_key_form(&expanded),
+            crate::url::canonical_key_form(&format!("filters:grayscale:blur(2)/{src}")),
+        );
+        // Expansion failures carry the frozen codes.
+        let err =
+            crate::url::expand_presets(&format!("preset:nope/{src}"), &presets, false).unwrap_err();
+        assert_eq!(err.code(), "unknown_preset");
+        let err =
+            crate::url::expand_presets(&format!("300x200/{src}"), &presets, true).unwrap_err();
+        assert_eq!(err.code(), "presets_only");
+    }
+
+    #[tokio::test]
     async fn unknown_presets_are_a_bad_request() {
         let src = spawn_image_server().await;
         let base = spawn_app_with_presets(preset_test_map(), false).await;

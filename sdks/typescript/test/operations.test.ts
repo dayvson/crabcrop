@@ -367,9 +367,55 @@ test("typed builders reject what the server would reject", () => {
     () => filter.studio("scene", { shadow: "soft" }),
     () => filter.studio("scene", { pad: 41 }),
     () => filter.radius(-1),
-    () => filter.border(0, "000000"),
+    () => filter.border(-1, "000000"),
   ];
   for (const build of bad) {
     assert.throws(build, Error);
+  }
+});
+
+import { readFileSync } from "node:fs";
+
+// The generated builder corpus (issue #353): the same
+// spec/operation-vectors.json the server crate checks against
+// the Rust parser. Each entry is one builder call and the
+// segment it must produce (or that it must throw), so the
+// typed surface and the grammar cannot drift apart silently.
+const builderCorpus = JSON.parse(
+  readFileSync(new URL("../../../spec/operation-vectors.json", import.meta.url), "utf8"),
+) as {
+  builder_cases: Array<{
+    call: string;
+    args: unknown[];
+    segment?: string;
+    throws?: boolean;
+  }>;
+};
+
+type BuilderFn = (...args: never[]) => string;
+
+function resolveCall(call: string): BuilderFn {
+  const [ns, name] = call.split(".");
+  const table = (ns === "ops" ? ops : filter) as unknown as Record<string, BuilderFn>;
+  return table[name];
+}
+
+function resolveArg(arg: unknown): unknown {
+  if (typeof arg === "object" && arg !== null && "call" in arg) {
+    const nested = arg as { call: string; args: unknown[] };
+    return resolveCall(nested.call)(...nested.args.map(resolveArg) as never[]);
+  }
+  return arg;
+}
+
+test("typed builders match the generated builder corpus", () => {
+  for (const entry of builderCorpus.builder_cases) {
+    const fn = resolveCall(entry.call);
+    const args = entry.args.map(resolveArg) as never[];
+    if (entry.throws) {
+      assert.throws(() => fn(...args), Error, entry.call);
+    } else {
+      assert.equal(fn(...args), entry.segment, entry.call);
+    }
   }
 });

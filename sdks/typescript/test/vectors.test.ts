@@ -167,215 +167,44 @@ test("buildURL rejects inputs that can never verify (audit P-4, P-5)", () => {
 
 import { explainUrl } from "../src/index.ts";
 
+// The explainer verdict corpus (audit P-3 / AP-23) is a
+// shared spec file, not a copy in this suite: the playground
+// suite and the server crate's differential tests run the
+// same entries (issue #353), so a verdict can only change in
+// one place and every surface re-checks it.
+const verdictCorpus = JSON.parse(
+  readFileSync(new URL("../../../spec/explain-verdicts.json", import.meta.url), "utf8"),
+) as { cases: Array<{ remainder: string; error: boolean; source: string }> };
+
 test("explainUrl verdicts match the server grammar (audit P-3 corpus)", () => {
   const SIG = "a".repeat(64);
-  const SRC = "https://example.com/a.jpg";
-  const cases: Array<[string, boolean, string]> = [
-    ["exp:99999999999999999999999999/300x200/" + SRC, true, SRC],
-    ["300x200/https://example.com/%2e%2e/a.jpg", false, "https://example.com/%2e%2e/a.jpg"],
-    ["300x/" + SRC, false, SRC],
-    ["x200/" + SRC, false, SRC],
-    ["fit-in:300x/" + SRC, false, SRC],
-    ["fit-in:-300x200/" + SRC, true, SRC],
-    ["fit-in:300x200:adaptive/" + SRC, false, SRC],
-    ["fit-in:300x200:sideways/" + SRC, true, SRC],
-    ["fit-in:300x200:adaptive:extra/" + SRC, true, SRC],
-    ["fit-in:adaptive/" + SRC, true, SRC],
-    ["pad:100x100:adaptive/" + SRC, true, SRC],
-    ["crop:100x100:sideways/" + SRC, true, SRC],
-    ["crop:100x100:smart/" + SRC, false, SRC],
-    ["crop:100x100:top-left/" + SRC, false, SRC],
-    ["crop:100x100:bottom-right/" + SRC, false, SRC],
-    ["crop:100x100:left-top/" + SRC, true, SRC],
-    ["crop:300x0/" + SRC, true, SRC],
-    ["crop:-300x200/" + SRC, true, SRC],
-    ["crop:origx100/" + SRC, true, SRC],
-    ["pad:300xorig/" + SRC, true, SRC],
-    ["pad:-200x100/" + SRC, true, SRC],
-    ["filters:quality(999)/" + SRC, true, SRC],
-    ["filters:quality(80):blur(2)/" + SRC, false, SRC],
-    ["filters:blur(-1)/" + SRC, true, SRC],
-    ["filters:dpr(7)/" + SRC, true, SRC],
-    ["filters:dpr(1.5)/" + SRC, false, SRC],
-    ["pad:100x100:blur/" + SRC, false, SRC],
-    ["pad:100x100:ff00aa/" + SRC, false, SRC],
-    ["pad:100x100:red/" + SRC, true, SRC],
-    ["crop-rect:0x0:50x50/" + SRC, false, SRC],
-    ["crop-rect:0x0:50/" + SRC, true, SRC],
-    ["focal:0x0:50x50/" + SRC, false, SRC],
-    ["focal:0x0:50/" + SRC, true, SRC],
-    ["16384x10/" + SRC, false, "16384x10/" + SRC],
-    ["exp:1893456000/300x200/" + SRC, false, SRC],
-    ["maxage:60/300x200/" + SRC, false, SRC],
-    ["maxage:0/300x200/" + SRC, false, SRC],
-    ["maxage:31536000/300x200/" + SRC, false, SRC],
-    ["maxage:31536001/300x200/" + SRC, true, SRC],
-    ["maxage:soon/300x200/" + SRC, true, SRC],
-    ["debug:focal/crop:100x100:smart/" + SRC, false, SRC],
-    ["debug:focal/" + SRC, false, SRC],
-    ["debug:banana/300x200/" + SRC, true, SRC],
-    ["debug:/300x200/" + SRC, true, SRC],
-    ["filters:radius(12)/" + SRC, false, SRC],
-    ["filters:radius(1,2,3,4):mask(circle)/" + SRC, false, SRC],
-    ["filters:radius(1,2)/" + SRC, true, SRC],
-    ["filters:border(2,00ff00)/" + SRC, false, SRC],
-    ["filters:border(0,00ff00)/" + SRC, true, SRC],
-    ["filters:mask(square)/" + SRC, true, SRC],
-    ["filters:sepia:duotone(000000,ffffff):flip(h)/" + SRC, false, SRC],
-    ["filters:duotone(000000)/" + SRC, true, SRC],
-    ["filters:curve(rgb,0,0,255,255)/" + SRC, false, SRC],
-    ["filters:curve(r,0,64,255,255):curve(b,32,10,224,245)/" + SRC, false, SRC],
-    ["filters:curve(x,0,0,255,255)/" + SRC, true, SRC],
-    ["filters:curve(rgb,0,0)/" + SRC, true, SRC],
-    ["filters:curve(rgb,0,0,255)/" + SRC, true, SRC],
-    ["filters:curve(rgb,0,0,256,255)/" + SRC, true, SRC],
-    ["filters:curve(rgb,128,0,64,255)/" + SRC, true, SRC],
-    ["filters:curve(rgb,0,0,0,255)/" + SRC, true, SRC],
-    ["filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)/" + SRC, false, SRC],
-    ["filters:convolution(0.0625,0.125,0.0625,0.125,0.25,0.125,0.0625,0.125,0.0625,1)/" + SRC, false, SRC],
-    ["filters:convolution(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)/" + SRC, false, SRC],
-    ["filters:convolution(0,0,0,0,1,0,0,0,0)/" + SRC, true, SRC],
-    ["filters:convolution(0,0,0,0,1,0,0,0,0,0,0)/" + SRC, true, SRC],
-    ["filters:convolution(0,-1,0,-1,5,-1,0,-1,0,2)/" + SRC, true, SRC],
-    ["filters:convolution(0,-1,0,-1,1e2,-1,0,-1,0,0)/" + SRC, true, SRC],
-    ["filters:convolution(0,-1,0,-1,.5,-1,0,-1,0,0)/" + SRC, true, SRC],
-    ["filters:convolution(0,-1,0,-1,1025,-1,0,-1,0,0)/" + SRC, true, SRC],
-    ["filters:noise(0)/" + SRC, false, SRC],
-    ["filters:noise(40)/" + SRC, false, SRC],
-    ["filters:noise(100)/" + SRC, false, SRC],
-    ["filters:noise(101)/" + SRC, true, SRC],
-    ["filters:noise(256)/" + SRC, true, SRC],
-    ["filters:noise(-1)/" + SRC, true, SRC],
-    ["filters:noise(1.5)/" + SRC, true, SRC],
-    ["filters:monochrome(ff8000):pixelate(8)/" + SRC, false, SRC],
-    ["filters:pixelate(0)/" + SRC, true, SRC],
-    ["filters:flip(x)/" + SRC, true, SRC],
-    ["filters:blur_region(1,2,30,40):pixelate_region(0,0,5,5)/" + SRC, false, SRC],
-    ["filters:blur_region(1,2,0,40)/" + SRC, true, SRC],
-    ["filters:pixelate_region(0,0,10,16384)/" + SRC, true, SRC],
-    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,80,multiply)/" + SRC, false, SRC],
-    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,screen,25)/" + SRC, false, SRC],
-    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,darken)/" + SRC, true, SRC],
-    ["filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,101,normal)/" + SRC, true, SRC],
-    ["filters:blurclass(person)/" + SRC, false, SRC],
-    ["filters:pixelateclass(traffic%20light)/" + SRC, false, SRC],
-    ["filters:blurclass()/" + SRC, true, SRC],
-    ["filters:blurclass(per%24on)/" + SRC, true, SRC],
-    ["filters:pixelateclass/" + SRC, true, SRC],
-    ["filters:keep_profile/" + SRC, false, SRC],
-    ["filters:format(mp4)/" + SRC, false, SRC],
-    ["filters:format(webm)/" + SRC, false, SRC],
-    ["filters:format(mov)/" + SRC, true, SRC],
-    // Studio (issues #197, #198): the mode first, then
-    // named key:value arguments, each at most once.
-    // Product takes bg, shadow, and pad; scene takes pad
-    // only. Verdicts verified against parse_studio in
-    // src/url.rs.
-    ["filters:studio(product)/" + SRC, false, SRC],
-    ["filters:studio(product,bg:white)/" + SRC, false, SRC],
-    ["filters:studio(product,bg:brand)/" + SRC, false, SRC],
-    ["filters:studio(product,bg:none)/" + SRC, false, SRC],
-    ["filters:studio(product,bg:f5f0e8)/" + SRC, false, SRC],
-    ["filters:studio(product,bg:F5F0E8)/" + SRC, false, SRC],
-    ["filters:studio(product,shadow:none)/" + SRC, false, SRC],
-    ["filters:studio(product,shadow:strong,pad:0)/" + SRC, false, SRC],
-    ["filters:studio(product,pad:40)/" + SRC, false, SRC],
-    ["filters:studio(product,pad:25,shadow:strong,bg:f5f0e8)/" + SRC, false, SRC],
-    ["filters:studio(product,pad:+10)/" + SRC, false, SRC],
-    ["filters:studio(product,pad:010)/" + SRC, false, SRC],
-    ["filters:studio(scene)/" + SRC, false, SRC],
-    ["filters:studio(scene,pad:25)/" + SRC, false, SRC],
-    ["filters:studio(scene,pad:40)/" + SRC, false, SRC],
-    // The chain splits on ':' outside parentheses, so a
-    // studio filter composes with its neighbours.
-    ["filters:grayscale:studio(product,bg:white):blur(2)/" + SRC, false, SRC],
-    ["filters:studio/" + SRC, true, SRC],
-    ["filters:studio()/" + SRC, true, SRC],
-    ["filters:studio(portrait)/" + SRC, true, SRC],
-    ["filters:studio(product,bg:blur)/" + SRC, true, SRC],
-    ["filters:studio(product,bg:fffff)/" + SRC, true, SRC],
-    ["filters:studio(product,bg:fffffff)/" + SRC, true, SRC],
-    ["filters:studio(product,bg:White)/" + SRC, true, SRC],
-    ["filters:studio(product,shadow:hard)/" + SRC, true, SRC],
-    ["filters:studio(product,pad:41)/" + SRC, true, SRC],
-    ["filters:studio(product,pad:-1)/" + SRC, true, SRC],
-    ["filters:studio(product,pad:-0)/" + SRC, true, SRC],
-    ["filters:studio(product,pad:1.5)/" + SRC, true, SRC],
-    ["filters:studio(product,zoom:2)/" + SRC, true, SRC],
-    ["filters:studio(product,pad:5,pad:6)/" + SRC, true, SRC],
-    ["filters:studio(product,bg:white,bg:none)/" + SRC, true, SRC],
-    ["filters:studio(product,pad)/" + SRC, true, SRC],
-    ["filters:studio(product,)/" + SRC, true, SRC],
-    ["filters:studio(scene,bg:white)/" + SRC, true, SRC],
-    ["filters:studio(scene,shadow:soft)/" + SRC, true, SRC],
-    ["filters:studio(scene,pad:41)/" + SRC, true, SRC],
-    ["filters:studio(scene,pad:10,pad:20)/" + SRC, true, SRC],
-    // AP-23 parity cases: each verdict below is the Rust
-    // parser's, verified against src/url.rs.
-    ["crop-rect:50x50:0x0/" + SRC, true, SRC],
-    ["crop-rect:50x50:51x51/" + SRC, false, SRC],
-    ["focal:50x50:0x0/" + SRC, true, SRC],
-    ["focal:50x50:51x51/" + SRC, false, SRC],
-    ["focalpoint:0.75x0.4:2/" + SRC, false, SRC],
-    ["focalpoint:0.75x0.4/" + SRC, false, SRC],
-    ["focalpoint:0x0:100/" + SRC, false, SRC],
-    ["focalpoint:1.5x0.4/" + SRC, true, SRC],
-    ["focalpoint:0.75x-0.1/" + SRC, true, SRC],
-    ["focalpoint:0.75x0.4:0/" + SRC, true, SRC],
-    ["focalpoint:0.75x0.4:101/" + SRC, true, SRC],
-    ["focalpoint:0.75/" + SRC, true, SRC],
-    ["focalpoint:0.75x0.4:2:3/" + SRC, true, SRC],
-    ["filters:blur(0x10)/" + SRC, true, SRC],
-    ["filters:contrast(0x2)/" + SRC, true, SRC],
-    ["filters:gamma(2.2)/" + SRC, false, SRC],
-    ["filters:gamma(1e1)/" + SRC, false, SRC],
-    ["filters:gamma(0)/" + SRC, true, SRC],
-    ["filters:gamma(11)/" + SRC, true, SRC],
-    ["filters:exposure(1.5)/" + SRC, false, SRC],
-    ["filters:exposure(0)/" + SRC, false, SRC],
-    ["filters:exposure(-1e1)/" + SRC, false, SRC],
-    ["filters:exposure(10.5)/" + SRC, true, SRC],
-    ["filters:exposure(nan)/" + SRC, true, SRC],
-    ["filters:highlights_shadows(30,-20)/" + SRC, false, SRC],
-    ["filters:highlights_shadows(0,0)/" + SRC, false, SRC],
-    ["filters:highlights_shadows(101,0)/" + SRC, true, SRC],
-    ["filters:highlights_shadows(30)/" + SRC, true, SRC],
-    ["filters:highlights_shadows(1,2,3)/" + SRC, true, SRC],
-    ["filters:vibrance(40)/" + SRC, false, SRC],
-    ["filters:vibrance(-100)/" + SRC, false, SRC],
-    ["filters:vibrance(101)/" + SRC, true, SRC],
-    ["filters:vibrance(nan)/" + SRC, true, SRC],
-    ["filters:enhance/" + SRC, false, SRC],
-    ["filters:enhance(1)/" + SRC, true, SRC],
-    ["filters:trim(20,5,0,5,0)/" + SRC, false, SRC],
-    ["filters:trim(20,5)/" + SRC, true, SRC],
-    ["filters:trim(20,5,0,5,-1)/" + SRC, true, SRC],
-    ["filters:trim(256,0,0,0,0)/" + SRC, true, SRC],
-    ["filters:palette(64)/" + SRC, false, SRC],
-    ["filters:palette(2)/" + SRC, false, SRC],
-    ["filters:palette(256)/" + SRC, false, SRC],
-    ["filters:palette(1)/" + SRC, true, SRC],
-    ["filters:palette(257)/" + SRC, true, SRC],
-    ["filters:palette()/" + SRC, true, SRC],
-    ["filters:blur( 1.5)/" + SRC, true, SRC],
-    ["filters:blur(1e2)/" + SRC, false, SRC],
-    ["filters:blur(.5)/" + SRC, false, SRC],
-    ["filters:overlay(a,b.png,0,0,80,normal)/" + SRC, true, SRC],
-    ["filters:overlay(a,b.png,0,0,80,normal,25)/" + SRC, false, SRC],
-    ["300x200//" + SRC, true, SRC],
-    ["filters:blurclass(" + "é".repeat(40) + ")/" + SRC, true, SRC],
-    ["filters:blurclass(" + "é".repeat(32) + ")/" + SRC, false, SRC],
-    ["filters:brighten(+5)/" + SRC, false, SRC],
-    ["filters:quality(+80)/" + SRC, false, SRC],
-    ["filters:text(Hello,+12,ff8800,center)/" + SRC, false, SRC],
-    ["+300x200/" + SRC, false, SRC],
-    ["filters:radius(+12)/" + SRC, false, SRC],
-    ["filters:pixelate(+8)/" + SRC, false, SRC],
-  ];
-  for (const [remainder, expectError, expectSource] of cases) {
+  for (const { remainder, error, source } of verdictCorpus.cases) {
     const out = explainUrl(`https://img.example.com/${SIG}/${remainder}`);
-    assert.equal(out.source, expectSource, remainder);
-    assert.equal(out.errors.length > 0, expectError, `${remainder}: ${JSON.stringify(out.errors)}`);
+    assert.equal(out.source, source, remainder);
+    assert.equal(out.errors.length > 0, error, `${remainder}: ${JSON.stringify(out.errors)}`);
+  }
+});
+
+// The generated-combination corpus (issue #353): generated
+// valid and invalid remainders whose verdicts the generator
+// pins from the grammar. The server crate checks the same
+// file against the Rust parser, including the canonical
+// forms and error codes this surface does not produce.
+const operationVectors = JSON.parse(
+  readFileSync(new URL("../../../spec/operation-vectors.json", import.meta.url), "utf8"),
+) as {
+  signature: string;
+  cases: Array<{ remainder: string; ok: boolean; source: string }>;
+};
+
+test("explainUrl verdicts match the generated combination corpus", () => {
+  for (const { remainder, ok, source } of operationVectors.cases) {
+    const out = explainUrl(
+      `https://img.example.com/${operationVectors.signature}/${remainder}`,
+      1700000000,
+    );
+    assert.equal(out.errors.length === 0, ok, `${remainder}: ${JSON.stringify(out.errors)}`);
+    assert.equal(out.source, source, remainder);
   }
 });
 

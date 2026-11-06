@@ -242,6 +242,11 @@ function validateFilter(name: string, args: string | null): string | null {
         : bad;
     }
     case "blur":
+      // The server's blur bound (url.rs MAX_BLUR_SIGMA):
+      // positive and at most 512.
+      return args !== null && isFloat(args) && Number(args) > 0 && Number(args) <= 512
+        ? null
+        : bad;
     case "sharpen":
       return args !== null && isFloat(args) && Number(args) > 0 ? null : bad;
     case "brighten":
@@ -432,7 +437,7 @@ function validateFilter(name: string, args: string | null): string | null {
       if (args === null) return bad;
       const parts = args.split(",");
       return parts.length === 2 &&
-        isIntIn(parts[0], 1, 16383) &&
+        isIntIn(parts[0], 0, 16383) &&
         /^[0-9a-fA-F]{6}$/.test(parts[1])
         ? null
         : bad;
@@ -717,6 +722,43 @@ function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment,
         "the response is a diagnostic image instead of the transform result: the canvas the next crop operates on, with the chosen focal point (magenta crosshair), the focal rectangle when one is in play, the detection boxes that fed the decision (amber), and the crop window outline (blue); with no crop it shows the focal analysis of the final image; debug responses are never cached and are served with Cache-Control: no-store; animated sources and video formats are refused with 400",
     };
   }
+  if (seg.startsWith("frame:")) {
+    const rest = seg.slice(6);
+    // The server's frame grammar (url.rs parse_frame): the
+    // poster keyword, or a strict decimal (no sign, no
+    // exponent, no leading dot) as seconds up to 86400 or,
+    // with a % suffix, as a percent up to 100.
+    const decimal = (text: string, max: number): boolean =>
+      /^\d+(\.\d+)?$/.test(text) && Number(text) <= max;
+    if (rest === "poster") {
+      return { kind: "operation", title: "Frame", detail: "render the video source's poster frame" };
+    }
+    if (rest.endsWith("%") && decimal(rest.slice(0, -1), 100)) {
+      return { kind: "operation", title: "Frame", detail: `render the frame ${rest} through the video source` };
+    }
+    if (!rest.endsWith("%") && decimal(rest, 86400)) {
+      return { kind: "operation", title: "Frame", detail: `render the frame at ${rest} seconds into the video source` };
+    }
+    return {
+      kind: "operation",
+      title: "Frame",
+      error: `malformed frame segment: ${seg} (want frame:poster, frame:<seconds> up to 86400, or frame:<percent>% up to 100; the server answers 400)`,
+    };
+  }
+  if (seg.startsWith("page:")) {
+    const rest = seg.slice(5);
+    // The server's page grammar (url.rs parse_page): ASCII
+    // digits, leading zeros allowed, 1 to 999999.
+    const digits = rest.replace(/^0+/, "");
+    if (!/^\d+$/.test(rest) || digits === "" || digits.length > 6) {
+      return {
+        kind: "operation",
+        title: "Page",
+        error: `malformed page segment: ${seg} (want page:<n> with n from 1 to 999999; the server answers 400)`,
+      };
+    }
+    return { kind: "operation", title: "Page", detail: `render page ${Number(digits)} of the PDF source` };
+  }
   if (seg.startsWith("preset:")) {
     const name = seg.slice(7);
     if (!name) {
@@ -849,7 +891,39 @@ function explainSegment(seg: string, nowSeconds: number): Omit<ExplainedSegment,
   if (parseSizeSegment(seg)) {
     return { kind: "operation", title: "Resize", detail: sizeBlurb(seg) };
   }
+  if (isSizeShaped(seg)) {
+    // The server's dispatch (url.rs size_shaped, issue #228):
+    // a segment shaped like a size that fails the size
+    // grammar is a malformed size, not the start of the
+    // source, so the request is a 400 rather than a fetch
+    // of a nonsense source.
+    return {
+      kind: "operation",
+      title: "Resize",
+      error: `malformed size segment: ${seg} (each side is a pixel count up to ${MAX_DIMENSION}, 0, or orig; the server answers 400)`,
+    };
+  }
   return null; // Not an operation: the source starts here.
+}
+
+/**
+ * The server's size-shape test (url.rs size_shaped), ported:
+ * an `x` joining two parts, at least one of them a dimension
+ * spelling (digits, `orig`, or empty, with an optional flip
+ * sign), and no `.` or `:` anywhere, the punctuation that
+ * marks URL text.
+ */
+function isSizeShaped(seg: string): boolean {
+  const x = seg.indexOf("x");
+  if (x === -1) return false;
+  const left = seg.slice(0, x);
+  const right = seg.slice(x + 1);
+  if (left.includes(".") || right.includes(".") || seg.includes(":")) return false;
+  const spelling = (part: string): boolean => {
+    const digits = part.startsWith("-") ? part.slice(1) : part;
+    return digits === "" || digits === "orig" || /^\d+$/.test(digits);
+  };
+  return spelling(left) || spelling(right);
 }
 
 /**

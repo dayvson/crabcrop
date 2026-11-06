@@ -1,0 +1,1006 @@
+{
+ "description": "Explainer verdict corpus (audit P-3 / AP-23): remainders with the verdict the server's grammar gives them and the source the remainder resolves to. Consumed by the TypeScript SDK tests, the playground tests, and the server crate's differential tests (issue #353): every surface that reads a remainder must agree with every entry. The generated combination corpus lives in operation-vectors.json.",
+ "version": 1,
+ "cases": [
+  {
+   "remainder": "exp:99999999999999999999999999/300x200/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "300x200/https://example.com/%2e%2e/a.jpg",
+   "error": false,
+   "source": "https://example.com/%2e%2e/a.jpg"
+  },
+  {
+   "remainder": "300x/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "x200/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "fit-in:300x/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "fit-in:-300x200/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "fit-in:300x200:adaptive/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "fit-in:300x200:sideways/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "fit-in:300x200:adaptive:extra/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "fit-in:adaptive/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "pad:100x100:adaptive/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:sideways/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:smart/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:top-left/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:bottom-right/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:left-top/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:300x0/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:-300x200/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:origx100/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "pad:300xorig/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "pad:-200x100/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:quality(999)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:quality(80):blur(2)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(-1)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(7)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:dpr(1.5)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "pad:100x100:blur/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "pad:100x100:ff00aa/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "pad:100x100:red/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop-rect:0x0:50x50/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop-rect:0x0:50/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focal:0x0:50x50/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focal:0x0:50/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "16384x10/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "exp:1893456000/300x200/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "maxage:60/300x200/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "maxage:0/300x200/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "maxage:31536000/300x200/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "maxage:31536001/300x200/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "maxage:soon/300x200/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "debug:focal/crop:100x100:smart/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "debug:focal/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "debug:banana/300x200/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "debug:/300x200/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:radius(12)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:radius(1,2,3,4):mask(circle)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:radius(1,2)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:border(2,00ff00)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:border(0,00ff00)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:mask(square)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:sepia:duotone(000000,ffffff):flip(h)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:duotone(000000)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(rgb,0,0,255,255)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(r,0,64,255,255):curve(b,32,10,224,245)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(x,0,0,255,255)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(rgb,0,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(rgb,0,0,255)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(rgb,0,0,256,255)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(rgb,128,0,64,255)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:curve(rgb,0,0,0,255)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0.0625,0.125,0.0625,0.125,0.25,0.125,0.0625,0.125,0.0625,1)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0,0,0,0,1,0,0,0,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0,0,0,0,1,0,0,0,0,0,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0,-1,0,-1,5,-1,0,-1,0,2)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0,-1,0,-1,1e2,-1,0,-1,0,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0,-1,0,-1,.5,-1,0,-1,0,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:convolution(0,-1,0,-1,1025,-1,0,-1,0,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(40)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(100)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(101)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(256)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(-1)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:noise(1.5)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:monochrome(ff8000):pixelate(8)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:pixelate(0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:flip(x)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur_region(1,2,30,40):pixelate_region(0,0,5,5)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur_region(1,2,0,40)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:pixelate_region(0,0,10,16384)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,80,multiply)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,screen,25)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,100,darken)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:overlay(https%3A%2F%2Fx%2Fov.png,0,0,101,normal)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(person)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:pixelateclass(traffic%20light)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass()/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(per%24on)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:pixelateclass/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:keep_profile/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(mp4)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(webm)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:format(mov)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:white)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:brand)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:none)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:f5f0e8)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:F5F0E8)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,shadow:none)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,shadow:strong,pad:0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:40)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:25,shadow:strong,bg:f5f0e8)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:+10)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:010)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(scene)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(scene,pad:25)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(scene,pad:40)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:grayscale:studio(product,bg:white):blur(2)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio()/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(portrait)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:blur)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:fffff)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:fffffff)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:White)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,shadow:hard)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:41)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:-1)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:-0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:1.5)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,zoom:2)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad:5,pad:6)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,bg:white,bg:none)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,pad)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(product,)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(scene,bg:white)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(scene,shadow:soft)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(scene,pad:41)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:studio(scene,pad:10,pad:20)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop-rect:50x50:0x0/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop-rect:50x50:51x51/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focal:50x50:0x0/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focal:50x50:51x51/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0.75x0.4:2/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0.75x0.4/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0x0:100/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:1.5x0.4/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0.75x-0.1/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0.75x0.4:0/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0.75x0.4:101/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0.75/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "focalpoint:0.75x0.4:2:3/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(0x10)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:contrast(0x2)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:gamma(2.2)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:gamma(1e1)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:gamma(0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:gamma(11)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:exposure(1.5)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:exposure(0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:exposure(-1e1)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:exposure(10.5)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:exposure(nan)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:highlights_shadows(30,-20)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:highlights_shadows(0,0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:highlights_shadows(101,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:highlights_shadows(30)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:highlights_shadows(1,2,3)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:vibrance(40)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:vibrance(-100)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:vibrance(101)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:vibrance(nan)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:enhance/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:enhance(1)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:trim(20,5,0,5,0)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:trim(20,5)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:trim(20,5,0,5,-1)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:trim(256,0,0,0,0)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:palette(64)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:palette(2)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:palette(256)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:palette(1)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:palette(257)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:palette()/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur( 1.5)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(1e2)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blur(.5)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:overlay(a,b.png,0,0,80,normal)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:overlay(a,b.png,0,0,80,normal,25)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "300x200//https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(éééééééééééééééééééééééééééééééééééééééé)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:blurclass(éééééééééééééééééééééééééééééééé)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:brighten(+5)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:quality(+80)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:text(Hello,+12,ff8800,center)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "+300x200/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:radius(+12)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:pixelate(+8)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(person)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(person,car):1.5/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(traffic%20light)/https://example.com/a.jpg",
+   "error": false,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects()/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(person,)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(person/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(person):0/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(person):101/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(bad;name)/https://example.com/a.jpg",
+   "error": true,
+   "source": "https://example.com/a.jpg"
+  }
+ ]
+}
