@@ -33,6 +33,17 @@ env:
   # tier behind them holds the full set once.
   CRABCROP_CACHE_MAX_MB: "256"
 
+# The disk tier is off in this overlay: the production
+# values enable it on the chart's one claim, which is
+# ReadWriteOnce, and several replicas cannot mount a
+# single-writer volume at once (all but one pod would
+# sit unschedulable). The shared bucket tier, required
+# by the install command above, is the multi-replica
+# tier. Bring the disk tier back only with a
+# ReadWriteMany claim or one volume per pod.
+resultStorage:
+  enabled: false
+
 # Spread replicas across nodes when the cluster allows it.
 affinity:
   podAntiAffinity:

@@ -136,7 +136,13 @@ resources: {}
   #   memory: 1Gi
 
 podAnnotations: {}
-podSecurityContext: {}
+podSecurityContext:
+  # The image runs as nobody (65534). fsGroup makes
+  # mounted volumes group-writable by that group, so the
+  # disk tier can write the result volume it mounts;
+  # without it the mount lands root-owned and the tier
+  # cannot write.
+  fsGroup: 65534
 securityContext:
   allowPrivilegeEscalation: false
   capabilities:
