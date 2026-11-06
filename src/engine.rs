@@ -2195,11 +2195,86 @@ fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
     explicit.or(ctx.dpr).unwrap_or(1.0)
 }
 
+/// Whether a filter leaves every existing pixel where it
+/// was (issue #373): the detection memos key on the image
+/// dimensions, so a chain step that moves content (a
+/// flip, a rotation, a trim, an upscale, a border, an
+/// overlay a face could hide behind) must invalidate
+/// them, or the next detection consumer is served boxes
+/// measured on a state the pixels have left, and a
+/// redaction lands where the object no longer is.
+/// Photometric filters, the detection consumers
+/// themselves, region filters (their coordinates are the
+/// request's own), and encode-time directives preserve
+/// positions. Anything not listed here invalidates: a
+/// new filter variant errs toward a fresh inference,
+/// never toward stale boxes.
+fn filter_preserves_positions(filter: &Filter) -> bool {
+    matches!(
+        filter,
+        Filter::Grayscale
+            | Filter::Invert
+            | Filter::Blur(_)
+            | Filter::Brighten(_)
+            | Filter::Contrast(_)
+            | Filter::Gamma(_)
+            | Filter::Exposure(_)
+            | Filter::HighlightsShadows(..)
+            | Filter::Vibrance(_)
+            | Filter::HueRotate(_)
+            | Filter::Sharpen(_)
+            | Filter::Saturation(_)
+            | Filter::Rgb(..)
+            | Filter::Curve(..)
+            | Filter::Convolution(..)
+            | Filter::Noise(_)
+            | Filter::Equalize
+            | Filter::Enhance
+            | Filter::Sepia
+            | Filter::Duotone(..)
+            | Filter::Monochrome(_)
+            | Filter::Pixelate(_)
+            | Filter::Fill(_)
+            | Filter::Radius(_)
+            | Filter::Mask(_)
+            | Filter::BlurFaces
+            | Filter::PixelateFaces
+            | Filter::BlurClass(_)
+            | Filter::PixelateClass(_)
+            | Filter::RecolorClass(..)
+            | Filter::FacePad(_)
+            | Filter::BlurRegion { .. }
+            | Filter::PixelateRegion { .. }
+            | Filter::RemoveRegion { .. }
+            | Filter::KeepProfile
+            | Filter::Dpr(_)
+            | Filter::MaxBytes(_)
+            | Filter::Quality(_)
+            | Filter::Palette(_)
+            | Filter::Format(_)
+            | Filter::NoUpscale
+    )
+}
+
+/// Drop every detection memo: the chain step that just
+/// ran moved the content the memos' boxes describe.
+fn invalidate_detection_memos(
+    face_memo: &mut FaceMemo,
+    detection_memos: &mut [DetectionMemo],
+    segment_memo: &mut SegmentMemo,
+) {
+    *face_memo = None;
+    detection_memos.iter_mut().for_each(|memo| *memo = None);
+    *segment_memo = None;
+}
+
 /// Memoized face detection for one pipeline run: the image
 /// dimensions the detections belong to, and the provider's
 /// result. Several face operations on the same image state
 /// share one inference; an operation that changes the size
-/// re-detects against the new state.
+/// re-detects against the new state, and a step that moves
+/// content invalidates the memo outright (see
+/// `filter_preserves_positions`).
 type FaceMemo = Option<(
     u32,
     u32,
@@ -3236,6 +3311,17 @@ fn apply_operations(
                             encode_opts.absorb(options);
                         }
                     }
+                    // A filter that moves content leaves the
+                    // detection memos describing a state the
+                    // pixels have left (issue #373): the next
+                    // detection consumer must re-detect.
+                    if !filter_preserves_positions(filter) {
+                        invalidate_detection_memos(
+                            &mut face_memo,
+                            &mut detection_memos,
+                            &mut segment_memo,
+                        );
+                    }
                     // Every filter leaves the image inside
                     // the output budget: growth is checked
                     // before it compounds across a chain,
@@ -3243,6 +3329,16 @@ fn apply_operations(
                     check_output_pixels(img.width(), img.height())?;
                 }
             }
+        }
+        // Every operation above the filters segment sizes,
+        // crops, or pads, so the detection memos never
+        // survive one (issue #373); the filters arm
+        // invalidates per filter instead, and the no-op
+        // arms (frame, page, debug) simply pay a fresh
+        // inference in a chain that mixes them with
+        // detection, which no real chain does.
+        if !matches!(op, Operation::Filters(_)) {
+            invalidate_detection_memos(&mut face_memo, &mut detection_memos, &mut segment_memo);
         }
         // The running image stays inside the output budget
         // after every operation, not only after the ones
@@ -10773,6 +10869,29 @@ mod tests {
         assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn a_flip_between_class_filters_redetects() {
+        // Issue #373: a flip keeps the dimensions, so the
+        // dimensions-keyed memo once served the pre-flip
+        // boxes to the second filter and the redaction
+        // landed on the wrong side. A geometric step
+        // invalidates the memo: two detections.
+        let engine = Engine;
+        let counter = CountingObjects::default();
+        engine
+            .process_preferred(
+                &class_scene(),
+                &[Operation::Filters(vec![
+                    Filter::BlurClass("person".to_string()),
+                    Filter::Flip(crate::url::FlipDirection::Horizontal),
+                    Filter::PixelateClass("car".to_string()),
+                ])],
+                detect_ctx(&counter),
+            )
+            .unwrap();
+        assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     /// A detector that knows person and bicycle but only
     /// ever finds the person: the no-match witness for the
     /// objects crop fallback (issue #318).
@@ -11852,6 +11971,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_flip_between_face_ops_redetects() {
+        // Issue #373, the face memo's half of the class
+        // test above: same dimensions after the flip, so
+        // only the invalidation keeps the second op from
+        // reusing the pre-flip face box.
+        let engine = Engine;
+        let provider = CountingFace::default();
+        engine
+            .process_preferred(
+                &face_scene(),
+                &[Operation::Filters(vec![
+                    Filter::BlurFaces,
+                    Filter::Flip(crate::url::FlipDirection::Horizontal),
+                    Filter::PixelateFaces,
+                ])],
+                ProcessContext {
+                    face_provider: Some(&provider),
+                    detect_provider: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     fn pad_op(w: u32, h: u32, fill: PadFill) -> Operation {
