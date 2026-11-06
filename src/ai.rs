@@ -1309,12 +1309,26 @@ pub struct OnnxFaceProvider {
 }
 
 impl OnnxFaceProvider {
+    /// Load a model file against the runtime at `dylib` (or the
+    /// runtime's own search when `None`). A probe detection on a
+    /// blank image runs at load, like the other providers: a
+    /// model that is not a YuNet export (a CLIP vision model is
+    /// the realistic mix-up) parses as a session but has the
+    /// wrong input shape and none of the YuNet heads, so it is
+    /// rejected here, at boot, with a Load error, not as a 500
+    /// on the first face request (issue #380).
     pub fn load(dylib: Option<&str>, model_path: &str) -> Result<Self, AiError> {
         let (session, input_name) = build_session(dylib, model_path)?;
-        Ok(Self {
+        let provider = Self {
             session: Mutex::new(session),
             input_name,
-        })
+        };
+        provider
+            .detect(&DynamicImage::new_rgb8(8, 8))
+            .map_err(|e| {
+                AiError::Load(format!("the model {model_path} failed its face probe: {e}"))
+            })?;
+        Ok(provider)
     }
 }
 
@@ -1568,6 +1582,26 @@ mod tests {
                 .detect(&solid(10, 20, 30, 120, 90))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Wrong-model rejection for the face load probe (issue
+    /// #380), run manually with the deployment artifacts in
+    /// place: the removebg model is a valid ONNX file but not
+    /// a YuNet export, so loading it as the face model must
+    /// fail at load, not on the first face request.
+    /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_REMOVEBG_MODEL=...
+    /// cargo test -- --ignored face_load_rejects_a_non_yunet_model
+    #[test]
+    #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+    fn face_load_rejects_a_non_yunet_model() {
+        let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+        let model = std::env::var("CRABCROP_TEST_REMOVEBG_MODEL").unwrap();
+        let err = OnnxFaceProvider::load(Some(&dylib), &model)
+            .expect_err("a U2-Net model is not a YuNet export");
+        assert!(
+            matches!(&err, AiError::Load(m) if m.contains("face probe")),
+            "load error: {err:?}"
         );
     }
 
