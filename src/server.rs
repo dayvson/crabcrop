@@ -1015,6 +1015,33 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
 /// One structured line per purge request (audit PL-8): the
 /// destructive, secret-gated endpoint must be auditable. The
 /// target is hashed; a raw target can carry signed URLs.
+/// How many shared-tier objects one purge request scans
+/// inline (issue #368): the shared walk reads entry
+/// headers one at a time, so its inline cost must not
+/// grow with the whole bucket. The tombstone already
+/// guarantees the purge's correctness (issue #350); a
+/// walk that outgrows the budget finishes in a
+/// background task and logs its own count on completion.
+const SHARED_PURGE_INLINE_SCAN: usize = 128;
+
+/// Queue the un-scanned remainder of a bounded shared
+/// purge, if any, on a background task (issue #368).
+fn spawn_shared_purge_rest(
+    shared: &Arc<crate::s3store::S3Store>,
+    pending: Option<crate::s3store::PendingPurge>,
+    event: &'static str,
+    target: &str,
+) {
+    if let Some(pending) = pending {
+        let shared = shared.clone();
+        let target = target.to_string();
+        tokio::spawn(async move {
+            let removed = shared.finish_purge(pending).await;
+            purge_log(event, &target, Some(removed));
+        });
+    }
+}
+
 fn purge_log(event: &str, target: &str, removed: Option<usize>) {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(target.as_bytes());
@@ -1154,7 +1181,11 @@ async fn purge_handle(
         // its matching walk, which also reaches older
         // epochs and hint-variant spellings.
         let epoch_form = format!("{key_form}#cfg{}", state.config_fingerprint);
-        removed += shared.purge_matching(&key_form, &epoch_form).await;
+        let (walked, pending) = shared
+            .purge_matching_bounded(&key_form, &epoch_form, SHARED_PURGE_INLINE_SCAN)
+            .await;
+        removed += walked;
+        spawn_shared_purge_rest(shared, pending, "purge", target);
     }
     state.metrics.record_purge();
     purge_log("purge", target, Some(removed));
@@ -1231,7 +1262,11 @@ async fn purge_group_handle(
         removed += store.purge_group(group);
     }
     if let Some(shared) = &state.shared_store {
-        removed += shared.purge_group(group).await;
+        let (walked, pending) = shared
+            .purge_group_bounded(group, SHARED_PURGE_INLINE_SCAN)
+            .await;
+        removed += walked;
+        spawn_shared_purge_rest(shared, pending, "purge-group", &target);
     }
     state.metrics.record_purge();
     purge_log("purge-group", &target, Some(removed));
@@ -1343,7 +1378,11 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
         removed += store.purge_source(source);
     }
     if let Some(shared) = &state.shared_store {
-        removed += shared.purge_source(source).await;
+        let (walked, pending) = shared
+            .purge_source_bounded(source, SHARED_PURGE_INLINE_SCAN)
+            .await;
+        removed += walked;
+        spawn_shared_purge_rest(shared, pending, "purge-source", source);
     }
     removed
 }

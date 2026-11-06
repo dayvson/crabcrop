@@ -508,7 +508,49 @@ impl S3Store {
     /// and no reads (audit R2-24); a header walk then
     /// catches any remaining spellings (request-hint
     /// variants, older epochs) by their stored keys.
+    ///
+    /// This is the unbounded form: the request path uses
+    /// the bounded variant (issue #368), and this stays
+    /// for the tests and any caller that wants the whole
+    /// walk in one call. The same applies to the
+    /// unbounded `purge_group` and `purge_source` below.
+    #[allow(dead_code)]
     pub async fn purge_matching(&self, base: &str, epoch_base: &str) -> usize {
+        let mut removed = self.delete_epoch_variants(epoch_base).await;
+        removed += self
+            .purge_where(&PurgeCriterion::KeyOrVariant(base.to_string()), None)
+            .await
+            .0;
+        removed
+    }
+
+    /// [`S3Store::purge_matching`] with a bounded inline
+    /// scan (issue #368): the walk reads at most `budget`
+    /// entry headers before returning, and any remainder
+    /// comes back as a [`PendingPurge`] for
+    /// [`S3Store::finish_purge`]. The direct variant
+    /// deletes are bounded by construction and always run
+    /// inline.
+    pub async fn purge_matching_bounded(
+        &self,
+        base: &str,
+        epoch_base: &str,
+        budget: usize,
+    ) -> (usize, Option<PendingPurge>) {
+        let mut removed = self.delete_epoch_variants(epoch_base).await;
+        let (walked, pending) = self
+            .purge_where(
+                &PurgeCriterion::KeyOrVariant(base.to_string()),
+                Some(budget),
+            )
+            .await;
+        removed += walked;
+        (removed, pending)
+    }
+
+    /// Delete the current epoch's enumerable variants of
+    /// a key directly by object name (audit R2-24).
+    async fn delete_epoch_variants(&self, epoch_base: &str) -> usize {
         let mut removed = 0;
         for candidate in [
             epoch_base.to_string(),
@@ -522,18 +564,26 @@ impl S3Store {
                 removed += 1;
             }
         }
-        removed += self
-            .purge_where(|stored_key, _| {
-                stored_key == base || stored_key.starts_with(&format!("{base}#"))
-            })
-            .await;
         removed
     }
 
     /// Remove every entry belonging to `group`. Returns
     /// how many entries were removed.
+    #[allow(dead_code)]
     pub async fn purge_group(&self, group: &str) -> usize {
-        self.purge_where(|_, groups| groups.iter().any(|g| g == group))
+        self.purge_where(&PurgeCriterion::Group(group.to_string()), None)
+            .await
+            .0
+    }
+
+    /// [`S3Store::purge_group`] with a bounded inline scan
+    /// (issue #368); see [`S3Store::purge_matching_bounded`].
+    pub async fn purge_group_bounded(
+        &self,
+        group: &str,
+        budget: usize,
+    ) -> (usize, Option<PendingPurge>) {
+        self.purge_where(&PurgeCriterion::Group(group.to_string()), Some(budget))
             .await
     }
 
@@ -542,30 +592,116 @@ impl S3Store {
     /// R2-07): an upload overwrite calls this so the
     /// replaced original's derivatives stop serving.
     /// Returns how many entries were removed.
+    #[allow(dead_code)]
     pub async fn purge_source(&self, source: &str) -> usize {
-        self.purge_where(|stored_key, _| key_belongs_to_source(stored_key, source))
+        self.purge_where(&PurgeCriterion::Source(source.to_string()), None)
+            .await
+            .0
+    }
+
+    /// [`S3Store::purge_source`] with a bounded inline
+    /// scan (issue #368); see
+    /// [`S3Store::purge_matching_bounded`].
+    pub async fn purge_source_bounded(
+        &self,
+        source: &str,
+        budget: usize,
+    ) -> (usize, Option<PendingPurge>) {
+        self.purge_where(&PurgeCriterion::Source(source.to_string()), Some(budget))
             .await
     }
 
-    /// The shared purge walk: list, read each entry's
-    /// header, delete the matches. Reads are header-sized
-    /// (see [`S3Store::read_entry_header`]), never whole
+    /// Complete a bounded purge's remainder (issue #368):
+    /// walk the objects the inline budget did not reach
+    /// and delete the matches. Returns how many entries
+    /// were removed.
+    pub async fn finish_purge(&self, pending: PendingPurge) -> usize {
+        self.purge_walk(&pending.criterion, pending.objects, None)
+            .await
+            .0
+    }
+
+    /// List the tier and walk it under `criterion`,
+    /// reading at most `budget` entry headers when a
+    /// budget is given; the un-scanned remainder comes
+    /// back as a [`PendingPurge`].
+    async fn purge_where(
+        &self,
+        criterion: &PurgeCriterion,
+        budget: Option<usize>,
+    ) -> (usize, Option<PendingPurge>) {
+        let objects = self.list_objects().await;
+        self.purge_walk(criterion, objects, budget).await
+    }
+
+    /// The shared purge walk: read each entry's header,
+    /// delete the matches. Reads are header-sized (see
+    /// [`S3Store::read_entry_header`]), never whole
     /// entries.
-    async fn purge_where(&self, matches: impl Fn(&str, &[String]) -> bool) -> usize {
+    async fn purge_walk(
+        &self,
+        criterion: &PurgeCriterion,
+        objects: Vec<String>,
+        budget: Option<usize>,
+    ) -> (usize, Option<PendingPurge>) {
         let mut removed = 0;
-        for object in self.list_objects().await {
-            let Some((stored_key, groups)) = self.read_entry_header(&object).await else {
+        for (index, object) in objects.iter().enumerate() {
+            if budget.is_some_and(|b| index >= b) {
+                return (
+                    removed,
+                    Some(PendingPurge {
+                        criterion: criterion.clone(),
+                        objects: objects[index..].to_vec(),
+                    }),
+                );
+            }
+            let Some((stored_key, groups)) = self.read_entry_header(object).await else {
                 continue;
             };
-            if !matches(&stored_key, &groups) {
+            if !criterion.matches(&stored_key, &groups) {
                 continue;
             }
-            if self.delete_object(&object).await {
+            if self.delete_object(object).await {
                 removed += 1;
             }
         }
-        removed
+        (removed, None)
     }
+}
+
+/// What a shared-tier purge walk removes (issue #368):
+/// the matching rule of one purge call, named so an
+/// unfinished walk can travel to a background task.
+#[derive(Clone)]
+enum PurgeCriterion {
+    /// The key itself or one of its `#`-suffixed variants.
+    KeyOrVariant(String),
+    /// Entries recorded in the named cache group.
+    Group(String),
+    /// Entries derived from the named source.
+    Source(String),
+}
+
+impl PurgeCriterion {
+    fn matches(&self, stored_key: &str, groups: &[String]) -> bool {
+        match self {
+            PurgeCriterion::KeyOrVariant(base) => {
+                stored_key == base.as_str() || stored_key.starts_with(&format!("{base}#"))
+            }
+            PurgeCriterion::Group(group) => groups.iter().any(|g| g == group),
+            PurgeCriterion::Source(source) => key_belongs_to_source(stored_key, source),
+        }
+    }
+}
+
+/// The un-scanned remainder of a bounded purge walk
+/// (issue #368): the objects the inline budget did not
+/// reach, with the rule that selects among them. Hand
+/// it to [`S3Store::finish_purge`] to complete the
+/// purge off the request path.
+pub struct PendingPurge {
+    criterion: PurgeCriterion,
+    objects: Vec<String>,
 }
 
 /// The five predefined XML entities, the only escaping S3
@@ -954,6 +1090,33 @@ mod tests {
         );
         assert!(s.get("a/example.com/i.jpg").await.is_none());
         assert!(s.get("ab/example.com/i.jpg").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_bounded_purge_scans_part_and_finishes_from_the_pending_rest() {
+        // Issue #368: with a scan budget below the object
+        // count, the inline call reads only the budgeted
+        // headers and hands back the un-scanned remainder;
+        // finishing it removes exactly the matches the
+        // whole walk would have removed.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        for i in 0..5 {
+            s.put(&format!("k{i}"), &image(b"x", &["hero"])).await;
+        }
+        s.put("other", &image(b"x", &["side"])).await;
+        let (removed, pending) = s.purge_group_bounded("hero", 2).await;
+        assert!(removed <= 2, "inline removals bounded: {removed}");
+        let pending = pending.expect("a remainder past the budget");
+        let rest = s.finish_purge(pending).await;
+        assert_eq!(removed + rest, 5);
+        assert!(s.get("other").await.is_some());
+        // A budget above the object count leaves nothing
+        // pending.
+        s.put("k9", &image(b"x", &["hero"])).await;
+        let (removed, pending) = s.purge_group_bounded("hero", 128).await;
+        assert_eq!(removed, 1);
+        assert!(pending.is_none());
     }
 
     #[tokio::test]
