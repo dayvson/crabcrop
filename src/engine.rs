@@ -3018,7 +3018,7 @@ fn apply_operations(
                             let ov = ctx.watermarks.and_then(|m| m.get(url)).ok_or_else(|| {
                                 EngineError::Unsupported(format!("overlay was not resolved: {url}"))
                             })?;
-                            img = blend_overlay(&img, ov, *x, *y, *alpha, *blend, *width);
+                            img = blend_overlay(ctx, &img, ov, *x, *y, *alpha, *blend, *width)?;
                         }
                         Filter::RemoveBg => {
                             let provider = ctx.mask_provider.ok_or_else(|| {
@@ -4171,7 +4171,9 @@ fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
 /// effective alpha is the overlay pixel's alpha times the
 /// opacity, and the base alpha channel is preserved, so
 /// `Normal` reproduces a watermark exactly.
+#[allow(clippy::too_many_arguments)]
 fn blend_overlay(
+    ctx: &ProcessContext<'_>,
     base: &DynamicImage,
     ov: &DynamicImage,
     x: i32,
@@ -4179,12 +4181,30 @@ fn blend_overlay(
     alpha: u8,
     mode: crate::url::BlendMode,
     width_pct: Option<u32>,
-) -> DynamicImage {
+) -> Result<DynamicImage, EngineError> {
     let scaled;
     let ov = match width_pct {
         Some(pct) => {
-            let target = ((base.width() as u64 * pct as u64) / 100).max(1) as u32;
-            scaled = ov.resize(target, u32::MAX, image::imageops::FilterType::Lanczos3);
+            let target = ((base.width() as u64 * pct as u64) / 100).max(1);
+            // The scaled height follows the overlay's aspect
+            // with no bound of its own, so an extreme aspect
+            // (or a very wide base) grows the intermediate
+            // far past the pixel budget that guards the
+            // other resize paths, up to aborting the process
+            // on the allocation (issue #358). Charge an upper
+            // bound of the scaled pair against the shared
+            // budget before the resize allocates it.
+            let scaled_h = (ov.height() as u64 * target / ov.width().max(1) as u64) + 1;
+            if target * scaled_h > MAX_OUTPUT_PIXELS {
+                return Err(EngineError::Unsupported(format!(
+                    "scaled overlay {target}x{scaled_h} exceeds the {MAX_OUTPUT_PIXELS} pixel limit"
+                )));
+            }
+            scaled = ov.resize(
+                target as u32,
+                u32::MAX,
+                image::imageops::FilterType::Lanczos3,
+            );
             &scaled
         }
         None => ov,
@@ -4204,6 +4224,10 @@ fn blend_overlay(
     let opacity = alpha as f32 / 100.0;
     let (bw, bh) = (out.width() as i64, out.height() as i64);
     for oy in 0..ov.height() as i64 {
+        // The blend walks every overlay pixel; a large
+        // legal pair still runs long, so the deadline is
+        // honored per row (issue #358).
+        ctx.check_deadline()?;
         for ox in 0..ov.width() as i64 {
             let (bx, by) = (left + ox, top + oy);
             if bx < 0 || by < 0 || bx >= bw || by >= bh {
@@ -4221,7 +4245,7 @@ fn blend_overlay(
             }
         }
     }
-    DynamicImage::ImageRgba8(out)
+    Ok(DynamicImage::ImageRgba8(out))
 }
 
 fn overlay_watermark(
@@ -9523,6 +9547,81 @@ mod tests {
         assert_eq!(img.get_pixel(17, 17), &image::Rgb([0, 0, 255]));
         assert_eq!(img.get_pixel(18, 18), &image::Rgb([255, 0, 0]));
         assert_eq!(img.get_pixel(7, 7), &image::Rgb([255, 0, 0]));
+    }
+
+    #[test]
+    fn overlay_scaling_is_charged_against_the_pixel_budget() {
+        // Issue #358: a 1x16384 overlay at 400 percent of a
+        // 1000 px base scales to 4000x65,536,001, far past
+        // the output pixel budget. The blend must refuse
+        // before the resize allocates it (the unbounded
+        // form aborted the process on allocation failure).
+        let base = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1000,
+            10,
+            image::Rgb([255, 0, 0]),
+        ));
+        let ov = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1,
+            16384,
+            image::Rgb([0, 0, 255]),
+        ));
+        let ctx = ProcessContext::default();
+        let err = blend_overlay(
+            &ctx,
+            &base,
+            &ov,
+            0,
+            0,
+            100,
+            crate::url::BlendMode::Normal,
+            Some(400),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("pixel limit"), "{err}");
+        // A scale inside the budget still blends.
+        let small =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 255])));
+        let out = blend_overlay(
+            &ctx,
+            &base,
+            &small,
+            0,
+            0,
+            100,
+            crate::url::BlendMode::Normal,
+            Some(10),
+        )
+        .unwrap();
+        assert_eq!((out.width(), out.height()), (1000, 10));
+    }
+
+    #[test]
+    fn overlay_blend_honors_the_deadline() {
+        // Issue #358: the per-pixel blend loop checks the
+        // render deadline per row instead of running to
+        // completion past it.
+        let base =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, image::Rgb([255, 0, 0])));
+        let ov =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, image::Rgb([0, 0, 255])));
+        let ctx = ProcessContext {
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let err = blend_overlay(
+            &ctx,
+            &base,
+            &ov,
+            0,
+            0,
+            100,
+            crate::url::BlendMode::Normal,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, EngineError::Timeout), "{err}");
     }
 
     #[test]
