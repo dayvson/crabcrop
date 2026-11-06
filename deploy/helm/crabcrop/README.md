@@ -142,7 +142,7 @@ helm install crabcrop deploy/helm/crabcrop \
 - The disk tier (`resultStorage`) is **per pod**, on that pod's volume. It is not shared unless you point every pod at a genuinely shared (ReadWriteMany) filesystem.
 - The bucket tier (`resultBucket`) is **shared**: every replica reads and writes it, and a shared hit promotes into the local tiers.
 
-Replicas therefore trade cache efficiency, never correctness: every replica produces identical bytes for a signed URL, so a cache miss just costs a re-fetch and re-process. Expect the aggregate hit rate of N replicas to be lower than one replica with the same total memory on the local tiers alone; the shared bucket is what keeps it whole. The multi-replica overlay lowers the per-replica memory tier to 256 MB for exactly this reason: size each replica's `CRABCROP_CACHE_MAX_MB` for its own share of the working set, and let the bucket hold the full set once.
+Replicas therefore trade cache efficiency: every replica produces identical bytes for a signed URL, so a cache miss just costs a re-fetch and re-process. One behavior does not cross replicas: a purge removes an entry from the receiving replica and the shared stores, not from other replicas' memory, so a purged entry can still be served by a replica holding it in memory until it evicts or restarts. Expect the aggregate hit rate of N replicas to be lower than one replica with the same total memory on the local tiers alone; the shared bucket is what keeps it whole. The multi-replica overlay lowers the per-replica memory tier to 256 MB for exactly this reason: size each replica's `CRABCROP_CACHE_MAX_MB` for its own share of the working set, and let the bucket hold the full set once.
 
 ## Teardown
 

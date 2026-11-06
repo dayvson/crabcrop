@@ -958,7 +958,11 @@ fn explain_load_error(e: LoadError) -> Response {
 }
 
 /// `POST /purge/<signature>/<path>`: invalidate every stored
-/// variant of one result. The signature is an HMAC over the
+/// variant of one result. The removal spans this process's
+/// tiers (its memory, its disk store, and the shared store);
+/// it does not reach another process's memory, so a replica
+/// can keep serving its own copy until it evicts or restarts
+/// (issue #351). The signature is an HMAC over the
 /// path under a purge subkey derived from the secret (see
 /// [`crate::url::purge_key`]), so only the secret holder can
 /// purge and an image signature can never be replayed here; a
@@ -1093,8 +1097,11 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
 }
 
 /// `POST /purge-group/<signature>/<group>`: invalidate every
-/// stored entry in one cache group (RFC 9875), across both
-/// tiers. The signature is verified under the purge-group
+/// stored entry in one cache group (RFC 9875), across this
+/// process's tiers (its memory, its disk store, and the
+/// shared store); another process's memory is not reached,
+/// as in the per-URL purge (issue #351). The signature is
+/// verified under the purge-group
 /// subkey, its own domain beside the purge subkey, over the
 /// group name, so neither an image signature nor a per-URL
 /// purge signature can be replayed here (audit R2-14). A
@@ -1232,7 +1239,8 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
 /// for a new object, `200` when an allowed overwrite
 /// replaced one.
 /// Remove every cached derivative of `source` from all
-/// three tiers; returns the total removed. The upload
+/// three of this process's tiers; returns the total
+/// removed. The upload
 /// overwrite path (audit R2-07) shares this with any
 /// future source-replacement flow.
 async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
@@ -11510,6 +11518,87 @@ mod tests {
             .unwrap();
         assert_eq!(ok.status(), 200);
         assert!(ok.text().await.unwrap().contains("purged 3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_purge_reaches_the_shared_stores_but_not_another_process_memory() {
+        // Issue #351: the purge guarantee is the receiving
+        // process plus its configured persistent and shared
+        // stores. A purge by one process removes the entry
+        // from the shared disk dir and the shared bucket,
+        // so a fresh process over the same stores cannot
+        // resurrect it; it does not reach into another
+        // process's memory, whose copy keeps serving.
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-p351-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let remainder = format!("25x25/{src}");
+        let sig = sign(&remainder);
+        let url_path = format!("{sig}/{remainder}");
+        // Process A renders: the entry lands in A's
+        // memory, the shared disk dir, and (in the
+        // background) the shared bucket.
+        let base_a = spawn_app_with_shared(Some(&dir), &fake.endpoint).await;
+        let resp = client()
+            .get(format!("{base_a}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The shared write-through is spawned; wait for
+        // it to land.
+        let mut landed = false;
+        for _ in 0..50 {
+            if !fake.objects.lock().unwrap().is_empty() {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(landed, "the shared write-through never landed");
+        // Process B: a fresh instance over the same
+        // stores, its memory empty. Its purge removes the
+        // disk entry and the shared entry: purged 2.
+        let base_b = spawn_app_with_shared(Some(&dir), &fake.endpoint).await;
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let ok = client()
+            .post(format!("{base_b}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        assert!(ok.text().await.unwrap().contains("purged 2"));
+        // A still serves its own memory copy without
+        // touching the origin: B's purge did not reach
+        // into A's process.
+        let resp = client()
+            .get(format!("{base_a}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "A answered from memory");
+        // Process C: fresh memory over the purged
+        // stores. Nothing is left to resurrect, so the
+        // request misses every tier and re-renders from
+        // the origin.
+        let base_c = spawn_app_with_shared(Some(&dir), &fake.endpoint).await;
+        let resp = client()
+            .get(format!("{base_c}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "C re-rendered from the origin"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

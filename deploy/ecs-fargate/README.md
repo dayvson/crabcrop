@@ -8,7 +8,7 @@ and the load balancer are created with the commands below.
 **Cache caveat, before anything else.** The in-memory result
 cache lives inside one task, and the disk tier is per-task
 unless you attach shared storage. Running more tasks trades
-cache hit rate, never correctness. On AWS the shared result
+cache hit rate. On AWS the shared result
 tier is native: set `CRABCROP_RESULT_BUCKET` (see step 5) and
 every task reads and writes one S3 bucket.
 

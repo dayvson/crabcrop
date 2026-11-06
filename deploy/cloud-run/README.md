@@ -6,7 +6,7 @@ with the signing secret in Secret Manager.
 **Cache caveat, before anything else.** The in-memory result
 cache lives inside one instance, and instance disk is
 ephemeral, so the disk tier buys little here. Instances
-trade cache hit rate, never correctness. `service.yaml`
+trade cache hit rate. `service.yaml`
 keeps `minScale: 1` so one instance (and its cache) stays
 warm; for a cache every instance shares, use the shared
 result tier in step 4.

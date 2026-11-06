@@ -7,7 +7,7 @@ secret store.
 **Cache caveat, before anything else.** The in-memory result
 cache lives inside one replica, and the disk tier is
 per-replica (Container Apps volumes are not a shared cache).
-Replicas trade cache hit rate, never correctness.
+Replicas trade cache hit rate.
 `containerapp.yaml` keeps `minReplicas: 1` so one replica
 (and its cache) stays warm. Azure has no S3-compatible store
 of its own; for the shared result tier, point

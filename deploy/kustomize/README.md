@@ -105,7 +105,7 @@ and then `http://localhost:3000`):
 The workload's caches are local to each pod: the
 in-memory tier is per replica, and the result-storage
 component's disk tier is one pod's volume. Replicas trade
-cache hit rate, never correctness. The multi-replica
+cache hit rate. The multi-replica
 overlay composes three replicas with resource budgets
 and pod anti-affinity, and its env patch shows the shared
 result tier: for several replicas, prefer
