@@ -1042,6 +1042,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "ureq",
  "webp",
  "zune-core",
  "zune-jpeg",
@@ -5373,6 +5374,7 @@ checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
 dependencies = [
  "base64 0.23.1",
  "der 0.8.2",
+ "flate2",
  "log",
  "native-tls",
  "percent-encoding",

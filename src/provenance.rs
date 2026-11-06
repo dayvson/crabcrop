@@ -43,6 +43,38 @@ use c2pa::{Builder, Context, Reader, SigningAlg, ValidationState};
 const AI_EDITED_SOURCE_TYPE: &str =
     "http://cv.iptc.org/newscodes/digitalsourcetype/compositeWithTrainedAlgorithmicMedia";
 
+/// The timestamp authority timeouts (issue #365): the
+/// SDK's own ureq resolver leaves every timeout unset,
+/// so a hung authority would hang the boot probe and
+/// every signed request. Signing hands the SDK a
+/// resolver agent with these set instead: 5 seconds to
+/// connect, 15 seconds for the whole round trip (the
+/// request and reply are a few hundred bytes each).
+const TSA_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TSA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A ureq agent carrying the TSA timeouts, in the
+/// redirect posture the SDK's own resolver uses (a
+/// timestamp reply is a direct answer, never a
+/// redirect to follow).
+fn tsa_agent(connect: std::time::Duration, total: std::time::Duration) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(connect))
+        .timeout_global(Some(total))
+        .max_redirects(0)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+/// The context signing runs under: the defaults, plus
+/// the timeout-carrying resolver above, shared across
+/// calls.
+fn signing_context() -> Context {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = AGENT.get_or_init(|| tsa_agent(TSA_CONNECT_TIMEOUT, TSA_REQUEST_TIMEOUT));
+    Context::new().with_resolver(agent.clone())
+}
+
 /// A 1x1 PNG, the boot self-test's signing target.
 const SELF_TEST_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0,
@@ -328,7 +360,7 @@ impl ProvenanceSigner {
             }],
         })
         .to_string();
-        let mut builder = Builder::from_context(Context::new())
+        let mut builder = Builder::from_context(signing_context())
             .with_definition(definition)
             .map_err(|e| e.to_string())?;
         // The actions assertion must open with a created
@@ -556,6 +588,33 @@ mod tests {
             Err(e) => e,
         };
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn tsa_agent_gives_up_on_a_stalled_authority() {
+        // Issue #365: the agent signing runs under carries
+        // connect and total timeouts. A listener that
+        // accepts and never answers must fail the request
+        // at the total timeout, not hang it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let staller = std::thread::spawn(move || {
+            let _held = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let agent = tsa_agent(
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let result = agent.get(&format!("http://{addr}/")).call();
+        assert!(result.is_err(), "a stalled authority is an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the request gave up at the timeout, took {:?}",
+            started.elapsed()
+        );
+        drop(staller);
     }
 
     #[test]

@@ -48,6 +48,12 @@ oxideav-heif = { version = "=0.0.13", default-features = false, features = ["reg
 oxideav-h265 = "=0.0.15"
 oxideav-webp = { version = "0.3.1", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# The timestamp authority transport for C2PA signing
+# (issue #365): c2pa's own ureq resolver leaves every
+# timeout unset, so provenance.rs hands the SDK a
+# resolver agent with connect and total timeouts set.
+# Same major line the lock already carries for c2pa.
+ureq = "3"
 resvg = "0.49"
 roxmltree = "0.21"
 sha2 = "0.11"
