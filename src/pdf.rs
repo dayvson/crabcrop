@@ -637,10 +637,23 @@ pub fn render_scale(page_width: f64, page_height: f64) -> f64 {
 /// a report the parser cannot read means the document
 /// is not one the pipeline can use.
 pub fn parse_probe(report: &str, page: u32) -> Option<PdfProbe> {
+    // pdfinfo prints the document metadata (title, author,
+    // and the rest) ahead of the document facts, and
+    // metadata is document-controlled text: a value
+    // containing a newline prints as extra report lines,
+    // including lines shaped like the structured fields.
+    // A forged small "Page size:" in a title once steered
+    // the raster clamp (issue #363). The real fields print
+    // in a fixed order after every metadata field, with
+    // Pages: first among them, so only the lines from the
+    // last Pages: line onward are read as the structured
+    // section; anything earlier is metadata.
+    let lines: Vec<&str> = report.lines().collect();
+    let start = lines.iter().rposition(|l| l.starts_with("Pages:"))?;
     let mut pages = None;
     let mut encrypted = None;
     let mut size = None;
-    for line in report.lines() {
+    for line in &lines[start..] {
         if let Some(rest) = line.strip_prefix("Pages:") {
             pages = rest.trim().parse::<u32>().ok();
         } else if let Some(rest) = line.strip_prefix("Encrypted:") {
@@ -773,6 +786,27 @@ Page size:       595.28 x 841.89 pts (A4)
         assert_eq!(probe.pages, 2);
         assert!(probe.encrypted);
         assert_eq!((probe.page_width, probe.page_height), (595.28, 841.89));
+    }
+
+    #[test]
+    fn probe_ignores_metadata_lines_shaped_like_facts() {
+        // Issue #363: a title containing a newline prints
+        // as extra report lines ahead of the structured
+        // section. The forged small page size (and the
+        // forged page count) must not steer the parse: the
+        // facts come from the structured section only.
+        let report = "\
+Title:           Forged
+Page size:       10 x 10 pts
+Pages:           999
+Producer:        someone
+Pages:           2
+Encrypted:       no
+Page size:       612 x 792 pts (letter)
+";
+        let probe = parse_probe(report, 1).expect("the real facts parse");
+        assert_eq!(probe.pages, 2);
+        assert_eq!((probe.page_width, probe.page_height), (612.0, 792.0));
     }
 
     #[test]
