@@ -52,7 +52,7 @@ helm upgrade crabcrop deploy/helm/crabcrop \
   --set resultBucket.name=<your-bucket>
 ```
 
-`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with the ambient AWS credentials (the pod's IAM role, for example); the chart carries no bucket credentials. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
+`resultBucket` also takes a `prefix` (the production values set `results`) and, for an S3-compatible store, `s3Endpoint` and `s3Region`. Requests are signed with environment-provided AWS credentials only: set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in the pod environment (through the chart's `env` map, backed by a Secret), because the server reads those variables once at startup and does not fetch credentials from a pod IAM role or any other part of the AWS credential chain. The tier is best-effort by design: a bucket error reads as a cache miss, never a failed request.
 
 ## Evaluation install
 

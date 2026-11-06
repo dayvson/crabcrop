@@ -25,9 +25,10 @@ replace the remaining `REPLACE_ME` values in
 - The AWS CLI, configured for the account and region.
 - An ECS cluster, plus a VPC subnet and a security group
   for the tasks.
-- Two IAM roles: the execution role and the task role the
-  task definition names. Steps 1 and 5 grant each of them
-  the permissions it needs.
+- An IAM execution role for the task definition: step 1
+  grants it the secret read it needs. Step 5 covers the
+  S3 credentials, which are environment-provided (the
+  server does not use a task role).
 
 ## 1. The signing secret
 
@@ -100,11 +101,17 @@ Add plain environment entries:
 {"name": "CRABCROP_RESULT_PREFIX", "value": "prod/"}
 ```
 
-The **task role** (not the execution role) then needs
+The credentials the server signs with then need
 `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and
-`s3:ListBucket` on that bucket. Credentials come from the
-task role through the ambient AWS chain; nothing else to
-wire.
+`s3:ListBucket` on that bucket. Credentials are
+environment-provided only: the server reads
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_SESSION_TOKEN` once at startup, and does not fetch
+credentials from the task role or any other part of the
+AWS credential chain. Add the three entries to the task
+definition's environment (sourced from Secrets Manager,
+like the signing secret), for an IAM user or role you
+mint keys for; a task role alone is not picked up.
 
 Disk tier per task: mount EFS at `/var/cache/crabcrop` and
 add `CRABCROP_RESULT_STORAGE_DIR=/var/cache/crabcrop` plus

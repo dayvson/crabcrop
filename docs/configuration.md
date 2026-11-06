@@ -68,7 +68,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_RESULT_PREFIX` | empty | Object prefix namespacing the shared result store's entries. |
 | `CRABCROP_RESULT_STORAGE_MAX_MB` | `512` | Disk result store budget in megabytes. `0` disables storage even with a directory set. |
 | `CRABCROP_UPLOAD_DIR` | unset | Local directory destination for the upload endpoint. Exactly one of this and `CRABCROP_UPLOAD_BUCKET` may be set; neither disables uploads (the route is a 404). Also becomes the `file://` source root when no `CRABCROP_FILE_ROOT` is set, and must sit under one that is. See [Upload an original](endpoints.md#upload-an-original). |
-| `CRABCROP_UPLOAD_BUCKET` | unset | S3 bucket destination for the upload endpoint, reusing the source S3 endpoint, region, and ambient AWS credentials. |
+| `CRABCROP_UPLOAD_BUCKET` | unset | S3 bucket destination for the upload endpoint, reusing the source S3 endpoint, region, and the environment's AWS credentials (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, read once at startup; no credential chain is consulted). |
 | `CRABCROP_UPLOAD_PREFIX` | empty | Object prefix namespacing the upload bucket's objects. |
 | `CRABCROP_UPLOAD_MAX_MB` | `10` | Cap on one upload in megabytes, 1 to 10 (the source fetch cap: a stored original must stay servable). |
 | `CRABCROP_UPLOAD_ALLOW_OVERWRITE` | off | Lets an upload `PUT` replace an existing object. Off, an existing name is a `409`. |

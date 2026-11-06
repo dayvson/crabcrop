@@ -60,10 +60,12 @@
 //!   store for `s3://` sources (path-style addressing).
 //!   Unset means AWS S3 (virtual-hosted, region from
 //!   `CRABCROP_S3_REGION`, default `us-east-1`). Credentials
-//!   come from the ambient `AWS_ACCESS_KEY_ID`,
+//!   come from the `AWS_ACCESS_KEY_ID`,
 //!   `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`
-//!   variables; both key parts must be set together. Unset
-//!   means unsigned fetches (public buckets).
+//!   environment variables, read once at startup; no AWS
+//!   credential chain is consulted. Both key parts must be
+//!   set together. Unset means unsigned fetches (public
+//!   buckets).
 //! - `CRABCROP_GCS_ENDPOINT` / `CRABCROP_GCS_REGION`: the
 //!   GCS XML API base for `gs://` sources (default
 //!   `https://storage.googleapis.com`) and its signing region
@@ -171,8 +173,8 @@
 //! - `CRABCROP_RESULT_BUCKET`: S3 bucket for the shared
 //!   result-storage tier (multi-replica), reusing
 //!   `CRABCROP_S3_ENDPOINT`, `CRABCROP_S3_REGION`, and the
-//!   ambient AWS credentials; `CRABCROP_RESULT_PREFIX`
-//!   namespaces its objects.
+//!   AWS credentials from the environment;
+//!   `CRABCROP_RESULT_PREFIX` namespaces its objects.
 //! - `CRABCROP_RESULT_STORAGE_DIR`: directory for the
 //!   disk-backed result store (the persistent tier under the
 //!   memory cache). Unset disables it.
@@ -1064,8 +1066,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Shared result storage (issue #142): one S3 bucket as
     // the multi-replica tier. It reuses the source S3
-    // configuration (endpoint, region, ambient AWS
-    // credentials); a prefix namespaces the entries.
+    // configuration (endpoint, region, and the AWS
+    // credentials from the environment); a prefix
+    // namespaces the entries.
     let shared_store = match env::var("CRABCROP_RESULT_BUCKET") {
         Ok(bucket) if !bucket.is_empty() => {
             let prefix = env::var("CRABCROP_RESULT_PREFIX").unwrap_or_default();

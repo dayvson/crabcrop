@@ -73,10 +73,11 @@ resultStorage:
 # disk tiers, read and written by every replica. This is
 # the tier that keeps the cache hit rate whole once you run
 # more than one replica. Set name to enable it. Requests
-# are signed with the ambient AWS credentials (the pod's
-# IAM role, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-# in the pod environment); the chart carries no bucket
-# credentials of its own.
+# are signed with the environment-provided AWS credentials
+# (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and
+# AWS_SESSION_TOKEN, read once at startup); a pod IAM role
+# is not picked up, so provide the keys through the env map
+# below, backed by a Secret.
 resultBucket:
   name: ""
   # Object prefix namespacing this deployment's entries.

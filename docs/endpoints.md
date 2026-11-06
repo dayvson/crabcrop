@@ -27,7 +27,7 @@ The guarantee behind that count: the removal covers the receiving server's memor
 crabcrop is a fetch-only service by design: sources live somewhere else, and transforms reference them by URL. The upload endpoint is the one deliberate exception, and it is off unless the operator turns it on. Configure exactly one destination:
 
 - `CRABCROP_UPLOAD_DIR=/srv/originals` stores originals as files in a local directory.
-- `CRABCROP_UPLOAD_BUCKET=originals` stores them in an S3 bucket, reusing the source S3 configuration (endpoint, region, and ambient AWS credentials); `CRABCROP_UPLOAD_PREFIX` namespaces the objects. The bucket must also appear in `CRABCROP_ALLOWED_BUCKETS`, because uploaded objects are served back as `s3://` sources. There is no GCS destination: `gs://` sources are read-only in crabcrop.
+- `CRABCROP_UPLOAD_BUCKET=originals` stores them in an S3 bucket, reusing the source S3 configuration (endpoint, region, and the AWS credentials from the environment); `CRABCROP_UPLOAD_PREFIX` namespaces the objects. The bucket must also appear in `CRABCROP_ALLOWED_BUCKETS`, because uploaded objects are served back as `s3://` sources. There is no GCS destination: `gs://` sources are read-only in crabcrop.
 
 With neither variable set, the endpoint does not exist: a `PUT` is a plain `404`. With one set, an upload is one signed `PUT`:
 
