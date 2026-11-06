@@ -104,10 +104,25 @@ mod tests {
 
     #[test]
     fn address_space_limit_stops_a_greedy_child() {
-        // dd sizing a 4 GiB block buffer under a 1 GiB cap
-        // fails at once instead of allocating it.
-        let child = Command::new("dd")
-            .args(["if=/dev/zero", "of=/dev/null", "bs=4294967296", "count=1"])
+        // The greedy child allocates 3 GiB after a short
+        // delay, under a 1 GiB cap set the moment it
+        // spawns: the allocation fails with a memory
+        // error instead of growing into the cap. The
+        // delay matters: the limit lands right after
+        // spawn, so the child must still be starting when
+        // it does (an instant allocator can finish inside
+        // the spawn-to-limit window under load, which is
+        // what an earlier dd-based version of this test
+        // did, flakily). python3 is the suites' usual
+        // helper interpreter; skip when it is absent.
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let child = Command::new("python3")
+            .args([
+                "-c",
+                "import time; time.sleep(0.5); x = bytearray(3 * 1024**3)",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
