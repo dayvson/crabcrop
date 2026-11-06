@@ -54,8 +54,10 @@ A video the server can fetch is also an image source: a `frame:` segment in the 
 
 Crabcrop ships no video decoder either. Extraction runs in an external program you configure, `CRABCROP_VIDEO_DECODER`: the path to a decoder executable, with FFmpeg as the reference. The path is validated at startup (it must exist and be executable, or the server refuses to boot). With the variable unset, frame selection is off and a `frame:` URL answers `501`. The contract between crabcrop and the program is fixed, and crabcrop builds every argument itself; the program never sees a shell:
 
-- **Probe**: argv is `ffmpeg -nostdin -v info -i pipe:0`, with the source bytes on stdin and no output target. The program reports the input on stderr (duration, stream list); crabcrop reads the duration, the first video stream's dimensions, and its frame rate from that report. A source whose report holds no video stream (a non-video, an audio-only file, a corrupt container) is a bad source.
-- **Extract**: argv is `ffmpeg -nostdin -v info -i pipe:0 -ss <seconds> -frames:v 1 -f image2pipe -vcodec png pipe:1`, again with the source bytes on stdin. One PNG frame comes back on stdout and becomes the source image, so every decode and output budget applies to it unchanged.
+- **Probe**: argv is `ffmpeg -nostdin -v info -protocol_whitelist pipe -format_whitelist <containers> -i pipe:0`, with the source bytes on stdin and no output target. The program reports the input on stderr (duration, stream list); crabcrop reads the duration, the first video stream's dimensions, and its frame rate from that report. A source whose report holds no video stream (a non-video, an audio-only file, a corrupt container) is a bad source.
+- **Extract**: argv is `ffmpeg -nostdin -v info -protocol_whitelist pipe -format_whitelist <containers> -i pipe:0 -ss <seconds> -frames:v 1 -f image2pipe -vcodec png pipe:1`, again with the source bytes on stdin. One PNG frame comes back on stdout and becomes the source image, so every decode and output budget applies to it unchanged.
+
+The whitelists pin the program to the bytes the loader already validated: the protocol whitelist leaves the pipe as the only input channel, and the format whitelist names the container formats (the MP4/MOV family, Matroska and WebM, AVI, MPEG, FLV, ASF, Ogg), so a manifest inside the source that points at a `file://` or network target, DASH or HLS, is refused by the program instead of followed.
 
 The bounds mirror the encoder's, because the work is the same class:
 

@@ -13,7 +13,8 @@
 //! and a cap on what it may write back. The argv contract
 //! is fixed and built entirely here:
 //!
-//! - Probe: `-nostdin -v info -i pipe:0`. No output
+//! - Probe: `-nostdin -v info -protocol_whitelist pipe
+//!   -format_whitelist <containers> -i pipe:0`. No output
 //!   target is named, so the tool prints its input report
 //!   (duration, stream list) to stderr and exits nonzero;
 //!   the probe reads its facts from that report and treats
@@ -21,7 +22,8 @@
 //!   video stream in the report (a non-video, an
 //!   audio-only file, a corrupt container) is
 //!   [`FrameError::NotVideo`].
-//! - Extract: `-nostdin -v info -i pipe:0 -ss <t>
+//! - Extract: `-nostdin -v info -protocol_whitelist pipe
+//!   -format_whitelist <containers> -i pipe:0 -ss <t>
 //!   -frames:v 1 -f image2pipe -vcodec png pipe:1`. The
 //!   seek is output-side, which is the accurate form:
 //!   the tool decodes forward and returns the first frame
@@ -32,6 +34,12 @@
 //!   [`VideoFrameExtractor::extract_frame`]): a request
 //!   past the end clamps to the last frame, as the
 //!   grammar promises.
+//!
+//! The whitelists keep the tool inside the loader's
+//! policy (issue #361): the bytes on stdin are the only
+//! input it can reach, so container indirection (a
+//! manifest naming a `file://` or network target) has
+//! nowhere to go.
 //!
 //! The extracted PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
@@ -51,6 +59,15 @@ use crate::url::FrameSelection;
 /// budgets, so anything larger is a broken or hostile
 /// tool, not a frame.
 pub const MAX_FRAME_PNG_BYTES: usize = 256 * 1024 * 1024;
+
+/// The input formats the extractor accepts (issue #361):
+/// the container demuxers a video source can legitimately
+/// arrive through. Manifest formats (dash, hls) are absent
+/// on purpose: their whole job is to point at further
+/// inputs, and the only input this tool may consume is
+/// the byte stream the loader already validated, which is
+/// also why the protocol whitelist names only `pipe`.
+const FORMAT_WHITELIST: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,flv,asf,ogg";
 
 /// How much of a tool's stderr report the probe keeps.
 /// The input report sits at the head of the output; this
@@ -164,7 +181,21 @@ impl VideoFrameExtractor {
     /// rate of its first video stream. `NotVideo` when
     /// the report names no usable video stream.
     pub fn probe(&self, video: &[u8]) -> Result<VideoProbe, FrameError> {
-        let run = self.run(&["-nostdin", "-v", "info", "-i", "pipe:0"], video, 0)?;
+        let run = self.run(
+            &[
+                "-nostdin",
+                "-v",
+                "info",
+                "-protocol_whitelist",
+                "pipe",
+                "-format_whitelist",
+                FORMAT_WHITELIST,
+                "-i",
+                "pipe:0",
+            ],
+            video,
+            0,
+        )?;
         parse_probe(&run.stderr).ok_or_else(|| {
             FrameError::NotVideo(
                 "the source has no video stream the decoder can read \
@@ -234,6 +265,10 @@ impl VideoFrameExtractor {
                 "-nostdin",
                 "-v",
                 "info",
+                "-protocol_whitelist",
+                "pipe",
+                "-format_whitelist",
+                FORMAT_WHITELIST,
                 "-i",
                 "pipe:0",
                 "-ss",
@@ -890,6 +925,38 @@ exit 1\n";
             .extract_frame(b"video bytes", FrameSelection::Percent(100.0))
             .unwrap();
         assert!((frame.timestamp - 2.9).abs() < 1e-9, "{}", frame.timestamp);
+    }
+
+    #[test]
+    fn runs_carry_the_input_whitelists() {
+        // Issue #361: every run (the probe and the
+        // extraction) restricts the tool to the pipe
+        // protocol and the accepted container formats, so
+        // a manifest inside the source bytes cannot point
+        // it at inputs the loader never validated. The
+        // stand-in tool records each invocation's argv, one
+        // line per run, and otherwise behaves like FAKE_OK.
+        let record = temp_dir("whitelists").join("argv.log");
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\necho \"$@\" >> {}\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\nexit 1\n",
+            record.display()
+        );
+        let program = fake_tool("whitelists", &script);
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        let frame = extractor
+            .extract_frame(b"video bytes", FrameSelection::Poster)
+            .unwrap();
+        assert!(frame.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 2, "{recorded}");
+        for line in lines {
+            assert!(line.contains("-protocol_whitelist pipe"), "{line}");
+            assert!(
+                line.contains(&format!("-format_whitelist {FORMAT_WHITELIST}")),
+                "{line}"
+            );
+        }
     }
 
     #[test]
