@@ -1627,11 +1627,19 @@ fn parse_crop_align(s: &str) -> Option<Align> {
     let mut classes: Vec<String> = Vec::new();
     for raw in list.split(',') {
         let name = parse_class_name(&percent_decode(raw)?)?;
-        if !classes.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+        // The cap applies as the list is built (issue
+        // #391): once the kept set is full, later names are
+        // still validated but are no longer scanned against
+        // or added to it, so a long list costs a bounded
+        // scan per name instead of a quadratic one, and the
+        // crop runs with exactly the capped set.
+        if classes.len() < MAX_OBJECTS_CLASSES
+            && !classes.iter().any(|c| c.eq_ignore_ascii_case(&name))
+        {
             classes.push(name);
         }
     }
-    if classes.is_empty() || classes.len() > MAX_OBJECTS_CLASSES {
+    if classes.is_empty() {
         return None;
     }
     Some(Align::Objects { classes, scale })
@@ -6263,7 +6271,8 @@ mod tests {
         ] {
             assert!(parse_operations(bad).is_err(), "{bad}");
         }
-        // The class list is bounded: 32 names parse, 33 do not.
+        // The class list is bounded: 32 names parse in
+        // full.
         let names = |n: usize| {
             (0..n)
                 .map(|i| format!("c{i}"))
@@ -6272,8 +6281,26 @@ mod tests {
         };
         let ok = format!("crop:300x200:objects({})/example.com/img.jpg", names(32));
         assert!(parse_operations(&ok).is_ok());
-        let too_many = format!("crop:300x200:objects({})/example.com/img.jpg", names(33));
-        assert!(parse_operations(&too_many).is_err());
+        // Past the cap, parsing keeps exactly the capped
+        // set (issue #391): the first 32 distinct names,
+        // in order.
+        let over = format!("crop:300x200:objects({})/example.com/img.jpg", names(40));
+        let (ops, _) = parse_operations(&over).unwrap();
+        assert!(matches!(
+            &ops[0],
+            Operation::Crop {
+                align: Align::Objects { classes, .. },
+                ..
+            } if classes.len() == MAX_OBJECTS_CLASSES
+                && classes.first().map(String::as_str) == Some("c0")
+                && classes.last().map(String::as_str) == Some("c31")
+        ));
+        // An invalid name past the cap is still a bad crop.
+        let bad_tail = format!(
+            "crop:300x200:objects({},per%24on)/example.com/img.jpg",
+            names(32)
+        );
+        assert!(parse_operations(&bad_tail).is_err());
     }
 
     #[test]
