@@ -160,18 +160,24 @@ fn parse_iccp(data: &[u8]) -> Option<Vec<u8>> {
 /// method, language and translated keywords (each
 /// null-terminated), then the (possibly compressed) text.
 fn parse_itxt_text(data: &[u8]) -> Option<Vec<u8>> {
+    // Every cursor step is bounds-checked (issue #372):
+    // a chunk shorter than the fixed fields it is walked
+    // through yields no text, never a slice panic.
     let mut cursor = 0;
     let skip_cstr = |data: &[u8], cursor: &mut usize| -> Option<()> {
-        let nul = data[*cursor..].iter().position(|&b| b == 0)?;
+        let nul = data.get(*cursor..)?.iter().position(|&b| b == 0)?;
         *cursor += nul + 1;
         Some(())
     };
     skip_cstr(data, &mut cursor)?; // keyword
     let compressed = *data.get(cursor)?;
     cursor += 2; // flag + method
+    if cursor > data.len() {
+        return None;
+    }
     skip_cstr(data, &mut cursor)?; // language
     skip_cstr(data, &mut cursor)?; // translated keyword
-    let text = &data[cursor..];
+    let text = data.get(cursor..)?;
     if compressed == 0 {
         Some(text.to_vec())
     } else {
@@ -582,6 +588,39 @@ mod tests {
         assert_eq!(got.icc, meta_in.icc);
         assert_eq!(got.xmp, meta_in.xmp);
         assert!(got.exif_tiff.is_some());
+    }
+
+    #[test]
+    fn short_itxt_chunks_yield_no_text_instead_of_panicking() {
+        // Issue #372: a chunk that ends inside the fixed
+        // fields (keyword, compression flag and method,
+        // language, translated keyword) walked the cursor
+        // past the end of the data and panicked the slice.
+        // Every truncation of a well-formed payload must
+        // answer None; the full payload still parses.
+        let mut full = b"XML:com.adobe.xmp\0".to_vec();
+        full.extend_from_slice(&[0, 0, 0, 0]);
+        full.extend_from_slice(b"<x:xmpmeta/>");
+        assert_eq!(parse_itxt_text(&full), Some(b"<x:xmpmeta/>".to_vec()));
+        // The fixed fields end at byte 22; every shorter
+        // truncation answers None.
+        for len in 0..22 {
+            assert_eq!(parse_itxt_text(&full[..len]), None, "len {len}");
+        }
+        // End to end: the 19-byte chunk (keyword plus the
+        // compression flag, no method byte) inside a PNG
+        // extracts as no XMP, not a panic.
+        let mut src = b"\x89PNG\r\n\x1a\n".to_vec();
+        src.extend_from_slice(&png_chunk(
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0],
+        ));
+        let mut chunk = b"XML:com.adobe.xmp\0".to_vec();
+        chunk.push(0);
+        assert_eq!(chunk.len(), 19);
+        src.extend_from_slice(&png_chunk(b"iTXt", &chunk));
+        src.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(extract_png_meta(&src).xmp.is_none());
     }
 
     #[test]
