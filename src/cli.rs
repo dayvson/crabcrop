@@ -16,6 +16,7 @@ crabcrop: on-demand image optimization service
 
 Server:
   crabcrop                      Start the server (configuration via environment).
+  crabcrop --version            Print the version and exit.
 
 CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_SECRET):
   crabcrop sign <remainder>           Print the signed URL for an operations + source remainder.
@@ -215,6 +216,9 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
     let verb = args.first().map(String::as_str).unwrap_or("");
     if verb == "--help" || verb == "-h" || verb == "help" {
         return Ok(USAGE.to_string());
+    }
+    if verb == "--version" || verb == "-V" {
+        return Ok(format!("crabcrop {}", env!("CARGO_PKG_VERSION")));
     }
     // Help in any position is help: `crabcrop sign --help`
     // prints usage and exits 0, like the top-level spelling,
@@ -1466,6 +1470,17 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn version_flags_print_the_version() {
+        // `crabcrop --version` (and -V) answer with the
+        // crate version instead of starting the server:
+        // main routes both flags here.
+        for flag in ["--version", "-V"] {
+            let out = exec(&args(&[flag])).await.unwrap();
+            assert_eq!(out, format!("crabcrop {}", env!("CARGO_PKG_VERSION")));
+        }
     }
 
     #[tokio::test]

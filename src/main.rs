@@ -335,10 +335,9 @@ async fn main() {
     // the port and serve. No argument at all starts the
     // server.
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv
-        .first()
-        .is_some_and(|a| !a.starts_with('-') || a == "--help" || a == "-h")
-    {
+    if argv.first().is_some_and(|a| {
+        !a.starts_with('-') || a == "--help" || a == "-h" || a == "--version" || a == "-V"
+    }) {
         match cli::exec(&argv).await {
             Ok(out) => {
                 if !out.is_empty() {
