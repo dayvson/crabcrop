@@ -537,8 +537,17 @@ pub fn app(state: AppState) -> Router {
 
 /// The PUT fallback: every PUT that is not an upload to a
 /// configured destination is simply not found.
-async fn put_not_found() -> Response {
-    (StatusCode::NOT_FOUND, "not found").into_response()
+async fn put_not_found(headers: HeaderMap) -> Response {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "not found".to_string(),
+        accept.as_deref(),
+    )
 }
 
 /// Headers applied to every response (audit PL-5, PL-6):
@@ -584,19 +593,29 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
     // the PL-5 residual): it serves only to a bearer of
     // the configured token, and an unconfigured server
     // keeps it closed rather than public.
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let Some(token) = &state.metrics_token else {
-        return (
+        return error_response(
             StatusCode::FORBIDDEN,
-            "metrics are disabled: set CRABCROP_METRICS_TOKEN to enable them",
-        )
-            .into_response();
+            "metrics_disabled",
+            "metrics are disabled: set CRABCROP_METRICS_TOKEN to enable them".to_string(),
+            accept.as_deref(),
+        );
     };
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     if !presented.is_some_and(|p| token_eq(p.as_bytes(), token.as_bytes())) {
-        return (StatusCode::UNAUTHORIZED, "metrics require a bearer token").into_response();
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "metrics_unauthorized",
+            "metrics require a bearer token".to_string(),
+            accept.as_deref(),
+        );
     }
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -753,11 +772,12 @@ async fn explain_handle(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let Some(tail) = uri.path().strip_prefix("/explain/") else {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "expected /explain/<signature>/<target>",
-        )
-            .into_response();
+            "invalid_path",
+            "expected /explain/<signature>/<target>".to_string(),
+            accept.as_deref(),
+        );
     };
     let full = format!("/{tail}");
     // A sealed spelling is refused wholesale (issue #255):
@@ -770,7 +790,12 @@ async fn explain_handle(
     // fetch happens for it.
     let first_segment = tail.split('/').next().unwrap_or("");
     if crate::url::looks_sealed(first_segment) {
-        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature".to_string(),
+            accept.as_deref(),
+        );
     }
     let (signature, key_id, rest) = match parse_signature(&full) {
         Ok(v) => v,
@@ -780,7 +805,12 @@ async fn explain_handle(
         .keyring
         .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe)
     {
-        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature".to_string(),
+            accept.as_deref(),
+        );
     }
     // The same domain separation as the image path: a
     // remainder may not begin with a reserved segment.
@@ -788,11 +818,12 @@ async fn explain_handle(
         rest.split('/').next(),
         Some("purge" | "purge-group" | "upload")
     ) {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "an image URL may not begin with a purge or upload segment",
-        )
-            .into_response();
+            "reserved_segment",
+            "an image URL may not begin with a purge or upload segment".to_string(),
+            accept.as_deref(),
+        );
     }
     let groups = crate::url::preset_names(rest);
     // Expansion always runs, even with no presets loaded:
@@ -826,7 +857,12 @@ async fn explain_handle(
     if let Some(exp) = expiry
         && now >= exp
     {
-        return (StatusCode::FORBIDDEN, "signature expired").into_response();
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "signature_expired",
+            "signature expired".to_string(),
+            accept.as_deref(),
+        );
     }
 
     // The single bounded source fetch, through the loader
@@ -859,7 +895,7 @@ async fn explain_handle(
         .await
     {
         Ok(fetched) => fetched,
-        Err(e) => return explain_load_error(e),
+        Err(e) => return explain_load_error(e, accept.as_deref()),
     };
     let probe = crate::engine::probe_source(&fetched.head);
 
@@ -931,30 +967,10 @@ async fn explain_handle(
 /// name a resolved address or a bucket, which are the
 /// operator's facts, not the caller's (issue #196,
 /// requirement 3).
-fn explain_load_error(e: LoadError) -> Response {
+fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
     eprintln!("explain load error: {e}");
-    let (status, message) = match e {
-        LoadError::Forbidden(_) => (
-            StatusCode::FORBIDDEN,
-            "source refused by policy".to_string(),
-        ),
-        LoadError::NotFound => (StatusCode::NOT_FOUND, "source not found".to_string()),
-        LoadError::BadStatus(code) => (
-            StatusCode::BAD_GATEWAY,
-            format!("source returned status {code}"),
-        ),
-        LoadError::Network(_) => (StatusCode::BAD_GATEWAY, "source fetch failed".to_string()),
-        LoadError::WrongContentType(_) => (
-            StatusCode::BAD_GATEWAY,
-            "source did not return an image".to_string(),
-        ),
-        LoadError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "source timed out".to_string()),
-        LoadError::TooLarge { limit } => (
-            StatusCode::BAD_GATEWAY,
-            format!("source exceeds {limit} bytes"),
-        ),
-    };
-    (status, message).into_response()
+    let (status, code, message) = load_error_parts(e);
+    error_response(status, code, message, accept)
 }
 
 /// `POST /purge/<signature>/<path>`: invalidate every stored
@@ -983,18 +999,34 @@ fn purge_log(event: &str, target: &str, removed: Option<usize>) {
     }
 }
 
-async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+async fn purge_handle(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+) -> Response {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let Some(tail) = uri.path().strip_prefix("/purge/") else {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "expected /purge/<signature>/<target>",
-        )
-            .into_response();
+            "invalid_path",
+            "expected /purge/<signature>/<target>".to_string(),
+            accept.as_deref(),
+        );
     };
     let full = format!("/{tail}");
     let (signature, key_id, target) = match parse_signature(&full) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.to_string(),
+                accept.as_deref(),
+            );
+        }
     };
     if !state
         .keyring
@@ -1002,7 +1034,12 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
     {
         state.metrics.record_purge();
         purge_log("purge", target, None);
-        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature".to_string(),
+            accept.as_deref(),
+        );
     }
     // A sealed target (issue #255) unseals here, the first
     // step of the chain, now that the purge signature has
@@ -1107,21 +1144,42 @@ async fn purge_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Re
 /// purge signature can be replayed here (audit R2-14). A
 /// bad signature is a 403 and removes nothing; an unknown
 /// group answers 200 with a count of 0.
-async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+async fn purge_group_handle(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+) -> Response {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let Some(tail) = uri.path().strip_prefix("/purge-group/") else {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "expected /purge-group/<signature>/<group>",
-        )
-            .into_response();
+            "invalid_path",
+            "expected /purge-group/<signature>/<group>".to_string(),
+            accept.as_deref(),
+        );
     };
     let full = format!("/{tail}");
     let (signature, key_id, group) = match parse_signature(&full) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.to_string(),
+                accept.as_deref(),
+            );
+        }
     };
     if group.is_empty() || group.contains('/') {
-        return (StatusCode::BAD_REQUEST, "invalid purge group name").into_response();
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_purge_group",
+            "invalid purge group name".to_string(),
+            accept.as_deref(),
+        );
     }
     let target = format!("purge-group/{group}");
     if !state
@@ -1130,7 +1188,12 @@ async fn purge_group_handle(State(state): State<AppState>, uri: axum::http::Uri)
     {
         state.metrics.record_purge();
         purge_log("purge-group", &target, None);
-        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature".to_string(),
+            accept.as_deref(),
+        );
     }
     // Tombstone first, tiers second (issue #350), as in
     // the per-URL purge.
@@ -1258,16 +1321,27 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
 }
 
 async fn upload_handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    let accept = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let Some(upload) = &state.upload else {
-        return (StatusCode::NOT_FOUND, "uploads are not configured").into_response();
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "uploads_not_configured",
+            "uploads are not configured".to_string(),
+            accept.as_deref(),
+        );
     };
     let (parts, body) = req.into_parts();
     let Some(tail) = parts.uri.path().strip_prefix("/upload/") else {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "expected /upload/<signature>/<name>",
-        )
-            .into_response();
+            "invalid_path",
+            "expected /upload/<signature>/<name>".to_string(),
+            accept.as_deref(),
+        );
     };
     let full = format!("/{tail}");
     // A sealed spelling is refused wholesale (issue #255):
@@ -1280,11 +1354,23 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // fetch happens for it.
     let first_segment = tail.split('/').next().unwrap_or("");
     if crate::url::looks_sealed(first_segment) {
-        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature".to_string(),
+            accept.as_deref(),
+        );
     }
     let (signature, key_id, rest) = match parse_signature(&full) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.to_string(),
+                accept.as_deref(),
+            );
+        }
     };
     // Verification runs over the remainder exactly as
     // presented: for the expiring form the `exp:` segment
@@ -1297,11 +1383,23 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     {
         state.metrics.record_upload();
         upload_log(rest, "rejected:bad-signature");
-        return (StatusCode::FORBIDDEN, "bad signature").into_response();
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature".to_string(),
+            accept.as_deref(),
+        );
     }
     let (expiry, name) = match crate::url::split_upload_remainder(rest) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.to_string(),
+                accept.as_deref(),
+            );
+        }
     };
     // Expiry is enforced after verification and before
     // anything else, like an image URL: the comparison is
@@ -1314,13 +1412,23 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         if now >= exp {
             state.metrics.record_upload();
             upload_log(name, "rejected:expired");
-            return (StatusCode::FORBIDDEN, "signature expired").into_response();
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "signature_expired",
+                "signature expired".to_string(),
+                accept.as_deref(),
+            );
         }
     }
     if let Err(e) = crate::upload::validate_upload_name(name) {
         state.metrics.record_upload();
         upload_log(name, "rejected:bad-name");
-        return (StatusCode::BAD_REQUEST, e).into_response();
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_upload_name",
+            e,
+            accept.as_deref(),
+        );
     }
     // The read is bounded by the cap itself: `to_bytes`
     // fails the moment the body passes it, which is the
@@ -1332,21 +1440,23 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         Err(_) => {
             state.metrics.record_upload();
             upload_log(name, "rejected:oversize-or-unreadable");
-            return (
+            return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
+                "upload_too_large",
                 format!("upload exceeds the {}-byte limit", upload.max_bytes),
-            )
-                .into_response();
+                accept.as_deref(),
+            );
         }
     };
     if bytes.is_empty() {
         state.metrics.record_upload();
         upload_log(name, "rejected:not-an-image");
-        return (
+        return error_response(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "upload body is empty: an image is required",
-        )
-            .into_response();
+            "upload_not_an_image",
+            "upload body is empty: an image is required".to_string(),
+            accept.as_deref(),
+        );
     }
     // The existence check runs before validation, so an
     // upload that will be refused as a duplicate never
@@ -1357,11 +1467,12 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     if existed && !upload.allow_overwrite {
         state.metrics.record_upload();
         upload_log(name, "rejected:exists");
-        return (
+        return error_response(
             StatusCode::CONFLICT,
-            "an object with this name already exists",
-        )
-            .into_response();
+            "upload_already_exists",
+            "an object with this name already exists".to_string(),
+            accept.as_deref(),
+        );
     }
     // The bytes must decode as an image this server can
     // serve, through the pipeline's own decode branches:
@@ -1375,21 +1486,31 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             eprintln!("upload rejected: {e}");
             state.metrics.record_upload();
             upload_log(name, "rejected:not-an-image");
-            return (
+            return error_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "upload is not an image this server can decode",
-            )
-                .into_response();
+                "upload_not_an_image",
+                "upload is not an image this server can decode".to_string(),
+                accept.as_deref(),
+            );
         }
         UploadValidation::Busy => {
             state.metrics.record_upload();
             upload_log(name, "rejected:busy");
-            return busy_response("server busy: too many images processing at once", 1);
+            return busy_response(
+                "server busy: too many images processing at once",
+                1,
+                accept.as_deref(),
+            );
         }
         UploadValidation::Panicked => {
             state.metrics.record_upload();
             upload_log(name, "rejected:validation-failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "image validation failed").into_response();
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "validation_failed",
+                "image validation failed".to_string(),
+                accept.as_deref(),
+            );
         }
     };
     // The name must present the body as what it is: a
@@ -1400,7 +1521,12 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     if let Err(e) = crate::upload::check_upload_media(name, prepared.media) {
         state.metrics.record_upload();
         upload_log(name, "rejected:media-mismatch");
-        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, e).into_response();
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "upload_media_mismatch",
+            e,
+            accept.as_deref(),
+        );
     }
     // What lands is the prepared form, and with
     // overwriting off the write is a conditional create:
@@ -1444,27 +1570,34 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         Err(crate::upload::UploadError::AlreadyExists) => {
             state.metrics.record_upload();
             upload_log(name, "rejected:exists");
-            (
+            error_response(
                 StatusCode::CONFLICT,
-                "an object with this name already exists",
+                "upload_already_exists",
+                "an object with this name already exists".to_string(),
+                accept.as_deref(),
             )
-                .into_response()
         }
         Err(crate::upload::UploadError::Backend(cause)) => {
             eprintln!("upload failed: {cause}");
             state.metrics.record_upload();
             upload_log(name, "rejected:store-failed");
-            (StatusCode::BAD_GATEWAY, "the upload store is unavailable").into_response()
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "upload_store_unavailable",
+                "the upload store is unavailable".to_string(),
+                accept.as_deref(),
+            )
         }
         Err(crate::upload::UploadError::Io(cause)) => {
             eprintln!("upload failed: {cause}");
             state.metrics.record_upload();
             upload_log(name, "rejected:store-failed");
-            (
+            error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "the upload could not be stored",
+                "upload_store_failed",
+                "the upload could not be stored".to_string(),
+                accept.as_deref(),
             )
-                .into_response()
         }
     }
 }
@@ -2091,7 +2224,12 @@ async fn serve(
         record.verify = verify_start.elapsed();
         if !verified {
             return (
-                (StatusCode::FORBIDDEN, "bad signature").into_response(),
+                error_response(
+                    StatusCode::FORBIDDEN,
+                    "bad_signature",
+                    "bad signature".to_string(),
+                    accept,
+                ),
                 record,
             );
         }
@@ -2109,11 +2247,12 @@ async fn serve(
             return sealed_refusal(record);
         }
         return (
-            (
+            error_response(
                 StatusCode::BAD_REQUEST,
-                "an image URL may not begin with a purge or upload segment",
-            )
-                .into_response(),
+                "reserved_segment",
+                "an image URL may not begin with a purge or upload segment".to_string(),
+                accept,
+            ),
             record,
         );
     }
@@ -2195,7 +2334,12 @@ async fn serve(
             .unwrap_or(0);
         if now >= exp {
             return (
-                (StatusCode::FORBIDDEN, "signature expired").into_response(),
+                error_response(
+                    StatusCode::FORBIDDEN,
+                    "signature_expired",
+                    "signature expired".to_string(),
+                    accept,
+                ),
                 record,
             );
         }
@@ -2248,14 +2392,15 @@ async fn serve(
             return sealed_refusal(record);
         }
         return (
-            (
+            error_response(
                 StatusCode::BAD_REQUEST,
+                "meta_not_available",
                 format!(
                     "meta is not available for video output: format({}) serves encoded video, not an image",
                     crate::url::format_text(directives.explicit_format.unwrap())
                 ),
-            )
-                .into_response(),
+                accept,
+            ),
             record,
         );
     }
@@ -2271,12 +2416,13 @@ async fn serve(
             return sealed_refusal(record);
         }
         return (
-            (
+            error_response(
                 StatusCode::BAD_REQUEST,
+                "meta_not_available",
                 "meta is not available for debug output: debug:focal serves a diagnostic image, not a transform result"
                     .to_string(),
-            )
-                .into_response(),
+                accept,
+            ),
             record,
         );
     }
@@ -2400,7 +2546,7 @@ async fn serve(
             Flight::Follower(mut changed) => {
                 if waits >= MAX_FLIGHT_WAITS {
                     return (
-                        busy_response("server busy: too many images processing at once", 1),
+                        busy_response("server busy: too many images processing at once", 1, accept),
                         record,
                     );
                 }
@@ -2818,7 +2964,11 @@ async fn serve_miss(
                 }
                 None => {
                     record.fail = FailStage::Load;
-                    return (sealed_or(sealed, load_error_response(e)), record, None);
+                    return (
+                        sealed_or(sealed, load_error_response(e, accept)),
+                        record,
+                        None,
+                    );
                 }
             }
         }
@@ -2842,7 +2992,11 @@ async fn serve_miss(
             Ok(b) => b,
             Err(e) => {
                 record.fail = FailStage::Load;
-                return (sealed_or(sealed, load_error_response(e)), record, None);
+                return (
+                    sealed_or(sealed, load_error_response(e, accept)),
+                    record,
+                    None,
+                );
             }
         };
         watermark_sources.push((wm_url.to_string(), wm_bytes));
@@ -2868,7 +3022,7 @@ async fn serve_miss(
                 return (
                     sealed_or(
                         sealed,
-                        busy_response("server busy: AI processing queue is full", 5),
+                        busy_response("server busy: AI processing queue is full", 5, accept),
                     ),
                     record,
                     None,
@@ -2902,7 +3056,7 @@ async fn serve_miss(
                 return (
                     sealed_or(
                         sealed,
-                        busy_response("server busy: video processing queue is full", 5),
+                        busy_response("server busy: video processing queue is full", 5, accept),
                     ),
                     record,
                     None,
@@ -2930,7 +3084,7 @@ async fn serve_miss(
                 return (
                     sealed_or(
                         sealed,
-                        busy_response("server busy: animation encoding queue is full", 5),
+                        busy_response("server busy: animation encoding queue is full", 5, accept),
                     ),
                     record,
                     None,
@@ -3011,12 +3165,16 @@ async fn serve_miss(
                 sealed_or(
                     sealed,
                     match lane {
-                        Lane::Slow => {
-                            busy_response("server busy: long-running processing lane is full", 5)
-                        }
-                        Lane::Process => {
-                            busy_response("server busy: too many images processing at once", 1)
-                        }
+                        Lane::Slow => busy_response(
+                            "server busy: long-running processing lane is full",
+                            5,
+                            accept,
+                        ),
+                        Lane::Process => busy_response(
+                            "server busy: too many images processing at once",
+                            1,
+                            accept,
+                        ),
                     },
                 ),
                 record,
@@ -3028,7 +3186,12 @@ async fn serve_miss(
             return (
                 sealed_or(
                     sealed,
-                    (StatusCode::INTERNAL_SERVER_ERROR, "image processing failed").into_response(),
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "processing_failed",
+                        "image processing failed".to_string(),
+                        accept,
+                    ),
                 ),
                 record,
                 None,
@@ -3039,7 +3202,12 @@ async fn serve_miss(
             return (
                 sealed_or(
                     sealed,
-                    (StatusCode::GATEWAY_TIMEOUT, "processing timed out").into_response(),
+                    error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "processing_timeout",
+                        "processing timed out".to_string(),
+                        accept,
+                    ),
                 ),
                 record,
                 None,
@@ -3116,7 +3284,11 @@ async fn serve_miss(
                 }
                 None => {
                     record.fail = FailStage::Engine;
-                    return (sealed_or(sealed, engine_error_response(e)), record, None);
+                    return (
+                        sealed_or(sealed, engine_error_response(e, accept)),
+                        record,
+                        None,
+                    );
                 }
             }
         }
@@ -4727,8 +4899,13 @@ fn finalize_validators(response: &mut Response, etag: &str, if_none_match: Optio
 /// them retry straight into the same full queue; the value
 /// is sized to the gate (the AI gate's jobs run seconds,
 /// the process gate's run in well under one).
-fn busy_response(message: &'static str, retry_after_secs: u64) -> Response {
-    let mut response = (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+fn busy_response(message: &'static str, retry_after_secs: u64, accept: Option<&str>) -> Response {
+    let mut response = error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_busy",
+        message.to_string(),
+        accept,
+    );
     response.headers_mut().insert(
         header::RETRY_AFTER,
         retry_after_secs.to_string().parse().unwrap(),
@@ -4755,47 +4932,93 @@ fn sealed_or(sealed: bool, resp: Response) -> Response {
     }
 }
 
-fn load_error_response(e: LoadError) -> Response {
-    // The detailed cause (which can embed origin-controlled
-    // strings and server-constructed store URLs) goes to the
-    // server log; clients get a short generic message (PL-6).
-    // A policy refusal is genericized the same way the
-    // explain path does it (issue #196, requirement 3): the
-    // reason can name a resolved address or a bucket, which
-    // are the operator's facts, not the caller's.
-    eprintln!("load error: {e}");
-    let (status, message) = match e {
+/// The load failure classes: status, stable code, and the
+/// generic client message, shared by the image path and
+/// the explain path. The detailed cause (which can embed
+/// origin-controlled strings and server-constructed store
+/// URLs) goes to the server log; clients get a short
+/// generic message (PL-6). A policy refusal is
+/// genericized the same way the explain path does it
+/// (issue #196, requirement 3): the reason can name a
+/// resolved address or a bucket, which are the operator's
+/// facts, not the caller's.
+fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
+    match e {
         LoadError::Forbidden(_) => (
             StatusCode::FORBIDDEN,
+            "source_forbidden",
             "source refused by policy".to_string(),
         ),
-        LoadError::NotFound => (StatusCode::NOT_FOUND, "source not found".to_string()),
+        LoadError::NotFound => (
+            StatusCode::NOT_FOUND,
+            "source_not_found",
+            "source not found".to_string(),
+        ),
         LoadError::BadStatus(code) => (
             StatusCode::BAD_GATEWAY,
+            "source_bad_status",
             format!("source returned status {code}"),
         ),
-        LoadError::Network(_) => (StatusCode::BAD_GATEWAY, "source fetch failed".to_string()),
+        LoadError::Network(_) => (
+            StatusCode::BAD_GATEWAY,
+            "source_fetch_failed",
+            "source fetch failed".to_string(),
+        ),
         LoadError::WrongContentType(_) => (
             StatusCode::BAD_GATEWAY,
+            "source_not_an_image",
             "source did not return an image".to_string(),
         ),
-        LoadError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "source timed out".to_string()),
+        LoadError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "source_timeout",
+            "source timed out".to_string(),
+        ),
         // 502, not 413: the client's request was a valid
         // signed URL; it is the origin object that is too
         // big, like the other origin faults above.
         LoadError::TooLarge { limit } => (
             StatusCode::BAD_GATEWAY,
+            "source_too_large",
             format!("source exceeds {limit} bytes"),
         ),
-    };
-    (status, message).into_response()
+    }
 }
 
-/// A grammar failure's response: the parser's message as
-/// plain text, or the v2 JSON envelope
-/// (`{"error":{"code","message"}}`, the code being the
-/// error's stable name) when the client asked for JSON,
-/// the same test the meta surface uses.
+fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
+    eprintln!("load error: {e}");
+    let (status, code, message) = load_error_parts(e);
+    error_response(status, code, message, accept)
+}
+
+/// One error response in the v2 contract: the plain-text
+/// body every client has always gotten, or the v2 JSON
+/// envelope (`{"error":{"code","message"}}`, the code
+/// being the failure's stable name) when the client asked
+/// for JSON, the same test the meta surface uses.
+/// Grammar failures carry the parser's codes; operational
+/// failures carry the codes assigned at their builders
+/// (issue #356). Codes are frozen once published, like
+/// the parser's: a failure class may be renamed in code,
+/// but its code never changes. Sealed requests never
+/// reach this builder for a payload failure: they answer
+/// the uniform refusal instead (see `sealed_or`).
+fn error_response(
+    status: StatusCode,
+    code: &str,
+    message: String,
+    accept: Option<&str>,
+) -> Response {
+    if wants_meta(accept) {
+        let body = serde_json::json!({
+            "error": { "code": code, "message": message }
+        });
+        (status, axum::Json(body)).into_response()
+    } else {
+        (status, message).into_response()
+    }
+}
+
 /// Cap for a parse error echoed to a client (issue
 /// #268): the parser's message embeds the offending
 /// segment verbatim, and a segment is bounded only by
@@ -4816,44 +5039,52 @@ fn truncate_echo(message: &str) -> String {
     format!("{}...", &message[..end])
 }
 
+/// A grammar failure's response: the parser's code and
+/// its (truncated) message, as plain text or the v2
+/// envelope per the client's Accept.
 fn parse_failure(e: &crate::url::ParseError, accept: Option<&str>) -> Response {
-    if wants_meta(accept) {
-        let body = serde_json::json!({
-            "error": { "code": e.code(), "message": truncate_echo(&e.to_string()) }
-        });
-        (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, truncate_echo(&e.to_string())).into_response()
-    }
+    error_response(
+        StatusCode::BAD_REQUEST,
+        e.code(),
+        truncate_echo(&e.to_string()),
+        accept,
+    )
 }
 
-fn engine_error_response(e: EngineError) -> Response {
-    eprintln!("engine error: {e}");
-    let (status, message) = match e {
+/// The engine failure classes: status, stable code, and
+/// the generic client message.
+fn engine_error_parts(e: EngineError) -> (StatusCode, &'static str, String) {
+    match e {
         EngineError::Decode(_) => (
             StatusCode::BAD_GATEWAY,
+            "decode_failed",
             "source image could not be decoded".to_string(),
         ),
         EngineError::Encode(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            "encode_failed",
             "image encoding failed".to_string(),
         ),
         EngineError::Timeout => (
             StatusCode::GATEWAY_TIMEOUT,
+            "processing_timeout",
             "processing timed out".to_string(),
         ),
-        EngineError::Unsupported(what) => (StatusCode::BAD_REQUEST, what),
-        EngineError::NotConfigured(what) => (StatusCode::NOT_IMPLEMENTED, what),
+        EngineError::Unsupported(what) => (StatusCode::BAD_REQUEST, "unsupported_operation", what),
+        EngineError::NotConfigured(what) => (StatusCode::NOT_IMPLEMENTED, "not_configured", what),
         EngineError::Inference(crate::ai::AiError::BadOutput(_)) => (
             StatusCode::BAD_GATEWAY,
+            "inference_bad_output",
             "model produced unexpected output".to_string(),
         ),
         EngineError::Inference(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            "inference_failed",
             "image inference failed".to_string(),
         ),
         EngineError::Render(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            "render_failed",
             "image rendering failed".to_string(),
         ),
         // The encoder is the operator's own program: its
@@ -4863,14 +5094,28 @@ fn engine_error_response(e: EngineError) -> Response {
         // stderr) stays in the log line above, where the
         // operator reads it, and never reaches the client
         // (audit R2-30).
-        EngineError::Video(_) => (StatusCode::BAD_GATEWAY, "video encoding failed".to_string()),
+        EngineError::Video(_) => (
+            StatusCode::BAD_GATEWAY,
+            "video_encode_failed",
+            "video encoding failed".to_string(),
+        ),
         EngineError::Frame(_) => (
             StatusCode::BAD_GATEWAY,
+            "frame_extract_failed",
             "video frame extraction failed".to_string(),
         ),
-        EngineError::Pdf(_) => (StatusCode::BAD_GATEWAY, "PDF rendering failed".to_string()),
-    };
-    (status, message).into_response()
+        EngineError::Pdf(_) => (
+            StatusCode::BAD_GATEWAY,
+            "pdf_render_failed",
+            "PDF rendering failed".to_string(),
+        ),
+    }
+}
+
+fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
+    eprintln!("engine error: {e}");
+    let (status, code, message) = engine_error_parts(e);
+    error_response(status, code, message, accept)
 }
 
 #[cfg(test)]
@@ -6999,6 +7244,515 @@ mod tests {
             resp.text().await.unwrap(),
             "invalid filters segment: filters:bogus(1)"
         );
+    }
+
+    async fn error_body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Assert one error response in both contract modes:
+    /// the exact legacy plain-text body with no JSON
+    /// Accept, and the v2 envelope carrying the class's
+    /// frozen code (and the same message) with one.
+    async fn assert_error_modes(
+        resp_plain: reqwest::Response,
+        resp_json: reqwest::Response,
+        status: StatusCode,
+        code: &str,
+        message: &str,
+    ) {
+        assert_eq!(resp_plain.status(), status);
+        assert_eq!(resp_plain.text().await.unwrap(), message);
+        assert_eq!(resp_json.status(), status);
+        let body: serde_json::Value =
+            serde_json::from_str(&resp_json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], code);
+        assert_eq!(body["error"]["message"], message);
+    }
+
+    fn load_error_cases() -> Vec<(LoadError, StatusCode, &'static str, String)> {
+        vec![
+            (
+                LoadError::Forbidden("a policy reason".to_string()),
+                StatusCode::FORBIDDEN,
+                "source_forbidden",
+                "source refused by policy".to_string(),
+            ),
+            (
+                LoadError::NotFound,
+                StatusCode::NOT_FOUND,
+                "source_not_found",
+                "source not found".to_string(),
+            ),
+            (
+                LoadError::BadStatus(503),
+                StatusCode::BAD_GATEWAY,
+                "source_bad_status",
+                "source returned status 503".to_string(),
+            ),
+            (
+                LoadError::Network("a cause".to_string()),
+                StatusCode::BAD_GATEWAY,
+                "source_fetch_failed",
+                "source fetch failed".to_string(),
+            ),
+            (
+                LoadError::WrongContentType(Some("text/html".to_string())),
+                StatusCode::BAD_GATEWAY,
+                "source_not_an_image",
+                "source did not return an image".to_string(),
+            ),
+            (
+                LoadError::Timeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "source_timeout",
+                "source timed out".to_string(),
+            ),
+            (
+                LoadError::TooLarge { limit: 10 },
+                StatusCode::BAD_GATEWAY,
+                "source_too_large",
+                "source exceeds 10 bytes".to_string(),
+            ),
+        ]
+    }
+
+    fn engine_error_cases() -> Vec<(EngineError, StatusCode, &'static str, String)> {
+        vec![
+            (
+                EngineError::Decode("a cause".to_string()),
+                StatusCode::BAD_GATEWAY,
+                "decode_failed",
+                "source image could not be decoded".to_string(),
+            ),
+            (
+                EngineError::Encode("a cause".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encode_failed",
+                "image encoding failed".to_string(),
+            ),
+            (
+                EngineError::Timeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "processing_timeout",
+                "processing timed out".to_string(),
+            ),
+            (
+                EngineError::Unsupported("a what".to_string()),
+                StatusCode::BAD_REQUEST,
+                "unsupported_operation",
+                "a what".to_string(),
+            ),
+            (
+                EngineError::NotConfigured("a what".to_string()),
+                StatusCode::NOT_IMPLEMENTED,
+                "not_configured",
+                "a what".to_string(),
+            ),
+            (
+                EngineError::Inference(crate::ai::AiError::BadOutput("a cause".to_string())),
+                StatusCode::BAD_GATEWAY,
+                "inference_bad_output",
+                "model produced unexpected output".to_string(),
+            ),
+            (
+                EngineError::Inference(crate::ai::AiError::Inference("a cause".to_string())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "inference_failed",
+                "image inference failed".to_string(),
+            ),
+            (
+                EngineError::Inference(crate::ai::AiError::LockPoisoned),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "inference_failed",
+                "image inference failed".to_string(),
+            ),
+            (
+                EngineError::Render("a cause".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "render_failed",
+                "image rendering failed".to_string(),
+            ),
+            (
+                EngineError::Video("a cause".to_string()),
+                StatusCode::BAD_GATEWAY,
+                "video_encode_failed",
+                "video encoding failed".to_string(),
+            ),
+            (
+                EngineError::Frame("a cause".to_string()),
+                StatusCode::BAD_GATEWAY,
+                "frame_extract_failed",
+                "video frame extraction failed".to_string(),
+            ),
+            (
+                EngineError::Pdf("a cause".to_string()),
+                StatusCode::BAD_GATEWAY,
+                "pdf_render_failed",
+                "PDF rendering failed".to_string(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn operational_error_classes_carry_stable_codes() {
+        // Issue #356: every operational failure class
+        // answers with its frozen code in the v2 envelope
+        // when the client asked for JSON, and with the
+        // exact legacy plain-text body when it did not.
+        // The classes are exercised at the builders here;
+        // the ones that trigger cheaply over HTTP are also
+        // covered end to end below (a source timeout needs
+        // a ten-second origin, a shed a saturated gate, a
+        // processing panic a panicking job). The builders
+        // consume the error, so each mode runs its own
+        // pass over fresh cases.
+        for (e, status, _code, message) in load_error_cases() {
+            let resp = load_error_response(e, None);
+            assert_eq!(resp.status(), status);
+            assert_eq!(error_body_text(resp).await, message);
+        }
+        for (e, status, code, message) in load_error_cases() {
+            let resp = load_error_response(e, Some("application/json"));
+            assert_eq!(resp.status(), status);
+            let body: serde_json::Value =
+                serde_json::from_str(&error_body_text(resp).await).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["message"], message);
+        }
+        for (e, status, _code, message) in engine_error_cases() {
+            let resp = engine_error_response(e, None);
+            assert_eq!(resp.status(), status);
+            assert_eq!(error_body_text(resp).await, message);
+        }
+        for (e, status, code, message) in engine_error_cases() {
+            let resp = engine_error_response(e, Some("application/json"));
+            assert_eq!(resp.status(), status);
+            let body: serde_json::Value =
+                serde_json::from_str(&error_body_text(resp).await).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["message"], message);
+        }
+        // The shed class keeps its Retry-After in both
+        // modes.
+        let resp = busy_response("server busy", 5, Some("application/json"));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "5");
+        let body: serde_json::Value = serde_json::from_str(&error_body_text(resp).await).unwrap();
+        assert_eq!(body["error"]["code"], "server_busy");
+        assert_eq!(body["error"]["message"], "server busy");
+    }
+
+    #[test]
+    fn every_error_code_is_documented() {
+        // The published list and the code stay in
+        // agreement (the AGENTS.md rule): every code the
+        // server can emit, grammar or operational, appears
+        // in docs/responses.md.
+        const CODES: &[&str] = &[
+            // The parser's frozen set.
+            "empty_path",
+            "missing_signature",
+            "malformed_signature",
+            "invalid_size",
+            "invalid_crop",
+            "invalid_crop_rect",
+            "invalid_focal_rect",
+            "invalid_focal_point",
+            "invalid_pad",
+            "invalid_expiry",
+            "invalid_maxage",
+            "invalid_debug",
+            "invalid_frame",
+            "invalid_page",
+            "unknown_preset",
+            "unknown_root",
+            "invalid_root",
+            "invalid_preset",
+            "presets_only",
+            "invalid_filters",
+            "invalid_curve",
+            "invalid_convolution",
+            "invalid_noise",
+            "missing_source_url",
+            // The operational set (issue #356).
+            "bad_signature",
+            "signature_expired",
+            "reserved_segment",
+            "invalid_path",
+            "meta_not_available",
+            "not_found",
+            "metrics_disabled",
+            "metrics_unauthorized",
+            "source_forbidden",
+            "source_not_found",
+            "source_bad_status",
+            "source_fetch_failed",
+            "source_not_an_image",
+            "source_too_large",
+            "source_timeout",
+            "decode_failed",
+            "encode_failed",
+            "unsupported_operation",
+            "not_configured",
+            "inference_bad_output",
+            "inference_failed",
+            "render_failed",
+            "video_encode_failed",
+            "frame_extract_failed",
+            "pdf_render_failed",
+            "processing_timeout",
+            "processing_failed",
+            "server_busy",
+            "invalid_purge_group",
+            "uploads_not_configured",
+            "invalid_upload_name",
+            "upload_too_large",
+            "upload_not_an_image",
+            "upload_media_mismatch",
+            "upload_already_exists",
+            "validation_failed",
+            "upload_store_unavailable",
+            "upload_store_failed",
+        ];
+        let docs = include_str!("../docs/responses.md");
+        for code in CODES {
+            assert!(
+                docs.contains(&format!("`{code}`")),
+                "error code {code} is not documented in docs/responses.md"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn operational_failures_speak_json_when_asked() {
+        // End to end over HTTP: the load and engine
+        // families, plus the signature classes, answer
+        // with the envelope when asked and keep the exact
+        // plain-text bodies when not.
+        let base = spawn_app(false).await;
+        let src = spawn_image_server().await;
+        // Bad signature.
+        let remainder = format!("100x50/{src}");
+        let url = format!("{base}/deadbeef/{remainder}");
+        let plain = client().get(&url).send().await.unwrap();
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature",
+        )
+        .await;
+        // Expired signed URL.
+        let remainder = format!("exp:1/300x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let plain = client().get(&url).send().await.unwrap();
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::FORBIDDEN,
+            "signature_expired",
+            "signature expired",
+        )
+        .await;
+        // The origin answers 404.
+        let (src404, _hits) = spawn_counting_server(404, "image/png", test_png()).await;
+        let remainder = format!("100x50/{src404}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let plain = client().get(&url).send().await.unwrap();
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::NOT_FOUND,
+            "source_not_found",
+            "source not found",
+        )
+        .await;
+        // The origin answers a non-2xx status.
+        let (src500, _hits) = spawn_counting_server(500, "image/png", test_png()).await;
+        let remainder = format!("100x50/{src500}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::BAD_GATEWAY);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "source_bad_status");
+        assert_eq!(body["error"]["message"], "source returned status 500");
+        // The origin answers a non-image Content-Type.
+        let (src_html, _hits) =
+            spawn_counting_server(200, "text/html", b"<html></html>".to_vec()).await;
+        let remainder = format!("100x50/{src_html}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::BAD_GATEWAY);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "source_not_an_image");
+        // The fetched bytes do not decode.
+        let (src_bad, _hits) =
+            spawn_counting_server(200, "image/png", b"not an image".to_vec()).await;
+        let remainder = format!("100x50/{src_bad}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::BAD_GATEWAY);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "decode_failed");
+        // A feature this server was not configured for.
+        let remainder = format!("filters:blurfaces/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::NOT_IMPLEMENTED);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "not_configured");
+    }
+
+    #[tokio::test]
+    async fn purge_failures_speak_json_when_asked() {
+        let base = spawn_app(false).await;
+        let src = spawn_image_server().await;
+        let target = format!("300x200/{src}");
+        let url = format!("{base}/purge/{}/{target}", "0".repeat(64));
+        let plain = client().post(&url).send().await.unwrap();
+        let json = client()
+            .post(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_failures_speak_json_when_asked() {
+        let dir = upload_dir("codes");
+        let base = spawn_app_with_upload(&dir, 1024 * 1024, false).await;
+        let name = "cat.png";
+        // Bad signature.
+        let url = format!("{base}/upload/{}/{name}", "0".repeat(64));
+        let json = client()
+            .put(&url)
+            .header("accept", "application/json")
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "bad_signature");
+        // A body that is not an image.
+        let sig = crate::url::upload_signature(SECRET, name);
+        let url = format!("{base}/upload/{sig}/{name}");
+        let json = client()
+            .put(&url)
+            .header("accept", "application/json")
+            .body(b"not an image".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "upload_not_an_image");
+        // A duplicate name with overwriting off.
+        let resp = client().put(&url).body(test_png()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = client()
+            .put(&url)
+            .header("accept", "application/json")
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "upload_already_exists");
+        // A body past the cap.
+        let dir = upload_dir("codes-oversize");
+        let base = spawn_app_with_upload(&dir, 16, false).await;
+        let url = format!("{base}/upload/{sig}/{name}");
+        let json = client()
+            .put(&url)
+            .header("accept", "application/json")
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "upload_too_large");
+    }
+
+    #[tokio::test]
+    async fn metrics_failures_speak_json_when_asked() {
+        // No token configured: metrics are disabled.
+        let base = spawn_app_with_metrics(false, None).await;
+        let json = client()
+            .get(format!("{base}/metrics"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "metrics_disabled");
+        // A token configured but the wrong bearer sent.
+        let base = spawn_app_with_metrics(false, Some(TEST_METRICS_TOKEN.to_string())).await;
+        let json = client()
+            .get(format!("{base}/metrics"))
+            .header("accept", "application/json")
+            .header("authorization", "Bearer wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "metrics_unauthorized");
     }
 
     #[tokio::test]
@@ -9730,7 +10484,7 @@ mod tests {
         // AP-16: a model that ran but produced unusable output
         // is a 502; a runtime failure or a poisoned session
         // lock stays a 500; the log line keeps the typed cause.
-        let status = |e: EngineError| engine_error_response(e).status();
+        let status = |e: EngineError| engine_error_response(e, None).status();
         assert_eq!(
             status(EngineError::Inference(crate::ai::AiError::BadOutput(
                 "unexpected shape".to_string()
@@ -9973,7 +10727,7 @@ mod tests {
     fn oversized_source_is_a_bad_gateway() {
         // The request was a valid signed URL; the origin
         // object is what is too big (review AP-11).
-        let resp = load_error_response(LoadError::TooLarge { limit: 10 });
+        let resp = load_error_response(LoadError::TooLarge { limit: 10 }, None);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -9983,9 +10737,12 @@ mod tests {
         // resolution; the image path answers with the same
         // generic body as the explain path (issue #196,
         // requirement 3), and the reason stays in the log.
-        let resp = load_error_response(LoadError::Forbidden(
-            "host localhost resolves to a non-public address (::1)".to_string(),
-        ));
+        let resp = load_error_response(
+            LoadError::Forbidden(
+                "host localhost resolves to a non-public address (::1)".to_string(),
+            ),
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -9998,7 +10755,7 @@ mod tests {
         // Both gate 503s are built by busy_response; the
         // header is what lets a client back off instead of
         // retrying into the same full queue (review AP-9).
-        let resp = busy_response("server busy", 5);
+        let resp = busy_response("server busy", 5, None);
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             resp.headers()

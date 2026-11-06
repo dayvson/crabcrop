@@ -40,7 +40,54 @@ With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at sta
 
 ## Errors
 
-Error bodies are plain text with a short message. Send `Accept: application/json` and a grammar failure (a `400` below) instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`. The codes are the parser's stable names, frozen as published: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_focal_point`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`, `invalid_frame`, `invalid_page`. The statuses you can get:
+Error bodies are plain text with a short message. Send `Accept: application/json` and any failure instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`: the same status and the same message, plus a stable machine-readable `code` that clients can branch on. The codes are frozen as published: a failure class may be renamed in code, but its code never changes. One exception: a sealed request's failures stay the uniform `403` refusal, with no envelope and no code, so a lifted token reveals nothing about the payload it carries; an opened token whose payload has expired answers `signature_expired`, exactly as the plain form does.
+
+Grammar failures (a `400` below) carry the parser's stable names: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_focal_point`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`, `invalid_frame`, `invalid_page`. Signature-segment failures on the purge, purge-group, and upload routes carry these codes too.
+
+Operational failures carry these codes:
+
+| Code | Status | Failure |
+| --- | --- | --- |
+| `bad_signature` | `403` | The signature does not verify (image, explain, purge, purge-group, and upload routes). |
+| `signature_expired` | `403` | The signed URL's `exp:` second has been reached. |
+| `reserved_segment` | `400` | An image URL begins with a purge or upload segment. |
+| `invalid_path` | `400` | An explain, purge, purge-group, or upload path does not have the route's shape. |
+| `meta_not_available` | `400` | Meta was asked for a video or debug output, which serves no image to describe. |
+| `not_found` | `404` | A `PUT` to a path that is not the upload route. |
+| `metrics_disabled` | `403` | `GET /metrics` when no `CRABCROP_METRICS_TOKEN` is configured. |
+| `metrics_unauthorized` | `401` | `GET /metrics` with a missing or wrong bearer token. |
+| `source_forbidden` | `403` | The source policy refused the source URL. |
+| `source_not_found` | `404` | The source does not exist. |
+| `source_bad_status` | `502` | The origin answered a non-2xx status other than 404. |
+| `source_fetch_failed` | `502` | The source fetch failed (a DNS, connect, TLS, or stream error). |
+| `source_not_an_image` | `502` | The origin answered with a non-image `Content-Type`. |
+| `source_too_large` | `502` | The source is larger than the fetch limit. |
+| `source_timeout` | `504` | The source fetch timed out. |
+| `decode_failed` | `502` | The fetched bytes could not be decoded as an image. |
+| `encode_failed` | `500` | Encoding the output failed. |
+| `unsupported_operation` | `400` | The operation is not supported for this source or output. |
+| `not_configured` | `501` | The operation needs a model or resource this server was not configured with. |
+| `inference_bad_output` | `502` | A model ran but produced output the server cannot use. |
+| `inference_failed` | `500` | An AI model failed at inference time. |
+| `render_failed` | `500` | A text overlay could not be rendered. |
+| `video_encode_failed` | `502` | The configured video encoder failed. |
+| `frame_extract_failed` | `502` | The configured frame extractor failed. |
+| `pdf_render_failed` | `502` | The configured PDF renderer failed. |
+| `processing_timeout` | `504` | Processing ran past the process deadline. |
+| `processing_failed` | `500` | The processing job itself failed. |
+| `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate waited past its timeout; the response carries `Retry-After`. |
+| `invalid_purge_group` | `400` | A purge-group name is empty or contains a slash. |
+| `uploads_not_configured` | `404` | A `PUT` to `/upload/...` when uploads are not configured. |
+| `invalid_upload_name` | `400` | The upload name is not valid. |
+| `upload_too_large` | `413` | The upload body is larger than the cap. |
+| `upload_not_an_image` | `415` | The upload body is empty or does not decode as an image. |
+| `upload_media_mismatch` | `415` | The upload name's extension does not match the body's media kind. |
+| `upload_already_exists` | `409` | An upload to a name that already exists, while overwriting is off. |
+| `validation_failed` | `500` | The upload's image validation itself failed. |
+| `upload_store_unavailable` | `502` | The upload store's backend is unavailable. |
+| `upload_store_failed` | `500` | The upload could not be stored. |
+
+The statuses you can get:
 
 | Status | Meaning |
 | --- | --- |
