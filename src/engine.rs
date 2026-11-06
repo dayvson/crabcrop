@@ -1274,18 +1274,20 @@ impl Engine {
                 .or(ctx.preferred)
                 .unwrap_or(detected);
             if frames.len() > 1
-                && resolved == ImageFormat::Jxl
                 && directives.explicit_format.is_none()
+                && !matches!(resolved, ImageFormat::Gif | ImageFormat::WebP)
             {
-                // Animated sources stay out of JXL negotiation:
-                // a negotiated JXL would silently drop the frames,
-                // so the preference falls back to GIF. An explicit
-                // format(jxl) still converts (first frame), as
+                // Negotiation never flattens an animation
+                // (issue #370): a negotiated WebP keeps the
+                // frames as an animated WebP, and a negotiated
+                // AVIF or JXL cannot carry them, so the
+                // preference falls back to GIF. An explicit
+                // format(...) still converts (first frame), as
                 // documented for still conversions.
                 resolved = ImageFormat::Gif;
             }
-            if frames.len() > 1 && resolved == ImageFormat::Gif {
-                return self.process_animated(frames, ops, &ctx, ImageFormat::Gif, None);
+            if frames.len() > 1 && matches!(resolved, ImageFormat::Gif | ImageFormat::WebP) {
+                return self.process_animated(frames, ops, &ctx, resolved, None);
             }
             if frames.len() > 1 && resolved.is_video() {
                 return self.process_video(frames, ops, &ctx, resolved);
@@ -1316,13 +1318,15 @@ impl Engine {
                 .or(ctx.preferred)
                 .unwrap_or(detected);
             if frames.len() > 1
-                && resolved == ImageFormat::Jxl
                 && directives.explicit_format.is_none()
+                && !matches!(resolved, ImageFormat::WebP | ImageFormat::Gif)
             {
-                // Animated sources stay out of JXL negotiation:
-                // a negotiated JXL would silently drop the frames,
-                // so the preference falls back to WebP. An explicit
-                // format(jxl) still converts (first frame), as
+                // Negotiation never flattens an animation
+                // (issue #370): a negotiated GIF keeps the
+                // frames as an animated GIF, and a negotiated
+                // AVIF or JXL cannot carry them, so the
+                // preference falls back to WebP. An explicit
+                // format(...) still converts (first frame), as
                 // documented for still conversions.
                 resolved = ImageFormat::WebP;
             }
@@ -8204,6 +8208,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.format, ImageFormat::Jxl);
+    }
+
+    #[test]
+    fn animated_sources_keep_their_frames_under_negotiation() {
+        let engine = Engine;
+        // Issue #370: negotiation once guarded only JXL, so
+        // an Accept naming AVIF flattened an animation to
+        // its first frame, and a negotiated WebP did the
+        // same to a GIF source. Negotiated preferences now
+        // keep the frames: AVIF falls back to the source
+        // format, and GIF and WebP cross over as animations.
+        let gif = animated_gif_bytes();
+        let out = engine
+            .process_preferred(
+                &gif,
+                &[],
+                ProcessContext {
+                    preferred: Some(ImageFormat::Avif),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        assert_eq!(decoded_gif_frames(&out.bytes).len(), 2);
+
+        let out = engine
+            .process_preferred(
+                &gif,
+                &[],
+                ProcessContext {
+                    preferred: Some(ImageFormat::WebP),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        assert_eq!(decoded_webp_frames(&out.bytes).len(), 2);
+
+        let webp = animated_webp_bytes();
+        let out = engine
+            .process_preferred(
+                &webp,
+                &[],
+                ProcessContext {
+                    preferred: Some(ImageFormat::Avif),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        assert_eq!(decoded_webp_frames(&out.bytes).len(), 3);
+
+        let out = engine
+            .process_preferred(
+                &webp,
+                &[],
+                ProcessContext {
+                    preferred: Some(ImageFormat::Gif),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        assert_eq!(decoded_gif_frames(&out.bytes).len(), 3);
     }
 
     /// A fake video encoder for the video tests: drains
