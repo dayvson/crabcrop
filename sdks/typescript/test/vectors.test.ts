@@ -208,6 +208,37 @@ test("explainUrl verdicts match the generated combination corpus", () => {
   }
 });
 
+test("explainUrl reports a sealed token as sealed, not malformed (issue #388)", () => {
+  const secret = "explain-sealed-secret";
+  const remainder = "300x200/https://example.com/a.jpg";
+  const token = sealWithNonce(secret, remainder, new Uint8Array(12).fill(7));
+  const out = explainUrl(`https://img.example.com/${token}`);
+  assert.equal(out.signature?.kind, "sealed");
+  assert.equal(out.signature?.value, token);
+  assert.equal(out.signature?.keyId, undefined);
+  assert.deepEqual(out.errors, []);
+  assert.deepEqual(out.segments, []);
+  assert.equal(out.source, "");
+  // A keyed token reports its key ID.
+  const keyed = sealWithNonce(secret, remainder, new Uint8Array(12).fill(9), "k2");
+  const keyedOut = explainUrl(`https://img.example.com/${keyed}`);
+  assert.equal(keyedOut.signature?.kind, "sealed");
+  assert.equal(keyedOut.signature?.keyId, "k2");
+  assert.deepEqual(keyedOut.errors, []);
+  // A trailing path behind a token is not part of the
+  // URL the server serves; the token still classifies.
+  const trailed = explainUrl(`https://img.example.com/${token}/300x200/https://example.com/a.jpg`);
+  assert.equal(trailed.signature?.kind, "sealed");
+  assert.deepEqual(trailed.segments, []);
+  // An unknown version marker is not a malformed
+  // signature either: the server refuses it uniformly.
+  const imitation = explainUrl(
+    "https://img.example.com/s2.AAAA/300x200/https://example.com/a.jpg",
+  );
+  assert.equal(imitation.signature?.kind, "invalid");
+  assert.match(imitation.signature?.detail ?? "", /uniform 403 refusal/);
+});
+
 test("explainUrl explains studio filters instead of calling them unknown", () => {
   const SIG = "a".repeat(64);
   const SRC = "https://example.com/a.jpg";

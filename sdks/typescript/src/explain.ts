@@ -10,7 +10,7 @@
 export type SegmentKind = "expiry" | "maxage" | "debug" | "preset" | "operation";
 
 /** The signature kinds an explanation can report. */
-export type SignatureKind = "hmac" | "unsafe" | "invalid";
+export type SignatureKind = "hmac" | "unsafe" | "sealed" | "invalid";
 
 export interface ExplainedSegment {
   raw: string;
@@ -958,6 +958,22 @@ export function explainUrl(
     path = path.slice(0, cut);
   }
   const errors: string[] = [];
+  // A sealed URL is a single segment: the token carries
+  // the whole remainder encrypted, so there is no slash
+  // and nothing visible to itemize (issue #388).
+  const sealedWhole = path.match(/^(?:([A-Za-z0-9_-]{1,32}):)?s1\.([A-Za-z0-9_-]+)$/);
+  if (sealedWhole) {
+    const signature: Explanation["signature"] = {
+      kind: "sealed",
+      value: `s1.${sealedWhole[2]}`,
+      detail:
+        "sealed token (AES-256-GCM): the operations and source are encrypted inside it, so there is nothing visible to itemize; the server opens it and serves the URL it carries",
+    };
+    if (sealedWhole[1]) {
+      signature.keyId = sealedWhole[1];
+    }
+    return { signature, segments: [], source: "", remainder: "", errors: [] };
+  }
   const slash = path.indexOf("/");
   if (slash === -1) {
     return { signature: null, segments: [], source: "", remainder: "", errors: ["no signature segment: the path is a single segment"] };
@@ -966,6 +982,23 @@ export function explainUrl(
   const remainder = path.slice(slash + 1);
   let signature: Explanation["signature"];
   const keyed = signatureRaw.match(/^([A-Za-z0-9_-]{1,32}):([0-9a-f]{64})$/);
+  const sealedTok = signatureRaw.match(/^(?:([A-Za-z0-9_-]{1,32}):)?s1\.([A-Za-z0-9_-]+)$/);
+  if (sealedTok) {
+    // A sealed token with a trailing path (issue #388):
+    // the server opens the token and serves the URL it
+    // carries; the visible remainder behind it is not
+    // part of that URL, so there is nothing to itemize.
+    signature = {
+      kind: "sealed",
+      value: `s1.${sealedTok[2]}`,
+      detail:
+        "sealed token (AES-256-GCM): the operations and source are encrypted inside it; the server opens it and serves the URL it carries, and anything visible after the token is not part of that URL",
+    };
+    if (sealedTok[1]) {
+      signature.keyId = sealedTok[1];
+    }
+    return { signature, segments: [], source: "", remainder, errors };
+  }
   if (signatureRaw === "unsafe") {
     signature = { kind: "unsafe", value: signatureRaw, detail: "unsigned; the server honors it only with CRABCROP_ALLOW_UNSAFE or in presets-only deployments" };
   } else if (keyed) {
@@ -974,6 +1007,9 @@ export function explainUrl(
     signature = { kind: "hmac", value: signatureRaw, detail: "HMAC-SHA256 of the remainder; paste the secret to verify it below" };
   } else if (/^[0-9a-f]+$/.test(signatureRaw)) {
     signature = { kind: "invalid", value: signatureRaw, detail: "lowercase hex, but not a full 64-character HMAC tag: the server will answer 403" };
+    errors.push("malformed signature segment");
+  } else if (/^(?:[A-Za-z0-9_-]{1,32}:)?s\d+\./.test(signatureRaw)) {
+    signature = { kind: "invalid", value: signatureRaw, detail: "a sealed-token shape this scheme does not open (an unknown version marker, or a malformed token body): the server answers the uniform 403 refusal, indistinguishable from a token that fails to open" };
     errors.push("malformed signature segment");
   } else {
     signature = { kind: "invalid", value: signatureRaw, detail: "not `unsafe` and not lowercase hex: the server rejects it as malformed (400)" };

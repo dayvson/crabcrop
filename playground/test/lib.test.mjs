@@ -72,6 +72,36 @@ test("expired expiries and malformed segments are flagged", () => {
   assert.ok(badSig.errors.length > 0);
 });
 
+test("a sealed token explains as sealed, not malformed (issue #388)", () => {
+  // Minted by the SDK (the playground itself does not
+  // seal), with a fixed nonce so the shape is stable.
+  const token = sdk.sealWithNonce(
+    "explain-sealed-secret",
+    "300x200/https://example.com/a.jpg",
+    new Uint8Array(12).fill(7),
+  );
+  const out = explainUrl(`https://images.example.com/${token}`);
+  assert.equal(out.signature.kind, "sealed");
+  assert.equal(out.signature.value, token);
+  assert.deepEqual(out.errors, []);
+  assert.deepEqual(out.segments, []);
+  assert.equal(out.source, "");
+
+  const keyed = sdk.sealWithNonce(
+    "explain-sealed-secret",
+    "300x200/https://example.com/a.jpg",
+    new Uint8Array(12).fill(9),
+    "k2",
+  );
+  const keyedOut = explainUrl(`https://images.example.com/${keyed}`);
+  assert.equal(keyedOut.signature.kind, "sealed");
+  assert.equal(keyedOut.signature.keyId, "k2");
+
+  const imitation = explainUrl("https://x/s2.AAAA/300x200/https://e.com/a.jpg");
+  assert.equal(imitation.signature.kind, "invalid");
+  assert.match(imitation.signature.detail, /uniform 403 refusal/);
+});
+
 test("studio filters explain, including inside a chain", () => {
   const product = explainUrl(
     `https://x/${SIG}/filters:studio(product,bg:f5f0e8,shadow:strong,pad:25)/https://e.com/a.jpg`,
