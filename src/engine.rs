@@ -1420,6 +1420,7 @@ impl Engine {
             dpr_factor(directives.dpr, &ctx),
             &ctx,
             &directives,
+            None,
         )?;
         ctx.check_deadline()?;
         // Placeholders describe the final pixels, so they are
@@ -1683,11 +1684,23 @@ impl Engine {
         // not of a frame, so every frame reports the same ones;
         // the first frame's copy is the request's.
         let mut encode_opts = EncodeOptions::default();
+        // One smart crop window per crop for the whole
+        // animation (issue #376): the first frame decides,
+        // the rest replay.
+        let mut smart_windows = SmartWindows::default();
         for frame in frames {
             ctx.check_deadline()?;
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, opts, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, opts, _, _, _, _) = apply_operations(
+                img,
+                ops,
+                cap,
+                dpr,
+                ctx,
+                &directives,
+                Some(&mut smart_windows),
+            )?;
             if out_frames.is_empty() {
                 encode_opts = opts;
             }
@@ -1855,7 +1868,8 @@ impl Engine {
             ctx.check_deadline()?;
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _, _, _, _) = apply_operations(img, ops, cap, dpr, ctx, &directives)?;
+            let (img, _, _, _, _, _) =
+                apply_operations(img, ops, cap, dpr, ctx, &directives, None)?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(crate::video::VideoFrame {
                 pixels: img.to_rgba8(),
@@ -2640,6 +2654,58 @@ fn fusion_plan(ops: &[Operation]) -> Option<FusionPlan> {
     })
 }
 
+/// Smart crop windows shared across the frames of one
+/// animated render (issue #376): the first frame's smart
+/// crop decides its window, and every later frame replays
+/// that window instead of running the focal analysis
+/// again, so the crop cannot jitter frame to frame and
+/// the analysis behind it (saliency, plus face detection
+/// when a provider feeds it) runs once per render, not
+/// once per frame. Entries key on the crop's position in
+/// the chain and the frame dimensions it decided on, so
+/// a frame of a different size decides for itself.
+/// One shared smart crop window: the chain position and
+/// frame dimensions it was decided on, and the window
+/// itself as (x, y, width, height).
+#[derive(Debug)]
+struct SmartWindow {
+    op_index: usize,
+    width: u32,
+    height: u32,
+    window: (u32, u32, u32, u32),
+}
+
+#[derive(Debug, Default)]
+struct SmartWindows {
+    entries: Vec<SmartWindow>,
+}
+
+impl SmartWindows {
+    fn get(&self, key: (usize, u32, u32)) -> Option<(u32, u32, u32, u32)> {
+        self.entries
+            .iter()
+            .find(|e| (e.op_index, e.width, e.height) == key)
+            .map(|e| e.window)
+    }
+
+    fn set(&mut self, key: (usize, u32, u32), window: (u32, u32, u32, u32)) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| (e.op_index, e.width, e.height) == key)
+        {
+            entry.window = window;
+        } else {
+            self.entries.push(SmartWindow {
+                op_index: key.0,
+                width: key.1,
+                height: key.2,
+                window,
+            });
+        }
+    }
+}
+
 fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
@@ -2647,6 +2713,7 @@ fn apply_operations(
     dpr: f32,
     ctx: &ProcessContext<'_>,
     directives: &crate::url::RequestDirectives,
+    mut smart_windows: Option<&mut SmartWindows>,
 ) -> Result<ApplyOutcome, EngineError> {
     check_operation_count(ops)?;
     let mut encode_opts = EncodeOptions::default();
@@ -3054,6 +3121,36 @@ fn apply_operations(
                         ));
                     }
                     cropped
+                } else if *align == Align::Smart && smart_windows.is_some() {
+                    // An animated render sharing windows
+                    // across frames (issue #376): the first
+                    // frame decides through the traced crop
+                    // (the trace reports the very window the
+                    // crop used) and later frames replay that
+                    // window verbatim, so the analysis runs
+                    // once and the framing cannot jitter.
+                    let windows = smart_windows
+                        .as_deref_mut()
+                        .expect("the arm guard checked the option");
+                    let key = (op_index, img.width(), img.height());
+                    if let Some((x, y, cw, ch)) = windows.get(key) {
+                        DynamicImage::ImageRgba8(
+                            image::imageops::crop_imm(&img, x, y, cw, ch).to_image(),
+                        )
+                    } else {
+                        let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                            img,
+                            tw,
+                            th,
+                            align.clone(),
+                            ctx.face_provider,
+                            ctx.focal_provider,
+                        );
+                        if let Some(trace) = trace {
+                            windows.set(key, trace.window);
+                        }
+                        cropped
+                    }
                 } else {
                     crate::crop::crop_to_aspect_with(
                         img,
@@ -6498,7 +6595,7 @@ mod tests {
     fn run_chain(img: &DynamicImage, ops: &[Operation]) -> DynamicImage {
         let directives = crate::url::RequestDirectives::analyze(ops);
         let ctx = ProcessContext::default();
-        apply_operations(img.clone(), ops, None, 1.0, &ctx, &directives)
+        apply_operations(img.clone(), ops, None, 1.0, &ctx, &directives, None)
             .unwrap()
             .0
     }
@@ -7605,13 +7702,14 @@ mod tests {
         let ops = [Operation::Filters(vec![Filter::Rotate(45.0)])];
         let directives = crate::url::RequestDirectives::analyze(&ops);
         let ctx = ProcessContext::default();
-        let err = apply_operations(img.clone(), &ops, None, 1.0, &ctx, &directives).unwrap_err();
+        let err =
+            apply_operations(img.clone(), &ops, None, 1.0, &ctx, &directives, None).unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
         // A quarter turn keeps the pixel count and passes.
         let ops = [Operation::Filters(vec![Filter::Rotate(90.0)])];
         let directives = crate::url::RequestDirectives::analyze(&ops);
         let (out, _, _, _, _, _) =
-            apply_operations(img, &ops, None, 1.0, &ctx, &directives).unwrap();
+            apply_operations(img, &ops, None, 1.0, &ctx, &directives, None).unwrap();
         assert_eq!((out.width(), out.height()), (8000, 8000));
     }
 
@@ -8297,6 +8395,86 @@ mod tests {
                 .iter()
                 .all(|f| f.buffer().width() == 20 && f.buffer().height() == 10)
         );
+    }
+
+    /// A focal provider that answers with the centroid of
+    /// the bright pixels and counts its runs: the two-frame
+    /// fixture below mirrors its bright half between
+    /// frames, so a per-frame analysis would move the
+    /// smart crop window, and the count shows whether it
+    /// ran per frame or once.
+    #[derive(Debug, Default)]
+    struct BrightCentroid {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::ai::FocalProvider for BrightCentroid {
+        fn focal_point(&self, img: &DynamicImage) -> Result<(f32, f32), crate::ai::AiError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let rgb = img.to_rgb8();
+            let (mut sx, mut n) = (0u64, 0u64);
+            for (x, _y, px) in rgb.enumerate_pixels() {
+                if px.0[0] > 200 {
+                    sx += x as u64;
+                    n += 1;
+                }
+            }
+            let cx = if n == 0 {
+                0.5
+            } else {
+                (sx as f32 / n as f32) / rgb.width() as f32
+            };
+            Ok((cx, 0.5))
+        }
+    }
+
+    /// Two 40x20 frames whose bright half mirrors: white
+    /// on the left first, then on the right.
+    fn mirrored_halves_gif() -> Vec<u8> {
+        let frame = |bright_left: bool| {
+            let img = image::RgbaImage::from_fn(40, 20, |x, _y| {
+                let bright = (x < 20) == bright_left;
+                let v = if bright { 255 } else { 0 };
+                image::Rgba([v, v, v, 255])
+            });
+            image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(100, 1))
+        };
+        let mut out = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut out)
+            .encode_frames(vec![frame(true), frame(false)])
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn animated_smart_crop_uses_one_window_for_every_frame() {
+        // Issue #376: the smart crop once decided per
+        // frame, so the window jumped as the content moved
+        // (and the focal analysis, face detection included,
+        // ran per frame). The first frame now decides and
+        // the rest replay its window: the mirrored second
+        // frame is cropped on the same (left) side, so its
+        // output is the dark half, and the provider ran
+        // once.
+        let engine = Engine;
+        let provider = BrightCentroid::default();
+        let out = engine
+            .process_preferred(
+                &mirrored_halves_gif(),
+                &[crop_op(20, 20, Align::Smart)],
+                ProcessContext {
+                    focal_provider: Some(&provider),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::Gif);
+        let frames = decoded_gif_frames(&out.bytes);
+        assert_eq!(frames.len(), 2);
+        let center = |f: &image::Frame| f.buffer().get_pixel(10, 10).0[0];
+        assert!(center(&frames[0]) > 200, "frame one keeps its bright half");
+        assert!(center(&frames[1]) < 55, "frame two replays the same window");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
