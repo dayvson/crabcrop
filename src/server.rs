@@ -2520,9 +2520,10 @@ async fn serve(
     // fallback) releases its waiters to take the miss path
     // themselves, one at a time, so a failing origin is
     // retried by the waiters rather than masked. Waits are
-    // capped: a key whose leaders keep failing sheds its
-    // remaining waiters with the busy response instead of
-    // queueing them forever.
+    // capped: a waiter whose leaders keep failing stops
+    // queueing and runs the miss path itself (issue #375),
+    // so it ends with the origin's real answer instead of
+    // a busy response masking it.
     let mut waits = 0;
     loop {
         if let Some((hit, cache_status)) = lookup_tiers(state, &cache_key, &groups).await {
@@ -2545,10 +2546,21 @@ async fn serve(
             }
             Flight::Follower(mut changed) => {
                 if waits >= MAX_FLIGHT_WAITS {
-                    return (
-                        busy_response("server busy: too many images processing at once", 1, accept),
-                        record,
-                    );
+                    // The wait cap is spent: run the miss
+                    // path, the same settlement the meta
+                    // flights use (issue #375). Shedding a
+                    // busy response here masked the origin's
+                    // real answer (its error, or a slow
+                    // success) behind a server_busy this
+                    // request never earned: the cap exists
+                    // to stop queueing behind failing leaders
+                    // forever, not to refuse a request that
+                    // has not had its own attempt.
+                    let (mut response, record, render_etag) = serve_miss(state, work, record).await;
+                    if let Some(etag) = &render_etag {
+                        finalize_validators(&mut response, etag, if_none_match);
+                    }
+                    return (response, record);
                 }
                 waits += 1;
                 // The leader always signals on drop; the
@@ -2685,7 +2697,8 @@ async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta
 
 /// How many times one request may wait on another
 /// request's in-flight miss for the same key before it
-/// sheds with a 503 (audit R2-09).
+/// stops waiting and runs the miss path itself (audit
+/// R2-09, issue #375).
 const MAX_FLIGHT_WAITS: u32 = 3;
 
 /// Whether a purge recorded after `snapshot` covers
@@ -15141,6 +15154,35 @@ mod tests {
         (format!("http://{addr}/src.png"), hits)
     }
 
+    /// Source server that counts its hits and answers
+    /// slowly with a 500, so a burst's leaders fail one
+    /// after another while their waiters are still queued.
+    async fn spawn_slow_failing_server(delay_ms: u64) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("http://{addr}/src.png"), hits)
+    }
+
     #[tokio::test]
     async fn concurrent_misses_share_one_origin_fetch() {
         // Audit R2-09: a burst of identical cache misses
@@ -15172,6 +15214,33 @@ mod tests {
             1,
             "one origin fetch for the whole burst"
         );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_end_with_the_origins_answer_not_a_busy_shed() {
+        // Issue #375: when leaders keep failing, a waiter
+        // that spent its wait cap once shed with a 503
+        // server_busy, masking the origin's real answer.
+        // The waiter now runs the miss path itself, so a
+        // burst against a slow failing origin ends the way
+        // a solo request does, for every request.
+        let (src, _hits) = spawn_slow_failing_server(300).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let solo = client().get(&url).send().await.unwrap();
+        let solo_status = solo.status();
+        assert_ne!(solo_status, StatusCode::SERVICE_UNAVAILABLE);
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                client().get(&url).send().await.unwrap().status()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), solo_status);
+        }
     }
 
     /// Fire `n` concurrent meta requests for one URL and
