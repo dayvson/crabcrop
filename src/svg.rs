@@ -371,6 +371,44 @@ fn count_expanded(nodes: &[usvg::Node]) -> usize {
         .sum()
 }
 
+/// The decoded byte size of the raster payloads embedded
+/// in a constructed usvg tree (issue #360). An `<image>`
+/// element counts as one node in the expansion accounting
+/// above, but the renderer decodes its payload at the
+/// payload's own dimensions, so those pixels are charged
+/// here at four bytes per pixel (the RGBA decode), the
+/// same accounting the stills decode budget uses. A
+/// nested SVG payload recurses: its own embedded rasters
+/// count too.
+fn embedded_raster_bytes(nodes: &[usvg::Node]) -> u64 {
+    nodes
+        .iter()
+        .map(|node| match node {
+            usvg::Node::Group(group) => embedded_raster_bytes(group.children()),
+            usvg::Node::Image(image) => match image.kind() {
+                usvg::ImageKind::SVG(tree) => embedded_raster_bytes(tree.root().children()),
+                _ => {
+                    let size = image.size();
+                    (size.width() as u64) * (size.height() as u64) * 4
+                }
+            },
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Refuse an SVG whose embedded rasters decode past the
+/// shared decode allocation budget (issue #360).
+fn check_raster_budget(decoded_bytes: u64) -> Result<(), String> {
+    if decoded_bytes > crate::engine::MAX_DECODE_ALLOC {
+        return Err(format!(
+            "SVG embedded images decode past the {} byte decode budget",
+            crate::engine::MAX_DECODE_ALLOC
+        ));
+    }
+    Ok(())
+}
+
 /// A sanitized, parsed SVG ready to rasterize.
 pub struct Prepared {
     tree: usvg::Tree,
@@ -407,6 +445,7 @@ pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
             "SVG expands past the {MAX_EXPANDED_NODES} node limit"
         ));
     }
+    check_raster_budget(embedded_raster_bytes(tree.root().children()))?;
     Ok(Prepared { tree })
 }
 
@@ -497,6 +536,77 @@ mod tests {
         // reference and the data-free fills.
         assert!(clean.contains("#local"));
         assert!(clean.contains("#0000ff"));
+    }
+
+    /// Base64-encode (standard alphabet, padded): enough
+    /// to build embedded-image fixtures in tests.
+    fn b64(data: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0] as u32,
+                *chunk.get(1).unwrap_or(&0) as u32,
+                *chunk.get(2).unwrap_or(&0) as u32,
+            ];
+            let n = (b[0] << 16) | (b[1] << 8) | b[2];
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    fn svg_with_embedded_png(w: u32, h: u32) -> String {
+        let png = image::RgbImage::from_pixel(w, h, image::Rgb([0, 128, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">\
+             <g><image href=\"data:image/png;base64,{}\" width=\"10\" height=\"10\"/></g></svg>",
+            b64(&bytes)
+        )
+    }
+
+    #[test]
+    fn embedded_rasters_are_charged_at_their_own_dimensions() {
+        // Issue #360: the <image> element is one node, but
+        // its payload decodes at the payload's dimensions
+        // (100x50 here, drawn into a 10x10 viewport), and
+        // the accounting charges the decoded RGBA bytes.
+        let svg = svg_with_embedded_png(100, 50);
+        let prepared = prepare(svg.as_bytes()).unwrap();
+        assert_eq!(
+            embedded_raster_bytes(prepared.tree.root().children()),
+            100 * 50 * 4
+        );
+        // An SVG with no embedded raster charges nothing.
+        let prepared = prepare(SIMPLE.as_bytes()).unwrap();
+        assert_eq!(embedded_raster_bytes(prepared.tree.root().children()), 0);
+    }
+
+    #[test]
+    fn raster_budget_refuses_past_the_decode_budget() {
+        // Issue #360: the accounting feeds the shared
+        // decode allocation budget; past it, prepare
+        // refuses instead of letting the renderer decode.
+        assert!(check_raster_budget(crate::engine::MAX_DECODE_ALLOC).is_ok());
+        let err = check_raster_budget(crate::engine::MAX_DECODE_ALLOC + 4).unwrap_err();
+        assert!(err.contains("decode budget"), "{err}");
     }
 
     #[test]
