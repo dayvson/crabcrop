@@ -179,8 +179,20 @@ impl VideoFrameExtractor {
 
     /// Probe the source: duration, dimensions, and frame
     /// rate of its first video stream. `NotVideo` when
-    /// the report names no usable video stream.
+    /// the report names no usable video stream. The
+    /// extraction path probes through `probe_until` (the
+    /// shared deadline); this spelling stays as the
+    /// single-probe entry the test suite exercises.
+    #[allow(dead_code)]
     pub fn probe(&self, video: &[u8]) -> Result<VideoProbe, FrameError> {
+        self.probe_until(video, Instant::now() + self.timeout)
+    }
+
+    /// The probe under a caller-supplied deadline, so a
+    /// stacked sequence (probe, then extraction attempts)
+    /// shares one budget instead of a fresh timeout per
+    /// invocation (issue #362).
+    fn probe_until(&self, video: &[u8], deadline: Instant) -> Result<VideoProbe, FrameError> {
         let run = self.run(
             &[
                 "-nostdin",
@@ -195,6 +207,7 @@ impl VideoFrameExtractor {
             ],
             video,
             0,
+            deadline,
         )?;
         parse_probe(&run.stderr).ok_or_else(|| {
             FrameError::NotVideo(
@@ -219,11 +232,16 @@ impl VideoFrameExtractor {
         video: &[u8],
         selection: FrameSelection,
     ) -> Result<ExtractedFrame, FrameError> {
-        let probe = self.probe(video)?;
+        // One deadline for the whole extraction (issue
+        // #362): the probe and every step-back attempt draw
+        // from the same budget, instead of each invocation
+        // restarting the timeout.
+        let deadline = Instant::now() + self.timeout;
+        let probe = self.probe_until(video, deadline)?;
         let mut timestamp = resolve_timestamp(selection, &probe)?;
         let step = frame_interval(probe.fps);
         for attempt in 0..=3 {
-            let png = self.extract_at(video, timestamp)?;
+            let png = self.extract_at(video, timestamp, deadline)?;
             if !png.is_empty() {
                 if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
                     return Err(FrameError::Failed(
@@ -258,7 +276,12 @@ impl VideoFrameExtractor {
     /// and there is no frame at that time (the caller
     /// decides whether to step back); any other failure
     /// is `Failed`.
-    fn extract_at(&self, video: &[u8], timestamp: f64) -> Result<Vec<u8>, FrameError> {
+    fn extract_at(
+        &self,
+        video: &[u8],
+        timestamp: f64,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, FrameError> {
         let seek = format_seconds(timestamp);
         let run = self.run(
             &[
@@ -283,6 +306,7 @@ impl VideoFrameExtractor {
             ],
             video,
             MAX_FRAME_PNG_BYTES,
+            deadline,
         )?;
         if !run.status.success() {
             return Err(FrameError::Failed(format!(
@@ -306,6 +330,7 @@ impl VideoFrameExtractor {
         args: &[&str],
         stdin_bytes: &[u8],
         max_stdout: usize,
+        deadline: Instant,
     ) -> Result<ToolRun, FrameError> {
         let mut cmd = Command::new(&self.program);
         cmd.args(args)
@@ -326,6 +351,11 @@ impl VideoFrameExtractor {
             ))
         })?;
         let pid = child.id();
+        crate::toolrun::limit_child(
+            pid,
+            self.timeout + crate::toolrun::TOOL_CPU_GRACE,
+            crate::toolrun::TOOL_MAX_ADDRESS_SPACE,
+        );
 
         let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
         let input = stdin_bytes.to_vec();
@@ -374,7 +404,6 @@ impl VideoFrameExtractor {
             let _ = err_tx.send(String::from_utf8_lossy(&kept).into_owned());
         });
 
-        let deadline = Instant::now() + self.timeout;
         // Wait for the exit status without ever blocking
         // past the deadline: a tool that closed its stdout
         // and then hung still gets killed on time.
@@ -1010,6 +1039,33 @@ exit 1\n",
             .unwrap_err();
         assert!(matches!(err, FrameError::Failed(_)), "{err}");
         assert!(err.to_string().contains("produced no frame"), "{err}");
+    }
+
+    #[test]
+    fn stacked_invocations_share_one_deadline() {
+        // Issue #362: the probe and the extraction draw
+        // from one budget. Each invocation of this stand-in
+        // sleeps 0.6s and then answers correctly; with a 1s
+        // budget the probe succeeds and the extraction is
+        // cut off by the shared deadline, where a fresh
+        // timeout per invocation would have let both run
+        // (1.2s in total) and succeed.
+        let program = fake_tool(
+            "slow",
+            "#!/bin/sh\ncat > /dev/null\nsleep 0.6\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\nexit 1\n",
+        );
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let err = extractor
+            .extract_frame(b"video bytes", FrameSelection::Poster)
+            .unwrap_err();
+        assert!(matches!(err, FrameError::Failed(_)), "{err}");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -370,6 +370,11 @@ impl VideoEncoder {
                 self.program.display()
             ))
         })?;
+        crate::toolrun::limit_child(
+            child.id(),
+            self.timeout + crate::toolrun::TOOL_CPU_GRACE,
+            crate::toolrun::TOOL_MAX_ADDRESS_SPACE,
+        );
         let mut stdin = child.stdin.take().expect("stdin is piped");
         let mut stdout = child.stdout.take().expect("stdout is piped");
         let mut stderr = child.stderr.take().expect("stderr is piped");

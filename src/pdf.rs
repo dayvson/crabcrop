@@ -211,8 +211,21 @@ impl PdfRenderer {
     /// document the probe cannot read is `NotPdf`, except
     /// one that needs a password, which is its own
     /// `Unsupported` class.
+    /// The single-probe entry: the render path probes
+    /// through `probe_until` (the shared deadline); this
+    /// spelling stays as the entry the test suite
+    /// exercises.
+    #[allow(dead_code)]
     pub fn probe(&self, pdf: &[u8], page: u32) -> Result<PdfProbe, PdfError> {
-        let run = self.run_probe(pdf, Some(page))?;
+        self.probe_until(pdf, page, Instant::now() + self.timeout)
+    }
+
+    /// The probe under a caller-supplied deadline, so a
+    /// stacked sequence (probe, a confirming second probe,
+    /// the render) shares one budget instead of a fresh
+    /// timeout per invocation (issue #362).
+    fn probe_until(&self, pdf: &[u8], page: u32, deadline: Instant) -> Result<PdfProbe, PdfError> {
+        let run = self.run_probe(pdf, Some(page), deadline)?;
         if run.status.success() {
             let report = String::from_utf8_lossy(&run.stdout);
             return parse_probe(&report, page).ok_or_else(not_pdf);
@@ -228,7 +241,7 @@ impl PdfRenderer {
             // answer with the range refusal and its real
             // count; a document the second probe cannot
             // read either is simply not usable.
-            let whole = self.run_probe(pdf, None)?;
+            let whole = self.run_probe(pdf, None, deadline)?;
             if whole.status.success() {
                 let report = String::from_utf8_lossy(&whole.stdout);
                 if let Some(probe) = parse_probe(&report, page) {
@@ -252,7 +265,12 @@ impl PdfRenderer {
     /// One probe run: ranged to the selected page (the
     /// form that reports that page's own size), or over
     /// the whole document when `page` is `None`.
-    fn run_probe(&self, pdf: &[u8], page: Option<u32>) -> Result<ToolRun, PdfError> {
+    fn run_probe(
+        &self,
+        pdf: &[u8],
+        page: Option<u32>,
+        deadline: Instant,
+    ) -> Result<ToolRun, PdfError> {
         match page {
             Some(page) => {
                 let page_arg = page.to_string();
@@ -262,9 +280,17 @@ impl PdfRenderer {
                     &["-f", &page_arg, "-l", &page_arg, "-"],
                     pdf,
                     PROBE_REPORT_CAP,
+                    deadline,
                 )
             }
-            None => self.run(&self.probe_program, "probe", &["-"], pdf, PROBE_REPORT_CAP),
+            None => self.run(
+                &self.probe_program,
+                "probe",
+                &["-"],
+                pdf,
+                PROBE_REPORT_CAP,
+                deadline,
+            ),
         }
     }
 
@@ -274,7 +300,10 @@ impl PdfRenderer {
     /// runs, and the render scale is computed from the
     /// probed page size.
     pub fn render_page(&self, pdf: &[u8], page: u32) -> Result<RenderedPage, PdfError> {
-        let probe = self.probe(pdf, page)?;
+        // One deadline for the probe and the render
+        // together (issue #362).
+        let deadline = Instant::now() + self.timeout;
+        let probe = self.probe_until(pdf, page, deadline)?;
         if probe.pages > MAX_PDF_PAGES {
             return Err(PdfError::NotPdf(format!(
                 "the document has {} pages, over the {MAX_PDF_PAGES} page cap",
@@ -312,6 +341,7 @@ impl PdfRenderer {
             ],
             pdf,
             MAX_PAGE_PNG_BYTES,
+            deadline,
         )?;
         if !run.status.success() {
             if run.stderr.contains("Incorrect password") {
@@ -364,6 +394,7 @@ impl PdfRenderer {
         args: &[&str],
         stdin_bytes: &[u8],
         max_stdout: usize,
+        deadline: Instant,
     ) -> Result<ToolRun, PdfError> {
         let mut cmd = Command::new(program);
         cmd.args(args)
@@ -384,6 +415,11 @@ impl PdfRenderer {
             ))
         })?;
         let pid = child.id();
+        crate::toolrun::limit_child(
+            pid,
+            self.timeout + crate::toolrun::TOOL_CPU_GRACE,
+            crate::toolrun::TOOL_MAX_ADDRESS_SPACE,
+        );
 
         let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
         let input = stdin_bytes.to_vec();
@@ -432,7 +468,6 @@ impl PdfRenderer {
             let _ = err_tx.send(String::from_utf8_lossy(&kept).into_owned());
         });
 
-        let deadline = Instant::now() + self.timeout;
         let timeout = self.timeout;
         // Wait for the exit status without ever blocking
         // past the deadline: a tool that closed its stdout
@@ -1061,7 +1096,14 @@ exit 0\n";
         );
         let renderer = PdfRenderer::new(program.clone(), Duration::from_secs(10)).unwrap();
         let err = renderer
-            .run(&program, "renderer", &[], b"input", 1024)
+            .run(
+                &program,
+                "renderer",
+                &[],
+                b"input",
+                1024,
+                Instant::now() + Duration::from_secs(10),
+            )
             .unwrap_err();
         assert!(matches!(err, PdfError::Failed(_)), "{err}");
         assert!(err.to_string().contains("byte cap"), "{err}");

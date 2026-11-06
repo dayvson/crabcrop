@@ -312,6 +312,7 @@ mod svg;
 mod text;
 mod thumbhash;
 mod tokenizer;
+mod toolrun;
 mod upload;
 mod url;
 mod video;
