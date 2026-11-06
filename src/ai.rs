@@ -893,6 +893,24 @@ pub fn segment_box_coords(img_w: u32, img_h: u32, bbox: (u32, u32, u32, u32)) ->
     ]
 }
 
+/// Charge one decoder mask's plane against the shared
+/// output pixel budget before anything copies it
+/// (issue #359). The decoder returns masks at the
+/// source's own resolution by contract, and the decode
+/// budgets keep every real source under this cap, so the
+/// check binds only a model whose claimed shape exceeds
+/// anything the pipeline could have fed it: that is a
+/// bad output, not a mask to materialize.
+fn check_mask_plane(mw: u32, mh: u32) -> Result<(), AiError> {
+    if mw as u64 * mh as u64 > crate::engine::MAX_OUTPUT_PIXELS {
+        return Err(AiError::BadOutput(format!(
+            "mask shape {mw}x{mh} exceeds the {} pixel budget",
+            crate::engine::MAX_OUTPUT_PIXELS
+        )));
+    }
+    Ok(())
+}
+
 /// One decoder mask channel (logits) as soft strengths:
 /// the logistic function scaled to 0..255.
 fn sigmoid_strengths(logits: &[f32]) -> Vec<u8> {
@@ -1232,6 +1250,7 @@ impl SegmentProvider for OnnxSegmentProvider {
                 mask_data.len()
             )));
         }
+        check_mask_plane(mw, mh)?;
         let channel = &mask_data[best * plane..end];
         let full = GrayImage::from_raw(mw, mh, sigmoid_strengths(channel)).ok_or_else(|| {
             AiError::BadOutput("the mask channel does not fit its shape".to_string())
@@ -2703,16 +2722,37 @@ fn normalize(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / norm).collect()
 }
 
+/// The longest side the 224-crop preprocessors
+/// (CLIP, ViT) may resize to (issue #359). Scaling the
+/// short side to 224 leaves the long side unbounded, so
+/// an extreme aspect input (16384x1) produced an
+/// intermediate of hundreds of millions of pixels on the
+/// way to a 224x224 crop. The cap bounds the intermediate
+/// at 4096x224 (under a million pixels); aspects beyond
+/// about 18:1 clamp the long side, the OCR recognition
+/// clamp's shape, and only the center crop is consumed
+/// either way.
+const PREPROCESS_MAX_SIDE: u32 = 4096;
+
+/// The resize dimensions for the 224-crop preprocessors:
+/// the short side scales to 224, the long side follows
+/// the aspect and clamps at [`PREPROCESS_MAX_SIDE`].
+fn crop224_resize_dims(w: u32, h: u32) -> (u32, u32) {
+    let (w, h) = (w.max(1), h.max(1));
+    let scale = 224.0 / w.min(h) as f32;
+    let nw = ((w as f32 * scale).round() as u32).clamp(224, PREPROCESS_MAX_SIDE);
+    let nh = ((h as f32 * scale).round() as u32).clamp(224, PREPROCESS_MAX_SIDE);
+    (nw, nh)
+}
+
 /// CLIP image preprocessing, matching the export's
 /// declared pipeline: resize the short side to 224
 /// (bicubic), center crop 224x224, normalize with the
 /// CLIP mean/std. Output is planar CHW.
 #[allow(clippy::excessive_precision)] // the model's published constants
 fn preprocess_clip(img: &DynamicImage) -> Vec<f32> {
-    let (w, h) = (img.width().max(1), img.height().max(1));
-    let scale = 224.0 / w.min(h) as f32;
-    let nw = ((w as f32 * scale).round() as u32).max(224);
-    let nh = ((h as f32 * scale).round() as u32).max(224);
+    let (w, h) = (img.width(), img.height());
+    let (nw, nh) = crop224_resize_dims(w, h);
     let resized = img.resize_exact(nw, nh, FilterType::CatmullRom);
     let cropped = resized
         .crop_imm((nw - 224) / 2, (nh - 224) / 2, 224, 224)
@@ -2732,6 +2772,45 @@ fn preprocess_clip(img: &DynamicImage) -> Vec<f32> {
 #[cfg(test)]
 mod clip_tests {
     use super::*;
+
+    #[test]
+    fn crop224_resize_dims_clamps_the_long_side() {
+        // Issue #359: the short side scales to 224 and the
+        // long side clamps at the cap, so an extreme aspect
+        // no longer produces an unbounded intermediate.
+        assert_eq!(crop224_resize_dims(16384, 1), (4096, 224));
+        assert_eq!(crop224_resize_dims(1, 16384), (224, 4096));
+        // Ordinary aspects are untouched.
+        assert_eq!(crop224_resize_dims(100, 50), (448, 224));
+        assert_eq!(crop224_resize_dims(50, 100), (224, 448));
+        assert_eq!(crop224_resize_dims(224, 224), (224, 224));
+    }
+
+    #[test]
+    fn preprocess_clip_survives_an_extreme_aspect() {
+        // The eval case: a 16384x1 source previously drove
+        // a 2.47 GB intermediate allocation and aborted.
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            16384,
+            1,
+            image::Rgb([255, 0, 0]),
+        ));
+        let input = preprocess_clip(&img);
+        assert_eq!(input.len(), 3 * 224 * 224);
+        assert!(input.iter().all(|v| v.is_finite()));
+        let input = preprocess_vit(&img);
+        assert_eq!(input.len(), 3 * 224 * 224);
+    }
+
+    #[test]
+    fn mask_planes_are_charged_against_the_pixel_budget() {
+        // Issue #359: a source-sized mask plane passes; a
+        // claimed shape past the shared output budget is a
+        // bad output before any copy materializes it.
+        assert!(check_mask_plane(8000, 8000).is_ok());
+        let err = check_mask_plane(20000, 20000).unwrap_err();
+        assert!(matches!(err, AiError::BadOutput(_)), "{err}");
+    }
 
     #[test]
     #[allow(clippy::excessive_precision)] // the model's published constants
@@ -4108,10 +4187,8 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 /// are the ones this model family declares.
 #[allow(clippy::excessive_precision)] // the model's published constants
 fn preprocess_vit(img: &DynamicImage) -> Vec<f32> {
-    let (w, h) = (img.width().max(1), img.height().max(1));
-    let scale = 224.0 / w.min(h) as f32;
-    let nw = ((w as f32 * scale).round() as u32).max(224);
-    let nh = ((h as f32 * scale).round() as u32).max(224);
+    let (w, h) = (img.width(), img.height());
+    let (nw, nh) = crop224_resize_dims(w, h);
     let resized = img.resize_exact(nw, nh, FilterType::CatmullRom);
     let cropped = resized
         .crop_imm((nw - 224) / 2, (nh - 224) / 2, 224, 224)
