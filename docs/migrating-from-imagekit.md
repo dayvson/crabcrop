@@ -65,7 +65,7 @@ ImageKit splits the cropping decision across two parameters: `c` chooses the siz
 | `f-orig` | Pin `filters:format(<the source format>)` | Approximate: dropping `f` does not keep the source format here, because negotiation then chooses. Name the format |
 | `q-80` | `filters:quality(80)` | Direct: the values copy, and the defaults agree (80 on both), the first guide in this series where they do |
 | `lo-true` (lossless WebP and PNG) | `filters:quality(100)` for WebP | Approximate: 100 selects crabcrop's lossless WebP encode; PNG is lossless at any setting |
-| `pr-true` (progressive JPEG) | `filters:format(jpeg)` | Approximate: progressive encoding is not a separate switch |
+| `pr-true` (progressive JPEG) | `filters:format(jpeg,progressive)` | Progressive encoding is a format option |
 | `md-true` (preserve all metadata, per URL) | Server configuration, not a URL option | Approximate: the operator policy `CRABCROP_METADATA=preserve` keeps EXIF, XMP, and IPTC on JPEG outputs and EXIF and XMP on PNG outputs, for every response. `md-false` and the default need nothing: stripping is crabcrop's default |
 | `cp-true` (embed the color profile) | `filters:keep_profile` | Approximate: the profile is kept and embedded in JPEG and PNG outputs. ImageKit also converts a non-sRGB source to sRGB with a standard profile embedded; `keep_profile` leaves the pixels unconverted |
 | `orig-true` (deliver the file as-is, ignoring other parameters) | A bare signed source URL | Direct in effect |

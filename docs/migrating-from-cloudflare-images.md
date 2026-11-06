@@ -54,7 +54,7 @@ Three operational differences matter. First, scope: Cloudflare signing is opt-in
 | `format=auto` | Nothing | Direct: negotiation is built in. Two behaviors widen: crabcrop also negotiates JPEG XL, and it honors a client's `q=0` refusal, where Cloudflare's `auto` picks between AVIF, WebP, and JPEG by browser support alone |
 | `format=avif`, `format=webp` | `filters:format(...)` | Direct, with one behavioral note: Cloudflare falls back to WebP or JPEG when an image is too large to encode to AVIF quickly; crabcrop encodes what was asked |
 | `format=jpeg` | `filters:format(jpeg)` | Approximate: Cloudflare's `jpeg` is progressive encoding |
-| `format=baseline-jpeg` | `filters:format(jpeg)` | Approximate: the progressive versus baseline distinction does not exist in crabcrop |
+| `format=baseline-jpeg` | `filters:format(jpeg)` | Baseline is the standing behavior, and the distinction does exist: progressive output is the separate option `filters:format(jpeg,progressive)` |
 | `format=json` | Fetch the image URL with `Accept: application/json`, or `crabcrop meta` | Direct |
 | `quality=80` | `filters:quality(80)` | Direct: the values copy. The defaults do not (Cloudflare 85, crabcrop 80) |
 | `quality=high`, `medium-high`, `medium-low`, `low` (perceptual levels) | `filters:quality(auto)`, or pick a number | Approximate: the names do not convert to numbers (Cloudflare publishes no equivalents). `quality(auto)` is the nearest behavior: a per-image choice made by content analysis |

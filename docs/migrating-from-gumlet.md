@@ -71,8 +71,8 @@ Gumlet splits the sizing decision across three parameters: `mode` chooses the st
 | `lossless=true` | `filters:quality(100)` for WebP | Approximate: 100 selects crabcrop's lossless WebP encode; PNG is lossless at any setting |
 | `compress=true` (extra lossy optimization of JPEG and PNG output) | No equivalent | Unsupported as a switch: there is no second recompression pass. Set `quality(...)` explicitly if templates relied on the size drop |
 | `metadata=true` (keep all metadata) | Server configuration, not a URL option | Approximate: the operator policy `CRABCROP_METADATA=preserve` keeps EXIF, XMP, and IPTC on JPEG outputs and EXIF and XMP on PNG outputs, for every response. `metadata=false` and the default need nothing: stripping is crabcrop's default |
-| `progressive=false` | `filters:format(jpeg)` | Approximate: progressive encoding is not a separate switch |
-| `subsample=true` (`chromasub`, force 4:2:0) | No equivalent | Unsupported: chroma subsampling is not exposed |
+| `progressive=false` | `filters:format(jpeg)` | Baseline is the standing behavior; `progressive=true` is the separate option `filters:format(jpeg,progressive)` |
+| `subsample=true` (`chromasub`, force 4:2:0) | `filters:format(jpeg,subsampling:420)` | Direct for JPEG output: subsampling is a JPEG/WebP format option (444, 422, or 420; 420 is the standing behavior). The AVIF encoder exposes no subsampling control, so AVIF output cannot be forced |
 | `pngcomp=9` | No equivalent | Unsupported: PNG compression level is not a knob |
 | `page=<n>` on PDF sources | No equivalent | Unsupported: crabcrop does not take PDF sources. On animated GIF and WebP sources, page selection has no equivalent either; animations keep their frames |
 | `dl=<filename>` (force download) | No equivalent | Unsupported: a `Content-Disposition` concern for your app or CDN layer |

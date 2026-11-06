@@ -54,7 +54,7 @@ Two operational differences matter. First, imgix signing is opt-in per Source (W
 | imgix | crabcrop | Mapping |
 | --- | --- | --- |
 | `fm=jpg`, `png`, `webp`, `avif`, `jxl`, `gif` | `filters:format(...)` | Direct; or drop `fm` and let negotiation choose |
-| `fm=pjpg` | `filters:format(jpeg)` | Approximate: progressive encoding is not a separate switch |
+| `fm=pjpg` | `filters:format(jpeg,progressive)` | Progressive encoding is a format option |
 | `fm=png8`, `png32`, `jp2`, `jxr` | No equivalent | Unsupported |
 | `q=80` | `filters:quality(80)` | Direct: the values copy. The defaults do not (imgix 75, crabcrop 80), and imgix `q=0` has no crabcrop spelling (1 is the floor) |
 | `lossless=true` | `filters:quality(100)` for WebP | Approximate: 100 selects crabcrop's lossless WebP encode; PNG is lossless at any setting |

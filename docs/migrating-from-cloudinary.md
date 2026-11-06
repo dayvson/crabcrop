@@ -27,7 +27,7 @@ Cloudinary is a hosted media service: assets are uploaded to it, and delivery UR
 | `c_limit` / `c_imagga_*` | `fit-in:` / `crop:` plus `filters:no_upscale` | The never-upscale half is a filter here |
 | `w_300` alone | `300x0` | Proportional in both |
 | `x_`, `y_` with `c_crop` (custom rectangle) | `crop-rect:<l>x<t>:<r>x<b>` | Cloudinary takes a corner and a size; crabcrop takes two corners |
-| `dpr_2.0` | Send `DPR: 2` or `Sec-CH-DPR: 2` | Device pixel ratio is a request signal, not a URL option |
+| `dpr_2.0` | `filters:dpr(2)`, or send `DPR: 2` or `Sec-CH-DPR: 2` | Approximate: the URL form takes exactly 1, 1.5, 2, and 3, so fractional Cloudinary values between the stops do not convert |
 | `r_20` / `r_max` | `filters:radius(20)` / `filters:mask(circle)` | Rounded corners; `r_max`'s circular crop is the circle mask |
 | `bo_4px_solid_rgb:000000` | `filters:border(4,000000)` | Border width and color |
 
