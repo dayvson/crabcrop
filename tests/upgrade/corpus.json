@@ -155,9 +155,9 @@
    "path": "/eef49b1a662a3f7876124102cd6beabdd8919449ca977c886bccc2a0388c6df1/400x0/filters:blur(1.5):saturation(1.4):sharpen(1.2):format(webp)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/webp",
-   "bytes": 13412,
-   "sha256": "8a5847f931db1aca6f0bc27cb0243f6a9cedc023721646407058f511c441c033",
-   "note": ""
+   "bytes": 13290,
+   "sha256": "c704ec900b93a1ab3e828c25cf090281acd9a60d288f5d184858364842d09a6b",
+   "note": "Re-baselined 2026-11-06 against the current build: the sharpen convolution changed deliberately (issue #378), its 3x3 taps now replicate the edge pixels instead of leaving a black border, so renders involving sharpen differ from the baseline bytes."
   },
   {
    "id": "blur",
@@ -175,9 +175,9 @@
    "path": "/458e404be9765a2835a5aba8e189700751c1a24ca595eafb4b18ea7c6063c542/300x0/filters:sharpen(1.5):format(png)/http://127.0.0.1:8991/gradient.png",
    "status": 200,
    "content_type": "image/png",
-   "bytes": 2587,
-   "sha256": "3b5f1682069d15fd2bff114456791ff537d5d2d07836882a5a0f3824a5a7635c",
-   "note": ""
+   "bytes": 2417,
+   "sha256": "41e5f8fdece7a1be01442c77cea0168a6b15cd3012b990e6980a7b7c5fa2be38",
+   "note": "Re-baselined 2026-11-06 against the current build: the sharpen convolution changed deliberately (issue #378), its 3x3 taps now replicate the edge pixels instead of leaving a black border, so renders involving sharpen differ from the baseline bytes."
   },
   {
    "id": "adjust-bright-contrast-saturation",

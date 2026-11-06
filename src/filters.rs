@@ -1107,16 +1107,22 @@ pub(crate) fn brighten_fast(img: DynamicImage, value: i32) -> DynamicImage {
 
 /// 3x3 convolution of an RGB image with the exact arithmetic
 /// of the image crate's `filter3x3` (same tap order, same
-/// inverse-sum scaling, same clamp and truncation, and the
-/// same zeroed border: the crate only writes interior pixels
-/// into a fresh buffer), but over raw row slices instead of
-/// per-pixel trait calls. Zero-weight taps are skipped: every
+/// inverse-sum scaling, same clamp and truncation), but over
+/// raw row slices instead of per-pixel trait calls, and with
+/// one deliberate divergence: the crate writes only interior
+/// pixels and leaves a zeroed border, so sharpening framed
+/// every output in black and turned an image under 3px on
+/// an axis entirely black (issue #378). Here the border
+/// pixels are computed with their taps clamped to the
+/// nearest edge pixel (edge replication, the same rule the
+/// `convolve` filter documents), and small images are
+/// computed whole. Zero-weight taps are skipped: every
 /// input channel is a non-negative f32, so a zero tap only
 /// ever added +0.0, which cannot change the running sum.
 fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let mut out = image::RgbImage::new(w as u32, h as u32);
-    if w < 2 || h < 2 {
+    if w == 0 || h == 0 {
         return out;
     }
     let src = img.as_raw();
@@ -1132,23 +1138,48 @@ fn filter3x3_rgb(img: &image::RgbImage, kernel: &[f32; 9]) -> image::RgbImage {
         .filter(|(_, k)| **k != 0.0)
         .map(|(ki, k)| (ki / 3, (ki % 3) * 3, *k))
         .collect();
-    for y in 1..h - 1 {
-        let rows = [
-            &src[(y - 1) * stride..y * stride],
-            &src[y * stride..(y + 1) * stride],
-            &src[(y + 1) * stride..(y + 2) * stride],
-        ];
-        for x in 1..w - 1 {
-            let xb = x * 3;
+    if w >= 3 && h >= 3 {
+        for y in 1..h - 1 {
+            let rows = [
+                &src[(y - 1) * stride..y * stride],
+                &src[y * stride..(y + 1) * stride],
+                &src[(y + 1) * stride..(y + 2) * stride],
+            ];
+            for x in 1..w - 1 {
+                let xb = x * 3;
+                let mut t = [0f32; 3];
+                for &(rd, coff, k) in &taps {
+                    let b = xb + coff - 3;
+                    let row = rows[rd];
+                    t[0] += row[b] as f32 * k;
+                    t[1] += row[b + 1] as f32 * k;
+                    t[2] += row[b + 2] as f32 * k;
+                }
+                let base = y * stride + xb;
+                for c in 0..3 {
+                    dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    // The border ring, and every pixel of an image under
+    // 3px on either axis: the same sum, with each tap's
+    // coordinates clamped into the frame.
+    for y in 0..h {
+        for x in 0..w {
+            if w >= 3 && h >= 3 && (1..w - 1).contains(&x) && (1..h - 1).contains(&y) {
+                continue;
+            }
             let mut t = [0f32; 3];
             for &(rd, coff, k) in &taps {
-                let b = xb + coff - 3;
-                let row = rows[rd];
-                t[0] += row[b] as f32 * k;
-                t[1] += row[b + 1] as f32 * k;
-                t[2] += row[b + 2] as f32 * k;
+                let sy = (y + rd).saturating_sub(1).min(h - 1);
+                let sx = (x + coff / 3).saturating_sub(1).min(w - 1);
+                let b = sy * stride + sx * 3;
+                t[0] += src[b] as f32 * k;
+                t[1] += src[b + 1] as f32 * k;
+                t[2] += src[b + 2] as f32 * k;
             }
-            let base = y * stride + xb;
+            let base = y * stride + x * 3;
             for c in 0..3 {
                 dst[base + c] = (t[c] * inverse_sum).clamp(0.0, 255.0) as u8;
             }
@@ -4168,7 +4199,42 @@ pub(crate) mod identity_proofs {
     }
 
     #[test]
-    fn filter3x3_rgb_matches_image_crate() {
+    fn filter3x3_rgb_matches_image_crate_in_the_interior_and_replicates_edges() {
+        // Interior pixels match the image crate byte for
+        // byte; the border is the deliberate divergence of
+        // issue #378 (the crate zeroes it), checked here
+        // against a clamped-tap reference computed pixel
+        // by pixel, for every size including the under-3px
+        // ones the crate turns entirely black.
+        let reference = |img: &image::RgbImage, kernel: &[f32; 9]| {
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            let sum: f32 = kernel.iter().sum();
+            let inverse_sum = if sum == 0.0 { 1.0 } else { 1.0 / sum };
+            let mut out = image::RgbImage::new(w as u32, h as u32);
+            for y in 0..h {
+                for x in 0..w {
+                    let mut t = [0f32; 3];
+                    for (ki, k) in kernel.iter().enumerate().filter(|(_, k)| **k != 0.0) {
+                        let sx = (x + (ki % 3) as i32 - 1).clamp(0, w - 1);
+                        let sy = (y + (ki / 3) as i32 - 1).clamp(0, h - 1);
+                        let px = img.get_pixel(sx as u32, sy as u32);
+                        for (c, tc) in t.iter_mut().enumerate() {
+                            *tc += px.0[c] as f32 * k;
+                        }
+                    }
+                    out.put_pixel(
+                        x as u32,
+                        y as u32,
+                        image::Rgb([
+                            (t[0] * inverse_sum).clamp(0.0, 255.0) as u8,
+                            (t[1] * inverse_sum).clamp(0.0, 255.0) as u8,
+                            (t[2] * inverse_sum).clamp(0.0, 255.0) as u8,
+                        ]),
+                    );
+                }
+            }
+            out
+        };
         let a = 1.5f32;
         let kernel: [f32; 9] = [0.0, -a, 0.0, -a, 1.0 + 4.0 * a, -a, 0.0, -a, 0.0];
         let blur_kernel: [f32; 9] = [1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0];
@@ -4176,9 +4242,32 @@ pub(crate) mod identity_proofs {
             let img = rand_rgb(w, h, 42 + w as u64);
             for k in [kernel, blur_kernel] {
                 let mine = filter3x3_rgb(&img, &k);
-                let theirs = image::imageops::filter3x3(&img, &k);
-                assert_eq!(mine.as_raw(), theirs.as_raw(), "size {w}x{h}");
+                assert_eq!(
+                    mine.as_raw(),
+                    reference(&img, &k).as_raw(),
+                    "replicated edges at {w}x{h}"
+                );
+                if w >= 3 && h >= 3 {
+                    let theirs = image::imageops::filter3x3(&img, &k);
+                    for y in 1..h - 1 {
+                        for x in 1..w - 1 {
+                            assert_eq!(
+                                mine.get_pixel(x, y),
+                                theirs.get_pixel(x, y),
+                                "interior pixel {x},{y} at {w}x{h}"
+                            );
+                        }
+                    }
+                }
             }
+        }
+        // The all-black cases of the issue: a solid image
+        // under 3px on an axis sharpens to itself, since
+        // every tap reads the same replicated pixel.
+        for (w, h) in [(1, 1), (2, 2), (1, 7), (7, 1)] {
+            let img = image::RgbImage::from_pixel(w, h, image::Rgb([120, 30, 200]));
+            let out = filter3x3_rgb(&img, &kernel);
+            assert_eq!(out.as_raw(), img.as_raw(), "solid {w}x{h} is unchanged");
         }
     }
 
