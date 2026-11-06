@@ -845,8 +845,10 @@ fn suffix_matches(host: &str, suffix: &str) -> bool {
 /// remaining special-purpose ranges (shared/CGNAT, reserved,
 /// multicast, broadcast, documentation, benchmarking, and the
 /// protocol-assignment blocks). IPv6 forms that embed an IPv4
-/// address (mapped, compatible, 6to4) are judged by the IPv4
-/// rules on the embedded address.
+/// address (mapped, compatible, 6to4, NAT64, Teredo) are judged
+/// by the IPv4 rules on the embedded address; the IPv6-native
+/// special-purpose ranges (local-use NAT64, site-local,
+/// benchmarking, discard-only) are blocked outright.
 fn is_non_public(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_non_public_v4(ip),
@@ -876,10 +878,37 @@ fn is_non_public_v6(ip: &Ipv6Addr) -> bool {
     if let Some(ipv4) = ip.to_ipv4() {
         return is_non_public_v4(&ipv4);
     }
+    let segments = ip.segments();
+    // The remaining IPv4 embeddings (issue #364) are judged
+    // by the IPv4 rules on the embedded address, the 6to4
+    // pattern below: NAT64 (64:ff9b::/96) embeds its target
+    // in the last two segments, and a Teredo address
+    // (2001::/32) embeds its server in the third and fourth.
+    if segments[0] == 0x0064 && segments[1] == 0xFF9B && segments[2] == 0 && segments[3] == 0 {
+        let embedded = Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        );
+        if is_non_public_v4(&embedded) {
+            return true;
+        }
+    }
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        let server = Ipv4Addr::new(
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+            (segments[3] >> 8) as u8,
+            segments[3] as u8,
+        );
+        if is_non_public_v4(&server) {
+            return true;
+        }
+    }
     // 6to4 (2002::/16) embeds the relay IPv4 address in the
     // second and third segments; a non-public relay makes the
     // address non-public.
-    let segments = ip.segments();
     if segments[0] == 0x2002 {
         let relay = Ipv4Addr::new(
             (segments[1] >> 8) as u8,
@@ -897,6 +926,10 @@ fn is_non_public_v6(ip: &Ipv6Addr) -> bool {
         || ip.is_unspecified()
         || ip.is_multicast()
         || (segments[0] == 0x2001 && segments[1] == 0x0DB8) // 2001:db8::/32, documentation
+        || (segments[0] == 0x0064 && segments[1] == 0xFF9B && segments[2] == 0x0001) // 64:ff9b:1::/48, local-use NAT64
+        || (segments[0] & 0xFFC0) == 0xFEC0 // fec0::/10, site-local
+        || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0) // 2001:2::/48, benchmarking
+        || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64, discard-only
 }
 
 /// Split the `bucket/key` remainder of a bucket URL. Both parts
@@ -1564,6 +1597,22 @@ mod tests {
             "2002:a00:1::",    // 6to4, relay 10.0.0.1
             "2002:6440:1::",   // 6to4, relay 100.64.0.1
             "2002:c000:201::", // 6to4, relay 192.0.2.1
+            // The remaining embeddings and IPv6-native
+            // special-purpose ranges (issue #364).
+            "64:ff9b::7f00:1",    // NAT64, embeds 127.0.0.1
+            "64:ff9b::a9fe:101",  // NAT64, embeds 169.254.1.1
+            "64:ff9b::a00:1",     // NAT64, embeds 10.0.0.1
+            "64:ff9b:1::1",       // local-use NAT64, 64:ff9b:1::/48
+            "64:ff9b:1::808:808", // local-use NAT64, public tail or not
+            "2001:0:7f00:1::",    // Teredo, server 127.0.0.1
+            "2001:0:a00:1::",     // Teredo, server 10.0.0.1
+            "2001:0:c633:6401::", // Teredo, server 198.51.100.1 (documentation)
+            "fec0::1",            // site-local, bottom of fec0::/10
+            "feff:ffff::1",       // site-local, top of fec0::/10
+            "2001:2::1",          // benchmarking, 2001:2::/48
+            "2001:2:0:ffff::1",   // benchmarking, top of 2001:2::/48
+            "100::1",             // discard-only, 100::/64
+            "100::ffff:1",        // discard-only, top of 100::/64
         ] {
             assert!(is_non_public(&s.parse().unwrap()), "{s}");
         }
@@ -1586,6 +1635,17 @@ mod tests {
             "::ffff:8.8.8.8", // mapped public
             "::8.8.8.8",      // compatible public
             "2002:808:808::", // 6to4, relay 8.8.8.8
+            // Embedding controls (issue #364): a public
+            // embedded address is judged public, exactly
+            // like the forms above, and addresses just
+            // outside the blocked IPv6-native ranges stay
+            // allowed.
+            "64:ff9b::808:808", // NAT64, embeds 8.8.8.8
+            "2001:0:808:808::", // Teredo, server 8.8.8.8
+            "64:ff9b:2::1",     // just outside both NAT64 ranges
+            "2001:3::1",        // just above 2001:2::/48
+            "100:0:0:1::1",     // just above 100::/64
+            "fbff::1",          // just below fec0::/10
         ] {
             assert!(!is_non_public(&s.parse().unwrap()), "{s}");
         }
