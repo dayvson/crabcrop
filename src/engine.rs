@@ -1118,6 +1118,22 @@ impl Engine {
         } else {
             detect_format(bytes)
         };
+        // keep_profile is convert-or-tag (issue #374): the
+        // kept profile is embedded at encode time, which
+        // only JPEG and PNG outputs carry in this pipeline.
+        // When the request resolves to any other output
+        // format, keeping the profile would leave the
+        // pixels in the source space with nothing labeling
+        // them (viewers assume sRGB and show wrong colors),
+        // so the conversion to sRGB runs as if the
+        // directive were absent, exactly as the filter
+        // docs state.
+        let resolved_output = directives
+            .explicit_format
+            .or(ctx.preferred)
+            .unwrap_or(detected);
+        let keep_profile = directives.keep_profile
+            && matches!(resolved_output, ImageFormat::Jpeg | ImageFormat::Png);
         // Background removal is validated before any real work:
         // its output is transparency, so the resolved format
         // must carry alpha, and a provider must be configured.
@@ -1360,9 +1376,7 @@ impl Engine {
             // then runs exactly as for the other formats.
             let (mut img, meta) = crate::heic::decode_heic(bytes)?;
             source_meta = meta;
-            if !directives.keep_profile
-                && let Some(icc) = &source_meta.icc
-            {
+            if !keep_profile && let Some(icc) = &source_meta.icc {
                 img = crate::color::convert_to_srgb(img, icc);
             }
             img
@@ -1383,9 +1397,7 @@ impl Engine {
             // stage works in one known space, unless the
             // request asked to keep the profile (then the
             // profile is embedded at encode time instead).
-            if !directives.keep_profile
-                && let Some(icc) = &source_meta.icc
-            {
+            if !keep_profile && let Some(icc) = &source_meta.icc {
                 img = crate::color::convert_to_srgb(img, icc);
             }
             img
@@ -5451,6 +5463,39 @@ mod tests {
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0).0, [200, 80, 40]);
         assert_eq!(crate::color::extract_source_meta(&out.bytes).icc, Some(icc));
+    }
+
+    #[test]
+    fn keep_profile_converts_when_the_output_cannot_tag() {
+        // Issue #374: WebP output cannot embed the profile
+        // in this pipeline, so keep_profile must convert
+        // to sRGB instead of shipping P3 pixels labeled as
+        // nothing. The kept and unkept WebP renders of the
+        // P3 source must carry the same (converted) pixel.
+        let engine = Engine;
+        let kept = engine
+            .process(
+                &p3_png(),
+                &[Operation::Filters(vec![
+                    Filter::KeepProfile,
+                    Filter::Format(FormatSpec::plain(ImageFormat::WebP)),
+                ])],
+            )
+            .unwrap();
+        let plain = engine
+            .process(
+                &p3_png(),
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    ImageFormat::WebP,
+                ))])],
+            )
+            .unwrap();
+        let kept_img = image::load_from_memory(&kept.bytes).unwrap().to_rgb8();
+        let plain_img = image::load_from_memory(&plain.bytes).unwrap().to_rgb8();
+        assert_eq!(kept_img.get_pixel(0, 0), plain_img.get_pixel(0, 0));
+        // And the converted pixel is not the raw P3 value:
+        // the conversion really ran.
+        assert_ne!(plain_img.get_pixel(0, 0).0, [200, 80, 40]);
     }
 
     #[test]
