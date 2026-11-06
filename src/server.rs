@@ -7451,75 +7451,96 @@ mod tests {
         // The published list and the code stay in
         // agreement (the AGENTS.md rule): every code the
         // server can emit, grammar or operational, appears
-        // in docs/responses.md.
-        const CODES: &[&str] = &[
-            // The parser's frozen set.
-            "empty_path",
-            "missing_signature",
-            "malformed_signature",
-            "invalid_size",
-            "invalid_crop",
-            "invalid_crop_rect",
-            "invalid_focal_rect",
-            "invalid_focal_point",
-            "invalid_pad",
-            "invalid_expiry",
-            "invalid_maxage",
-            "invalid_debug",
-            "invalid_frame",
-            "invalid_page",
-            "unknown_preset",
-            "unknown_root",
-            "invalid_root",
-            "invalid_preset",
-            "presets_only",
-            "invalid_filters",
-            "invalid_curve",
-            "invalid_convolution",
-            "invalid_noise",
-            "missing_source_url",
-            // The operational set (issue #356).
-            "bad_signature",
-            "signature_expired",
-            "reserved_segment",
-            "invalid_path",
-            "meta_not_available",
-            "not_found",
-            "metrics_disabled",
-            "metrics_unauthorized",
-            "source_forbidden",
-            "source_not_found",
-            "source_bad_status",
-            "source_fetch_failed",
-            "source_not_an_image",
-            "source_too_large",
-            "source_timeout",
-            "decode_failed",
-            "encode_failed",
-            "unsupported_operation",
-            "not_configured",
-            "inference_bad_output",
-            "inference_failed",
-            "render_failed",
-            "video_encode_failed",
-            "frame_extract_failed",
-            "pdf_render_failed",
-            "processing_timeout",
-            "processing_failed",
-            "server_busy",
-            "invalid_purge_group",
-            "uploads_not_configured",
-            "invalid_upload_name",
-            "upload_too_large",
-            "upload_not_an_image",
-            "upload_media_mismatch",
-            "upload_already_exists",
-            "validation_failed",
-            "upload_store_unavailable",
-            "upload_store_failed",
-        ];
+        // in docs/responses.md. The set is derived from the
+        // code under test instead of enumerated by hand, so
+        // a code added without docs fails here. The grammar
+        // codes are the literals UrlError::code returns.
+        // The operational codes are the literals passed in
+        // argument position in this module above the tests,
+        // the shape every envelope builder call site takes;
+        // the shape filter (snake_case, an underscore, at
+        // least five characters) keeps the neighboring
+        // literals that are not codes (JSON keys, header
+        // values, meta kinds) out of the set.
+        fn snake_literals(source: &str) -> Vec<(usize, usize)> {
+            // (open, close) byte indexes of the quotes of
+            // "..." literals whose whole content is
+            // snake_case.
+            let bytes = source.as_bytes();
+            let mut spans = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] != b'"' {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_lowercase()
+                        || bytes[j].is_ascii_digit()
+                        || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'"' && j > i + 1 {
+                    spans.push((i, j));
+                    i = j + 1;
+                } else {
+                    i += 1;
+                }
+            }
+            spans
+        }
+        let mut codes: Vec<&str> = Vec::new();
+        let url_rs = include_str!("url.rs");
+        let fn_start = url_rs.find("pub fn code(&self)").expect("UrlError::code");
+        let fn_rest = &url_rs[fn_start..];
+        let fn_end = fn_rest.find("\n}\n").expect("end of UrlError::code");
+        for (open, close) in snake_literals(&fn_rest[..fn_end]) {
+            codes.push(&fn_rest[open + 1..close]);
+        }
+        // One literal in argument position is not an
+        // envelope code: timed_out is a meta unavailable
+        // reason (the ModerationMeta, EmbeddingMeta, and
+        // OcrMeta unavailable payloads), never an envelope.
+        const NOT_CODES: &[&str] = &["timed_out"];
+        let server_rs = include_str!("server.rs");
+        let head = &server_rs[..server_rs.find("#[cfg(test)]").expect("test module")];
+        let head_bytes = head.as_bytes();
+        for (open, close) in snake_literals(head) {
+            let code = &head[open + 1..close];
+            if code.len() < 5 || !code.contains('_') || NOT_CODES.contains(&code) {
+                continue;
+            }
+            let mut prev = open;
+            while prev > 0 && matches!(head_bytes[prev - 1], b' ' | b'\t' | b'\n') {
+                prev -= 1;
+            }
+            if prev == 0 {
+                continue;
+            }
+            let prev = prev - 1;
+            let mut next = close + 1;
+            while next < head_bytes.len() && matches!(head_bytes[next], b' ' | b'\t' | b'\n') {
+                next += 1;
+            }
+            if next < head_bytes.len()
+                && matches!(head_bytes[prev], b',' | b'(')
+                && matches!(head_bytes[next], b',' | b')')
+            {
+                codes.push(code);
+            }
+        }
+        // The derivation must find the set it derived
+        // today (62 codes) in bulk; a broken extraction
+        // fails loudly here instead of vacuously passing.
+        assert!(
+            codes.len() >= 60,
+            "derived only {} error codes from the sources",
+            codes.len()
+        );
         let docs = include_str!("../docs/responses.md");
-        for code in CODES {
+        for code in &codes {
             assert!(
                 docs.contains(&format!("`{code}`")),
                 "error code {code} is not documented in docs/responses.md"
