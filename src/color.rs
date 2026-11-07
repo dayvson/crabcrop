@@ -118,12 +118,12 @@ fn extract_jpeg_meta(bytes: &[u8], preserve: bool) -> SourceMeta {
 /// (iCCP, inflated) and, when `preserve` is set, EXIF
 /// (eXIf) and XMP (the iTXt whose keyword is
 /// `XML:com.adobe.xmp`). Only the first chunk of each kind
-/// is read, as libpng does (the spec allows one iCCP and
-/// one eXIf): later ones are skipped unread, so a source
-/// cannot repeat a compressed chunk to multiply the inflate
-/// work (issue #399). Every inflate is charged to
-/// `inflate_budget`, the bytes of zlib output this source
-/// may still produce.
+/// is read (the spec allows one iCCP and one eXIf, and
+/// libpng ignores repeats of either): later ones are
+/// skipped unread, so a source cannot repeat a compressed
+/// chunk to multiply the inflate work (issue #399). Every
+/// inflate is charged to `inflate_budget`, the bytes of
+/// zlib output this source may still produce.
 fn extract_png_meta(bytes: &[u8], preserve: bool, inflate_budget: &mut usize) -> SourceMeta {
     let mut meta = SourceMeta::default();
     let (mut seen_iccp, mut seen_exif, mut seen_xmp) = (false, false, false);
@@ -169,7 +169,12 @@ fn inflate_capped(stream: &[u8], cap: usize, budget: &mut usize) -> Option<Vec<u
     let read = flate2::read::ZlibDecoder::new(stream)
         .take(limit as u64 + 1)
         .read_to_end(&mut out);
-    *budget = budget.saturating_sub(out.len());
+    // The byte past the limit only detects the overflow and
+    // is not charged: a refused stream must not eat into
+    // the cap of the next one, or the profile (which drives
+    // the pixels) would depend on whether an XMP packet
+    // ahead of it was read, that is, on the policy.
+    *budget -= out.len().min(limit);
     read.ok()?;
     (out.len() <= limit).then_some(out)
 }
@@ -1023,6 +1028,26 @@ mod tests {
         let png = png_with_chunks(&[(b"iTXt", &itxt)]);
         let mut budget = MAX_INFLATE_BYTES;
         assert!(extract_png_meta(&png, true, &mut budget).xmp.is_none());
-        assert_eq!(MAX_INFLATE_BYTES - budget, MAX_META_BYTES + 1);
+        // Charged up to the cap; the byte that detected the
+        // overflow is not.
+        assert_eq!(MAX_INFLATE_BYTES - budget, MAX_META_BYTES);
+    }
+
+    #[test]
+    fn the_profile_does_not_depend_on_the_metadata_policy() {
+        // The profile drives the pixels, so both policies
+        // must read the same one. An over-cap XMP packet
+        // ahead of the iCCP chunk (iTXt may come anywhere
+        // before IDAT) is read only under preserve; it must
+        // not leave a profile at its cap short of budget.
+        let itxt = compressed_xmp_payload(&zlib_zeros(MAX_META_BYTES + 1));
+        let iccp = iccp_payload(&zlib_zeros(MAX_ICC_BYTES));
+        let png = png_with_chunks(&[(b"iTXt", &itxt), (b"iCCP", &iccp)]);
+        let stripped = extract_source_meta(&png, false);
+        assert_eq!(stripped.icc.as_ref().map(Vec::len), Some(MAX_ICC_BYTES));
+        let kept = extract_source_meta(&png, true);
+        assert!(kept.xmp.is_none());
+        assert_eq!(kept.icc.as_ref().map(Vec::len), Some(MAX_ICC_BYTES));
+        assert!(kept.icc == stripped.icc);
     }
 }
