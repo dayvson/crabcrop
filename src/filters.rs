@@ -1,6 +1,6 @@
 //! Applying filter operations to decoded images.
 //!
-//! [`apply_filters`] runs pixel filters in URL order and collects
+//! [`apply_filters_filled`] runs pixel filters in URL order and collects
 //! encoding directives. `Format`, `Quality`, `Fill`, and
 //! `MaxBytes` do not touch pixels; they are recorded for the
 //! encoder.
@@ -93,7 +93,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
     apply_filters_filled(img, filters, None)
 }
 
-/// [`apply_filters`] with the request's resolved fill color,
+/// `apply_filters` (test builds only) with the request's resolved fill color,
 /// which arbitrary-angle rotation uses for the corners the
 /// turned image leaves uncovered (issue #144).
 pub fn apply_filters_filled(

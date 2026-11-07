@@ -1784,7 +1784,7 @@ fn decode_webp_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
 /// lever and a cold encode of a real animation ran past the
 /// 600 s processing deadline on the production soak host
 /// (issue #310). The quality mapping matches the still path
-/// in [`encode::encode_webp`]: the default quality is 80, quality
+/// in `encode::encode_webp`: the default quality is 80, quality
 /// below 100 is a lossy encode at that quality, and quality
 /// 100 is a lossless encode through the same libwebp encoder.
 /// The lossless corner stays on libwebp because its animated
