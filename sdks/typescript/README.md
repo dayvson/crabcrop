@@ -1,6 +1,6 @@
 # @crabcrop/url
 
-Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScript or JavaScript. Standard library only (`node:crypto`); the signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md). Signing is pinned by the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json), which this package runs as tests, and the explainer's verdicts and the typed builders are pinned by the shared grammar corpora in [`spec/explain-verdicts.json`](../../spec/explain-verdicts.json) and [`spec/operation-vectors.json`](../../spec/operation-vectors.json), which the playground's suite and the server crate's differential tests run as well.
+Build and sign [crabcrop](https://github.com/dayvson/crabcrop) URLs from TypeScript or JavaScript, on Node or in the browser. No dependencies: Node signs and seals with `node:crypto`, and browser bundles get a built-in TypeScript implementation of the same functions (see [Browsers and bundlers](#browsers-and-bundlers)). The signing scheme is specified in [`spec/url-signing.md`](../../spec/url-signing.md). Signing is pinned by the canonical [`spec/test-vectors.json`](../../spec/test-vectors.json), which this package runs as tests, and the explainer's verdicts and the typed builders are pinned by the shared grammar corpora in [`spec/explain-verdicts.json`](../../spec/explain-verdicts.json) and [`spec/operation-vectors.json`](../../spec/operation-vectors.json), which the playground's suite and the server crate's differential tests run as well.
 
 ## Usage
 
@@ -86,12 +86,30 @@ const url = buildURL("https://images.example.com", "your-secret", operations, "h
 
 A value the server would reject (`filter.quality(0)`, `filter.brighten(256)`, `ops.crop(0, 100)`) throws at build time instead of minting a URL that fails at the edge. The closed sets are exported as types (`ImageFormat`, `CropAlign`, `Anchor`, `BlendMode`, `MaskShape`, `Dimension`), and `FILTER_DESCRIPTIONS` is the filter metadata table the explainer uses.
 
+## Browsers and bundlers
+
+The package imports its crypto through one internal specifier, `#crypto`, which `package.json` maps by condition:
+
+| Condition | Backend | Who resolves it |
+|---|---|---|
+| `browser` | `dist/crypto/portable.js`: SHA-256, HMAC-SHA-256, and AES-256-GCM in plain TypeScript | client builds from bundlers that read `imports` conditions (Vite, webpack 5, esbuild, Rollup) |
+| `node` | `dist/crypto/node.js`: `node:crypto` (OpenSSL) | Node, and server builds that target it |
+| `default` | the portable backend | any other runtime, such as an edge worker without Node compatibility |
+
+The rest of the package uses no Node globals (no `Buffer`, no `process`), so a client bundle never pulls in a Node built-in. Every function stays synchronous on both backends; WebCrypto's `crypto.subtle` is asynchronous and could not keep the API as it is. Both backends produce identical bytes: the test suite checks the portable one against `node:crypto` on thousands of random inputs and runs every spec vector on each, and [`tests/browser-bundles`](../../tests/browser-bundles) builds the framework integrations with Vite and runs the bundles without Node globals.
+
+The portable backend is slower: about 5 µs per signature against about 2 µs on `node:crypto` (Node 22), and about a quarter of a millisecond to seal a 2 KB remainder, the largest allowed. Sealing needs `crypto.getRandomValues`, which every browser and edge runtime provides. Its AES rounds index the S-box by key-dependent bytes, which a cache-timing observer could in principle measure; Node keeps OpenSSL for that reason as well as speed.
+
+A secret in browser code is public: anyone who loads the page can read it. The browser build exists so that client code can import the package at all: to build unsigned and preset URLs, explain URLs, and sign where the secret belongs to the person using the page (a playground-style tool). Sign with a deployment secret only in server code; the [framework integrations](../../frameworks) never sign in the browser.
+
 ## Runtime
 
 The package is TypeScript and runs directly on Node >= 22 (type stripping), which is also how the tests run:
 
 ```bash
-node --test
+npm test
 ```
 
-In this repository the framework loaders and the MCP server resolve `@crabcrop/url` to these sources; a standalone install comes from npm once published, or from the repository with `"@crabcrop/url": "file:../typescript"` as the MCP package in this repo does.
+`npm test` builds `dist/` first (the `#crypto` import resolves there), then runs the suite twice: on `node:crypto`, and again under `--conditions=browser` on the portable backend.
+
+In this repository the framework loaders and the MCP server resolve `@crabcrop/url` to these sources, so build the package once (`npm run build`) before running their tests; a standalone install comes from npm once published, or from the repository with `"@crabcrop/url": "file:../typescript"` as the MCP package in this repo does.

@@ -4,7 +4,7 @@ A loader factory for SvelteKit apps that routes image URLs through your crabcrop
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (or copy `sdks/typescript/src/index.ts` into your project and adjust the import).
+1. Install the builder: `npm install @crabcrop/url`.
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project, for example under `src/lib/`.
 3. Create the loader in a shared module:
 
@@ -67,4 +67,6 @@ A loader created without a secret, or running in the browser, builds unsigned UR
 
 ## Tests
 
-`npm test` in this directory runs the loader against exact expected URLs; the signed cases reproduce the canonical spec test vectors byte for byte, and the remaining signatures are cross-checked with `node:crypto` directly. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs`; in a real project the installed package resolves it.
+`npm test` in this directory runs the loader against exact expected URLs; the signed cases reproduce the canonical spec test vectors byte for byte, and the remaining signatures are cross-checked with `node:crypto` directly. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
+
+[`tests/browser-bundles`](../../tests/browser-bundles) builds this loader into a browser bundle with Vite and runs it with a browser's globals and none of Node's.

@@ -4,7 +4,7 @@ A loader for `@shopify/hydrogen`'s `Image` component, for images that do **not**
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (or copy `sdks/typescript/src/index.ts` into your project and adjust the import).
+1. Install the builder: `npm install @crabcrop/url`.
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project.
 3. Create the loader where you have configuration access (a route loader or a shared module fed from `context.env`), and pass it to `Image`:
 
@@ -50,4 +50,6 @@ The setup above builds unsigned URLs. Hydrogen's `Image` calls the loader once p
 
 ## Tests
 
-`npm test` in this directory pins the factory's output to exact URLs (signatures cross-checked with `node:crypto` directly). The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs`; in a real project the installed package resolves it.
+`npm test` in this directory pins the factory's output to exact URLs (signatures cross-checked with `node:crypto` directly). The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
+
+[`tests/browser-bundles`](../../tests/browser-bundles) builds this loader into a browser bundle with Vite and runs it with a browser's globals and none of Node's.
