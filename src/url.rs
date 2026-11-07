@@ -1606,7 +1606,10 @@ fn parse_align(s: &str) -> Option<Align> {
 /// `focalpoint` zoom precedent. A class named twice (in
 /// any case: vocabulary matching is case-insensitive)
 /// names one class, so the canonical form keeps the first
-/// spelling of each.
+/// spelling of each, and the [`MAX_OBJECTS_CLASSES`] cap
+/// counts distinct names: a repeat costs nothing against
+/// it, and a list naming more distinct classes than the cap
+/// is rejected, never truncated.
 fn parse_crop_align(s: &str) -> Option<Align> {
     let Some(args) = s.strip_prefix("objects") else {
         return parse_align(s);
@@ -1627,17 +1630,21 @@ fn parse_crop_align(s: &str) -> Option<Align> {
     let mut classes: Vec<String> = Vec::new();
     for raw in list.split(',') {
         let name = parse_class_name(&percent_decode(raw)?)?;
-        // The cap applies as the list is built (issue
-        // #391): once the kept set is full, later names are
-        // still validated but are no longer scanned against
-        // or added to it, so a long list costs a bounded
-        // scan per name instead of a quadratic one, and the
-        // crop runs with exactly the capped set.
-        if classes.len() < MAX_OBJECTS_CLASSES
-            && !classes.iter().any(|c| c.eq_ignore_ascii_case(&name))
-        {
-            classes.push(name);
+        if classes.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+            continue;
         }
+        // The cap applies as the list is built (issue
+        // #391), so the kept set never grows past it and
+        // each name costs at most a cap-sized scan instead
+        // of a quadratic one. A distinct name past the cap
+        // rejects the segment (issue #408): truncating
+        // would crop to a set the caller never asked for,
+        // and center-crop when the only class in the image
+        // is one of the dropped names.
+        if classes.len() == MAX_OBJECTS_CLASSES {
+            return None;
+        }
+        classes.push(name);
     }
     if classes.is_empty() {
         return None;
@@ -6292,12 +6299,7 @@ mod tests {
                 .join(",")
         };
         let ok = format!("crop:300x200:objects({})/example.com/img.jpg", names(32));
-        assert!(parse_operations(&ok).is_ok());
-        // Past the cap, parsing keeps exactly the capped
-        // set (issue #391): the first 32 distinct names,
-        // in order.
-        let over = format!("crop:300x200:objects({})/example.com/img.jpg", names(40));
-        let (ops, _) = parse_operations(&over).unwrap();
+        let (ops, _) = parse_operations(&ok).unwrap();
         assert!(matches!(
             &ops[0],
             Operation::Crop {
@@ -6307,12 +6309,68 @@ mod tests {
                 && classes.first().map(String::as_str) == Some("c0")
                 && classes.last().map(String::as_str) == Some("c31")
         ));
-        // An invalid name past the cap is still a bad crop.
+        // A 33rd distinct class is a bad crop (issue #408),
+        // as it was at 0.9.10, not a silent truncation to
+        // the first 32 (what the #391 fix briefly shipped).
+        for n in [33, 40] {
+            let over = format!("crop:300x200:objects({})/example.com/img.jpg", names(n));
+            assert!(
+                matches!(parse_operations(&over), Err(ParseError::InvalidCrop(_))),
+                "{n} classes"
+            );
+        }
+        // The cap counts distinct names: repeats in any case
+        // fold before they count, so 32 classes spelled 64
+        // times parse to the 32.
+        let repeated = format!(
+            "crop:300x200:objects({},{})/example.com/img.jpg",
+            names(32),
+            names(32).to_uppercase()
+        );
+        let (ops, _) = parse_operations(&repeated).unwrap();
+        assert!(matches!(
+            &ops[0],
+            Operation::Crop {
+                align: Align::Objects { classes, .. },
+                ..
+            } if classes.len() == MAX_OBJECTS_CLASSES
+        ));
+        // An invalid name past a full set is still a bad crop.
         let bad_tail = format!(
             "crop:300x200:objects({},per%24on)/example.com/img.jpg",
             names(32)
         );
         assert!(parse_operations(&bad_tail).is_err());
+    }
+
+    #[test]
+    fn a_long_objects_list_is_rejected_at_the_cap() {
+        // Hostile input (issues #391, #408): a list of
+        // thousands of distinct names is rejected when the
+        // 33rd arrives, so the parse never scans past a
+        // cap-sized set; one of thousands of repeats of a
+        // single name parses to that one class. Both stay
+        // linear in the segment, which the URI length
+        // already bounds.
+        let distinct: Vec<String> = (0..20_000).map(|i| format!("c{i}")).collect();
+        let over = format!(
+            "crop:300x200:objects({})/example.com/img.jpg",
+            distinct.join(",")
+        );
+        assert!(matches!(
+            parse_operations(&over),
+            Err(ParseError::InvalidCrop(_))
+        ));
+        let same = vec!["person"; 20_000].join(",");
+        let (ops, _) =
+            parse_operations(&format!("crop:300x200:objects({same})/example.com/img.jpg")).unwrap();
+        assert!(matches!(
+            &ops[0],
+            Operation::Crop {
+                align: Align::Objects { classes, .. },
+                ..
+            } if classes.len() == 1
+        ));
     }
 
     #[test]
