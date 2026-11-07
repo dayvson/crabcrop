@@ -611,6 +611,9 @@ const U64_MAX = 18446744073709551615n;
  * decoded class names (duplicates folded, first spelling
  * kept, as the server's canonical form folds them) and the
  * scale, or null when the server would reject the form.
+ * The 32-class cap counts distinct names, as the server's
+ * does: repeats are free, and a 33rd distinct name rejects
+ * the form (issue #408).
  */
 function parseObjectsAlign(align: string): { classes: string[]; scale: number } | null {
   if (!align.startsWith("objects(")) return null;
@@ -628,7 +631,6 @@ function parseObjectsAlign(align: string): { classes: string[]; scale: number } 
     if (!(scale > 0) || scale > 100) return null;
   }
   const parts = list.split(",");
-  if (parts.length > 32) return null;
   const classes: string[] = [];
   const seen = new Set<string>();
   for (const part of parts) {
@@ -644,6 +646,7 @@ function parseObjectsAlign(align: string): { classes: string[]; scale: number } 
     }
     const key = name.toLowerCase();
     if (!seen.has(key)) {
+      if (classes.length === 32) return null;
       seen.add(key);
       classes.push(name);
     }

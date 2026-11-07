@@ -24,6 +24,12 @@ test("typed segments match the canonical spellings", () => {
     [ops.cropObjects(400, 300, ["person", "car"], 1.5), "crop:400x300:objects(person,car):1.5"],
     [ops.cropObjects(400, 300, ["dog", "Dog"]), "crop:400x300:objects(dog):1"],
     [ops.cropObjects(400, 300, ["traffic light"], 2), "crop:400x300:objects(traffic%20light):2"],
+    // The cap counts distinct classes, as the server's does
+    // (issue #408): 33 entries naming 32 classes build.
+    [
+      ops.cropObjects(400, 300, [...Array.from({ length: 32 }, (_, i) => `c${i}`), "C0"]),
+      `crop:400x300:objects(${Array.from({ length: 32 }, (_, i) => `c${i}`).join(",")}):1`,
+    ],
     [ops.cropRect(10, 20, 110, 220), "crop-rect:10x20:110x220"],
     [ops.focal(10, 20, 110, 220), "focal:10x20:110x220"],
     [ops.focalPoint(0.75, 0.4, 2), "focalpoint:0.75x0.4:2"],

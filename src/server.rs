@@ -9678,6 +9678,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_objects_crop_past_the_class_cap_is_a_400_on_both_routes() {
+        // Issue #408: a 33rd distinct class is the grammar's
+        // 400 invalid_crop on the image route and on
+        // /explain, before any fetch, as at 0.9.10, not a
+        // silent truncation that reaches the detector (the
+        // 501 below) with classes the caller never sees
+        // dropped.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let names = |n: usize| {
+            (0..n)
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for n in [33, 40] {
+            let remainder = format!("crop:100x100:objects({})/{src}", names(n));
+            for route in ["", "explain/"] {
+                let resp = client()
+                    .get(format!("{base}/{route}{}/{remainder}", sign(&remainder)))
+                    .header("accept", "application/json")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "/{route} {n}");
+                let body: serde_json::Value =
+                    serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+                assert_eq!(body["error"]["code"], "invalid_crop", "/{route} {n}");
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // 32 distinct classes, spelled with repeats, pass
+        // the grammar: the image route reaches the missing
+        // detector's 501 and /explain reports the folded set.
+        let remainder = format!("crop:100x100:objects({},C0,c31)/{src}", names(32));
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let resp = client()
+            .get(format!("{base}/explain/{}/{remainder}", sign(&remainder)))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.contains(&format!("objects({}):1", names(32))),
+            "explain: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn recolorclass_renders_and_needs_a_detector() {
         let src = spawn_image_server().await;
         // Configured: the recolor renders.
