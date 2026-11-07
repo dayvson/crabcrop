@@ -11,7 +11,7 @@
 //! successful responses are stored; errors are never cached.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::url::ImageFormat;
 
@@ -99,9 +99,22 @@ const MAX_TOMBSTONES: usize = 1024;
 /// the newer generation and is unaffected, so the guard
 /// costs a fresh render nothing.
 ///
+/// The guard also knows which purges are still running
+/// (issue #400). A shared-tier purge walk can outlive its
+/// request by minutes on a large bucket, and until it
+/// reaches an object that object still reads as a hit. A
+/// lookup that starts after the purge snapshots the newer
+/// generation, so the tombstone alone would let it serve
+/// that copy and promote it into the local tiers, where
+/// the walk never looks. While a purge is active, a copy
+/// it covers that a lookup finds in a persistent tier is
+/// therefore treated as already purged, whatever the
+/// lookup's snapshot.
+///
 /// The guard tracks purges, not entries: it holds no
 /// image data and its maps stay proportional to how many
-/// distinct targets were purged, capped above.
+/// distinct targets were purged, capped above, plus the
+/// purges still running.
 #[derive(Debug, Default)]
 pub struct PurgeGuard {
     inner: Mutex<PurgeGuardInner>,
@@ -122,6 +135,59 @@ struct PurgeGuardInner {
     /// keys that derive from the source, the rule
     /// `Cache::purge_source` removes by.
     sources: HashMap<String, u64>,
+    /// Purges still running (issue #400), by generation:
+    /// one entry per [`ActivePurge`] handle alive. Not
+    /// capped: each entry belongs to a purge task that is
+    /// still doing work, and it leaves when that task ends.
+    active: HashMap<u64, PurgeTarget>,
+}
+
+/// What one purge removes: the matching rule the tiers
+/// remove by, kept for as long as the purge runs.
+#[derive(Debug)]
+pub enum PurgeTarget {
+    /// A base cache key: the bare key and its
+    /// `#`-suffixed variants.
+    Key(String),
+    /// Every entry recorded in the cache group.
+    Group(String),
+    /// Every entry derived from the source.
+    Source(String),
+}
+
+impl PurgeTarget {
+    /// Whether this purge removes an entry stored under
+    /// `key` with `groups`.
+    fn covers(&self, key: &str, groups: &[String]) -> bool {
+        match self {
+            PurgeTarget::Key(base) => key == base || key.starts_with(&format!("{base}#")),
+            PurgeTarget::Group(group) => groups.iter().any(|g| g == group),
+            PurgeTarget::Source(source) => key_belongs_to_source(key, source),
+        }
+    }
+}
+
+/// A purge in progress (issue #400), from its tombstone
+/// until the last tier it reaches is done, the shared
+/// walk's background remainder included. Dropping the
+/// handle ends it, so a purge task that finishes, panics,
+/// or is torn down never leaves it behind.
+#[must_use = "the purge counts as active only while the handle lives"]
+#[derive(Debug)]
+pub struct ActivePurge {
+    guard: Arc<PurgeGuard>,
+    generation: u64,
+}
+
+impl Drop for ActivePurge {
+    fn drop(&mut self) {
+        let mut inner = self
+            .guard
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.active.remove(&self.generation);
+    }
 }
 
 impl PurgeGuard {
@@ -136,38 +202,66 @@ impl PurgeGuard {
         self.inner.lock().unwrap().generation
     }
 
-    /// Record a purge of the entries keyed at `base` (the
-    /// bare key and its variants). Returns the purge's
-    /// generation.
-    pub fn record_key(&self, base: &str) -> u64 {
+    /// Start a purge of `target`: record its tombstone at
+    /// a fresh generation and mark it active, in one step,
+    /// so no lookup can fall between the two. The purge
+    /// stays active until the returned handle is dropped;
+    /// the caller holds it until every tier it purges is
+    /// done.
+    pub fn begin(self: &Arc<Self>, target: PurgeTarget) -> ActivePurge {
         let mut inner = self.inner.lock().unwrap();
-        inner.generation += 1;
-        let generation = inner.generation;
-        inner.keys.insert(base.to_string(), generation);
-        trim_tombstones(&mut inner.keys);
-        generation
+        let generation = record_tombstone(&mut inner, &target);
+        inner.active.insert(generation, target);
+        ActivePurge {
+            guard: Arc::clone(self),
+            generation,
+        }
     }
 
-    /// Record a purge of `group`'s member entries.
+    /// Record a purge of the entries keyed at `base` (the
+    /// bare key and its variants), tombstone only.
     /// Returns the purge's generation.
+    #[cfg(test)]
+    pub fn record_key(&self, base: &str) -> u64 {
+        let target = PurgeTarget::Key(base.to_string());
+        record_tombstone(&mut self.inner.lock().unwrap(), &target)
+    }
+
+    /// Record a purge of `group`'s member entries,
+    /// tombstone only. Returns the purge's generation.
+    #[cfg(test)]
     pub fn record_group(&self, group: &str) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
-        inner.generation += 1;
-        let generation = inner.generation;
-        inner.groups.insert(group.to_string(), generation);
-        trim_tombstones(&mut inner.groups);
-        generation
+        let target = PurgeTarget::Group(group.to_string());
+        record_tombstone(&mut self.inner.lock().unwrap(), &target)
     }
 
     /// Record a purge of every entry derived from
-    /// `source`. Returns the purge's generation.
+    /// `source`, tombstone only. Returns the purge's
+    /// generation.
+    #[cfg(test)]
     pub fn record_source(&self, source: &str) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
-        inner.generation += 1;
-        let generation = inner.generation;
-        inner.sources.insert(source.to_string(), generation);
-        trim_tombstones(&mut inner.sources);
-        generation
+        let target = PurgeTarget::Source(source.to_string());
+        record_tombstone(&mut self.inner.lock().unwrap(), &target)
+    }
+
+    /// Whether a purge that is still running covers an
+    /// entry stored under `key` with `groups`, whatever
+    /// generation the reader snapshotted (issue #400). A
+    /// tier copy it covers predates the purge or raced it,
+    /// and must read as a miss until the purge has reached
+    /// every tier.
+    pub fn active_covers(&self, key: &str, groups: &[String]) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .active
+            .values()
+            .any(|target| target.covers(key, groups))
+    }
+
+    /// How many purges are still running.
+    #[cfg(test)]
+    pub fn active_count(&self) -> usize {
+        self.inner.lock().unwrap().active.len()
     }
 
     /// Whether a purge recorded after `snapshot` covers
@@ -185,6 +279,21 @@ impl PurgeGuard {
                 *purge_gen > snapshot && key_belongs_to_source(key, source)
             })
     }
+}
+
+/// Record `target`'s tombstone at a fresh generation
+/// and return the generation.
+fn record_tombstone(inner: &mut PurgeGuardInner, target: &PurgeTarget) -> u64 {
+    inner.generation += 1;
+    let generation = inner.generation;
+    let (map, name) = match target {
+        PurgeTarget::Key(base) => (&mut inner.keys, base),
+        PurgeTarget::Group(group) => (&mut inner.groups, group),
+        PurgeTarget::Source(source) => (&mut inner.sources, source),
+    };
+    map.insert(name.clone(), generation);
+    trim_tombstones(map);
+    generation
 }
 
 /// Drop the oldest tombstones until the map is back at
@@ -558,6 +667,56 @@ mod tests {
         guard.record_group("thumb");
         assert!(!guard.purge_covers(mid, "any/key", &["hero".to_string()]));
         assert!(guard.purge_covers(mid, "any/key", &["thumb".to_string()]));
+    }
+
+    #[test]
+    fn active_purges_cover_later_readers_until_they_end() {
+        // Issue #400: a reader that starts after a purge
+        // snapshots the newer generation, so the tombstone
+        // alone lets it through. While the purge is still
+        // running, the active mark does not.
+        let guard = Arc::new(PurgeGuard::new());
+        let key_purge = guard.begin(PurgeTarget::Key("30x20/http://x/cat.jpg".into()));
+        let after = guard.snapshot();
+        assert!(!guard.purge_covers(after, "30x20/http://x/cat.jpg#w300", &[]));
+        assert!(guard.active_covers("30x20/http://x/cat.jpg#w300", &[]));
+        assert!(guard.active_covers("30x20/http://x/cat.jpg", &[]));
+        assert!(!guard.active_covers("30x20/http://x/cat.jpg2", &[]));
+        assert!(!guard.active_covers("30x20/http://x/dog.jpg", &[]));
+        // The mark and the tombstone go up together: a
+        // write begun before `begin` is stale.
+        assert!(guard.purge_covers(0, "30x20/http://x/cat.jpg", &[]));
+        let group_purge = guard.begin(PurgeTarget::Group("hero".into()));
+        let source_purge = guard.begin(PurgeTarget::Source("file:///heroes/dog.jpg".into()));
+        assert_eq!(guard.active_count(), 3);
+        assert!(guard.active_covers("any/key", &["hero".to_string()]));
+        assert!(!guard.active_covers("any/key", &["thumb".to_string()]));
+        assert!(guard.active_covers("300x200/file:///heroes/dog.jpg#cfg1", &[]));
+        assert!(!guard.active_covers("300x200/file:///heroes/dog.jpg2", &[]));
+        // Ending one purge leaves the others active, and
+        // its tombstone outlives the mark.
+        drop(key_purge);
+        assert!(!guard.active_covers("30x20/http://x/cat.jpg#w300", &[]));
+        assert!(guard.purge_covers(0, "30x20/http://x/cat.jpg", &[]));
+        assert!(guard.active_covers("any/key", &["hero".to_string()]));
+        drop(group_purge);
+        drop(source_purge);
+        assert_eq!(guard.active_count(), 0);
+        assert!(!guard.active_covers("any/key", &["hero".to_string()]));
+    }
+
+    #[test]
+    fn active_purge_ends_when_its_task_panics() {
+        let guard = Arc::new(PurgeGuard::new());
+        let task_guard = guard.clone();
+        let joined = std::thread::spawn(move || {
+            let _active = task_guard.begin(PurgeTarget::Group("hero".into()));
+            panic!("purge task panics mid-walk");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert_eq!(guard.active_count(), 0);
+        assert!(!guard.active_covers("any/key", &["hero".to_string()]));
     }
 
     #[test]

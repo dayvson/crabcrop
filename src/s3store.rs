@@ -717,6 +717,7 @@ fn xml_unescape(s: &str) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -743,6 +744,13 @@ pub(crate) mod test_support {
         /// how a lookup was answered, not just what it
         /// returned.
         pub requests: Arc<StdMutex<Vec<String>>>,
+        /// Ranged GETs (the purge walk's header reads)
+        /// that have arrived so far, held ones included.
+        pub ranged_gets: Arc<AtomicUsize>,
+        /// While set to `Some(n)`, every ranged GET past
+        /// the first `n` waits until it is cleared, so a
+        /// test can act while a purge walk is mid-flight.
+        pub hold_ranged_after: Arc<StdMutex<Option<usize>>>,
         pub endpoint: String,
     }
 
@@ -750,16 +758,22 @@ pub(crate) mod test_support {
         let objects = Arc::new(StdMutex::new(HashMap::new()));
         let fail = Arc::new(StdMutex::new(FailFlags::default()));
         let requests = Arc::new(StdMutex::new(Vec::new()));
+        let ranged_gets = Arc::new(AtomicUsize::new(0));
+        let hold_ranged_after: Arc<StdMutex<Option<usize>>> = Arc::new(StdMutex::new(None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = objects.clone();
         let shared_fail = fail.clone();
         let shared_requests = requests.clone();
+        let shared_ranged = ranged_gets.clone();
+        let shared_hold = hold_ranged_after.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let objects = shared.clone();
                 let fail = shared_fail.clone();
                 let requests = shared_requests.clone();
+                let ranged_gets = shared_ranged.clone();
+                let hold_ranged_after = shared_hold.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -811,6 +825,16 @@ pub(crate) mod test_support {
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default().to_string();
                     let target = parts.next().unwrap_or_default().to_string();
+                    if method == "GET" && range_end.is_some() {
+                        let seen = ranged_gets.fetch_add(1, Ordering::SeqCst);
+                        while hold_ranged_after
+                            .lock()
+                            .unwrap()
+                            .is_some_and(|after| seen >= after)
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    }
                     {
                         let (path, _) = match target.split_once('?') {
                             Some((p, q)) => (p, q),
@@ -854,6 +878,8 @@ pub(crate) mod test_support {
             objects,
             fail,
             requests,
+            ranged_gets,
+            hold_ranged_after,
             endpoint: format!("http://127.0.0.1:{port}"),
         }
     }
@@ -926,10 +952,19 @@ pub(crate) mod test_support {
                 let mut xml = String::from(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><IsTruncated>false</IsTruncated>",
                 );
-                for k in objects.lock().unwrap().keys() {
-                    if k.starts_with(&prefix) {
-                        xml += &format!("<Contents><Key>{k}</Key></Contents>");
-                    }
+                // Keys list in ascending order, as S3 lists
+                // them, so a test can place objects ahead of
+                // others in a purge walk.
+                let mut keys: Vec<String> = objects
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                keys.sort();
+                for k in keys {
+                    xml += &format!("<Contents><Key>{k}</Key></Contents>");
                 }
                 xml += "</ListBucketResult>";
                 ("200 OK".into(), xml.into_bytes(), String::new())
