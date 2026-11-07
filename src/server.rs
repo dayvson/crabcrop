@@ -6723,9 +6723,10 @@ mod tests {
     /// same files in its own suite; a disagreement anywhere
     /// fails the gate here or there, and the mismatch list is
     /// printed whole so one run shows every divergence.
-    /// These tests live here rather than in url.rs because
-    /// the fuzz crate includes url.rs textually, without the
-    /// explain module or serde_json in scope.
+    /// These tests were put here rather than in url.rs while
+    /// the fuzz crate included url.rs textually, without the
+    /// explain module or serde_json in scope; since the
+    /// library target (issue #417) nothing keeps them here.
     fn load_spec(name: &str) -> serde_json::Value {
         let text = match name {
             "explain-verdicts.json" => include_str!("../spec/explain-verdicts.json"),

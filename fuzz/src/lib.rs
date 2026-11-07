@@ -4,65 +4,21 @@
 //! surfaces behind them (issue #387): image decode,
 //! source metadata extraction, and filter chains.
 //!
-//! The server-side modules live in the server binary
-//! crate, which a fuzz package cannot depend on, so they
-//! are included by path: each has no crate-internal
-//! dependencies beyond the ones shimmed below (only the
-//! `crabcrop-url` signing crate, std, and the decoder
-//! stack), and compiles here unchanged. The opener lives
-//! in `crabcrop-url` itself, a direct dependency.
+//! The harness depends on the server's library target
+//! (issue #417), so every check runs the server's own
+//! code: the parser in `crabcrop::url`, the decode
+//! dispatch in `crabcrop::engine`, the metadata code in
+//! `crabcrop::color`, the filters in `crabcrop::filters`,
+//! and the SVG pipeline in `crabcrop::svg`. The opener
+//! lives in `crabcrop-url`, a direct dependency.
 //! `check` drives the parser target, `check_seal` the
 //! opener target, and `check_decode`, `check_meta`, and
 //! `check_chain` the byte targets; all of them also run
 //! under the deterministic smoke test.
 
-#[path = "../../src/url.rs"]
-pub mod url;
+pub use crabcrop::{color, filters, svg, url};
 
-#[path = "../../src/color.rs"]
-pub mod color;
-
-#[path = "../../src/filters.rs"]
-pub mod filters;
-
-#[path = "../../src/svg.rs"]
-pub mod svg;
-
-/// A stand-in for the server crate's engine module:
-/// `src/svg.rs` (included by path) reads the decode
-/// allocation cap from `crate::engine`. The value
-/// mirrors `src/engine.rs` (256 MiB); the two must move
-/// together.
-pub mod engine {
-    pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
-}
-
-/// Stand-ins for the server crate's AI types:
-/// `src/filters.rs` (included by path) names them in its
-/// face and detection redaction helpers. The shapes
-/// mirror `src/ai.rs`; the chain harness never calls
-/// those helpers with real detections, so the stand-ins
-/// only need to compile.
-pub mod ai {
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct FaceBox {
-        pub x: u32,
-        pub y: u32,
-        pub w: u32,
-        pub h: u32,
-        pub score: f32,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Detection {
-        pub label: String,
-        pub score: f32,
-        pub x: u32,
-        pub y: u32,
-        pub w: u32,
-        pub h: u32,
-    }
-}
+use crabcrop::engine;
 
 use url::Signature;
 
@@ -191,15 +147,23 @@ pub fn sample_token(remainder: &str) -> String {
         .expect("a remainder within the cap seals")
 }
 
-/// The decode invariants (issue #387): decoding
+/// The decode invariants (issues #387, #417): decoding
 /// attacker-controlled bytes is total. An SVG-shaped
 /// input goes through the sanitizer and rasterizer the
-/// server uses; anything else goes through the image
-/// decoders. Errors are the expected outcome for most
-/// inputs; a panic or an unbounded allocation is the
-/// failure. The render size is clamped so a well-formed
-/// but enormous SVG cannot turn the harness itself into
-/// the allocation victim.
+/// server uses. Anything else goes through the server's
+/// decode dispatch, the branches a render walks: HEIC
+/// through its decoder, animated GIF and WebP frame by
+/// frame under the animation caps, JPEG XL through its
+/// header probe, and the bounded still decode
+/// (`engine::decode_image`: the server's dimension and
+/// allocation limits, the zune-jpeg and libwebp fast
+/// paths) for everything else. The still decode then runs
+/// on its own as well, since a still render of an
+/// animated source takes it too. Errors are the expected
+/// outcome for most inputs; a panic or an unbounded
+/// allocation is the failure. The SVG render size is
+/// clamped so a well-formed but enormous SVG cannot turn
+/// the harness itself into the allocation victim.
 pub fn check_decode(data: &[u8]) {
     if svg::is_svg(data) {
         if let Ok(prepared) = svg::prepare(data) {
@@ -210,7 +174,8 @@ pub fn check_decode(data: &[u8]) {
         }
         return;
     }
-    let _ = image::load_from_memory(data);
+    let _ = engine::validate_source_image(data);
+    let _ = engine::decode_image(data);
 }
 
 /// The source-metadata invariants (issue #387):

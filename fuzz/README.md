@@ -34,6 +34,12 @@ every input:
 every input: nothing panics and no allocation runs away,
 whether the bytes are an image the decoders accept, an
 SVG the sanitizer and rasterizer process, or garbage.
+Non-SVG bytes go through the server's decode dispatch
+(`engine::validate_source_image`: HEIC, animated GIF and
+WebP frames under the animation caps, the JPEG XL header
+probe) and through `engine::decode_image`, the bounded
+still decode with the server's dimension and allocation
+limits and its JPEG and WebP fast paths.
 
 `source_meta` checks metadata handling (`check_meta`):
 extracting a source's ICC profile, EXIF stream, XMP
@@ -61,15 +67,27 @@ package cannot link while the server is a binary-only
 crate. Driving the whole operation list through the
 engine waits on the library target (issue #417).
 
-The server-side modules live in the server binary crate,
-so the harness includes them by path (`src/url.rs`,
-`src/color.rs`, `src/filters.rs`, `src/svg.rs`), with
-small stand-ins for the two things they name from the
-rest of the crate (the engine's decode cap and the AI
-types in filter signatures). The opener lives in
+The harness depends on the server's library target
+(`crabcrop`, issue #417), so each target runs the
+server's own code: the parser, the decode dispatch, the
+metadata code, the filters, and the SVG pipeline, with
+no copies or stand-ins. The opener lives in
 `crabcrop-url`, a direct dependency. This package is
 detached from the main workspace so fuzzing dependencies
 never enter a normal build.
+
+`Cargo.lock` here pins the same versions as the root
+lockfile. Because the package builds the server library,
+a dependency added or bumped in the root manifest (or a
+release version bump) can leave it stale, and the
+smoke's `--locked` build (in `scripts/test_all.sh` and
+CI) then fails until it is refreshed. Refresh it from
+the root lockfile:
+
+```sh
+cp Cargo.lock fuzz/Cargo.lock
+cargo update -w --manifest-path fuzz/Cargo.toml
+```
 
 ## The smoke (runs everywhere)
 
