@@ -1606,7 +1606,10 @@ fn parse_align(s: &str) -> Option<Align> {
 /// `focalpoint` zoom precedent. A class named twice (in
 /// any case: vocabulary matching is case-insensitive)
 /// names one class, so the canonical form keeps the first
-/// spelling of each.
+/// spelling of each, and the [`MAX_OBJECTS_CLASSES`] cap
+/// counts distinct names: a repeat costs nothing against
+/// it, and a list naming more distinct classes than the cap
+/// is rejected, never truncated.
 fn parse_crop_align(s: &str) -> Option<Align> {
     let Some(args) = s.strip_prefix("objects") else {
         return parse_align(s);
@@ -1627,17 +1630,21 @@ fn parse_crop_align(s: &str) -> Option<Align> {
     let mut classes: Vec<String> = Vec::new();
     for raw in list.split(',') {
         let name = parse_class_name(&percent_decode(raw)?)?;
-        // The cap applies as the list is built (issue
-        // #391): once the kept set is full, later names are
-        // still validated but are no longer scanned against
-        // or added to it, so a long list costs a bounded
-        // scan per name instead of a quadratic one, and the
-        // crop runs with exactly the capped set.
-        if classes.len() < MAX_OBJECTS_CLASSES
-            && !classes.iter().any(|c| c.eq_ignore_ascii_case(&name))
-        {
-            classes.push(name);
+        if classes.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+            continue;
         }
+        // The cap applies as the list is built (issue
+        // #391), so the kept set never grows past it and
+        // each name costs at most a cap-sized scan instead
+        // of a quadratic one. A distinct name past the cap
+        // rejects the segment (issue #408): truncating
+        // would crop to a set the caller never asked for,
+        // and center-crop when the only class in the image
+        // is one of the dropped names.
+        if classes.len() == MAX_OBJECTS_CLASSES {
+            return None;
+        }
+        classes.push(name);
     }
     if classes.is_empty() {
         return None;
@@ -2493,34 +2500,20 @@ pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError
     Ok(operations)
 }
 
-/// Expand `preset:<name>` segments in a request remainder,
-/// splicing each preset's operation string in its place.
-///
-/// The signature covers the unexpanded remainder (the preset
-/// reference is what gets signed); expansion is deterministic
-/// and server-side, and everything downstream of it (parsing,
-/// cache keys) sees the expanded string, so editing a preset
-/// definition produces fresh cache entries naturally.
-///
-/// The walk stops expanding at the first segment that starts
-/// the source URL, using the same dispatch as
-/// [`parse_operations_with_expiry`]: a `preset:` segment inside
-/// the source path is URL text, not a reference. Expansion is
-/// single-pass: spliced text is not rescanned (and configured
-/// presets cannot contain `preset:` segments anyway; see
-/// [`parse_preset_operations`]).
-///
-/// With `only_presets`, any real operation segment in the
-/// request is an error: the operations must all arrive via
-/// presets. `exp:` and `maxage:` metadata stay allowed; neither
-/// is an operation.
 /// The preset names a remainder references, in order,
 /// deduplicated: the cache groups (RFC 9875) the response
 /// belongs to. Scans the same leading segment run
 /// [`expand_presets`] expands and stops where it stops (the
 /// source, or a segment that is not an operation).
+///
+/// The scan runs on the request path before expansion
+/// rejects unknown names, so it sees untrusted input (issue
+/// #409). A hash set tracks the names already kept: n
+/// distinct names cost linear work, where scanning the kept
+/// list was quadratic. The output keeps first-seen order.
 pub fn preset_names(rest: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut tail = rest;
     loop {
         let (seg, remaining) = match tail.split_once('/') {
@@ -2528,7 +2521,7 @@ pub fn preset_names(rest: &str) -> Vec<String> {
             None => (tail, ""),
         };
         if let Some(name) = seg.strip_prefix("preset:") {
-            if !name.is_empty() && !out.iter().any(|n| n == name) {
+            if !name.is_empty() && seen.insert(name) {
                 out.push(name.to_string());
             }
         } else if !(seg.starts_with("exp:")
@@ -2624,6 +2617,27 @@ pub fn parse_default_ops(
     Ok(ops)
 }
 
+/// Expand `preset:<name>` segments in a request remainder,
+/// splicing each preset's operation string in its place.
+///
+/// The signature covers the unexpanded remainder (the preset
+/// reference is what gets signed); expansion is deterministic
+/// and server-side, and everything downstream of it (parsing,
+/// cache keys) sees the expanded string, so editing a preset
+/// definition produces fresh cache entries naturally.
+///
+/// The walk stops expanding at the first segment that starts
+/// the source URL, using the same dispatch as
+/// [`parse_operations_with_expiry`]: a `preset:` segment inside
+/// the source path is URL text, not a reference. Expansion is
+/// single-pass: spliced text is not rescanned (and configured
+/// presets cannot contain `preset:` segments anyway; see
+/// [`parse_preset_operations`]).
+///
+/// With `only_presets`, any real operation segment in the
+/// request is an error: the operations must all arrive via
+/// presets. `exp:` and `maxage:` metadata stay allowed; neither
+/// is an operation.
 pub fn expand_presets(
     rest: &str,
     presets: &std::collections::HashMap<String, String>,
@@ -6292,12 +6306,7 @@ mod tests {
                 .join(",")
         };
         let ok = format!("crop:300x200:objects({})/example.com/img.jpg", names(32));
-        assert!(parse_operations(&ok).is_ok());
-        // Past the cap, parsing keeps exactly the capped
-        // set (issue #391): the first 32 distinct names,
-        // in order.
-        let over = format!("crop:300x200:objects({})/example.com/img.jpg", names(40));
-        let (ops, _) = parse_operations(&over).unwrap();
+        let (ops, _) = parse_operations(&ok).unwrap();
         assert!(matches!(
             &ops[0],
             Operation::Crop {
@@ -6307,12 +6316,68 @@ mod tests {
                 && classes.first().map(String::as_str) == Some("c0")
                 && classes.last().map(String::as_str) == Some("c31")
         ));
-        // An invalid name past the cap is still a bad crop.
+        // A 33rd distinct class is a bad crop (issue #408),
+        // as it was at 0.9.10, not a silent truncation to
+        // the first 32 (what the #391 fix briefly shipped).
+        for n in [33, 40] {
+            let over = format!("crop:300x200:objects({})/example.com/img.jpg", names(n));
+            assert!(
+                matches!(parse_operations(&over), Err(ParseError::InvalidCrop(_))),
+                "{n} classes"
+            );
+        }
+        // The cap counts distinct names: repeats in any case
+        // fold before they count, so 32 classes spelled 64
+        // times parse to the 32.
+        let repeated = format!(
+            "crop:300x200:objects({},{})/example.com/img.jpg",
+            names(32),
+            names(32).to_uppercase()
+        );
+        let (ops, _) = parse_operations(&repeated).unwrap();
+        assert!(matches!(
+            &ops[0],
+            Operation::Crop {
+                align: Align::Objects { classes, .. },
+                ..
+            } if classes.len() == MAX_OBJECTS_CLASSES
+        ));
+        // An invalid name past a full set is still a bad crop.
         let bad_tail = format!(
             "crop:300x200:objects({},per%24on)/example.com/img.jpg",
             names(32)
         );
         assert!(parse_operations(&bad_tail).is_err());
+    }
+
+    #[test]
+    fn a_long_objects_list_is_rejected_at_the_cap() {
+        // Hostile input (issues #391, #408): a list of
+        // thousands of distinct names is rejected when the
+        // 33rd arrives, so the parse never scans past a
+        // cap-sized set; one of thousands of repeats of a
+        // single name parses to that one class. Both stay
+        // linear in the segment, which the URI length
+        // already bounds.
+        let distinct: Vec<String> = (0..20_000).map(|i| format!("c{i}")).collect();
+        let over = format!(
+            "crop:300x200:objects({})/example.com/img.jpg",
+            distinct.join(",")
+        );
+        assert!(matches!(
+            parse_operations(&over),
+            Err(ParseError::InvalidCrop(_))
+        ));
+        let same = vec!["person"; 20_000].join(",");
+        let (ops, _) =
+            parse_operations(&format!("crop:300x200:objects({same})/example.com/img.jpg")).unwrap();
+        assert!(matches!(
+            &ops[0],
+            Operation::Crop {
+                align: Align::Objects { classes, .. },
+                ..
+            } if classes.len() == 1
+        ));
     }
 
     #[test]
@@ -7155,6 +7220,54 @@ mod tests {
                 true
             ),
             Err(ParseError::PresetsOnly("filters:grayscale".to_string()))
+        );
+    }
+
+    #[test]
+    fn preset_names_dedupe_in_first_seen_order() {
+        assert_eq!(
+            preset_names("preset:a/preset:b/preset:a/exp:999/preset:c/preset:b/example.com/i.jpg"),
+            vec!["a", "b", "c"]
+        );
+        // The scan stops where expansion stops: a `preset:`
+        // segment in the source path is URL text.
+        assert_eq!(
+            preset_names("preset:a/example.com/preset:b/i.jpg"),
+            vec!["a"]
+        );
+        assert!(preset_names("example.com/i.jpg").is_empty());
+        assert!(preset_names("preset:/example.com/i.jpg").is_empty());
+    }
+
+    #[test]
+    fn preset_names_stay_linear_on_long_distinct_lists() {
+        // Hostile input (issue #409): the scan runs before
+        // expansion rejects unknown names, so a remainder of
+        // thousands of distinct names must cost linear work.
+        let remainder = |names: &[String]| {
+            let mut text: String = names.iter().map(|n| format!("preset:{n}/")).collect();
+            text.push_str("example.com/img.jpg");
+            text
+        };
+        // The report's shape: about 6,000 distinct short
+        // names (a 65 KB remainder), then the same names
+        // again, which fold into the first-seen order.
+        let names: Vec<String> = (0..6_000).map(|i| format!("{i:x}")).collect();
+        let doubled: Vec<String> = names.iter().chain(names.iter()).cloned().collect();
+        assert_eq!(preset_names(&remainder(&names)), names);
+        assert_eq!(preset_names(&remainder(&doubled)), names);
+        // Linear, not quadratic: 50,000 distinct names take
+        // milliseconds with the hash set, where the old scan
+        // of the kept list made about 1.25 billion string
+        // comparisons (seconds even in a release build).
+        let many: Vec<String> = (0..50_000).map(|i| format!("{i:x}")).collect();
+        let text = remainder(&many);
+        let started = std::time::Instant::now();
+        assert_eq!(preset_names(&text).len(), many.len());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "50,000 names took {:?}",
+            started.elapsed()
         );
     }
 

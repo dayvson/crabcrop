@@ -4,65 +4,21 @@
 //! surfaces behind them (issue #387): image decode,
 //! source metadata extraction, and filter chains.
 //!
-//! The server-side modules live in the server binary
-//! crate, which a fuzz package cannot depend on, so they
-//! are included by path: each has no crate-internal
-//! dependencies beyond the ones shimmed below (only the
-//! `crabcrop-url` signing crate, std, and the decoder
-//! stack), and compiles here unchanged. The opener lives
-//! in `crabcrop-url` itself, a direct dependency.
+//! The harness depends on the server's library target
+//! (issue #417), so every check runs the server's own
+//! code: the parser in `crabcrop::url`, the decode
+//! dispatch in `crabcrop::engine`, the metadata code in
+//! `crabcrop::color`, the filters in `crabcrop::filters`,
+//! and the SVG pipeline in `crabcrop::svg`. The opener
+//! lives in `crabcrop-url`, a direct dependency.
 //! `check` drives the parser target, `check_seal` the
 //! opener target, and `check_decode`, `check_meta`, and
 //! `check_chain` the byte targets; all of them also run
 //! under the deterministic smoke test.
 
-#[path = "../../src/url.rs"]
-pub mod url;
+pub use crabcrop::{color, filters, svg, url};
 
-#[path = "../../src/color.rs"]
-pub mod color;
-
-#[path = "../../src/filters.rs"]
-pub mod filters;
-
-#[path = "../../src/svg.rs"]
-pub mod svg;
-
-/// A stand-in for the server crate's engine module:
-/// `src/svg.rs` (included by path) reads the decode
-/// allocation cap from `crate::engine`. The value
-/// mirrors `src/engine.rs` (256 MiB); the two must move
-/// together.
-pub mod engine {
-    pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
-}
-
-/// Stand-ins for the server crate's AI types:
-/// `src/filters.rs` (included by path) names them in its
-/// face and detection redaction helpers. The shapes
-/// mirror `src/ai.rs`; the chain harness never calls
-/// those helpers with real detections, so the stand-ins
-/// only need to compile.
-pub mod ai {
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct FaceBox {
-        pub x: u32,
-        pub y: u32,
-        pub w: u32,
-        pub h: u32,
-        pub score: f32,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Detection {
-        pub label: String,
-        pub score: f32,
-        pub x: u32,
-        pub y: u32,
-        pub w: u32,
-        pub h: u32,
-    }
-}
+use crabcrop::engine;
 
 use url::Signature;
 
@@ -191,15 +147,23 @@ pub fn sample_token(remainder: &str) -> String {
         .expect("a remainder within the cap seals")
 }
 
-/// The decode invariants (issue #387): decoding
+/// The decode invariants (issues #387, #417): decoding
 /// attacker-controlled bytes is total. An SVG-shaped
 /// input goes through the sanitizer and rasterizer the
-/// server uses; anything else goes through the image
-/// decoders. Errors are the expected outcome for most
-/// inputs; a panic or an unbounded allocation is the
-/// failure. The render size is clamped so a well-formed
-/// but enormous SVG cannot turn the harness itself into
-/// the allocation victim.
+/// server uses. Anything else goes through the server's
+/// decode dispatch, the branches a render walks: HEIC
+/// through its decoder, animated GIF and WebP frame by
+/// frame under the animation caps, JPEG XL through its
+/// header probe, and the bounded still decode
+/// (`engine::decode_image`: the server's dimension and
+/// allocation limits, the zune-jpeg and libwebp fast
+/// paths) for everything else. The still decode then runs
+/// on its own as well, since a still render of an
+/// animated source takes it too. Errors are the expected
+/// outcome for most inputs; a panic or an unbounded
+/// allocation is the failure. The SVG render size is
+/// clamped so a well-formed but enormous SVG cannot turn
+/// the harness itself into the allocation victim.
 pub fn check_decode(data: &[u8]) {
     if svg::is_svg(data) {
         if let Ok(prepared) = svg::prepare(data) {
@@ -210,7 +174,8 @@ pub fn check_decode(data: &[u8]) {
         }
         return;
     }
-    let _ = image::load_from_memory(data);
+    let _ = engine::validate_source_image(data);
+    let _ = engine::decode_image(data);
 }
 
 /// The source-metadata invariants (issue #387):
@@ -245,33 +210,84 @@ pub fn check_meta(data: &[u8]) {
     }
 }
 
-/// The operation-chain invariants (issue #387): a parsed
-/// filter chain applied to an image is total, and the
-/// canvas never collapses or explodes under pixel
-/// filters: dimensions stay the input's, or swapped by a
-/// rotation, never zero. The chain runs on a small
-/// synthetic image (the harness's stand-in source), one
-/// `filters:` segment at a time, in URL order.
+/// The largest canvas the chain harness lets a rotation
+/// allocate. The engine checks every rotation against the
+/// output pixel budget before the canvas exists (issue
+/// #182); the harness applies filters directly, so it
+/// applies the same kind of check with a budget sized for
+/// fuzzing throughput: a chain whose next rotation would
+/// land on a larger canvas stops there.
+const CHAIN_MAX_PIXELS: u64 = 1 << 18;
+
+/// The operation-chain invariants (issues #387, #415): a
+/// parsed filter chain applied to an image is total, and
+/// every filter lands on the canvas its kind predicts:
+///
+/// - a rotation lands on [`filters::rotated_canvas`] of the
+///   canvas it turns: quarter turns swap the axes, any
+///   other angle grows to the rotated bounding box;
+/// - a trim never grows either axis;
+/// - every other filter keeps the dimensions;
+/// - no filter leaves a zero dimension.
+///
+/// The chain runs on a small synthetic image (the
+/// harness's stand-in source), one filter at a time, in URL
+/// order across every `filters:` segment, with the
+/// request's `fill` color, resolved the way the engine
+/// resolves it, for the corners an arbitrary rotation
+/// uncovers. Resize, crop, and focal operations
+/// are not applied: they run in the engine, which this
+/// package cannot link while the server is binary-only
+/// (issue #417).
 pub fn check_chain(input: &str) {
     let Ok((_, _, request)) = url::parse_request(input) else {
         return;
     };
-    let base = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 18, |x, y| {
+    let chain: Vec<&url::Filter> = request
+        .operations
+        .iter()
+        .filter_map(|op| match op {
+            url::Operation::Filters(filters) => Some(filters.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let fill = url::RequestDirectives::analyze(&request.operations).fill;
+    let mut img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 18, |x, y| {
         image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 3) as u8])
     }));
-    let (bw, bh) = (base.width(), base.height());
-    let mut img = base;
-    for op in &request.operations {
-        if let url::Operation::Filters(filters) = op {
-            let (out, _) = filters::apply_filters_filled(img, filters, None);
-            assert!(
-                (out.width() == bw && out.height() == bh)
-                    || (out.width() == bh && out.height() == bw),
-                "a filter chain changed the canvas from {bw}x{bh} to {}x{}",
-                out.width(),
-                out.height()
-            );
-            img = out;
+    for filter in chain {
+        let (w, h) = (img.width(), img.height());
+        let predicted = match filter {
+            url::Filter::Rotate(degrees) => {
+                let (rw, rh) = filters::rotated_canvas(w, h, *degrees);
+                if rw as u64 * rh as u64 > CHAIN_MAX_PIXELS {
+                    return;
+                }
+                Some((rw, rh))
+            }
+            url::Filter::Trim(_) | url::Filter::TrimSides(..) => None,
+            _ => Some((w, h)),
+        };
+        let (out, _) = filters::apply_filters_filled(img, std::slice::from_ref(filter), fill);
+        let (ow, oh) = (out.width(), out.height());
+        assert!(
+            ow > 0 && oh > 0,
+            "{filter:?} collapsed the canvas from {w}x{h} to {ow}x{oh}"
+        );
+        match predicted {
+            Some(size) => assert_eq!(
+                (ow, oh),
+                size,
+                "{filter:?} turned a {w}x{h} canvas into {ow}x{oh}, not the predicted {}x{}",
+                size.0,
+                size.1
+            ),
+            None => assert!(
+                ow <= w && oh <= h,
+                "{filter:?} grew the canvas from {w}x{h} to {ow}x{oh}"
+            ),
         }
+        img = out;
     }
 }

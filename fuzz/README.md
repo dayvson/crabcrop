@@ -34,6 +34,12 @@ every input:
 every input: nothing panics and no allocation runs away,
 whether the bytes are an image the decoders accept, an
 SVG the sanitizer and rasterizer process, or garbage.
+Non-SVG bytes go through the server's decode dispatch
+(`engine::validate_source_image`: HEIC, animated GIF and
+WebP frames under the animation caps, the JPEG XL header
+probe) and through `engine::decode_image`, the bounded
+still decode with the server's dimension and allocation
+limits and its JPEG and WebP fast paths.
 
 `source_meta` checks metadata handling (`check_meta`):
 extracting a source's ICC profile, EXIF stream, XMP
@@ -43,27 +49,55 @@ containers, and converting through an extracted profile
 are all total over untrusted bytes.
 
 `op_chain` checks filter chains (`check_chain`): a
-request that parses has its `filters:` segments applied
-to a small synthetic image; application is total, and
-the canvas keeps its dimensions (or its rotation swap)
-under every chain.
+request that parses has the filters of its `filters:`
+segments applied one at a time, in URL order, to a small
+synthetic image. Application is total, and each filter
+lands on the canvas its kind predicts: a rotation on the
+canvas `filters::rotated_canvas` computes (quarter turns
+swap the axes, other angles grow to the rotated bounding
+box), a trim never grows either axis, every other filter
+keeps the dimensions, and no dimension is ever zero. A
+rotation whose canvas would exceed the harness's pixel
+budget ends the chain, the way the engine's output
+budget refuses it.
 
-The server-side modules live in the server binary crate,
-so the harness includes them by path (`src/url.rs`,
-`src/color.rs`, `src/filters.rs`, `src/svg.rs`), with
-small stand-ins for the two things they name from the
-rest of the crate (the engine's decode cap and the AI
-types in filter signatures). The opener lives in
+`op_chain` does not reach resize, crop, or focal
+operations yet: they run in the engine, which this
+package cannot link while the server is a binary-only
+crate. Driving the whole operation list through the
+engine waits on the library target (issue #417).
+
+The harness depends on the server's library target
+(`crabcrop`, issue #417), so each target runs the
+server's own code: the parser, the decode dispatch, the
+metadata code, the filters, and the SVG pipeline, with
+no copies or stand-ins. The opener lives in
 `crabcrop-url`, a direct dependency. This package is
 detached from the main workspace so fuzzing dependencies
 never enter a normal build.
+
+`Cargo.lock` here pins the same versions as the root
+lockfile. Because the package builds the server library,
+a dependency added or bumped in the root manifest (or a
+release version bump) can leave it stale, and the
+smoke's `--locked` build (in `scripts/test_all.sh` and
+CI) then fails until it is refreshed. Refresh it from
+the root lockfile:
+
+```sh
+cp Cargo.lock fuzz/Cargo.lock
+cargo update -w --manifest-path fuzz/Cargo.toml
+```
 
 ## The smoke (runs everywhere)
 
 `scripts/test_all.sh` runs the deterministic smoke: every
 seed in the corpora, every truncation of a representative
 seed per target, and single-byte mutations of each, through
-the same harness. On its own:
+the same harness. `op_chain` also checks that every seed
+parses, and runs a short fixed-seed random mutation pass
+(substitutions, insertions, and deletions over the grammar
+alphabet) as a stand-in for a real fuzz run. On its own:
 
 ```sh
 cargo test --manifest-path fuzz/Cargo.toml --lib --test smoke
@@ -99,5 +133,8 @@ non-sealed segments. `corpus/decode/` and
 corpus and the fixtures (small images per format, an SVG,
 EXIF and ICC carriers, and truncated prefixes of the
 animated formats). `corpus/op_chain/` seeds filter-chain
-remainders, plain and face-shaped. Add a seed file per
-interesting shape; keep them small.
+remainders: plain, face-shaped, quarter and arbitrary-angle
+rotations (`rotate(91)`, `rotate(45)`, negative and
+fractional angles), and trims that shrink the canvas. Add a
+seed file per interesting shape; keep them small, and make
+sure it parses (the smoke rejects a seed that does not).

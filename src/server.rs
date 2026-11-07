@@ -58,9 +58,9 @@ impl std::fmt::Debug for NamedDetector {
 
 mod process;
 pub(in crate::server) use process::{
-    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, JobPermits, Lane, MetaFlight, PROCESS_GATE_WAIT,
-    ProcessFailure, ProcessJob, SharedMeta, VIDEO_GATE_WAIT, run_process, wants_animation_gate,
-    wants_slow_lane,
+    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, Lane, MetaFlight,
+    PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SharedFlight, SharedResponse, VIDEO_GATE_WAIT,
+    run_process, wants_animation_gate, wants_slow_lane,
 };
 pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
@@ -531,16 +531,30 @@ fn width_hint(headers: &HeaderMap) -> Option<u32> {
     None
 }
 
+/// The widest width a client hint may resolve to (issue
+/// #403). Hints are client-controlled and the hinted width
+/// joins the cache key, so without a ceiling one URL fans
+/// out into a key (and a render) per quantization step all
+/// the way to the parser's dimension cap. 3840 is the UHD
+/// display width; the DPR hint still multiplies on top,
+/// and the hinted op never enlarges past the source either
+/// way.
+const MAX_HINT_WIDTH: u32 = 3840;
+const _: () = assert!(MAX_HINT_WIDTH <= crate::url::MAX_DIMENSION);
+
 /// Round a hinted width UP to the next multiple of the
 /// quantization step, so a client never gets less than it
-/// asked for and the cache sees bounded cardinality. The
-/// result is clamped to the parser's dimension cap: the
-/// synthesized op bypasses parsing, so without the clamp
-/// a near-cap hint at a coarse step would mint a size the
-/// URL grammar itself would reject.
+/// asked for and the cache sees bounded cardinality, then
+/// clamp it to [`MAX_HINT_WIDTH`]. The clamp happens here,
+/// before the cache key is built, so hints past the
+/// ceiling all share the ceiling's entry. It also keeps the
+/// synthesized op inside the parser's dimension cap: the op
+/// bypasses parsing, so a near-cap hint at a coarse step
+/// must not mint a size the URL grammar itself would
+/// reject.
 fn quantize_width(width: u32, step: u32) -> u32 {
     let step = step.max(1);
-    (width.div_ceil(step) * step).min(crate::url::MAX_DIMENSION)
+    (width.div_ceil(step) * step).min(MAX_HINT_WIDTH)
 }
 
 /// Whether the client sent `Save-Data: on`.
@@ -828,17 +842,23 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
 /// How many shared-tier objects one purge request scans
 /// inline (issue #368): the shared walk reads entry
 /// headers one at a time, so its inline cost must not
-/// grow with the whole bucket. The tombstone already
-/// guarantees the purge's correctness (issue #350); a
-/// walk that outgrows the budget finishes in a
-/// background task and logs its own count on completion.
+/// grow with the whole bucket. A walk that outgrows the
+/// budget finishes in a background task and logs its own
+/// count on completion. Correctness does not wait for
+/// it: the tombstone keeps writes begun before the purge
+/// out (issue #350), and the purge stays active until
+/// the walk ends, so a lookup that overlaps the walk
+/// treats a copy the purge covers as a miss (issue #400).
 const SHARED_PURGE_INLINE_SCAN: usize = 128;
 
 /// Queue the un-scanned remainder of a bounded shared
-/// purge, if any, on a background task (issue #368).
+/// purge, if any, on a background task (issue #368). The
+/// purge stays active until that task finishes; with
+/// nothing left to walk it ends here.
 fn spawn_shared_purge_rest(
     shared: &Arc<crate::s3store::S3Store>,
     pending: Option<crate::s3store::PendingPurge>,
+    active: crate::cache::ActivePurge,
     event: &'static str,
     target: &str,
 ) {
@@ -847,6 +867,7 @@ fn spawn_shared_purge_rest(
         let target = target.to_string();
         tokio::spawn(async move {
             let removed = shared.finish_purge(pending).await;
+            drop(active);
             purge_log(event, &target, Some(removed));
         });
     }
@@ -988,8 +1009,11 @@ async fn purge_handle(
         // The tombstone lands before any tier is touched
         // (issue #350): a write begun before this purge can
         // then see it whenever it tries to land, including
-        // after this handler has finished.
-        task_state.purge_guard.record_key(&key_form);
+        // after this handler has finished. The purge stays
+        // active until the shared walk ends (issue #400).
+        let active = task_state
+            .purge_guard
+            .begin(crate::cache::PurgeTarget::Key(key_form.clone()));
         let mut removed = task_state.cache.purge_matching(&key_form);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1010,7 +1034,7 @@ async fn purge_handle(
                 .purge_matching_bounded(&key_form, &epoch_form, SHARED_PURGE_INLINE_SCAN)
                 .await;
             removed += walked;
-            spawn_shared_purge_rest(shared, pending, "purge", &task_target);
+            spawn_shared_purge_rest(shared, pending, active, "purge", &task_target);
         }
         task_state.metrics.record_purge();
         purge_log("purge", &task_target, Some(removed));
@@ -1092,7 +1116,9 @@ async fn purge_group_handle(
     let removed = tokio::spawn(async move {
         // Tombstone first, tiers second (issue #350), as in
         // the per-URL purge.
-        task_state.purge_guard.record_group(&group);
+        let active = task_state
+            .purge_guard
+            .begin(crate::cache::PurgeTarget::Group(group.clone()));
         let mut removed = task_state.cache.purge_group(&group);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1107,7 +1133,7 @@ async fn purge_group_handle(
                 .purge_group_bounded(&group, SHARED_PURGE_INLINE_SCAN)
                 .await;
             removed += walked;
-            spawn_shared_purge_rest(shared, pending, "purge-group", &task_target);
+            spawn_shared_purge_rest(shared, pending, active, "purge-group", &task_target);
         }
         task_state.metrics.record_purge();
         purge_log("purge-group", &task_target, Some(removed));
@@ -1224,7 +1250,9 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
     tokio::spawn(async move {
         // Tombstone first, tiers second (issue #350), as in
         // the per-URL purge.
-        task_state.purge_guard.record_source(&source);
+        let active = task_state
+            .purge_guard
+            .begin(crate::cache::PurgeTarget::Source(source.clone()));
         let mut removed = task_state.cache.purge_source(&source);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1239,7 +1267,7 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
                 .purge_source_bounded(&source, SHARED_PURGE_INLINE_SCAN)
                 .await;
             removed += walked;
-            spawn_shared_purge_rest(shared, pending, "purge-source", &source);
+            spawn_shared_purge_rest(shared, pending, active, "purge-source", &source);
         }
         purge_log("purge-source", &source, Some(removed));
         removed
@@ -2043,15 +2071,34 @@ async fn serve(
     // leads (one fetch, one encode, under the gates below);
     // concurrent requests for the same key wait for the
     // leader, then re-check the tiers and serve its entry.
-    // A leader whose result is not cached (an error, a
-    // fallback) releases its waiters to take the miss path
-    // themselves, one at a time, so a failing origin is
-    // retried by the waiters rather than masked. Waits are
-    // capped: a waiter whose leaders keep failing stops
-    // queueing and runs the miss path itself (issue #375),
-    // so it ends with the origin's real answer instead of
-    // a busy response masking it.
+    // A leader whose result no tier stored (an error, a
+    // fallback, a render with the caches off) leaves its
+    // response in the flight's slot instead, and a waiter
+    // whose request is identical to the leader's answers
+    // with it (issue #407): it is the answer the waiter
+    // would have produced itself, and taking it keeps a
+    // burst on a failing origin at one fetch per flight
+    // rather than one per waiter. Identical means the same
+    // raw path (the sealing, the cache groups, and the
+    // cache lifetime all come from it) and the same header
+    // inputs as the miss path sees them: the negotiated
+    // format, not the raw Accept (on this path errors are
+    // plain text whatever it says), and the quantized
+    // width, not the raw hint, so browsers that phrase the
+    // same request differently still share one flight. The
+    // conditional header is left out: each waiter applies
+    // its own. A waiter that cannot take the response
+    // (another spelling of the key, a body past the share
+    // cap, a leader whose request was dropped, a run a
+    // purge of the key overtook) leads or follows the next
+    // flight. Waits are capped: a waiter whose flights
+    // keep ending without an answer for it stops queueing
+    // and runs the miss path itself (issue #375), so it
+    // ends with the origin's real answer instead of a busy
+    // response masking it.
+    let flight_request = format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
     let mut waits = 0;
+    let mut followed: Option<Arc<FlightSlot>> = None;
     loop {
         if let Some((hit, cache_status)) = lookup_tiers(state, &cache_key, &groups).await {
             record.cache_hit = true;
@@ -2062,16 +2109,51 @@ async fn serve(
             finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
         }
+        let taken = followed
+            .take()
+            .and_then(|slot| {
+                slot.shared
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|shared| shared.request == flight_request)
+                    .cloned()
+            })
+            .filter(|shared| {
+                !state
+                    .purge_guard
+                    .purge_covers(shared.snapshot, &cache_key, &groups)
+            });
+        if let Some(shared) = taken {
+            record.bytes_out = shared.response.body.len();
+            record.fallback = shared.fallback;
+            let mut response = respond_shared(&shared.response);
+            if let Some(etag) = &shared.etag {
+                finalize_validators(&mut response, etag, if_none_match);
+            }
+            return (response, record);
+        }
         match state.inflight.lead(&cache_key) {
-            Flight::Leader(guard) => {
-                let (mut response, record, render_etag) = serve_miss(state, work, record).await;
+            Flight::Leader(guard, slot) => {
+                let snapshot = state.purge_guard.snapshot();
+                let (response, record, render_etag) = serve_miss(state, work, record).await;
+                let (mut response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
+                if let Some(shared) = shared {
+                    *slot.shared.lock().unwrap() = Some(SharedFlight {
+                        request: flight_request,
+                        snapshot,
+                        response: shared,
+                        etag: render_etag.clone(),
+                        fallback: record.fallback,
+                    });
+                }
                 drop(guard);
                 if let Some(etag) = &render_etag {
                     finalize_validators(&mut response, etag, if_none_match);
                 }
                 return (response, record);
             }
-            Flight::Follower(mut changed) => {
+            Flight::Follower(mut changed, slot) => {
                 if waits >= MAX_FLIGHT_WAITS {
                     // The wait cap is spent: run the miss
                     // path, the same settlement the meta
@@ -2096,10 +2178,19 @@ async fn serve(
                 // re-checks the tiers and may lead itself.
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed())
                     .await;
+                followed = Some(slot);
             }
         }
     }
 }
+
+/// The body size above which an image flight's response
+/// is not shared with its followers (issue #407). The
+/// body is already in memory and followers share the
+/// leader's buffer rather than copying it, so the cap
+/// only bounds what one flight can pin for its followers;
+/// it sits well above any realistic still render.
+const FLIGHT_SHARE_CAP: usize = 64 * 1024 * 1024;
 
 /// The body size above which a meta document is not
 /// shared with a flight's followers (issue #295): real
@@ -2110,20 +2201,23 @@ const META_SHARE_CAP: usize = 4 * 1024 * 1024;
 /// Meta singleflight (issue #295): concurrent identical
 /// meta requests share one run of the miss path instead
 /// of each loading and rendering the same source. The
-/// leader runs `serve_miss` unchanged; on a 200 it
-/// collects the document into the flight's slot before
-/// its guard drops, and followers answer with a
-/// reconstructed response (the leader's status, headers,
-/// and body) and their own request record, which
-/// truthfully shows they ran no load and no process
-/// stage. Only 200 documents are shared: a flight that
-/// produced anything else leaves its slot empty, and its
-/// followers loop to lead or follow the next flight and
-/// finally run the miss path themselves, so errors are
-/// never shared and every request keeps the error
-/// semantics of a solo request. Nothing outlives the
-/// flight: meta remains uncached across time, exactly
-/// as before.
+/// leader runs `serve_miss` unchanged and collects its
+/// response into the flight's slot before its guard
+/// drops, and followers answer with a reconstructed
+/// response (the leader's status, headers, and body) and
+/// their own request record, which truthfully shows they
+/// ran no load and no process stage. Errors are shared
+/// too (issue #407): meta errors are always the JSON
+/// envelope, shaped only by inputs the flight key pins,
+/// so a follower receives exactly the failure a solo
+/// request gets, and a burst against a failing origin
+/// costs one fetch instead of one per follower. A flight
+/// that leaves its slot empty (a body past the share
+/// cap, a leader whose request was dropped) sends its
+/// followers to lead or follow the next flight, and
+/// finally to run the miss path themselves. Nothing
+/// outlives the flight: meta remains uncached across
+/// time, exactly as before.
 ///
 /// The two choices this settles, deliberately: request
 /// records stay per request with no flight marker (the
@@ -2144,13 +2238,9 @@ async fn serve_meta_flight(
         match state.inflight.lead_meta(key) {
             MetaFlight::Leader(guard, slot) => {
                 let (response, record, _) = serve_miss(state, work, record).await;
-                if response.status() == StatusCode::OK {
-                    let (response, shared) = share_meta_response(response).await;
-                    if let Some(shared) = shared {
-                        *slot.shared.lock().unwrap() = Some(shared);
-                    }
-                    drop(guard);
-                    return (response, record);
+                let (response, shared) = share_response(response, META_SHARE_CAP).await;
+                if let Some(shared) = shared {
+                    *slot.shared.lock().unwrap() = Some(shared);
                 }
                 drop(guard);
                 return (response, record);
@@ -2176,34 +2266,34 @@ async fn serve_meta_flight(
     }
 }
 
-/// Rebuild a response from a shared meta document: the
-/// leader's status and headers, its body bytes.
-fn respond_shared(shared: &SharedMeta) -> Response {
+/// Rebuild a response from a flight's shared response:
+/// the leader's status and headers, its body bytes.
+fn respond_shared(shared: &SharedResponse) -> Response {
     let mut response = Response::new(axum::body::Body::from(shared.body.clone()));
     *response.status_mut() = shared.status;
     *response.headers_mut() = shared.headers.clone();
     response
 }
 
-/// Split a 200 meta response into the shared form a
+/// Split a leader's response into the shared form a
 /// flight slot carries, rebuilding the leader's own
 /// response from the same parts. Returns `None` for the
 /// shared form when the body is not collected whole
-/// within the share cap; meta bodies are in-memory, so
-/// in practice only the cap refuses, and the leader's
+/// within `cap`; the miss path's bodies are in-memory,
+/// so in practice only the cap refuses, and the leader's
 /// response is rebuilt untouched in that case whenever
 /// the body was not consumed trying.
-async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta>) {
+async fn share_response(response: Response, cap: usize) -> (Response, Option<SharedResponse>) {
     let (parts, body) = response.into_parts();
     if <axum::body::Body as axum::body::HttpBody>::size_hint(&body)
         .exact()
-        .is_none_or(|n| n > META_SHARE_CAP as u64)
+        .is_none_or(|n| n > cap as u64)
     {
         return (Response::from_parts(parts, body), None);
     }
-    match axum::body::to_bytes(body, META_SHARE_CAP).await {
+    match axum::body::to_bytes(body, cap).await {
         Ok(bytes) => {
-            let shared = SharedMeta {
+            let shared = SharedResponse {
                 status: parts.status,
                 headers: parts.headers.clone(),
                 body: bytes,
@@ -2212,11 +2302,11 @@ async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta
             (response, Some(shared))
         }
         Err(_) => {
-            // Unreachable for the in-memory bodies meta
-            // answers with (the size hint above already
-            // vouched for the body); the status and
-            // headers survive, the body does not.
-            eprintln!("meta flight: leader body could not be collected for sharing");
+            // Unreachable for the in-memory bodies the
+            // miss path answers with (the size hint above
+            // already vouched for the body); the status
+            // and headers survive, the body does not.
+            eprintln!("flight: leader body could not be collected for sharing");
             (Response::from_parts(parts, axum::body::Body::empty()), None)
         }
     }
@@ -2225,7 +2315,10 @@ async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta
 /// How many times one request may wait on another
 /// request's in-flight miss for the same key before it
 /// stops waiting and runs the miss path itself (audit
-/// R2-09, issue #375).
+/// R2-09, issue #375). Since issue #407 a burst of
+/// identical requests settles on the first flight, so the
+/// cap only comes into play for waiters no flight could
+/// answer.
 const MAX_FLIGHT_WAITS: u32 = 3;
 
 /// Whether a purge recorded after `snapshot` covers
@@ -2349,9 +2442,17 @@ fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedIma
 /// leaving the persistent copies invisible to the group
 /// purge. Every write this chain makes (promotions,
 /// merge write-backs) runs under the purge guard, under
-/// the generation the lookup started with. Returns the
-/// image and the `Cache-Status` value for the tier that
-/// served it.
+/// the generation the lookup started with. A disk or
+/// shared copy that a purge covers is a miss, and is
+/// deleted on sight, when that purge was running at any
+/// point since the lookup began (issue #400): the purge
+/// may not have reached the copy when it was read, and
+/// serving or promoting it would outlive the purge. The
+/// memory tier needs no such check: a purge empties it
+/// before any slower tier, and every way back in is a
+/// promotion through this chain or a guarded write.
+/// Returns the image and the `Cache-Status` value for
+/// the tier that served it.
 async fn lookup_tiers(
     state: &AppState,
     cache_key: &str,
@@ -2421,6 +2522,16 @@ async fn lookup_tiers(
     if let Some(shared) = &state.shared_store
         && let Some(mut image) = shared.get(cache_key).await
     {
+        // Checked after the read, against purges running at
+        // any point since the snapshot: a walk can delete
+        // this object and end while its bytes are in flight.
+        if state
+            .purge_guard
+            .running_covers(snapshot, cache_key, &image.groups)
+        {
+            shared.remove(cache_key).await;
+            return None;
+        }
         if !groups.is_empty() {
             let merged = crate::cache::union_groups(&image.groups, groups);
             if merged != image.groups {
@@ -2461,6 +2572,13 @@ async fn lookup_disk_tier(
     let (image, grew) = store
         .blocking(move |store| {
             let mut image = store.get(&key)?;
+            if guard.running_covers(snapshot, &key, &image.groups) {
+                // A purge running since the lookup began
+                // covers this copy (issue #400): drop it
+                // rather than serve and promote it.
+                store.remove(&key);
+                return None;
+            }
             let mut grew = false;
             if !lookup_groups.is_empty() && store.merge_groups(&key, &lookup_groups) {
                 image.groups = crate::cache::union_groups(&image.groups, &lookup_groups);
@@ -2711,8 +2829,13 @@ async fn serve_miss(
     // comes from the slow lane (issue #324), so the still
     // pool keeps every permit throughout. Like the AI
     // permit, it travels with the process job and drains
-    // with it (issue #357).
-    let anim_permit = if wants_animation_gate(&bytes, &directives) {
+    // with it (issue #357). The decision covers animated
+    // GIF sources rendered to WebP as well as animated
+    // WebP sources, and counts the negotiated format, not
+    // only an explicit one (issue #405); it is made once,
+    // so the gate, the lane, and a fallback retry agree.
+    let animated_webp = wants_animation_gate(&bytes, &directives, preferred);
+    let anim_permit = if animated_webp {
         match tokio::time::timeout(ANIM_GATE_WAIT, state.anim_gate.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Some(permit),
             _ => {
@@ -2732,6 +2855,13 @@ async fn serve_miss(
     // A width hint applies only when the URL sizes nothing
     // itself: it synthesizes the width-only size op a client
     // URL would have carried, ahead of the URL's own ops.
+    // The op carries `no_upscale` semantics (issue #403): a
+    // hint says how wide the client displays the image, not
+    // that the server should invent pixels, so a hint past
+    // the source returns the source width, and the DPR hint
+    // runs into the same cap. The directive is request-wide,
+    // but the URL has no size op of its own here, so the
+    // synthesized op is the only resize it can bound.
     let job_ops = match hinted_width {
         Some(w) => {
             let mut combined = vec![crate::url::Operation::Size(crate::url::ImageSize {
@@ -2740,6 +2870,11 @@ async fn serve_miss(
                 flip_horizontal: false,
                 flip_vertical: false,
             })];
+            if !directives.no_upscale {
+                combined.push(crate::url::Operation::Filters(vec![
+                    crate::url::Filter::NoUpscale,
+                ]));
+            }
             combined.extend(ops.iter().cloned());
             combined
         }
@@ -2783,7 +2918,7 @@ async fn serve_miss(
     // its saturation sheds slow requests only and stills
     // keep their full capacity; everything else takes
     // the stills lane as before.
-    let lane = if wants_slow_lane(&bytes, &directives, wants_video, wants_frame, wants_page) {
+    let lane = if wants_slow_lane(animated_webp, wants_video, wants_frame, wants_page) {
         Lane::Slow
     } else {
         Lane::Process
@@ -2887,7 +3022,7 @@ async fn serve_miss(
                                 _ => may_retry = false,
                             }
                         }
-                        if may_retry && wants_animation_gate(&bytes, &directives) {
+                        if may_retry && animated_webp {
                             match tokio::time::timeout(
                                 ANIM_GATE_WAIT,
                                 state.anim_gate.clone().acquire_owned(),
@@ -3735,6 +3870,19 @@ mod tests {
         let opts = oxideav_webp::EncodeOptions::default()
             .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
         oxideav_webp::encode_animation(&frames, &opts).unwrap()
+    }
+
+    /// One-frame GIF bytes: the GIF animation probe's
+    /// negative case (issue #405).
+    fn still_gif_bytes() -> Vec<u8> {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            40,
+            20,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Gif).unwrap();
+        buf.into_inner()
     }
 
     /// Still WebP bytes: the animation probe's negative
@@ -6575,9 +6723,10 @@ mod tests {
     /// same files in its own suite; a disagreement anywhere
     /// fails the gate here or there, and the mismatch list is
     /// printed whole so one run shows every divergence.
-    /// These tests live here rather than in url.rs because
-    /// the fuzz crate includes url.rs textually, without the
-    /// explain module or serde_json in scope.
+    /// These tests were put here rather than in url.rs while
+    /// the fuzz crate included url.rs textually, without the
+    /// explain module or serde_json in scope; since the
+    /// library target (issue #417) nothing keeps them here.
     fn load_spec(name: &str) -> serde_json::Value {
         let text = match name {
             "explain-verdicts.json" => include_str!("../spec/explain-verdicts.json"),
@@ -6849,6 +6998,38 @@ mod tests {
         let base = spawn_app_with_presets(preset_test_map(), false).await;
         let resp = get_signed(&base, &format!("preset:nope/{src}")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn thousands_of_distinct_unknown_presets_are_still_unknown_preset() {
+        // Issue #409: the cache-group scan runs before
+        // expansion, and used to de-duplicate quadratically.
+        // A presets-only remainder of about 5,400 distinct
+        // names (just under hyper's URI cap) answers the same
+        // 400 unknown_preset, naming the first unknown, on
+        // the image route and on /explain, without a fetch.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_presets(preset_test_map(), true).await;
+        let mut remainder = String::from("preset:small/");
+        for i in 0..5_400 {
+            remainder.push_str(&format!("preset:{i:03x}/"));
+        }
+        remainder.push_str(&src);
+        assert!(remainder.len() > 60_000, "{}", remainder.len());
+        for route in ["", "explain/"] {
+            let resp = client()
+                .get(format!("{base}/{route}{}/{remainder}", sign(&remainder)))
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "/{route}");
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"], "unknown_preset", "/{route}");
+            assert_eq!(body["error"]["message"], "unknown preset: 000", "/{route}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     /// Issue #247: with NO presets configured, a `preset:`
@@ -9678,6 +9859,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_objects_crop_past_the_class_cap_is_a_400_on_both_routes() {
+        // Issue #408: a 33rd distinct class is the grammar's
+        // 400 invalid_crop on the image route and on
+        // /explain, before any fetch, as at 0.9.10, not a
+        // silent truncation that reaches the detector (the
+        // 501 below) with classes the caller never sees
+        // dropped.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app(false).await;
+        let names = |n: usize| {
+            (0..n)
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for n in [33, 40] {
+            let remainder = format!("crop:100x100:objects({})/{src}", names(n));
+            for route in ["", "explain/"] {
+                let resp = client()
+                    .get(format!("{base}/{route}{}/{remainder}", sign(&remainder)))
+                    .header("accept", "application/json")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "/{route} {n}");
+                let body: serde_json::Value =
+                    serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+                assert_eq!(body["error"]["code"], "invalid_crop", "/{route} {n}");
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // 32 distinct classes, spelled with repeats, pass
+        // the grammar: the image route reaches the missing
+        // detector's 501 and /explain reports the folded set.
+        let remainder = format!("crop:100x100:objects({},C0,c31)/{src}", names(32));
+        let resp = client()
+            .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let resp = client()
+            .get(format!("{base}/explain/{}/{remainder}", sign(&remainder)))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = resp.text().await.unwrap();
+        assert!(
+            text.contains(&format!("objects({}):1", names(32))),
+            "explain: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn recolorclass_renders_and_needs_a_detector() {
         let src = spawn_image_server().await;
         // Configured: the recolor renders.
@@ -10144,9 +10381,29 @@ mod tests {
         assert_eq!(quantize_width(250, 100), 300);
         assert_eq!(quantize_width(250, 1), 250);
         assert_eq!(quantize_width(250, 0), 250);
-        // Rounding up never crosses the parser's cap.
-        assert_eq!(quantize_width(16383, 2000), 16383);
-        assert_eq!(quantize_width(16383, 100), 16383);
+        // Hints past the ceiling all resolve to it (issue
+        // #403), so they share one cache entry, and rounding
+        // up never crosses the ceiling, let alone the
+        // parser's cap.
+        assert_eq!(quantize_width(3800, 100), 3800);
+        assert_eq!(quantize_width(3801, 100), MAX_HINT_WIDTH);
+        assert_eq!(quantize_width(5000, 100), MAX_HINT_WIDTH);
+        assert_eq!(quantize_width(16383, 2000), MAX_HINT_WIDTH);
+        assert_eq!(quantize_width(16383, 1), MAX_HINT_WIDTH);
+    }
+
+    #[test]
+    fn hinted_widths_have_bounded_cardinality() {
+        // Every width the hint headers accept resolves to
+        // one of a bounded set of keys (issue #403): at the
+        // default step, the 38 multiples of 100 up to 3800
+        // plus the 3840 ceiling, where it used to be 164
+        // steps up to the parser cap.
+        let distinct: std::collections::BTreeSet<u32> = (1..=crate::url::MAX_DIMENSION)
+            .map(|w| quantize_width(w, 100))
+            .collect();
+        assert_eq!(distinct.len(), 39);
+        assert_eq!(distinct.last(), Some(&MAX_HINT_WIDTH));
     }
 
     #[test]
@@ -10289,18 +10546,26 @@ mod tests {
         assert!(resp.headers().get(header::ETAG).is_none());
     }
 
+    /// A black PNG of the given size: a source wider than
+    /// the hints the client-hint tests send.
+    fn png_of(width: u32, height: u32) -> Vec<u8> {
+        let img = DynamicImage::new_rgb8(width, height);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
     #[tokio::test]
     async fn width_hint_sizes_an_unsized_url_and_separates_the_cache() {
-        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let (src, hits) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
         let base = spawn_app(false).await;
-        // The source is 100x60 and the URL sizes nothing.
+        // The source is 640x480 and the URL sizes nothing.
         let remainder = format!("filters:format(png)/{src}");
         let width_of = |resp: reqwest::Response| async {
             let bytes = resp.bytes().await.unwrap();
             image::load_from_memory(&bytes).unwrap().width()
         };
-        // 250 quantizes to 300 (upscale is the engine's
-        // default posture): proof the synthesized op ran.
+        // 250 quantizes to 300: proof the synthesized op ran.
         let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "250")]).await;
         assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
         // The response advertises the hints it reads, so a
@@ -10320,8 +10585,113 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         // No hint at all: its own entry again.
         let resp = get_with_headers(&base, &remainder, &[]).await;
-        assert_eq!(width_of(resp).await, 100);
+        assert_eq!(width_of(resp).await, 640);
         assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_width_hint_never_upscales_past_the_source() {
+        let src = spawn_bytes_server(png_of(640, 480)).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(png)/{src}");
+        let dims_of = |resp: reqwest::Response| async {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.bytes().await.unwrap();
+            let img = image::load_from_memory(&bytes).unwrap();
+            (img.width(), img.height())
+        };
+        // Issue #403: a hint past the source used to upscale
+        // to the hinted width (3000x2250 here). It returns
+        // the source width now.
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "3000")]).await;
+        assert_eq!(dims_of(resp).await, (640, 480));
+        // The DPR hint runs into the same cap instead of
+        // doubling past it (it used to answer 6000x4500).
+        let resp = get_with_headers(
+            &base,
+            &remainder,
+            &[("Sec-CH-Width", "3000"), ("Sec-CH-DPR", "2")],
+        )
+        .await;
+        assert_eq!(dims_of(resp).await, (640, 480));
+        // A hint whose DPR product crosses the source stops
+        // at the source too: 400 * 2 is 800, past 640.
+        let resp = get_with_headers(
+            &base,
+            &remainder,
+            &[("Sec-CH-Width", "400"), ("Sec-CH-DPR", "2")],
+        )
+        .await;
+        assert_eq!(dims_of(resp).await, (640, 480));
+        // Below the source the hint and DPR still size as
+        // before: 300 * 2 is 600.
+        let resp = get_with_headers(
+            &base,
+            &remainder,
+            &[("Sec-CH-Width", "300"), ("Sec-CH-DPR", "2")],
+        )
+        .await;
+        assert_eq!(dims_of(resp).await, (600, 450));
+        // An explicit size in the URL is not a hint: the
+        // engine's upscale posture is unchanged for it.
+        let resp = get_with_headers(&base, &format!("1280x0/{src}"), &[]).await;
+        assert_eq!(dims_of(resp).await, (1280, 960));
+    }
+
+    #[tokio::test]
+    async fn a_width_hint_rasterizes_an_svg_at_the_hinted_width() {
+        // A vector has no pixels to invent: an SVG rasterizes
+        // at the size the request heads for, and the
+        // `no_upscale` cap is that raster, the same as for an
+        // explicit `filters:no_upscale` in the URL. So a hint
+        // past the intrinsic 100x10 still renders crisp at
+        // the hinted width, and the hint ceiling (issue #403)
+        // is what bounds it.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="10"><rect width="100" height="10" fill="#00ff00"/></svg>"##;
+        let (src, _) = spawn_counting_server(200, "image/svg+xml", svg.to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(png)/{src}");
+        let dims_of = |resp: reqwest::Response| async {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.bytes().await.unwrap();
+            let img = image::load_from_memory(&bytes).unwrap();
+            (img.width(), img.height())
+        };
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "300")]).await;
+        assert_eq!(dims_of(resp).await, (300, 30));
+        let explicit = format!("300x0/filters:no_upscale:format(png)/{src}");
+        let resp = get_with_headers(&base, &explicit, &[]).await;
+        assert_eq!(dims_of(resp).await, (300, 30));
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "9000")]).await;
+        assert_eq!(dims_of(resp).await, (MAX_HINT_WIDTH, 384));
+    }
+
+    #[tokio::test]
+    async fn hints_past_the_ceiling_share_one_cache_entry() {
+        let (src, hits) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(png)/{src}");
+        // Issue #403: every hint past MAX_HINT_WIDTH resolves
+        // to it before the key is built, so a client cycling
+        // through large widths gets one render and one entry,
+        // not one per quantization step.
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "5000")]).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(resp.status(), StatusCode::OK);
+        for width in ["3900", "9000", "16383"] {
+            let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", width)]).await;
+            assert_eq!(
+                header(&resp, "cache-status"),
+                "crabcrop; hit",
+                "hint {width}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Below the ceiling, a different step is its own
+        // entry as before.
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "3700")]).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -13221,16 +13591,16 @@ mod tests {
             let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
             crate::url::RequestDirectives::analyze(&ops)
         };
-        let slow = |bytes: &[u8], ops_str: &str| {
+        let slow_with = |bytes: &[u8], ops_str: &str, preferred: Option<ImageFormat>| {
             let d = directives(ops_str);
             wants_slow_lane(
-                bytes,
-                &d,
+                wants_animation_gate(bytes, &d, preferred),
                 d.explicit_format.is_some_and(|f| f.is_video()),
                 d.frame.is_some(),
                 d.page.is_some(),
             )
         };
+        let slow = |bytes: &[u8], ops_str: &str| slow_with(bytes, ops_str, None);
         let anim_webp = animated_webp_bytes();
         let anim_gif = animated_gif_bytes();
         assert!(slow(&anim_webp, "example.com/i.webp"));
@@ -13242,6 +13612,20 @@ mod tests {
         assert!(!slow(&anim_gif, "example.com/i.gif"));
         assert!(!slow(&anim_webp, "filters:format(gif)/example.com/i.webp"));
         assert!(!slow(&anim_webp, "filters:format(png)/example.com/i.webp"));
+        // Issue #405: an animated GIF rendered to WebP runs
+        // the animated WebP encoder, so it is slow whether
+        // WebP was named in the URL or negotiated.
+        assert!(slow(&anim_gif, "filters:format(webp)/example.com/i.gif"));
+        assert!(slow_with(
+            &anim_gif,
+            "example.com/i.gif",
+            Some(ImageFormat::WebP)
+        ));
+        assert!(!slow_with(
+            &anim_gif,
+            "example.com/i.gif",
+            Some(ImageFormat::Avif)
+        ));
     }
 
     #[tokio::test]
@@ -13638,51 +14022,138 @@ mod tests {
 
     #[test]
     fn animation_gate_predicate_matches_the_encoder_trigger() {
-        // Issue #231: only an animated WebP source rendered
-        // to WebP output reaches the slow lossless animation
-        // encode, so only that combination takes the gate.
+        // Issue #231: only an animated source rendered to
+        // WebP output reaches the slow animated WebP encode,
+        // so only that combination takes the gate. Issue
+        // #405: since #370 that includes an animated GIF
+        // source whose output resolves to WebP, through an
+        // explicit format(webp) or a negotiated Accept.
         let anim = animated_webp_bytes();
+        let anim_gif = animated_gif_bytes();
         let directives = |ops_str: &str| {
             let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
             crate::url::RequestDirectives::analyze(&ops)
         };
-        assert!(wants_animation_gate(
+        let gated = |bytes: &[u8], ops_str: &str, preferred: Option<ImageFormat>| {
+            wants_animation_gate(bytes, &directives(ops_str), preferred)
+        };
+        assert!(gated(&anim, "example.com/i.webp", None));
+        assert!(gated(
             &anim,
-            &directives("example.com/i.webp")
+            "filters:format(webp)/example.com/i.webp",
+            None
         ));
-        assert!(wants_animation_gate(
-            &anim,
-            &directives("filters:format(webp)/example.com/i.webp")
+        // A negotiated AVIF or JXL cannot carry the frames:
+        // the animation falls back to WebP and is encoded
+        // as one, gate and all.
+        for preferred in [ImageFormat::WebP, ImageFormat::Avif, ImageFormat::Jxl] {
+            assert!(gated(&anim, "example.com/i.webp", Some(preferred)));
+        }
+        // An animated GIF to WebP, explicit or negotiated,
+        // runs the same encoder and takes the same gate.
+        assert!(gated(
+            &anim_gif,
+            "filters:format(webp)/example.com/i.gif",
+            None
         ));
-        // Explicit non-WebP outputs never reach the
-        // animated WebP encoder: GIF output uses the fast
-        // GIF encoder, still formats take frame 0, and
-        // video takes the video gate instead.
-        for fmt in ["gif", "png", "jpeg", "mp4"] {
+        assert!(gated(
+            &anim_gif,
+            "example.com/i.gif",
+            Some(ImageFormat::WebP)
+        ));
+        assert!(gated(
+            &anim_gif,
+            "filters:format(webp)/example.com/i.gif",
+            Some(ImageFormat::Avif)
+        ));
+        // An animated GIF that stays GIF (no preference, or
+        // a negotiated AVIF or JXL, which fall back to GIF)
+        // uses the chunked GIF encoder, ungated.
+        for preferred in [None, Some(ImageFormat::Avif), Some(ImageFormat::Jxl)] {
             assert!(
-                !wants_animation_gate(
-                    &anim,
-                    &directives(&format!("filters:format({fmt})/example.com/i.webp"))
-                ),
-                "format({fmt}) must not take the animation gate"
+                !gated(&anim_gif, "example.com/i.gif", preferred),
+                "{preferred:?} must not gate an animated GIF"
             );
         }
+        // Explicit non-WebP outputs never reach the
+        // animated WebP encoder, whatever was negotiated:
+        // GIF output uses the GIF encoder, still formats
+        // take frame 0, and video takes the video gate
+        // instead.
+        for fmt in ["gif", "png", "jpeg", "mp4"] {
+            for (src, name) in [(&anim, "i.webp"), (&anim_gif, "i.gif")] {
+                assert!(
+                    !gated(
+                        src,
+                        &format!("filters:format({fmt})/example.com/{name}"),
+                        Some(ImageFormat::WebP)
+                    ),
+                    "format({fmt}) on {name} must not take the animation gate"
+                );
+            }
+        }
         // Still sources are never gated, whatever their
-        // container: a still WebP carries no ANIM chunk, a
-        // GIF source never reaches the WebP animation path,
-        // and a PNG is not WebP at all.
-        assert!(!wants_animation_gate(
-            &still_webp_bytes(),
-            &directives("example.com/i.webp")
-        ));
-        assert!(!wants_animation_gate(
-            &animated_gif_bytes(),
-            &directives("example.com/i.gif")
-        ));
-        assert!(!wants_animation_gate(
-            &test_png(),
-            &directives("example.com/i.png")
-        ));
+        // container or output: a still WebP carries no ANIM
+        // chunk, a one-frame GIF has no second frame, and a
+        // PNG is neither.
+        for preferred in [None, Some(ImageFormat::WebP)] {
+            assert!(!gated(&still_webp_bytes(), "example.com/i.webp", preferred));
+            assert!(!gated(&still_gif_bytes(), "example.com/i.gif", preferred));
+            assert!(!gated(
+                &still_gif_bytes(),
+                "filters:format(webp)/example.com/i.gif",
+                preferred
+            ));
+            assert!(!gated(&test_png(), "example.com/i.png", preferred));
+        }
+    }
+
+    #[test]
+    fn animation_gate_predicate_agrees_with_the_engine() {
+        // Issue #405: the predicate drifted from the
+        // engine's routing once already, so this runs the
+        // real engine over every source, explicit format,
+        // and negotiated preference the predicate decides
+        // between, and requires the gate exactly when the
+        // render comes out as an animated WebP.
+        let sources: [(&str, Vec<u8>); 5] = [
+            ("animated gif", animated_gif_bytes()),
+            ("animated webp", animated_webp_bytes()),
+            ("still gif", still_gif_bytes()),
+            ("still webp", still_webp_bytes()),
+            ("png", test_png()),
+        ];
+        let formats = [
+            "",
+            "filters:format(webp)/",
+            "filters:format(gif)/",
+            "filters:format(png)/",
+        ];
+        let preferences = [None, Some(ImageFormat::WebP), Some(ImageFormat::Jxl)];
+        for (name, src) in &sources {
+            for prefix in formats {
+                for preferred in preferences {
+                    let (ops, _) =
+                        crate::url::parse_operations(&format!("{prefix}example.com/i")).unwrap();
+                    let directives = crate::url::RequestDirectives::analyze(&ops);
+                    let out = Engine
+                        .process_preferred(
+                            src,
+                            &ops,
+                            crate::engine::ProcessContext {
+                                preferred,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        wants_animation_gate(src, &directives, preferred),
+                        crate::engine::is_animated_webp(&out.bytes),
+                        "{name} with {prefix:?} and {preferred:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -13710,6 +14181,62 @@ mod tests {
         assert!(
             started.elapsed() >= ANIM_GATE_WAIT,
             "the shed must come only after the gate wait elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn animation_gate_sheds_gif_to_webp_renders() {
+        // Issue #405: an animated GIF rendered to WebP runs
+        // the animated WebP encoder, so with the single
+        // animation permit held it sheds with the
+        // animation-queue 503 like an animated WebP source
+        // does, whether the WebP came from an unsigned
+        // Accept header or an explicit format(webp). Before
+        // the fix both ran at once on the stills lane.
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let base = spawn_app_with_anim_gate(gate.clone()).await;
+        let src = spawn_bytes_server(animated_gif_bytes()).await;
+        let _held = gate.acquire_owned().await.unwrap();
+        let sig = sign(&src);
+        let explicit = format!("filters:format(webp)/{src}");
+        let explicit_sig = sign(&explicit);
+        let started = Instant::now();
+        let (negotiated, explicit) = tokio::join!(
+            client()
+                .get(format!("{base}/{sig}/{src}"))
+                .header("accept", "image/webp,*/*")
+                .send(),
+            client()
+                .get(format!("{base}/{explicit_sig}/{explicit}"))
+                .send(),
+        );
+        for (label, resp) in [("negotiated", negotiated), ("explicit", explicit)] {
+            let resp = resp.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{label}");
+            assert_eq!(resp.headers().get("retry-after").unwrap(), "5", "{label}");
+            let body = resp.text().await.unwrap();
+            assert!(
+                body.contains("animation encoding queue is full"),
+                "{label}: {body}"
+            );
+        }
+        assert!(
+            started.elapsed() >= ANIM_GATE_WAIT,
+            "the shed must come only after the gate wait elapses"
+        );
+        // The same animated GIF kept as GIF uses the GIF
+        // encoder and never waits on the animation gate.
+        let started = Instant::now();
+        let resp = client()
+            .get(format!("{base}/{sig}/{src}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/gif");
+        assert!(
+            started.elapsed() < ANIM_GATE_WAIT,
+            "GIF output must not wait on the animation gate"
         );
     }
 
@@ -14397,33 +14924,139 @@ mod tests {
         (format!("http://{addr}/src.png"), hits)
     }
 
-    /// Source server that counts its hits and answers
-    /// slowly with a 500, so a burst's leaders fail one
-    /// after another while their waiters are still queued.
-    async fn spawn_slow_failing_server(delay_ms: u64) -> (String, Arc<AtomicUsize>) {
+    /// Source server that answers slowly, with `body` as a
+    /// PNG or, for `None`, with a 500, so a burst's flights
+    /// overlap its requests. Returns its URL, its hit
+    /// count, and the most fetches it ever had open at once
+    /// (issue #407: a burst on one key must not fetch in
+    /// parallel).
+    async fn spawn_slow_peak_server(
+        body: Option<Vec<u8>>,
+        delay_ms: u64,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(AtomicUsize::new(0));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let counted = hits.clone();
+        let peaked = peak.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 counted.fetch_add(1, Ordering::SeqCst);
+                peaked.fetch_max(open.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                let open = open.clone();
+                let body = body.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
                     let _ = socket.read(&mut buf).await;
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    let _ = socket
-                        .write_all(
-                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await;
+                    match &body {
+                        Some(body) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(head.as_bytes()).await;
+                            let _ = socket.write_all(body).await;
+                        }
+                        None => {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
+                                .await;
+                        }
+                    }
+                    open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
-        (format!("http://{addr}/src.png"), hits)
+        (format!("http://{addr}/src.png"), hits, peak)
+    }
+
+    /// Persistent source server that answers slowly with
+    /// whatever body is current when the request arrives,
+    /// counting its hits: a source replaced while a render
+    /// of its old bytes is still in flight.
+    async fn spawn_slow_swappable_server(
+        body: Vec<u8>,
+        delay_ms: u64,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let current = Arc::new(std::sync::Mutex::new(body));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = hits.clone();
+        let served = current.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                // Taken before the hit counts, so a caller
+                // that sees the hit can swap the body
+                // without racing this request.
+                let body = served.lock().unwrap().clone();
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}/src.png"), hits, current)
+    }
+
+    /// Fire one GET per `(url, if_none_match)` pair at once
+    /// and collect each answer's status, ETag, and body, in
+    /// order.
+    async fn image_burst(
+        requests: Vec<(String, Option<String>)>,
+    ) -> Vec<(StatusCode, String, bytes::Bytes)> {
+        image_burst_with(
+            requests
+                .into_iter()
+                .map(|(url, inm)| (url, inm.map(|e| ("If-None-Match", e)).into_iter().collect()))
+                .collect(),
+        )
+        .await
+    }
+
+    /// Fire one GET per `(url, headers)` pair at once and
+    /// collect each answer's status, ETag, and body, in
+    /// order.
+    async fn image_burst_with(
+        requests: Vec<(String, Vec<(&'static str, String)>)>,
+    ) -> Vec<(StatusCode, String, bytes::Bytes)> {
+        let mut tasks = Vec::new();
+        for (url, headers) in requests {
+            tasks.push(tokio::spawn(async move {
+                let mut req = client().get(&url);
+                for (name, value) in headers {
+                    req = req.header(name, value);
+                }
+                let resp = req.send().await.unwrap();
+                let status = resp.status();
+                let etag = header(&resp, "etag");
+                (status, etag, resp.bytes().await.unwrap())
+            }));
+        }
+        let mut out = Vec::new();
+        for task in tasks {
+            out.push(task.await.unwrap());
+        }
+        out
     }
 
     #[tokio::test]
@@ -14542,26 +15175,217 @@ mod tests {
         // Issue #375: when leaders keep failing, a waiter
         // that spent its wait cap once shed with a 503
         // server_busy, masking the origin's real answer.
-        // The waiter now runs the miss path itself, so a
-        // burst against a slow failing origin ends the way
-        // a solo request does, for every request.
-        let (src, _hits) = spawn_slow_failing_server(300).await;
+        // Every request in a burst against a slow failing
+        // origin must end the way a solo request does.
+        // Issue #407: and the burst must not cost one
+        // origin fetch per request. Before, three flights
+        // failed one after another and then every waiter
+        // past the wait cap fetched at once (12 requests
+        // made 12 fetches, 9 of them in parallel); the
+        // waiters now take the leader's answer.
+        let (src, hits, peak) = spawn_slow_peak_server(None, 300).await;
         let base = spawn_app(false).await;
         let remainder = format!("50x30/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
         let solo = client().get(&url).send().await.unwrap();
         let solo_status = solo.status();
-        assert_ne!(solo_status, StatusCode::SERVICE_UNAVAILABLE);
-        let mut tasks = Vec::new();
-        for _ in 0..6 {
-            let url = url.clone();
-            tasks.push(tokio::spawn(async move {
-                client().get(&url).send().await.unwrap().status()
-            }));
+        let solo_body = solo.bytes().await.unwrap();
+        assert_eq!(solo_status, StatusCode::BAD_GATEWAY);
+        let before = hits.load(Ordering::SeqCst);
+        let burst = image_burst(vec![(url.clone(), None); 12]).await;
+        for (status, _, body) in &burst {
+            assert_eq!(*status, solo_status);
+            assert_eq!(*body, solo_body);
         }
-        for task in tasks {
-            assert_eq!(task.await.unwrap(), solo_status);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+        let fetched = hits.load(Ordering::SeqCst) - before;
+        assert!(
+            fetched <= 2,
+            "12 identical requests made {fetched} origin fetches"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_share_a_render_no_tier_stored() {
+        // Issue #407: with every cache tier off, a leader's
+        // render is stored nowhere, so its waiters used to
+        // fetch and render again, one flight at a time and
+        // then all at once past the wait cap. They now take
+        // the leader's response, and each one still answers
+        // its own conditional request against the shared
+        // render's ETag.
+        let (src, hits, peak) = spawn_slow_peak_server(Some(test_png()), 300).await;
+        let base = spawn_app_full(std::collections::HashMap::new(), None, 0).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let solo = client().get(&url).send().await.unwrap();
+        assert_eq!(solo.status(), StatusCode::OK);
+        let etag = header(&solo, "etag");
+        assert!(!etag.is_empty());
+        let solo_body = solo.bytes().await.unwrap();
+        let before = hits.load(Ordering::SeqCst);
+        // Every other request revalidates the render it
+        // already holds; the rest ask for the bytes.
+        let requests = (0..8)
+            .map(|i| (url.clone(), (i % 2 == 0).then(|| etag.clone())))
+            .collect();
+        let burst = image_burst(requests).await;
+        for (i, (status, got_etag, body)) in burst.iter().enumerate() {
+            assert_eq!(*got_etag, etag, "request {i}");
+            if i % 2 == 0 {
+                assert_eq!(*status, StatusCode::NOT_MODIFIED, "request {i}");
+                assert!(body.is_empty(), "request {i}");
+            } else {
+                assert_eq!(*status, StatusCode::OK, "request {i}");
+                assert_eq!(*body, solo_body, "request {i}");
+            }
         }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+        let fetched = hits.load(Ordering::SeqCst) - before;
+        assert!(
+            fetched <= 2,
+            "8 identical requests made {fetched} origin fetches"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_take_only_an_identical_requests_answer() {
+        // Issue #407: one cache key serves spellings that
+        // answer differently. A sealed request answers a
+        // failure with the uniform refusal, so it must never
+        // take the plain spelling's 502 from a flight they
+        // share, nor the plain one the sealed refusal; each
+        // spelling still ends exactly as it does alone.
+        let (src, _hits, peak) = spawn_slow_peak_server(None, 300).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let plain = format!("{base}/{}/{remainder}", sign(&remainder));
+        let sealed = format!("{base}/{}", sealed_path(&remainder, None));
+        let solo = image_burst(vec![(plain.clone(), None), (sealed.clone(), None)]).await;
+        assert_eq!(solo[0].0, StatusCode::BAD_GATEWAY);
+        assert_eq!(solo[1].0, StatusCode::FORBIDDEN);
+        assert_eq!(solo[1].2.as_ref(), b"bad signature");
+        let requests = (0..8)
+            .map(|i| (if i % 2 == 0 { &plain } else { &sealed }.clone(), None))
+            .collect();
+        let burst = image_burst(requests).await;
+        for (i, (status, _, body)) in burst.iter().enumerate() {
+            let expected = &solo[i % 2];
+            assert_eq!((*status, body), (expected.0, &expected.2), "request {i}");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_share_across_headers_that_do_not_change_the_answer() {
+        // Issue #407: browsers phrase one request in
+        // different headers. These Accept strings all
+        // negotiate WebP, and the URL sizes the image
+        // itself, so no width hint applies: every request
+        // gets the same answer and must share one flight.
+        // Compared as raw headers, each of the five
+        // spellings needed a flight of its own, and the
+        // waiters of the last ones passed the wait cap and
+        // fetched at once.
+        let (src, hits, peak) = spawn_slow_peak_server(None, 300).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let spellings = [
+            ("image/webp", "300"),
+            ("image/webp,*/*", "310"),
+            ("image/webp,image/*;q=0.8", "320"),
+            ("image/png,image/webp", "330"),
+            ("image/webp;q=0.9,*/*;q=0.1", "340"),
+        ];
+        let solo =
+            image_burst_with(vec![(url.clone(), vec![("Accept", "image/webp".into())])]).await;
+        assert_eq!(solo[0].0, StatusCode::BAD_GATEWAY);
+        let before = hits.load(Ordering::SeqCst);
+        let requests = (0..15)
+            .map(|i| {
+                let (accept, width) = spellings[i % spellings.len()];
+                (
+                    url.clone(),
+                    vec![
+                        ("Accept", accept.to_string()),
+                        ("Sec-CH-Width", width.to_string()),
+                    ],
+                )
+            })
+            .collect();
+        let burst = image_burst_with(requests).await;
+        for (i, (status, _, body)) in burst.iter().enumerate() {
+            assert_eq!((*status, body), (solo[0].0, &solo[0].2), "request {i}");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+        let fetched = hits.load(Ordering::SeqCst) - before;
+        assert!(
+            fetched <= 2,
+            "15 requests for one answer made {fetched} origin fetches"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_do_not_take_a_render_a_purge_overtook() {
+        // Issue #407: a follower takes the leader's unstored
+        // response only while no purge of its key has
+        // landed since the leader's run began. Here the
+        // source is replaced and purged while the leader
+        // still renders the old bytes. The purge keeps that
+        // render out of the tiers (issue #350), and a
+        // request sent after the purge must get the new
+        // image, as the purge promises the next request,
+        // not the old render through the flight it joined.
+        let (src, hits, current) = spawn_slow_swappable_server(test_png(), 800).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("25x25/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let leader_url = url.clone();
+        let leader = tokio::spawn(async move { client().get(&leader_url).send().await.unwrap() });
+        for _ in 0..50 {
+            if hits.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the render never started");
+        *current.lock().unwrap() = test_png_red();
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The leader is still loading, so this request
+        // joins its flight.
+        let follower = client().get(&url).send().await.unwrap();
+        let leader = leader.await.unwrap();
+        assert_eq!(leader.status(), StatusCode::OK);
+        assert_eq!(follower.status(), StatusCode::OK);
+        assert_ne!(
+            header(&follower, "etag"),
+            header(&leader, "etag"),
+            "the request after the purge got the render the purge overtook"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     /// Fire `n` concurrent meta requests for one URL and
@@ -14667,11 +15491,11 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_meta_requests_keep_solo_error_semantics() {
-        // Issue #295: errors are never shared, and no
-        // waiter hangs or panics: when the origin fails,
-        // every request in the burst ends with the failure
-        // a solo request gets, from its own attempt at the
-        // miss path.
+        // Issue #295: no waiter hangs or panics: when the
+        // origin fails, every request in the burst ends
+        // with the failure a solo request gets (since issue
+        // #407, the leader's failure, shared through the
+        // flight).
         let (src, _hits) = spawn_counting_server(404, "image/png", Vec::new()).await;
         let base = spawn_app(false).await;
         let remainder = format!("50x30/{src}");
@@ -14686,6 +15510,40 @@ mod tests {
                 .iter()
                 .all(|(s, b)| *s == solo[0].0 && *b == solo[0].1),
             "every waiter failed the way the solo request did"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_meta_requests_share_a_failure_instead_of_refetching() {
+        // Issue #407: meta followers used to share only a
+        // 200 document, so a failing leader sent them to
+        // lead the next flights one by one and then, past
+        // the wait cap, to fetch all at once. They now take
+        // the leader's failure, which is the one they would
+        // have computed themselves.
+        let (src, hits, peak) = spawn_slow_peak_server(None, 300).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let solo = meta_burst(&url, "application/json", 1).await;
+        assert_eq!(solo[0].0, StatusCode::BAD_GATEWAY);
+        let before = hits.load(Ordering::SeqCst);
+        let burst = meta_burst(&url, "application/json", 12).await;
+        assert!(
+            burst
+                .iter()
+                .all(|(s, b)| *s == solo[0].0 && *b == solo[0].1),
+            "every follower failed the way the solo request did"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+        let fetched = hits.load(Ordering::SeqCst) - before;
+        assert!(
+            fetched <= 2,
+            "12 identical meta requests made {fetched} origin fetches"
         );
     }
 
@@ -14889,6 +15747,271 @@ mod tests {
             .unwrap();
         assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Poll `done` every 20 ms for up to five seconds, or
+    /// fail with `what`.
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..250 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    /// A served app over disk and shared tiers for the
+    /// background purge walk tests (issue #400): one preset
+    /// render in group `small`, its bucket copy replaced by
+    /// distinct "stale" bytes, so a later answer shows which
+    /// copy served it, behind more filler objects than the
+    /// inline purge budget, so a group purge returns before
+    /// its walk reaches the entry.
+    struct WalkFixture {
+        fake: crate::s3store::test_support::FakeS3,
+        dir: std::path::PathBuf,
+        hits: Arc<AtomicUsize>,
+        probe: AppState,
+        base: String,
+        url: String,
+        object: String,
+        key: String,
+        stale: CachedImage,
+    }
+
+    impl WalkFixture {
+        async fn new(name: &str) -> Self {
+            let fake = crate::s3store::test_support::start_fake().await;
+            let dir =
+                std::env::temp_dir().join(format!("crabcrop-srv-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+            let mut state = tier_test_state(Some(&dir), &fake.endpoint);
+            state.presets = preset_test_map();
+            let probe = state.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                axum::serve(listener, app(state)).await.unwrap();
+            });
+            let preset = format!("preset:small/{src}");
+            let url = format!("{base}/{}/{preset}", sign(&preset));
+            // One render stores the entry, in group `small`,
+            // in memory, on disk, and (written through in the
+            // background) in the bucket.
+            let resp = client().get(&url).send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            wait_until("the shared write-through lands", || {
+                fake.objects.lock().unwrap().len() == 1
+            })
+            .await;
+            let (object, key, rendered) = {
+                let objects = fake.objects.lock().unwrap();
+                let (object, data) = objects.iter().next().unwrap();
+                let (key, image) =
+                    crate::storage::parse_entry(data, &crate::url::entry_key(b"disk-key-test"))
+                        .unwrap();
+                (object.clone(), key, image)
+            };
+            // Stand the bucket copy in for one the purge must
+            // remove.
+            let stale = CachedImage {
+                bytes: bytes::Bytes::from_static(b"stale-pixels"),
+                etag: crate::cache::etag_for_bytes(b"stale-pixels"),
+                ..rendered
+            };
+            assert_eq!(stale.groups, vec!["small".to_string()]);
+            probe.shared_store.clone().unwrap().put(&key, &stale).await;
+            {
+                let mut objects = fake.objects.lock().unwrap();
+                for i in 0..SHARED_PURGE_INLINE_SCAN + 40 {
+                    let filler = format!("0-filler-{i:04}");
+                    assert!(filler < object, "fillers must list ahead of the entry");
+                    objects.insert(filler, b"not a cache entry".to_vec());
+                }
+            }
+            WalkFixture {
+                fake,
+                dir,
+                hits,
+                probe,
+                base,
+                url,
+                object,
+                key,
+                stale,
+            }
+        }
+
+        /// Purge group `small` and wait until its background
+        /// walk is parked on its first header read past the
+        /// inline budget.
+        async fn purge_and_park_walk(&self) {
+            self.fake.ranged_gets.store(0, Ordering::SeqCst);
+            *self.fake.hold_ranged_after.lock().unwrap() = Some(SHARED_PURGE_INLINE_SCAN);
+            let sig = crate::url::purge_group_signature(SECRET, "small");
+            let resp = client()
+                .post(format!("{}/purge-group/{sig}/small", self.base))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            // Memory and disk; the bucket copy waits for the
+            // walk.
+            assert_eq!(resp.text().await.unwrap(), "purged 2\n");
+            wait_until("the background walk parks", || {
+                self.fake.ranged_gets.load(Ordering::SeqCst) > SHARED_PURGE_INLINE_SCAN
+            })
+            .await;
+            assert_eq!(self.probe.purge_guard.active_count(), 1);
+            assert!(self.fake.objects.lock().unwrap().contains_key(&self.object));
+        }
+
+        /// Let the parked walk finish and wait until the
+        /// purge ends.
+        async fn finish_walk(&self) {
+            *self.fake.hold_ranged_after.lock().unwrap() = None;
+            wait_until("the purge walk ends", || {
+                self.probe.purge_guard.active_count() == 0
+            })
+            .await;
+        }
+
+        /// No tier holds the stale copy, and the URL serves a
+        /// fresh render.
+        async fn assert_no_tier_serves_the_stale_copy(&self) {
+            let is_stale = |image: &CachedImage| image.etag == self.stale.etag;
+            let store = self.probe.store.clone().unwrap();
+            let shared = self.probe.shared_store.clone().unwrap();
+            assert!(
+                !self
+                    .probe
+                    .cache
+                    .get(&self.key)
+                    .is_some_and(|e| is_stale(&e))
+            );
+            assert!(!store.get(&self.key).is_some_and(|e| is_stale(&e)));
+            assert!(!shared.get(&self.key).await.is_some_and(|e| is_stale(&e)));
+            let resp = client().get(&self.url).send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_ne!(header(&resp, "etag"), self.stale.etag);
+            assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+        }
+    }
+
+    impl Drop for WalkFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn lookups_during_a_background_purge_walk_do_not_resurrect_the_entry() {
+        // Issue #400: a shared purge walk that outgrows the
+        // inline budget finishes in the background. Before
+        // the fix, a GET during that walk missed memory and
+        // disk (the purge had emptied them), served the
+        // shared copy the walk had not reached yet, and
+        // promoted it into both local tiers, where the walk
+        // never looks: the purged entry kept serving after
+        // the walk deleted the bucket object.
+        let fx = WalkFixture::new("walk").await;
+        fx.purge_and_park_walk().await;
+        // A GET during the walk is a miss: it renders from
+        // the origin instead of serving the bucket copy.
+        let resp = client().get(&fx.url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_ne!(header(&resp, "etag"), fx.stale.etag);
+        assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+        assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+        // The lookup deleted the copy on sight, while the
+        // walk was still parked.
+        assert!(
+            fx.fake
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == &format!("DELETE {}", fx.object)),
+            "the lookup did not delete the purged bucket copy"
+        );
+        fx.finish_walk().await;
+        fx.assert_no_tier_serves_the_stale_copy().await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_the_purge_walk_ends_under_does_not_resurrect_the_entry() {
+        // Issue #400, at the end of the walk: a lookup that
+        // starts while the walk runs reads the bucket copy
+        // before the walk reaches it, and the walk deletes
+        // the object and ends while those bytes are still in
+        // flight. A check against only the purges still
+        // running when the bytes arrive finds none, and the
+        // lookup serves the copy and promotes it into both
+        // local tiers after the purge is over.
+        let fx = WalkFixture::new("walk-end").await;
+        fx.purge_and_park_walk().await;
+        fx.fake.hold_object_gets.store(true, Ordering::SeqCst);
+        let url = fx.url.clone();
+        let get = tokio::spawn(async move { client().get(&url).send().await.unwrap() });
+        wait_until("the lookup reads the bucket copy", || {
+            fx.fake.held_object_gets.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        fx.finish_walk().await;
+        assert!(
+            !fx.fake.objects.lock().unwrap().contains_key(&fx.object),
+            "the walk did not delete the bucket copy"
+        );
+        fx.fake.hold_object_gets.store(false, Ordering::SeqCst);
+        let resp = get.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_ne!(header(&resp, "etag"), fx.stale.etag);
+        assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+        assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+        fx.assert_no_tier_serves_the_stale_copy().await;
+    }
+
+    #[tokio::test]
+    async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
+        // Issue #400, at the tier chain: while a purge is
+        // still running, a disk or bucket copy it covers is
+        // a miss for a lookup that starts after the purge,
+        // and is deleted on sight; copies it does not cover
+        // still serve, and once the purge ends a fresh copy
+        // serves again.
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-active-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let store = state.store.clone().unwrap();
+        let shared = state.shared_store.clone().unwrap();
+        let key = "40x24/example.com/i.png#cfgtest#w300";
+        let other = "40x24/example.com/other.png#cfgtest";
+        store.put(key, &tier_test_entry());
+        shared.put(key, &tier_test_entry()).await;
+        store.put(other, &tier_test_entry());
+        let active = state.purge_guard.begin(crate::cache::PurgeTarget::Key(
+            "40x24/example.com/i.png".into(),
+        ));
+        assert!(lookup_tiers(&state, key, &[]).await.is_none());
+        assert!(store.get(key).is_none(), "the disk copy survived");
+        assert!(shared.get(key).await.is_none(), "the bucket copy survived");
+        assert!(state.cache.get(key).is_none(), "the copy was promoted");
+        let (_, status) = lookup_tiers(&state, other, &[]).await.unwrap();
+        assert_eq!(status, "crabcrop; hit; detail=\"disk\"");
+        // A copy only in the bucket is caught there too.
+        shared.put(key, &tier_test_entry()).await;
+        assert!(lookup_tiers(&state, key, &[]).await.is_none());
+        assert!(shared.get(key).await.is_none());
+        drop(active);
+        shared.put(key, &tier_test_entry()).await;
+        let (_, status) = lookup_tiers(&state, key, &[]).await.unwrap();
+        assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

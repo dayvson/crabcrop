@@ -264,18 +264,25 @@ export const ops = {
    * none of the classes is detected the render falls back
    * to the plain center crop of the same size. Duplicate
    * classes (case-insensitive) are spelled once, as the
-   * server's canonical form spells them.
+   * server's canonical form spells them; at most 32
+   * distinct classes, and a 33rd throws, since the server
+   * rejects it with `invalid_crop`.
    */
   cropObjects(width: number, height: number, classes: string[], scale = 1): string {
-    if (!Array.isArray(classes) || classes.length < 1 || classes.length > 32) {
-      fail("crop objects classes", classes, "an array of 1 to 32 class names");
+    if (!Array.isArray(classes) || classes.length < 1) {
+      fail("crop objects classes", classes, "an array of 1 to 32 distinct class names");
     }
+    // The cap counts distinct names, as the server's parser
+    // does (issue #408): repeats fold first and cost nothing.
     const seen = new Set<string>();
     const names: string[] = [];
     for (const name of classes) {
       const encoded = className("crop objects class", name);
       const key = typeof name === "string" ? name.trim().toLowerCase() : "";
       if (!seen.has(key)) {
+        if (names.length === 32) {
+          fail("crop objects classes", classes, "an array of 1 to 32 distinct class names");
+        }
         seen.add(key);
         names.push(encoded);
       }

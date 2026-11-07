@@ -35,6 +35,7 @@ Details an encoder setup has to match:
 - Frames are composited over black and padded up to even dimensions (H.264 and VP9 need them) by replicating the edge pixels. The response describes the padded dimensions.
 - Frame timing: the pipe contract carries one constant rate, so crabcrop picks it from the fastest frame, `ceil(1000 / shortest delay)` clamped to 1-100 fps (10 fps when no frame carries a delay), and repeats each frame `round(delay × fps / 1000)` times, at least once. Total duration is preserved to within one frame period per source frame. A source whose delays total more than 600 s is refused with a `400`.
 - At most two encodes run at a time, each under a hard wall-clock timeout (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s) after which the encoder is killed, and a hard output cap (`CRABCROP_VIDEO_MAX_MB`, default 64 MB) that aborts the encode the moment it is crossed. The encoder runs with an empty environment; nothing is inherited from the server's.
+- On Linux the encoder also runs under kernel resource limits, a backstop behind the wall clock: 8 GiB of address space, and CPU time of the timeout times one more than the cores the server may use, plus 5 s (155 CPU seconds at the default 30 s on a 4-core host). The kernel counts CPU time across all of the program's threads, and FFmpeg works on several, so the limit scales with the cores: a run that fits the wall clock never reaches it.
 
 ### Errors
 
@@ -54,15 +55,17 @@ A video the server can fetch is also an image source: a `frame:` segment in the 
 
 Crabcrop ships no video decoder either. Extraction runs in an external program you configure, `CRABCROP_VIDEO_DECODER`: the path to a decoder executable, with FFmpeg as the reference. The path is validated at startup (it must exist and be executable, or the server refuses to boot). With the variable unset, frame selection is off and a `frame:` URL answers `501`. The contract between crabcrop and the program is fixed, and crabcrop builds every argument itself; the program never sees a shell:
 
-- **Probe**: argv is `ffmpeg -nostdin -v info -protocol_whitelist pipe -format_whitelist <containers> -i pipe:0`, with the source bytes on stdin and no output target. The program reports the input on stderr (duration, stream list); crabcrop reads the duration, the first video stream's dimensions, and its frame rate from that report. A source whose report holds no video stream (a non-video, an audio-only file, a corrupt container) is a bad source.
-- **Extract**: argv is `ffmpeg -nostdin -v info -protocol_whitelist pipe -format_whitelist <containers> -i pipe:0 -ss <seconds> -frames:v 1 -f image2pipe -vcodec png pipe:1`, again with the source bytes on stdin. One PNG frame comes back on stdout and becomes the source image, so every decode and output budget applies to it unchanged.
+- **Input**: the source bytes arrive on stdin as a seekable file, not a pipe. Crabcrop stages them once per extraction in a private temporary file (in `TMPDIR`, at most one fetch-capped source per running extraction) and unlinks it at once, so only the open descriptor reaches the bytes and nothing is left behind. The program reads them through FFmpeg's `fd` protocol, which seeks on a regular file; that is what makes an MP4 with its index (the `moov` box) at the end, FFmpeg's own default layout, readable, because the demuxer has to seek back to the samples after reading the index. Faststart MP4s and every other container work the same way. The `fd` protocol arrived in FFmpeg 6.0, so frame extraction needs FFmpeg 6.0 or newer; an older build refuses the input, and the request answers `502` with the cause named in the server log.
+- **Probe**: argv is `ffmpeg -nostdin -v info -protocol_whitelist fd -format_whitelist <containers> -i fd:`, with the source on stdin and no output target. The program reports the input on stderr (duration, stream list); crabcrop reads the duration, the first video stream's dimensions, and its frame rate from that report. A source whose report holds no video stream (a non-video, an audio-only file, a corrupt container) is a bad source.
+- **Extract**: argv is `ffmpeg -nostdin -v info -protocol_whitelist fd -format_whitelist <containers> -i fd: -ss <seconds> -frames:v 1 -f image2pipe -vcodec png pipe:1`, again with the source on stdin. One PNG frame comes back on stdout and becomes the source image, so every decode and output budget applies to it unchanged.
 
-The whitelists pin the program to the bytes the loader already validated: the protocol whitelist leaves the pipe as the only input channel, and the format whitelist names the container formats (the MP4/MOV family, Matroska and WebM, AVI, MPEG, FLV, ASF, Ogg), so a manifest inside the source that points at a `file://` or network target, DASH or HLS, is refused by the program instead of followed.
+The whitelists pin the program to the bytes the loader already validated: the protocol whitelist leaves stdin as the only input channel (`fd` reads a descriptor the program already holds and refuses one named in a URL, and no `file` or network protocol is allowed), and the format whitelist names the container formats (the MP4/MOV family, Matroska and WebM, AVI, MPEG, FLV, ASF, Ogg), so a manifest inside the source that points at a `file://` or network target, DASH or HLS, is refused by the program instead of followed.
 
 The bounds mirror the encoder's, because the work is the same class:
 
 - At most two extractions run at a time behind the video gate (shared with encodes), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
 - Each run (probe and extraction alike) is bounded by the same wall-clock timeout as encodes (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a frame whose PNG passes 256 MiB, the decode allocation budget, is refused).
+- Each run also gets the encoder's kernel limits (address space, and CPU time scaled by the cores the server may use; see [the encoder details](#the-encoder-contract)), so a multi-threaded decode that fits the wall clock, such as a far seek in a long 4K clip, is never cut short by the CPU limit.
 - The source itself flows through the ordinary loader first, with the same allowlist, size cap, and redirect rules as any source. Only a URL carrying a `frame:` segment may fetch a `video/*` Content-Type; every other request keeps the image-only rule.
 
 ### Errors
@@ -74,7 +77,7 @@ The bounds mirror the encoder's, because the work is the same class:
 | Source has no video stream, or is not a readable video | `502`: the bad-source failure every undecodable source gets |
 | Percentage selection on a video that reports no duration | `400` |
 | Malformed `frame:` selector | `400` with the `invalid_frame` code, before any fetch |
-| Decoder exits nonzero, produces no frame, exceeds the cap, or times out | `502`: `video frame extraction failed` (the cause, including the decoder's stderr excerpt, is in the server log) |
+| Decoder exits nonzero, produces no frame, exceeds the cap, or times out; decoder older than FFmpeg 6.0 (no `fd` protocol); source cannot be staged in the temporary directory | `502`: `video frame extraction failed` (the cause, including the decoder's stderr excerpt, is in the server log) |
 | Video queue full (both slots busy past a 10 s wait) | `503` |
 
 A frame render's [meta response](meta.md#meta-responses) carries a `video` object: the source's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. The explain endpoint labels a video source's kind as `video`; its dimensions stay unknown there, because explain never runs the decoder.
@@ -94,6 +97,7 @@ The bounds mirror the frame extractor's, because the work is the same class:
 
 - Page work takes the video gate (at most two runs at a time, shared with encodes and frame extractions), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
 - Each run is bounded by `CRABCROP_PDF_TIMEOUT_SECS` (default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a page whose PNG passes 256 MiB, the decode allocation budget, is refused).
+- Each run also gets the same kernel limits as the video tools (address space, and CPU time scaled by the cores the server may use; see [the encoder details](#the-encoder-contract)), here against `CRABCROP_PDF_TIMEOUT_SECS`.
 
 ### Errors
 

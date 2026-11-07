@@ -71,8 +71,9 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// checked in our own code, because decoder adherence to
 /// `max_alloc` varies by format; a probe failure is not fatal
 /// (some valid files have headers the probe cannot read), the
-/// limited decode behind it is the second line.
-pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
+/// limited decode behind it is the second line. Public
+/// for the fuzz harness's decode target (issue #417).
+pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     // AVIF decoding is compiled in only with the avif-decode
     // feature (issue #141): dav1d is a C dependency the
     // default build does not carry. Name the way out rather
@@ -175,7 +176,7 @@ fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
 /// table does not enumerate (the PNM/TGA/QOI long tail);
 /// those carry no extension binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UploadMedia {
+pub enum UploadMedia {
     Svg,
     Heic,
     Jpeg,
@@ -256,9 +257,9 @@ pub(crate) struct PreparedUpload {
 /// decodability is the question. The upload handler
 /// calls [`prepare_upload`] (it also needs the prepared
 /// form); this predicate stays as the acceptance test's
-/// own spelling.
-#[allow(dead_code)]
-pub(crate) fn validate_source_image(bytes: &[u8]) -> Result<(), EngineError> {
+/// own spelling, and the fuzz harness's decode target
+/// drives every branch through it (issue #417).
+pub fn validate_source_image(bytes: &[u8]) -> Result<(), EngineError> {
     prepare_upload(bytes).map(|_| ())
 }
 
@@ -393,7 +394,7 @@ fn jxl_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 /// probe, the SVG document's intrinsic size, the HEIC item
 /// graph's announced size, or the JPEG XL basic info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SourceProbe {
+pub struct SourceProbe {
     /// A short lowercase media label: `jpeg`, `png`, `gif`,
     /// `webp`, `avif`, `jxl`, `heic`, `svg`, one of the image
     /// crate's long-tail kinds (`bmp`, `tiff`, `ico`), or
@@ -1007,28 +1008,18 @@ impl Engine {
                         .to_string(),
                 ));
             }
-            let mut resolved = directives
-                .explicit_format
-                .or(ctx.preferred)
-                .unwrap_or(detected);
-            if frames.len() > 1
-                && directives.explicit_format.is_none()
-                && !matches!(resolved, ImageFormat::Gif | ImageFormat::WebP)
-            {
-                // Negotiation never flattens an animation
-                // (issue #370): a negotiated WebP keeps the
-                // frames as an animated WebP, and a negotiated
-                // AVIF or JXL cannot carry them, so the
-                // preference falls back to GIF. An explicit
-                // format(...) still converts (first frame), as
-                // documented for still conversions.
-                resolved = ImageFormat::Gif;
-            }
-            if frames.len() > 1 && matches!(resolved, ImageFormat::Gif | ImageFormat::WebP) {
-                return self.process_animated(frames, ops, &ctx, resolved, None);
-            }
-            if frames.len() > 1 && resolved.is_video() {
-                return self.process_video(frames, ops, &ctx, resolved);
+            if frames.len() > 1 {
+                let resolved = animated_output_format(
+                    ImageFormat::Gif,
+                    directives.explicit_format,
+                    ctx.preferred,
+                );
+                if matches!(resolved, ImageFormat::Gif | ImageFormat::WebP) {
+                    return self.process_animated(frames, ops, &ctx, resolved, None);
+                }
+                if resolved.is_video() {
+                    return self.process_video(frames, ops, &ctx, resolved);
+                }
             }
             DynamicImage::ImageRgba8(
                 frames
@@ -1051,28 +1042,18 @@ impl Engine {
                         .to_string(),
                 ));
             }
-            let mut resolved = directives
-                .explicit_format
-                .or(ctx.preferred)
-                .unwrap_or(detected);
-            if frames.len() > 1
-                && directives.explicit_format.is_none()
-                && !matches!(resolved, ImageFormat::WebP | ImageFormat::Gif)
-            {
-                // Negotiation never flattens an animation
-                // (issue #370): a negotiated GIF keeps the
-                // frames as an animated GIF, and a negotiated
-                // AVIF or JXL cannot carry them, so the
-                // preference falls back to WebP. An explicit
-                // format(...) still converts (first frame), as
-                // documented for still conversions.
-                resolved = ImageFormat::WebP;
-            }
-            if frames.len() > 1 && matches!(resolved, ImageFormat::WebP | ImageFormat::Gif) {
-                return self.process_animated(frames, ops, &ctx, resolved, Some(loop_count));
-            }
-            if frames.len() > 1 && resolved.is_video() {
-                return self.process_video(frames, ops, &ctx, resolved);
+            if frames.len() > 1 {
+                let resolved = animated_output_format(
+                    ImageFormat::WebP,
+                    directives.explicit_format,
+                    ctx.preferred,
+                );
+                if matches!(resolved, ImageFormat::WebP | ImageFormat::Gif) {
+                    return self.process_animated(frames, ops, &ctx, resolved, Some(loop_count));
+                }
+                if resolved.is_video() {
+                    return self.process_video(frames, ops, &ctx, resolved);
+                }
             }
             DynamicImage::ImageRgba8(
                 frames
@@ -1711,6 +1692,61 @@ fn webp_animation_params(bytes: &[u8]) -> Option<(u16, [u8; 4])> {
 /// their own gate (issue #231) before any engine work runs.
 pub(crate) fn is_animated_webp(bytes: &[u8]) -> bool {
     webp_animation_params(bytes).is_some()
+}
+
+/// Whether the source bytes are an animated GIF: a GIF with
+/// a second frame, which is what sends [`decode_gif_frames`]
+/// output down the animated paths. A block walk, not a
+/// decode: the gif crate (the parser the decoder itself
+/// uses) reads frame descriptors with LZW decoding skipped,
+/// and the walk stops at the second frame, so it costs one
+/// pass over the first frame's compressed bytes and
+/// allocates no pixels. The server uses it, beside
+/// [`is_animated_webp`], to route animated WebP encodes from
+/// GIF sources to their gate (issue #405) before any engine
+/// work runs. A file that does not parse that far reads as
+/// not animated; the decode then refuses it anyway, or
+/// renders a still.
+pub(crate) fn is_animated_gif(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"GIF") {
+        return false;
+    }
+    let mut options = gif::DecodeOptions::new();
+    options.skip_frame_decoding(true);
+    let Ok(mut decoder) = options.read_info(bytes) else {
+        return false;
+    };
+    for _ in 0..2 {
+        if !matches!(decoder.next_frame_info(), Ok(Some(_))) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The format an animated source renders to while it keeps
+/// its frames (or goes to video): an explicit `format(...)`
+/// first, then the negotiated preference, then the source's
+/// own format. Negotiation never flattens an animation
+/// (issue #370): a negotiated GIF or WebP keeps the frames
+/// in that format, and any other negotiated format (AVIF and
+/// JPEG XL cannot carry them) falls back to the source
+/// format. An explicit format always wins; a still format
+/// then converts the first frame, as documented for still
+/// conversions. The engine's animated branches and the
+/// server's animation gate predicate (issue #405) both
+/// resolve through this one function, so the gate cannot
+/// drift from the encoder it guards again.
+pub(crate) fn animated_output_format(
+    source: ImageFormat,
+    explicit: Option<ImageFormat>,
+    preferred: Option<ImageFormat>,
+) -> ImageFormat {
+    match (explicit, preferred) {
+        (Some(format), _) => format,
+        (None, Some(format @ (ImageFormat::Gif | ImageFormat::WebP))) => format,
+        (None, _) => source,
+    }
 }
 
 /// Decode all frames of an animated WebP source, under the
@@ -7710,6 +7746,162 @@ mod tests {
             .unwrap();
         assert_eq!(out.format, ImageFormat::Gif);
         assert_eq!(decoded_gif_frames(&out.bytes).len(), 3);
+    }
+
+    #[test]
+    fn animated_output_format_keeps_frames_under_negotiation_only() {
+        // Issue #370's resolution, shared with the server's
+        // animation gate (issue #405): explicit beats
+        // negotiated, a negotiated GIF or WebP crosses over,
+        // and anything else negotiated falls back to the
+        // source format.
+        use ImageFormat::*;
+        let cases = [
+            (Gif, None, None, Gif),
+            (Gif, None, Some(WebP), WebP),
+            (Gif, None, Some(Avif), Gif),
+            (Gif, None, Some(Jxl), Gif),
+            (Gif, None, Some(Mp4), Gif),
+            (Gif, Some(WebP), None, WebP),
+            (Gif, Some(Png), Some(WebP), Png),
+            (Gif, Some(Mp4), Some(WebP), Mp4),
+            (WebP, None, None, WebP),
+            (WebP, None, Some(Gif), Gif),
+            (WebP, None, Some(Avif), WebP),
+            (WebP, Some(Gif), Some(WebP), Gif),
+            (WebP, Some(Jxl), None, Jxl),
+        ];
+        for (source, explicit, preferred, want) in cases {
+            assert_eq!(
+                animated_output_format(source, explicit, preferred),
+                want,
+                "{source:?} {explicit:?} {preferred:?}"
+            );
+        }
+    }
+
+    /// A hand-built GIF of `frames` 1x1 frames over a
+    /// two-entry global palette, each frame the smallest
+    /// valid LZW stream (clear, pixel 0, end), then the
+    /// trailer: the base the probe's hostile cases cut up.
+    fn raw_gif(frames: usize) -> Vec<u8> {
+        let mut out = b"GIF89a".to_vec();
+        out.extend_from_slice(&[1, 0, 1, 0, 0x80, 0, 0]);
+        out.extend_from_slice(&[0, 0, 0, 255, 255, 255]);
+        for _ in 0..frames {
+            out.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0]);
+            out.extend_from_slice(&[2, 2, 0x44, 0x01, 0]);
+        }
+        out.push(0x3B);
+        out
+    }
+
+    #[test]
+    fn animated_gif_probe_counts_frames_like_the_decoder() {
+        // Issue #405: the server routes GIF-to-WebP
+        // renders to the animation gate on this probe, so
+        // it must call a source animated exactly when the
+        // decoder hands the engine more than one frame.
+        let still = gif_bytes(&DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            40,
+            20,
+            image::Rgba([255, 0, 0, 255]),
+        )));
+        for (name, bytes) in [
+            ("raw 1", raw_gif(1)),
+            ("raw 2", raw_gif(2)),
+            ("raw 3", raw_gif(3)),
+            ("animated", animated_gif_bytes()),
+            ("still", still),
+        ] {
+            let frames = decode_gif_frames(&bytes).unwrap().len();
+            assert_eq!(
+                is_animated_gif(&bytes),
+                frames > 1,
+                "{name}: {frames} frames"
+            );
+        }
+        assert!(!is_animated_gif(&animated_webp_bytes()));
+        assert!(!is_animated_gif(&png_bytes(&DynamicImage::new_rgb8(4, 4))));
+    }
+
+    #[test]
+    fn animated_gif_probe_survives_hostile_input() {
+        // The probe runs on untrusted source bytes before
+        // any gate, on the async worker: malformed input
+        // must read as not animated without panicking,
+        // allocating pixels, or walking past the second
+        // frame.
+        for bytes in [
+            &b""[..],
+            b"GIF",
+            b"GIF89",
+            b"GIF89a",
+            b"GIF89a\x01\x00",
+            b"GIFxxx\0\0\0\0",
+        ] {
+            assert!(!is_animated_gif(bytes), "{bytes:?}");
+        }
+        // Every truncation of a two-frame file: no panic,
+        // and not animated until the second frame's header
+        // has arrived (after the file header, screen
+        // descriptor, palette, and first frame: the second
+        // frame's descriptor, code size, and first
+        // sub-block length).
+        let full = raw_gif(2);
+        let second_frame_ready = 6 + 7 + 6 + 15 + 12;
+        for len in 0..full.len() {
+            assert_eq!(
+                is_animated_gif(&full[..len]),
+                len >= second_frame_ready,
+                "prefix of {len} bytes"
+            );
+        }
+        // A first-frame sub-block length that runs past the
+        // end of the file swallows the second frame: the
+        // walk hits the end, and the decoder refuses it.
+        let mut overlong = raw_gif(2);
+        overlong[6 + 7 + 6 + 11] = 0xFF;
+        assert!(!is_animated_gif(&overlong));
+        assert!(decode_gif_frames(&overlong).is_err());
+        // No color table anywhere: the decoder refuses the
+        // frame, and so does the probe.
+        let mut no_palette = b"GIF89a".to_vec();
+        no_palette.extend_from_slice(&[1, 0, 1, 0, 0, 0, 0]);
+        for _ in 0..2 {
+            no_palette.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0]);
+        }
+        no_palette.push(0x3B);
+        assert!(!is_animated_gif(&no_palette));
+        assert!(decode_gif_frames(&no_palette).is_err());
+        // An LZW code size past the format's maximum.
+        let mut bad_code_size = raw_gif(2);
+        bad_code_size[6 + 7 + 6 + 10] = 13;
+        assert!(!is_animated_gif(&bad_code_size));
+        // An unknown block type where a block should start.
+        let mut unknown_block = raw_gif(2);
+        unknown_block[6 + 7 + 6] = 0x99;
+        assert!(!is_animated_gif(&unknown_block));
+        assert!(decode_gif_frames(&unknown_block).is_err());
+        // Megabytes of comment sub-blocks ahead of the
+        // frames: the walk skips them without buffering and
+        // still finds the frame count.
+        let comments = |frames: usize| {
+            let mut bytes = raw_gif(frames);
+            let mut filler = vec![0x21, 0xFE];
+            for _ in 0..16_384 {
+                filler.push(255);
+                filler.extend_from_slice(&[b'x'; 255]);
+            }
+            filler.push(0);
+            bytes.splice(6 + 7 + 6..6 + 7 + 6, filler);
+            bytes
+        };
+        assert!(!is_animated_gif(&comments(1)));
+        assert!(is_animated_gif(&comments(2)));
+        // A frame bomb is still only probed to its second
+        // frame; the decoder's own cap refuses it later.
+        assert!(is_animated_gif(&raw_gif(5_000)));
     }
 
     /// A fake video encoder for the video tests: drains

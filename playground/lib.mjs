@@ -642,6 +642,9 @@ const ALIGN_NAMES = new Set(["center", "smart", "face", "top", "bottom", "left",
  * decoded class names (duplicates folded, first spelling
  * kept, as the server's canonical form folds them) and the
  * scale, or null when the server would reject the form.
+ * The 32-class cap counts distinct names, as the server's
+ * does: repeats are free, and a 33rd distinct name rejects
+ * the form (issue #408).
  */
 function parseObjectsAlign(align) {
   if (!align.startsWith("objects(")) return null;
@@ -659,7 +662,6 @@ function parseObjectsAlign(align) {
     if (!(scale > 0) || scale > 100) return null;
   }
   const parts = list.split(",");
-  if (parts.length > 32) return null;
   const classes = [];
   const seen = new Set();
   for (const part of parts) {
@@ -675,6 +677,7 @@ function parseObjectsAlign(align) {
     }
     const key = name.toLowerCase();
     if (!seen.has(key)) {
+      if (classes.length === 32) return null;
       seen.add(key);
       classes.push(name);
     }
