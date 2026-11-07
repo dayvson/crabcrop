@@ -56,7 +56,7 @@ Operational failures carry these codes:
 | `invalid_path` | `400` | An explain, purge, purge-group, or upload path does not have the route's shape. |
 | `meta_not_available` | `400` | Meta was asked for a video or debug output, which serves no image to describe. |
 | `meta_disabled` | `403` | Meta mode is switched off on this server (`CRABCROP_META_MODE=0`). |
-| `not_found` | `404` | A `PUT` to a path that is not the upload route. On a server without uploads configured that is every `PUT`, `/upload/...` included. |
+| `not_found` | `404` | A `PUT` to a path that is not the upload route. On a server without uploads configured, that includes a `PUT` to `/upload/...`. |
 | `metrics_disabled` | `403` | `GET /metrics` when no `CRABCROP_METRICS_TOKEN` is configured. |
 | `metrics_unauthorized` | `401` | `GET /metrics` with a missing or wrong bearer token. |
 | `source_forbidden` | `403` | The source policy refused the source URL. |

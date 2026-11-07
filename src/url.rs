@@ -2990,15 +2990,14 @@ impl RequestDirectives {
         !self.classes.is_empty()
     }
 
-    /// Whether the request names any AI directive, smart crops
-    /// included: background removal, studio mode, region
-    /// removal, upscale, face operations, class redaction,
-    /// object crops, and `debug:focal` count unconditionally,
-    /// and a smart crop infers only when a face or focal
-    /// provider is configured. Only the tests call this, to
-    /// pin the directive classification: the server's AI gate
-    /// uses `uses_ai_beyond_smart_crop` plus that provider
-    /// check (issue #379).
+    /// Whether the request names any AI directive: background
+    /// removal, studio mode, region removal, upscale, face
+    /// operations, class redaction, object crops,
+    /// `debug:focal`, or a smart crop. A smart crop infers
+    /// only when a face or focal provider is configured, so
+    /// the server's AI gate uses `uses_ai_beyond_smart_crop`
+    /// plus that provider check (issue #379). Only the tests
+    /// call this, to pin the directive classification.
     #[allow(dead_code)]
     pub fn uses_ai(&self) -> bool {
         self.uses_ai_beyond_smart_crop() || self.smart_crop

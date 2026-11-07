@@ -4,7 +4,7 @@ An [Astro image service](https://docs.astro.build/en/reference/image-service-ref
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (or copy `index.ts`, `operations.ts`, and `explain.ts` from `sdks/typescript/src/` into your project, since `index.ts` imports the other two, and adjust the import).
+1. Install the builder: `npm install @crabcrop/url`.
 2. Copy [`crabcrop-service.ts`](crabcrop-service.ts) into your project.
 3. Register it as the image service in `astro.config`:
 
