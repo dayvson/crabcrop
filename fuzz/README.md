@@ -58,12 +58,23 @@ The harness depends on the server's library target
 (`crabcrop`, issue #417), so each target runs the
 server's own code: the parser, the decode dispatch, the
 metadata code, the filters, and the SVG pipeline, with
-no copies or stand-ins. `Cargo.lock` here pins the same
-versions as the root lockfile; refresh it from the root
-one when dependencies move. The opener lives in
+no copies or stand-ins. The opener lives in
 `crabcrop-url`, a direct dependency. This package is
 detached from the main workspace so fuzzing dependencies
 never enter a normal build.
+
+`Cargo.lock` here pins the same versions as the root
+lockfile. Because the package builds the server library,
+a dependency added or bumped in the root manifest (or a
+release version bump) can leave it stale, and the
+smoke's `--locked` build (in `scripts/test_all.sh` and
+CI) then fails until it is refreshed. Refresh it from
+the root lockfile:
+
+```sh
+cp Cargo.lock fuzz/Cargo.lock
+cargo update -w --manifest-path fuzz/Cargo.toml
+```
 
 ## The smoke (runs everywhere)
 

@@ -31,8 +31,9 @@ both SDKs must all pass.
   server's parser is `src/url.rs`.
 - `sdks/`: TypeScript and Python SDKs, plus the MCP server (`sdks/mcp`).
 - `frameworks/`, `playground/`: integration starters and the live playground.
-- `fuzz/`: cargo-fuzz targets over the server library: the URL
-  parser, the token opener, image decode, metadata, filter chains.
+- `fuzz/`: cargo-fuzz targets for the URL parser, the token
+  opener, image decode, metadata, and filter chains, built on the
+  server library and `crabcrop-url` (the opener's home).
 - `tests/functional/`: the HTTP functional suite, tiered; the local tier
   runs without network or model files.
 
@@ -59,6 +60,10 @@ both SDKs must all pass.
 - `Cargo.lock` moves with any version or dependency change. Version bumps
   run through `scripts/bump_version.py` plus a lockfile refresh; a bump
   without the lockfile update fails every `--locked` build.
+  `fuzz/Cargo.lock` moves too: the fuzz package builds the server
+  library, so a dependency change that the root lockfile records needs
+  the refresh in `fuzz/README.md`, or the fuzz smoke's `--locked` build
+  in CI fails.
 - One binary, configuration-gated: AI and provenance features are enabled
   by environment configuration in the same binary, not by separate builds
   or cargo features. Never commit model files, certificates, or keys.
