@@ -43,10 +43,14 @@ both SDKs must all pass.
   model files and an ONNX Runtime library, which are deployment artifacts,
   never repo content. `.github/workflows/ai-models.yml` downloads the
   pinned artifacts and runs them (`cargo test -- --ignored`) on pull
-  requests and main pushes that touch `src/ai.rs`, `src/tokenizer.rs`, or
-  their fixture photo, on every release tag before anything publishes,
-  weekly, and by hand. When you cannot run them locally, that pull-request
-  run is where an AI change is verified.
+  requests and main pushes that touch `src/ai.rs`, `src/tokenizer.rs`,
+  `tests/fixtures/portrait.jpg` or the workflow itself, on every release
+  tag before anything publishes, weekly, and by hand. When you cannot run
+  them locally, that pull-request run is where an AI change is verified.
+  A change outside those paths can still break them (the real-model tests
+  in `src/main.rs` and `src/engine.rs`, an `ort` bump in `Cargo.lock`)
+  without starting it: run the workflow by hand on the branch
+  (`gh workflow run ai-models.yml --ref <branch>`).
 - The AI functional groups (`tests/functional`, tier `local`) run in no CI
   workflow: only a local run with the models verifies them.
 

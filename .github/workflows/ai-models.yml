@@ -56,7 +56,11 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v7
+      # Pinned like the release workflow's actions: release.yml
+      # calls this workflow as its gate (issue #414).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set the asset directory
         run: echo "AI_ASSETS=$RUNNER_TEMP/ai-assets" >> "$GITHUB_ENV"
@@ -316,4 +320,4 @@ jobs:
           # CRABCROP_TEST_DETECT_LABELS is deliberately unset: the
           # detection tests then read the class names embedded in
           # the YOLO export, which is the production path.
-        run: cargo test -- --ignored --skip avif_encode_bench --skip real_ffmpeg_encodes_mp4_and_webm
+        run: cargo test --locked -- --ignored --skip avif_encode_bench --skip real_ffmpeg_encodes_mp4_and_webm
