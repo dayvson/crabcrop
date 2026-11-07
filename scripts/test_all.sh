@@ -53,10 +53,15 @@ for bad in "v0.10.0" "crabcrop-url/0.10.0" "0.10" "0.10.0-"; do
     exit 1
   fi
 done
-# Both npm publish steps (@crabcrop/url and @crabcrop/mcp) pass the tag.
-if [ "$(grep -c 'npm publish --access public --tag "\$NPM_TAG"$' .github/workflows/release.yml)" -ne 2 ] \
-  || grep -q 'npm publish --access public$' .github/workflows/release.yml; then
-  echo "every npm publish in release.yml must pass --tag \"\$NPM_TAG\" from scripts/npm_dist_tag.sh" >&2
+# Every npm publish command in release.yml passes the tag, whatever
+# its other flags: the two known steps (@crabcrop/url and
+# @crabcrop/mcp) and any publish added later.
+publishes=$(grep -E 'npm publish( |$)' .github/workflows/release.yml \
+  | grep -vE '^[[:space:]]*(- name:|#)' || true)
+untagged=$(printf '%s\n' "$publishes" | grep -v -- '--tag "\$NPM_TAG"$' || true)
+if [ "$(printf '%s\n' "$publishes" | grep -c .)" -lt 2 ] || [ -n "$untagged" ]; then
+  echo "every npm publish in release.yml must pass --tag \"\$NPM_TAG\" from scripts/npm_dist_tag.sh:" >&2
+  printf '%s\n' "${untagged:-(no npm publish commands found)}" >&2
   exit 1
 fi
 
