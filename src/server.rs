@@ -842,17 +842,23 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
 /// How many shared-tier objects one purge request scans
 /// inline (issue #368): the shared walk reads entry
 /// headers one at a time, so its inline cost must not
-/// grow with the whole bucket. The tombstone already
-/// guarantees the purge's correctness (issue #350); a
-/// walk that outgrows the budget finishes in a
-/// background task and logs its own count on completion.
+/// grow with the whole bucket. A walk that outgrows the
+/// budget finishes in a background task and logs its own
+/// count on completion. Correctness does not wait for
+/// it: the tombstone keeps writes begun before the purge
+/// out (issue #350), and the purge stays active until
+/// the walk ends, so a lookup that overlaps the walk
+/// treats a copy the purge covers as a miss (issue #400).
 const SHARED_PURGE_INLINE_SCAN: usize = 128;
 
 /// Queue the un-scanned remainder of a bounded shared
-/// purge, if any, on a background task (issue #368).
+/// purge, if any, on a background task (issue #368). The
+/// purge stays active until that task finishes; with
+/// nothing left to walk it ends here.
 fn spawn_shared_purge_rest(
     shared: &Arc<crate::s3store::S3Store>,
     pending: Option<crate::s3store::PendingPurge>,
+    active: crate::cache::ActivePurge,
     event: &'static str,
     target: &str,
 ) {
@@ -861,6 +867,7 @@ fn spawn_shared_purge_rest(
         let target = target.to_string();
         tokio::spawn(async move {
             let removed = shared.finish_purge(pending).await;
+            drop(active);
             purge_log(event, &target, Some(removed));
         });
     }
@@ -1002,8 +1009,11 @@ async fn purge_handle(
         // The tombstone lands before any tier is touched
         // (issue #350): a write begun before this purge can
         // then see it whenever it tries to land, including
-        // after this handler has finished.
-        task_state.purge_guard.record_key(&key_form);
+        // after this handler has finished. The purge stays
+        // active until the shared walk ends (issue #400).
+        let active = task_state
+            .purge_guard
+            .begin(crate::cache::PurgeTarget::Key(key_form.clone()));
         let mut removed = task_state.cache.purge_matching(&key_form);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1024,7 +1034,7 @@ async fn purge_handle(
                 .purge_matching_bounded(&key_form, &epoch_form, SHARED_PURGE_INLINE_SCAN)
                 .await;
             removed += walked;
-            spawn_shared_purge_rest(shared, pending, "purge", &task_target);
+            spawn_shared_purge_rest(shared, pending, active, "purge", &task_target);
         }
         task_state.metrics.record_purge();
         purge_log("purge", &task_target, Some(removed));
@@ -1106,7 +1116,9 @@ async fn purge_group_handle(
     let removed = tokio::spawn(async move {
         // Tombstone first, tiers second (issue #350), as in
         // the per-URL purge.
-        task_state.purge_guard.record_group(&group);
+        let active = task_state
+            .purge_guard
+            .begin(crate::cache::PurgeTarget::Group(group.clone()));
         let mut removed = task_state.cache.purge_group(&group);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1121,7 +1133,7 @@ async fn purge_group_handle(
                 .purge_group_bounded(&group, SHARED_PURGE_INLINE_SCAN)
                 .await;
             removed += walked;
-            spawn_shared_purge_rest(shared, pending, "purge-group", &task_target);
+            spawn_shared_purge_rest(shared, pending, active, "purge-group", &task_target);
         }
         task_state.metrics.record_purge();
         purge_log("purge-group", &task_target, Some(removed));
@@ -1238,7 +1250,9 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
     tokio::spawn(async move {
         // Tombstone first, tiers second (issue #350), as in
         // the per-URL purge.
-        task_state.purge_guard.record_source(&source);
+        let active = task_state
+            .purge_guard
+            .begin(crate::cache::PurgeTarget::Source(source.clone()));
         let mut removed = task_state.cache.purge_source(&source);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1253,7 +1267,7 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
                 .purge_source_bounded(&source, SHARED_PURGE_INLINE_SCAN)
                 .await;
             removed += walked;
-            spawn_shared_purge_rest(shared, pending, "purge-source", &source);
+            spawn_shared_purge_rest(shared, pending, active, "purge-source", &source);
         }
         purge_log("purge-source", &source, Some(removed));
         removed
@@ -2363,9 +2377,17 @@ fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedIma
 /// leaving the persistent copies invisible to the group
 /// purge. Every write this chain makes (promotions,
 /// merge write-backs) runs under the purge guard, under
-/// the generation the lookup started with. Returns the
-/// image and the `Cache-Status` value for the tier that
-/// served it.
+/// the generation the lookup started with. A disk or
+/// shared copy that a purge covers is a miss, and is
+/// deleted on sight, when that purge was running at any
+/// point since the lookup began (issue #400): the purge
+/// may not have reached the copy when it was read, and
+/// serving or promoting it would outlive the purge. The
+/// memory tier needs no such check: a purge empties it
+/// before any slower tier, and every way back in is a
+/// promotion through this chain or a guarded write.
+/// Returns the image and the `Cache-Status` value for
+/// the tier that served it.
 async fn lookup_tiers(
     state: &AppState,
     cache_key: &str,
@@ -2435,6 +2457,16 @@ async fn lookup_tiers(
     if let Some(shared) = &state.shared_store
         && let Some(mut image) = shared.get(cache_key).await
     {
+        // Checked after the read, against purges running at
+        // any point since the snapshot: a walk can delete
+        // this object and end while its bytes are in flight.
+        if state
+            .purge_guard
+            .running_covers(snapshot, cache_key, &image.groups)
+        {
+            shared.remove(cache_key).await;
+            return None;
+        }
         if !groups.is_empty() {
             let merged = crate::cache::union_groups(&image.groups, groups);
             if merged != image.groups {
@@ -2475,6 +2507,13 @@ async fn lookup_disk_tier(
     let (image, grew) = store
         .blocking(move |store| {
             let mut image = store.get(&key)?;
+            if guard.running_covers(snapshot, &key, &image.groups) {
+                // A purge running since the lookup began
+                // covers this copy (issue #400): drop it
+                // rather than serve and promote it.
+                store.remove(&key);
+                return None;
+            }
             let mut grew = false;
             if !lookup_groups.is_empty() && store.merge_groups(&key, &lookup_groups) {
                 image.groups = crate::cache::union_groups(&image.groups, &lookup_groups);
@@ -15311,6 +15350,271 @@ mod tests {
             .unwrap();
         assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Poll `done` every 20 ms for up to five seconds, or
+    /// fail with `what`.
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..250 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    /// A served app over disk and shared tiers for the
+    /// background purge walk tests (issue #400): one preset
+    /// render in group `small`, its bucket copy replaced by
+    /// distinct "stale" bytes, so a later answer shows which
+    /// copy served it, behind more filler objects than the
+    /// inline purge budget, so a group purge returns before
+    /// its walk reaches the entry.
+    struct WalkFixture {
+        fake: crate::s3store::test_support::FakeS3,
+        dir: std::path::PathBuf,
+        hits: Arc<AtomicUsize>,
+        probe: AppState,
+        base: String,
+        url: String,
+        object: String,
+        key: String,
+        stale: CachedImage,
+    }
+
+    impl WalkFixture {
+        async fn new(name: &str) -> Self {
+            let fake = crate::s3store::test_support::start_fake().await;
+            let dir =
+                std::env::temp_dir().join(format!("crabcrop-srv-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+            let mut state = tier_test_state(Some(&dir), &fake.endpoint);
+            state.presets = preset_test_map();
+            let probe = state.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                axum::serve(listener, app(state)).await.unwrap();
+            });
+            let preset = format!("preset:small/{src}");
+            let url = format!("{base}/{}/{preset}", sign(&preset));
+            // One render stores the entry, in group `small`,
+            // in memory, on disk, and (written through in the
+            // background) in the bucket.
+            let resp = client().get(&url).send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            wait_until("the shared write-through lands", || {
+                fake.objects.lock().unwrap().len() == 1
+            })
+            .await;
+            let (object, key, rendered) = {
+                let objects = fake.objects.lock().unwrap();
+                let (object, data) = objects.iter().next().unwrap();
+                let (key, image) =
+                    crate::storage::parse_entry(data, &crate::url::entry_key(b"disk-key-test"))
+                        .unwrap();
+                (object.clone(), key, image)
+            };
+            // Stand the bucket copy in for one the purge must
+            // remove.
+            let stale = CachedImage {
+                bytes: bytes::Bytes::from_static(b"stale-pixels"),
+                etag: crate::cache::etag_for_bytes(b"stale-pixels"),
+                ..rendered
+            };
+            assert_eq!(stale.groups, vec!["small".to_string()]);
+            probe.shared_store.clone().unwrap().put(&key, &stale).await;
+            {
+                let mut objects = fake.objects.lock().unwrap();
+                for i in 0..SHARED_PURGE_INLINE_SCAN + 40 {
+                    let filler = format!("0-filler-{i:04}");
+                    assert!(filler < object, "fillers must list ahead of the entry");
+                    objects.insert(filler, b"not a cache entry".to_vec());
+                }
+            }
+            WalkFixture {
+                fake,
+                dir,
+                hits,
+                probe,
+                base,
+                url,
+                object,
+                key,
+                stale,
+            }
+        }
+
+        /// Purge group `small` and wait until its background
+        /// walk is parked on its first header read past the
+        /// inline budget.
+        async fn purge_and_park_walk(&self) {
+            self.fake.ranged_gets.store(0, Ordering::SeqCst);
+            *self.fake.hold_ranged_after.lock().unwrap() = Some(SHARED_PURGE_INLINE_SCAN);
+            let sig = crate::url::purge_group_signature(SECRET, "small");
+            let resp = client()
+                .post(format!("{}/purge-group/{sig}/small", self.base))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            // Memory and disk; the bucket copy waits for the
+            // walk.
+            assert_eq!(resp.text().await.unwrap(), "purged 2\n");
+            wait_until("the background walk parks", || {
+                self.fake.ranged_gets.load(Ordering::SeqCst) > SHARED_PURGE_INLINE_SCAN
+            })
+            .await;
+            assert_eq!(self.probe.purge_guard.active_count(), 1);
+            assert!(self.fake.objects.lock().unwrap().contains_key(&self.object));
+        }
+
+        /// Let the parked walk finish and wait until the
+        /// purge ends.
+        async fn finish_walk(&self) {
+            *self.fake.hold_ranged_after.lock().unwrap() = None;
+            wait_until("the purge walk ends", || {
+                self.probe.purge_guard.active_count() == 0
+            })
+            .await;
+        }
+
+        /// No tier holds the stale copy, and the URL serves a
+        /// fresh render.
+        async fn assert_no_tier_serves_the_stale_copy(&self) {
+            let is_stale = |image: &CachedImage| image.etag == self.stale.etag;
+            let store = self.probe.store.clone().unwrap();
+            let shared = self.probe.shared_store.clone().unwrap();
+            assert!(
+                !self
+                    .probe
+                    .cache
+                    .get(&self.key)
+                    .is_some_and(|e| is_stale(&e))
+            );
+            assert!(!store.get(&self.key).is_some_and(|e| is_stale(&e)));
+            assert!(!shared.get(&self.key).await.is_some_and(|e| is_stale(&e)));
+            let resp = client().get(&self.url).send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_ne!(header(&resp, "etag"), self.stale.etag);
+            assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+        }
+    }
+
+    impl Drop for WalkFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn lookups_during_a_background_purge_walk_do_not_resurrect_the_entry() {
+        // Issue #400: a shared purge walk that outgrows the
+        // inline budget finishes in the background. Before
+        // the fix, a GET during that walk missed memory and
+        // disk (the purge had emptied them), served the
+        // shared copy the walk had not reached yet, and
+        // promoted it into both local tiers, where the walk
+        // never looks: the purged entry kept serving after
+        // the walk deleted the bucket object.
+        let fx = WalkFixture::new("walk").await;
+        fx.purge_and_park_walk().await;
+        // A GET during the walk is a miss: it renders from
+        // the origin instead of serving the bucket copy.
+        let resp = client().get(&fx.url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_ne!(header(&resp, "etag"), fx.stale.etag);
+        assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+        assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+        // The lookup deleted the copy on sight, while the
+        // walk was still parked.
+        assert!(
+            fx.fake
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == &format!("DELETE {}", fx.object)),
+            "the lookup did not delete the purged bucket copy"
+        );
+        fx.finish_walk().await;
+        fx.assert_no_tier_serves_the_stale_copy().await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_the_purge_walk_ends_under_does_not_resurrect_the_entry() {
+        // Issue #400, at the end of the walk: a lookup that
+        // starts while the walk runs reads the bucket copy
+        // before the walk reaches it, and the walk deletes
+        // the object and ends while those bytes are still in
+        // flight. A check against only the purges still
+        // running when the bytes arrive finds none, and the
+        // lookup serves the copy and promotes it into both
+        // local tiers after the purge is over.
+        let fx = WalkFixture::new("walk-end").await;
+        fx.purge_and_park_walk().await;
+        fx.fake.hold_object_gets.store(true, Ordering::SeqCst);
+        let url = fx.url.clone();
+        let get = tokio::spawn(async move { client().get(&url).send().await.unwrap() });
+        wait_until("the lookup reads the bucket copy", || {
+            fx.fake.held_object_gets.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        fx.finish_walk().await;
+        assert!(
+            !fx.fake.objects.lock().unwrap().contains_key(&fx.object),
+            "the walk did not delete the bucket copy"
+        );
+        fx.fake.hold_object_gets.store(false, Ordering::SeqCst);
+        let resp = get.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_ne!(header(&resp, "etag"), fx.stale.etag);
+        assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+        assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+        fx.assert_no_tier_serves_the_stale_copy().await;
+    }
+
+    #[tokio::test]
+    async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
+        // Issue #400, at the tier chain: while a purge is
+        // still running, a disk or bucket copy it covers is
+        // a miss for a lookup that starts after the purge,
+        // and is deleted on sight; copies it does not cover
+        // still serve, and once the purge ends a fresh copy
+        // serves again.
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-active-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let store = state.store.clone().unwrap();
+        let shared = state.shared_store.clone().unwrap();
+        let key = "40x24/example.com/i.png#cfgtest#w300";
+        let other = "40x24/example.com/other.png#cfgtest";
+        store.put(key, &tier_test_entry());
+        shared.put(key, &tier_test_entry()).await;
+        store.put(other, &tier_test_entry());
+        let active = state.purge_guard.begin(crate::cache::PurgeTarget::Key(
+            "40x24/example.com/i.png".into(),
+        ));
+        assert!(lookup_tiers(&state, key, &[]).await.is_none());
+        assert!(store.get(key).is_none(), "the disk copy survived");
+        assert!(shared.get(key).await.is_none(), "the bucket copy survived");
+        assert!(state.cache.get(key).is_none(), "the copy was promoted");
+        let (_, status) = lookup_tiers(&state, other, &[]).await.unwrap();
+        assert_eq!(status, "crabcrop; hit; detail=\"disk\"");
+        // A copy only in the bucket is caught there too.
+        shared.put(key, &tier_test_entry()).await;
+        assert!(lookup_tiers(&state, key, &[]).await.is_none());
+        assert!(shared.get(key).await.is_none());
+        drop(active);
+        shared.put(key, &tier_test_entry()).await;
+        let (_, status) = lookup_tiers(&state, key, &[]).await.unwrap();
+        assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
