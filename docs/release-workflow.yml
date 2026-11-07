@@ -527,6 +527,41 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  publish-mcp:
+    name: Publish @crabcrop/mcp to npm
+    needs:
+      - plan
+      - host
+    if: ${{ !github.event.pull_request }}
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # The prepack build compiles the TypeScript SDK first and
+      # then the server itself; without both installs it fails
+      # on a clean runner for want of the SDK's locked dev
+      # dependencies (typescript, @types/node).
+      - name: Install TypeScript SDK dependencies
+        working-directory: sdks/typescript
+        run: npm ci
+      - name: Install MCP dependencies
+        working-directory: sdks/mcp
+        run: npm ci
+      - name: npm publish
+        working-directory: sdks/mcp
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
   publish-pypi:
     name: Publish crabcrop_url to PyPI
     needs:
