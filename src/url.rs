@@ -2499,11 +2499,11 @@ pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError
 /// [`expand_presets`] expands and stops where it stops (the
 /// source, or a segment that is not an operation).
 ///
-/// The scan runs on the request path ahead of expansion, so
-/// on untrusted input (issue #409): the seen-set is a hash
-/// set, keeping a remainder of n distinct names linear in n
-/// where a scan of the kept list was quadratic, and the
-/// output keeps first-seen order.
+/// The scan runs on the request path before expansion
+/// rejects unknown names, so it sees untrusted input (issue
+/// #409). A hash set tracks the names already kept: n
+/// distinct names cost linear work, where scanning the kept
+/// list was quadratic. The output keeps first-seen order.
 pub fn preset_names(rest: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();

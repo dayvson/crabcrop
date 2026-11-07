@@ -6878,12 +6878,7 @@ mod tests {
             let body: serde_json::Value =
                 serde_json::from_str(&resp.text().await.unwrap()).unwrap();
             assert_eq!(body["error"]["code"], "unknown_preset", "/{route}");
-            assert!(
-                body["error"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("000")),
-                "/{route}: {body}"
-            );
+            assert_eq!(body["error"]["message"], "unknown preset: 000", "/{route}");
         }
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
