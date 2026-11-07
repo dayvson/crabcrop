@@ -73,13 +73,23 @@ pub(in crate::server) struct FlightSlot {
 #[derive(Clone)]
 pub(in crate::server) struct SharedFlight {
     /// Every input `serve` shaped the response from
-    /// besides the conditional headers (see `serve`): a
-    /// follower takes the response only when its own
-    /// request carries the same, since one cache key can
-    /// serve spellings that answer differently (a sealed
-    /// one answers errors with the uniform refusal, a
-    /// preset one names its cache group).
+    /// besides the conditional headers, as the miss path
+    /// sees it (the raw path, the negotiated format, the
+    /// hints; see `serve`): a follower takes the response
+    /// only when its own request carries the same, since
+    /// one cache key can serve spellings that answer
+    /// differently (a sealed one answers errors with the
+    /// uniform refusal, a preset one names its cache
+    /// group).
     pub(in crate::server) request: String,
+    /// The purge generation read before the leader's run
+    /// began. A follower may have arrived after a purge
+    /// that landed during the run (an overwritten upload,
+    /// a purged URL), and such a request is owed a fresh
+    /// render, so once a purge covering the key has been
+    /// recorded since this reading no follower takes the
+    /// response.
+    pub(in crate::server) snapshot: u64,
     /// The response as the miss path produced it, before
     /// the leader's own conditional headers were applied.
     pub(in crate::server) response: SharedResponse,
