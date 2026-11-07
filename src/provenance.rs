@@ -33,8 +33,9 @@
 //! constructors are removed in 0.92.
 
 use std::io::Cursor;
+use std::time::Duration;
 
-use c2pa::{Builder, Context, Reader, SigningAlg, ValidationState};
+use c2pa::{Builder, Context, Reader, Signer, SigningAlg, ValidationState};
 
 /// The IPTC digital source type recorded on the edit
 /// action of an AI-edited output: the pixels were changed
@@ -43,21 +44,47 @@ use c2pa::{Builder, Context, Reader, SigningAlg, ValidationState};
 const AI_EDITED_SOURCE_TYPE: &str =
     "http://cv.iptc.org/newscodes/digitalsourcetype/compositeWithTrainedAlgorithmicMedia";
 
-/// The timestamp authority timeouts (issue #365): the
-/// SDK's own ureq resolver leaves every timeout unset,
-/// so a hung authority would hang the boot probe and
-/// every signed request. Signing hands the SDK a
-/// resolver agent with these set instead: 5 seconds to
-/// connect, 15 seconds for the whole round trip (the
-/// request and reply are a few hundred bytes each).
-const TSA_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const TSA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The default timestamp authority bounds (issues #365,
+/// #397): the SDK's own ureq resolver leaves every
+/// timeout unset, so a hung authority would hang the boot
+/// probe and every signed request. 5 seconds to connect,
+/// 15 seconds for the whole round trip (the request and
+/// reply are a few hundred bytes each).
+const TSA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TSA_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A ureq agent carrying the TSA timeouts, in the
-/// redirect posture the SDK's own resolver uses (a
-/// timestamp reply is a direct answer, never a
-/// redirect to follow).
-fn tsa_agent(connect: std::time::Duration, total: std::time::Duration) -> ureq::Agent {
+/// A timestamp authority and the bounds on one call to
+/// it. The bounds are fields rather than constants so a
+/// test can drive the real signing path against a stalled
+/// authority in well under a second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimestampAuthority {
+    pub url: String,
+    /// Time allowed to open the connection.
+    pub connect_timeout: Duration,
+    /// Time allowed for the whole call, from the lookup
+    /// to the last byte of the reply.
+    pub request_timeout: Duration,
+}
+
+impl TimestampAuthority {
+    /// The authority at `url`, with the default bounds.
+    pub fn new(url: String) -> Self {
+        Self {
+            url,
+            connect_timeout: TSA_CONNECT_TIMEOUT,
+            request_timeout: TSA_REQUEST_TIMEOUT,
+        }
+    }
+}
+
+/// A ureq agent carrying the TSA timeouts. It follows
+/// no redirect: a timestamp reply is a direct answer,
+/// and a single hop keeps the total timeout a bound on
+/// the whole call. (The SDK's default stack follows up
+/// to 10 redirects, and wrapped around this agent each
+/// hop would restart the clock.)
+fn tsa_agent(connect: Duration, total: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(connect))
         .timeout_global(Some(total))
@@ -66,13 +93,89 @@ fn tsa_agent(connect: std::time::Duration, total: std::time::Duration) -> ureq::
     ureq::Agent::new_with_config(config)
 }
 
-/// The context signing runs under: the defaults, plus
-/// the timeout-carrying resolver above, shared across
-/// calls.
-fn signing_context() -> Context {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    let agent = AGENT.get_or_init(|| tsa_agent(TSA_CONNECT_TIMEOUT, TSA_REQUEST_TIMEOUT));
-    Context::new().with_resolver(agent.clone())
+/// The SDK signer with its timestamp request sent through
+/// the timed agent (issue #397). `create_signer::from_keys`
+/// returns a signer that leaves `send_timestamp_request`
+/// to the trait default, and that default builds a fresh
+/// `Context::new()`, whose resolver has no timeout at all,
+/// whatever context the builder signs under. So the
+/// builder's context never reached the one call that
+/// talks to the authority. This wrapper overrides that
+/// call and delegates everything else unchanged.
+struct TimedSigner {
+    inner: c2pa::BoxedSigner,
+    agent: ureq::Agent,
+}
+
+impl TimedSigner {
+    /// A context whose resolver is the timed agent.
+    fn context(&self) -> Context {
+        Context::new().with_resolver(self.agent.clone())
+    }
+}
+
+impl Signer for TimedSigner {
+    fn sign(&self, data: &[u8]) -> c2pa::Result<Vec<u8>> {
+        self.inner.sign(data)
+    }
+
+    fn alg(&self) -> SigningAlg {
+        self.inner.alg()
+    }
+
+    fn certs(&self) -> c2pa::Result<Vec<Vec<u8>>> {
+        self.inner.certs()
+    }
+
+    fn reserve_size(&self) -> usize {
+        self.inner.reserve_size()
+    }
+
+    fn time_authority_url(&self) -> Option<String> {
+        self.inner.time_authority_url()
+    }
+
+    fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
+        self.inner.timestamp_request_headers()
+    }
+
+    fn timestamp_request_body(&self, message: &[u8]) -> c2pa::Result<Vec<u8>> {
+        self.inner.timestamp_request_body(message)
+    }
+
+    fn send_timestamp_request(&self, message: &[u8]) -> Option<c2pa::Result<Vec<u8>>> {
+        let url = self.time_authority_url()?;
+        // The SDK default skips the timestamp silently
+        // when the request body cannot be built; an
+        // operator who configured an authority gets the
+        // error instead of an untimestamped signature.
+        let body = match self.timestamp_request_body(message) {
+            Ok(body) => body,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(
+            c2pa::crypto::time_stamp::default_rfc3161_request(
+                &url,
+                self.timestamp_request_headers(),
+                &body,
+                message,
+                &self.context(),
+            )
+            .map_err(Into::into),
+        )
+    }
+
+    fn ocsp_val(&self) -> Option<Vec<u8>> {
+        self.inner.ocsp_val()
+    }
+
+    fn direct_cose_handling(&self) -> bool {
+        self.inner.direct_cose_handling()
+    }
+
+    fn dynamic_assertions(&self) -> Vec<Box<dyn c2pa::dynamic_assertion::DynamicAssertion>> {
+        self.inner.dynamic_assertions()
+    }
 }
 
 /// A 1x1 PNG, the boot self-test's signing target.
@@ -195,7 +298,7 @@ pub fn signable_mime(format: crate::url::ImageFormat) -> Option<&'static str> {
 
 /// The operator's signing identity: a PEM certificate
 /// chain and its private key, plus an optional timestamp
-/// authority URL. The SDK signer is built once, when
+/// authority. The SDK signer is built once, when
 /// `from_pem` settles the algorithm: rebuilding it per
 /// sign re-parsed the PEM chain and key every time, which
 /// measured ~0.64 ms of a ~1.9 ms small-output sign. The
@@ -203,9 +306,9 @@ pub fn signable_mime(format: crate::url::ImageFormat) -> Option<&'static str> {
 /// shareable across threads with no lock around it, and
 /// signing stays a borrow.
 pub struct ProvenanceSigner {
-    signer: c2pa::BoxedSigner,
+    signer: TimedSigner,
     alg: SigningAlg,
-    tsa_url: Option<String>,
+    tsa: Option<TimestampAuthority>,
     /// The identity validators will display, read back
     /// from the boot self-test's manifest (the leaf
     /// certificate's common name).
@@ -220,7 +323,7 @@ impl std::fmt::Debug for ProvenanceSigner {
         f.debug_struct("ProvenanceSigner")
             .field("name", &self.name)
             .field("alg", &self.alg)
-            .field("tsa_url", &self.tsa_url)
+            .field("tsa", &self.tsa)
             .finish_non_exhaustive()
     }
 }
@@ -246,7 +349,8 @@ pub struct SignRequest<'a> {
 impl ProvenanceSigner {
     /// Load from the operator's files and prove the
     /// identity works (see `from_pem`) before the server
-    /// starts answering.
+    /// starts answering. A timestamp authority gets the
+    /// default bounds.
     pub fn from_files(
         cert_path: &str,
         key_path: &str,
@@ -256,13 +360,13 @@ impl ProvenanceSigner {
             .map_err(|e| format!("cannot read CRABCROP_C2PA_CERT file {cert_path}: {e}"))?;
         let key_pem = std::fs::read(key_path)
             .map_err(|e| format!("cannot read CRABCROP_C2PA_KEY file {key_path}: {e}"))?;
-        Self::from_pem(cert_pem, key_pem, tsa_url)
+        Self::from_pem(cert_pem, key_pem, tsa_url.map(TimestampAuthority::new))
     }
 
     /// Build and validate a signing identity from PEM
     /// bytes. Validation is a real round trip: sign the
     /// self-test image and require the result to read back
-    /// valid. That one probe settles the algorithm (each
+    /// valid. That probe settles the algorithm (each
     /// candidate is tried until one produces a verifying
     /// signature), the certificate profile (the SDK refuses
     /// a bare self-signed certificate, an end-entity
@@ -272,10 +376,19 @@ impl ProvenanceSigner {
     /// the SDK's own error: boot fails fast, like the model
     /// preloads, instead of the first signed request
     /// discovering a broken identity.
+    ///
+    /// The algorithm search runs without the authority,
+    /// and the authority is then asked exactly once, with
+    /// the settled algorithm (issue #397). Probing every
+    /// candidate against it would multiply a stalled
+    /// authority's bound by every algorithm the key
+    /// happens to load under (an RSA key loads as all
+    /// three PS variants), and a failed timestamp says
+    /// nothing about the algorithm anyway.
     pub fn from_pem(
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
-        tsa_url: Option<String>,
+        tsa: Option<TimestampAuthority>,
     ) -> Result<Self, String> {
         let mut first_error = None;
         for alg in [
@@ -287,25 +400,31 @@ impl ProvenanceSigner {
             SigningAlg::Ps384,
             SigningAlg::Ps512,
         ] {
-            let boxed =
-                match c2pa::create_signer::from_keys(&cert_pem, &key_pem, alg, tsa_url.clone()) {
-                    Ok(signer) => signer,
-                    Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e.to_string());
-                        }
-                        continue;
+            let signer = match Self::build(&cert_pem, &key_pem, alg, None) {
+                Ok(signer) => signer,
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
-                };
-            let signer = Self {
-                signer: boxed,
-                alg,
-                tsa_url: tsa_url.clone(),
-                name: String::new(),
+                    continue;
+                }
             };
             match signer.probe() {
                 Ok(name) => {
-                    return Ok(Self { name, ..signer });
+                    let Some(tsa) = tsa else {
+                        return Ok(Self { name, ..signer });
+                    };
+                    let url = tsa.url.clone();
+                    return Self::build(&cert_pem, &key_pem, alg, Some(tsa))
+                        .and_then(|signer| {
+                            let name = signer.probe()?;
+                            Ok(Self { name, ..signer })
+                        })
+                        .map_err(|e| {
+                            format!(
+                                "the timestamp authority {url} failed the signing self-test: {e}"
+                            )
+                        });
                 }
                 Err(e) => {
                     if first_error.is_none() {
@@ -318,6 +437,35 @@ impl ProvenanceSigner {
             "the configured C2PA identity cannot sign: {}",
             first_error.unwrap_or_else(|| "no signing algorithm worked".to_string())
         ))
+    }
+
+    /// One candidate signer, not yet probed. Every SDK
+    /// HTTP call signing makes goes through an agent with
+    /// the authority's bounds (the defaults when there is
+    /// no authority).
+    fn build(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        alg: SigningAlg,
+        tsa: Option<TimestampAuthority>,
+    ) -> Result<Self, String> {
+        let inner = c2pa::create_signer::from_keys(
+            cert_pem,
+            key_pem,
+            alg,
+            tsa.as_ref().map(|t| t.url.clone()),
+        )
+        .map_err(|e| e.to_string())?;
+        let agent = match &tsa {
+            Some(t) => tsa_agent(t.connect_timeout, t.request_timeout),
+            None => tsa_agent(TSA_CONNECT_TIMEOUT, TSA_REQUEST_TIMEOUT),
+        };
+        Ok(Self {
+            signer: TimedSigner { inner, agent },
+            alg,
+            tsa,
+            name: String::new(),
+        })
     }
 
     /// The boot probe: sign the self-test image with this
@@ -360,7 +508,7 @@ impl ProvenanceSigner {
             }],
         })
         .to_string();
-        let mut builder = Builder::from_context(signing_context())
+        let mut builder = Builder::from_context(self.signer.context())
             .with_definition(definition)
             .map_err(|e| e.to_string())?;
         // The actions assertion must open with a created
@@ -410,7 +558,7 @@ impl ProvenanceSigner {
         let mut source = Cursor::new(output);
         let mut dest = Cursor::new(Vec::new());
         builder
-            .sign(&*self.signer, mime, &mut source, &mut dest)
+            .sign(&self.signer, mime, &mut source, &mut dest)
             .map_err(|e| e.to_string())?;
         Ok(dest.into_inner())
     }
@@ -590,31 +738,213 @@ mod tests {
         assert!(!err.is_empty());
     }
 
-    #[test]
-    fn tsa_agent_gives_up_on_a_stalled_authority() {
-        // Issue #365: the agent signing runs under carries
-        // connect and total timeouts. A listener that
-        // accepts and never answers must fail the request
-        // at the total timeout, not hang it.
+    /// A timestamp authority that accepts every
+    /// connection and never answers. It holds each
+    /// connection until `release` is dropped, or for 20
+    /// seconds at most, so a regression fails its test
+    /// instead of hanging the suite. The join handle
+    /// yields how many connections it accepted.
+    fn stalled_authority() -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<usize>,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let staller = std::thread::spawn(move || {
-            let _held = listener.accept();
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut held = Vec::new();
+            while std::time::Instant::now() < deadline
+                && released.try_recv() == Err(std::sync::mpsc::TryRecvError::Empty)
+            {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Count a connection still queued when the
+            // release came.
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+            held.len()
         });
-        let agent = tsa_agent(
-            std::time::Duration::from_millis(300),
-            std::time::Duration::from_millis(300),
-        );
+        (url, release, staller)
+    }
+
+    /// Short bounds for the stalled-authority tests.
+    fn short_bounds(url: String) -> TimestampAuthority {
+        TimestampAuthority {
+            url,
+            connect_timeout: Duration::from_millis(300),
+            request_timeout: Duration::from_millis(500),
+        }
+    }
+
+    #[test]
+    fn boot_probe_gives_up_on_a_stalled_authority() {
+        // Issue #397: the timestamp request used the SDK's
+        // trait default, which builds its own untimed
+        // context, so a stalled authority hung boot with no
+        // limit. Through the real constructor, the probe
+        // must fail at the configured bound, after asking
+        // the authority exactly once.
+        let (url, release, staller) = stalled_authority();
+        let tsa = short_bounds(url.clone());
+        let bound = tsa.request_timeout;
         let started = std::time::Instant::now();
-        let result = agent.get(&format!("http://{addr}/")).call();
+        let result = ProvenanceSigner::from_pem(
+            TEST_CHAIN.as_bytes().to_vec(),
+            TEST_KEY.as_bytes().to_vec(),
+            Some(tsa),
+        );
+        let elapsed = started.elapsed();
+        drop(release);
+        let contacts = staller.join().unwrap();
+        let err = match result {
+            Ok(_) => panic!("a stalled authority cannot timestamp the self-test"),
+            Err(e) => e,
+        };
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "boot gave up at the bound, took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= bound,
+            "the failure came from the bound, not an earlier error: {elapsed:?}, {err}"
+        );
+        assert_eq!(contacts, 1, "the authority is asked once: {err}");
+        assert!(err.contains(&url), "the error names the authority: {err}");
+    }
+
+    #[test]
+    fn signing_gives_up_on_an_authority_that_stalls_after_boot() {
+        // The per-request path: a signer whose authority
+        // stops answering after boot fails each signed
+        // output at the bound instead of holding the
+        // process job.
+        let (url, release, staller) = stalled_authority();
+        let tsa = short_bounds(url);
+        let bound = tsa.request_timeout;
+        let signer = ProvenanceSigner::build(
+            TEST_CHAIN.as_bytes(),
+            TEST_KEY.as_bytes(),
+            SigningAlg::Es256,
+            Some(tsa),
+        )
+        .expect("the test identity loads");
+        let started = std::time::Instant::now();
+        let result = signer.sign(SELF_TEST_PNG, "image/png", &plain());
+        let elapsed = started.elapsed();
+        drop(release);
+        let contacts = staller.join().unwrap();
         assert!(result.is_err(), "a stalled authority is an error");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "the request gave up at the timeout, took {:?}",
-            started.elapsed()
+            elapsed < Duration::from_secs(5),
+            "signing gave up at the bound, took {elapsed:?}"
         );
-        drop(staller);
+        assert!(elapsed >= bound, "{elapsed:?}");
+        assert_eq!(contacts, 1);
+    }
+
+    /// A timestamp authority that answers its first
+    /// request with a 307 to `location`, then exits. The
+    /// join handle yields whether it served a request
+    /// (it gives up after 20 seconds without one).
+    fn redirecting_authority(location: String) -> (String, std::thread::JoinHandle<bool>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let redirector = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            // Read the whole request before answering, so
+            // closing the socket never resets it mid-send.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .is_ok()
+        });
+        (url, redirector)
+    }
+
+    #[test]
+    fn a_redirecting_authority_is_not_followed() {
+        // The timestamp request goes through the timed
+        // agent, which follows no redirect: a timestamp
+        // reply is a direct answer, and one hop keeps the
+        // bound on the whole call. The SDK's default stack,
+        // which this path no longer uses, followed up to
+        // 10 hops. A redirecting authority fails boot with
+        // its status named instead.
+        let (target, release, staller) = stalled_authority();
+        let (url, redirector) = redirecting_authority(target);
+        let result = ProvenanceSigner::from_pem(
+            TEST_CHAIN.as_bytes().to_vec(),
+            TEST_KEY.as_bytes().to_vec(),
+            Some(short_bounds(url.clone())),
+        );
+        drop(release);
+        let followed = staller.join().unwrap();
+        assert!(redirector.join().unwrap(), "the authority was asked");
+        let err = match result {
+            Ok(_) => panic!("a redirect is not a timestamp"),
+            Err(e) => e,
+        };
+        assert_eq!(followed, 0, "the redirect was not followed: {err}");
+        assert!(err.contains("status = 307"), "the status is named: {err}");
+        assert!(err.contains(&url), "the error names the authority: {err}");
+    }
+
+    #[test]
+    fn authority_defaults_match_the_documented_bounds() {
+        // docs/meta.md and docs/configuration.md promise
+        // 5 seconds to connect and 15 overall.
+        let tsa = TimestampAuthority::new("http://tsa.example/".to_string());
+        assert_eq!(tsa.connect_timeout, Duration::from_secs(5));
+        assert_eq!(tsa.request_timeout, Duration::from_secs(15));
     }
 
     #[test]
