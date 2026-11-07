@@ -75,7 +75,7 @@ The bounds mirror the encoder's, because the work is the same class:
 | Source has no video stream, or is not a readable video | `502`: the bad-source failure every undecodable source gets |
 | Percentage selection on a video that reports no duration | `400` |
 | Malformed `frame:` selector | `400` with the `invalid_frame` code, before any fetch |
-| Decoder exits nonzero, produces no frame, exceeds the cap, or times out | `502`: `video frame extraction failed` (the cause, including the decoder's stderr excerpt, is in the server log) |
+| Decoder exits nonzero, produces no frame, exceeds the cap, or times out; decoder older than FFmpeg 6.0 (no `fd` protocol); source cannot be staged in the temporary directory | `502`: `video frame extraction failed` (the cause, including the decoder's stderr excerpt, is in the server log) |
 | Video queue full (both slots busy past a 10 s wait) | `503` |
 
 A frame render's [meta response](meta.md#meta-responses) carries a `video` object: the source's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. The explain endpoint labels a video source's kind as `video`; its dimensions stay unknown there, because explain never runs the decoder.

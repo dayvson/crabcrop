@@ -1386,4 +1386,57 @@ exit 1\n",
             assert_eq!((img.width(), img.height()), (640, 480), "{selection:?}");
         }
     }
+
+    #[test]
+    fn real_tool_refuses_a_playlist_that_names_a_local_file() {
+        // Hostile input on the seekable channel (issues #361
+        // and #411): a source that is a concat script naming
+        // a video on the server's disk must not reach it. The
+        // format whitelist refuses the concat demuxer, and a
+        // nested open would fail anyway: a relative name
+        // resolves against `fd:` to `fd:<name>`, which the
+        // fd protocol refuses, and `file` is not whitelisted.
+        // The decoy is a readable clip, so a leak would come
+        // back as a frame instead of a refusal.
+        let Some(ffmpeg) = ffmpeg_path() else {
+            return;
+        };
+        let dir = temp_dir("playlist");
+        let decoy = dir.join("decoy.mp4");
+        let status = Command::new(&ffmpeg)
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:size=64x48:rate=10:duration=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&decoy)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let extractor = VideoFrameExtractor::new(ffmpeg, Duration::from_secs(30)).unwrap();
+        extractor
+            .extract_frame(&std::fs::read(&decoy).unwrap(), FrameSelection::Poster)
+            .unwrap();
+
+        // The tool runs in the temporary directory, so the
+        // relative name is the one concat's safe mode allows.
+        let relative = decoy.strip_prefix(std::env::temp_dir()).unwrap();
+        for script in [
+            format!("ffconcat version 1.0\nfile {}\n", relative.display()),
+            format!("ffconcat version 1.0\nfile 'file:{}'\n", decoy.display()),
+        ] {
+            let err = extractor
+                .extract_frame(script.as_bytes(), FrameSelection::Poster)
+                .unwrap_err();
+            assert!(matches!(err, FrameError::NotVideo(_)), "{script:?}: {err}");
+        }
+    }
 }
