@@ -35,6 +35,7 @@ Details an encoder setup has to match:
 - Frames are composited over black and padded up to even dimensions (H.264 and VP9 need them) by replicating the edge pixels. The response describes the padded dimensions.
 - Frame timing: the pipe contract carries one constant rate, so crabcrop picks it from the fastest frame, `ceil(1000 / shortest delay)` clamped to 1-100 fps (10 fps when no frame carries a delay), and repeats each frame `round(delay × fps / 1000)` times, at least once. Total duration is preserved to within one frame period per source frame. A source whose delays total more than 600 s is refused with a `400`.
 - At most two encodes run at a time, each under a hard wall-clock timeout (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s) after which the encoder is killed, and a hard output cap (`CRABCROP_VIDEO_MAX_MB`, default 64 MB) that aborts the encode the moment it is crossed. The encoder runs with an empty environment; nothing is inherited from the server's.
+- On Unix the encoder also runs under kernel resource limits, a backstop behind the wall clock: 8 GiB of address space, and CPU time of the timeout times one more than the cores the server may use, plus 5 s (155 CPU seconds at the default 30 s on a 4-core host). The kernel counts CPU time across all of the program's threads, and FFmpeg works on several, so the limit scales with the cores: a run that fits the wall clock never reaches it.
 
 ### Errors
 
@@ -63,6 +64,7 @@ The bounds mirror the encoder's, because the work is the same class:
 
 - At most two extractions run at a time behind the video gate (shared with encodes), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
 - Each run (probe and extraction alike) is bounded by the same wall-clock timeout as encodes (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a frame whose PNG passes 256 MiB, the decode allocation budget, is refused).
+- Each run also gets the encoder's kernel limits (address space, and CPU time scaled by the cores the server may use; see [the encoder details](#the-encoder-contract)), so a multi-threaded decode that fits the wall clock, such as a far seek in a long 4K clip, is never cut short by the CPU limit.
 - The source itself flows through the ordinary loader first, with the same allowlist, size cap, and redirect rules as any source. Only a URL carrying a `frame:` segment may fetch a `video/*` Content-Type; every other request keeps the image-only rule.
 
 ### Errors
@@ -94,6 +96,7 @@ The bounds mirror the frame extractor's, because the work is the same class:
 
 - Page work takes the video gate (at most two runs at a time, shared with encodes and frame extractions), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
 - Each run is bounded by `CRABCROP_PDF_TIMEOUT_SECS` (default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a page whose PNG passes 256 MiB, the decode allocation budget, is refused).
+- Each run also gets the same kernel limits as the video tools (address space, and CPU time scaled by the cores the server may use; see [the encoder details](#the-encoder-contract)), here against `CRABCROP_PDF_TIMEOUT_SECS`.
 
 ### Errors
 
