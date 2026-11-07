@@ -2,7 +2,7 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
-## [Unreleased]
+## [0.9.11] - 2026-11-07
 
 ### Added
 
@@ -54,6 +54,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - `pixelatefaces` redacts faces of any size (issue #401). Each face becomes a mosaic of averaged cells, at most 8 across and never under 2 px; faces under 20 px across used to come back unchanged. This changes the bytes served for existing `pixelatefaces` URLs whose faces are under 20 px.
 
+- npm prereleases publish under the `next` dist-tag (issue #413), so a release candidate such as 0.10.0-rc.1 no longer becomes what `npm install @crabcrop/url` or `npx -y @crabcrop/mcp` installs; only a plain release moves `latest`, the same rule the container images already followed.
+
 ### Fixed
 
 - Sharpening no longer frames the image in black (issue #378). The 3x3 convolution behind `sharpen` zeroed its border, so every sharpened output had a 1 px black frame and an image under 3 px on either axis came out entirely black. Border pixels now replicate the nearest edge pixel, the rule `convolve` already documents; interior pixels are unchanged. This changes the bytes served for every existing URL that sharpens, and the upgrade corpus entries `sharpen` and `chain-multi-filter` are re-baselined for this reason.
@@ -95,6 +97,12 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 - Segmentation decodes are bounded at the encoder's 1024 px scale and read only each box's region (issue #410), so one box no longer costs hundreds of MB to GBs on large images.
 
 - Documentation corrections. The purge guarantee now states that another replica's own disk tier, like its memory tier, is not reached by a purge sent to one replica (issue #351). Nine migration guide rows that described shipped features as missing (`dpr`, progressive JPEG, chroma subsampling, compass gravities, imgproxy focal points) now name the matching options. The test that keeps the documented error codes complete derives the code set from the sources instead of a second hand-kept list.
+
+- SVG embedded rasters are charged wherever the renderer draws them (issue #398). Embedded images inside patterns, masks, clip paths, and filter `feImage` sources now count against the 256 MiB decode budget at their decoded size, once for each time they are drawn, and pattern, mask, and clip-path contents count toward the 100,000-node expansion limit. A 16000x16000 payload that was refused as a plain `<image>` previously decoded at full size when wrapped in one of those constructs.
+
+- PNG metadata inflation is bounded per source (issue #399). Only the first ICC profile, EXIF, and XMP chunk is read, repeats are skipped unread, and every inflate draws on one shared 20 MiB budget, so a small PNG can no longer carry hundreds of chunks that each inflate to its own cap. An XMP packet past its cap is dropped instead of copied in truncated form, and under the default `strip` policy the EXIF, XMP, and Photoshop segments are not inflated at all.
+
+- The container recipes start with a writable disk result tier (issue #396). The images create `/var/cache/crabcrop` owned by `nobody` and the kustomize base sets `fsGroup: 65534`, so the compose production stack and the kustomize full overlay boot with the disk tier live instead of exiting on an unwritable directory; a compose `results` volume that already holds root-owned files needs the one-off chown in deploy/compose/README.md.
 
 ## [0.9.10] - 2026-11-06
 
