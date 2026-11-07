@@ -1972,10 +1972,6 @@ fn upscale_image(
     Ok(img)
 }
 
-/// Apply the operations to one image, collecting the encoding
-/// directives along the way. Shared by the still pipeline and
-/// the animated paths (GIF and WebP), which run it once per
-/// frame.
 /// The effective DPR factor: an explicit `dpr(...)` directive
 /// wins, then the client hint carried on the context, else 1.
 fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
@@ -2415,16 +2411,6 @@ fn fusion_plan(ops: &[Operation]) -> Option<FusionPlan> {
     })
 }
 
-/// Smart crop windows shared across the frames of one
-/// animated render (issue #376): the first frame's smart
-/// crop decides its window, and every later frame replays
-/// that window instead of running the focal analysis
-/// again, so the crop cannot jitter frame to frame and
-/// the analysis behind it (saliency, plus face detection
-/// when a provider feeds it) runs once per render, not
-/// once per frame. Entries key on the crop's position in
-/// the chain and the frame dimensions it decided on, so
-/// a frame of a different size decides for itself.
 /// One shared smart crop window: the chain position and
 /// frame dimensions it was decided on, and the window
 /// itself as (x, y, width, height).
@@ -2436,6 +2422,16 @@ struct SmartWindow {
     window: (u32, u32, u32, u32),
 }
 
+/// Smart crop windows shared across the frames of one
+/// animated render (issue #376): the first frame's smart
+/// crop decides its window, and every later frame replays
+/// that window instead of running the focal analysis
+/// again, so the crop cannot jitter frame to frame and
+/// the analysis behind it (saliency, plus face detection
+/// when a provider feeds it) runs once per render, not
+/// once per frame. Entries key on the crop's position in
+/// the chain and the frame dimensions it decided on, so
+/// a frame of a different size decides for itself.
 #[derive(Debug, Default)]
 struct SmartWindows {
     entries: Vec<SmartWindow>,
@@ -2467,6 +2463,10 @@ impl SmartWindows {
     }
 }
 
+/// Apply the operations to one image, collecting the encoding
+/// directives along the way. Shared by the still pipeline and
+/// the animated paths (GIF and WebP), which run it once per
+/// frame.
 fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],

@@ -134,8 +134,6 @@ fn format_name(format: ImageFormat) -> &'static str {
     }
 }
 
-/// The meta response: what the pipeline produced, as JSON,
-/// without the image bytes.
 /// The composed meta annotation: the tags that cleared the
 /// threshold, and a readable alt text built from the best
 /// labels. Composition lives here, at the call site, not
@@ -1439,6 +1437,8 @@ struct MetaBody {
     thumbhash: Option<String>,
 }
 
+/// The meta response: what the pipeline produced, as JSON,
+/// without the image bytes.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::server) fn meta_response(
     processed: &crate::engine::ProcessedImage,

@@ -645,17 +645,6 @@ fn take_line<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
     Some(line)
 }
 
-/// Split a stored file into (key, format, quality, groups,
-/// payload offset). `None` on any inconsistency, including a
-/// payload whose length disagrees with the header.
-/// `total_len` is the entry's full length: for a whole
-/// entry in memory it is `data.len()`; for a header prefix
-/// read on its own (the shared tier's purge walk) it is the
-/// object's real length, and `data` then holds only the
-/// header bytes, which is all this function touches. The
-/// MAC is parsed but not verified here: verification needs
-/// the whole entry, payload included, and happens in
-/// [`parse_entry`] and [`read_header`], the serving paths.
 /// A stored file's parsed header.
 struct EntryHeader {
     key: String,
@@ -673,6 +662,17 @@ struct EntryHeader {
     etag: Option<String>,
 }
 
+/// Split a stored file into (key, format, quality, groups,
+/// payload offset). `None` on any inconsistency, including a
+/// payload whose length disagrees with the header.
+/// `total_len` is the entry's full length: for a whole
+/// entry in memory it is `data.len()`; for a header prefix
+/// read on its own (the shared tier's purge walk) it is the
+/// object's real length, and `data` then holds only the
+/// header bytes, which is all this function touches. The
+/// MAC is parsed but not verified here: verification needs
+/// the whole entry, payload included, and happens in
+/// [`parse_entry`] and [`read_header`], the serving paths.
 fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
     let mut pos = 0;
     let version5 = match take_line(data, &mut pos)? {

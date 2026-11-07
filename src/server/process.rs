@@ -279,7 +279,6 @@ impl Gate {
     }
 }
 
-/// Run one image request, timing each stage into the returned record.
 /// An owned bundle for one engine run: everything
 /// [`crate::engine::ProcessContext`] borrows, owned so the work
 /// can move to a blocking thread (audit E-5).

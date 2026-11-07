@@ -1222,10 +1222,6 @@ pub fn parse_size(segment: &str) -> Result<ImageSize, ParseError> {
     })
 }
 
-/// Split the signature off the front of a request path.
-///
-/// Returns the signature and the remainder of the path (operations and
-/// image URL, still slash-separated).
 /// Whether `id` is a well-formed key ID (issue #143): 1 to 32
 /// characters of `[A-Za-z0-9_-]`. Key IDs are routing metadata
 /// in the signature segment, never secret material.
@@ -1233,16 +1229,6 @@ pub fn is_valid_key_id(id: &str) -> bool {
     crabcrop_url::is_valid_key_id(id)
 }
 
-/// Split a sealed token off the front of a signature
-/// segment (issue #255): `Some((key_id, token))` when the
-/// segment is a sealed spelling, `[<key-id>:]s1.<body>`,
-/// `None` when it is a plain signature segment. Detection is
-/// a prefix test, complete by construction: a plain
-/// signature is 64 lowercase hex characters or `unsafe`, and
-/// a key ID is `[A-Za-z0-9_-]`, so no valid plain segment
-/// can start with `s1.`. The token keeps its `s1.` marker;
-/// the key ID routes the open (see [`Keyring::open_sealed`])
-/// and is not part of the ciphertext or the AAD.
 /// Whether a signature segment presents as a sealed
 /// spelling (issue #255): a real token (see
 /// [`split_sealed_segment`]), or a marker-shaped imitation,
@@ -1269,6 +1255,16 @@ pub fn looks_sealed(segment: &str) -> bool {
     digits > 0 && rest.as_bytes().get(digits) == Some(&b'.')
 }
 
+/// Split a sealed token off the front of a signature
+/// segment (issue #255): `Some((key_id, token))` when the
+/// segment is a sealed spelling, `[<key-id>:]s1.<body>`,
+/// `None` when it is a plain signature segment. Detection is
+/// a prefix test, complete by construction: a plain
+/// signature is 64 lowercase hex characters or `unsafe`, and
+/// a key ID is `[A-Za-z0-9_-]`, so no valid plain segment
+/// can start with `s1.`. The token keeps its `s1.` marker;
+/// the key ID routes the open (see [`Keyring::open_sealed`])
+/// and is not part of the ciphertext or the AAD.
 pub fn split_sealed_segment(segment: &str) -> Option<(Option<&str>, &str)> {
     if segment.starts_with(crabcrop_url::SEALED_PREFIX) {
         return Some((None, segment));
@@ -3133,8 +3129,6 @@ pub(crate) fn format_text(format: ImageFormat) -> &'static str {
     }
 }
 
-/// The one canonical spelling of a filter: the grammar
-/// text the parser produces this exact value from.
 /// The canonical spelling of one quality value: `auto` or
 /// the number.
 fn quality_value_text(value: QualityValue) -> String {
@@ -3144,6 +3138,8 @@ fn quality_value_text(value: QualityValue) -> String {
     }
 }
 
+/// The one canonical spelling of a filter: the grammar
+/// text the parser produces this exact value from.
 fn filter_text(filter: &Filter) -> String {
     match filter {
         Filter::Grayscale => "grayscale".to_string(),

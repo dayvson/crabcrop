@@ -1738,12 +1738,6 @@ fn pdf_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String
     Ok(secs)
 }
 
-/// Build the PDF renderer (issue #215) from
-/// `CRABCROP_PDF_RENDERER`: the document-side
-/// counterpart of the frame extractor. Same boot rule:
-/// a set path that is not a usable renderer, or one
-/// whose `pdfinfo` sibling is missing, is fatal here,
-/// not on the first `page:` request.
 /// Build the C2PA output signer from the environment
 /// (issue #173): the `CRABCROP_C2PA_CERT` /
 /// `CRABCROP_C2PA_KEY` pair (a PEM certificate chain and
@@ -1790,6 +1784,12 @@ fn build_provenance_signer(
     }
 }
 
+/// Build the PDF renderer (issue #215) from
+/// `CRABCROP_PDF_RENDERER`: the document-side
+/// counterpart of the frame extractor. Same boot rule:
+/// a set path that is not a usable renderer, or one
+/// whose `pdfinfo` sibling is missing, is fatal here,
+/// not on the first `page:` request.
 fn build_pdf_renderer(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Arc<crate::pdf::PdfRenderer>>, String> {
@@ -2216,9 +2216,6 @@ fn build_declared_detectors(
     Ok(DeclaredDetectors { boxes, focal })
 }
 
-/// Build the CLIP tag provider from the environment, when
-/// configured: preloaded like every other model, with a
-/// broken configuration failing startup.
 /// A loaded tag provider plus the threshold its meta
 /// annotations compose with, and the embedding
 /// provider built from the same tagger (issue #172).
@@ -2228,6 +2225,9 @@ struct TaggerSetup {
     embeddings: Arc<dyn crate::ai::EmbeddingProvider>,
 }
 
+/// Build the CLIP tag provider from the environment, when
+/// configured: preloaded like every other model, with a
+/// broken configuration failing startup.
 fn build_tagger(
     ort_dylib: Option<&str>,
     get: impl Fn(&str) -> Option<String>,
