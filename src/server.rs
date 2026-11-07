@@ -1179,7 +1179,9 @@ async fn purge_handle(
     state.purge_guard.record_key(&key_form);
     let mut removed = state.cache.purge_matching(&key_form);
     if let Some(store) = &state.store {
-        removed += store.purge_matching(&key_form);
+        let store = store.clone();
+        let key_form = key_form.clone();
+        removed += run_disk_op(move || store.purge_matching(&key_form)).await;
     }
     if let Some(shared) = &state.shared_store {
         // The shared tier deletes the current epoch's
@@ -1266,7 +1268,9 @@ async fn purge_group_handle(
     state.purge_guard.record_group(group);
     let mut removed = state.cache.purge_group(group);
     if let Some(store) = &state.store {
-        removed += store.purge_group(group);
+        let store = store.clone();
+        let group = group.to_string();
+        removed += run_disk_op(move || store.purge_group(&group)).await;
     }
     if let Some(shared) = &state.shared_store {
         let (walked, pending) = shared
@@ -1382,7 +1386,9 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
     state.purge_guard.record_source(source);
     let mut removed = state.cache.purge_source(source);
     if let Some(store) = &state.store {
-        removed += store.purge_source(source);
+        let store = store.clone();
+        let source = source.to_string();
+        removed += run_disk_op(move || store.purge_source(&source)).await;
     }
     if let Some(shared) = &state.shared_store {
         let (walked, pending) = shared
@@ -2824,22 +2830,55 @@ fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedIma
     }
 }
 
+/// Run one disk-tier operation on the blocking pool and
+/// wait for its result (issue #347). The disk store is
+/// synchronous filesystem I/O; the request path used to
+/// call it directly, so a slow or contended disk stalled
+/// the runtime worker for the duration of the read, the
+/// write, or the purge walk. The caller still waits for
+/// the operation to finish, so the tier ordering and the
+/// purge-guard interleavings around it are exactly what
+/// they were inline; only the thread changes, the same
+/// boundary image processing and AI inference already
+/// run behind. A panicked task degrades to the
+/// operation's default (a miss, a count of zero, a
+/// dropped write): the store's standing best-effort
+/// rule is that a cache must not take the pipeline down
+/// with it.
+async fn run_disk_op<T, F>(op: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Default + Send + 'static,
+{
+    tokio::task::spawn_blocking(op).await.unwrap_or_default()
+}
+
 /// Store `entry` in the disk tier under the purge guard
 /// (issue #350): the same skip-and-reconcile discipline
-/// as [`put_memory_tier`].
-fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
+/// as [`put_memory_tier`], with the whole sequence on
+/// the blocking pool (issue #347), so the guard checks
+/// and the store calls interleave exactly as they did
+/// inline.
+async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
     let Some(store) = &state.store else {
         return;
     };
-    if write_is_stale(state, snapshot, key, entry) {
-        return;
-    }
-    store.put(key, entry);
-    if write_is_stale(state, snapshot, key, entry)
-        && store.get(key).is_some_and(|held| held.etag == entry.etag)
-    {
-        store.remove(key);
-    }
+    let store = store.clone();
+    let guard = state.purge_guard.clone();
+    let key = key.to_string();
+    let entry = entry.clone();
+    run_disk_op(move || {
+        if guard.purge_covers(snapshot, &key, &entry.groups) {
+            return;
+        }
+        store.put(&key, &entry);
+        if guard.purge_covers(snapshot, &key, &entry.groups)
+            && store.get(&key).is_some_and(|held| held.etag == entry.etag)
+        {
+            store.remove(&key);
+        }
+    })
+    .await;
 }
 
 /// Write `entry` through to the shared tier in the
@@ -2903,20 +2942,28 @@ async fn lookup_tiers(
             // first learned.
             let merged = crate::cache::union_groups(&hit.groups, groups);
             if let Some(store) = &state.store {
-                store.merge_groups(cache_key, groups);
-                // A purge that landed during the merge
-                // removed the entry as it was; the merged
-                // copy must not be left behind (the same
-                // reconcile the tier writes run).
+                // The merge and its reconcile run as one
+                // blocking operation (issue #347), in the
+                // same order they ran inline.
+                let store = store.clone();
+                let guard = state.purge_guard.clone();
+                let key = cache_key.to_string();
+                let groups = groups.to_vec();
                 let mut entry = hit.clone();
                 entry.groups = merged.clone();
-                if write_is_stale(state, snapshot, cache_key, &entry)
-                    && store
-                        .get(cache_key)
-                        .is_some_and(|held| held.etag == entry.etag)
-                {
-                    store.remove(cache_key);
-                }
+                run_disk_op(move || {
+                    store.merge_groups(&key, &groups);
+                    // A purge that landed during the merge
+                    // removed the entry as it was; the merged
+                    // copy must not be left behind (the same
+                    // reconcile the tier writes run).
+                    if guard.purge_covers(snapshot, &key, &entry.groups)
+                        && store.get(&key).is_some_and(|held| held.etag == entry.etag)
+                    {
+                        store.remove(&key);
+                    }
+                })
+                .await;
             }
             if merged != hit.groups {
                 let mut entry = hit.clone();
@@ -2926,28 +2973,45 @@ async fn lookup_tiers(
         }
         return Some((hit, "crabcrop; hit"));
     }
-    if let Some(store) = &state.store
-        && let Some(mut image) = store.get(cache_key)
-    {
-        if !groups.is_empty() && store.merge_groups(cache_key, groups) {
-            image.groups = crate::cache::union_groups(&image.groups, groups);
-            // A purge that landed during the merge removed
-            // the entry as it was; the merged copy must not
-            // be left behind (the same reconcile the tier
-            // writes run).
-            if write_is_stale(state, snapshot, cache_key, &image)
-                && store
-                    .get(cache_key)
-                    .is_some_and(|held| held.etag == image.etag)
-            {
-                store.remove(cache_key);
+    if let Some(store) = &state.store {
+        // The disk lookup, its group merge, and the merge
+        // reconcile run as one blocking operation (issue
+        // #347), in the same order they ran inline; the
+        // boolean reports whether the merge grew the
+        // entry's group set.
+        let store = store.clone();
+        let guard = state.purge_guard.clone();
+        let key = cache_key.to_string();
+        let lookup_groups = groups.to_vec();
+        let found = run_disk_op(move || {
+            let mut image = store.get(&key)?;
+            let mut grew = false;
+            if !lookup_groups.is_empty() && store.merge_groups(&key, &lookup_groups) {
+                image.groups = crate::cache::union_groups(&image.groups, &lookup_groups);
+                // A purge that landed during the merge
+                // removed the entry as it was; the merged
+                // copy must not be left behind (the same
+                // reconcile the tier writes run).
+                if guard.purge_covers(snapshot, &key, &image.groups)
+                    && store.get(&key).is_some_and(|held| held.etag == image.etag)
+                {
+                    store.remove(&key);
+                }
+                grew = true;
             }
-            // The merge grew the disk entry's set; the
-            // shared tier's copy learns it too (issue #350).
-            spawn_shared_put(state, snapshot, cache_key, image.clone());
+            Some((image, grew))
+        })
+        .await;
+        if let Some((image, grew)) = found {
+            if grew {
+                // The merge grew the disk entry's set; the
+                // shared tier's copy learns it too (issue
+                // #350).
+                spawn_shared_put(state, snapshot, cache_key, image.clone());
+            }
+            put_memory_tier(state, snapshot, cache_key, &image);
+            return Some((image, "crabcrop; hit; detail=\"disk\""));
         }
-        put_memory_tier(state, snapshot, cache_key, &image);
-        return Some((image, "crabcrop; hit; detail=\"disk\""));
     }
     if let Some(shared) = &state.shared_store
         && let Some(mut image) = shared.get(cache_key).await
@@ -2962,7 +3026,7 @@ async fn lookup_tiers(
             }
         }
         put_memory_tier(state, snapshot, cache_key, &image);
-        put_disk_tier(state, snapshot, cache_key, &image);
+        put_disk_tier(state, snapshot, cache_key, &image).await;
         return Some((image, "crabcrop; hit; detail=\"shared\""));
     }
     None
@@ -3449,7 +3513,7 @@ async fn serve_miss(
         // itself. The shared tier's write stays off the
         // response path, as before.
         put_memory_tier(state, write_snapshot, &cache_key, &entry);
-        put_disk_tier(state, write_snapshot, &cache_key, &entry);
+        put_disk_tier(state, write_snapshot, &cache_key, &entry).await;
         spawn_shared_put(state, write_snapshot, &cache_key, entry);
     }
     record.bytes_out = processed.bytes.len();
