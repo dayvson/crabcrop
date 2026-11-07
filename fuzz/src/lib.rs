@@ -245,33 +245,84 @@ pub fn check_meta(data: &[u8]) {
     }
 }
 
-/// The operation-chain invariants (issue #387): a parsed
-/// filter chain applied to an image is total, and the
-/// canvas never collapses or explodes under pixel
-/// filters: dimensions stay the input's, or swapped by a
-/// rotation, never zero. The chain runs on a small
-/// synthetic image (the harness's stand-in source), one
-/// `filters:` segment at a time, in URL order.
+/// The largest canvas the chain harness lets a rotation
+/// allocate. The engine checks every rotation against the
+/// output pixel budget before the canvas exists (issue
+/// #182); the harness applies filters directly, so it
+/// applies the same kind of check with a budget sized for
+/// fuzzing throughput: a chain whose next rotation would
+/// land on a larger canvas stops there.
+const CHAIN_MAX_PIXELS: u64 = 1 << 18;
+
+/// The operation-chain invariants (issues #387, #415): a
+/// parsed filter chain applied to an image is total, and
+/// every filter lands on the canvas its kind predicts:
+///
+/// - a rotation lands on [`filters::rotated_canvas`] of the
+///   canvas it turns: quarter turns swap the axes, any
+///   other angle grows to the rotated bounding box;
+/// - a trim never grows either axis;
+/// - every other filter keeps the dimensions;
+/// - no filter leaves a zero dimension.
+///
+/// The chain runs on a small synthetic image (the
+/// harness's stand-in source), one filter at a time, in URL
+/// order across every `filters:` segment, with the
+/// request's `fill` color, resolved the way the engine
+/// resolves it, for the corners an arbitrary rotation
+/// uncovers. Resize, crop, and focal operations
+/// are not applied: they run in the engine, which this
+/// package cannot link while the server is binary-only
+/// (issue #417).
 pub fn check_chain(input: &str) {
     let Ok((_, _, request)) = url::parse_request(input) else {
         return;
     };
-    let base = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 18, |x, y| {
+    let chain: Vec<&url::Filter> = request
+        .operations
+        .iter()
+        .filter_map(|op| match op {
+            url::Operation::Filters(filters) => Some(filters.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let fill = url::RequestDirectives::analyze(&request.operations).fill;
+    let mut img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 18, |x, y| {
         image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 3) as u8])
     }));
-    let (bw, bh) = (base.width(), base.height());
-    let mut img = base;
-    for op in &request.operations {
-        if let url::Operation::Filters(filters) = op {
-            let (out, _) = filters::apply_filters_filled(img, filters, None);
-            assert!(
-                (out.width() == bw && out.height() == bh)
-                    || (out.width() == bh && out.height() == bw),
-                "a filter chain changed the canvas from {bw}x{bh} to {}x{}",
-                out.width(),
-                out.height()
-            );
-            img = out;
+    for filter in chain {
+        let (w, h) = (img.width(), img.height());
+        let predicted = match filter {
+            url::Filter::Rotate(degrees) => {
+                let (rw, rh) = filters::rotated_canvas(w, h, *degrees);
+                if rw as u64 * rh as u64 > CHAIN_MAX_PIXELS {
+                    return;
+                }
+                Some((rw, rh))
+            }
+            url::Filter::Trim(_) | url::Filter::TrimSides(..) => None,
+            _ => Some((w, h)),
+        };
+        let (out, _) = filters::apply_filters_filled(img, std::slice::from_ref(filter), fill);
+        let (ow, oh) = (out.width(), out.height());
+        assert!(
+            ow > 0 && oh > 0,
+            "{filter:?} collapsed the canvas from {w}x{h} to {ow}x{oh}"
+        );
+        match predicted {
+            Some(size) => assert_eq!(
+                (ow, oh),
+                size,
+                "{filter:?} turned a {w}x{h} canvas into {ow}x{oh}, not the predicted {}x{}",
+                size.0,
+                size.1
+            ),
+            None => assert!(
+                ow <= w && oh <= h,
+                "{filter:?} grew the canvas from {w}x{h} to {ow}x{oh}"
+            ),
         }
+        img = out;
     }
 }

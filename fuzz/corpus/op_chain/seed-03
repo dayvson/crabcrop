@@ -1,1 +1,1 @@
-/unsafe/filters:convolve(0,-1,0,-1,5,-1,0,-1,0):gamma(1.8):exposure(0.7):vibrance(30)/example.com/c.jpg
+/unsafe/filters:convolution(0,-1,0,-1,5,-1,0,-1,0,0):gamma(1.8):exposure(0.7):vibrance(30)/example.com/c.jpg

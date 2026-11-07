@@ -43,10 +43,23 @@ containers, and converting through an extracted profile
 are all total over untrusted bytes.
 
 `op_chain` checks filter chains (`check_chain`): a
-request that parses has its `filters:` segments applied
-to a small synthetic image; application is total, and
-the canvas keeps its dimensions (or its rotation swap)
-under every chain.
+request that parses has the filters of its `filters:`
+segments applied one at a time, in URL order, to a small
+synthetic image. Application is total, and each filter
+lands on the canvas its kind predicts: a rotation on the
+canvas `filters::rotated_canvas` computes (quarter turns
+swap the axes, other angles grow to the rotated bounding
+box), a trim never grows either axis, every other filter
+keeps the dimensions, and no dimension is ever zero. A
+rotation whose canvas would exceed the harness's pixel
+budget ends the chain, the way the engine's output
+budget refuses it.
+
+`op_chain` does not reach resize, crop, or focal
+operations yet: they run in the engine, which this
+package cannot link while the server is a binary-only
+crate. Driving the whole operation list through the
+engine waits on the library target (issue #417).
 
 The server-side modules live in the server binary crate,
 so the harness includes them by path (`src/url.rs`,
@@ -63,7 +76,10 @@ never enter a normal build.
 `scripts/test_all.sh` runs the deterministic smoke: every
 seed in the corpora, every truncation of a representative
 seed per target, and single-byte mutations of each, through
-the same harness. On its own:
+the same harness. `op_chain` also checks that every seed
+parses, and runs a short fixed-seed random mutation pass
+(substitutions, insertions, and deletions over the grammar
+alphabet) as a stand-in for a real fuzz run. On its own:
 
 ```sh
 cargo test --manifest-path fuzz/Cargo.toml --lib --test smoke
@@ -99,5 +115,8 @@ non-sealed segments. `corpus/decode/` and
 corpus and the fixtures (small images per format, an SVG,
 EXIF and ICC carriers, and truncated prefixes of the
 animated formats). `corpus/op_chain/` seeds filter-chain
-remainders, plain and face-shaped. Add a seed file per
-interesting shape; keep them small.
+remainders: plain, face-shaped, quarter and arbitrary-angle
+rotations (`rotate(91)`, `rotate(45)`, negative and
+fractional angles), and trims that shrink the canvas. Add a
+seed file per interesting shape; keep them small, and make
+sure it parses (the smoke rejects a seed that does not).
