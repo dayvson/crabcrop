@@ -78,10 +78,12 @@ impl TimestampAuthority {
     }
 }
 
-/// A ureq agent carrying the TSA timeouts, in the
-/// redirect posture the SDK's own resolver uses (a
-/// timestamp reply is a direct answer, never a
-/// redirect to follow).
+/// A ureq agent carrying the TSA timeouts. It follows
+/// no redirect: a timestamp reply is a direct answer,
+/// and a single hop keeps the total timeout a bound on
+/// the whole call. (The SDK's default stack follows up
+/// to 10 redirects, and wrapped around this agent each
+/// hop would restart the clock.)
 fn tsa_agent(connect: Duration, total: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(connect))
@@ -848,6 +850,92 @@ mod tests {
         );
         assert!(elapsed >= bound, "{elapsed:?}");
         assert_eq!(contacts, 1);
+    }
+
+    /// A timestamp authority that answers its first
+    /// request with a 307 to `location`, then exits. The
+    /// join handle yields whether it served a request
+    /// (it gives up after 20 seconds without one).
+    fn redirecting_authority(location: String) -> (String, std::thread::JoinHandle<bool>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let redirector = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            // Read the whole request before answering, so
+            // closing the socket never resets it mid-send.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .is_ok()
+        });
+        (url, redirector)
+    }
+
+    #[test]
+    fn a_redirecting_authority_is_not_followed() {
+        // The timestamp request goes through the timed
+        // agent, which follows no redirect: a timestamp
+        // reply is a direct answer, and one hop keeps the
+        // bound on the whole call. The SDK's default stack,
+        // which this path no longer uses, followed up to
+        // 10 hops. A redirecting authority fails boot with
+        // its status named instead.
+        let (target, release, staller) = stalled_authority();
+        let (url, redirector) = redirecting_authority(target);
+        let result = ProvenanceSigner::from_pem(
+            TEST_CHAIN.as_bytes().to_vec(),
+            TEST_KEY.as_bytes().to_vec(),
+            Some(short_bounds(url.clone())),
+        );
+        drop(release);
+        let followed = staller.join().unwrap();
+        assert!(redirector.join().unwrap(), "the authority was asked");
+        let err = match result {
+            Ok(_) => panic!("a redirect is not a timestamp"),
+            Err(e) => e,
+        };
+        assert_eq!(followed, 0, "the redirect was not followed: {err}");
+        assert!(err.contains("status = 307"), "the status is named: {err}");
+        assert!(err.contains(&url), "the error names the authority: {err}");
     }
 
     #[test]
