@@ -25,16 +25,28 @@ const loader = createCrabcropLoader({
 />
 ```
 
+This setup builds unsigned URLs; read [Signing and server modes](#signing-and-server-modes) before you deploy it.
+
 ## Configuration
 
 `createCrabcropLoader({ base, preset?, secret?, expires? })`:
 
 - `base` (required): the crabcrop origin.
-- `preset`: a server-side preset name. Recommended when URLs are generated anywhere near the client: the transform policy stays on the server and no secret is involved. Pair with the server running `CRABCROP_ALLOW_UNSAFE=1`. (`CRABCROP_ONLY_PRESETS=1` goes further and rejects the sizing appended after the preset; it fits URLs that carry a preset reference alone.)
+- `preset`: a server-side preset name. Recommended: the transform policy stays on the server. See [Signing and server modes](#signing-and-server-modes) for the server configuration it pairs with.
 - `secret`: signs the URLs. Only pass it from server-side code.
 - `expires`: a unix-seconds expiry applied to every URL.
 
 The loader maps Hydrogen's `{src, width, height, scale}` calls onto the grammar: width and height together become `{w}x{h}` (with `scale` multiplied in, for device-pixel-ratio variants), width alone becomes `{w}x0`, height alone `0x{h}`. With a preset, `preset:<name>` leads and the sizing appends.
+
+## Signing and server modes
+
+The setup above builds unsigned URLs. Hydrogen's `Image` calls the loader once per width, during server rendering and again in the browser, and the browser calls cannot sign. That decides which server mode fits:
+
+- **Signed (production).** Run the server without `CRABCROP_ALLOW_UNSAFE`. Build the URLs in a route `loader` (server-only) with a loader created from `context.env.CRABCROP_SECRET`, return the `src` and `srcset` strings in the loader data, and render them with a plain `<img>`. Passing the loader to `Image` makes the browser rebuild the URLs unsigned, which a signed server answers with `403`.
+- **Presets-only (no secret anywhere).** `CRABCROP_ONLY_PRESETS=1` with `CRABCROP_ALLOW_UNSAFE=1` accepts URLs that carry a preset reference alone and rejects the sizing this loader appends with `400`, so `Image` with this loader cannot target it. A preset that carries the size (`card-640 = 640x0/filters:format(webp)`) works from a plain `<img>`.
+- **Unsafe alone (local development only).** With `CRABCROP_ALLOW_UNSAFE=1` and presets-only off, the setup above works as is, but the server then honors any unsigned operation chain on any public source: the preset constrains nothing, because a client can drop it or append anything after it. That is an open image proxy and CPU sink. Use it to try the loader locally, never as the public deployment.
+
+[Presets](../../docs/operations.md#presets) compares the three modes.
 
 ## Tests
 

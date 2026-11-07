@@ -19,8 +19,10 @@
  * Configuration is a factory argument because Hydrogen apps
  * read configuration from the request context, not from
  * build-time env: pass `secret` only from server-side code
- * (a loader function in a route), or prefer a preset, which
- * needs no secret anywhere. The returned loader enforces the
+ * (a loader function in a route). Unsigned URLs with appended
+ * sizing need the server's unsafe mode without presets-only,
+ * an open image proxy fit for local development only (see
+ * the README's server modes). The returned loader enforces the
  * boundary: in a browser context the secret is forced to
  * null, so a factory created with one still cannot sign (or
  * leak it) client-side.

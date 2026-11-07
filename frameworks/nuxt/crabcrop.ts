@@ -24,8 +24,11 @@
  * never needs the secret), `secret` (optional; honored only
  * when this code runs server-side. Nuxt compiles provider
  * options into the app, so in the browser the secret is
- * forced to null and can never ship in the client bundle;
- * prefer a preset for client-side use).
+ * forced to null and can never ship in the client bundle).
+ * Unsigned URLs with appended geometry need the server's
+ * unsafe mode without presets-only, an open image proxy fit
+ * for local development only; production builds signed URLs
+ * in server code (see the README's server modes).
  *
  * Modifier mapping:
  *   width + height, fit cover (default) -> crop:WxH:smart

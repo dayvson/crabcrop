@@ -3,6 +3,9 @@
 // first (CRABCROP_ALLOW_UNSAFE=1 plus a preset definition),
 // then `npm run dev` in an Astro
 // project with these files and the page in src/pages/.
+// Unsafe mode alone is an open image proxy, so this is a
+// local development setup: production sets `secret` and
+// runs the server signed (see the README).
 import { defineConfig } from "astro/config";
 
 export default defineConfig({

@@ -29,12 +29,14 @@ export const images = createCrabcropLoader({
 />
 ```
 
+This setup builds unsigned URLs; read [Signing and server modes](#signing-and-server-modes) before you deploy it.
+
 ## Configuration
 
 `createCrabcropLoader({ base, preset?, secret?, expires?, origin? })`:
 
 - `base` (required): the crabcrop origin.
-- `preset`: a server-side preset name. Recommended when URLs are generated anywhere near the client: the transform policy stays on the server and no secret is involved. Pair with the server running `CRABCROP_ALLOW_UNSAFE=1`. (`CRABCROP_ONLY_PRESETS=1` goes further and rejects the sizing appended after the preset; it fits URLs that carry a preset reference alone.)
+- `preset`: a server-side preset name. Recommended: the transform policy stays on the server and the URLs carry only what varies per image. See [Signing and server modes](#signing-and-server-modes) for the server configuration it pairs with.
 - `secret`: signs the URLs. Create the loader with it only in server-side code (a `$lib/server` module or a load function reading `$env/static/private`); the loader additionally forces the secret to null in a browser context, so a factory created with one still cannot sign client-side.
 - `expires`: a unix-seconds expiry applied to every URL.
 - `origin`: origin prepended to root-relative `src` values such as `/uploads/a.jpg`, which crabcrop cannot fetch on their own.
@@ -51,7 +53,17 @@ export const images = createCrabcropLoader({
 
 With a preset configured, `preset:<name>` leads and the geometry and filters above append after it. A `srcset` varies the width alone, carrying any `format` and `quality` options through to every entry. Dimensions past the server's 16383 cap, unsupported formats, and out-of-range qualities throw where the mistake is made, instead of minting a URL the server would reject.
 
-The [`example/`](example) directory is a minimal loader module and page that render an image through a local crabcrop using only a preset name: the page names no operations at all.
+The [`example/`](example) directory is a minimal loader module and page that render an image through a local crabcrop using only a preset name: the page names no operations at all. It builds unsigned URLs for a local server in unsafe mode, a development setup (see below).
+
+## Signing and server modes
+
+A loader created without a secret, or running in the browser, builds unsigned URLs. That decides which server mode fits:
+
+- **Signed (production).** Run the server without `CRABCROP_ALLOW_UNSAFE`. Create the loader with `secret` in server code (a `$lib/server` module, or a `+page.server` / `+layout.server` load function reading `$env/static/private`), build `src` and `srcset` there, and return the strings to the page. A loader running in the browser cannot sign, and a signed server answers its URLs with `403`.
+- **Presets-only (no secret anywhere).** `CRABCROP_ONLY_PRESETS=1` with `CRABCROP_ALLOW_UNSAFE=1` accepts URLs that carry a preset reference alone. Call `url(src)` with no options and put the size in the preset (`card-800 = 800x0/filters:format(webp)`): sized calls, `format`, `quality`, and `srcset` append operations, which this mode rejects with `400`. A responsive srcset then needs one preset per width.
+- **Unsafe alone (local development only).** With `CRABCROP_ALLOW_UNSAFE=1` and presets-only off, every loader call works as is, but the server then honors any unsigned operation chain on any public source: the preset constrains nothing, because a client can drop it or append anything after it. That is an open image proxy and CPU sink. Use it to try the loader locally, never as the public deployment.
+
+[Presets](../../docs/operations.md#presets) compares the three modes.
 
 ## Tests
 
