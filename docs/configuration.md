@@ -59,7 +59,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_PDF_RENDERER` | unset | Path to the external PDF renderer program for `page:` rendering from PDF sources (its `pdfinfo` sibling is derived and validated alongside), validated at startup. Unset disables page selection. See [PDF pages](media.md#pdf-pages). |
 | `CRABCROP_C2PA_CERT` | unset | Path to a PEM certificate chain: the C2PA signing identity for output provenance. Set together with `CRABCROP_C2PA_KEY`; a partial set is a startup error, and the identity is proven at boot. Unset disables output signing. See [Provenance (C2PA)](meta.md#provenance-c2pa). |
 | `CRABCROP_C2PA_KEY` | unset | Path to the private key for `CRABCROP_C2PA_CERT`, in PKCS#8 PEM form (`BEGIN PRIVATE KEY`; convert a traditional key with `openssl pkcs8 -topk8 -nocrypt`). |
-| `CRABCROP_C2PA_TSA_URL` | unset | Optional timestamp authority URL recorded in output signatures. Requires the certificate pair. |
+| `CRABCROP_C2PA_TSA_URL` | unset | Optional timestamp authority URL recorded in output signatures. Requires the certificate pair. Each call to it is bounded at 5 seconds to connect and 15 seconds overall; an authority that does not answer in time fails boot (the boot probe asks it once) or the signed request. |
 | `CRABCROP_PDF_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external PDF tool run (one probe or one page render), 1 to 600 seconds. |
 | `CRABCROP_VIDEO_MAX_MB` | `64` | Output cap per video encode in megabytes, 1 to 1024. The encode aborts the moment it is crossed. |
 | `CRABCROP_FALLBACK_IMAGE` | unset | URL or local file path of the fallback image served when a source cannot be fetched or decoded. See [Fallback image](responses.md#fallback-image). |
