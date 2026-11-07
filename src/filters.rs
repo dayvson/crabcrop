@@ -1933,10 +1933,6 @@ pub fn draw_border(img: &DynamicImage, width: u32, color: [u8; 3]) -> DynamicIma
     DynamicImage::ImageRgba8(rgba)
 }
 
-/// Crop away the uniform border: keep the bounding box of
-/// pixels that differ from the top-left corner color by more
-/// than `tolerance` in any channel (alpha included). A fully
-/// uniform image is returned unchanged, never emptied.
 /// Blur every detected face region in `img`. The blur sigma
 /// scales with each face's size, so the redaction holds up at
 /// any resolution. Pixels outside the face boxes are untouched.
@@ -2255,6 +2251,10 @@ fn redact_faces(
     DynamicImage::ImageRgba8(base)
 }
 
+/// Crop away the uniform border: keep the bounding box of
+/// pixels that differ from the top-left corner color by more
+/// than `tolerance` in any channel (alpha included). A fully
+/// uniform image is returned unchanged, never emptied.
 fn trim(img: DynamicImage, tolerance: u8) -> DynamicImage {
     let rgba = img.to_rgba8();
     let corner = *rgba.get_pixel(0, 0);
