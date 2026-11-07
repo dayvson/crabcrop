@@ -107,7 +107,10 @@ environment variable beside the others:
 A mounted Azure Files volume at `/var/cache/crabcrop` plus
 `CRABCROP_RESULT_STORAGE_DIR=/var/cache/crabcrop` and
 `CRABCROP_RESULT_STORAGE_MAX_MB` gives each replica a
-persistent disk tier. Treat it as per-replica storage:
+persistent disk tier. The image runs as `nobody` (uid
+65534) and the server exits at boot when that directory
+is not writable, so the share's mount must let uid 65534
+write. Treat it as per-replica storage:
 replicas do not coordinate on a shared volume, which is
 safe (entries are content-addressed) but no better than
 several private disks.
