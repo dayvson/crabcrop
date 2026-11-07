@@ -40,10 +40,23 @@ What the production file sets, against the evaluation run:
 
 - **Caddy in front** (`caddy:2`, this directory's `Caddyfile`): the only published ports are 80 and 443. Caddy obtains and renews the certificate for `CRABCROP_HOST` automatically once the name resolves to this host, and proxies to the app over the compose network. `/health` and `/metrics` are not served on the public face at all (check them from inside, as the smoke checklist does): `/health` is unauthenticated, and `/metrics` exposes traffic and error counters.
 - **The app unpublished**: no host port maps to it. Its resource shape matches the Helm production values (2 CPUs and 2 GB at the limit, the 512 MB memory result tier set in `crabcrop.env` inside that), and Caddy waits for the app's own healthcheck before it starts proxying.
-- **Persistent results**: the disk result tier lives on the named volume `results`, so renders survive rebuilds and restarts. Its budget is `CRABCROP_RESULT_STORAGE_MAX_MB` in `crabcrop.env` (8 GiB as shipped).
+- **Persistent results**: the disk result tier lives on the named volume `results`, so renders survive rebuilds and restarts. Its budget is `CRABCROP_RESULT_STORAGE_MAX_MB` in `crabcrop.env` (8 GiB as shipped). The server runs as `nobody` (uid 65534) and exits at boot when that directory is not writable; the image creates `/var/cache/crabcrop` owned by `nobody`, and Docker copies that ownership into the volume while it is empty. For a `results` volume created by an older image, see [Upgrading an existing volume](#upgrading-an-existing-volume).
 - **Restart policy**: both services run `unless-stopped`.
 
 The production environment also states the slow lane at one permit (long-running renders, such as animated encodes, never starve stills) and the 30-second processing limit, and refuses sources that resolve to non-public addresses. Raise the slow lane in `crabcrop.env` on hosts with cores to spare for animation or video traffic.
+
+### Upgrading an existing volume
+
+Images up to 0.9.10 did not create `/var/cache/crabcrop`, so a `results` volume first created by one of them is owned by root, and the server, which runs as `nobody`, could not write it: those servers ran with a dead disk tier. Such a volume is normally still empty, so it takes the new image's ownership when `up --build` recreates the container, and nothing else is needed. If it holds files, Docker leaves its ownership alone, and the server exits at boot with `the result storage directory … is not writable: Permission denied`. Hand the volume to `nobody` once, then start the stack as usual:
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm --user root \
+  --entrypoint chown crabcrop -R 65534:65534 /var/cache/crabcrop
+CRABCROP_HOST=images.example.com \
+  docker compose -f docker-compose.prod.yml up -d --build
+```
+
+A fresh or empty volume needs none of this.
 
 ### Smoke checklist (production)
 

@@ -30,6 +30,12 @@ RUN apt-get update \
 COPY --from=builder /usr/local/bin/crabcrop /usr/local/bin/crabcrop
 ENV PORT=3000
 EXPOSE 3000
+# The disk result tier's conventional directory, owned by the
+# runtime user. A fresh Docker named volume mounted here starts
+# with this ownership, and the server exits at boot when its
+# CRABCROP_RESULT_STORAGE_DIR is not writable.
+RUN mkdir -p /var/cache/crabcrop \
+    && chown 65534:65534 /var/cache/crabcrop
 USER nobody
 HEALTHCHECK --interval=30s --timeout=3s \
     CMD curl -f "http://127.0.0.1:${PORT:-3000}/health" || exit 1

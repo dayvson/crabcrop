@@ -113,10 +113,46 @@ definition's environment (sourced from Secrets Manager,
 like the signing secret), for an IAM user or role you
 mint keys for; a task role alone is not picked up.
 
-Disk tier per task: mount EFS at `/var/cache/crabcrop` and
-add `CRABCROP_RESULT_STORAGE_DIR=/var/cache/crabcrop` plus
-`CRABCROP_RESULT_STORAGE_MAX_MB`. Without EFS the Fargate
-ephemeral disk works too, but it disappears with the task.
+Disk tier per task: add
+`CRABCROP_RESULT_STORAGE_DIR=/var/cache/crabcrop` plus
+`CRABCROP_RESULT_STORAGE_MAX_MB`. The image runs as
+`nobody` (uid and gid 65534) and the server exits at boot
+when that directory is not writable, so whatever backs it
+must be writable by 65534:
+
+- Fargate ephemeral storage: mount nothing at
+  `/var/cache/crabcrop`. The image creates the directory
+  owned by `nobody`, and the tier writes to the task's
+  ephemeral storage, so it disappears with the task.
+- EFS, to keep results across task restarts: the root of
+  a new file system is owned by root, so mount it through
+  an access point that runs as 65534 and creates its
+  directory owned by 65534:
+
+  ```sh
+  aws efs create-access-point --file-system-id fs-0123456789abcdef0 \
+    --posix-user Uid=65534,Gid=65534 \
+    --root-directory 'Path=/crabcrop-results,CreationInfo={OwnerUid=65534,OwnerGid=65534,Permissions=0755}'
+  ```
+
+  Then add a volume to the task definition and mount it
+  in the container (access points require transit
+  encryption):
+
+  ```json
+  "volumes": [{
+    "name": "results",
+    "efsVolumeConfiguration": {
+      "fileSystemId": "fs-0123456789abcdef0",
+      "transitEncryption": "ENABLED",
+      "authorizationConfig": {"accessPointId": "fsap-0123456789abcdef0"}
+    }
+  }]
+  ```
+
+  ```json
+  "mountPoints": [{"sourceVolume": "results", "containerPath": "/var/cache/crabcrop"}]
+  ```
 
 ## Smoke checklist
 

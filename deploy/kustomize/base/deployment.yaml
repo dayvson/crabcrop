@@ -17,6 +17,14 @@ spec:
         app.kubernetes.io/name: crabcrop
         app.kubernetes.io/instance: crabcrop
     spec:
+      # The image runs as nobody (65534). fsGroup makes
+      # mounted volumes group-writable by that group, so the
+      # result-storage component's claim is writable by the
+      # disk tier; without it the mount lands root-owned and
+      # the server exits at boot (the chart's
+      # podSecurityContext).
+      securityContext:
+        fsGroup: 65534
       containers:
         - name: crabcrop
           image: ghcr.io/dayvson/crabcrop:0.9.10
