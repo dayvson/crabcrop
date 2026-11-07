@@ -18,7 +18,10 @@
 //! before the parent sets the limits; it cannot do
 //! meaningful work of its own in that window, and the
 //! wall-clock group kill covers the whole lifetime
-//! regardless.
+//! regardless. `prlimit` is a Linux syscall, so the
+//! kernel limits exist only there; on other platforms
+//! the wall clock and the group kill are the bounds, as
+//! they were before this module.
 
 use std::time::Duration;
 
@@ -65,10 +68,12 @@ fn cpu_limit_for(timeout: Duration, cores: usize) -> Duration {
 /// Apply the resource limits to a spawned tool child.
 /// Best effort: a limit the platform refuses is skipped
 /// (the wall-clock timeout and the process-group kill
-/// remain the primary bounds). Unix only; elsewhere this
-/// is a no-op, as before.
+/// remain the primary bounds). Linux only: `prlimit` is
+/// the one call that sets another process's limits, and
+/// it exists nowhere else. Elsewhere this is a no-op, as
+/// before.
 pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64) {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let Ok(raw) = i32::try_from(pid) else {
             return;
@@ -94,7 +99,7 @@ pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64)
             },
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = (pid, cpu_limit, max_address_space);
     }
@@ -105,6 +110,10 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
+    // The kernel limits exist only where prlimit does;
+    // elsewhere limit_child is a no-op and this child
+    // would spin until the watchdog kills it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn cpu_limit_stops_a_spinning_child() {
         let mut child = Command::new("/bin/sh")
@@ -176,6 +185,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn cpu_limit_lets_a_multi_threaded_child_finish() {
         // Issue #406: a child that keeps every core busy for
