@@ -64,7 +64,19 @@ pub struct DiskStore {
     /// that cannot write must be visible in the logs and
     /// on /metrics instead of failing silently forever.
     errors: std::sync::atomic::AtomicU64,
+    /// Bounds how many store operations run on tokio's
+    /// blocking pool at once (issue #347): the permit is
+    /// taken on the async side, so operations waiting for
+    /// one hold no thread, and a slow disk cannot crowd
+    /// out the other work the pool carries.
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
+
+/// How many disk operations may run on the blocking pool
+/// at once (issue #347). Fixed, not configured: the disk
+/// acceptance for this boundary is that waiting work
+/// holds no thread, not a new tuning knob.
+const DISK_OP_PERMITS: usize = 32;
 
 /// Entry format version. CRABDISK2 adds the entry's cache
 /// groups to the header; CRABDISK3 marks the move to
@@ -164,6 +176,7 @@ impl DiskStore {
             entry_key,
             inner: Mutex::new(Inner::default()),
             errors: std::sync::atomic::AtomicU64::new(0),
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
         };
         store.scan()?;
         Ok(store)
@@ -182,6 +195,61 @@ impl DiskStore {
         self.errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!("result storage: {what}: {e}");
+    }
+
+    /// Count and log a blocking task that died before it
+    /// could report its operation's result (issue #367):
+    /// the operation degrades the way a failed store call
+    /// does, but the failure is on the record.
+    pub(crate) fn note_task_failure(&self, what: &str) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("result storage: disk task failed: {what}");
+    }
+
+    /// Whether the index holds `key`, without touching
+    /// the filesystem: the cheap pre-check the request
+    /// path runs before paying for the blocking boundary
+    /// (issue #347). The index mutex is never held across
+    /// file I/O, so this is safe on a runtime worker; a
+    /// race with a concurrent write or eviction only
+    /// turns a hit into a miss.
+    pub fn contains(&self, key: &str) -> bool {
+        self.max_bytes != 0 && self.inner.lock().unwrap().entries.contains_key(key)
+    }
+
+    /// Run one store operation on tokio's blocking pool
+    /// and wait for its result (issue #347). The store is
+    /// synchronous filesystem I/O; calling it from the
+    /// request path directly would stall a runtime worker
+    /// for the duration of the read, the write, or the
+    /// purge walk. A permit bounds how many operations
+    /// run at once and is acquired before the hop, so
+    /// waiting operations hold no thread. `None` when the
+    /// task died before reporting: the caller degrades to
+    /// the operation's failure shape (a miss, a count of
+    /// zero, a dropped write), the store's standing
+    /// best-effort rule, with the failure counted through
+    /// [`DiskStore::note_task_failure`].
+    pub async fn blocking<T, F>(self: &std::sync::Arc<Self>, op: F) -> Option<T>
+    where
+        F: FnOnce(&DiskStore) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = self.permits.clone().acquire_owned().await.ok()?;
+        let store = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            op(&store)
+        })
+        .await
+        {
+            Ok(value) => Some(value),
+            Err(e) => {
+                self.note_task_failure(&e.to_string());
+                None
+            }
+        }
     }
 
     /// Index existing entry files, oldest first, so the LRU

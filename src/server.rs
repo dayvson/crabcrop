@@ -1172,32 +1172,49 @@ async fn purge_handle(
             Err(_) => crate::url::canonical_key_form(target),
         }
     };
-    // The tombstone lands before any tier is touched
-    // (issue #350): a write begun before this purge can
-    // then see it whenever it tries to land, including
-    // after this handler has finished.
-    state.purge_guard.record_key(&key_form);
-    let mut removed = state.cache.purge_matching(&key_form);
-    if let Some(store) = &state.store {
-        let store = store.clone();
-        let key_form = key_form.clone();
-        removed += run_disk_op(move || store.purge_matching(&key_form)).await;
-    }
-    if let Some(shared) = &state.shared_store {
-        // The shared tier deletes the current epoch's
-        // enumerable variants directly by object name
-        // (audit R2-24); the fingerprint-free form drives
-        // its matching walk, which also reaches older
-        // epochs and hint-variant spellings.
-        let epoch_form = format!("{key_form}#cfg{}", state.config_fingerprint);
-        let (walked, pending) = shared
-            .purge_matching_bounded(&key_form, &epoch_form, SHARED_PURGE_INLINE_SCAN)
-            .await;
-        removed += walked;
-        spawn_shared_purge_rest(shared, pending, "purge", target);
-    }
-    state.metrics.record_purge();
-    purge_log("purge", target, Some(removed));
+    // The fan-out runs in a spawned task once the
+    // signature has verified (issue #347): a purge that
+    // has started completes and is logged even if the
+    // caller disconnects mid-purge; dropping the
+    // JoinHandle detaches the task instead of cancelling
+    // it. The caller waits for the count, so the response
+    // is unchanged.
+    let task_state = state.clone();
+    let task_target = target.to_string();
+    let removed = tokio::spawn(async move {
+        // The tombstone lands before any tier is touched
+        // (issue #350): a write begun before this purge can
+        // then see it whenever it tries to land, including
+        // after this handler has finished.
+        task_state.purge_guard.record_key(&key_form);
+        let mut removed = task_state.cache.purge_matching(&key_form);
+        if let Some(store) = &task_state.store {
+            let store = store.clone();
+            let key = key_form.clone();
+            removed += store
+                .blocking(move |store| store.purge_matching(&key))
+                .await
+                .unwrap_or(0);
+        }
+        if let Some(shared) = &task_state.shared_store {
+            // The shared tier deletes the current epoch's
+            // enumerable variants directly by object name
+            // (audit R2-24); the fingerprint-free form drives
+            // its matching walk, which also reaches older
+            // epochs and hint-variant spellings.
+            let epoch_form = format!("{key_form}#cfg{}", task_state.config_fingerprint);
+            let (walked, pending) = shared
+                .purge_matching_bounded(&key_form, &epoch_form, SHARED_PURGE_INLINE_SCAN)
+                .await;
+            removed += walked;
+            spawn_shared_purge_rest(shared, pending, "purge", &task_target);
+        }
+        task_state.metrics.record_purge();
+        purge_log("purge", &task_target, Some(removed));
+        removed
+    })
+    .await
+    .unwrap_or(0);
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
 }
 
@@ -1263,24 +1280,38 @@ async fn purge_group_handle(
             accept.as_deref(),
         );
     }
-    // Tombstone first, tiers second (issue #350), as in
-    // the per-URL purge.
-    state.purge_guard.record_group(group);
-    let mut removed = state.cache.purge_group(group);
-    if let Some(store) = &state.store {
-        let store = store.clone();
-        let group = group.to_string();
-        removed += run_disk_op(move || store.purge_group(&group)).await;
-    }
-    if let Some(shared) = &state.shared_store {
-        let (walked, pending) = shared
-            .purge_group_bounded(group, SHARED_PURGE_INLINE_SCAN)
-            .await;
-        removed += walked;
-        spawn_shared_purge_rest(shared, pending, "purge-group", &target);
-    }
-    state.metrics.record_purge();
-    purge_log("purge-group", &target, Some(removed));
+    // The fan-out runs in a spawned task once the
+    // signature has verified, as in the per-URL purge
+    // (issue #347).
+    let task_state = state.clone();
+    let task_target = target.clone();
+    let group = group.to_string();
+    let removed = tokio::spawn(async move {
+        // Tombstone first, tiers second (issue #350), as in
+        // the per-URL purge.
+        task_state.purge_guard.record_group(&group);
+        let mut removed = task_state.cache.purge_group(&group);
+        if let Some(store) = &task_state.store {
+            let store = store.clone();
+            let group = group.clone();
+            removed += store
+                .blocking(move |store| store.purge_group(&group))
+                .await
+                .unwrap_or(0);
+        }
+        if let Some(shared) = &task_state.shared_store {
+            let (walked, pending) = shared
+                .purge_group_bounded(&group, SHARED_PURGE_INLINE_SCAN)
+                .await;
+            removed += walked;
+            spawn_shared_purge_rest(shared, pending, "purge-group", &task_target);
+        }
+        task_state.metrics.record_purge();
+        purge_log("purge-group", &task_target, Some(removed));
+        removed
+    })
+    .await
+    .unwrap_or(0);
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
 }
 
@@ -1381,23 +1412,37 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
 /// overwrite path (audit R2-07) shares this with any
 /// future source-replacement flow.
 async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
-    // Tombstone first, tiers second (issue #350), as in
-    // the per-URL purge.
-    state.purge_guard.record_source(source);
-    let mut removed = state.cache.purge_source(source);
-    if let Some(store) = &state.store {
-        let store = store.clone();
-        let source = source.to_string();
-        removed += run_disk_op(move || store.purge_source(&source)).await;
-    }
-    if let Some(shared) = &state.shared_store {
-        let (walked, pending) = shared
-            .purge_source_bounded(source, SHARED_PURGE_INLINE_SCAN)
-            .await;
-        removed += walked;
-        spawn_shared_purge_rest(shared, pending, "purge-source", source);
-    }
-    removed
+    // The fan-out runs in a spawned task, as in the purge
+    // handlers (issue #347): a purge that has started
+    // completes and is logged even if the caller is
+    // dropped mid-purge. The caller waits for the count.
+    let task_state = state.clone();
+    let source = source.to_string();
+    tokio::spawn(async move {
+        // Tombstone first, tiers second (issue #350), as in
+        // the per-URL purge.
+        task_state.purge_guard.record_source(&source);
+        let mut removed = task_state.cache.purge_source(&source);
+        if let Some(store) = &task_state.store {
+            let store = store.clone();
+            let key = source.clone();
+            removed += store
+                .blocking(move |store| store.purge_source(&key))
+                .await
+                .unwrap_or(0);
+        }
+        if let Some(shared) = &task_state.shared_store {
+            let (walked, pending) = shared
+                .purge_source_bounded(&source, SHARED_PURGE_INLINE_SCAN)
+                .await;
+            removed += walked;
+            spawn_shared_purge_rest(shared, pending, "purge-source", &source);
+        }
+        purge_log("purge-source", &source, Some(removed));
+        removed
+    })
+    .await
+    .unwrap_or(0)
 }
 
 async fn upload_handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
@@ -1632,8 +1677,10 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
                 // (audit R2-07). A first store has no
                 // derivatives to invalidate.
                 let source = upload.source_ref(name);
-                let removed = purge_source_everywhere(&state, &source).await;
-                purge_log("purge-source", &source, Some(removed));
+                // Logged inside the purge itself, so the
+                // line lands even if this request is dropped
+                // while the purge runs (issue #347).
+                let _removed = purge_source_everywhere(&state, &source).await;
             }
             let status = if existed {
                 StatusCode::OK
@@ -2830,35 +2877,34 @@ fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedIma
     }
 }
 
-/// Run one disk-tier operation on the blocking pool and
-/// wait for its result (issue #347). The disk store is
-/// synchronous filesystem I/O; the request path used to
-/// call it directly, so a slow or contended disk stalled
-/// the runtime worker for the duration of the read, the
-/// write, or the purge walk. The caller still waits for
-/// the operation to finish, so the tier ordering and the
-/// purge-guard interleavings around it are exactly what
-/// they were inline; only the thread changes, the same
-/// boundary image processing and AI inference already
-/// run behind. A panicked task degrades to the
-/// operation's default (a miss, a count of zero, a
-/// dropped write): the store's standing best-effort
-/// rule is that a cache must not take the pipeline down
-/// with it.
-async fn run_disk_op<T, F>(op: F) -> T
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Default + Send + 'static,
-{
-    tokio::task::spawn_blocking(op).await.unwrap_or_default()
+/// The reconcile every guarded disk write and group
+/// merge runs after landing (issue #350): when a purge
+/// recorded after `snapshot` covers the entry and the
+/// disk tier still holds this exact copy, remove it, so
+/// the copy the write or merge just made is not left
+/// behind for the purge to miss. The ETag match leaves
+/// alone an entry a fresher write has already replaced
+/// under the same key.
+fn reconcile_disk(
+    store: &crate::storage::DiskStore,
+    guard: &crate::cache::PurgeGuard,
+    snapshot: u64,
+    key: &str,
+    entry: &CachedImage,
+) {
+    if guard.purge_covers(snapshot, key, &entry.groups)
+        && store.get(key).is_some_and(|held| held.etag == entry.etag)
+    {
+        store.remove(key);
+    }
 }
 
 /// Store `entry` in the disk tier under the purge guard
 /// (issue #350): the same skip-and-reconcile discipline
-/// as [`put_memory_tier`], with the whole sequence on
-/// the blocking pool (issue #347), so the guard checks
-/// and the store calls interleave exactly as they did
-/// inline.
+/// as [`put_memory_tier`], run as one blocking operation
+/// (issue #347), so the guard checks and the store calls
+/// stay in one sequence that finishes even if the
+/// request that asked for it is dropped while it waits.
 async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
     let Some(store) = &state.store else {
         return;
@@ -2867,18 +2913,15 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
     let guard = state.purge_guard.clone();
     let key = key.to_string();
     let entry = entry.clone();
-    run_disk_op(move || {
-        if guard.purge_covers(snapshot, &key, &entry.groups) {
-            return;
-        }
-        store.put(&key, &entry);
-        if guard.purge_covers(snapshot, &key, &entry.groups)
-            && store.get(&key).is_some_and(|held| held.etag == entry.etag)
-        {
-            store.remove(&key);
-        }
-    })
-    .await;
+    let _ = store
+        .blocking(move |store| {
+            if guard.purge_covers(snapshot, &key, &entry.groups) {
+                return;
+            }
+            store.put(&key, &entry);
+            reconcile_disk(store, &guard, snapshot, &key, &entry);
+        })
+        .await;
 }
 
 /// Write `entry` through to the shared tier in the
@@ -2941,75 +2984,55 @@ async fn lookup_tiers(
             // propagation; it reached them when it was
             // first learned.
             let merged = crate::cache::union_groups(&hit.groups, groups);
+            if merged != hit.groups {
+                // The shared propagation is spawned first,
+                // before any wait (issue #347): it does not
+                // depend on the disk merge, and a request
+                // dropped during that merge must not be
+                // able to strand it.
+                let mut entry = hit.clone();
+                entry.groups = merged.clone();
+                spawn_shared_put(state, snapshot, cache_key, entry);
+            }
             if let Some(store) = &state.store {
                 // The merge and its reconcile run as one
-                // blocking operation (issue #347), in the
-                // same order they ran inline.
+                // blocking operation (issue #347), so the
+                // sequence finishes even if this request is
+                // dropped while it waits.
                 let store = store.clone();
                 let guard = state.purge_guard.clone();
                 let key = cache_key.to_string();
                 let groups = groups.to_vec();
                 let mut entry = hit.clone();
-                entry.groups = merged.clone();
-                run_disk_op(move || {
-                    store.merge_groups(&key, &groups);
-                    // A purge that landed during the merge
-                    // removed the entry as it was; the merged
-                    // copy must not be left behind (the same
-                    // reconcile the tier writes run).
-                    if guard.purge_covers(snapshot, &key, &entry.groups)
-                        && store.get(&key).is_some_and(|held| held.etag == entry.etag)
-                    {
-                        store.remove(&key);
-                    }
-                })
-                .await;
-            }
-            if merged != hit.groups {
-                let mut entry = hit.clone();
                 entry.groups = merged;
-                spawn_shared_put(state, snapshot, cache_key, entry);
+                let _ = store
+                    .blocking(move |store| {
+                        store.merge_groups(&key, &groups);
+                        reconcile_disk(store, &guard, snapshot, &key, &entry);
+                    })
+                    .await;
             }
         }
         return Some((hit, "crabcrop; hit"));
     }
-    if let Some(store) = &state.store {
-        // The disk lookup, its group merge, and the merge
-        // reconcile run as one blocking operation (issue
-        // #347), in the same order they ran inline; the
-        // boolean reports whether the merge grew the
-        // entry's group set.
-        let store = store.clone();
-        let guard = state.purge_guard.clone();
+    if let Some(store) = &state.store
+        && store.contains(cache_key)
+    {
+        // The disk hit and everything it owes the other
+        // tiers run in a spawned task (issue #347):
+        // dropping this request's JoinHandle detaches the
+        // task instead of cancelling it, so a client that
+        // disconnects while the disk answers cannot leave
+        // the disk entry holding a group the shared tier
+        // never learned (issue #350).
+        let task_state = state.clone();
         let key = cache_key.to_string();
         let lookup_groups = groups.to_vec();
-        let found = run_disk_op(move || {
-            let mut image = store.get(&key)?;
-            let mut grew = false;
-            if !lookup_groups.is_empty() && store.merge_groups(&key, &lookup_groups) {
-                image.groups = crate::cache::union_groups(&image.groups, &lookup_groups);
-                // A purge that landed during the merge
-                // removed the entry as it was; the merged
-                // copy must not be left behind (the same
-                // reconcile the tier writes run).
-                if guard.purge_covers(snapshot, &key, &image.groups)
-                    && store.get(&key).is_some_and(|held| held.etag == image.etag)
-                {
-                    store.remove(&key);
-                }
-                grew = true;
-            }
-            Some((image, grew))
+        let joined = tokio::spawn(async move {
+            lookup_disk_tier(&task_state, snapshot, &key, &lookup_groups).await
         })
         .await;
-        if let Some((image, grew)) = found {
-            if grew {
-                // The merge grew the disk entry's set; the
-                // shared tier's copy learns it too (issue
-                // #350).
-                spawn_shared_put(state, snapshot, cache_key, image.clone());
-            }
-            put_memory_tier(state, snapshot, cache_key, &image);
+        if let Ok(Some(image)) = joined {
             return Some((image, "crabcrop; hit; detail=\"disk\""));
         }
     }
@@ -3030,6 +3053,49 @@ async fn lookup_tiers(
         return Some((image, "crabcrop; hit; detail=\"shared\""));
     }
     None
+}
+
+/// The disk tier's half of [`lookup_tiers`], run as its
+/// own task so a dropped request cannot strand it
+/// mid-chain: read the entry, union the request's groups
+/// into it under the purge guard, then pay what the hit
+/// owes the other tiers: the group propagation to the
+/// shared tier and the promotion into memory, in that
+/// order. Returns the image on a hit.
+async fn lookup_disk_tier(
+    state: &AppState,
+    snapshot: u64,
+    cache_key: &str,
+    groups: &[String],
+) -> Option<CachedImage> {
+    let store = state.store.clone()?;
+    let guard = state.purge_guard.clone();
+    let key = cache_key.to_string();
+    let lookup_groups = groups.to_vec();
+    // The read, its group merge, and the merge reconcile
+    // run as one blocking operation (issue #347); the
+    // boolean reports whether the merge grew the entry's
+    // group set.
+    let (image, grew) = store
+        .blocking(move |store| {
+            let mut image = store.get(&key)?;
+            let mut grew = false;
+            if !lookup_groups.is_empty() && store.merge_groups(&key, &lookup_groups) {
+                image.groups = crate::cache::union_groups(&image.groups, &lookup_groups);
+                reconcile_disk(store, &guard, snapshot, &key, &image);
+                grew = true;
+            }
+            Some((image, grew))
+        })
+        .await
+        .flatten()?;
+    if grew {
+        // The merge grew the disk entry's set; the
+        // shared tier's copy learns it too (issue #350).
+        spawn_shared_put(state, snapshot, cache_key, image.clone());
+    }
+    put_memory_tier(state, snapshot, cache_key, &image);
+    Some(image)
 }
 
 /// Everything the cache-miss path needs, bundled so the
@@ -3513,8 +3579,12 @@ async fn serve_miss(
         // itself. The shared tier's write stays off the
         // response path, as before.
         put_memory_tier(state, write_snapshot, &cache_key, &entry);
+        // The shared write is spawned before the disk
+        // write waits (issue #347): it is already off the
+        // response path, and the order means a request
+        // dropped during the disk write cannot strand it.
+        spawn_shared_put(state, write_snapshot, &cache_key, entry.clone());
         put_disk_tier(state, write_snapshot, &cache_key, &entry).await;
-        spawn_shared_put(state, write_snapshot, &cache_key, entry);
     }
     record.bytes_out = processed.bytes.len();
     // The render's AI permit drained with its job:
@@ -12668,8 +12738,11 @@ mod tests {
 
     /// An app with shared (S3) result storage against the
     /// fake endpoint, and optionally a disk tier at `dir`.
-    async fn spawn_app_with_shared(dir: Option<&std::path::Path>, endpoint: &str) -> String {
-        let state = AppState {
+    /// An app state with a disk tier (when `dir` is set)
+    /// and a shared tier at `endpoint`, unserved: the
+    /// tier-chain tests drive it directly.
+    fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
+        AppState {
             keyring: crate::url::Keyring::single(SECRET.to_vec()),
             allow_unsafe: false,
             loader: Loader::with_defaults().unwrap(),
@@ -12736,13 +12809,187 @@ mod tests {
             purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
             provenance_signer: None,
             config_fingerprint: "test".to_string(),
-        };
+        }
+    }
+
+    async fn spawn_app_with_shared(dir: Option<&std::path::Path>, endpoint: &str) -> String {
+        let state = tier_test_state(dir, endpoint);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app(state)).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// A group-free entry as the tier-chain tests seed it.
+    fn tier_test_entry() -> CachedImage {
+        CachedImage {
+            bytes: bytes::Bytes::copy_from_slice(b"tier-test-pixels"),
+            format: crate::url::ImageFormat::WebP,
+            quality: Some(80),
+            groups: Vec::new(),
+            etag: crate::cache::etag_for_bytes(b"tier-test-pixels"),
+        }
+    }
+
+    /// Poll a lookup future exactly once, then drop it:
+    /// the shape of a client disconnecting at the first
+    /// await that cannot complete synchronously.
+    fn poll_lookup_once(state: &AppState, key: &str, groups: &[String]) {
+        let fut = lookup_tiers(state, key, groups);
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let polled = std::future::Future::poll(fut.as_mut(), &mut cx);
+        assert!(polled.is_pending(), "the lookup must wait on a tier");
+        drop(fut);
+    }
+
+    /// Wait until the shared tier's copy of `key` carries
+    /// `group`, or fail: the propagation the dropped
+    /// request owed the tier lands detached, or not at all.
+    async fn shared_learns_group(shared: &crate::s3store::S3Store, key: &str, group: &str) {
+        for _ in 0..50 {
+            if let Some(image) = shared.get(key).await
+                && image.groups.iter().any(|g| g == group)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the shared tier never learned the group {group}");
+    }
+
+    #[tokio::test]
+    async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-drop3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let store = state.store.clone().unwrap();
+        let shared = state.shared_store.clone().unwrap();
+        let key = "40x24/example.com/i.png";
+        // Both persistent tiers hold the entry, group-free.
+        store.put(key, &tier_test_entry());
+        shared.put(key, &tier_test_entry()).await;
+        // One poll starts the disk chain; the request is
+        // then gone (issue #347). The merge, the shared
+        // propagation, and the memory promotion still owe
+        // (issue #350).
+        poll_lookup_once(&state, key, &["thumb".to_string()]);
+        shared_learns_group(&shared, key, "thumb").await;
+        let promoted = state.cache.get(key).expect("promoted into memory");
+        assert!(promoted.groups.iter().any(|g| g == "thumb"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-drop4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let shared = state.shared_store.clone().unwrap();
+        let key = "40x24/example.com/i.png";
+        state.cache.put(key.to_string(), tier_test_entry());
+        shared.put(key, &tier_test_entry()).await;
+        // The memory hit's shared propagation is owed
+        // before any wait (issue #347): one poll and a
+        // drop cannot strand it.
+        poll_lookup_once(&state, key, &["thumb".to_string()]);
+        shared_learns_group(&shared, key, "thumb").await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn disk_task_panic_degrades_and_counts_the_error() {
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-panic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = std::sync::Arc::new(
+            crate::storage::DiskStore::open(
+                &dir,
+                16 * 1024 * 1024,
+                crate::url::entry_key(b"disk-key-test"),
+            )
+            .unwrap(),
+        );
+        let before = store.errors();
+        // A panicked disk operation degrades to None and
+        // moves the tier error counter (issues #347, #367);
+        // it does not take the request path down with it.
+        let out: Option<usize> = store.blocking(|_| -> usize { panic!("test panic") }).await;
+        assert_eq!(out, None);
+        assert_eq!(store.errors(), before + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A disk read that blocks must not stall the runtime
+    /// worker (issue #347): the stored entry's file is
+    /// swapped for a FIFO, so the read waits until a
+    /// writer opens the pipe two seconds later, while
+    /// /health has to answer within one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_disk_read_leaves_health_responsive() {
+        let dir = std::env::temp_dir().join(format!("crabcrop-srv-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_storage(&dir).await;
+        let remainder = format!("25x25/{src}");
+        let url_path = format!("{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(format!("{base}/{url_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // A second instance on the same directory: its
+        // memory is cold, so its requests reach the disk
+        // tier. Its index is built now, from the real file.
+        let base = spawn_app_with_storage(&dir).await;
+        let bin = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().is_some_and(|x| x == "bin"))
+            .expect("the stored entry file")
+            .path();
+        std::fs::remove_file(&bin).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&bin)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // The writer that releases the read two seconds
+        // in. Detached on purpose: if the read never
+        // happens the open blocks forever, and joining it
+        // would hang the suite instead of failing a check.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = std::fs::OpenOptions::new().write(true).open(&bin);
+        });
+        let pending_base = base.clone();
+        let pending_path = url_path.clone();
+        let pending = tokio::spawn(async move {
+            client()
+                .get(format!("{pending_base}/{pending_path}"))
+                .send()
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let start = std::time::Instant::now();
+        let health = client().get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(health.status(), 200);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "/health waited {:?} behind a blocked disk read",
+            start.elapsed()
+        );
+        let resp = pending.await.unwrap().unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
