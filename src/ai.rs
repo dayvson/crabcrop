@@ -1161,8 +1161,10 @@ pub fn mask_geometry(mask: &GrayImage) -> Option<MaskGeometry> {
 /// 256x64x64 embedding from a 1024x1024 input, and a
 /// prompt decoder (the `SamOnnxModel` export shape) taking
 /// the embedding plus point prompts and answering mask
-/// logits at the original image size, one candidate per
-/// mask token, with predicted-IoU scores. The reference
+/// logits at the size its `orig_im_size` input names, one
+/// candidate per mask token, with predicted-IoU scores.
+/// That size is the frame's, capped at the encoder's scale
+/// (`segment_mask_dims`, issue #410). The reference
 /// artifact is MobileSAM (Apache-2.0): a 28 MB encoder and
 /// a 16.5 MB decoder exported from the project's
 /// checkpoint with its own ONNX export path. Box prompts
