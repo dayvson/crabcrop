@@ -234,6 +234,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn address_space_limit_stops_a_greedy_child() {
         // The greedy child allocates 3 GiB after a short
