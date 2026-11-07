@@ -10,7 +10,7 @@
 //! by total bytes with least-recently-used eviction. Only
 //! successful responses are stored; errors are never cached.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::url::ImageFormat;
@@ -109,12 +109,16 @@ const MAX_TOMBSTONES: usize = 1024;
 /// the walk never looks. While a purge is active, a copy
 /// it covers that a lookup finds in a persistent tier is
 /// therefore treated as already purged, whatever the
-/// lookup's snapshot.
+/// lookup's snapshot. The same holds for a lookup that
+/// was under way while the purge ran and finishes after
+/// it ended: the copy it read may predate the walk's
+/// delete, so the guard also remembers when recent
+/// purges ended.
 ///
 /// The guard tracks purges, not entries: it holds no
 /// image data and its maps stay proportional to how many
 /// distinct targets were purged, capped above, plus the
-/// purges still running.
+/// purges still running and as many recent endings.
 #[derive(Debug, Default)]
 pub struct PurgeGuard {
     inner: Mutex<PurgeGuardInner>,
@@ -122,8 +126,8 @@ pub struct PurgeGuard {
 
 #[derive(Debug, Default)]
 struct PurgeGuardInner {
-    /// Bumped by every recorded purge; a snapshot is a
-    /// reading of this counter.
+    /// Bumped by every recorded purge and by every purge
+    /// that ends; a snapshot is a reading of this counter.
     generation: u64,
     /// Base cache key -> generation of its purge. Matches
     /// the key itself and its `#`-suffixed variants, the
@@ -140,6 +144,12 @@ struct PurgeGuardInner {
     /// capped: each entry belongs to a purge task that is
     /// still doing work, and it leaves when that task ends.
     active: HashMap<u64, PurgeTarget>,
+    /// Purges that have ended (issue #400), oldest first,
+    /// each with the generation recorded at its end, so a
+    /// lookup that overlapped one can tell. Capped at
+    /// [`MAX_TOMBSTONES`]; a lookup outlasting that many
+    /// purge endings is far outside any lookup's lifetime.
+    ended: VecDeque<(u64, PurgeTarget)>,
 }
 
 /// What one purge removes: the matching rule the tiers
@@ -186,7 +196,14 @@ impl Drop for ActivePurge {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.active.remove(&self.generation);
+        if let Some(target) = inner.active.remove(&self.generation) {
+            inner.generation += 1;
+            let ended_at = inner.generation;
+            inner.ended.push_back((ended_at, target));
+            if inner.ended.len() > MAX_TOMBSTONES {
+                inner.ended.pop_front();
+            }
+        }
     }
 }
 
@@ -244,18 +261,26 @@ impl PurgeGuard {
         record_tombstone(&mut self.inner.lock().unwrap(), &target)
     }
 
-    /// Whether a purge that is still running covers an
-    /// entry stored under `key` with `groups`, whatever
-    /// generation the reader snapshotted (issue #400). A
-    /// tier copy it covers predates the purge or raced it,
-    /// and must read as a miss until the purge has reached
-    /// every tier.
-    pub fn active_covers(&self, key: &str, groups: &[String]) -> bool {
+    /// Whether a purge that was running at any point
+    /// since `snapshot` covers an entry stored under `key`
+    /// with `groups` (issue #400): one still running, or
+    /// one that ended after the reader took its snapshot,
+    /// whenever it began. A tier copy such a reader holds
+    /// may have been read before the purge reached it, so
+    /// it must read as a miss. A reader that starts after
+    /// the purge ended is unaffected.
+    pub fn running_covers(&self, snapshot: u64, key: &str, groups: &[String]) -> bool {
         let inner = self.inner.lock().unwrap();
         inner
             .active
             .values()
             .any(|target| target.covers(key, groups))
+            || inner
+                .ended
+                .iter()
+                .rev()
+                .take_while(|(ended_at, _)| *ended_at > snapshot)
+                .any(|(_, target)| target.covers(key, groups))
     }
 
     /// How many purges are still running.
@@ -679,30 +704,62 @@ mod tests {
         let key_purge = guard.begin(PurgeTarget::Key("30x20/http://x/cat.jpg".into()));
         let after = guard.snapshot();
         assert!(!guard.purge_covers(after, "30x20/http://x/cat.jpg#w300", &[]));
-        assert!(guard.active_covers("30x20/http://x/cat.jpg#w300", &[]));
-        assert!(guard.active_covers("30x20/http://x/cat.jpg", &[]));
-        assert!(!guard.active_covers("30x20/http://x/cat.jpg2", &[]));
-        assert!(!guard.active_covers("30x20/http://x/dog.jpg", &[]));
+        assert!(guard.running_covers(after, "30x20/http://x/cat.jpg#w300", &[]));
+        assert!(guard.running_covers(after, "30x20/http://x/cat.jpg", &[]));
+        assert!(!guard.running_covers(after, "30x20/http://x/cat.jpg2", &[]));
+        assert!(!guard.running_covers(after, "30x20/http://x/dog.jpg", &[]));
         // The mark and the tombstone go up together: a
         // write begun before `begin` is stale.
         assert!(guard.purge_covers(0, "30x20/http://x/cat.jpg", &[]));
         let group_purge = guard.begin(PurgeTarget::Group("hero".into()));
         let source_purge = guard.begin(PurgeTarget::Source("file:///heroes/dog.jpg".into()));
         assert_eq!(guard.active_count(), 3);
-        assert!(guard.active_covers("any/key", &["hero".to_string()]));
-        assert!(!guard.active_covers("any/key", &["thumb".to_string()]));
-        assert!(guard.active_covers("300x200/file:///heroes/dog.jpg#cfg1", &[]));
-        assert!(!guard.active_covers("300x200/file:///heroes/dog.jpg2", &[]));
+        let now = guard.snapshot();
+        assert!(guard.running_covers(now, "any/key", &["hero".to_string()]));
+        assert!(!guard.running_covers(now, "any/key", &["thumb".to_string()]));
+        assert!(guard.running_covers(now, "300x200/file:///heroes/dog.jpg#cfg1", &[]));
+        assert!(!guard.running_covers(now, "300x200/file:///heroes/dog.jpg2", &[]));
         // Ending one purge leaves the others active, and
         // its tombstone outlives the mark.
         drop(key_purge);
-        assert!(!guard.active_covers("30x20/http://x/cat.jpg#w300", &[]));
+        let now = guard.snapshot();
+        assert!(!guard.running_covers(now, "30x20/http://x/cat.jpg#w300", &[]));
         assert!(guard.purge_covers(0, "30x20/http://x/cat.jpg", &[]));
-        assert!(guard.active_covers("any/key", &["hero".to_string()]));
+        assert!(guard.running_covers(now, "any/key", &["hero".to_string()]));
         drop(group_purge);
         drop(source_purge);
         assert_eq!(guard.active_count(), 0);
-        assert!(!guard.active_covers("any/key", &["hero".to_string()]));
+        let now = guard.snapshot();
+        assert!(!guard.running_covers(now, "any/key", &["hero".to_string()]));
+    }
+
+    #[test]
+    fn a_purge_that_ends_mid_lookup_still_covers_that_lookup() {
+        // Issue #400: a lookup under way while the purge
+        // runs can read a copy the walk has not deleted
+        // yet and only check it after the walk ended. A
+        // purge that ended after the lookup's snapshot
+        // still covers it; one that ended before does not.
+        let guard = Arc::new(PurgeGuard::new());
+        let before = guard.snapshot();
+        let purge = guard.begin(PurgeTarget::Group("hero".into()));
+        let during = guard.snapshot();
+        drop(purge);
+        let after = guard.snapshot();
+        let hero = ["hero".to_string()];
+        assert!(guard.running_covers(before, "any/key", &hero));
+        assert!(guard.running_covers(during, "any/key", &hero));
+        assert!(!guard.running_covers(during, "any/key", &["thumb".to_string()]));
+        assert!(!guard.running_covers(after, "any/key", &hero));
+        // Ending a purge records no tombstone: a write
+        // begun during the purge is not stale.
+        assert!(!guard.purge_covers(during, "any/key", &hero));
+        // Only recent endings are kept.
+        for i in 0..MAX_TOMBSTONES {
+            drop(guard.begin(PurgeTarget::Key(format!("k{i}"))));
+        }
+        assert!(!guard.running_covers(during, "any/key", &hero));
+        assert!(guard.running_covers(during, "k0#w300", &[]));
     }
 
     #[test]
@@ -716,7 +773,8 @@ mod tests {
         .join();
         assert!(joined.is_err());
         assert_eq!(guard.active_count(), 0);
-        assert!(!guard.active_covers("any/key", &["hero".to_string()]));
+        let now = guard.snapshot();
+        assert!(!guard.running_covers(now, "any/key", &["hero".to_string()]));
     }
 
     #[test]

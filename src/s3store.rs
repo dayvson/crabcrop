@@ -717,7 +717,7 @@ fn xml_unescape(s: &str) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -751,6 +751,14 @@ pub(crate) mod test_support {
         /// the first `n` waits until it is cleared, so a
         /// test can act while a purge walk is mid-flight.
         pub hold_ranged_after: Arc<StdMutex<Option<usize>>>,
+        /// While set, a whole-object GET (a lookup's read)
+        /// is answered from the object as it stands when the
+        /// request arrives, then held before the answer is
+        /// sent until cleared, so a test can change the
+        /// store while those bytes are in flight.
+        pub hold_object_gets: Arc<AtomicBool>,
+        /// Whole-object GETs held right now.
+        pub held_object_gets: Arc<AtomicUsize>,
         pub endpoint: String,
     }
 
@@ -760,6 +768,8 @@ pub(crate) mod test_support {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let ranged_gets = Arc::new(AtomicUsize::new(0));
         let hold_ranged_after: Arc<StdMutex<Option<usize>>> = Arc::new(StdMutex::new(None));
+        let hold_object_gets = Arc::new(AtomicBool::new(false));
+        let held_object_gets = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = objects.clone();
@@ -767,6 +777,8 @@ pub(crate) mod test_support {
         let shared_requests = requests.clone();
         let shared_ranged = ranged_gets.clone();
         let shared_hold = hold_ranged_after.clone();
+        let shared_hold_objects = hold_object_gets.clone();
+        let shared_held_objects = held_object_gets.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let objects = shared.clone();
@@ -774,6 +786,8 @@ pub(crate) mod test_support {
                 let requests = shared_requests.clone();
                 let ranged_gets = shared_ranged.clone();
                 let hold_ranged_after = shared_hold.clone();
+                let hold_object_gets = shared_hold_objects.clone();
+                let held_object_gets = shared_held_objects.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -861,6 +875,17 @@ pub(crate) mod test_support {
                         range_end,
                         if_none_match.as_deref(),
                     );
+                    if method == "GET"
+                        && range_end.is_none()
+                        && !target.contains("list-type=2")
+                        && hold_object_gets.load(Ordering::SeqCst)
+                    {
+                        held_object_gets.fetch_add(1, Ordering::SeqCst);
+                        while hold_object_gets.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        held_object_gets.fetch_sub(1, Ordering::SeqCst);
+                    }
                     let resp = format!(
                         "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n",
                         payload.len()
@@ -880,6 +905,8 @@ pub(crate) mod test_support {
             requests,
             ranged_gets,
             hold_ranged_after,
+            hold_object_gets,
+            held_object_gets,
             endpoint: format!("http://127.0.0.1:{port}"),
         }
     }

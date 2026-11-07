@@ -77,7 +77,7 @@ Groups make preset-wide invalidation one call instead of a script over every URL
 curl -X POST "http://localhost:3000/purge-group/<signature>/small"
 ```
 
-The response is `200` with a body like `purged 3`: every entry recorded in the group, across this server's cache tiers, with the same reach as a per-URL purge (this server's tiers and the shared bucket, not other replicas' memory) and the same bounded shared-bucket scan: on a very large bucket the count reports what the request itself removed and the remainder finishes in the background, logged on completion, while the receiving server treats any copy of a group member as a miss until the scan ends. A bad signature is a `403` and removes nothing; an unknown group answers `purged 0`.
+The response is `200` with a body like `purged 3`: every entry recorded in the group, across this server's cache tiers, with the same reach as a per-URL purge (this server's tiers and the shared bucket, not other replicas' memory) and the same bounded shared-bucket scan: on a very large bucket the count reports what the request itself removed and the remainder finishes in the background, logged on completion, while the receiving server treats any disk or bucket copy of a group member as a miss until the scan ends. A bad signature is a `403` and removes nothing; an unknown group answers `purged 0`.
 
 Every image request also writes one structured JSON log line to stdout, with the operation summary, status, per-stage timings, and cache result (never the full source URL).
 
