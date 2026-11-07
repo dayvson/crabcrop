@@ -4539,7 +4539,8 @@ mod moderation_tests {
         let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
         let img = image::load_from_memory(bytes).unwrap();
         let report = provider.moderate(&img).unwrap();
-        assert_eq!(report.model, model);
+        // Meta names a model by its file name, not the operator's path.
+        assert_eq!(report.model, model_display_name(&model));
         assert!(report.signals.is_empty());
         assert_eq!(report.scores.len(), 2);
         assert_eq!(report.scores[0].label, "normal");
@@ -6277,7 +6278,8 @@ mod embedding_tests {
         let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
         let img = image::load_from_memory(bytes).unwrap();
         let embedding = provider.embed(&img).unwrap();
-        assert_eq!(embedding.model, image_model);
+        // Meta names a model by its file name, not the operator's path.
+        assert_eq!(embedding.model, model_display_name(&image_model));
         assert_eq!(embedding.vector.len(), 512);
         let norm: f32 = embedding.vector.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-3, "norm {norm}");
