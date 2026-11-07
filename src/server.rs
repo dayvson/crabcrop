@@ -60,7 +60,8 @@ mod process;
 pub(in crate::server) use process::{
     AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
     PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
-    SharedResponse, VIDEO_GATE_WAIT, run_process, wants_animation_gate, wants_slow_lane,
+    SharedResponse, VIDEO_GATE_WAIT, WatermarkSources, run_process, wants_animation_gate,
+    wants_slow_lane,
 };
 pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
@@ -470,7 +471,7 @@ fn lane_metrics(state: &AppState) -> String {
     out
 }
 
-/// Source byte budget occupancy for `/metrics` (issue
+/// Source buffer budget occupancy for `/metrics` (issue
 /// #403): the source and watermark bytes cache misses hold
 /// right now, against the configured budget, read live at
 /// scrape time. In use sitting at capacity while requests
@@ -601,11 +602,23 @@ pub enum Fallback {
 
 /// The fallback's bytes, when one is configured and reachable.
 /// A URL fallback that itself fails to load yields `None`, and
-/// the caller answers with the original source error.
-async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
+/// the caller answers with the original source error. The copy
+/// is charged to the request's source budget share like a
+/// source (issue #403); no budget within the wait is `None` too.
+async fn fallback_source_bytes(
+    state: &AppState,
+    charge: &crate::loader::SourceCharge,
+) -> Option<Vec<u8>> {
     match &state.fallback {
-        Some(Fallback::Bytes(bytes)) => Some(bytes.as_ref().clone()),
-        Some(Fallback::Url(url)) => state.loader.load(url).await.ok(),
+        Some(Fallback::Bytes(bytes)) => {
+            charge.grow_to(charge.bytes() + bytes.len()).await.ok()?;
+            Some(bytes.as_ref().clone())
+        }
+        Some(Fallback::Url(url)) => state
+            .loader
+            .load_media_charged(url, crate::loader::MediaAdmission::default(), charge)
+            .await
+            .ok(),
         None => None,
     }
 }
@@ -1176,6 +1189,40 @@ fn upload_log(name: &str, outcome: &str) {
     println!("{{\"event\":\"upload\",\"target\":\"{hash}\",\"outcome\":\"{outcome}\"}}");
 }
 
+/// Read an upload body of at most `cap` bytes, charging it
+/// to `charge` as it arrives (issue #403), in steps so a
+/// trickling client does not touch the budget per frame.
+/// [`LoadError::TooLarge`] past the cap,
+/// [`LoadError::Network`] for an unreadable body, and
+/// [`LoadError::Busy`] when the request's wait for budget
+/// ran out.
+async fn read_upload_body(
+    mut body: axum::body::Body,
+    cap: usize,
+    charge: &crate::loader::SourceCharge,
+) -> Result<Vec<u8>, LoadError> {
+    use axum::body::HttpBody as _;
+    const STEP: usize = 256 * 1024;
+    let mut out = Vec::new();
+    while let Some(frame) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+    {
+        let frame = frame.map_err(|e| LoadError::Network(e.to_string()))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let received = out.len() + data.len();
+        if received > cap {
+            return Err(LoadError::TooLarge { limit: cap as u64 });
+        }
+        let step = received.div_ceil(STEP).saturating_mul(STEP);
+        charge.grow_to(step.min(cap).max(received)).await?;
+        out.extend_from_slice(&data);
+    }
+    charge.shrink_to(out.len());
+    Ok(out)
+}
+
 /// The outcome of running upload validation under the
 /// process gate.
 enum UploadValidation {
@@ -1408,29 +1455,24 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         );
     }
     // A buffered upload is a source like a fetched one
-    // (issue #403): before the body is read it reserves the
-    // upload cap from the source byte budget, keeps what it
-    // received, and holds that until the handler is done
-    // with the bytes, so a burst of uploads waits at the
-    // budget instead of buffering past it.
+    // (issue #403): its body is charged to the source buffer
+    // budget as it arrives and the charge is held until the
+    // handler is done with the bytes, so a burst of uploads
+    // waits at the budget instead of buffering past it, and
+    // a client that stalls mid-body holds only what it sent.
+    // The read is bounded by the cap itself: it fails the
+    // moment the body passes it, which is the oversize
+    // answer (413) without ever holding more than the cap in
+    // memory; an unreadable body answers the same.
+    let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
     let cap = usize::try_from(upload.max_bytes).unwrap_or(usize::MAX);
-    let Some(mut body_share) = state
-        .loader
-        .source_budget()
-        .reserve(cap, SOURCE_BUDGET_WAIT)
-        .await
-    else {
-        state.metrics.record_upload();
-        upload_log(name, "rejected:busy");
-        return source_budget_busy(accept.as_deref());
-    };
-    // The read is bounded by the cap itself: `to_bytes`
-    // fails the moment the body passes it, which is the
-    // oversize answer (413) without ever holding more
-    // than the cap in memory. Any other read failure is
-    // a bad request body (400).
-    let bytes = match axum::body::to_bytes(body, upload.max_bytes as usize).await {
+    let bytes = match read_upload_body(body, cap, &charge).await {
         Ok(bytes) => bytes,
+        Err(LoadError::Busy) => {
+            state.metrics.record_upload();
+            upload_log(name, "rejected:busy");
+            return source_budget_busy(accept.as_deref());
+        }
         Err(_) => {
             state.metrics.record_upload();
             upload_log(name, "rejected:oversize-or-unreadable");
@@ -1442,7 +1484,6 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             );
         }
     };
-    body_share.shrink_to(bytes.len());
     if bytes.is_empty() {
         state.metrics.record_upload();
         upload_log(name, "rejected:not-an-image");
@@ -1476,8 +1517,8 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // The decode runs under the process gate, like every
     // transform (see `run_upload_validation`).
     // The body moves into validation rather than being
-    // copied for it, so the share covers what is held.
-    let prepared = match run_upload_validation(&state, Vec::from(bytes)).await {
+    // copied for it, so the charge covers what is held.
+    let prepared = match run_upload_validation(&state, bytes).await {
         UploadValidation::Valid(prepared) => prepared,
         UploadValidation::Invalid(e) => {
             eprintln!("upload rejected: {e}");
@@ -2731,36 +2772,42 @@ async fn serve_miss(
     let wants_frame = directives.frame.is_some();
     let wants_page = directives.page.is_some();
     record.load_ran = true;
-    // Admission comes before any buffering (issue #403): the
-    // miss reserves its share of the source byte budget, the
-    // fetch cap, before it loads a byte, and sheds like a
-    // full gate when the budget stays exhausted. The share
-    // is trimmed to what each load received and travels
-    // with the bytes into the render job, which returns it
-    // when it finishes, so a burst of distinct misses waits
-    // here instead of each buffering a whole source before
-    // the gates below are even consulted.
-    let Some(mut source_share) = state.loader.reserve_load(SOURCE_BUDGET_WAIT).await else {
-        return (sealed_or(sealed, source_budget_busy(accept)), record, None);
-    };
+    // Every byte this miss buffers, the source, its
+    // watermarks, a fallback, is charged to the source
+    // buffer budget as it arrives (issue #403), and the
+    // charge travels with the bytes into the render job,
+    // which returns it when it finishes. A burst of distinct
+    // misses therefore waits here, before the gates below,
+    // instead of each buffering a whole source first; a miss
+    // whose wait for budget runs out sheds like a full gate.
+    // Nothing is charged before an origin answers, and an
+    // origin that answers and then stalls holds only what it
+    // has delivered (see `SourceCharge`).
+    let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
     let load_start = Instant::now();
     let mut used_fallback = false;
     let admission = crate::loader::MediaAdmission {
         video: wants_frame,
         pdf: wants_page,
     };
-    let bytes = match state.loader.load_media(source_url, admission).await {
+    let bytes = match state
+        .loader
+        .load_media_charged(source_url, admission, &charge)
+        .await
+    {
         Ok(b) => b,
         Err(e) => {
             record.load = load_start.elapsed();
             // A policy refusal (Forbidden) is a decision, not a
-            // failure: it never falls back. Any other load
-            // failure degrades to the configured fallback when
-            // there is one.
-            let fb = if matches!(e, LoadError::Forbidden(_)) {
+            // failure: it never falls back. Neither does an
+            // exhausted budget (issue #403): that is overload,
+            // and the fallback would need budget too. Any other
+            // load failure degrades to the configured fallback
+            // when there is one.
+            let fb = if matches!(e, LoadError::Forbidden(_) | LoadError::Busy) {
                 None
             } else {
-                fallback_source_bytes(state).await
+                fallback_source_bytes(state, &charge).await
             };
             match fb {
                 Some(b) => {
@@ -2768,7 +2815,11 @@ async fn serve_miss(
                     b
                 }
                 None => {
-                    record.fail = FailStage::Load;
+                    // A budget shed is overload, like a full
+                    // gate, not a loader error (issue #403).
+                    if e != LoadError::Busy {
+                        record.fail = FailStage::Load;
+                    }
                     return (
                         sealed_or(sealed, load_error_response(e, accept)),
                         record,
@@ -2780,7 +2831,6 @@ async fn serve_miss(
     };
     record.load = load_start.elapsed();
     record.bytes_in = bytes.len();
-    source_share.shrink_to(bytes.len());
 
     // Watermarks are fetched here, before the engine runs:
     // each referenced image goes through the same loader (and
@@ -2791,19 +2841,22 @@ async fn serve_miss(
     // blocking job with the rest of the engine work, so a
     // watermark that does not decode fails the request from
     // there with the same engine error (audit R2-16).
-    // Each watermark load reserves its own share first, like
-    // the source (issue #403), and the request keeps every
-    // share until its job ends.
-    let mut watermark_sources: Vec<(String, Vec<u8>)> = Vec::new();
+    // Watermark loads charge the same budget, against the
+    // request's one wait (issue #403); their share is split
+    // off to travel with the watermark bytes.
+    let mut watermark_images: Vec<(String, Vec<u8>)> = Vec::new();
     for wm_url in &directives.watermark_urls {
         record.load_ran = true;
-        let Some(mut wm_share) = state.loader.reserve_load(SOURCE_BUDGET_WAIT).await else {
-            return (sealed_or(sealed, source_budget_busy(accept)), record, None);
-        };
-        let wm_bytes = match state.loader.load(wm_url).await {
+        let wm_bytes = match state
+            .loader
+            .load_media_charged(wm_url, crate::loader::MediaAdmission::default(), &charge)
+            .await
+        {
             Ok(b) => b,
             Err(e) => {
-                record.fail = FailStage::Load;
+                if e != LoadError::Busy {
+                    record.fail = FailStage::Load;
+                }
                 return (
                     sealed_or(sealed, load_error_response(e, accept)),
                     record,
@@ -2811,11 +2864,13 @@ async fn serve_miss(
                 );
             }
         };
-        wm_share.shrink_to(wm_bytes.len());
-        source_share.merge(wm_share);
-        watermark_sources.push((wm_url.to_string(), wm_bytes));
+        watermark_images.push((wm_url.to_string(), wm_bytes));
     }
-    let watermark_bytes: usize = watermark_sources.iter().map(|(_, b)| b.len()).sum();
+    let watermark_bytes: usize = watermark_images.iter().map(|(_, b)| b.len()).sum();
+    let watermark_sources = Arc::new(WatermarkSources {
+        images: watermark_images,
+        share: Some(charge.split_off(watermark_bytes)),
+    });
 
     record.process_ran = true;
     let process_start = Instant::now();
@@ -2943,9 +2998,7 @@ async fn serve_miss(
         }
         None => ops.clone(),
     };
-    // One job, shared by the run and a fallback retry, so
-    // the watermark bytes it carries are never copied.
-    let job = Arc::new(ProcessJob {
+    let job = ProcessJob {
         save_data,
         preserve_metadata: state.preserve_metadata,
         ops: job_ops,
@@ -2977,7 +3030,7 @@ async fn serve_miss(
         brand_color: state.brand_color,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
-    });
+    };
     // The lane this run draws its permit from (issue
     // #324): long-running work goes to the slow lane, so
     // its saturation sheds slow requests only and stills
@@ -2995,10 +3048,9 @@ async fn serve_miss(
     };
     let source = JobSource {
         bytes,
-        share: Some(source_share),
+        share: Some(charge),
     };
-    let first_run = run_process(state, job.clone(), source, lane, process_deadline, permits);
-    let processed = match first_run.await {
+    let processed = match run_process(state, &job, source, lane, process_deadline, permits).await {
         Ok(p) => p,
         Err(ProcessFailure::Busy) => {
             return (
@@ -3059,29 +3111,16 @@ async fn serve_miss(
             // other fallback case. Other engine errors are
             // properties of the request or the configuration,
             // not of the source, and stay honest.
-            // The first run's budget share drained with its
-            // job, so the retry reserves again before the
-            // fallback loads (issue #403): the fetch cap plus
-            // the watermarks the job still carries. An
-            // exhausted budget leaves the original engine
-            // error standing, like a full gate below.
-            let retry_share = if !used_fallback
-                && state.fallback.is_some()
-                && matches!(e, EngineError::Decode(_))
-            {
-                let cap = usize::try_from(state.loader.max_bytes()).unwrap_or(usize::MAX);
-                state
-                    .loader
-                    .source_budget()
-                    .reserve(cap.saturating_add(watermark_bytes), SOURCE_BUDGET_WAIT)
-                    .await
-            } else {
-                None
-            };
-            let retry = if let Some(mut retry_share) = retry_share {
-                match fallback_source_bytes(state).await {
+            // The first run's source share drained with its
+            // job, so the fallback is charged afresh (issue
+            // #403), with a wait of its own like each gate
+            // below; the watermarks keep the share they
+            // travel with. No budget leaves the original
+            // engine error standing, like a full gate.
+            let retry_charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
+            let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
+                match fallback_source_bytes(state, &retry_charge).await {
                     Some(fb) => {
-                        retry_share.shrink_to(fb.len() + watermark_bytes);
                         // The fallback run draws on the same
                         // gates as the first: each kind of
                         // work re-acquires its permit (the
@@ -3126,18 +3165,11 @@ async fn serve_miss(
                         if may_retry {
                             let source = JobSource {
                                 bytes: fb,
-                                share: Some(retry_share),
+                                share: Some(retry_charge),
                             };
-                            run_process(
-                                state,
-                                job.clone(),
-                                source,
-                                lane,
-                                process_deadline,
-                                retry_permits,
-                            )
-                            .await
-                            .ok()
+                            run_process(state, &job, source, lane, process_deadline, retry_permits)
+                                .await
+                                .ok()
                         } else {
                             None
                         }
@@ -3165,9 +3197,9 @@ async fn serve_miss(
         }
     };
     record.process = process_start.elapsed();
-    // The run's budget share has drained with its job; the
-    // watermark bytes the job carries go with it now, not
-    // after the population writes and meta annotations.
+    // The source's budget share drained with its run; the
+    // watermarks go now with theirs (issue #403), not after
+    // the population writes and meta annotations.
     drop(job);
     // The validator for this render is a digest of its
     // bytes, computed once here: it is stored with the
@@ -3510,17 +3542,15 @@ fn finalize_validators(response: &mut Response, etag: &str, if_none_match: Optio
     }
 }
 
-/// The 503 for an exhausted source byte budget (issue
+/// The 503 for an exhausted source buffer budget (issue
 /// #403): the same `server_busy` answer as a full gate,
 /// with the stills lane's short Retry-After, since shares
 /// free as soon as renders end.
 fn source_budget_busy(accept: Option<&str>) -> Response {
-    busy_response(
-        "server busy: too many source images held in memory",
-        1,
-        accept,
-    )
+    busy_response(SOURCE_BUDGET_BUSY, 1, accept)
 }
+
+const SOURCE_BUDGET_BUSY: &str = "server busy: too many source images held in memory";
 
 /// A 503 for a saturated gate. Retry-After tells clients
 /// and CDNs when a retry has a chance, instead of letting
@@ -3610,10 +3640,19 @@ fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
             "source_too_large",
             format!("source exceeds {limit} bytes"),
         ),
+        // The overload answer every gate gives (issue #403).
+        LoadError::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_busy",
+            SOURCE_BUDGET_BUSY.to_string(),
+        ),
     }
 }
 
 fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
+    if e == LoadError::Busy {
+        return source_budget_busy(accept);
+    }
     eprintln!("load error: {e}");
     let (status, code, message) = load_error_parts(e);
     error_response(status, code, message, accept)
@@ -6089,6 +6128,12 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
                 "source_too_large",
                 "source exceeds 10 bytes".to_string(),
+            ),
+            (
+                LoadError::Busy,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_busy",
+                "server busy: too many source images held in memory".to_string(),
             ),
         ]
     }
@@ -12542,7 +12587,7 @@ mod tests {
             brand_color: None,
             ops: Vec::new(),
             preferred: None,
-            watermark_sources: Vec::new(),
+            watermark_sources: Default::default(),
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,
@@ -12876,7 +12921,7 @@ mod tests {
             brand_color: None,
             ops: Vec::new(),
             preferred: None,
-            watermark_sources: Vec::new(),
+            watermark_sources: Default::default(),
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,
@@ -13016,7 +13061,7 @@ mod tests {
                 brand_color: None,
                 ops,
                 preferred: None,
-                watermark_sources: Vec::new(),
+                watermark_sources: Default::default(),
                 placeholders: false,
                 mask_provider: None,
                 upscale_provider: None,
@@ -13199,7 +13244,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_source_budget_share_is_held_until_the_job_actually_finishes() {
-        // Issue #403: the share serve_miss reserves for a
+        // Issue #403: the charge serve_miss holds for a
         // source travels into the run with the bytes. A run
         // shed at its deadline leaves the detached job
         // holding the bytes, so the share must stay held
@@ -13215,11 +13260,8 @@ mod tests {
             release: release.clone(),
         }));
         let png = test_png();
-        let mut share = budget
-            .reserve(1 << 20, std::time::Duration::from_secs(1))
-            .await
-            .unwrap();
-        share.shrink_to(png.len());
+        let share = budget.charge(std::time::Duration::from_secs(1));
+        share.grow_to(png.len()).await.unwrap();
         assert_eq!(budget.in_use(), png.len());
         let source = JobSource {
             bytes: png.clone(),
@@ -13711,7 +13753,7 @@ mod tests {
             brand_color: None,
             ops,
             preferred: None,
-            watermark_sources: Vec::new(),
+            watermark_sources: Default::default(),
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,
@@ -14151,10 +14193,13 @@ mod tests {
             brand_color: None,
             ops: Vec::new(),
             preferred: None,
-            watermark_sources: vec![(
-                "http://img/wm.png".to_string(),
-                b"this is not an image".to_vec(),
-            )],
+            watermark_sources: Arc::new(WatermarkSources {
+                images: vec![(
+                    "http://img/wm.png".to_string(),
+                    b"this is not an image".to_vec(),
+                )],
+                share: None,
+            }),
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,

@@ -760,10 +760,10 @@ fn build_keyring(get: impl Fn(&str) -> Option<String>) -> Result<crate::url::Key
 }
 
 /// Fetch caps per processing lane permit in the default
-/// source byte budget (issue #403): for each permit, one
-/// source rendering, one loaded and queued behind it, and
-/// two loading. A load reserves the whole cap only while
-/// it runs and keeps just what it received, so typical
+/// source buffer budget (issue #403): for each permit, room
+/// for one source rendering, one loaded and queued behind
+/// it, and two loading, all at the cap. A load is charged
+/// its declared length, then what it received, so typical
 /// sources, far under the cap, fit many more at once.
 const SOURCE_BUFFER_CAPS_PER_PERMIT: u64 = 4;
 
@@ -771,7 +771,7 @@ const SOURCE_BUFFER_CAPS_PER_PERMIT: u64 = 4;
 /// 64 GiB; the computed default is clamped to it too.
 const MAX_SOURCE_BUFFER_MB: u64 = 65_536;
 
-/// The source byte budget in bytes (issue #403), from
+/// The source buffer budget in bytes (issue #403), from
 /// `CRABCROP_SOURCE_BUFFER_MAX_MB`, read through `get` so
 /// tests can drive it. The default scales with the
 /// processing lanes (`lane_permits`, the stills lane plus
@@ -971,7 +971,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     // The stills lane is sized to the cores at boot; the
-    // source byte budget's default scales with both lanes.
+    // source buffer budget's default scales with both lanes.
     let process_permits = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);

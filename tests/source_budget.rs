@@ -1,19 +1,18 @@
-//! The source byte budget (issue #403), end to end through
-//! the binary: a burst of distinct cache misses against a
-//! slow origin. Before the budget, every miss buffered its
-//! whole source before any gate was consulted, so the
-//! sources in memory grew with the number of requests;
-//! with it, a miss reserves its share before it fetches a
-//! byte, and the origin never sees more fetches at once
-//! than the budget holds. A miss that cannot reserve within
-//! the wait sheds with the documented `503 server_busy`.
-//! An upload body is budgeted the same way before it is
-//! read.
+//! The source buffer budget (issue #403), end to end
+//! through the binary. Before the budget, every cache miss
+//! buffered its whole source before any gate was consulted,
+//! so the sources in memory grew with the number of
+//! requests. Now a miss charges its body to the budget as
+//! the bytes arrive: an origin that answers and then stalls
+//! holds only what it delivered, so stalled origins cannot
+//! starve other requests, while a budget genuinely full of
+//! buffered bytes makes new misses wait, then shed with the
+//! documented `503 server_busy`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -132,37 +131,29 @@ fn tiny_png() -> Vec<u8> {
     png.into_inner()
 }
 
-/// A local origin that records every path it is asked for
-/// and how many bodies it is serving at once. A path
-/// containing `stall` is held until `release` is set;
-/// every other body goes out after `delay`.
+/// A local origin. A path containing `stall` answers with
+/// a declared length of `declared` bytes, sends `sent` of
+/// them, then holds the connection until `release` is set
+/// (or 9 s pass); every other path gets the tiny PNG. It
+/// records every path it is asked for.
 struct Origin {
     port: u16,
     paths: Arc<Mutex<Vec<String>>>,
-    peak: Arc<AtomicUsize>,
     release: Arc<AtomicBool>,
 }
 
-fn spawn_origin(delay: Duration) -> Origin {
+fn spawn_origin(declared: usize, sent: usize) -> Origin {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let paths = Arc::new(Mutex::new(Vec::new()));
-    let serving = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(AtomicBool::new(false));
     let png = Arc::new(tiny_png());
     {
-        let (paths, peak, release) = (paths.clone(), peak.clone(), release.clone());
+        let (paths, release) = (paths.clone(), release.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                let (paths, serving, peak, release, png) = (
-                    paths.clone(),
-                    serving.clone(),
-                    peak.clone(),
-                    release.clone(),
-                    png.clone(),
-                );
+                let (paths, release, png) = (paths.clone(), release.clone(), png.clone());
                 std::thread::spawn(move || {
                     let mut request = Vec::new();
                     let mut buf = [0u8; 1024];
@@ -177,16 +168,18 @@ fn spawn_origin(delay: Duration) -> Origin {
                         .nth(1)
                         .unwrap_or("")
                         .to_string();
-                    let now = serving.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
                     paths.lock().unwrap().push(path.clone());
                     if path.contains("stall") {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&vec![0u8; sent]);
                         let until = Instant::now() + Duration::from_secs(9);
                         while !release.load(Ordering::SeqCst) && Instant::now() < until {
                             std::thread::sleep(Duration::from_millis(20));
                         }
-                    } else {
-                        std::thread::sleep(delay);
+                        return;
                     }
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -194,7 +187,6 @@ fn spawn_origin(delay: Duration) -> Origin {
                     );
                     let _ = stream.write_all(head.as_bytes());
                     let _ = stream.write_all(&png);
-                    serving.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
@@ -202,8 +194,19 @@ fn spawn_origin(delay: Duration) -> Origin {
     Origin {
         port,
         paths,
-        peak,
         release,
+    }
+}
+
+/// Wait until the origin has been asked for `n` paths.
+fn wait_for_requests(origin: &Origin, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while origin.paths.lock().unwrap().len() < n {
+        assert!(
+            Instant::now() < deadline,
+            "the origin never saw {n} requests"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -213,49 +216,95 @@ fn metrics(port: u16) -> String {
     String::from_utf8(body).unwrap()
 }
 
+/// The `crabcrop_source_buffer_bytes` gauge.
+fn held_bytes(port: u16) -> u64 {
+    metrics(port)
+        .lines()
+        .find_map(|l| l.strip_prefix("crabcrop_source_buffer_bytes "))
+        .and_then(|v| v.parse().ok())
+        .expect("the gauge is exported")
+}
+
 #[test]
-fn a_burst_of_distinct_misses_never_fetches_more_than_the_budget_holds() {
-    // Two fetch caps of budget (20 MB): however many
-    // distinct misses arrive together, at most two sources
-    // are being fetched at once. Before the budget all
-    // eight were fetched, and buffered, at the same time.
-    let origin = spawn_origin(Duration::from_millis(300));
-    let uploads = scratch_dir("burst");
+fn stalled_origins_do_not_block_a_normal_request() {
+    // Four misses whose origin answers with a 10 MB
+    // Content-Length and then sends nothing, under a budget
+    // of two fetch caps (20 MB). Charging the fetch cap up
+    // front would let two of them hold the whole budget for
+    // the fetch timeout, and the normal request below would
+    // shed after its 5 s wait. Charged as bytes arrive, a
+    // stall holds its declared length only for the one-second
+    // grant, then only what it delivered: nothing.
+    let origin = spawn_origin(10 * 1024 * 1024, 0);
+    let uploads = scratch_dir("stall");
     let (_server, port) = boot(20, &uploads);
-    let requests: Vec<_> = (0..8)
+    // An upload client that announces 10 MB, sends 1000
+    // bytes, and stalls holds one charge step, not the
+    // upload cap.
+    let sig = crabcrop::url::upload_signature(SECRET.as_bytes(), "stall.png");
+    let mut stalled_upload = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stalled_upload,
+        "PUT /upload/{sig}/stall.png HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+        10 * 1024 * 1024
+    )
+    .unwrap();
+    stalled_upload.write_all(&[0u8; 1000]).unwrap();
+    let stalled: Vec<_> = (0..4)
         .map(|i| {
-            let path = format!("/unsafe/20x20/http://127.0.0.1:{}/s{i}.png", origin.port);
+            let path = format!(
+                "/unsafe/20x20/http://127.0.0.1:{}/stall{i}.png",
+                origin.port
+            );
             std::thread::spawn(move || get(port, &path, "").0)
         })
         .collect();
-    let statuses: Vec<u16> = requests.into_iter().map(|t| t.join().unwrap()).collect();
-    assert_eq!(statuses, vec![200; 8], "every miss is served, in turn");
-    assert_eq!(origin.paths.lock().unwrap().len(), 8);
-    let peak = origin.peak.load(Ordering::SeqCst);
-    assert!(
-        peak <= 2,
-        "{peak} sources fetched at once under a two-cap budget"
-    );
-    // Every share came back with its job; the exposition
-    // reports the budget and what is held against it.
+    wait_for_requests(&origin, 4);
+    let start = Instant::now();
+    let path = format!("/unsafe/20x20/http://127.0.0.1:{}/normal.png", origin.port);
+    let (status, head, _) = get(port, &path, "");
+    let waited = start.elapsed();
+    assert_eq!(status, 200, "{head}");
+    assert!(waited < Duration::from_secs(4), "served after {waited:?}");
+    // Once their grants end, the stalls, still open, hold
+    // nothing they did not receive: the origin stalls
+    // nothing, the upload one 256 KiB step for its 1000
+    // bytes.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while held_bytes(port) > 256 * 1024 {
+        assert!(
+            Instant::now() < deadline,
+            "stalls still hold {} bytes",
+            held_bytes(port)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(stalled_upload);
+    origin.release.store(true, Ordering::SeqCst);
+    for t in stalled {
+        assert_ne!(t.join().unwrap(), 200, "a stalled source never renders");
+    }
+    assert_eq!(held_bytes(port), 0, "every charge came back");
     let body = metrics(port);
     assert!(
         body.contains("crabcrop_source_buffer_capacity_bytes 20971520\n"),
         "{body}"
     );
-    assert!(body.contains("crabcrop_source_buffer_bytes 0\n"), "{body}");
+    assert!(!uploads.join("stall.png").exists());
     let _ = std::fs::remove_dir_all(&uploads);
 }
 
 #[test]
-fn a_miss_that_cannot_reserve_in_time_sheds_with_server_busy() {
-    // One fetch cap of budget (10 MB), held by a miss whose
-    // origin stalls: misses behind it wait out the bound
+fn a_budget_full_of_buffered_bytes_sheds_new_misses_with_server_busy() {
+    // One fetch cap of budget (10 MB), filled by a miss
+    // whose origin delivers all but ten bytes of a 10 MB
+    // body and stalls: those bytes really are in memory, so
+    // they stay charged. Misses behind it wait out the bound
     // (the stills gate's five seconds), then shed with the
-    // documented busy answer, never having fetched. An
-    // image request and a meta request shed alike, and so
-    // does an upload, whose body is never read or stored.
-    let origin = spawn_origin(Duration::ZERO);
+    // documented busy answer. An image request, a meta
+    // request, and an upload (never stored) shed alike.
+    const CAP: usize = 10 * 1024 * 1024;
+    let origin = spawn_origin(CAP, CAP - 10);
     let uploads = scratch_dir("shed");
     let (_server, port) = boot(10, &uploads);
     let stalled = {
@@ -263,8 +312,8 @@ fn a_miss_that_cannot_reserve_in_time_sheds_with_server_busy() {
         std::thread::spawn(move || get(port, &path, "").0)
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while origin.paths.lock().unwrap().is_empty() {
-        assert!(Instant::now() < deadline, "the stalled fetch never arrived");
+    while held_bytes(port) < (CAP - 10) as u64 {
+        assert!(Instant::now() < deadline, "the stalled body never arrived");
         std::thread::sleep(Duration::from_millis(20));
     }
     let start = Instant::now();
@@ -311,12 +360,8 @@ fn a_miss_that_cannot_reserve_in_time_sheds_with_server_busy() {
         waited >= Duration::from_millis(4500),
         "shed after {waited:?}, before the wait bound"
     );
-    assert_eq!(
-        *origin.paths.lock().unwrap(),
-        vec!["/stall.png".to_string()],
-        "a shed miss never reaches the origin"
-    );
     origin.release.store(true, Ordering::SeqCst);
-    assert_eq!(stalled.join().unwrap(), 200);
+    assert_ne!(stalled.join().unwrap(), 200);
+    assert_eq!(held_bytes(port), 0, "the stalled charge came back");
     let _ = std::fs::remove_dir_all(&uploads);
 }
