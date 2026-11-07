@@ -2,6 +2,100 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Added
+
+- A configuration switch for meta mode (issue #390). Meta mode answered any `Accept: application/json` request on a signed URL with an uncached full render plus up to five annotation inferences, and a deployment had no way to turn it off. `CRABCROP_META_MODE` now controls it, parsed with the usual boolean spellings and on by default for compatibility; with it off, a meta request answers `403 meta_disabled`. Renders are unaffected.
+
+- Cache tier failures are logged and counted (issue #367). The disk and shared tiers used to drop their failures silently, so a dead tier could go unnoticed for weeks. Each failure is now logged as it happens and counted on `/metrics` as `crabcrop_cache_tier_errors_total`, with `tier="disk"` and `tier="shared"` series for the configured tiers. The tiers stay best-effort: a failed write is still a dropped write, never a failed request. The disk tier also probes its directory with a scratch file when it opens, so an unwritable result directory fails at boot with a clear message.
+
+- `crabcrop --version` and `crabcrop -V` print the version and exit. Both used to fall through to the server start, binding the port (and failing without a secret) instead of answering.
+
+- The release pipeline publishes the MCP server package, `@crabcrop/mcp`, to npm next to the other registry packages, behind the same `release` environment approval (issue #382).
+
+- Fuzz targets for image decoding, source metadata, and operation chains (issue #387). The fuzz package covered only the URL parser and the sealed-token opener; three targets now run the decoders and the SVG sanitizer, metadata extraction and re-injection, and a parsed request's filter segments against a synthetic image. The local gate's smoke sweep exercises their seed corpora without cargo-fuzz.
+
+### Changed
+
+- This release starts a new cache epoch (issue #412). Several fixes below change the bytes served for URLs that already exist (sharpen, `keep_profile` on WebP, AVIF, and JPEG XL output, animated sources under format negotiation, animated smart crops, detection-driven filters after a geometric step, arbitrary-angle rotations whose canvas was one pixel off, and `pixelatefaces` mosaics for faces under 20 px), so the rendering version in the configuration fingerprint moves from 1 to 2 and the default configuration no longer prints the 0.9.10 fingerprint, `7b993291c4880a4d`. The first start on this version begins a new epoch: entries written by 0.9.10 and earlier stay in the disk and shared tiers under their old keys, unreachable, until they age out, and during a rolling upgrade old and new replicas read and write separate entries instead of serving each other's renders. A new gate check, `scripts/check_rendering_version.py`, fails when an upgrade corpus entry has been re-baselined since the last release tag without a rendering version bump, and RELEASING.md gains the matching step.
+
+- `objects(...)` class lists are capped at 32 distinct classes while they are parsed (issues #391, #408). The parser used to deduplicate a long list against the growing set before checking the cap, a quadratic scan on the request path. The cap now applies inside the loop, so the kept set never grows past 32 and each name costs at most a cap-sized scan. Repeats fold and cost nothing, and a list that names a 33rd distinct class is refused with `400 invalid_crop`, the 0.9.10 verdict; the TypeScript explainer, the playground and the `cropObjects` builder count distinct classes the same way.
+
+- A shared-tier purge scans a bounded number of entries inside the request (issue #368). The purge endpoints used to list the whole bucket prefix and read every entry header before answering, so their cost grew with the cache rather than with the matches. They now read at most 128 headers inline and hand the remainder to a background task that finishes the walk and logs its own count; the count in the response reports what the request itself removed.
+
+- A request that has waited out three failed leaders runs the fetch itself (issue #375). Under request coalescing, a waiter whose leaders kept failing without storing a result (a failing origin, a fallback render) answered `503 server_busy` after its third wait, masking the origin's real answer. It now runs the miss path and ends with whatever that produces, as metadata requests already did.
+
+- A smart crop takes the AI gate only when a model runs (issue #379). On a deployment with no face or focal provider configured, a smart crop uses the built-in saliency statistic and runs no inference, but it still took an AI gate permit and could be shed with `503 server_busy` behind real AI work. It now takes the gate only when a face or focal provider participates.
+
+- The face model is probed at load like the other providers (issue #380). Any parseable ONNX file configured as `CRABCROP_FACE_MODEL` used to boot as loaded and fail with a 500 on the first face request; a model that cannot run a probe detection is now a startup error naming the face probe.
+
+- Disk cache I/O runs off the async runtime workers (issue #347). The disk tier's lookups, writes, and purge walks were synchronous filesystem calls on the request path, so a slow disk stalled every request its worker carried. Each disk sequence now runs behind one bounded blocking boundary, in the same order as before, and a started disk-hit chain or purge completes even when the client disconnects. Cache semantics and the on-disk format are unchanged.
+
+- Metadata responses are built from typed structures (issue #346). The JSON body is now serialized from one typed struct per section instead of assembled from format strings, byte-identical for finite values. A non-finite reading (a NaN or infinite container duration, PDF page size, or scene measure) is now omitted from its record, the same shape as a field the source does not report; before, a NaN container duration was written into the response as `NaN`, which is not valid JSON.
+
+- Pinned source clients are reused (issue #369). The pinned fetch path built a fresh HTTP client, TLS configuration included, for every redirect hop. Clients are now cached per validated host and address pair, so a chain that revisits a pair, and later fetches to it, reuse the connection pool; the pair is the whole key, so a client is never used for a pin the policy did not validate.
+
+- CLIP label tokenization changed for multi-word labels (issue #377). The pre-tokenizer now attaches a space to the piece that follows it instead of emitting each space as its own piece, which changes the token ids of every multi-word label and so shifts the zero-shot `tags` and moderation `signals` scores of phrase labels. A follow-up (issue #404) dropped the stray space token the pre-tokenizer still emitted between words, so phrase labels now tokenize as the reference does for ASCII and precomposed accented letters; a few Unicode letter classes still split approximately. Meta responses are never cached, so no stored entry is affected.
+
+- Release and CI coverage (issues #383, #385, #386). CI now runs the whole workspace's tests, checks the root package at its declared MSRV, checks version consistency, and runs the functional suite on pushes to main as well as on pull requests. The version tooling covers the deploy image pins (the Helm values, the kustomize base and AI component, and the platform guides), so `scripts/bump_version.py` moves them and `scripts/check_versions.py` fails on a drifted one. In the release pipeline, registry publishes wait for the GitHub Release job, and a prerelease version pushes only its own image tags, leaving `latest` alone.
+
+- The server and engine sources are split by responsibility (issue #345): request coalescing in `src/server/process.rs`, metadata responses in `src/server/meta.rs`, encoders in `src/engine/encode.rs`, and pipeline state in `src/engine/state.rs`. Behavior is unchanged.
+
+- Width client hints no longer upscale raster sources past their own size, the DPR hint included, and hinted widths stop at 3840 (issue #403). One URL could split into a cache entry per quantization step up to the dimension cap; every hint past 3840 now shares the 3840 entry. This changes the bytes served for existing URLs requested with a hint wider than the source or wider than 3840.
+
+- Removing duplicate cache-group preset names takes linear time (issue #409). The scan ran on the request path before expansion rejected unknown names and de-duplicated against the kept list, so thousands of distinct `preset:` segments cost quadratic CPU per request. A hash set tracks the names already kept; the response is unchanged.
+
+- Animated GIF sources rendered to WebP, whether `format(webp)` names it or `Accept` negotiates it, take the animation gate and the slow lane like animated WebP sources (issue #405). They used to run ungated on the stills lane because the gate predicate predated frames surviving a GIF to WebP conversion. Rendered bytes are unchanged; only scheduling changes.
+
+- The framework integration READMEs no longer recommend running `CRABCROP_ALLOW_UNSAFE=1` without `CRABCROP_ONLY_PRESETS=1` (issue #416); each now describes signed URLs for production, presets-only mode, and unsafe mode as local development only.
+
+- The crate now builds a library target next to the binary (issue #417). The library is internal and carries no API stability promise; it exists so the fuzz harness and the integration tests import the server's own modules instead of copies and stand-ins, and the decode fuzz target runs the server's own decode path and limits. The shipped binaries and the bytes they serve are unchanged.
+
+- `pixelatefaces` redacts faces of any size (issue #401). Each face becomes a mosaic of averaged cells, at most 8 across and never under 2 px; faces under 20 px across used to come back unchanged. This changes the bytes served for existing `pixelatefaces` URLs whose faces are under 20 px.
+
+### Fixed
+
+- Sharpening no longer frames the image in black (issue #378). The 3x3 convolution behind `sharpen` zeroed its border, so every sharpened output had a 1 px black frame and an image under 3 px on either axis came out entirely black. Border pixels now replicate the nearest edge pixel, the rule `convolve` already documents; interior pixels are unchanged. This changes the bytes served for every existing URL that sharpens, and the upgrade corpus entries `sharpen` and `chain-multi-filter` are re-baselined for this reason.
+
+- `keep_profile` converts to sRGB when the output cannot carry the profile (issue #374). It skipped the conversion and relied on embedding the source profile, but only JPEG and PNG output embed one, so a wide-gamut source rendered to WebP, AVIF, or JPEG XL kept its source-space pixels untagged and displayed with wrong colors. The conversion now resolves the output format the way the pipeline does (explicit format, then the negotiated one, then the source format) and converts for anything but JPEG and PNG, as the filter docs already said. This changes the bytes served for existing `keep_profile` URLs with wide-gamut sources and those output formats.
+
+- Format negotiation keeps animated frames (issue #370). Only a negotiated JPEG XL was guarded, so an `Accept` naming AVIF flattened an animated GIF or WebP to its first frame, and a negotiated WebP flattened a GIF. A negotiated GIF or WebP now carries the animation across and a negotiated AVIF or JPEG XL falls back to the source format; an explicit `format(...)` still converts, first frame only, as documented. This changes the bytes served for existing URLs of animated sources whose clients negotiate.
+
+- An animated smart crop decides its window once (issue #376). The focal analysis re-ran on every frame, so the window jumped as the content moved and the analysis cost was paid per frame. The first frame now decides and later frames of the same size replay its window. This changes the bytes served for existing smart crop URLs of animated sources.
+
+- Detection results are re-measured after a step that moves content (issue #373). The face, detection, and segment memos were keyed on image dimensions, so a dimension-preserving step between two detection consumers (a flip, a same-size rotation, a crop padded back to size) reused boxes measured before it, and a redaction landed where the object no longer was. The memos are now dropped after every sizing, crop, or pad operation and after any filter that does not preserve pixel positions; photometric chains still share one inference. This changes the bytes served for existing URLs with such chains.
+
+- Malformed and hostile inputs no longer crash or escape a budget. A PNG `iTXt` chunk shorter than its fields no longer panics metadata extraction (issue #372). A focal rectangle left outside the frame by an earlier resize is clamped into it instead of panicking (issue #371). An overlay scaled to an extreme aspect is charged against the output pixel budget before it is allocated, and the blend checks the render deadline (issue #358). The CLIP and ViT preprocessors clamp the long side of an extreme-aspect input at 4096 px, and a SAM mask plane over the output pixel budget is refused as a bad model output (issue #359). Embedded `<image>` rasters in an SVG, including those in groups and nested SVG documents, are charged against the decode budget at their own dimensions (issue #360). The PDF probe reads page facts only from the structured part of the `pdfinfo` report, so a forged size in the document title no longer steers the raster clamp (issue #363).
+
+- External tools run under one deadline per request and kernel resource limits (issue #362). The frame extractor and the PDF renderer used to grant each probe and attempt its own full timeout, so one request could run several timeouts back to back while holding a lane permit. Each now computes one deadline for all its invocations, and every child gets an address-space cap (8 GiB) and a CPU-time cap a few seconds past the wall-clock budget.
+
+- Frame extraction reads only the validated input, from a seekable staged copy (issues #361, #411). The decoder program now runs with a protocol whitelist of `fd` and a format whitelist of the accepted containers, reading a regular file staged on its stdin, so a manifest inside the byte stream (DASH, HLS) can no longer point it at files or network targets the source policy never checked, and an MP4 whose index sits at the end of the file, FFmpeg's default layout, reads instead of failing. `CRABCROP_VIDEO_DECODER` needs FFmpeg 6.0 or newer, the first with the fd protocol; an older decoder's refusal names the requirement.
+
+- The private-address check classifies the remaining special-purpose IPv6 ranges (issue #364). NAT64 (`64:ff9b::/96`) and Teredo (`2001::/32`) embeddings are decoded and judged by the IPv4 rules, and local-use NAT64, site-local, benchmarking, and discard-only ranges are refused outright.
+
+- Uploads are stored with their sniffed `Content-Type` (issue #366). Upload objects were written with no content type, so on a store that defaults headerless objects to a binary type (the documented AWS behavior) every upload succeeded with a reference that then failed to load.
+
+- C2PA signing bounds the timestamp authority call (issues #365, #397). Building the signer with a bounded HTTP agent was not enough, because the SDK's signer sent the timestamp request through its own untimed default; the request now goes through the timed agent too (5 seconds to connect, 15 seconds for the whole call), boot asks the authority once with the settled algorithm instead of once per candidate algorithm, and a failure the authority causes names it. The call follows no redirect, so configure the authority's final URL.
+
+- The TypeScript and playground explainers recognize sealed URLs (issue #388). A valid `s1.` token, bare or key-id prefixed, used to fall into the malformed-signature verdicts although the server accepts it; it now explains as kind `sealed`, and marker-shaped imitations report the uniform `403` refusal the server gives.
+
+- Deploy recipes match the server. The Helm values and kustomize manifests defaulted to image 0.1.0, the first release, and now pin the current release (issue #383). The multi-replica overlay no longer mounts one ReadWriteOnce result volume from three replicas, which left all but one pod unschedulable; it disables the disk tier and relies on the shared bucket tier, and the chart sets `fsGroup: 65534` so a mounted volume is writable by the image's user (issue #384). The ECS and Helm recipes and the configuration docs now say AWS credentials come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in the environment; the server consults no credential chain, so a task or pod role alone is not picked up (issue #389).
+
+- A request made while a shared-tier purge is still scanning in the background no longer serves or restores the purged entry (issue #400). The purge tombstone only caught writes that began before the purge, so a lookup that started after it could serve a bucket copy the background walk had not reached yet and promote it into the local tiers, where the walk never looks. Until the scan ends, the receiving server treats any disk or bucket copy the purge covers as a miss and deletes it.
+
+- Arbitrary-angle rotations now size their canvas from the same reduced angle the pixel budget check uses (issue #415), fixing a one-pixel mismatch for some negative fractional angles. The op_chain fuzz target checks each filter's predicted canvas instead of a keep-or-swap rule that was never true.
+
+- Concurrent requests for one URL whose result is not stored now share the first request's response (issue #407). Origin errors, busy sheds, fallback images, and renders with caches turned off used to send every waiter back to the origin after three failed rounds of waiting; waiters now receive the leader's response with their own conditional headers applied, and meta requests share errors the same way. A response rendered before a purge is never shared into a request that arrived after it.
+
+- External tool CPU limits scale with the cores the server may use (issue #406), so multi-threaded FFmpeg runs that fit the wall-clock timeout, such as far seeks in long 4K clips, are no longer killed early.
+
+- Video frame probes read facts only from lines a source cannot forge (issue #402). The duration comes from the report's single indented `Duration:` line, and a second one refuses the report; stream facts are read through a fresh random `-dump_separator` passed on each probe, which text planted in a source's metadata cannot know. Planted lines shaped like a duration or a stream can no longer steer frame selection or meta responses.
+
+- Segmentation decodes are bounded at the encoder's 1024 px scale and read only each box's region (issue #410), so one box no longer costs hundreds of MB to GBs on large images.
+
+- Documentation corrections. The purge guarantee now states that another replica's own disk tier, like its memory tier, is not reached by a purge sent to one replica (issue #351). Nine migration guide rows that described shipped features as missing (`dpr`, progressive JPEG, chroma subsampling, compass gravities, imgproxy focal points) now name the matching options. The test that keeps the documented error codes complete derives the code set from the sources instead of a second hand-kept list.
+
 ## [0.9.10] - 2026-11-06
 
 ### Changed
