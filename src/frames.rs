@@ -353,7 +353,7 @@ impl VideoFrameExtractor {
         let pid = child.id();
         crate::toolrun::limit_child(
             pid,
-            self.timeout + crate::toolrun::TOOL_CPU_GRACE,
+            crate::toolrun::tool_cpu_limit(self.timeout),
             crate::toolrun::TOOL_MAX_ADDRESS_SPACE,
         );
 
