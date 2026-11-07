@@ -34,6 +34,12 @@ every input:
 every input: nothing panics and no allocation runs away,
 whether the bytes are an image the decoders accept, an
 SVG the sanitizer and rasterizer process, or garbage.
+Non-SVG bytes go through the server's decode dispatch
+(`engine::validate_source_image`: HEIC, animated GIF and
+WebP frames under the animation caps, the JPEG XL header
+probe) and through `engine::decode_image`, the bounded
+still decode with the server's dimension and allocation
+limits and its JPEG and WebP fast paths.
 
 `source_meta` checks metadata handling (`check_meta`):
 extracting a source's ICC profile, EXIF stream, XMP
@@ -48,12 +54,13 @@ to a small synthetic image; application is total, and
 the canvas keeps its dimensions (or its rotation swap)
 under every chain.
 
-The server-side modules live in the server binary crate,
-so the harness includes them by path (`src/url.rs`,
-`src/color.rs`, `src/filters.rs`, `src/svg.rs`), with
-small stand-ins for the two things they name from the
-rest of the crate (the engine's decode cap and the AI
-types in filter signatures). The opener lives in
+The harness depends on the server's library target
+(`crabcrop`, issue #417), so each target runs the
+server's own code: the parser, the decode dispatch, the
+metadata code, the filters, and the SVG pipeline, with
+no copies or stand-ins. `Cargo.lock` here pins the same
+versions as the root lockfile; refresh it from the root
+one when dependencies move. The opener lives in
 `crabcrop-url`, a direct dependency. This package is
 detached from the main workspace so fuzzing dependencies
 never enter a normal build.
