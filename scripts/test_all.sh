@@ -38,12 +38,6 @@ for pair in "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml
   fi
 done
 
-step "Operation vectors (the generated corpus is current)"
-python3 spec/generate_operation_vectors.py --check
-
-step "Version consistency (every artifact and deploy pin agrees)"
-python3 scripts/check_versions.py
-
 step "npm dist-tag (a prerelease publishes under next, never latest)"
 for pair in "0.10.0 latest" "0.10.0-rc.1 next" "1.2.3-beta.2+sha.5 next" "1.2.3+build-7 latest"; do
   set -- $pair
@@ -65,6 +59,12 @@ if [ "$(grep -c 'npm publish --access public --tag "\$NPM_TAG"$' .github/workflo
   echo "every npm publish in release.yml must pass --tag \"\$NPM_TAG\" from scripts/npm_dist_tag.sh" >&2
   exit 1
 fi
+
+step "Operation vectors (the generated corpus is current)"
+python3 spec/generate_operation_vectors.py --check
+
+step "Version consistency (every artifact and deploy pin agrees)"
+python3 scripts/check_versions.py
 
 step "Build (debug binary: the MCP suite spawns it)"
 cargo build --locked
