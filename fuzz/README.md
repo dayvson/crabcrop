@@ -1,9 +1,12 @@
-# Fuzzing the untrusted-text surfaces
+# Fuzzing the untrusted surfaces
 
-Every request starts as untrusted text, so the text that
-reaches the server is its attack surface. This package fuzzes
-the two entry points: the URL parser (issue #146) and the
-sealed-token opener (issue #255).
+Every request starts as untrusted text, and the body it
+names is untrusted bytes, so both are the server's attack
+surface. This package fuzzes the text entry points, the
+URL parser (issue #146) and the sealed-token opener
+(issue #255), and the byte surfaces behind them (issue
+#387): image decode, source metadata extraction, and
+filter chains.
 
 ## The targets
 
@@ -27,19 +30,40 @@ every input:
   secret, so a wrong key or a tampered body is a refusal,
   never another plaintext.
 
-The parser lives in the server binary crate, so the harness
-includes `src/url.rs` by path (it has no crate-internal
-dependencies). The opener lives in `crabcrop-url`, a direct
-dependency. This package is detached from the main workspace
-so fuzzing dependencies never enter a normal build.
+`decode` checks the decode path (`check_decode`) for
+every input: nothing panics and no allocation runs away,
+whether the bytes are an image the decoders accept, an
+SVG the sanitizer and rasterizer process, or garbage.
+
+`source_meta` checks metadata handling (`check_meta`):
+extracting a source's ICC profile, EXIF stream, XMP
+packet, and PNG text chunks, patching the TIFF
+orientation, re-injecting metadata into JPEG and PNG
+containers, and converting through an extracted profile
+are all total over untrusted bytes.
+
+`op_chain` checks filter chains (`check_chain`): a
+request that parses has its `filters:` segments applied
+to a small synthetic image; application is total, and
+the canvas keeps its dimensions (or its rotation swap)
+under every chain.
+
+The server-side modules live in the server binary crate,
+so the harness includes them by path (`src/url.rs`,
+`src/color.rs`, `src/filters.rs`, `src/svg.rs`), with
+small stand-ins for the two things they name from the
+rest of the crate (the engine's decode cap and the AI
+types in filter signatures). The opener lives in
+`crabcrop-url`, a direct dependency. This package is
+detached from the main workspace so fuzzing dependencies
+never enter a normal build.
 
 ## The smoke (runs everywhere)
 
 `scripts/test_all.sh` runs the deterministic smoke: every
-seed in `corpus/parse_request/` and `corpus/unseal/`, every
-truncation of a grammar-rich seed and a well-formed token,
-and single-byte mutations of each, through the same harness.
-On its own:
+seed in the corpora, every truncation of a representative
+seed per target, and single-byte mutations of each, through
+the same harness. On its own:
 
 ```sh
 cargo test --manifest-path fuzz/Cargo.toml --lib --test smoke
@@ -54,6 +78,9 @@ rustup toolchain install nightly
 cargo +nightly install cargo-fuzz
 cargo +nightly fuzz run parse_request -- -max_total_time=300
 cargo +nightly fuzz run unseal -- -max_total_time=300
+cargo +nightly fuzz run decode -- -max_total_time=300
+cargo +nightly fuzz run source_meta -- -max_total_time=300
+cargo +nightly fuzz run op_chain -- -max_total_time=300
 ```
 
 Crashes land in `fuzz/artifacts/`. A crash becomes its own
@@ -67,5 +94,10 @@ the canonicalization test strings, the filter accept/reject
 batches, preset and expiry shapes, keyed signatures, and
 malformed spellings. `corpus/unseal/` seeds the token shapes:
 prefix-only, truncated, keyed, wrong-version, bad base64, and
-non-sealed segments. Add a seed file per interesting shape;
-keep them small.
+non-sealed segments. `corpus/decode/` and
+`corpus/source_meta/` seed real bodies from the functional
+corpus and the fixtures (small images per format, an SVG,
+EXIF and ICC carriers, and truncated prefixes of the
+animated formats). `corpus/op_chain/` seeds filter-chain
+remainders, plain and face-shaped. Add a seed file per
+interesting shape; keep them small.

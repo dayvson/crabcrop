@@ -14,6 +14,15 @@ cargo-fuzz = true
 [dependencies]
 crabcrop-url = { path = "../crates/crabcrop-url" }
 libfuzzer-sys = "0.4"
+# The byte-surface modules included by path in src/lib.rs
+# (issue #387) build against the same decoder and color
+# stack the server uses, at the same version requirements
+# as the root crate.
+image = { version = "0.25", features = ["avif", "nasm", "tiff"] }
+moxcms = "0.8"
+resvg = "0.49"
+roxmltree = "0.21"
+flate2 = "1"
 
 [lib]
 path = "src/lib.rs"
@@ -25,3 +34,15 @@ path = "fuzz_targets/parse_request.rs"
 [[bin]]
 name = "unseal"
 path = "fuzz_targets/unseal.rs"
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+
+[[bin]]
+name = "source_meta"
+path = "fuzz_targets/source_meta.rs"
+
+[[bin]]
+name = "op_chain"
+path = "fuzz_targets/op_chain.rs"

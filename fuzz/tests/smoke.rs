@@ -52,6 +52,116 @@ fn truncations_and_mutations_satisfy_the_invariants() {
     }
 }
 
+fn byte_corpus_inputs(name: &str) -> Vec<Vec<u8>> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("corpus/{name}"));
+    let mut inputs: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+        .expect("the byte seed corpus directory exists")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read(e.path()).ok())
+        .collect();
+    inputs.sort();
+    assert!(inputs.len() >= 4, "the {name} corpus should stay seeded");
+    inputs
+}
+
+#[test]
+fn decode_seeds_satisfy_the_invariants() {
+    for input in byte_corpus_inputs("decode") {
+        crabcrop_fuzz::check_decode(&input);
+    }
+}
+
+#[test]
+fn decode_truncations_and_mutations_satisfy_the_invariants() {
+    // The smallest rich seed: a real PNG with header,
+    // chunks, and pixel data, so truncations land inside
+    // every structure the decoder walks.
+    let seed = byte_corpus_inputs("decode")
+        .into_iter()
+        .find(|s| s.starts_with(b"\x89PNG"))
+        .expect("a PNG seed");
+    for end in 0..=seed.len() {
+        crabcrop_fuzz::check_decode(&seed[..end]);
+    }
+    let mut bytes = seed.clone();
+    for i in 0..bytes.len() {
+        for replacement in [0x00u8, 0xff, 0x89, b'P', b'I', b't'] {
+            let original = bytes[i];
+            bytes[i] = replacement;
+            crabcrop_fuzz::check_decode(&bytes);
+            bytes[i] = original;
+        }
+    }
+}
+
+#[test]
+fn source_meta_seeds_satisfy_the_invariants() {
+    for input in byte_corpus_inputs("source_meta") {
+        crabcrop_fuzz::check_meta(&input);
+    }
+}
+
+#[test]
+fn source_meta_truncations_and_mutations_satisfy_the_invariants() {
+    // The EXIF seed's front: the metadata segments live
+    // there, so truncations land inside the JPEG segments
+    // and the TIFF stream the patcher walks. The sweep
+    // works on the front 8 KB so it stays fast; the full
+    // seeds run whole in the seeds test above.
+    let seed: Vec<u8> = byte_corpus_inputs("source_meta")
+        .into_iter()
+        .find(|s| s.starts_with(b"\xff\xd8"))
+        .expect("a JPEG seed")
+        .into_iter()
+        .take(8192)
+        .collect();
+    for end in 0..=seed.len() {
+        crabcrop_fuzz::check_meta(&seed[..end]);
+    }
+    let mut bytes = seed.clone();
+    for i in 0..bytes.len().min(4096) {
+        for replacement in [0x00u8, 0xff, 0xe1, b'E', b'x'] {
+            let original = bytes[i];
+            bytes[i] = replacement;
+            crabcrop_fuzz::check_meta(&bytes);
+            bytes[i] = original;
+        }
+    }
+}
+
+#[test]
+fn op_chain_seeds_satisfy_the_invariants() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus/op_chain");
+    let mut inputs: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the chain seed corpus directory exists")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    inputs.sort();
+    assert!(inputs.len() >= 5, "the chain corpus should stay seeded");
+    for input in &inputs {
+        crabcrop_fuzz::check_chain(input);
+    }
+    // Mutations of a chain seed, with grammar-significant
+    // replacements, like the parser sweep.
+    let rich = inputs
+        .iter()
+        .max_by_key(|s| s.len())
+        .expect("a chain seed")
+        .clone();
+    let mut bytes = rich.into_bytes();
+    for i in 0..bytes.len() {
+        for replacement in [b'/', b':', b'(', b')', b',', b'0', b'-'] {
+            let original = bytes[i];
+            bytes[i] = replacement;
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                crabcrop_fuzz::check_chain(text);
+            }
+            bytes[i] = original;
+        }
+    }
+}
+
 fn seal_corpus_inputs() -> Vec<String> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus/unseal");
     let mut inputs: Vec<String> = std::fs::read_dir(&dir)

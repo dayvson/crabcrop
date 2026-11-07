@@ -1,18 +1,68 @@
-//! The fuzz harness for the two untrusted-text surfaces in
-//! front of the server: the URL parser (issue #146) and the
-//! sealed-token opener (issue #255).
+//! The fuzz harness for the untrusted surfaces in front
+//! of the server: the URL parser (issue #146), the
+//! sealed-token opener (issue #255), and the byte
+//! surfaces behind them (issue #387): image decode,
+//! source metadata extraction, and filter chains.
 //!
-//! The parser lives in the server binary crate, which a fuzz
-//! package cannot depend on, so the module is included by
-//! path: it has no crate-internal dependencies (only the
-//! `crabcrop-url` signing crate and std), and compiles here
-//! unchanged. The opener lives in `crabcrop-url` itself, a
-//! direct dependency. `check` drives the parser target and
-//! `check_seal` the opener target; both also run under the
-//! deterministic smoke test.
+//! The server-side modules live in the server binary
+//! crate, which a fuzz package cannot depend on, so they
+//! are included by path: each has no crate-internal
+//! dependencies beyond the ones shimmed below (only the
+//! `crabcrop-url` signing crate, std, and the decoder
+//! stack), and compiles here unchanged. The opener lives
+//! in `crabcrop-url` itself, a direct dependency.
+//! `check` drives the parser target, `check_seal` the
+//! opener target, and `check_decode`, `check_meta`, and
+//! `check_chain` the byte targets; all of them also run
+//! under the deterministic smoke test.
 
 #[path = "../../src/url.rs"]
 pub mod url;
+
+#[path = "../../src/color.rs"]
+pub mod color;
+
+#[path = "../../src/filters.rs"]
+pub mod filters;
+
+#[path = "../../src/svg.rs"]
+pub mod svg;
+
+/// A stand-in for the server crate's engine module:
+/// `src/svg.rs` (included by path) reads the decode
+/// allocation cap from `crate::engine`. The value
+/// mirrors `src/engine.rs` (256 MiB); the two must move
+/// together.
+pub mod engine {
+    pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+}
+
+/// Stand-ins for the server crate's AI types:
+/// `src/filters.rs` (included by path) names them in its
+/// face and detection redaction helpers. The shapes
+/// mirror `src/ai.rs`; the chain harness never calls
+/// those helpers with real detections, so the stand-ins
+/// only need to compile.
+pub mod ai {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct FaceBox {
+        pub x: u32,
+        pub y: u32,
+        pub w: u32,
+        pub h: u32,
+        pub score: f32,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Detection {
+        pub label: String,
+        pub score: f32,
+        pub x: u32,
+        pub y: u32,
+        pub w: u32,
+        pub h: u32,
+    }
+}
 
 use url::Signature;
 
@@ -139,4 +189,89 @@ pub fn check_seal(data: &[u8]) {
 pub fn sample_token(remainder: &str) -> String {
     crabcrop_url::seal_with_nonce(SEAL_SECRET, None, &[0x5a; 12], remainder)
         .expect("a remainder within the cap seals")
+}
+
+/// The decode invariants (issue #387): decoding
+/// attacker-controlled bytes is total. An SVG-shaped
+/// input goes through the sanitizer and rasterizer the
+/// server uses; anything else goes through the image
+/// decoders. Errors are the expected outcome for most
+/// inputs; a panic or an unbounded allocation is the
+/// failure. The render size is clamped so a well-formed
+/// but enormous SVG cannot turn the harness itself into
+/// the allocation victim.
+pub fn check_decode(data: &[u8]) {
+    if svg::is_svg(data) {
+        if let Ok(prepared) = svg::prepare(data) {
+            let (w, h) = prepared.intrinsic();
+            let w = (w.ceil() as u32).clamp(1, 128);
+            let h = (h.ceil() as u32).clamp(1, 128);
+            let _ = prepared.render(w, h);
+        }
+        return;
+    }
+    let _ = image::load_from_memory(data);
+}
+
+/// The source-metadata invariants (issue #387):
+/// extracting and re-injecting the metadata of
+/// attacker-controlled bytes is total. Extraction reads
+/// the JPEG and PNG segment structures; the TIFF patch
+/// walks the extracted EXIF stream; the injectors walk
+/// the container again on the way out. When the bytes
+/// carry a profile and decode as a small image, the
+/// color conversion runs too, since it parses the
+/// profile with a real color engine.
+pub fn check_meta(data: &[u8]) {
+    let meta = color::extract_source_meta(data);
+    if let Some(exif) = &meta.exif_tiff {
+        let mut tiff = exif.clone();
+        color::patch_tiff_orientation(&mut tiff);
+    }
+    let _ = color::inject_jpeg(data, meta.icc.as_deref(), &meta, true);
+    let _ = color::inject_png(data, meta.icc.as_deref(), &meta, true);
+    if let Some(icc) = &meta.icc {
+        let dims = image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok());
+        if let Some((w, h)) = dims {
+            if w <= 1024 && h <= 1024 {
+                if let Ok(img) = image::load_from_memory(data) {
+                    let _ = color::convert_to_srgb(img, icc);
+                }
+            }
+        }
+    }
+}
+
+/// The operation-chain invariants (issue #387): a parsed
+/// filter chain applied to an image is total, and the
+/// canvas never collapses or explodes under pixel
+/// filters: dimensions stay the input's, or swapped by a
+/// rotation, never zero. The chain runs on a small
+/// synthetic image (the harness's stand-in source), one
+/// `filters:` segment at a time, in URL order.
+pub fn check_chain(input: &str) {
+    let Ok((_, _, request)) = url::parse_request(input) else {
+        return;
+    };
+    let base = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 18, |x, y| {
+        image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 3) as u8])
+    }));
+    let (bw, bh) = (base.width(), base.height());
+    let mut img = base;
+    for op in &request.operations {
+        if let url::Operation::Filters(filters) = op {
+            let (out, _) = filters::apply_filters_filled(img, filters, None);
+            assert!(
+                (out.width() == bw && out.height() == bh)
+                    || (out.width() == bh && out.height() == bw),
+                "a filter chain changed the canvas from {bw}x{bh} to {}x{}",
+                out.width(),
+                out.height()
+            );
+            img = out;
+        }
+    }
 }
