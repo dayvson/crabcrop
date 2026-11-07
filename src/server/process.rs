@@ -331,27 +331,27 @@ pub(in crate::server) const SLOW_LANE_WAIT: std::time::Duration =
     std::time::Duration::from_secs(10);
 
 /// Whether this miss belongs in the slow lane (issue
-/// #324): it will encode an animated WebP (the animation
-/// gate's own predicate), or it is external-tool work
-/// behind the video gate, a video encode, a `frame:`
-/// extraction, or a `page:` render, all subprocess work
-/// that runs for seconds and is unpredictable in the
-/// same way. Everything else, still renders in
-/// particular, stays in the process lane. AI transforms
-/// stay there too: they are still renders behind the AI
-/// gate, not encodes, and the AI gate already bounds
-/// them separately. Animated GIF output stays there as
-/// well: its encoder is chunked per frame with deadline
-/// checks inside the loop (issue #322), not one opaque
-/// long call like the animated WebP encoder.
+/// #324): it will encode an animated WebP (`animated_webp`,
+/// the animation gate's own predicate, decided once per
+/// miss so the gate and the lane always agree), or it is
+/// external-tool work behind the video gate, a video
+/// encode, a `frame:` extraction, or a `page:` render, all
+/// subprocess work that runs for seconds and is
+/// unpredictable in the same way. Everything else, still
+/// renders in particular, stays in the process lane. AI
+/// transforms stay there too: they are still renders
+/// behind the AI gate, not encodes, and the AI gate
+/// already bounds them separately. Animated GIF output
+/// stays there as well: its encoder is chunked per frame
+/// with deadline checks inside the loop (issue #322), not
+/// one opaque long call like the animated WebP encoder.
 pub(in crate::server) fn wants_slow_lane(
-    bytes: &[u8],
-    directives: &crate::url::RequestDirectives,
+    animated_webp: bool,
     wants_video: bool,
     wants_frame: bool,
     wants_page: bool,
 ) -> bool {
-    wants_animation_gate(bytes, directives) || wants_video || wants_frame || wants_page
+    animated_webp || wants_video || wants_frame || wants_page
 }
 
 /// The grace bound past the processing deadline (issue
@@ -402,21 +402,32 @@ pub(in crate::server) const ANIM_GATE_WAIT: std::time::Duration =
     std::time::Duration::from_secs(10);
 
 /// Whether this miss will encode an animated WebP and so
-/// must take the animation gate (issue #231): the source
-/// is an animated WebP (a container probe on the loaded
-/// bytes, no decode) and the output resolves to WebP.
-/// The explicit-format half is conservative: an explicit
-/// GIF, still, or video format never reaches the animated
-/// WebP encoder, and with no explicit format negotiation
-/// keeps an animated WebP source at WebP; if some header
-/// combination resolved to a still instead, the permit is
-/// held for one fast render, which is harmless.
+/// must take the animation gate (issue #231) and the slow
+/// lane (issue #324): the source is animated, an animated
+/// WebP or an animated GIF (probes on the loaded bytes, no
+/// decode), and its output resolves to WebP through the
+/// engine's own resolution, the explicit `format(...)` or
+/// else the format negotiated from `Accept` (`preferred`).
+/// Since issue #370 an animated GIF rendered to WebP keeps
+/// its frames and runs the same libwebp animated encoder as
+/// an animated WebP source; before issue #405 this
+/// predicate looked at WebP sources only, so those encodes
+/// ran on the stills lane with no animation gate. The GIF
+/// probe walks the first frame's compressed bytes, so it
+/// runs only when the output would resolve to WebP.
 pub(in crate::server) fn wants_animation_gate(
     bytes: &[u8],
     directives: &crate::url::RequestDirectives,
+    preferred: Option<ImageFormat>,
 ) -> bool {
-    crate::engine::is_animated_webp(bytes)
-        && matches!(directives.explicit_format, None | Some(ImageFormat::WebP))
+    let to_webp = |source| {
+        crate::engine::animated_output_format(source, directives.explicit_format, preferred)
+            == ImageFormat::WebP
+    };
+    if crate::engine::is_animated_webp(bytes) {
+        return to_webp(ImageFormat::WebP);
+    }
+    to_webp(ImageFormat::Gif) && crate::engine::is_animated_gif(bytes)
 }
 
 /// The gate permits a request acquired before its run,

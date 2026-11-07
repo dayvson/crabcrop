@@ -2711,8 +2711,13 @@ async fn serve_miss(
     // comes from the slow lane (issue #324), so the still
     // pool keeps every permit throughout. Like the AI
     // permit, it travels with the process job and drains
-    // with it (issue #357).
-    let anim_permit = if wants_animation_gate(&bytes, &directives) {
+    // with it (issue #357). The decision covers animated
+    // GIF sources rendered to WebP as well as animated
+    // WebP sources, and counts the negotiated format, not
+    // only an explicit one (issue #405); it is made once,
+    // so the gate, the lane, and a fallback retry agree.
+    let animated_webp = wants_animation_gate(&bytes, &directives, preferred);
+    let anim_permit = if animated_webp {
         match tokio::time::timeout(ANIM_GATE_WAIT, state.anim_gate.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Some(permit),
             _ => {
@@ -2783,7 +2788,7 @@ async fn serve_miss(
     // its saturation sheds slow requests only and stills
     // keep their full capacity; everything else takes
     // the stills lane as before.
-    let lane = if wants_slow_lane(&bytes, &directives, wants_video, wants_frame, wants_page) {
+    let lane = if wants_slow_lane(animated_webp, wants_video, wants_frame, wants_page) {
         Lane::Slow
     } else {
         Lane::Process
@@ -2887,7 +2892,7 @@ async fn serve_miss(
                                 _ => may_retry = false,
                             }
                         }
-                        if may_retry && wants_animation_gate(&bytes, &directives) {
+                        if may_retry && animated_webp {
                             match tokio::time::timeout(
                                 ANIM_GATE_WAIT,
                                 state.anim_gate.clone().acquire_owned(),
@@ -3735,6 +3740,19 @@ mod tests {
         let opts = oxideav_webp::EncodeOptions::default()
             .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
         oxideav_webp::encode_animation(&frames, &opts).unwrap()
+    }
+
+    /// One-frame GIF bytes: the GIF animation probe's
+    /// negative case (issue #405).
+    fn still_gif_bytes() -> Vec<u8> {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            40,
+            20,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Gif).unwrap();
+        buf.into_inner()
     }
 
     /// Still WebP bytes: the animation probe's negative
@@ -13221,16 +13239,16 @@ mod tests {
             let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
             crate::url::RequestDirectives::analyze(&ops)
         };
-        let slow = |bytes: &[u8], ops_str: &str| {
+        let slow_with = |bytes: &[u8], ops_str: &str, preferred: Option<ImageFormat>| {
             let d = directives(ops_str);
             wants_slow_lane(
-                bytes,
-                &d,
+                wants_animation_gate(bytes, &d, preferred),
                 d.explicit_format.is_some_and(|f| f.is_video()),
                 d.frame.is_some(),
                 d.page.is_some(),
             )
         };
+        let slow = |bytes: &[u8], ops_str: &str| slow_with(bytes, ops_str, None);
         let anim_webp = animated_webp_bytes();
         let anim_gif = animated_gif_bytes();
         assert!(slow(&anim_webp, "example.com/i.webp"));
@@ -13242,6 +13260,20 @@ mod tests {
         assert!(!slow(&anim_gif, "example.com/i.gif"));
         assert!(!slow(&anim_webp, "filters:format(gif)/example.com/i.webp"));
         assert!(!slow(&anim_webp, "filters:format(png)/example.com/i.webp"));
+        // Issue #405: an animated GIF rendered to WebP runs
+        // the animated WebP encoder, so it is slow whether
+        // WebP was named in the URL or negotiated.
+        assert!(slow(&anim_gif, "filters:format(webp)/example.com/i.gif"));
+        assert!(slow_with(
+            &anim_gif,
+            "example.com/i.gif",
+            Some(ImageFormat::WebP)
+        ));
+        assert!(!slow_with(
+            &anim_gif,
+            "example.com/i.gif",
+            Some(ImageFormat::Avif)
+        ));
     }
 
     #[tokio::test]
@@ -13638,51 +13670,138 @@ mod tests {
 
     #[test]
     fn animation_gate_predicate_matches_the_encoder_trigger() {
-        // Issue #231: only an animated WebP source rendered
-        // to WebP output reaches the slow lossless animation
-        // encode, so only that combination takes the gate.
+        // Issue #231: only an animated source rendered to
+        // WebP output reaches the slow animated WebP encode,
+        // so only that combination takes the gate. Issue
+        // #405: since #370 that includes an animated GIF
+        // source whose output resolves to WebP, through an
+        // explicit format(webp) or a negotiated Accept.
         let anim = animated_webp_bytes();
+        let anim_gif = animated_gif_bytes();
         let directives = |ops_str: &str| {
             let (ops, _) = crate::url::parse_operations(ops_str).unwrap();
             crate::url::RequestDirectives::analyze(&ops)
         };
-        assert!(wants_animation_gate(
+        let gated = |bytes: &[u8], ops_str: &str, preferred: Option<ImageFormat>| {
+            wants_animation_gate(bytes, &directives(ops_str), preferred)
+        };
+        assert!(gated(&anim, "example.com/i.webp", None));
+        assert!(gated(
             &anim,
-            &directives("example.com/i.webp")
+            "filters:format(webp)/example.com/i.webp",
+            None
         ));
-        assert!(wants_animation_gate(
-            &anim,
-            &directives("filters:format(webp)/example.com/i.webp")
+        // A negotiated AVIF or JXL cannot carry the frames:
+        // the animation falls back to WebP and is encoded
+        // as one, gate and all.
+        for preferred in [ImageFormat::WebP, ImageFormat::Avif, ImageFormat::Jxl] {
+            assert!(gated(&anim, "example.com/i.webp", Some(preferred)));
+        }
+        // An animated GIF to WebP, explicit or negotiated,
+        // runs the same encoder and takes the same gate.
+        assert!(gated(
+            &anim_gif,
+            "filters:format(webp)/example.com/i.gif",
+            None
         ));
-        // Explicit non-WebP outputs never reach the
-        // animated WebP encoder: GIF output uses the fast
-        // GIF encoder, still formats take frame 0, and
-        // video takes the video gate instead.
-        for fmt in ["gif", "png", "jpeg", "mp4"] {
+        assert!(gated(
+            &anim_gif,
+            "example.com/i.gif",
+            Some(ImageFormat::WebP)
+        ));
+        assert!(gated(
+            &anim_gif,
+            "filters:format(webp)/example.com/i.gif",
+            Some(ImageFormat::Avif)
+        ));
+        // An animated GIF that stays GIF (no preference, or
+        // a negotiated AVIF or JXL, which fall back to GIF)
+        // uses the chunked GIF encoder, ungated.
+        for preferred in [None, Some(ImageFormat::Avif), Some(ImageFormat::Jxl)] {
             assert!(
-                !wants_animation_gate(
-                    &anim,
-                    &directives(&format!("filters:format({fmt})/example.com/i.webp"))
-                ),
-                "format({fmt}) must not take the animation gate"
+                !gated(&anim_gif, "example.com/i.gif", preferred),
+                "{preferred:?} must not gate an animated GIF"
             );
         }
+        // Explicit non-WebP outputs never reach the
+        // animated WebP encoder, whatever was negotiated:
+        // GIF output uses the GIF encoder, still formats
+        // take frame 0, and video takes the video gate
+        // instead.
+        for fmt in ["gif", "png", "jpeg", "mp4"] {
+            for (src, name) in [(&anim, "i.webp"), (&anim_gif, "i.gif")] {
+                assert!(
+                    !gated(
+                        src,
+                        &format!("filters:format({fmt})/example.com/{name}"),
+                        Some(ImageFormat::WebP)
+                    ),
+                    "format({fmt}) on {name} must not take the animation gate"
+                );
+            }
+        }
         // Still sources are never gated, whatever their
-        // container: a still WebP carries no ANIM chunk, a
-        // GIF source never reaches the WebP animation path,
-        // and a PNG is not WebP at all.
-        assert!(!wants_animation_gate(
-            &still_webp_bytes(),
-            &directives("example.com/i.webp")
-        ));
-        assert!(!wants_animation_gate(
-            &animated_gif_bytes(),
-            &directives("example.com/i.gif")
-        ));
-        assert!(!wants_animation_gate(
-            &test_png(),
-            &directives("example.com/i.png")
-        ));
+        // container or output: a still WebP carries no ANIM
+        // chunk, a one-frame GIF has no second frame, and a
+        // PNG is neither.
+        for preferred in [None, Some(ImageFormat::WebP)] {
+            assert!(!gated(&still_webp_bytes(), "example.com/i.webp", preferred));
+            assert!(!gated(&still_gif_bytes(), "example.com/i.gif", preferred));
+            assert!(!gated(
+                &still_gif_bytes(),
+                "filters:format(webp)/example.com/i.gif",
+                preferred
+            ));
+            assert!(!gated(&test_png(), "example.com/i.png", preferred));
+        }
+    }
+
+    #[test]
+    fn animation_gate_predicate_agrees_with_the_engine() {
+        // Issue #405: the predicate drifted from the
+        // engine's routing once already, so this runs the
+        // real engine over every source, explicit format,
+        // and negotiated preference the predicate decides
+        // between, and requires the gate exactly when the
+        // render comes out as an animated WebP.
+        let sources: [(&str, Vec<u8>); 5] = [
+            ("animated gif", animated_gif_bytes()),
+            ("animated webp", animated_webp_bytes()),
+            ("still gif", still_gif_bytes()),
+            ("still webp", still_webp_bytes()),
+            ("png", test_png()),
+        ];
+        let formats = [
+            "",
+            "filters:format(webp)/",
+            "filters:format(gif)/",
+            "filters:format(png)/",
+        ];
+        let preferences = [None, Some(ImageFormat::WebP), Some(ImageFormat::Jxl)];
+        for (name, src) in &sources {
+            for prefix in formats {
+                for preferred in preferences {
+                    let (ops, _) =
+                        crate::url::parse_operations(&format!("{prefix}example.com/i")).unwrap();
+                    let directives = crate::url::RequestDirectives::analyze(&ops);
+                    let out = Engine
+                        .process_preferred(
+                            src,
+                            &ops,
+                            crate::engine::ProcessContext {
+                                preferred,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        wants_animation_gate(src, &directives, preferred),
+                        crate::engine::is_animated_webp(&out.bytes),
+                        "{name} with {prefix:?} and {preferred:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -13710,6 +13829,62 @@ mod tests {
         assert!(
             started.elapsed() >= ANIM_GATE_WAIT,
             "the shed must come only after the gate wait elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn animation_gate_sheds_gif_to_webp_renders() {
+        // Issue #405: an animated GIF rendered to WebP runs
+        // the animated WebP encoder, so with the single
+        // animation permit held it sheds with the
+        // animation-queue 503 like an animated WebP source
+        // does, whether the WebP came from an unsigned
+        // Accept header or an explicit format(webp). Before
+        // the fix both ran at once on the stills lane.
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let base = spawn_app_with_anim_gate(gate.clone()).await;
+        let src = spawn_bytes_server(animated_gif_bytes()).await;
+        let _held = gate.acquire_owned().await.unwrap();
+        let sig = sign(&src);
+        let explicit = format!("filters:format(webp)/{src}");
+        let explicit_sig = sign(&explicit);
+        let started = Instant::now();
+        let (negotiated, explicit) = tokio::join!(
+            client()
+                .get(format!("{base}/{sig}/{src}"))
+                .header("accept", "image/webp,*/*")
+                .send(),
+            client()
+                .get(format!("{base}/{explicit_sig}/{explicit}"))
+                .send(),
+        );
+        for (label, resp) in [("negotiated", negotiated), ("explicit", explicit)] {
+            let resp = resp.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{label}");
+            assert_eq!(resp.headers().get("retry-after").unwrap(), "5", "{label}");
+            let body = resp.text().await.unwrap();
+            assert!(
+                body.contains("animation encoding queue is full"),
+                "{label}: {body}"
+            );
+        }
+        assert!(
+            started.elapsed() >= ANIM_GATE_WAIT,
+            "the shed must come only after the gate wait elapses"
+        );
+        // The same animated GIF kept as GIF uses the GIF
+        // encoder and never waits on the animation gate.
+        let started = Instant::now();
+        let resp = client()
+            .get(format!("{base}/{sig}/{src}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/gif");
+        assert!(
+            started.elapsed() < ANIM_GATE_WAIT,
+            "GIF output must not wait on the animation gate"
         );
     }
 
