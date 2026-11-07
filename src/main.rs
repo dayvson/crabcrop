@@ -1211,7 +1211,6 @@ async fn shutdown_signal() {
     }
 }
 
-/// Fingerprint the configuration that shapes rendered
 /// The rendering version: bumped deliberately in any
 /// release that changes rendered output for the same
 /// inputs under the same configuration, so an upgraded
@@ -1219,8 +1218,19 @@ async fn shutdown_signal() {
 /// the previous build's renders from the persistent
 /// tiers. Configuration alone cannot express that
 /// change, so it travels as its own fingerprint
-/// component.
-const RENDERING_VERSION: u32 = 1;
+/// component. `scripts/check_rendering_version.py`
+/// fails the gate when an upgrade corpus golden was
+/// re-baselined since the last release tag and this
+/// value did not move (issue #412).
+///
+/// 2: the first release after 0.9.10, which changes
+/// output for existing URLs (sharpen edge replication
+/// #378, keep_profile converting to sRGB for formats
+/// that cannot carry a profile #374, animation kept
+/// under format negotiation #370, one smart crop
+/// window per animated render #376, detection memos
+/// dropped after geometric steps #373).
+const RENDERING_VERSION: u32 = 2;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
@@ -2638,6 +2648,32 @@ mod tests {
             ))
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn default_fingerprint_leaves_the_0_9_10_epoch() {
+        // 0.9.10 printed `configuration fingerprint:
+        // 7b993291c4880a4d` under the default
+        // configuration. The release after it changes
+        // rendered output for existing URLs, so the same
+        // default configuration must print a different
+        // fingerprint, or upgraded servers keep serving
+        // 0.9.10 renders from the disk and shared tiers
+        // (issue #412). The arguments are the boot path's
+        // own defaults, not the fixed values the other
+        // fingerprint tests use.
+        let fingerprint = config_fingerprint(
+            env_of(&[]),
+            metadata_config(env_of(&[])).unwrap(),
+            crate::quality::DEFAULT_SSIM_TARGET,
+            crate::engine::DEFAULT_AVIF_SPEED,
+            crate::engine::DEFAULT_JXL_SPEED,
+            DEFAULT_WIDTH_STEP,
+        );
+        assert_ne!(
+            fingerprint, "7b993291c4880a4d",
+            "the default fingerprint still matches 0.9.10"
+        );
     }
 
     #[test]

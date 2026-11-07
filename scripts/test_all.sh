@@ -44,6 +44,10 @@ python3 spec/generate_operation_vectors.py --check
 step "Version consistency (every artifact and deploy pin agrees)"
 python3 scripts/check_versions.py
 
+step "Rendering version (a corpus re-baseline since the last release tag raises it)"
+python3 scripts/check_rendering_version.py
+python3 scripts/test_check_rendering_version.py
+
 step "Build (debug binary: the MCP suite spawns it)"
 cargo build --locked
 

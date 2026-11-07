@@ -83,13 +83,27 @@ reason in that entry's `note` field in `corpus.json` and in the
 CHANGELOG. A re-baseline with no recorded reason is not a
 re-baseline, it is a silent compatibility break.
 
+A re-baseline also means the release renders existing URLs
+differently, so it must raise `RENDERING_VERSION` in
+`src/main.rs`: the constant is part of the configuration
+fingerprint every cache key carries, and without a new value
+upgraded servers keep serving the previous release's renders
+from the disk and shared tiers. `scripts/check_rendering_version.py`
+enforces it: it compares the corpus with the one at the last
+release tag, and fails when an entry's recorded status, content
+type, length, or digest changed while the constant did not.
+Added entries and re-minted paths with unchanged bytes do not
+count.
+
 ## Release wiring
 
 RELEASING.md carries the step: run this check against the release
 candidate build before tagging. `scripts/test_all.sh` also runs it
 (against the debug build) after the Rust suites, so an
 incompatibility shows up in the ordinary gate, not only at release
-time.
+time. The rendering version check runs early in the same gate and
+in the release steps; it needs the last release tag, so a shallow
+clone without tags reports it skipped.
 
 ## Scope exclusions
 
