@@ -10245,6 +10245,33 @@ mod tests {
         }
     }
 
+    /// Reports several faces under 20 px inside the checkerboard
+    /// of `face_scene`, like a detector on a group photo or after
+    /// a downscale (issue #401).
+    #[derive(Debug)]
+    struct SmallFaces;
+
+    const SMALL_FACES: [(u32, u32, u32, u32); 3] =
+        [(141, 31, 8, 6), (152, 40, 12, 12), (160, 52, 19, 15)];
+
+    impl crate::ai::FaceProvider for SmallFaces {
+        fn detect(
+            &self,
+            _img: &DynamicImage,
+        ) -> Result<Vec<crate::ai::FaceBox>, crate::ai::AiError> {
+            Ok(SMALL_FACES
+                .iter()
+                .map(|&(x, y, w, h)| crate::ai::FaceBox {
+                    x,
+                    y,
+                    w,
+                    h,
+                    score: 0.9,
+                })
+                .collect())
+        }
+    }
+
     #[derive(Debug)]
     struct FailingFace;
 
@@ -11440,18 +11467,56 @@ mod tests {
             .unwrap();
         let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(result.get_pixel(10, 10), &image::Rgb([90, 90, 90]));
-        // Neighboring pixels inside one 4px block agree.
+        // Neighboring pixels inside one 5 px cell (40 px / 8)
+        // agree.
         assert_eq!(result.get_pixel(141, 31), result.get_pixel(142, 32));
-        // The checkerboard is gone: blocks are mid-gray averages
-        // or single extremes, but adjacent blocks differ from a
-        // per-pixel checker pattern.
+        // The checkerboard is gone: each 5x5 cell averages its
+        // black and white pixels into a gray (a sampled block
+        // would keep one of them), and with 13 of one and 12 of
+        // the other there are only two such grays.
         let mut distinct = std::collections::HashSet::new();
         for y in 30..70 {
             for x in 140..180 {
-                distinct.insert(result.get_pixel(x, y).0);
+                let p = result.get_pixel(x, y).0;
+                assert!(p[0] != 0 && p[0] != 255, "face pixel ({x}, {y}) survived");
+                distinct.insert(p);
             }
         }
-        assert!(distinct.len() <= 100, "{} distinct colors", distinct.len());
+        assert!(distinct.len() <= 2, "{} distinct colors", distinct.len());
+    }
+
+    #[test]
+    fn pixelatefaces_redacts_faces_under_20_px() {
+        // Issue #401: faces narrower than 20 px got a 1 px block
+        // and came back bit-identical with a success.
+        let engine = Engine;
+        let out = engine
+            .process_preferred(
+                &face_scene(),
+                &[Operation::Filters(vec![Filter::PixelateFaces])],
+                ProcessContext {
+                    face_provider: Some(&SmallFaces),
+                    detect_provider: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let result = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
+        let source = image::load_from_memory(&face_scene()).unwrap().to_rgb8();
+        let in_a_face = |x: u32, y: u32| {
+            SMALL_FACES
+                .iter()
+                .any(|&(fx, fy, fw, fh)| (fx..fx + fw).contains(&x) && (fy..fy + fh).contains(&y))
+        };
+        for (x, y, p) in result.enumerate_pixels() {
+            if in_a_face(x, y) {
+                // The checkerboard's black and white are averaged
+                // into grays.
+                assert!(p[0] != 0 && p[0] != 255, "face pixel ({x}, {y}) survived");
+            } else {
+                assert_eq!(p, source.get_pixel(x, y), "pixel ({x}, {y}) changed");
+            }
+        }
     }
 
     #[test]
