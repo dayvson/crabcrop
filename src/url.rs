@@ -2493,27 +2493,6 @@ pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError
     Ok(operations)
 }
 
-/// Expand `preset:<name>` segments in a request remainder,
-/// splicing each preset's operation string in its place.
-///
-/// The signature covers the unexpanded remainder (the preset
-/// reference is what gets signed); expansion is deterministic
-/// and server-side, and everything downstream of it (parsing,
-/// cache keys) sees the expanded string, so editing a preset
-/// definition produces fresh cache entries naturally.
-///
-/// The walk stops expanding at the first segment that starts
-/// the source URL, using the same dispatch as
-/// [`parse_operations_with_expiry`]: a `preset:` segment inside
-/// the source path is URL text, not a reference. Expansion is
-/// single-pass: spliced text is not rescanned (and configured
-/// presets cannot contain `preset:` segments anyway; see
-/// [`parse_preset_operations`]).
-///
-/// With `only_presets`, any real operation segment in the
-/// request is an error: the operations must all arrive via
-/// presets. `exp:` and `maxage:` metadata stay allowed; neither
-/// is an operation.
 /// The preset names a remainder references, in order,
 /// deduplicated: the cache groups (RFC 9875) the response
 /// belongs to. Scans the same leading segment run
@@ -2631,6 +2610,27 @@ pub fn parse_default_ops(
     Ok(ops)
 }
 
+/// Expand `preset:<name>` segments in a request remainder,
+/// splicing each preset's operation string in its place.
+///
+/// The signature covers the unexpanded remainder (the preset
+/// reference is what gets signed); expansion is deterministic
+/// and server-side, and everything downstream of it (parsing,
+/// cache keys) sees the expanded string, so editing a preset
+/// definition produces fresh cache entries naturally.
+///
+/// The walk stops expanding at the first segment that starts
+/// the source URL, using the same dispatch as
+/// [`parse_operations_with_expiry`]: a `preset:` segment inside
+/// the source path is URL text, not a reference. Expansion is
+/// single-pass: spliced text is not rescanned (and configured
+/// presets cannot contain `preset:` segments anyway; see
+/// [`parse_preset_operations`]).
+///
+/// With `only_presets`, any real operation segment in the
+/// request is an error: the operations must all arrive via
+/// presets. `exp:` and `maxage:` metadata stay allowed; neither
+/// is an operation.
 pub fn expand_presets(
     rest: &str,
     presets: &std::collections::HashMap<String, String>,
