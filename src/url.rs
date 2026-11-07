@@ -1589,7 +1589,7 @@ fn parse_align(s: &str) -> Option<Align> {
     }
 }
 
-/// The alignment after `crop:<WxH>:`. Every historical
+/// The alignment after `crop:<WxH>:`. Every other
 /// alignment is a bare keyword; the `objects` mode (issue
 /// #318) is the one parameterized form,
 /// `objects(<class>[,<class>...])[:<scale>]`: the classes
