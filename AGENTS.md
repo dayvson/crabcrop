@@ -17,9 +17,11 @@ both SDKs must all pass.
 
 ## Layout
 
-- `src/`: the server binary. Pipeline in `engine.rs`, HTTP, caching, and
-  request coalescing in `server.rs`, source fetching policy in `loader.rs`,
-  AI features in `ai.rs` and `studio.rs`.
+- `src/`: the server binary. Pipeline in `engine.rs` (encoders in
+  `engine/encode.rs`, pipeline state in `engine/state.rs`), HTTP and
+  caching in `server.rs` (request coalescing in `server/process.rs`,
+  metadata responses in `server/meta.rs`), source fetching policy in
+  `loader.rs`, AI features in `ai.rs` and `studio.rs`.
 - `crates/crabcrop-url`: the URL grammar and signing library.
 - `sdks/`: TypeScript and Python SDKs, plus the MCP server (`sdks/mcp`).
 - `frameworks/`, `playground/`: integration starters and the live playground.
