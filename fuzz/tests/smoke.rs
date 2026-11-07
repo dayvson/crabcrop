@@ -1,8 +1,9 @@
 //! The deterministic fuzz smoke (issue #146): every seed in
 //! the corpus, every truncation of the representative seeds,
-//! and single-byte mutations of a grammar-rich seed, all run
-//! through the same invariant harness as the cargo-fuzz
-//! target. Bounded and fast, so it belongs on the local
+//! single-byte mutations of grammar-rich seeds, and a short
+//! fixed-seed random mutation pass over the chain seeds, all
+//! run through the same invariant harness as the cargo-fuzz
+//! targets. Bounded and fast, so it belongs on the local
 //! checklist (scripts/test_all.sh); the open-ended fuzzing
 //! itself runs under cargo-fuzz on a nightly toolchain (see
 //! fuzz/README.md).

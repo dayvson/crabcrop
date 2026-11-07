@@ -268,8 +268,9 @@ const CHAIN_MAX_PIXELS: u64 = 1 << 18;
 /// The chain runs on a small synthetic image (the
 /// harness's stand-in source), one filter at a time, in URL
 /// order across every `filters:` segment, with the
-/// request's `fill` color for the corners an arbitrary
-/// rotation uncovers. Resize, crop, and focal operations
+/// request's `fill` color, resolved the way the engine
+/// resolves it, for the corners an arbitrary rotation
+/// uncovers. Resize, crop, and focal operations
 /// are not applied: they run in the engine, which this
 /// package cannot link while the server is binary-only
 /// (issue #417).
@@ -286,10 +287,7 @@ pub fn check_chain(input: &str) {
         })
         .flatten()
         .collect();
-    let fill = chain.iter().rev().find_map(|f| match f {
-        url::Filter::Fill(color) => Some(*color),
-        _ => None,
-    });
+    let fill = url::RequestDirectives::analyze(&request.operations).fill;
     let mut img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 18, |x, y| {
         image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 3) as u8])
     }));
