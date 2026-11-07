@@ -66,7 +66,7 @@ fn cpu_limit_for(timeout: Duration, cores: usize) -> Duration {
 /// Best effort: a limit the platform refuses is skipped
 /// (the wall-clock timeout and the process-group kill
 /// remain the primary bounds). Unix only; elsewhere this
-/// is a no-op.
+/// is a no-op, as before.
 pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64) {
     #[cfg(unix)]
     {
