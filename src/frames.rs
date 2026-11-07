@@ -22,12 +22,15 @@
 //! and built entirely here:
 //!
 //! - Probe: `-nostdin -v info -protocol_whitelist fd
-//!   -format_whitelist <containers> -i fd:`. No output
-//!   target is named, so the tool prints its input report
-//!   (duration, stream list) to stderr and exits nonzero;
-//!   the probe reads its facts from that report and treats
-//!   the exit status as meaningless. A source with no
-//!   video stream in the report (a non-video, an
+//!   -format_whitelist <containers> -dump_separator <token>
+//!   -i fd:`. No output target is named, so the tool
+//!   prints its input report (duration, stream list) to
+//!   stderr and exits nonzero; the probe reads its facts
+//!   from that report and treats the exit status as
+//!   meaningless. The report also prints the source's own
+//!   metadata, so the token, random per probe, marks the
+//!   real stream lines (see [`parse_probe`]). A source with
+//!   no video stream in the report (a non-video, an
 //!   audio-only file, a corrupt container) is
 //!   [`FrameError::NotVideo`].
 //! - Extract: `-nostdin -v info -protocol_whitelist fd
