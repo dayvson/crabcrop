@@ -11278,16 +11278,19 @@ mod tests {
         // Neighboring pixels inside one 5 px cell (40 px / 8)
         // agree.
         assert_eq!(result.get_pixel(141, 31), result.get_pixel(142, 32));
-        // The checkerboard is gone: blocks are mid-gray averages
-        // or single extremes, but adjacent blocks differ from a
-        // per-pixel checker pattern.
+        // The checkerboard is gone: each 5x5 cell averages its
+        // black and white pixels into a gray (a sampled block
+        // would keep one of them), and with 13 of one and 12 of
+        // the other there are only two such grays.
         let mut distinct = std::collections::HashSet::new();
         for y in 30..70 {
             for x in 140..180 {
-                distinct.insert(result.get_pixel(x, y).0);
+                let p = result.get_pixel(x, y).0;
+                assert!(p[0] != 0 && p[0] != 255, "face pixel ({x}, {y}) survived");
+                distinct.insert(p);
             }
         }
-        assert!(distinct.len() <= 100, "{} distinct colors", distinct.len());
+        assert!(distinct.len() <= 2, "{} distinct colors", distinct.len());
     }
 
     #[test]
