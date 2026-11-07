@@ -10,11 +10,19 @@
 //! bounded subprocess, never a shell, with the source
 //! bytes on stdin, an empty environment, its own process
 //! group (killed whole on timeout), a wall-clock limit,
-//! and a cap on what it may write back. The argv contract
-//! is fixed and built entirely here:
+//! and a cap on what it may write back. Stdin is a
+//! seekable file, not a pipe (issue #411): the bytes are
+//! staged once in an unlinked temporary file, because an
+//! MP4 whose index (the moov box) follows its samples,
+//! FFmpeg's own default layout, can only be read by
+//! seeking back to the samples after the index. The tool
+//! reads it through the `fd` protocol (FFmpeg 6.0 and
+//! later), the one input protocol that seeks on a regular
+//! file without naming a path. The argv contract is fixed
+//! and built entirely here:
 //!
-//! - Probe: `-nostdin -v info -protocol_whitelist pipe
-//!   -format_whitelist <containers> -i pipe:0`. No output
+//! - Probe: `-nostdin -v info -protocol_whitelist fd
+//!   -format_whitelist <containers> -i fd:`. No output
 //!   target is named, so the tool prints its input report
 //!   (duration, stream list) to stderr and exits nonzero;
 //!   the probe reads its facts from that report and treats
@@ -22,8 +30,8 @@
 //!   video stream in the report (a non-video, an
 //!   audio-only file, a corrupt container) is
 //!   [`FrameError::NotVideo`].
-//! - Extract: `-nostdin -v info -protocol_whitelist pipe
-//!   -format_whitelist <containers> -i pipe:0 -ss <t>
+//! - Extract: `-nostdin -v info -protocol_whitelist fd
+//!   -format_whitelist <containers> -i fd: -ss <t>
 //!   -frames:v 1 -f image2pipe -vcodec png pipe:1`. The
 //!   seek is output-side, which is the accurate form:
 //!   the tool decodes forward and returns the first frame
@@ -37,16 +45,18 @@
 //!
 //! The whitelists keep the tool inside the loader's
 //! policy (issue #361): the bytes on stdin are the only
-//! input it can reach, so container indirection (a
-//! manifest naming a `file://` or network target) has
-//! nowhere to go.
+//! input it can reach (`fd` opens a descriptor the tool
+//! already holds, and refuses a descriptor named in a URL),
+//! so container indirection (a manifest naming a `file://`
+//! or network target) has nowhere to go.
 //!
 //! The extracted PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
 //! dimensions and allocation, output pixels) applies to
 //! it unchanged.
 
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -66,7 +76,7 @@ pub const MAX_FRAME_PNG_BYTES: usize = 256 * 1024 * 1024;
 /// on purpose: their whole job is to point at further
 /// inputs, and the only input this tool may consume is
 /// the byte stream the loader already validated, which is
-/// also why the protocol whitelist names only `pipe`.
+/// also why the protocol whitelist names only `fd`.
 const FORMAT_WHITELIST: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,flv,asf,ogg";
 
 /// How much of a tool's stderr report the probe keeps.
@@ -185,31 +195,41 @@ impl VideoFrameExtractor {
     /// single-probe entry the test suite exercises.
     #[allow(dead_code)]
     pub fn probe(&self, video: &[u8]) -> Result<VideoProbe, FrameError> {
-        self.probe_until(video, Instant::now() + self.timeout)
+        let input = stage_input(video)?;
+        self.probe_until(&input, Instant::now() + self.timeout)
     }
 
     /// The probe under a caller-supplied deadline, so a
     /// stacked sequence (probe, then extraction attempts)
     /// shares one budget instead of a fresh timeout per
     /// invocation (issue #362).
-    fn probe_until(&self, video: &[u8], deadline: Instant) -> Result<VideoProbe, FrameError> {
+    fn probe_until(&self, input: &File, deadline: Instant) -> Result<VideoProbe, FrameError> {
         let run = self.run(
             &[
                 "-nostdin",
                 "-v",
                 "info",
                 "-protocol_whitelist",
-                "pipe",
+                "fd",
                 "-format_whitelist",
                 FORMAT_WHITELIST,
                 "-i",
-                "pipe:0",
+                "fd:",
             ],
-            video,
+            input,
             0,
             deadline,
         )?;
         parse_probe(&run.stderr).ok_or_else(|| {
+            if run.stderr.contains("Protocol not found") {
+                // FFmpeg before 6.0 has no `fd` protocol: say
+                // so, rather than blame the source.
+                return FrameError::Failed(format!(
+                    "the video decoder cannot read the fd protocol \
+                     (frame extraction needs FFmpeg 6.0 or newer): {}",
+                    stderr_excerpt(&run.stderr)
+                ));
+            }
             FrameError::NotVideo(
                 "the source has no video stream the decoder can read \
                  (not a video, audio only, or a corrupt container)"
@@ -237,11 +257,12 @@ impl VideoFrameExtractor {
         // from the same budget, instead of each invocation
         // restarting the timeout.
         let deadline = Instant::now() + self.timeout;
-        let probe = self.probe_until(video, deadline)?;
+        let input = stage_input(video)?;
+        let probe = self.probe_until(&input, deadline)?;
         let mut timestamp = resolve_timestamp(selection, &probe)?;
         let step = frame_interval(probe.fps);
         for attempt in 0..=3 {
-            let png = self.extract_at(video, timestamp, deadline)?;
+            let png = self.extract_at(&input, timestamp, deadline)?;
             if !png.is_empty() {
                 if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
                     return Err(FrameError::Failed(
@@ -278,7 +299,7 @@ impl VideoFrameExtractor {
     /// is `Failed`.
     fn extract_at(
         &self,
-        video: &[u8],
+        input: &File,
         timestamp: f64,
         deadline: Instant,
     ) -> Result<Vec<u8>, FrameError> {
@@ -289,11 +310,11 @@ impl VideoFrameExtractor {
                 "-v",
                 "info",
                 "-protocol_whitelist",
-                "pipe",
+                "fd",
                 "-format_whitelist",
                 FORMAT_WHITELIST,
                 "-i",
-                "pipe:0",
+                "fd:",
                 "-ss",
                 &seek,
                 "-frames:v",
@@ -304,7 +325,7 @@ impl VideoFrameExtractor {
                 "png",
                 "pipe:1",
             ],
-            video,
+            input,
             MAX_FRAME_PNG_BYTES,
             deadline,
         )?;
@@ -319,7 +340,8 @@ impl VideoFrameExtractor {
     }
 
     /// Run the program once under the standing bounds:
-    /// the source bytes on stdin, stdout capped at
+    /// the staged source on stdin, read from its start
+    /// (every run shares the file's offset), stdout capped at
     /// `max_stdout` (past the cap the process group is
     /// killed and the run fails), stderr kept up to the
     /// report cap while the rest is drained so the tool
@@ -328,13 +350,18 @@ impl VideoFrameExtractor {
     fn run(
         &self,
         args: &[&str],
-        stdin_bytes: &[u8],
+        input: &File,
         max_stdout: usize,
         deadline: Instant,
     ) -> Result<ToolRun, FrameError> {
+        let staging_failed = |e: std::io::Error| {
+            FrameError::Failed(format!("staging the video for the decoder failed: {e}"))
+        };
+        let mut stdin = input.try_clone().map_err(staging_failed)?;
+        stdin.rewind().map_err(staging_failed)?;
         let mut cmd = Command::new(&self.program);
         cmd.args(args)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::from(stdin))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
@@ -356,12 +383,6 @@ impl VideoFrameExtractor {
             self.timeout + crate::toolrun::TOOL_CPU_GRACE,
             crate::toolrun::TOOL_MAX_ADDRESS_SPACE,
         );
-
-        let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
-        let input = stdin_bytes.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin_pipe.write_all(&input);
-        });
 
         let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
@@ -476,7 +497,6 @@ impl VideoFrameExtractor {
                 }
             }
         };
-        let _ = writer.join();
         // The reader threads are deliberately never
         // joined (issue #263, the video.rs pattern): a
         // grandchild that inherited the pipes and holds
@@ -496,6 +516,48 @@ impl VideoFrameExtractor {
             stderr,
         })
     }
+}
+
+/// Stage the source bytes for the tool's stdin (issue
+/// #411): a fresh file in the temporary directory, created
+/// exclusively and private to this user, unlinked as soon
+/// as it exists, so nothing is left behind whatever happens
+/// next and only the open descriptor reaches the bytes.
+/// The file disappears when the last descriptor (ours, or
+/// a run's stdin) closes.
+fn stage_input(video: &[u8]) -> Result<File, FrameError> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let failed = |e: std::io::Error| {
+        FrameError::Failed(format!("staging the video for the decoder failed: {e}"))
+    };
+    let dir = std::env::temp_dir();
+    let mut attempt = 0;
+    let (mut file, path) = loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!(
+            "crabcrop-frame-{}-{}-{nanos:08x}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => break (file, path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => attempt += 1,
+            Err(e) => return Err(failed(e)),
+        }
+    };
+    std::fs::remove_file(&path).map_err(failed)?;
+    file.write_all(video).map_err(failed)?;
+    Ok(file)
 }
 
 /// One finished tool run.
@@ -959,8 +1021,9 @@ exit 1\n";
     #[test]
     fn runs_carry_the_input_whitelists() {
         // Issue #361: every run (the probe and the
-        // extraction) restricts the tool to the pipe
-        // protocol and the accepted container formats, so
+        // extraction) restricts the tool to the fd protocol
+        // on its stdin (issue #411) and the accepted
+        // container formats, so
         // a manifest inside the source bytes cannot point
         // it at inputs the loader never validated. The
         // stand-in tool records each invocation's argv, one
@@ -980,12 +1043,74 @@ exit 1\n";
         let lines: Vec<&str> = recorded.lines().collect();
         assert_eq!(lines.len(), 2, "{recorded}");
         for line in lines {
-            assert!(line.contains("-protocol_whitelist pipe"), "{line}");
+            assert!(line.contains("-protocol_whitelist fd "), "{line}");
+            let argv: Vec<&str> = line.split_whitespace().collect();
+            assert!(argv.windows(2).any(|w| w == ["-i", "fd:"]), "{line}");
+            assert!(!line.contains("pipe:0"), "{line}");
             assert!(
                 line.contains(&format!("-format_whitelist {FORMAT_WHITELIST}")),
                 "{line}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runs_read_a_seekable_staged_copy() {
+        // Issue #411: every run gets the source as a regular
+        // file on stdin (which the fd protocol can seek),
+        // already unlinked, and each run reads it from the
+        // start, though the runs share one staged file. The
+        // stand-in records, per run, how many bytes it read,
+        // whether stdin is a regular file, and what the
+        // descriptor points at.
+        let record = temp_dir("staged").join("stdin.log");
+        let script = format!(
+            "#!/bin/sh\n\
+n=$(cat | wc -c)\n\
+if [ -f /dev/stdin ]; then kind=file; else kind=other; fi\n\
+echo \"$n $kind $(readlink /proc/self/fd/0)\" >> {}\n\
+for a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\ndone\n\
+printf '%s\\n' 'Input #0, mov,mp4, from fd:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\n\
+exit 1\n",
+            record.display()
+        );
+        let program = fake_tool("staged", &script);
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        let video = vec![7u8; 100_000];
+        let frame = extractor
+            .extract_frame(&video, FrameSelection::Seconds(1.5))
+            .unwrap();
+        assert!(frame.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(lines.len(), 2, "{recorded}");
+        for line in lines {
+            let mut fields = line.splitn(3, ' ');
+            assert_eq!(fields.next(), Some("100000"), "{line}");
+            assert_eq!(fields.next(), Some("file"), "{line}");
+            let target = fields.next().unwrap_or_default();
+            assert!(target.contains("crabcrop-frame-"), "{line}");
+            assert!(target.ends_with("(deleted)"), "{line}");
+        }
+    }
+
+    #[test]
+    fn probe_names_a_decoder_without_the_fd_protocol() {
+        // FFmpeg before 6.0 has no fd protocol and refuses
+        // the input outright; that is the decoder's
+        // shortcoming, not a bad source, and the error says
+        // what is needed. Recorded from FFmpeg 5.1.
+        let program = fake_tool(
+            "oldffmpeg",
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'fd:: Protocol not found' 'Did you mean file:fd:?' >&2\nexit 1\n",
+        );
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        let err = extractor
+            .extract_frame(b"video bytes", FrameSelection::Poster)
+            .unwrap_err();
+        assert!(matches!(err, FrameError::Failed(_)), "{err}");
+        assert!(err.to_string().contains("FFmpeg 6.0 or newer"), "{err}");
     }
 
     #[test]
@@ -1187,5 +1312,78 @@ exit 1\n",
             (r, g, b)
         );
         assert!((frame.timestamp - 2.9).abs() < 0.01, "{}", frame.timestamp);
+    }
+
+    #[test]
+    fn real_tool_reads_an_mp4_with_its_index_at_the_end() {
+        // Issue #411: FFmpeg writes an MP4's index (the moov
+        // box) after its samples unless told to "faststart",
+        // and a demuxer reading such a file from a pipe could
+        // not get back to the samples once it was past what
+        // its buffer holds. A few megabytes of noise makes
+        // sure this clip is well past that.
+        let Some(ffmpeg) = ffmpeg_path() else {
+            return;
+        };
+        let dir = temp_dir("moov-at-end");
+        let clip = dir.join("clip.mp4");
+        let status = Command::new(&ffmpeg)
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x480:rate=10:duration=10",
+                "-vf",
+                "noise=alls=30:allf=t",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-b:v",
+                "3300k",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(&clip).unwrap();
+        assert!(bytes.len() > 2 << 20, "{} bytes", bytes.len());
+        let mut boxes = Vec::new();
+        let mut at = 0;
+        while at + 8 <= bytes.len() {
+            let size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            boxes.push(bytes[at + 4..at + 8].to_vec());
+            if size < 8 {
+                break;
+            }
+            at += size;
+        }
+        let mdat = boxes
+            .iter()
+            .position(|b| b == b"mdat")
+            .expect("an mdat box");
+        let moov = boxes.iter().position(|b| b == b"moov").expect("a moov box");
+        assert!(moov > mdat, "the index sits at the end: {boxes:?}");
+
+        let extractor = VideoFrameExtractor::new(ffmpeg, Duration::from_secs(30)).unwrap();
+        let probe = extractor.probe(&bytes).unwrap();
+        assert_eq!((probe.width, probe.height), (640, 480));
+        assert_eq!(probe.duration, Some(10.0));
+        for selection in [
+            FrameSelection::Poster,
+            FrameSelection::Seconds(1.0),
+            FrameSelection::Percent(100.0),
+        ] {
+            let frame = extractor
+                .extract_frame(&bytes, selection)
+                .unwrap_or_else(|e| panic!("{selection:?}: {e}"));
+            let img = image::load_from_memory(&frame.png).unwrap();
+            assert_eq!((img.width(), img.height()), (640, 480), "{selection:?}");
+        }
     }
 }
