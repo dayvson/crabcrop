@@ -531,16 +531,30 @@ fn width_hint(headers: &HeaderMap) -> Option<u32> {
     None
 }
 
+/// The widest width a client hint may resolve to (issue
+/// #403). Hints are client-controlled and the hinted width
+/// joins the cache key, so without a ceiling one URL fans
+/// out into a key (and a render) per quantization step all
+/// the way to the parser's dimension cap. 3840 is the UHD
+/// display width; the DPR hint still multiplies on top,
+/// and the hinted op never enlarges past the source either
+/// way.
+const MAX_HINT_WIDTH: u32 = 3840;
+const _: () = assert!(MAX_HINT_WIDTH <= crate::url::MAX_DIMENSION);
+
 /// Round a hinted width UP to the next multiple of the
 /// quantization step, so a client never gets less than it
-/// asked for and the cache sees bounded cardinality. The
-/// result is clamped to the parser's dimension cap: the
-/// synthesized op bypasses parsing, so without the clamp
-/// a near-cap hint at a coarse step would mint a size the
-/// URL grammar itself would reject.
+/// asked for and the cache sees bounded cardinality, then
+/// clamp it to [`MAX_HINT_WIDTH`]. The clamp happens here,
+/// before the cache key is built, so hints past the
+/// ceiling all share the ceiling's entry. It also keeps the
+/// synthesized op inside the parser's dimension cap: the op
+/// bypasses parsing, so a near-cap hint at a coarse step
+/// must not mint a size the URL grammar itself would
+/// reject.
 fn quantize_width(width: u32, step: u32) -> u32 {
     let step = step.max(1);
-    (width.div_ceil(step) * step).min(crate::url::MAX_DIMENSION)
+    (width.div_ceil(step) * step).min(MAX_HINT_WIDTH)
 }
 
 /// Whether the client sent `Save-Data: on`.
@@ -2732,6 +2746,13 @@ async fn serve_miss(
     // A width hint applies only when the URL sizes nothing
     // itself: it synthesizes the width-only size op a client
     // URL would have carried, ahead of the URL's own ops.
+    // The op carries `no_upscale` semantics (issue #403): a
+    // hint says how wide the client displays the image, not
+    // that the server should invent pixels, so a hint past
+    // the source returns the source width, and the DPR hint
+    // runs into the same cap. The directive is request-wide,
+    // but the URL has no size op of its own here, so the
+    // synthesized op is the only resize it can bound.
     let job_ops = match hinted_width {
         Some(w) => {
             let mut combined = vec![crate::url::Operation::Size(crate::url::ImageSize {
@@ -2740,6 +2761,11 @@ async fn serve_miss(
                 flip_horizontal: false,
                 flip_vertical: false,
             })];
+            if !directives.no_upscale {
+                combined.push(crate::url::Operation::Filters(vec![
+                    crate::url::Filter::NoUpscale,
+                ]));
+            }
             combined.extend(ops.iter().cloned());
             combined
         }
@@ -10144,9 +10170,29 @@ mod tests {
         assert_eq!(quantize_width(250, 100), 300);
         assert_eq!(quantize_width(250, 1), 250);
         assert_eq!(quantize_width(250, 0), 250);
-        // Rounding up never crosses the parser's cap.
-        assert_eq!(quantize_width(16383, 2000), 16383);
-        assert_eq!(quantize_width(16383, 100), 16383);
+        // Hints past the ceiling all resolve to it (issue
+        // #403), so they share one cache entry, and rounding
+        // up never crosses the ceiling, let alone the
+        // parser's cap.
+        assert_eq!(quantize_width(3800, 100), 3800);
+        assert_eq!(quantize_width(3801, 100), MAX_HINT_WIDTH);
+        assert_eq!(quantize_width(5000, 100), MAX_HINT_WIDTH);
+        assert_eq!(quantize_width(16383, 2000), MAX_HINT_WIDTH);
+        assert_eq!(quantize_width(16383, 1), MAX_HINT_WIDTH);
+    }
+
+    #[test]
+    fn hinted_widths_have_bounded_cardinality() {
+        // Every width the hint headers accept resolves to
+        // one of a bounded set of keys (issue #403): at the
+        // default step, the 38 multiples of 100 up to 3800
+        // plus the 3840 ceiling, where it used to be 164
+        // steps up to the parser cap.
+        let distinct: std::collections::BTreeSet<u32> = (1..=crate::url::MAX_DIMENSION)
+            .map(|w| quantize_width(w, 100))
+            .collect();
+        assert_eq!(distinct.len(), 39);
+        assert_eq!(distinct.last(), Some(&MAX_HINT_WIDTH));
     }
 
     #[test]
@@ -10289,18 +10335,26 @@ mod tests {
         assert!(resp.headers().get(header::ETAG).is_none());
     }
 
+    /// A black PNG of the given size: a source wider than
+    /// the hints the client-hint tests send.
+    fn png_of(width: u32, height: u32) -> Vec<u8> {
+        let img = DynamicImage::new_rgb8(width, height);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
     #[tokio::test]
     async fn width_hint_sizes_an_unsized_url_and_separates_the_cache() {
-        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let (src, hits) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
         let base = spawn_app(false).await;
-        // The source is 100x60 and the URL sizes nothing.
+        // The source is 640x480 and the URL sizes nothing.
         let remainder = format!("filters:format(png)/{src}");
         let width_of = |resp: reqwest::Response| async {
             let bytes = resp.bytes().await.unwrap();
             image::load_from_memory(&bytes).unwrap().width()
         };
-        // 250 quantizes to 300 (upscale is the engine's
-        // default posture): proof the synthesized op ran.
+        // 250 quantizes to 300: proof the synthesized op ran.
         let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "250")]).await;
         assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
         // The response advertises the hints it reads, so a
@@ -10320,8 +10374,85 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         // No hint at all: its own entry again.
         let resp = get_with_headers(&base, &remainder, &[]).await;
-        assert_eq!(width_of(resp).await, 100);
+        assert_eq!(width_of(resp).await, 640);
         assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_width_hint_never_upscales_past_the_source() {
+        let src = spawn_bytes_server(png_of(640, 480)).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(png)/{src}");
+        let dims_of = |resp: reqwest::Response| async {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.bytes().await.unwrap();
+            let img = image::load_from_memory(&bytes).unwrap();
+            (img.width(), img.height())
+        };
+        // Issue #403: a hint past the source used to upscale
+        // to the hinted width (3000x2250 here). It returns
+        // the source width now.
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "3000")]).await;
+        assert_eq!(dims_of(resp).await, (640, 480));
+        // The DPR hint runs into the same cap instead of
+        // doubling past it (it used to answer 6000x4500).
+        let resp = get_with_headers(
+            &base,
+            &remainder,
+            &[("Sec-CH-Width", "3000"), ("Sec-CH-DPR", "2")],
+        )
+        .await;
+        assert_eq!(dims_of(resp).await, (640, 480));
+        // A hint whose DPR product crosses the source stops
+        // at the source too: 400 * 2 is 800, past 640.
+        let resp = get_with_headers(
+            &base,
+            &remainder,
+            &[("Sec-CH-Width", "400"), ("Sec-CH-DPR", "2")],
+        )
+        .await;
+        assert_eq!(dims_of(resp).await, (640, 480));
+        // Below the source the hint and DPR still size as
+        // before: 300 * 2 is 600.
+        let resp = get_with_headers(
+            &base,
+            &remainder,
+            &[("Sec-CH-Width", "300"), ("Sec-CH-DPR", "2")],
+        )
+        .await;
+        assert_eq!(dims_of(resp).await, (600, 450));
+        // An explicit size in the URL is not a hint: the
+        // engine's upscale posture is unchanged for it.
+        let resp = get_with_headers(&base, &format!("1280x0/{src}"), &[]).await;
+        assert_eq!(dims_of(resp).await, (1280, 960));
+    }
+
+    #[tokio::test]
+    async fn hints_past_the_ceiling_share_one_cache_entry() {
+        let (src, hits) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(png)/{src}");
+        // Issue #403: every hint past MAX_HINT_WIDTH resolves
+        // to it before the key is built, so a client cycling
+        // through large widths gets one render and one entry,
+        // not one per quantization step.
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "5000")]).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(resp.status(), StatusCode::OK);
+        for width in ["3900", "9000", "16383"] {
+            let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", width)]).await;
+            assert_eq!(
+                header(&resp, "cache-status"),
+                "crabcrop; hit",
+                "hint {width}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Below the ceiling, a different step is its own
+        // entry as before.
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "3700")]).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
