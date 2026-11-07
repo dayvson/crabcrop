@@ -38,6 +38,33 @@ for pair in "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml
   fi
 done
 
+step "npm dist-tag (a prerelease publishes under next, never latest)"
+for pair in "0.10.0 latest" "0.10.0-rc.1 next" "1.2.3-beta.2+sha.5 next" "1.2.3+build-7 latest"; do
+  set -- $pair
+  got=$(bash scripts/npm_dist_tag.sh "$1")
+  if [ "$got" != "$2" ]; then
+    echo "npm_dist_tag.sh $1 printed '$got', expected '$2'" >&2
+    exit 1
+  fi
+done
+for bad in "v0.10.0" "crabcrop-url/0.10.0" "0.10" "0.10.0-"; do
+  if bash scripts/npm_dist_tag.sh "$bad" >/dev/null 2>&1; then
+    echo "npm_dist_tag.sh accepted '$bad', which is not a version" >&2
+    exit 1
+  fi
+done
+# Every npm publish command in release.yml passes the tag, whatever
+# its other flags: the two known steps (@crabcrop/url and
+# @crabcrop/mcp) and any publish added later.
+publishes=$(grep -E 'npm publish( |$)' .github/workflows/release.yml \
+  | grep -vE '^[[:space:]]*(- name:|#)' || true)
+untagged=$(printf '%s\n' "$publishes" | grep -v -- '--tag "\$NPM_TAG"$' || true)
+if [ "$(printf '%s\n' "$publishes" | grep -c .)" -lt 2 ] || [ -n "$untagged" ]; then
+  echo "every npm publish in release.yml must pass --tag \"\$NPM_TAG\" from scripts/npm_dist_tag.sh:" >&2
+  printf '%s\n' "${untagged:-(no npm publish commands found)}" >&2
+  exit 1
+fi
+
 step "Operation vectors (the generated corpus is current)"
 python3 spec/generate_operation_vectors.py --check
 

@@ -521,9 +521,18 @@ jobs:
       - name: Install SDK dependencies
         working-directory: sdks/typescript
         run: npm ci
+      # npm puts every publish on the `latest` dist-tag unless
+      # told otherwise (issue #413). The tag comes from the
+      # version being published: a prerelease goes to `next`,
+      # and only a plain release moves `latest`, like the
+      # images' :latest tags above.
       - name: npm publish
         working-directory: sdks/typescript
-        run: npm publish --access public
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          NPM_TAG=$(bash "$GITHUB_WORKSPACE/scripts/npm_dist_tag.sh" "$version")
+          echo "Publishing $version under the npm dist-tag $NPM_TAG"
+          npm publish --access public --tag "$NPM_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -556,9 +565,18 @@ jobs:
       - name: Install MCP dependencies
         working-directory: sdks/mcp
         run: npm ci
+      # npm puts every publish on the `latest` dist-tag unless
+      # told otherwise (issue #413). The tag comes from the
+      # version being published: a prerelease goes to `next`,
+      # and only a plain release moves `latest`, like the
+      # images' :latest tags above.
       - name: npm publish
         working-directory: sdks/mcp
-        run: npm publish --access public
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          NPM_TAG=$(bash "$GITHUB_WORKSPACE/scripts/npm_dist_tag.sh" "$version")
+          echo "Publishing $version under the npm dist-tag $NPM_TAG"
+          npm publish --access public --tag "$NPM_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
