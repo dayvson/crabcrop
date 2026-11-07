@@ -86,6 +86,38 @@ def edits(version):
     if count != 1:
         raise SystemExit("Chart.yaml: appVersion matched 0 times")
     out["deploy/helm/crabcrop/Chart.yaml"] = chart
+    # The deploy pins (issue #383): the image tags in the
+    # chart values, the kustomize base and AI component,
+    # and the platform guides. Every occurrence moves;
+    # check_versions.py reads the same sites and would
+    # fail the bump otherwise.
+    values = read_text("deploy/helm/crabcrop/values.yaml")
+    values, count = re.subn(r'(?m)^(\s+tag: ")[^"]+(")', rf"\g<1>{version}\g<2>", values)
+    if count != 2:
+        raise SystemExit(f"values.yaml: tag matched {count} times, expected 2")
+    out["deploy/helm/crabcrop/values.yaml"] = values
+    for rel, image in (
+        ("deploy/kustomize/base/deployment.yaml", "crabcrop"),
+        ("deploy/kustomize/components/ai/deployment-patch.yaml", "crabcrop-ai"),
+    ):
+        out[rel] = sub_once(
+            rel,
+            rf"(image: ghcr\.io/dayvson/{image}:)\S+",
+            rf"\g<1>{version}",
+        )
+    for rel in (
+        "deploy/cloud-run/README.md",
+        "deploy/container-apps/README.md",
+        "deploy/ecs-fargate/README.md",
+        "deploy/helm/crabcrop/README.md",
+    ):
+        text = read_text(rel)
+        text, count = re.subn(
+            r"(crabcrop(?:-ai)?:)\d+\.\d+\.\d+", rf"\g<1>{version}", text
+        )
+        if count < 1:
+            raise SystemExit(f"{rel}: no image pin found to bump")
+        out[rel] = text
     return out
 
 

@@ -41,6 +41,9 @@ done
 step "Operation vectors (the generated corpus is current)"
 python3 spec/generate_operation_vectors.py --check
 
+step "Version consistency (every artifact and deploy pin agrees)"
+python3 scripts/check_versions.py
+
 step "Build (debug binary: the MCP suite spawns it)"
 cargo build --locked
 

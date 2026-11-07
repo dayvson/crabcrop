@@ -55,6 +55,30 @@ def wp_plugin_version(rel):
     return match.group(1) if match else None
 
 
+def helm_values_tags(rel):
+    """The image tags pinned in the Helm values: the
+    server image and the AI image. Returns both."""
+    tags = re.findall(r'^\s+tag: "([^"]+)"', read(rel), re.M)
+    return tags if len(tags) == 2 else [None]
+
+
+def kustomize_image_tags(rel, image):
+    tags = re.findall(rf"image: ghcr\.io/dayvson/{image}:(\S+)", read(rel))
+    return tags[0] if len(tags) == 1 else None
+
+
+def readme_image_tags(rel):
+    """The image references in a deploy guide. A guide
+    may show the pin several times; all of them must
+    agree, so the site value is the common tag, a MIXED
+    marker when they disagree, and None when the guide
+    carries no pin at all."""
+    tags = set(re.findall(r"crabcrop(?:-ai)?:(\d+\.\d+\.\d+)", read(rel)))
+    if len(tags) == 1:
+        return tags.pop()
+    return "MIXED:" + ",".join(sorted(tags)) if tags else None
+
+
 def sites():
     found = {
         "Cargo.toml (server)": cargo_package_version("Cargo.toml"),
@@ -76,6 +100,27 @@ def sites():
     chart, app = chart_versions("deploy/helm/crabcrop/Chart.yaml")
     found["deploy/helm/crabcrop/Chart.yaml version"] = chart
     found["deploy/helm/crabcrop/Chart.yaml appVersion"] = app
+    # The deploy pins (issue #383): the tags a reader
+    # copies out of the chart values, the kustomize base,
+    # and the platform guides. They are version sites
+    # like any other; a release that leaves one behind
+    # ships a guide pointing at an old image.
+    server_tag, ai_tag = helm_values_tags("deploy/helm/crabcrop/values.yaml")
+    found["deploy/helm/crabcrop/values.yaml image.tag"] = server_tag
+    found["deploy/helm/crabcrop/values.yaml ai.image.tag"] = ai_tag
+    found["deploy/kustomize/base/deployment.yaml image"] = kustomize_image_tags(
+        "deploy/kustomize/base/deployment.yaml", "crabcrop"
+    )
+    found["deploy/kustomize/components/ai image"] = kustomize_image_tags(
+        "deploy/kustomize/components/ai/deployment-patch.yaml", "crabcrop-ai"
+    )
+    for guide in (
+        "deploy/cloud-run/README.md",
+        "deploy/container-apps/README.md",
+        "deploy/ecs-fargate/README.md",
+        "deploy/helm/crabcrop/README.md",
+    ):
+        found[f"{guide} image pins"] = readme_image_tags(guide)
     return found
 
 
