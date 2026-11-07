@@ -135,6 +135,97 @@ impl MediaAdmission {
     }
 }
 
+/// The process-wide budget for source bytes held in memory
+/// (issue #403). A cache miss reserves its share before it
+/// fetches anything: the fetch cap for each load, since a
+/// body's size is unknown until it ends, trimmed to what
+/// the load actually received once it does. The share then
+/// stays with the bytes until the render job that uses
+/// them finishes, so peak buffered source memory is
+/// bounded by the budget rather than by how many requests
+/// arrive at once. Clones share one budget.
+#[derive(Debug, Clone)]
+pub struct SourceBudget {
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    capacity: usize,
+}
+
+impl SourceBudget {
+    /// A budget of `capacity` bytes.
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.min(tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+
+    /// A budget nothing realistic exhausts: what a loader
+    /// starts with until the server installs the configured
+    /// one, so a loader built for a test or a tool never
+    /// sheds on it.
+    pub fn unlimited() -> Self {
+        Self::new(tokio::sync::Semaphore::MAX_PERMITS)
+    }
+
+    /// The budget, in bytes.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes currently reserved against the budget.
+    pub fn in_use(&self) -> usize {
+        self.capacity.saturating_sub(self.sem.available_permits())
+    }
+
+    /// Reserve `bytes`, waiting at most `wait` for them to
+    /// come free. `None` when the wait runs out, or at once
+    /// when `bytes` exceeds the whole budget and could never
+    /// be granted. Waiters are served in arrival order.
+    pub async fn reserve(&self, bytes: usize, wait: Duration) -> Option<SourceReservation> {
+        if bytes > self.capacity {
+            return None;
+        }
+        let permits = u32::try_from(bytes).ok()?;
+        match tokio::time::timeout(wait, self.sem.clone().acquire_many_owned(permits)).await {
+            Ok(Ok(permit)) => Some(SourceReservation { permit }),
+            _ => None,
+        }
+    }
+}
+
+/// One request's share of a [`SourceBudget`]: the bytes it
+/// is accounted for, returned to the budget when the share
+/// is dropped.
+#[derive(Debug)]
+pub struct SourceReservation {
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl SourceReservation {
+    /// The bytes this share holds.
+    pub fn bytes(&self) -> usize {
+        self.permit.num_permits()
+    }
+
+    /// Keep `bytes` of the share and return the rest to the
+    /// budget at once. A share already at or under `bytes`
+    /// is left as it is: shrinking never grows a share.
+    pub fn shrink_to(&mut self, bytes: usize) {
+        let excess = self.permit.num_permits().saturating_sub(bytes);
+        if excess > 0 {
+            drop(self.permit.split(excess));
+        }
+    }
+
+    /// Fold `other` into this share, so the two are
+    /// released together. Both must come from the same
+    /// budget.
+    pub fn merge(&mut self, other: SourceReservation) {
+        self.permit.merge(other.permit);
+    }
+}
+
 /// Which sources the loader may fetch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourcePolicy {
@@ -187,6 +278,11 @@ pub struct Loader {
     pinned_clients: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<(String, std::net::SocketAddr), Client>>,
     >,
+    /// The source byte budget (issue #403) the server's
+    /// misses reserve against before they load: see
+    /// [`Loader::reserve_load`]. Unlimited until the server
+    /// installs the configured budget.
+    source_budget: SourceBudget,
 }
 
 /// Cap on the pinned-client cache (issue #369).
@@ -303,6 +399,7 @@ impl Loader {
             pinned_clients: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            source_budget: SourceBudget::unlimited(),
         })
     }
 
@@ -322,6 +419,35 @@ impl Loader {
     pub fn with_sources(mut self, sources: SourceConfig) -> Self {
         self.sources = sources;
         self
+    }
+
+    /// Set the source byte budget (issue #403).
+    pub fn with_source_budget(mut self, budget: SourceBudget) -> Self {
+        self.source_budget = budget;
+        self
+    }
+
+    /// The fetch cap: the most bytes one load may return.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// The source byte budget this loader's callers reserve
+    /// against.
+    pub fn source_budget(&self) -> &SourceBudget {
+        &self.source_budget
+    }
+
+    /// Reserve the budget one full load may buffer, the
+    /// fetch cap, waiting at most `wait` (issue #403). The
+    /// caller holds the share across the load, trims it to
+    /// the bytes received with
+    /// [`SourceReservation::shrink_to`], and keeps it for as
+    /// long as it keeps the bytes. `None` means the budget
+    /// stayed exhausted for the whole wait.
+    pub async fn reserve_load(&self, wait: Duration) -> Option<SourceReservation> {
+        let cap = usize::try_from(self.max_bytes).unwrap_or(usize::MAX);
+        self.source_budget.reserve(cap, wait).await
     }
 
     /// Fetch `url` and return the body bytes, dispatching on
@@ -2213,5 +2339,171 @@ mod tests {
             assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
         }
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_source_budget_reserves_trims_merges_and_releases() {
+        let budget = SourceBudget::new(100);
+        let wait = Duration::from_millis(50);
+        let mut a = budget.reserve(60, wait).await.unwrap();
+        assert_eq!((a.bytes(), budget.in_use()), (60, 60));
+        // More than is free: the wait runs out.
+        assert!(budget.reserve(41, wait).await.is_none());
+        // More than the whole budget can never be granted:
+        // refused at once instead of waiting it out.
+        let start = std::time::Instant::now();
+        assert!(budget.reserve(101, Duration::from_secs(5)).await.is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        // Trimming returns the excess at once, and never
+        // grows a share.
+        a.shrink_to(10);
+        assert_eq!((a.bytes(), budget.in_use()), (10, 10));
+        a.shrink_to(50);
+        assert_eq!((a.bytes(), budget.in_use()), (10, 10));
+        // Merged shares are released together.
+        let b = budget.reserve(90, wait).await.unwrap();
+        a.merge(b);
+        assert_eq!((a.bytes(), budget.in_use()), (100, 100));
+        drop(a);
+        assert_eq!(budget.in_use(), 0);
+        // Clones are one budget.
+        let c = budget.clone().reserve(70, wait).await.unwrap();
+        assert_eq!(budget.in_use(), 70);
+        drop(c);
+        assert_eq!(budget.in_use(), 0);
+        // A fresh loader never sheds on its budget; the
+        // server installs the configured one.
+        let loader = Loader::with_defaults().unwrap();
+        assert_eq!(
+            loader.source_budget().capacity(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        let share = loader.reserve_load(wait).await.unwrap();
+        assert_eq!(share.bytes() as u64, DEFAULT_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_reservation_is_granted_when_a_share_is_released() {
+        let budget = SourceBudget::new(100);
+        let held = budget
+            .reserve(100, Duration::from_millis(10))
+            .await
+            .unwrap();
+        let waiter = {
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                budget
+                    .reserve(80, Duration::from_secs(5))
+                    .await
+                    .map(|share| share.bytes())
+            })
+        };
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the budget is held: the reservation waits"
+        );
+        drop(held);
+        assert_eq!(waiter.await.unwrap(), Some(80));
+    }
+
+    /// The burst the source budget exists for (issue #403):
+    /// `loads` concurrent distinct loads from an origin that
+    /// takes 100 ms per body, each reserving the fetch cap
+    /// first and then holding its body for 50 ms, as a
+    /// render would. Returns the most bodies the origin was
+    /// sending at once and the most body bytes held at once.
+    async fn budgeted_burst(budget: SourceBudget, loads: usize) -> (usize, usize) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BODY: usize = 48 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sending = Arc::new(AtomicUsize::new(0));
+        let peak_sending = Arc::new(AtomicUsize::new(0));
+        {
+            let (sending, peak_sending) = (sending.clone(), peak_sending.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let (sending, peak_sending) = (sending.clone(), peak_sending.clone());
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 1024];
+                        let _ = socket.read(&mut buf).await;
+                        let now = sending.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak_sending.fetch_max(now, Ordering::SeqCst);
+                        sleep(Duration::from_millis(100)).await;
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {BODY}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(&vec![0u8; BODY]).await;
+                        sending.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+        let loader = Loader::new(64 * 1024, Duration::from_secs(10))
+            .unwrap()
+            .with_source_budget(budget);
+        let held = Arc::new(AtomicUsize::new(0));
+        let peak_held = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for i in 0..loads {
+            let loader = loader.clone();
+            let (held, peak_held) = (held.clone(), peak_held.clone());
+            tasks.push(tokio::spawn(async move {
+                let mut share = loader
+                    .reserve_load(Duration::from_secs(5))
+                    .await
+                    .expect("every load fits within the wait");
+                let body = loader
+                    .load(&format!("http://{addr}/s{i}.png"))
+                    .await
+                    .unwrap();
+                share.shrink_to(body.len());
+                let now = held.fetch_add(body.len(), Ordering::SeqCst) + body.len();
+                peak_held.fetch_max(now, Ordering::SeqCst);
+                sleep(Duration::from_millis(50)).await;
+                held.fetch_sub(body.len(), Ordering::SeqCst);
+                drop(body);
+                drop(share);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(loader.source_budget().in_use(), 0, "every share came back");
+        (
+            peak_sending.load(Ordering::SeqCst),
+            peak_held.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_loads_buffers_what_the_budget_holds_not_what_arrives() {
+        const CAP: usize = 64 * 1024;
+        // Unbudgeted, every load of the burst is in flight
+        // at once: buffering grows with the request count.
+        let (sending, _) = budgeted_burst(SourceBudget::unlimited(), 12).await;
+        assert!(
+            sending > 3,
+            "without a budget the burst overlaps: {sending}"
+        );
+        // Three fetch caps of budget: never more than three
+        // bodies in flight, and never more body bytes held
+        // than the budget, however many loads are queued.
+        let (sending, held) = budgeted_burst(SourceBudget::new(3 * CAP), 12).await;
+        assert!(
+            sending <= 3,
+            "{sending} bodies in flight under a 3-cap budget"
+        );
+        assert!(
+            held <= 3 * CAP,
+            "{held} bytes held under a {} byte budget",
+            3 * CAP
+        );
     }
 }

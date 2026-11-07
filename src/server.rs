@@ -58,9 +58,9 @@ impl std::fmt::Debug for NamedDetector {
 
 mod process;
 pub(in crate::server) use process::{
-    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, Lane, MetaFlight,
-    PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SharedFlight, SharedResponse, VIDEO_GATE_WAIT,
-    run_process, wants_animation_gate, wants_slow_lane,
+    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
+    PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SOURCE_BUDGET_WAIT, SharedFlight,
+    SharedResponse, VIDEO_GATE_WAIT, run_process, wants_animation_gate, wants_slow_lane,
 };
 pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
@@ -430,9 +430,10 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         format!(
-            "{}{}{}",
+            "{}{}{}{}",
             state.metrics.render(),
             lane_metrics(&state),
+            source_buffer_metrics(&state),
             tier_metrics(&state)
         ),
     )
@@ -467,6 +468,26 @@ fn lane_metrics(state: &AppState) -> String {
         state.slow_gate.capacity()
     ));
     out
+}
+
+/// Source byte budget occupancy for `/metrics` (issue
+/// #403): the source and watermark bytes cache misses hold
+/// right now, against the configured budget, read live at
+/// scrape time. In use sitting at capacity while requests
+/// shed with `server_busy` is the signal to raise
+/// `CRABCROP_SOURCE_BUFFER_MAX_MB`.
+fn source_buffer_metrics(state: &AppState) -> String {
+    let budget = state.loader.source_budget();
+    format!(
+        "# HELP crabcrop_source_buffer_bytes Source bytes cache misses hold against the source buffer budget.\n\
+         # TYPE crabcrop_source_buffer_bytes gauge\n\
+         crabcrop_source_buffer_bytes {}\n\
+         # HELP crabcrop_source_buffer_capacity_bytes The source buffer budget.\n\
+         # TYPE crabcrop_source_buffer_capacity_bytes gauge\n\
+         crabcrop_source_buffer_capacity_bytes {}\n",
+        budget.in_use(),
+        budget.capacity()
+    )
 }
 
 /// Cache tier failures for `/metrics` (issue #367): the
@@ -1386,6 +1407,23 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             accept.as_deref(),
         );
     }
+    // A buffered upload is a source like a fetched one
+    // (issue #403): before the body is read it reserves the
+    // upload cap from the source byte budget, keeps what it
+    // received, and holds that until the handler is done
+    // with the bytes, so a burst of uploads waits at the
+    // budget instead of buffering past it.
+    let cap = usize::try_from(upload.max_bytes).unwrap_or(usize::MAX);
+    let Some(mut body_share) = state
+        .loader
+        .source_budget()
+        .reserve(cap, SOURCE_BUDGET_WAIT)
+        .await
+    else {
+        state.metrics.record_upload();
+        upload_log(name, "rejected:busy");
+        return source_budget_busy(accept.as_deref());
+    };
     // The read is bounded by the cap itself: `to_bytes`
     // fails the moment the body passes it, which is the
     // oversize answer (413) without ever holding more
@@ -1404,6 +1442,7 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             );
         }
     };
+    body_share.shrink_to(bytes.len());
     if bytes.is_empty() {
         state.metrics.record_upload();
         upload_log(name, "rejected:not-an-image");
@@ -1436,7 +1475,9 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // the destination never holds an unservable object.
     // The decode runs under the process gate, like every
     // transform (see `run_upload_validation`).
-    let prepared = match run_upload_validation(&state, bytes.to_vec()).await {
+    // The body moves into validation rather than being
+    // copied for it, so the share covers what is held.
+    let prepared = match run_upload_validation(&state, Vec::from(bytes)).await {
         UploadValidation::Valid(prepared) => prepared,
         UploadValidation::Invalid(e) => {
             eprintln!("upload rejected: {e}");
@@ -2690,6 +2731,18 @@ async fn serve_miss(
     let wants_frame = directives.frame.is_some();
     let wants_page = directives.page.is_some();
     record.load_ran = true;
+    // Admission comes before any buffering (issue #403): the
+    // miss reserves its share of the source byte budget, the
+    // fetch cap, before it loads a byte, and sheds like a
+    // full gate when the budget stays exhausted. The share
+    // is trimmed to what each load received and travels
+    // with the bytes into the render job, which returns it
+    // when it finishes, so a burst of distinct misses waits
+    // here instead of each buffering a whole source before
+    // the gates below are even consulted.
+    let Some(mut source_share) = state.loader.reserve_load(SOURCE_BUDGET_WAIT).await else {
+        return (sealed_or(sealed, source_budget_busy(accept)), record, None);
+    };
     let load_start = Instant::now();
     let mut used_fallback = false;
     let admission = crate::loader::MediaAdmission {
@@ -2727,6 +2780,7 @@ async fn serve_miss(
     };
     record.load = load_start.elapsed();
     record.bytes_in = bytes.len();
+    source_share.shrink_to(bytes.len());
 
     // Watermarks are fetched here, before the engine runs:
     // each referenced image goes through the same loader (and
@@ -2737,9 +2791,15 @@ async fn serve_miss(
     // blocking job with the rest of the engine work, so a
     // watermark that does not decode fails the request from
     // there with the same engine error (audit R2-16).
+    // Each watermark load reserves its own share first, like
+    // the source (issue #403), and the request keeps every
+    // share until its job ends.
     let mut watermark_sources: Vec<(String, Vec<u8>)> = Vec::new();
     for wm_url in &directives.watermark_urls {
         record.load_ran = true;
+        let Some(mut wm_share) = state.loader.reserve_load(SOURCE_BUDGET_WAIT).await else {
+            return (sealed_or(sealed, source_budget_busy(accept)), record, None);
+        };
         let wm_bytes = match state.loader.load(wm_url).await {
             Ok(b) => b,
             Err(e) => {
@@ -2751,8 +2811,11 @@ async fn serve_miss(
                 );
             }
         };
+        wm_share.shrink_to(wm_bytes.len());
+        source_share.merge(wm_share);
         watermark_sources.push((wm_url.to_string(), wm_bytes));
     }
+    let watermark_bytes: usize = watermark_sources.iter().map(|(_, b)| b.len()).sum();
 
     record.process_ran = true;
     let process_start = Instant::now();
@@ -2880,7 +2943,9 @@ async fn serve_miss(
         }
         None => ops.clone(),
     };
-    let job = ProcessJob {
+    // One job, shared by the run and a fallback retry, so
+    // the watermark bytes it carries are never copied.
+    let job = Arc::new(ProcessJob {
         save_data,
         preserve_metadata: state.preserve_metadata,
         ops: job_ops,
@@ -2912,7 +2977,7 @@ async fn serve_miss(
         brand_color: state.brand_color,
         avif_speed: state.avif_speed,
         jxl_speed: state.jxl_speed,
-    };
+    });
     // The lane this run draws its permit from (issue
     // #324): long-running work goes to the slow lane, so
     // its saturation sheds slow requests only and stills
@@ -2928,7 +2993,12 @@ async fn serve_miss(
         video: video_permit,
         anim: anim_permit,
     };
-    let processed = match run_process(state, &job, &bytes, lane, process_deadline, permits).await {
+    let source = JobSource {
+        bytes,
+        share: Some(source_share),
+    };
+    let first_run = run_process(state, job.clone(), source, lane, process_deadline, permits);
+    let processed = match first_run.await {
         Ok(p) => p,
         Err(ProcessFailure::Busy) => {
             return (
@@ -2989,9 +3059,29 @@ async fn serve_miss(
             // other fallback case. Other engine errors are
             // properties of the request or the configuration,
             // not of the source, and stay honest.
-            let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
+            // The first run's budget share drained with its
+            // job, so the retry reserves again before the
+            // fallback loads (issue #403): the fetch cap plus
+            // the watermarks the job still carries. An
+            // exhausted budget leaves the original engine
+            // error standing, like a full gate below.
+            let retry_share = if !used_fallback
+                && state.fallback.is_some()
+                && matches!(e, EngineError::Decode(_))
+            {
+                let cap = usize::try_from(state.loader.max_bytes()).unwrap_or(usize::MAX);
+                state
+                    .loader
+                    .source_budget()
+                    .reserve(cap.saturating_add(watermark_bytes), SOURCE_BUDGET_WAIT)
+                    .await
+            } else {
+                None
+            };
+            let retry = if let Some(mut retry_share) = retry_share {
                 match fallback_source_bytes(state).await {
                     Some(fb) => {
+                        retry_share.shrink_to(fb.len() + watermark_bytes);
                         // The fallback run draws on the same
                         // gates as the first: each kind of
                         // work re-acquires its permit (the
@@ -3034,9 +3124,20 @@ async fn serve_miss(
                             }
                         }
                         if may_retry {
-                            run_process(state, &job, &fb, lane, process_deadline, retry_permits)
-                                .await
-                                .ok()
+                            let source = JobSource {
+                                bytes: fb,
+                                share: Some(retry_share),
+                            };
+                            run_process(
+                                state,
+                                job.clone(),
+                                source,
+                                lane,
+                                process_deadline,
+                                retry_permits,
+                            )
+                            .await
+                            .ok()
                         } else {
                             None
                         }
@@ -3064,6 +3165,10 @@ async fn serve_miss(
         }
     };
     record.process = process_start.elapsed();
+    // The run's budget share has drained with its job; the
+    // watermark bytes the job carries go with it now, not
+    // after the population writes and meta annotations.
+    drop(job);
     // The validator for this render is a digest of its
     // bytes, computed once here: it is stored with the
     // cache entry and returned to the caller, so a hit and
@@ -3403,6 +3508,18 @@ fn finalize_validators(response: &mut Response, etag: &str, if_none_match: Optio
         response.headers_mut().remove(header::CONTENT_TYPE);
         response.headers_mut().remove(header::CONTENT_LENGTH);
     }
+}
+
+/// The 503 for an exhausted source byte budget (issue
+/// #403): the same `server_busy` answer as a full gate,
+/// with the stills lane's short Retry-After, since shares
+/// free as soon as renders end.
+fn source_budget_busy(accept: Option<&str>) -> Response {
+    busy_response(
+        "server busy: too many source images held in memory",
+        1,
+        accept,
+    )
 }
 
 /// A 503 for a saturated gate. Retry-After tells clients
@@ -13078,6 +13195,68 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(back, "the permit must return when the job drains");
+    }
+
+    #[tokio::test]
+    async fn a_source_budget_share_is_held_until_the_job_actually_finishes() {
+        // Issue #403: the share serve_miss reserves for a
+        // source travels into the run with the bytes. A run
+        // shed at its deadline leaves the detached job
+        // holding the bytes, so the share must stay held
+        // with it, and come back only once the job finishes
+        // and has dropped them; freed at the shed, it would
+        // let new loads buffer on top of bytes still in
+        // memory.
+        let state = lane_test_state(std::time::Duration::from_millis(300), 1, 1);
+        let budget = crate::loader::SourceBudget::new(1 << 20);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut job = lane_test_job(None, "filters:upscale(2)/example.com/i.png");
+        job.upscale_provider = Some(Arc::new(BlockingUpscale {
+            release: release.clone(),
+        }));
+        let png = test_png();
+        let mut share = budget
+            .reserve(1 << 20, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        share.shrink_to(png.len());
+        assert_eq!(budget.in_use(), png.len());
+        let source = JobSource {
+            bytes: png.clone(),
+            share: Some(share),
+        };
+        let result = run_process(
+            &state,
+            &job,
+            source,
+            Lane::Process,
+            std::time::Instant::now() + state.process_timeout,
+            JobPermits::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ProcessFailure::TimedOut)),
+            "the blocked run must answer TimedOut at its deadline, got {result:?}"
+        );
+        assert_eq!(
+            budget.in_use(),
+            png.len(),
+            "the share must stay with the detached job after the shed"
+        );
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        let mut back = false;
+        for _ in 0..100 {
+            if budget.in_use() == 0 {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(back, "the share must return when the job drains");
     }
 
     #[tokio::test]

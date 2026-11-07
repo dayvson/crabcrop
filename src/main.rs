@@ -759,6 +759,47 @@ fn build_keyring(get: impl Fn(&str) -> Option<String>) -> Result<crate::url::Key
     Ok(keyring)
 }
 
+/// Fetch caps per processing lane permit in the default
+/// source byte budget (issue #403): for each permit, one
+/// source rendering, one loaded and queued behind it, and
+/// two loading. A load reserves the whole cap only while
+/// it runs and keeps just what it received, so typical
+/// sources, far under the cap, fit many more at once.
+const SOURCE_BUFFER_CAPS_PER_PERMIT: u64 = 4;
+
+/// The upper bound on `CRABCROP_SOURCE_BUFFER_MAX_MB`,
+/// 64 GiB; the computed default is clamped to it too.
+const MAX_SOURCE_BUFFER_MB: u64 = 65_536;
+
+/// The source byte budget in bytes (issue #403), from
+/// `CRABCROP_SOURCE_BUFFER_MAX_MB`, read through `get` so
+/// tests can drive it. The default scales with the
+/// processing lanes (`lane_permits`, the stills lane plus
+/// the slow lane): four fetch caps per permit. The floor is
+/// one fetch cap, below which no source could ever load.
+fn source_buffer_budget(
+    get: impl Fn(&str) -> Option<String>,
+    lane_permits: usize,
+) -> Result<u64, String> {
+    const MB: u64 = 1024 * 1024;
+    let cap_mb = crate::loader::DEFAULT_MAX_BYTES / MB;
+    let default_mb = (cap_mb * SOURCE_BUFFER_CAPS_PER_PERMIT)
+        .saturating_mul(lane_permits as u64)
+        .clamp(cap_mb, MAX_SOURCE_BUFFER_MB);
+    let mb: u64 = parse_env_value(
+        "CRABCROP_SOURCE_BUFFER_MAX_MB",
+        get("CRABCROP_SOURCE_BUFFER_MAX_MB"),
+        default_mb,
+    )?;
+    if !(cap_mb..=MAX_SOURCE_BUFFER_MB).contains(&mb) {
+        return Err(format!(
+            "CRABCROP_SOURCE_BUFFER_MAX_MB must be between {cap_mb} (the source fetch cap) \
+             and {MAX_SOURCE_BUFFER_MB}, got {mb}"
+        ));
+    }
+    Ok(mb * MB)
+}
+
 /// The default upload cap, in megabytes: the loader's
 /// source cap (issue #168 ties the two, so a stored
 /// original is always one the loader will fetch back).
@@ -929,6 +970,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    // The stills lane is sized to the cores at boot; the
+    // source byte budget's default scales with both lanes.
+    let process_permits = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let source_buffer_bytes = source_buffer_budget(
+        |name| env::var(name).ok(),
+        process_permits + slow_lane_permits,
+    )?;
     let avif_speed: u8 = parse_env("CRABCROP_AVIF_SPEED", crate::engine::DEFAULT_AVIF_SPEED)?;
     if !(1..=10).contains(&avif_speed) {
         return Err(
@@ -1106,7 +1156,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         loader: Loader::with_defaults()
             .map_err(|e| format!("cannot build the loader: {e}"))?
             .with_policy(policy)
-            .with_sources(sources),
+            .with_sources(sources)
+            .with_source_budget(crate::loader::SourceBudget::new(
+                usize::try_from(source_buffer_bytes).unwrap_or(usize::MAX),
+            )),
         engine: Engine,
         process_timeout: std::time::Duration::from_secs(process_timeout_secs),
         metrics: Arc::new(Metrics::default()),
@@ -1133,11 +1186,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         upload,
         meta_enabled,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        process_gate: Arc::new(crate::server::Gate::new(
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4),
-        )),
+        process_gate: Arc::new(crate::server::Gate::new(process_permits)),
         slow_gate: Arc::new(crate::server::Gate::new(slow_lane_permits)),
         ssim_target,
         avif_speed,
@@ -3292,6 +3341,33 @@ mod tests {
                 assert_eq!(&bytes[..], b"these are not image bytes")
             }
             server::Fallback::Url(_) => panic!("a local path must load as bytes"),
+        }
+    }
+
+    #[test]
+    fn the_source_buffer_budget_scales_with_the_lanes_and_checks_its_bounds() {
+        const MB: u64 = 1024 * 1024;
+        // Unset: four fetch caps per lane permit, so a
+        // one-core host with the default slow lane (two
+        // permits) gets 80 MB and a four-core one 200 MB.
+        assert_eq!(source_buffer_budget(env_of(&[]), 2).unwrap(), 80 * MB);
+        assert_eq!(source_buffer_budget(env_of(&[]), 5).unwrap(), 200 * MB);
+        // The default never leaves the accepted range.
+        assert_eq!(
+            source_buffer_budget(env_of(&[]), usize::MAX).unwrap(),
+            MAX_SOURCE_BUFFER_MB * MB
+        );
+        // Set: megabytes, with one fetch cap as the floor.
+        let set =
+            |v: &str| source_buffer_budget(env_of(&[("CRABCROP_SOURCE_BUFFER_MAX_MB", v)]), 2);
+        assert_eq!(set("10").unwrap(), 10 * MB);
+        assert_eq!(set("65536").unwrap(), 65_536 * MB);
+        for bad in ["0", "9", "65537", "lots", "-1", ""] {
+            let err = expect_err(set(bad));
+            assert!(
+                err.contains("CRABCROP_SOURCE_BUFFER_MAX_MB"),
+                "{bad}: {err}"
+            );
         }
     }
 
