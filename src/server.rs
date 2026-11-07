@@ -1002,7 +1002,7 @@ async fn purge_handle(
     // caller disconnects mid-purge; dropping the
     // JoinHandle detaches the task instead of cancelling
     // it. The caller waits for the count, so the response
-    // is unchanged.
+    // still carries it.
     let task_state = state.clone();
     let task_target = target.to_string();
     let removed = tokio::spawn(async move {
@@ -2042,8 +2042,7 @@ async fn serve(
         max_age,
         sealed,
     };
-    // Debug requests keep bypassing everything, per
-    // request, as before.
+    // Debug requests bypass everything, per request.
     if debug {
         let (response, record, _) = serve_miss(state, work, record).await;
         return (response, record);
@@ -2217,8 +2216,8 @@ const META_SHARE_CAP: usize = 4 * 1024 * 1024;
 /// cap, a leader whose request was dropped) sends its
 /// followers to lead or follow the next flight, and
 /// finally to run the miss path themselves. Nothing
-/// outlives the flight: meta remains uncached across
-/// time, exactly as before.
+/// outlives the flight: meta stays uncached across
+/// time.
 ///
 /// The two choices this settles, deliberately: request
 /// records stay per request with no flight marker (the
@@ -2316,8 +2315,8 @@ async fn share_response(response: Response, cap: usize) -> (Response, Option<Sha
 /// How many times one request may wait on another
 /// request's in-flight miss for the same key before it
 /// stops waiting and runs the miss path itself (audit
-/// R2-09, issue #375). Since issue #407 a burst of
-/// identical requests settles on the first flight, so the
+/// R2-09, issue #375). A burst of identical requests
+/// settles on the first flight (issue #407), so the
 /// cap only comes into play for waiters no flight could
 /// answer.
 const MAX_FLIGHT_WAITS: u32 = 3;
@@ -2918,7 +2917,7 @@ async fn serve_miss(
     // #324): long-running work goes to the slow lane, so
     // its saturation sheds slow requests only and stills
     // keep their full capacity; everything else takes
-    // the stills lane as before.
+    // the stills lane.
     let lane = if wants_slow_lane(animated_webp, wants_video, wants_frame, wants_page) {
         Lane::Slow
     } else {
@@ -3095,7 +3094,7 @@ async fn serve_miss(
         // running keeps the entry out of every tier, while
         // the response below still serves the render
         // itself. The shared tier's write stays off the
-        // response path, as before.
+        // response path.
         put_memory_tier(state, write_snapshot, &cache_key, &entry);
         // The shared write is spawned before the disk
         // write waits (issue #347): it is already off the
@@ -3109,9 +3108,8 @@ async fn serve_miss(
     // run_process holds it until the work finishes, which
     // on this success path has already happened, so the
     // gate is free and the annotation paths acquire it per
-    // section like any other request. (They once ran under
-    // the request's own held permit, audit R2-29; that
-    // permit no longer outlives the run.)
+    // section like any other request. (The request's own
+    // AI permit does not outlive the run, audit R2-29.)
     let ai_gated = false;
     // The annotation sections share one deadline, the
     // same process budget the render ran under: a

@@ -338,7 +338,7 @@ fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> D
     let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
     // Every output pixel is a pure function of the source,
     // so the canvas splits into row bands across scoped
-    // threads without changing a byte (wave 3); small
+    // threads without changing a byte; small
     // canvases run sequentially on the calling thread.
     let row_len = (new_w * 4) as usize;
     let threads = band_threads();
@@ -477,11 +477,11 @@ fn map_rgb_image(
 }
 
 // ----------------------------------------------------------------
-// Wave-3 fast paths. Every function in this section is a
+// Fast paths. Every function in this section is a
 // byte-identical stand-in for the image-crate operation it
 // replaces: the identity is pinned by tests in this module
-// against the crate over fixture sweeps, and (for hue) an
-// exhaustive check over the RGB cube in the wave-3 spike.
+// against the crate over fixture sweeps, and hue was also
+// checked exhaustively over the RGB cube, outside the suite.
 // ----------------------------------------------------------------
 
 /// Below this frame size (in subpixels) the crate's
@@ -1466,11 +1466,11 @@ pub fn convolve(img: &DynamicImage, kernel: &[f64], normalize: bool) -> DynamicI
         1.0
     };
     let has_alpha = img.color().has_alpha();
-    // Fast path for opaque RGB sources: the RGBA detour this
-    // function used to take only ever read and wrote the three
-    // color channels (the synthesized alpha was dropped again
-    // on the way back), so working on the RGB buffer directly
-    // is byte-identical while skipping both conversions.
+    // Fast path for opaque RGB sources: the RGBA path below
+    // only ever reads and writes their three color channels
+    // (the synthesized alpha is dropped again on the way
+    // back), so working on the RGB buffer directly is
+    // byte-identical while skipping both conversions.
     if let DynamicImage::ImageRgb8(rgb) = img {
         let out = convolve_raw::<3>(
             rgb.as_raw(),
@@ -1956,9 +1956,9 @@ const FACE_MOSAIC_CELLS: u32 = 8;
 /// box: its longer side spans at most `FACE_MOSAIC_CELLS`
 /// cells, and a cell is never under 2 px, so a face only a few
 /// pixels wide is averaged away rather than passed through
-/// (issue #401: a 1 px block made the old nearest-neighbor
-/// round trip an identity for faces under 20 px, and sampling
-/// kept a quarter of the pixels of slightly larger ones).
+/// (issue #401: with a 1 px block a nearest-neighbor round
+/// trip is an identity for faces under 20 px, and sampling
+/// keeps a quarter of the pixels of slightly larger ones).
 /// Pixels outside the face boxes are untouched.
 pub fn pixelate_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicImage {
     redact_faces(img, faces, |region, face| {

@@ -4,10 +4,8 @@
 //! (image and meta flights), and the process runner
 //! itself.
 //!
-//! Extracted from server.rs as a pure code move: every
-//! item keeps its name and behavior, and server.rs
-//! re-exports the items the request path, main, and the
-//! tests use, so existing paths do not change.
+//! server.rs re-exports the items the request path, main,
+//! and the tests use.
 
 use std::sync::Arc;
 
@@ -423,16 +421,10 @@ pub(in crate::server) fn wants_slow_lane(
 /// inference, the external video encoder), which no
 /// checkpoint can interrupt: detaching is what bounds
 /// its hold on the server, and it aborts at the first
-/// deadline check after that call returns. Before issue
-/// #322 the runner waited on a flat ten-minute runaway
-/// cap instead, and the detached job kept the process
-/// permit with it, so one stuck encode shed every
-/// follow-up request with a gate 503 until it finished.
-/// Issue #357 gives the detached job its permits back
-/// deliberately: with the deadline machinery in place
-/// the hold is bounded (the deadline plus the longest
-/// single opaque call), where the ten-minute cap made
-/// it open-ended.
+/// deadline check after that call returns. The detached
+/// job keeps its permits deliberately (issue #357): the
+/// deadline checks bound the hold (the deadline plus the
+/// longest single opaque call).
 const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long an AI-backed request may wait for an inference
@@ -462,11 +454,10 @@ pub(in crate::server) const ANIM_GATE_WAIT: std::time::Duration =
 /// decode), and its output resolves to WebP through the
 /// engine's own resolution, the explicit `format(...)` or
 /// else the format negotiated from `Accept` (`preferred`).
-/// Since issue #370 an animated GIF rendered to WebP keeps
-/// its frames and runs the same libwebp animated encoder as
-/// an animated WebP source; before issue #405 this
-/// predicate looked at WebP sources only, so those encodes
-/// ran on the stills lane with no animation gate. The GIF
+/// An animated GIF rendered to WebP keeps its frames and
+/// runs the same libwebp animated encoder as an animated
+/// WebP source (issue #370), so this predicate covers both
+/// sources (issue #405). The GIF
 /// probe walks the first frame's compressed bytes, so it
 /// runs only when the output would resolve to WebP.
 pub(in crate::server) fn wants_animation_gate(
@@ -613,9 +604,8 @@ pub(in crate::server) async fn run_process(
     });
     // Past the deadline plus the grace bound the runner
     // stops waiting and sheds the request with a 504
-    // (issue #322), unchanged. What the shed leaves
-    // behind changed with issue #357: the detached job
-    // keeps every permit it holds until it finishes, so
+    // (issue #322). The detached job keeps every permit
+    // it holds until it finishes (issue #357), so
     // a follow-up request waits at the gate for the
     // bounded drain and sheds there if the drain outlasts
     // its gate wait, rather than starting work the

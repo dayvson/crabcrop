@@ -5,10 +5,8 @@
 //! detections, moderation, embedding, aesthetic, OCR),
 //! and the Accept negotiation that selects them.
 //!
-//! Extracted from server.rs as a pure code move: every
-//! item keeps its name and behavior, and server.rs
-//! re-exports the items the request path and the tests
-//! use, so existing paths do not change.
+//! server.rs re-exports the items the request path and the
+//! tests use.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -1375,8 +1373,7 @@ pub(in crate::server) fn ocr_json(meta: &OcrMeta) -> OcrJson {
 /// meta surface emits, in emission order, built from
 /// typed values and serialized with serde. Field order
 /// in this struct is the wire order; optional fields
-/// are skipped when absent, exactly where the
-/// hand-built body used to omit them.
+/// are skipped when absent.
 #[derive(serde::Serialize)]
 struct MetaBody {
     width: u32,

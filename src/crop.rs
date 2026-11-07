@@ -110,7 +110,7 @@ fn crop_to_aspect_impl(
     let dst_ratio = target_w as u64 * h as u64;
     if src_ratio == dst_ratio {
         // No crop runs, so the plain path decides nothing
-        // (and runs no detection, exactly as before). The
+        // (and runs no detection). The
         // traced path still reports the focal analysis: a
         // full-frame window positioned on the point.
         let traced = trace.then(|| focal_for(&align, &img, faces, declared));
@@ -179,7 +179,7 @@ fn crop_to_aspect_impl(
 /// The window start for smart alignment: the focal-point
 /// start, adjusted by face-safe placement (issue #199)
 /// when faces fed the decision. With no faces the focal
-/// start stands, exactly as before face-safety.
+/// start stands.
 fn smart_start(
     faces: &[crate::ai::FaceBox],
     vertical: bool,

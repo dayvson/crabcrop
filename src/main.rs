@@ -14,9 +14,8 @@
 #![forbid(unsafe_code)]
 
 // The modules live in the library target (`src/lib.rs`);
-// importing them at the crate root keeps every `crate::`
-// path in this file resolving as it did when they were
-// declared here.
+// importing them at the crate root lets every `crate::`
+// path in this file resolve to them.
 use crabcrop::{
     ai, cache, cli, engine, frames, loader, observe, pdf, provenance, quality, s3store, server,
     sigv4, storage, text, upload, url, video,
@@ -390,9 +389,9 @@ fn parse_env_value<T: std::str::FromStr>(
 /// Read a boolean environment variable, strictly: `1`,
 /// `true`, `yes`, `on` (any case) are true; `0`, `false`,
 /// `no`, `off` are false; anything else is a startup error
-/// naming the variable. The lenient reading this replaces
-/// (only `1` or `true` count) made a typo like `ture`
-/// silently false, which for a safety flag such as
+/// naming the variable. A lenient reading (only `1` or
+/// `true` count) would make a typo like `ture` silently
+/// false, which for a safety flag such as
 /// CRABCROP_BLOCK_PRIVATE_SOURCES is the unsafe direction.
 fn parse_bool(name: &str, default: bool) -> Result<bool, String> {
     parse_bool_value(name, env::var(name).ok(), default)

@@ -2799,13 +2799,12 @@ fn parse_text_color(s: &str) -> Option<[u8; 4]> {
 
 /// Everything the server and the engine need to know about a
 /// parsed request's directives, computed in ONE pass over the
-/// operations. This replaces the former family of per-question
-/// walks (each helper re-scanned the whole list, and the
-/// server's AI-gate predicate had drifted from the engine's
-/// preflight): there is now exactly one place that reads the
-/// ops list for directives, and both sides consume it.
+/// operations. This is the one place that reads the ops list
+/// for directives, and both the server and the engine consume
+/// it, so the server's AI-gate predicate cannot drift from the
+/// engine's preflight.
 ///
-/// Field semantics match the historical helpers: `format`,
+/// Field semantics: `format`,
 /// `fill`, `dpr`, and `facepad` are request-wide with the LAST
 /// segment winning; the shape filter is the FIRST one (it names
 /// error messages); class names keep request order; watermark
@@ -3502,10 +3501,9 @@ pub fn verify(secret: &[u8], signature: &Signature, remainder: &str, allow_unsaf
 /// P-1): they are HMACs under this derived key, never under the
 /// secret itself, so a signature minted for an image URL can
 /// never be replayed against the purge endpoint, even when the
-/// image remainder begins with `purge/`. Before this change the
-/// purge scheme signed the literal `purge/<target>` with the
-/// secret, which is exactly an image signature over a remainder
-/// of that shape.
+/// image remainder begins with `purge/`. Signing the literal
+/// `purge/<target>` with the secret itself would be exactly an
+/// image signature over a remainder of that shape.
 pub fn purge_key(secret: &[u8]) -> Vec<u8> {
     crabcrop_url::purge_key(secret)
 }
