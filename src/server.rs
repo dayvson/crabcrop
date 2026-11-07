@@ -4102,29 +4102,116 @@ async fn moderate_meta(
     }
 }
 
-/// Render a score list the way meta carries it:
-/// `[{"label":...,"score":...}, ...]`. A non-finite
+/// A number in a meta response, carried as the exact
+/// text the response has always printed for it (issue
+/// #346). serde_json renders floats through ryu, which
+/// spells a whole value 1.0 where these responses print
+/// 1, so a float cannot ride as a plain f32 or f64
+/// without changing the body byte for byte. The number
+/// is formatted here with the same expressions the
+/// hand-built body used (plain Display, {:.1}, {:.3},
+/// or the probe rounding below) and carried as a raw
+/// JSON value, so the typed structs around it serialize
+/// to the identical bytes.
+struct MetaNum(Box<serde_json::value::RawValue>);
+
+impl MetaNum {
+    fn text(text: String) -> Self {
+        // The text comes from Rust's own formatting of
+        // a finite value: sections guard non-finite
+        // provider output before composing (issue #352),
+        // and the remaining values are integers, counts,
+        // or probe readings that are finite whenever
+        // they exist. Rust's formatting of a finite
+        // value always spells a valid JSON number.
+        Self(
+            serde_json::value::RawValue::from_string(text)
+                .expect("a formatted finite number is valid JSON"),
+        )
+    }
+
+    /// Plain Display, the form most float fields use.
+    fn display(value: f32) -> Self {
+        Self::text(format!("{value}"))
+    }
+
+    /// One decimal place for a 64-bit value: the
+    /// verified auto-quality score.
+    fn fixed1(value: f64) -> Self {
+        Self::text(format!("{value:.1}"))
+    }
+
+    /// Three decimal places: segment scores and
+    /// coverages.
+    fn fixed3(value: f32) -> Self {
+        Self::text(format!("{value:.3}"))
+    }
+
+    /// Seconds as the video record prints them:
+    /// millisecond precision, whole values bare.
+    fn seconds(value: f64) -> Self {
+        let rounded = (value * 1000.0).round() / 1000.0;
+        if rounded == rounded.trunc() {
+            Self::text(format!("{}", rounded as i64))
+        } else {
+            Self::text(format!("{rounded}"))
+        }
+    }
+
+    /// PDF points as the pdf record prints them:
+    /// two-decimal precision, whole values bare.
+    fn points(value: f64) -> Self {
+        let rounded = (value * 100.0).round() / 100.0;
+        if rounded == rounded.trunc() {
+            Self::text(format!("{}", rounded as i64))
+        } else {
+            Self::text(format!("{rounded}"))
+        }
+    }
+}
+
+impl serde::Serialize for MetaNum {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+/// One scored label in a meta response: a tag, a
+/// moderation verdict, or a review signal.
+#[derive(serde::Serialize)]
+struct ScoreJson {
+    label: String,
+    score: MetaNum,
+}
+
+/// Build the wire form of a score list. A non-finite
 /// score has no JSON representation, so the list
 /// refuses as a whole (issue #352): the caller
 /// degrades the section rather than emit a malformed
 /// body. The meta helpers reject non-finite model
 /// output before composition, so this is the
 /// serializer's own guard for any future caller.
-fn score_list_json(scores: &[crate::ai::TagScore]) -> Option<String> {
+fn score_list(scores: &[crate::ai::TagScore]) -> Option<Vec<ScoreJson>> {
     if scores.iter().any(|s| !s.score.is_finite()) {
         return None;
     }
-    let items: Vec<String> = scores
-        .iter()
-        .map(|s| {
-            format!(
-                "{{\"label\":{},\"score\":{}}}",
-                serde_json::to_string(&s.label).unwrap_or_default(),
-                s.score
-            )
-        })
-        .collect();
-    Some(format!("[{}]", items.join(",")))
+    Some(
+        scores
+            .iter()
+            .map(|s| ScoreJson {
+                label: s.label.clone(),
+                score: MetaNum::display(s.score),
+            })
+            .collect(),
+    )
+}
+
+/// The string form of `score_list`,
+/// `[{"label":...,"score":...}, ...]`, kept for the
+/// guard's unit test.
+#[cfg(test)]
+fn score_list_json(scores: &[crate::ai::TagScore]) -> Option<String> {
+    score_list(scores).and_then(|list| serde_json::to_string(&list).ok())
 }
 
 /// The embedding field of a meta response that asked
@@ -4423,6 +4510,508 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     half
 }
 
+/// One detection box in a meta response, with the
+/// detector that produced it.
+#[derive(serde::Serialize)]
+struct DetectionJson {
+    label: String,
+    score: MetaNum,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    detector: String,
+}
+
+/// One detection box in an objects-crop record: the
+/// same box without the detector attribution.
+#[derive(serde::Serialize)]
+struct CropObjectJson {
+    label: String,
+    score: MetaNum,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// The review-only signals inside a moderation report.
+#[derive(serde::Serialize)]
+struct ModerationSignalsJson {
+    review_only: bool,
+    scores: Vec<ScoreJson>,
+}
+
+/// The moderation field of a meta response: the
+/// report, or the uniform unavailable object.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ModerationJson {
+    Report {
+        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scores: Option<Vec<ScoreJson>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signals: Option<ModerationSignalsJson>,
+    },
+    Unavailable {
+        available: bool,
+        reason: String,
+    },
+}
+
+/// Compose the moderation field. An empty section is
+/// omitted; a section that no longer renders (only
+/// possible if composition was skipped by a future
+/// caller) degrades the whole field to the unavailable
+/// form rather than present a partial one.
+fn moderation_json(meta: &ModerationMeta) -> ModerationJson {
+    match meta {
+        ModerationMeta::Report(report) => {
+            let scores = if report.scores.is_empty() {
+                Some(None)
+            } else {
+                score_list(&report.scores).map(Some)
+            };
+            let signals = if report.signals.is_empty() {
+                Some(None)
+            } else {
+                score_list(&report.signals).map(|scores| {
+                    Some(ModerationSignalsJson {
+                        review_only: true,
+                        scores,
+                    })
+                })
+            };
+            match (scores, signals) {
+                (Some(scores), Some(signals)) => ModerationJson::Report {
+                    model: report.model.clone(),
+                    scores,
+                    signals,
+                },
+                _ => ModerationJson::Unavailable {
+                    available: false,
+                    reason: "inference_failed".to_string(),
+                },
+            }
+        }
+        ModerationMeta::Unavailable(reason) => ModerationJson::Unavailable {
+            available: false,
+            reason: reason.to_string(),
+        },
+    }
+}
+
+/// The embedding slot of a meta response: the packed
+/// vector as a string, or an explicit null when the
+/// embedding was asked for but not produced.
+enum EmbeddingJson {
+    Packed(String),
+    Absent,
+}
+
+impl serde::Serialize for EmbeddingJson {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            EmbeddingJson::Packed(packed) => serializer.serialize_str(packed),
+            EmbeddingJson::Absent => serializer.serialize_none(),
+        }
+    }
+}
+
+/// The aesthetic field of a meta response: the head's
+/// identity always, the encoder's whenever a vector
+/// was produced, and a score or the reason there is
+/// none.
+#[derive(serde::Serialize)]
+struct AestheticJson {
+    head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    score: Option<MetaNum>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    got: Option<usize>,
+}
+
+fn aesthetic_json(meta: &AestheticMeta) -> AestheticJson {
+    let (score, reason, expected, got) = match &meta.outcome {
+        AestheticOutcome::Score(value) if value.is_finite() => {
+            (Some(MetaNum::display(*value)), None, None, None)
+        }
+        // A non-finite score has no JSON representation
+        // (issue #352): report it the way a failed
+        // inference is reported rather than print it.
+        AestheticOutcome::Score(_) => (None, Some("inference_failed"), None, None),
+        AestheticOutcome::DimensionMismatch { expected, got } => (
+            None,
+            Some("dimension_mismatch"),
+            Some(*expected),
+            Some(*got),
+        ),
+        AestheticOutcome::Unavailable(why) => (None, Some(*why), None, None),
+    };
+    AestheticJson {
+        head: meta.head.clone(),
+        model: meta.model.clone(),
+        score,
+        reason,
+        expected,
+        got,
+    }
+}
+
+/// One manifest summary inside the provenance field.
+#[derive(serde::Serialize)]
+struct ManifestJson {
+    state: &'static str,
+    signer: Option<String>,
+    manifests: usize,
+    ingredients: usize,
+}
+
+fn manifest_json(summary: &crate::provenance::ManifestSummary) -> ManifestJson {
+    ManifestJson {
+        state: summary.state,
+        signer: summary.signer.clone(),
+        manifests: summary.manifests,
+        ingredients: summary.ingredients,
+    }
+}
+
+/// The provenance field of a meta response.
+#[derive(serde::Serialize)]
+struct ProvenanceJson {
+    signing_configured: bool,
+    source: Option<ManifestJson>,
+    output: Option<ManifestJson>,
+}
+
+/// The video record of a meta response.
+#[derive(serde::Serialize)]
+struct VideoJson {
+    width: u32,
+    height: u32,
+    frame_timestamp: MetaNum,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration: Option<MetaNum>,
+}
+
+/// The pdf record of a meta response.
+#[derive(serde::Serialize)]
+struct PdfJson {
+    pages: u32,
+    page: u32,
+    page_width: MetaNum,
+    page_height: MetaNum,
+}
+
+/// The scene facts inside a studio record.
+#[derive(serde::Serialize)]
+struct SceneJson {
+    subject: Option<(u32, u32, u32, u32)>,
+    subjects: u32,
+    crop: (u32, u32, u32, u32),
+    levels: [[u8; 2]; 3],
+    saturation: MetaNum,
+}
+
+/// The studio record of a meta response.
+#[derive(serde::Serialize)]
+struct StudioJson {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bg_from: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadow: Option<String>,
+    pad: u8,
+    steps: Vec<&'static str>,
+    fallbacks: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scene: Option<SceneJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mask_confidence: Option<MetaNum>,
+}
+
+fn studio_json(record: &crate::studio::StudioRecord) -> StudioJson {
+    let (bg, bg_from, shadow) = match record.mode {
+        crate::url::StudioMode::Product => (
+            Some(match &record.bg {
+                Some([r, g, b]) => format!("#{r:02x}{g:02x}{b:02x}"),
+                None => "none".to_string(),
+            }),
+            Some(record.bg_from),
+            Some(record.shadow.name().to_string()),
+        ),
+        crate::url::StudioMode::Scene => (None, None, None),
+    };
+    StudioJson {
+        mode: match record.mode {
+            crate::url::StudioMode::Product => "product",
+            crate::url::StudioMode::Scene => "scene",
+        },
+        bg,
+        bg_from,
+        shadow,
+        pad: record.pad,
+        steps: record.steps.clone(),
+        fallbacks: record.fallbacks.clone(),
+        scene: record.scene.as_ref().map(|scene| SceneJson {
+            subject: scene.subject,
+            subjects: scene.subjects,
+            crop: scene.crop,
+            levels: scene.levels,
+            // The factor is recorded at millisecond
+            // precision: the value itself, not its full
+            // f32 expansion.
+            saturation: MetaNum::display((scene.saturation * 1000.0).round() / 1000.0),
+        }),
+        // A non-finite confidence has no JSON
+        // representation (issue #352): the field is
+        // omitted rather than printed.
+        mask_confidence: record
+            .confidence
+            .filter(|c| c.is_finite())
+            .map(MetaNum::display),
+    }
+}
+
+/// The inpaint record of a meta response.
+#[derive(serde::Serialize)]
+struct InpaintJson {
+    regions: Vec<(u32, u32, u32, u32)>,
+}
+
+/// One segmented object in a segments record.
+#[derive(serde::Serialize)]
+struct SegmentObjectJson {
+    label: String,
+    score: MetaNum,
+    #[serde(rename = "box")]
+    bounds: (u32, u32, u32, u32),
+    tight_box: (u32, u32, u32, u32),
+    coverage: MetaNum,
+    centroid: (u32, u32),
+}
+
+/// The segments record of a meta response. The record
+/// carries render-pipeline values, so it gets the same
+/// non-finite guarantee as the helper sections (issue
+/// #352, scope note on #346): a non-finite score or
+/// coverage omits the record rather than print a value
+/// JSON cannot represent.
+#[derive(serde::Serialize)]
+struct SegmentsJson {
+    objects: Vec<SegmentObjectJson>,
+}
+
+fn segments_json(record: &crate::engine::SegmentRecord) -> Option<SegmentsJson> {
+    if !record
+        .objects
+        .iter()
+        .all(|o| o.score.is_finite() && o.coverage.is_finite())
+    {
+        return None;
+    }
+    Some(SegmentsJson {
+        objects: record
+            .objects
+            .iter()
+            .map(|o| SegmentObjectJson {
+                label: o.label.clone(),
+                score: MetaNum::fixed3(o.score),
+                bounds: o.detection,
+                tight_box: o.tight_box,
+                coverage: MetaNum::fixed3(o.coverage),
+                centroid: o.centroid,
+            })
+            .collect(),
+    })
+}
+
+/// The objects-crop record of a meta response, with
+/// the same non-finite guarantee as the segments
+/// record above.
+#[derive(serde::Serialize)]
+struct ObjectsCropJson {
+    classes: Vec<String>,
+    scale: MetaNum,
+    path: &'static str,
+    objects: Vec<CropObjectJson>,
+    union: Option<(u32, u32, u32, u32)>,
+}
+
+fn objects_crop_json(record: &crate::engine::ObjectsCropRecord) -> Option<ObjectsCropJson> {
+    if !record.scale.is_finite() || !record.objects.iter().all(|o| o.score.is_finite()) {
+        return None;
+    }
+    Some(ObjectsCropJson {
+        classes: record.classes.clone(),
+        scale: MetaNum::display(record.scale),
+        path: if record.fallback {
+            "fallback"
+        } else {
+            "objects"
+        },
+        objects: record
+            .objects
+            .iter()
+            .map(|o| CropObjectJson {
+                label: o.label.clone(),
+                score: MetaNum::display(o.score),
+                x: o.x,
+                y: o.y,
+                w: o.w,
+                h: o.h,
+            })
+            .collect(),
+        union: record.union,
+    })
+}
+
+/// One line of recognized text in an OCR field.
+#[derive(serde::Serialize)]
+struct OcrLineJson {
+    text: String,
+    score: MetaNum,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// The OCR field of a meta response: the report, or
+/// the uniform unavailable object.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum OcrJson {
+    Report {
+        model: String,
+        language: String,
+        text: Vec<OcrLineJson>,
+        text_content: String,
+    },
+    Unavailable {
+        available: bool,
+        reason: String,
+    },
+}
+
+fn ocr_json(meta: &OcrMeta) -> OcrJson {
+    match meta {
+        OcrMeta::Report(report) => {
+            // Last-line guard (issue #352): a report that
+            // reached composition with a bad score
+            // degrades the same way a failed inference
+            // does, never a malformed value.
+            if report.lines.iter().all(|l| l.score.is_finite()) {
+                OcrJson::Report {
+                    model: report.model.clone(),
+                    language: report.language.clone(),
+                    text: report
+                        .lines
+                        .iter()
+                        .map(|l| OcrLineJson {
+                            text: l.text.clone(),
+                            score: MetaNum::display(l.score),
+                            x: l.x,
+                            y: l.y,
+                            w: l.w,
+                            h: l.h,
+                        })
+                        .collect(),
+                    text_content: report
+                        .lines
+                        .iter()
+                        .map(|l| l.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                }
+            } else {
+                OcrJson::Unavailable {
+                    available: false,
+                    reason: "inference_failed".to_string(),
+                }
+            }
+        }
+        OcrMeta::Unavailable(reason) => OcrJson::Unavailable {
+            available: false,
+            reason: reason.to_string(),
+        },
+    }
+}
+
+/// A meta response body (issue #346): every field the
+/// meta surface emits, in emission order, built from
+/// typed values and serialized with serde. Field order
+/// in this struct is the wire order; optional fields
+/// are skipped when absent, exactly where the
+/// hand-built body used to omit them.
+#[derive(serde::Serialize)]
+struct MetaBody {
+    width: u32,
+    height: u32,
+    format: &'static str,
+    bytes: usize,
+    source_width: u32,
+    source_height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sealed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<ScoreJson>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alt_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detections: Option<Vec<DetectionJson>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moderation: Option<ModerationJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding: Option<EmbeddingJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_dim: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_encoding: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_normalized: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aesthetic: Option<AestheticJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssimulacra2: Option<MetaNum>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<ProvenanceJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video: Option<VideoJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pdf: Option<PdfJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    studio: Option<StudioJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inpaint: Option<InpaintJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    segments: Option<SegmentsJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objects_crop: Option<ObjectsCropJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ocr: Option<OcrJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dominant_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placeholder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    palette: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbhash: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn meta_response(
     processed: &crate::engine::ProcessedImage,
@@ -4434,491 +5023,163 @@ fn meta_response(
     aesthetic: Option<&AestheticMeta>,
     ocr: Option<&OcrMeta>,
 ) -> Response {
-    let mut body = format!(
-        "{{\"width\":{},\"height\":{},\"format\":\"{}\",\"bytes\":{},\"source_width\":{},\"source_height\":{}",
-        processed.width,
-        processed.height,
-        format_name(processed.format),
-        processed.bytes.len(),
-        processed.source_width,
-        processed.source_height,
-    );
-    if sealed {
-        // The sealed audit (issue #255): a request that
-        // arrived sealed gets the render facts and every
-        // image-derived section (tags, detections,
-        // moderation, embedding, aesthetic, OCR, placeholder,
-        // ssimulacra2), never a field that reports operation
-        // or source text. Below, that means the operation
-        // records (video, pdf, studio, inpaint, segments)
-        // are skipped: each resolves or echoes a URL
-        // argument, the recipe text the token exists to
-        // hide. Model identities inside moderation and OCR
-        // are deployment facts the plain meta of any URL
-        // already publishes, and the base fields above are
-        // measured from the render.
-        body.push_str(",\"sealed\":true");
-    }
-    if let Some(a) = annotation {
-        // Tags serialize through the same guarded
-        // list as the moderation scores (issue #352):
-        // if a score ever arrived non-finite, the
-        // section omits instead of corrupting the
-        // body, the annotation failure stance.
-        if let Some(tags) = score_list_json(&a.tags) {
-            body.push_str(&format!(
-                ",\"tags\":{},\"alt_text\":{}",
-                tags,
-                serde_json::to_string(&a.alt_text).unwrap_or_default()
-            ));
-        }
-    }
-    if let Some(detections) = detections.filter(|ds| ds.iter().all(|(_, d)| d.score.is_finite())) {
-        // Each box keeps its original fields and gains a
-        // trailing `detector`: the provider that produced
-        // it (`builtin`, or a declared detector's name from
-        // `CRABCROP_DETECTORS_FILE`, issue #166).
-        let boxes: Vec<String> = detections
-            .iter()
-            .map(|(source, d)| {
-                format!(
-                    "{{\"label\":{},\"score\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"detector\":{}}}",
-                    serde_json::to_string(&d.label).unwrap_or_default(),
-                    d.score,
-                    d.x,
-                    d.y,
-                    d.w,
-                    d.h,
-                    serde_json::to_string(source).unwrap_or_default()
-                )
-            })
-            .collect();
-        body.push_str(&format!(",\"detections\":[{}]", boxes.join(",")));
-    }
-    if let Some(moderation) = moderation {
-        // The moderation field (issue #171): a report
-        // carries the model identity, the verdict scores
-        // when a classifier ran, and the zero-shot
-        // signals (marked review-only: leads, never
-        // verdicts) when the CLIP fallback ran. An
-        // unavailable moderation is explicit too, since
-        // the client opted in by name.
-        match moderation {
-            ModerationMeta::Report(report) => {
-                // Each list renders through the guarded
-                // serializer (issue #352): an absent list
-                // is a present section with no field, a
-                // refused list degrades the whole field
-                // to the unavailable form.
-                let scores = if report.scores.is_empty() {
-                    Some(None)
-                } else {
-                    score_list_json(&report.scores).map(Some)
-                };
-                let signals = if report.signals.is_empty() {
-                    Some(None)
-                } else {
-                    score_list_json(&report.signals).map(Some)
-                };
-                match (scores, signals) {
-                    (Some(scores), Some(signals)) => {
-                        body.push_str(&format!(
-                            ",\"moderation\":{{\"model\":{}",
-                            serde_json::to_string(&report.model).unwrap_or_default()
-                        ));
-                        if let Some(scores) = scores {
-                            body.push_str(&format!(",\"scores\":{scores}"));
-                        }
-                        if let Some(signals) = signals {
-                            body.push_str(&format!(
-                                ",\"signals\":{{\"review_only\":true,\"scores\":{signals}}}"
-                            ));
-                        }
-                        body.push('}');
-                    }
-                    _ => {
-                        body.push_str(
-                            ",\"moderation\":{\"available\":false,\"reason\":\"inference_failed\"}",
-                        );
-                    }
-                }
-            }
-            ModerationMeta::Unavailable(reason) => {
-                body.push_str(&format!(
-                    ",\"moderation\":{{\"available\":false,\"reason\":\"{reason}\"}}"
-                ));
-            }
-        }
-    }
-    if let Some(embedding) = embedding {
-        // The embedding fields (issue #172): the
-        // vector, base64-packed float16 little-endian,
-        // with the companions that keep it
-        // interpretable across operator
-        // reconfigurations: the encoder identity, the
-        // dimension, the encoding name, and the
-        // normalization guarantee. An opt-in that
-        // cannot be answered reports null plus a
-        // reason instead, like the moderation field.
-        match embedding {
-            EmbeddingMeta::Report(report) => {
-                body.push_str(&format!(
-                    ",\"embedding\":{},\"embedding_model\":{},\"embedding_dim\":{},\"embedding_encoding\":\"f16le-base64\",\"embedding_normalized\":true",
-                    serde_json::to_string(&pack_embedding(&report.vector)).unwrap_or_default(),
-                    serde_json::to_string(&report.model).unwrap_or_default(),
-                    report.vector.len()
-                ));
-            }
-            EmbeddingMeta::Unavailable(reason) => {
-                body.push_str(&format!(
-                    ",\"embedding\":null,\"embedding_reason\":\"{reason}\""
-                ));
-            }
-        }
-    }
-    if let Some(aesthetic) = aesthetic {
-        // The aesthetic field (issue #172): the head's
-        // score of the same embedding, with both
-        // identities, or a null score carrying the
-        // reason (a dimension mismatch names the
-        // expected and actual dimensions). The score
-        // is descriptive only.
-        body.push_str(&format!(
-            ",\"aesthetic\":{{\"head\":{}",
-            serde_json::to_string(&aesthetic.head).unwrap_or_default()
-        ));
-        if let Some(model) = &aesthetic.model {
-            body.push_str(&format!(
-                ",\"model\":{}",
-                serde_json::to_string(model).unwrap_or_default()
-            ));
-        }
-        match &aesthetic.outcome {
-            AestheticOutcome::Score(score) => {
-                // The serializer's own guard (issue
-                // #352): a non-finite score degrades to
-                // the unavailable shape rather than
-                // corrupt the body.
-                if score.is_finite() {
-                    body.push_str(&format!(",\"score\":{score}"));
-                } else {
-                    body.push_str(",\"score\":null,\"reason\":\"inference_failed\"");
-                }
-            }
-            AestheticOutcome::DimensionMismatch { expected, got } => {
-                body.push_str(&format!(
-                    ",\"score\":null,\"reason\":\"dimension_mismatch\",\"expected\":{expected},\"got\":{got}"
-                ));
-            }
-            AestheticOutcome::Unavailable(reason) => {
-                body.push_str(&format!(",\"score\":null,\"reason\":\"{reason}\""));
-            }
-        }
-        body.push('}');
-    }
-    if let Some(score) = processed.ssimulacra2.filter(|s| s.is_finite()) {
-        body.push_str(&format!(",\"ssimulacra2\":{score:.1}"));
-    }
-    if let Some(facts) = &processed.provenance {
-        // C2PA provenance (issue #173): what the source
-        // carried and what the output carries, verified
-        // inside the process job. Both are facts read from
-        // the assets' embedded credentials, the same class
-        // as the tags above, so a sealed request reports
-        // them too (never operation or source text). A
-        // valid credential proves origin, not untouched
-        // pixels: the states say exactly which of valid,
-        // trusted, or invalid each manifest earned.
-        let summary = |s: &crate::provenance::ManifestSummary| {
-            format!(
-                "{{\"state\":\"{}\",\"signer\":{},\"manifests\":{},\"ingredients\":{}}}",
-                s.state,
-                s.signer
-                    .as_ref()
-                    .map(|n| serde_json::to_string(n).unwrap_or_default())
-                    .unwrap_or_else(|| "null".to_string()),
-                s.manifests,
-                s.ingredients,
-            )
-        };
-        body.push_str(&format!(
-            ",\"provenance\":{{\"signing_configured\":{},\"source\":{},\"output\":{}}}",
-            facts.signing_configured,
-            facts
-                .source
-                .as_ref()
-                .map(summary)
-                .unwrap_or_else(|| "null".to_string()),
-            facts
-                .output
-                .as_ref()
-                .map(summary)
-                .unwrap_or_else(|| "null".to_string()),
-        ));
-    }
-    if !sealed && let Some(video) = &processed.video {
-        // The video record (issue #214): the probed facts
-        // of the video source and the resolved timestamp
-        // the frame was selected at. The duration is
-        // omitted when the container reports none. Numbers
-        // print at millisecond precision, the same
-        // rounding the extractor seeks with.
-        let seconds = |v: f64| {
-            let rounded = (v * 1000.0).round() / 1000.0;
-            if rounded == rounded.trunc() {
-                format!("{}", rounded as i64)
-            } else {
-                format!("{rounded}")
-            }
-        };
-        let duration = match video.duration_seconds {
-            Some(d) => format!(",\"duration\":{}", seconds(d)),
-            None => String::new(),
-        };
-        body.push_str(&format!(
-            ",\"video\":{{\"width\":{},\"height\":{},\"frame_timestamp\":{}{}}}",
-            video.width,
-            video.height,
-            seconds(video.frame_seconds),
-            duration
-        ));
-    }
-    if !sealed && let Some(pdf) = &processed.pdf {
-        // The PDF record (issue #215): the document's page
-        // count, the page this response rendered (after
-        // canonicalization), and the page size in points.
-        // Points print the way the probe reports them:
-        // whole values bare, fractions at two decimals.
-        let points = |v: f64| {
-            let rounded = (v * 100.0).round() / 100.0;
-            if rounded == rounded.trunc() {
-                format!("{}", rounded as i64)
-            } else {
-                format!("{rounded}")
-            }
-        };
-        body.push_str(&format!(
-            ",\"pdf\":{{\"pages\":{},\"page\":{},\"page_width\":{},\"page_height\":{}}}",
-            pdf.pages,
-            pdf.page,
-            points(pdf.page_width),
-            points(pdf.page_height)
-        ));
-    }
-    if !sealed && let Some(studio) = &processed.studio {
-        // The studio record (issues #197 and #198): the
-        // mode, the resolved parameters, the steps that
-        // ran, the fallbacks taken, and the mask confidence
-        // when the provider exposed one. Product spells its
-        // backdrop like the placeholder colors (`#rrggbb`),
-        // or `none` when the subject kept its transparency;
-        // scene carries its own object (subject, crop
-        // window, and the correction applied) and no
-        // backdrop fields at all.
-        let steps: Vec<String> = studio.steps.iter().map(|s| format!("\"{s}\"")).collect();
-        let fallbacks: Vec<String> = studio
-            .fallbacks
-            .iter()
-            .map(|s| format!("\"{s}\""))
-            .collect();
-        match studio.mode {
-            crate::url::StudioMode::Product => {
-                let bg = match studio.bg {
-                    Some(c) => format!("\"#{:02x}{:02x}{:02x}\"", c[0], c[1], c[2]),
-                    None => "\"none\"".to_string(),
-                };
-                body.push_str(&format!(
-                    ",\"studio\":{{\"mode\":\"product\",\"bg\":{bg},\"bg_from\":\"{}\",\"shadow\":\"{}\",\"pad\":{},\"steps\":[{}],\"fallbacks\":[{}]",
-                    studio.bg_from,
-                    studio.shadow.name(),
-                    studio.pad,
-                    steps.join(","),
-                    fallbacks.join(",")
-                ));
-            }
-            crate::url::StudioMode::Scene => {
-                body.push_str(&format!(
-                    ",\"studio\":{{\"mode\":\"scene\",\"pad\":{},\"steps\":[{}],\"fallbacks\":[{}]",
-                    studio.pad,
-                    steps.join(","),
-                    fallbacks.join(",")
-                ));
-                if let Some(scene) = &studio.scene {
-                    let subject = match scene.subject {
-                        Some((x, y, w, h)) => format!("[{x},{y},{w},{h}]"),
-                        None => "null".to_string(),
-                    };
-                    let (cx, cy, cw, ch) = scene.crop;
-                    let levels: Vec<String> = scene
-                        .levels
+    // A sealed meta describes the render and nothing
+    // else: the annotation/derivative sections below
+    // would echo the sealed operations (the objects a
+    // crop named, the regions an inpaint removed), so
+    // they are withheld, like the image URL's ops would
+    // be. The tags section is different: CLIP labels
+    // describe the pixels, not the recipe, so they ride
+    // along (a sealed holder can ask what is in the
+    // picture without learning how it was made).
+    // Detections sit with the tags: boxes and class
+    // names describe the pixels. Sections that name
+    // model identities stay (moderation, OCR): a model
+    // name is a property of the deployment, not of the
+    // recipe.
+    let tags = annotation.and_then(|a| score_list(&a.tags));
+    let alt_text = match (annotation, &tags) {
+        // The alt text rides whenever the tags render,
+        // even when it is empty: the pair is one section.
+        (Some(a), Some(_)) => Some(a.alt_text.clone()),
+        _ => None,
+    };
+    let meta = MetaBody {
+        width: processed.width,
+        height: processed.height,
+        format: format_name(processed.format),
+        bytes: processed.bytes.len(),
+        source_width: processed.source_width,
+        source_height: processed.source_height,
+        sealed: if sealed { Some(true) } else { None },
+        tags,
+        alt_text,
+        detections: detections.and_then(|pairs| {
+            // A non-finite score has no JSON
+            // representation (issue #352): the whole
+            // section is dropped rather than print a
+            // malformed value. The meta helper rejects
+            // non-finite boxes before this point, so
+            // this is the serializer's own guard.
+            if pairs.iter().all(|(_, d)| d.score.is_finite()) {
+                Some(
+                    pairs
                         .iter()
-                        .map(|[lo, hi]| format!("[{lo},{hi}]"))
-                        .collect();
-                    // Rounded to 3 decimals, like the other
-                    // model scores meta carries.
-                    let saturation = (scene.saturation * 1000.0).round() / 1000.0;
-                    body.push_str(&format!(
-                        ",\"scene\":{{\"subject\":{subject},\"subjects\":{},\"crop\":[{cx},{cy},{cw},{ch}],\"levels\":[{}],\"saturation\":{saturation}}}",
-                        scene.subjects,
-                        levels.join(",")
-                    ));
-                }
-            }
-        }
-        if let Some(confidence) = studio.confidence {
-            body.push_str(&format!(",\"mask_confidence\":{confidence}"));
-        }
-        body.push('}');
-    }
-    if !sealed && let Some(inpaint) = &processed.inpaint {
-        // The region-removal record (issue #176): the
-        // rectangles the inpainting model erased, in chain
-        // order, each [x, y, w, h] in the pixel coordinates
-        // in effect where its filter ran.
-        let regions: Vec<String> = inpaint
-            .regions
-            .iter()
-            .map(|(x, y, w, h)| format!("[{x},{y},{w},{h}]"))
-            .collect();
-        body.push_str(&format!(
-            ",\"inpaint\":{{\"regions\":[{}]}}",
-            regions.join(",")
-        ));
-    }
-    if !sealed && let Some(segments) = &processed.segments {
-        // The segmentation record (issue #175): every
-        // object a class operation segmented, in chain
-        // order, with its mask geometry: the detection box
-        // it came from, the silhouette's tight box inside
-        // it, and the silhouette's coverage of the box.
-        let objects: Vec<String> = segments
-            .objects
-            .iter()
-            .map(|o| {
-                let (x, y, w, h) = o.detection;
-                let (tx, ty, tw, th) = o.tight_box;
-                let (cx, cy) = o.centroid;
-                let label = serde_json::to_string(&o.label).unwrap_or_default();
-                let score = format!("{:.3}", o.score);
-                let coverage = format!("{:.3}", o.coverage);
-                format!(
-                    "{{\"label\":{label},\"score\":{score},\"box\":[{x},{y},{w},{h}],\
-                     \"tight_box\":[{tx},{ty},{tw},{th}],\
-                     \"coverage\":{coverage},\"centroid\":[{cx},{cy}]}}"
+                        .map(|(detector, d)| DetectionJson {
+                            label: d.label.clone(),
+                            score: MetaNum::display(d.score),
+                            x: d.x,
+                            y: d.y,
+                            w: d.w,
+                            h: d.h,
+                            detector: detector.clone(),
+                        })
+                        .collect(),
                 )
+            } else {
+                None
+            }
+        }),
+        moderation: moderation.map(moderation_json),
+        embedding: match embedding {
+            Some(EmbeddingMeta::Report(report)) => {
+                Some(EmbeddingJson::Packed(pack_embedding(&report.vector)))
+            }
+            Some(EmbeddingMeta::Unavailable(_)) => Some(EmbeddingJson::Absent),
+            None => None,
+        },
+        embedding_model: match embedding {
+            Some(EmbeddingMeta::Report(report)) => Some(report.model.clone()),
+            _ => None,
+        },
+        embedding_dim: match embedding {
+            Some(EmbeddingMeta::Report(report)) => Some(report.vector.len()),
+            _ => None,
+        },
+        embedding_encoding: match embedding {
+            Some(EmbeddingMeta::Report(_)) => Some("f16le-base64"),
+            _ => None,
+        },
+        embedding_normalized: match embedding {
+            Some(EmbeddingMeta::Report(_)) => Some(true),
+            _ => None,
+        },
+        embedding_reason: match embedding {
+            Some(EmbeddingMeta::Unavailable(reason)) => Some(*reason),
+            _ => None,
+        },
+        aesthetic: aesthetic.map(aesthetic_json),
+        // The verified auto-quality score, on the meta
+        // of the response it gated (issue #132). One
+        // decimal: the score is a ranking signal, not a
+        // measurement. A non-finite score cannot occur
+        // (ssimulacra2 returns a bounded dissimilarity),
+        // but the field guards anyway rather than print
+        // a malformed value.
+        ssimulacra2: processed
+            .ssimulacra2
+            .filter(|s| s.is_finite())
+            .map(MetaNum::fixed1),
+        provenance: processed.provenance.as_ref().map(|facts| ProvenanceJson {
+            signing_configured: facts.signing_configured,
+            source: facts.source.as_ref().map(manifest_json),
+            output: facts.output.as_ref().map(manifest_json),
+        }),
+        video: if sealed {
+            None
+        } else {
+            processed.video.as_ref().map(|v| VideoJson {
+                width: v.width,
+                height: v.height,
+                frame_timestamp: MetaNum::seconds(v.frame_seconds),
+                duration: v.duration_seconds.map(MetaNum::seconds),
             })
-            .collect();
-        body.push_str(&format!(
-            ",\"segments\":{{\"objects\":[{}]}}",
-            objects.join(",")
-        ));
-    }
-    if !sealed && let Some(record) = &processed.objects_crop {
-        // The objects-crop record (issue #318): the
-        // classes the crop named, the scale it applied,
-        // the path it took, and on the objects path the
-        // detections it used and the union box it framed,
-        // in the coordinates in effect where the crop ran
-        // (the output is the resized window, so the box is
-        // stated against the crop's canvas, like the
-        // segmentation record's geometry).
-        let classes: Vec<String> = record
-            .classes
-            .iter()
-            .map(|c| serde_json::to_string(c).unwrap_or_default())
-            .collect();
-        let objects: Vec<String> = record
-            .objects
-            .iter()
-            .map(|d| {
-                format!(
-                    "{{\"label\":{},\"score\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
-                    serde_json::to_string(&d.label).unwrap_or_default(),
-                    d.score,
-                    d.x,
-                    d.y,
-                    d.w,
-                    d.h
-                )
+        },
+        pdf: if sealed {
+            None
+        } else {
+            processed.pdf.as_ref().map(|pdf| PdfJson {
+                pages: pdf.pages,
+                page: pdf.page,
+                page_width: MetaNum::points(pdf.page_width),
+                page_height: MetaNum::points(pdf.page_height),
             })
-            .collect();
-        let union = match record.union {
-            Some((x, y, w, h)) => format!("[{x},{y},{w},{h}]"),
-            None => "null".to_string(),
-        };
-        body.push_str(&format!(
-            ",\"objects_crop\":{{\"classes\":[{}],\"scale\":{},\"path\":\"{}\",\"objects\":[{}],\"union\":{}}}",
-            classes.join(","),
-            record.scale,
-            if record.fallback { "fallback" } else { "objects" },
-            objects.join(","),
-            union
-        ));
-    }
-    if let Some(ocr) = ocr {
-        // The OCR field (issue #177): the model identity
-        // (the recognition model: it fixes the script),
-        // the operator-declared language, the lines in
-        // reading order with their boxes in the rendered
-        // image's pixels, and the lines joined as one
-        // text content. An unavailable OCR is explicit
-        // too, since the client opted in by name.
-        match ocr {
-            // A report whose line scores are not all
-            // finite falls through to the unavailable
-            // form below (issue #352): the serializer
-            // never writes a non-finite number.
-            OcrMeta::Report(report) if report.lines.iter().all(|l| l.score.is_finite()) => {
-                let lines: Vec<String> = report
-                    .lines
-                    .iter()
-                    .map(|l| {
-                        format!(
-                            "{{\"text\":{},\"score\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
-                            serde_json::to_string(&l.text).unwrap_or_default(),
-                            l.score,
-                            l.x,
-                            l.y,
-                            l.w,
-                            l.h
-                        )
-                    })
-                    .collect();
-                let content = report
-                    .lines
-                    .iter()
-                    .map(|l| l.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                body.push_str(&format!(
-                    ",\"ocr\":{{\"model\":{},\"language\":{},\"text\":[{}],\"text_content\":{}}}",
-                    serde_json::to_string(&report.model).unwrap_or_default(),
-                    serde_json::to_string(&report.language).unwrap_or_default(),
-                    lines.join(","),
-                    serde_json::to_string(&content).unwrap_or_default()
-                ));
-            }
-            OcrMeta::Report(_) => {
-                body.push_str(",\"ocr\":{\"available\":false,\"reason\":\"inference_failed\"}");
-            }
-            OcrMeta::Unavailable(reason) => {
-                body.push_str(&format!(
-                    ",\"ocr\":{{\"available\":false,\"reason\":\"{reason}\"}}"
-                ));
-            }
-        }
-    }
-    if let Some(ph) = &processed.placeholder {
-        let palette: Vec<String> = ph.palette.iter().map(|c| format!("\"{c}\"")).collect();
-        body.push_str(&format!(
-            ",\"dominant_color\":\"{}\",\"placeholder\":\"{}\",\"palette\":[{}],\"thumbhash\":\"{}\"",
-            ph.dominant_color,
-            ph.data_uri,
-            palette.join(","),
-            ph.thumbhash
-        ));
-    }
-    body.push('}');
+        },
+        studio: if sealed {
+            None
+        } else {
+            processed.studio.as_ref().map(studio_json)
+        },
+        inpaint: if sealed {
+            None
+        } else {
+            processed.inpaint.as_ref().map(|record| InpaintJson {
+                regions: record.regions.clone(),
+            })
+        },
+        segments: if sealed {
+            None
+        } else {
+            processed.segments.as_ref().and_then(segments_json)
+        },
+        objects_crop: if sealed {
+            None
+        } else {
+            processed.objects_crop.as_ref().and_then(objects_crop_json)
+        },
+        ocr: ocr.map(ocr_json),
+        dominant_color: processed
+            .placeholder
+            .as_ref()
+            .map(|ph| ph.dominant_color.clone()),
+        placeholder: processed.placeholder.as_ref().map(|ph| ph.data_uri.clone()),
+        palette: processed.placeholder.as_ref().map(|ph| ph.palette.clone()),
+        thumbhash: processed
+            .placeholder
+            .as_ref()
+            .map(|ph| ph.thumbhash.clone()),
+    };
+    let body = serde_json::to_string(&meta).unwrap_or_default();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
     // Meta is a second representation of the same URL (audit
