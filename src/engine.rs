@@ -71,8 +71,9 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// checked in our own code, because decoder adherence to
 /// `max_alloc` varies by format; a probe failure is not fatal
 /// (some valid files have headers the probe cannot read), the
-/// limited decode behind it is the second line.
-pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
+/// limited decode behind it is the second line. Public
+/// for the fuzz harness's decode target (issue #417).
+pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     // AVIF decoding is compiled in only with the avif-decode
     // feature (issue #141): dav1d is a C dependency the
     // default build does not carry. Name the way out rather
@@ -175,7 +176,7 @@ fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
 /// table does not enumerate (the PNM/TGA/QOI long tail);
 /// those carry no extension binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UploadMedia {
+pub enum UploadMedia {
     Svg,
     Heic,
     Jpeg,
@@ -256,9 +257,9 @@ pub(crate) struct PreparedUpload {
 /// decodability is the question. The upload handler
 /// calls [`prepare_upload`] (it also needs the prepared
 /// form); this predicate stays as the acceptance test's
-/// own spelling.
-#[allow(dead_code)]
-pub(crate) fn validate_source_image(bytes: &[u8]) -> Result<(), EngineError> {
+/// own spelling, and the fuzz harness's decode target
+/// drives every branch through it (issue #417).
+pub fn validate_source_image(bytes: &[u8]) -> Result<(), EngineError> {
     prepare_upload(bytes).map(|_| ())
 }
 
@@ -393,7 +394,7 @@ fn jxl_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 /// probe, the SVG document's intrinsic size, the HEIC item
 /// graph's announced size, or the JPEG XL basic info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SourceProbe {
+pub struct SourceProbe {
     /// A short lowercase media label: `jpeg`, `png`, `gif`,
     /// `webp`, `avif`, `jxl`, `heic`, `svg`, one of the image
     /// crate's long-tail kinds (`bmp`, `tiff`, `ico`), or

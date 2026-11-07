@@ -17,15 +17,22 @@ both SDKs must all pass.
 
 ## Layout
 
-- `src/`: the server binary. Pipeline in `engine.rs` (encoders in
-  `engine/encode.rs`, pipeline state in `engine/state.rs`), HTTP and
-  caching in `server.rs` (request coalescing in `server/process.rs`,
-  metadata responses in `server/meta.rs`), source fetching policy in
-  `loader.rs`, AI features in `ai.rs` and `studio.rs`.
-- `crates/crabcrop-url`: the URL grammar and signing library.
+- `src/`: the server. `lib.rs` declares the modules as a library
+  target, which the fuzz harness and the integration tests import;
+  `main.rs` is the binary, reading configuration and booting the
+  server. The operation parser and canonical forms in `url.rs`,
+  pipeline in `engine.rs` (encoders in `engine/encode.rs`, pipeline
+  state in `engine/state.rs`), HTTP and caching in `server.rs`
+  (request coalescing in `server/process.rs`, metadata responses in
+  `server/meta.rs`), source fetching policy in `loader.rs`, AI
+  features in `ai.rs` and `studio.rs`.
+- `crates/crabcrop-url`: the client-side library: signing, sealing,
+  verification, and URL building. It does not parse operations; the
+  server's parser is `src/url.rs`.
 - `sdks/`: TypeScript and Python SDKs, plus the MCP server (`sdks/mcp`).
 - `frameworks/`, `playground/`: integration starters and the live playground.
-- `fuzz/`: cargo-fuzz targets for the parsers.
+- `fuzz/`: cargo-fuzz targets over the server library: the URL
+  parser, the token opener, image decode, metadata, filter chains.
 - `tests/functional/`: the HTTP functional suite, tiered; the local tier
   runs without network or model files.
 

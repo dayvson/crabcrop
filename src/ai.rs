@@ -1480,8 +1480,11 @@ fn iou(a: &FaceBox, b: &FaceBox) -> f32 {
 /// variable keeps the old behavior exactly, including the
 /// panic on a non-UTF-8 value and any failure for a missing
 /// or invalid file it points at.
-#[cfg(test)]
-pub(crate) fn env_or_skip(name: &str) -> Option<String> {
+///
+/// Not `cfg(test)`: the binary's own tests (`src/main.rs`, a
+/// separate crate from this library) call it too.
+#[doc(hidden)]
+pub fn env_or_skip(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => {

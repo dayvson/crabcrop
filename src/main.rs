@@ -296,37 +296,14 @@
 
 #![forbid(unsafe_code)]
 
-mod ai;
-mod cache;
-mod cli;
-mod color;
-mod crop;
-mod debugview;
-mod engine;
-mod explain;
-mod filters;
-mod focus;
-mod frames;
-mod heic;
-mod loader;
-mod observe;
-mod pdf;
-mod placeholder;
-mod provenance;
-mod quality;
-mod s3store;
-mod server;
-mod sigv4;
-mod storage;
-mod studio;
-mod svg;
-mod text;
-mod thumbhash;
-mod tokenizer;
-mod toolrun;
-mod upload;
-mod url;
-mod video;
+// The modules live in the library target (`src/lib.rs`);
+// importing them at the crate root keeps every `crate::`
+// path in this file resolving as it did when they were
+// declared here.
+use crabcrop::{
+    ai, cache, cli, engine, frames, loader, observe, pdf, provenance, quality, s3store, server,
+    sigv4, storage, text, upload, url, video,
+};
 
 use std::env;
 use std::sync::Arc;
