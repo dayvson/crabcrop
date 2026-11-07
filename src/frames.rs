@@ -80,9 +80,13 @@ pub const MAX_FRAME_PNG_BYTES: usize = 256 * 1024 * 1024;
 const FORMAT_WHITELIST: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,flv,asf,ogg";
 
 /// How much of a tool's stderr report the probe keeps.
-/// The input report sits at the head of the output; this
-/// is generous headroom for chatty builds.
-const PROBE_REPORT_CAP: usize = 64 * 1024;
+/// The input report sits at the head of the output, and a
+/// real one is a few kilobytes; this is generous headroom
+/// for chatty builds and metadata-heavy sources. A probe
+/// report past the cap is refused, not parsed (issue
+/// #402): source metadata could have pushed the real facts
+/// past the cut and left only planted lines in view.
+const PROBE_REPORT_CAP: usize = 256 * 1024;
 
 /// What a probe learned about a video source.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -220,6 +224,12 @@ impl VideoFrameExtractor {
             0,
             deadline,
         )?;
+        if run.stderr_truncated {
+            return Err(FrameError::NotVideo(format!(
+                "the decoder's report on the source passed the {PROBE_REPORT_CAP} byte cap, \
+                 so its facts cannot be checked"
+            )));
+        }
         parse_probe(&run.stderr).ok_or_else(|| {
             if run.stderr.contains("Protocol not found") {
                 // FFmpeg before 6.0 has no `fd` protocol: say
@@ -407,22 +417,22 @@ impl VideoFrameExtractor {
         });
 
         let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-        let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<(String, bool)>();
         let stderr_thread = std::thread::spawn(move || {
             let mut kept = Vec::new();
+            let mut truncated = false;
             let mut chunk = [0u8; 16 * 1024];
             loop {
                 match stderr_pipe.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if kept.len() < PROBE_REPORT_CAP {
-                            let take = (PROBE_REPORT_CAP - kept.len()).min(n);
-                            kept.extend_from_slice(&chunk[..take]);
-                        }
+                        let take = (PROBE_REPORT_CAP - kept.len()).min(n);
+                        kept.extend_from_slice(&chunk[..take]);
+                        truncated |= take < n;
                     }
                 }
             }
-            let _ = err_tx.send(String::from_utf8_lossy(&kept).into_owned());
+            let _ = err_tx.send((String::from_utf8_lossy(&kept).into_owned(), truncated));
         });
 
         // Wait for the exit status without ever blocking
@@ -505,7 +515,7 @@ impl VideoFrameExtractor {
         // is worth a short grace through its channel, no
         // more; the stdout result already arrived through
         // its own channel.
-        let stderr = err_rx
+        let (stderr, stderr_truncated) = err_rx
             .recv_timeout(Duration::from_millis(200))
             .unwrap_or_default();
         drop(stdout_thread);
@@ -514,6 +524,7 @@ impl VideoFrameExtractor {
             status,
             stdout,
             stderr,
+            stderr_truncated,
         })
     }
 }
@@ -565,6 +576,8 @@ struct ToolRun {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: String,
+    /// Whether stderr passed the report cap and was cut.
+    stderr_truncated: bool,
 }
 
 /// The frame interval a probe implies, for clamping and
@@ -620,12 +633,6 @@ fn format_seconds(value: f64) -> String {
     }
 }
 
-/// Parse the probe facts out of the tool's stderr
-/// report: the `Duration:` line and the first
-/// `Stream ...: Video:` line that carries dimensions.
-/// Returns `None` when no usable video stream appears,
-/// which is the not-a-video answer for every corrupt,
-/// audio-only, or non-video source.
 /// Demuxers that carry raw still images rather than
 /// video (issue #266): ffmpeg promotes a JPEG embedded
 /// in an arbitrary blob (a PDF, a zip, junk bytes) to a
@@ -663,37 +670,101 @@ const IMAGE_DEMUXERS: &[&str] = &[
     "svg_pipe",
 ];
 
+/// The media type markers a stream line can carry, as the
+/// report spells them (the type name, capitalized, between
+/// `: ` and `: `).
+const STREAM_KINDS: &[&str] = &[
+    ": Video: ",
+    ": Audio: ",
+    ": Subtitle: ",
+    ": Data: ",
+    ": Attachment: ",
+    ": Unknown: ",
+];
+
+/// Parse the probe facts out of the tool's stderr report:
+/// the input's `Duration:` line and its lowest-numbered
+/// video stream that carries dimensions. Returns `None`
+/// when no usable video stream appears, which is the
+/// not-a-video answer for every corrupt, audio-only, or
+/// non-video source, and when the report carries planted
+/// fact lines (below), which is the same answer for a
+/// forged one.
+///
+/// The report interleaves the facts with source-controlled
+/// text: container, chapter, program, and stream metadata,
+/// and each stream's language tag inside its own stream
+/// line. A metadata value's continuation lines start with
+/// `: `, but keys and language tags print raw, newlines
+/// included, so a source can plant whole lines shaped like
+/// the facts, indentation and all (issue #402, the video
+/// twin of the forged PDF page size in #363). The parse
+/// leans only on what a source cannot change:
+///
+/// - Fact lines print at exactly two spaces of indent;
+///   metadata entries print at four or more, so a
+///   long metadata key that starts with `Duration: ` is
+///   not a fact.
+/// - The report prints exactly one `Duration:` line for
+///   the input, after every container metadata line and
+///   before the first stream. A second one means a planted
+///   copy, and the report is refused; stream lines count
+///   only after it.
+/// - Every stream prints, numbered from 0, always with the
+///   same text (a stream listed under two programs repeats
+///   verbatim). A planted stream line either reuses a real
+///   number with different text, which refuses the report,
+///   or takes a number above the real video stream's, which
+///   the lowest-number rule never reaches.
+/// - A stream's media type is the last type marker on its
+///   line: a marker planted in the language tag sits
+///   before the real one.
 pub fn parse_probe(report: &str) -> Option<VideoProbe> {
-    let mut duration = None;
-    let mut stream: Option<(u32, u32, Option<f64>)> = None;
-    let mut demuxers: Vec<&str> = Vec::new();
-    for line in report.lines() {
-        if demuxers.is_empty()
-            && let Some(rest) = line.trim_start().strip_prefix("Input #")
-            && let Some((_, after)) = rest.split_once(", ")
-            && let Some((list, _)) = after.split_once(", from ")
-        {
-            demuxers = list.split(',').map(str::trim).collect();
-        }
-        if duration.is_none()
-            && let Some(rest) = line.split("Duration: ").nth(1)
-        {
-            duration = parse_duration(rest);
-        }
-        // An attached picture (album art) is not the
-        // video stream, even when it is the only one.
-        if stream.is_none()
-            && line.contains("Stream #")
-            && line.contains(": Video: ")
-            && !line.contains("(attached pic)")
-        {
-            stream = parse_video_stream(line);
-        }
-    }
+    let lines: Vec<&str> = report.lines().collect();
+    let demuxers: Vec<&str> = lines
+        .iter()
+        .find_map(|line| {
+            let rest = line.trim_start().strip_prefix("Input #")?;
+            let (_, after) = rest.split_once(", ")?;
+            let (list, _) = after.split_once(", from ")?;
+            Some(list.split(',').map(str::trim).collect())
+        })
+        .unwrap_or_default();
     if !demuxers.is_empty() && demuxers.iter().all(|d| IMAGE_DEMUXERS.contains(d)) {
         return None;
     }
-    let (width, height, fps) = stream?;
+
+    let mut duration_lines = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(at, line)| Some((at, line.strip_prefix("  Duration: ")?)));
+    let (duration_at, duration_rest) = duration_lines.next()?;
+    if duration_lines.next().is_some() {
+        return None;
+    }
+    let duration = parse_duration(duration_rest);
+
+    let mut streams: std::collections::BTreeMap<u32, &str> = std::collections::BTreeMap::new();
+    for line in &lines[duration_at + 1..] {
+        let Some(rest) = line.strip_prefix("  Stream #0:") else {
+            continue;
+        };
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(index) = rest[..digits].parse::<u32>() else {
+            continue;
+        };
+        match streams.entry(index) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(line);
+            }
+            std::collections::btree_map::Entry::Occupied(seen) => {
+                if *seen.get() != *line {
+                    return None;
+                }
+            }
+        }
+    }
+    let (width, height, fps) = streams.values().find_map(|line| parse_video_stream(line))?;
     Some(VideoProbe {
         duration,
         width,
@@ -705,29 +776,56 @@ pub fn parse_probe(report: &str) -> Option<VideoProbe> {
 /// Parse an `HH:MM:SS.cc` duration token (the text right
 /// after `Duration: `, up to the comma). `N/A` and
 /// anything malformed mean the container reports no
-/// duration, which is a fact, not a failure.
+/// duration, which is a fact, not a failure. Every part
+/// must be plain digits: `str::parse::<f64>` alone would
+/// also take `NaN`, `inf`, signs, and exponents.
 fn parse_duration(rest: &str) -> Option<f64> {
     let token = rest.split(',').next()?.trim();
     let mut parts = token.split(':');
-    let hours: f64 = parts.next()?.parse().ok()?;
-    let minutes: f64 = parts.next()?.parse().ok()?;
-    let seconds: f64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || hours < 0.0 || minutes < 0.0 || seconds < 0.0 {
+    let (hours, minutes, seconds) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
         return None;
     }
-    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, "0"));
+    if !digits(hours) || !digits(minutes) || !digits(whole) || !digits(fraction) {
+        return None;
+    }
+    let total = hours.parse::<f64>().ok()? * 3600.0
+        + minutes.parse::<f64>().ok()? * 60.0
+        + seconds.parse::<f64>().ok()?;
+    total.is_finite().then_some(total)
 }
 
-/// Parse one video stream line: the first comma
-/// field whose leading token is exactly `<w>x<h>` (the
-/// field usually continues with `[SAR ... DAR ...]`),
-/// and the `<n> fps` field when present (with `<n> tbr`
-/// as the fallback rate). Leading-token matching plus a
-/// nonzero check keeps hex codec tags (`0x31637661`,
-/// which would split as 0 by 31637661) from reading as
-/// dimensions.
+/// Parse one stream line as a video stream: its media type
+/// is the last type marker on the line (see
+/// [`parse_probe`]), and an attached picture (album art) is
+/// not the video stream, even when it is the only one.
+/// From the text after the marker: the first comma field
+/// whose leading token is exactly `<w>x<h>` (the field
+/// usually continues with `[SAR ... DAR ...]`), and the
+/// `<n> fps` field when present (with `<n> tbr` as the
+/// fallback rate). Leading-token matching plus a nonzero
+/// check keeps hex codec tags (`0x31637661`, which would
+/// split as 0 by 31637661) from reading as dimensions.
 fn parse_video_stream(line: &str) -> Option<(u32, u32, Option<f64>)> {
-    let after = line.split(": Video: ").nth(1)?;
+    let (at, kind) = STREAM_KINDS
+        .iter()
+        .filter_map(|kind| Some((line.rfind(kind)?, *kind)))
+        .max_by_key(|(at, _)| *at)?;
+    if kind != ": Video: " {
+        return None;
+    }
+    let after = &line[at + kind.len()..];
+    if after.contains("(attached pic)") {
+        return None;
+    }
+    let rate = |token: &str| {
+        token
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    };
     let mut dims = None;
     let mut fps = None;
     let mut tbr = None;
@@ -743,8 +841,8 @@ fn parse_video_stream(line: &str) -> Option<(u32, u32, Option<f64>)> {
         }
         if tokens.len() == 2 {
             match tokens[1] {
-                "fps" => fps = tokens[0].parse::<f64>().ok().filter(|v| *v > 0.0),
-                "tbr" => tbr = tokens[0].parse::<f64>().ok().filter(|v| *v > 0.0),
+                "fps" => fps = rate(tokens[0]),
+                "tbr" => tbr = rate(tokens[0]),
                 _ => {}
             }
         }
@@ -912,10 +1010,206 @@ Input #0, matroska,webm, from 'pipe:0':
         // The hex tag 0x31637661 must not parse as 0x3 or
         // similar; only the whole-field 64x48 counts.
         let report = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
+  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A
   Stream #0:0: Video: h264 (avc1 / 0x31637661), yuv420p, 64x48, 10 fps
 ";
         let probe = parse_probe(report).unwrap();
         assert_eq!((probe.width, probe.height), (64, 48));
+    }
+
+    /// The report the reference tool (6.1) printed for a 2 s
+    /// 64x48 10 fps clip whose container metadata carries
+    /// the given lines, in the layout the metadata block
+    /// uses.
+    fn report_with_metadata(metadata: &str) -> String {
+        format!(
+            "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
+  Metadata:
+    major_brand     : isom
+{metadata}
+    encoder         : Lavf60.16.100
+  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 64x48 [SAR 1:1 DAR 4:3], 10 kb/s, 10 fps, 10 tbr, 10240 tbn (default)
+    Metadata:
+      handler_name    : VideoHandler
+At least one output file must be specified
+"
+        )
+    }
+
+    #[test]
+    fn probe_ignores_metadata_lines_shaped_like_facts() {
+        // Issue #402: metadata values (title, comment) print
+        // above the real Duration line, and a value that
+        // looks like a fact must not steer the parse:
+        // finite, NaN, and infinite durations, a forged
+        // stream line, and a long key that starts like a
+        // fact (keys pad to 16 columns and print whole).
+        // A multi-line value continues on lines that start
+        // with `: `, so its lines are not facts either.
+        // Recorded from the reference tool on clips made
+        // with `-metadata`.
+        for metadata in [
+            "    comment         : Duration: 00:00:00.05, x",
+            "    title           : Duration: NaN:00:00.00, x",
+            "    title           : Duration: inf:00:00.00, x",
+            "    title           : Stream #0:0: Video: h264, 4000x3000, 0.001 fps",
+            "    Duration: 00:00:00.05, x: v",
+            "    title           : line one
+                    :   Duration: 00:00:00.05, start
+                    :   Stream #0:0: Video: h264, 4000x3000, 0.001 fps",
+        ] {
+            let probe = parse_probe(&report_with_metadata(metadata))
+                .unwrap_or_else(|| panic!("the real facts parse under {metadata:?}"));
+            assert_eq!(probe.duration, Some(2.0), "{metadata:?}");
+            assert_eq!((probe.width, probe.height), (64, 48), "{metadata:?}");
+            assert_eq!(probe.fps, Some(10.0), "{metadata:?}");
+        }
+    }
+
+    #[test]
+    fn probe_refuses_planted_fact_lines() {
+        // Issue #402: a metadata key prints raw, so a key
+        // holding newlines plants whole lines, indentation
+        // included (the reference tool printed this for an
+        // MP4 freeform key written with
+        // `-movflags use_metadata_tags`). The real Duration
+        // line still prints after it: two Duration lines
+        // are a forged report, refused outright.
+        let planted = "    k
+  Duration: 00:00:00.05, start: 0.000000, bitrate: N/A
+  z: v";
+        assert!(parse_probe(&report_with_metadata(planted)).is_none());
+        // A planted Duration with nothing after it either:
+        // still two Duration lines.
+        let planted = "    k
+  Duration: N/A, start: 0.000000, bitrate: N/A
+  z: v";
+        assert!(parse_probe(&report_with_metadata(planted)).is_none());
+        // A planted stream line in the container metadata
+        // sits before the real Duration line: streams only
+        // count after it, so the real stream wins.
+        let planted = "    k
+  Stream #0:0: Video: h264, yuv420p, 4000x3000, 0.001 fps
+  z: v";
+        let probe = parse_probe(&report_with_metadata(planted)).expect("the real stream parses");
+        assert_eq!((probe.width, probe.height), (64, 48));
+        assert_eq!(probe.fps, Some(10.0));
+
+        // Planted after the Duration line (stream, chapter,
+        // or program metadata): reusing a real stream
+        // number with different text is a forgery...
+        let report = "\
+Input #0, matroska,webm, from 'pipe:0':
+  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A
+  Stream #0:0: Audio: vorbis, 44100 Hz, mono, fltp
+    Metadata:
+      k
+  Stream #0:1: Video: h264, yuv420p, 4000x3000, 0.001 fps
+      z           : v
+  Stream #0:1: Video: h264 (High), yuv420p(tv, progressive), 64x48 [SAR 1:1 DAR 4:3], 10 fps, 10 tbr, 1k tbn
+";
+        assert!(parse_probe(report).is_none());
+        // ...and a fresh, higher number never outranks the
+        // real video stream, which has the lowest number.
+        let report = "\
+Input #0, matroska,webm, from 'pipe:0':
+  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A
+  Chapters:
+    Chapter #0:0: start 0.000000, end 1.000000
+      Metadata:
+        k
+  Stream #0:7: Video: h264, yuv420p, 4000x3000, 0.001 fps
+        z               : v
+  Stream #0:0: Video: h264 (High), yuv420p(tv, progressive), 64x48 [SAR 1:1 DAR 4:3], 10 fps, 10 tbr, 1k tbn
+";
+        let probe = parse_probe(report).expect("the real stream parses");
+        assert_eq!((probe.width, probe.height), (64, 48));
+        // A stream listed under two programs repeats
+        // verbatim; that is a real report, not a forgery.
+        let report = "\
+Input #0, mpegts, from 'pipe:0':
+  Duration: 00:00:02.00, start: 1.400000, bitrate: N/A
+  Program 1
+  Stream #0:0[0x100]: Video: h264 (High) ([27][0][0][0] / 0x001B), yuv420p(progressive), 64x48, 10 fps, 10 tbr, 90k tbn
+  Program 2
+  Stream #0:0[0x100]: Video: h264 (High) ([27][0][0][0] / 0x001B), yuv420p(progressive), 64x48, 10 fps, 10 tbr, 90k tbn
+";
+        let probe = parse_probe(report).expect("a repeated stream parses");
+        assert_eq!((probe.width, probe.height), (64, 48));
+    }
+
+    #[test]
+    fn probe_reads_a_stream_type_past_a_forged_language_tag() {
+        // Issue #402: a Matroska language tag prints raw
+        // inside its stream line, ahead of the real type.
+        // Recorded from the reference tool: the audio stream
+        // must not read as a 4000x3000 video, and the real
+        // video stream still parses.
+        let report = "\
+Input #0, matroska,webm, from 'pipe:0':
+  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A
+  Stream #0:0(x): Video: h264, yuv420p, 4000x3000, 0.001 fps, 1 tbr (): Audio: vorbis, 44100 Hz, mono, fltp
+  Stream #0:1: Video: h264 (High), yuv420p(tv, progressive), 64x48 [SAR 1:1 DAR 4:3], 10 fps, 10 tbr, 1k tbn
+";
+        let probe = parse_probe(report).expect("the real video stream parses");
+        assert_eq!((probe.width, probe.height), (64, 48));
+        assert_eq!(probe.fps, Some(10.0));
+        // A language tag cannot mark the real video stream
+        // as an attached picture either.
+        let report = "\
+Input #0, matroska,webm, from 'pipe:0':
+  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A
+  Stream #0:0((attached pic)): Video: h264 (High), yuv420p(tv, progressive), 64x48, 10 fps, 10 tbr, 1k tbn
+";
+        assert!(parse_probe(report).is_some());
+    }
+
+    #[test]
+    fn probe_rejects_non_finite_and_malformed_numbers() {
+        // Issue #402: `str::parse::<f64>` takes NaN, inf,
+        // signs, and exponents; none of them is a duration
+        // the report prints, so each reads as no duration.
+        for token in [
+            "NaN:00:00.00",
+            "inf:00:00.00",
+            "00:00:NaN",
+            "00:00:inf",
+            "00:00:infinity",
+            "-1:00:00.00",
+            "+1:00:00.00",
+            "00:00:1e3",
+            "00:00:.5",
+            "00:00:5.",
+            "00::05.00",
+            "00:00:05.00:00",
+            "N/A",
+            "",
+        ] {
+            assert_eq!(
+                parse_duration(&format!("{token}, start: 0")),
+                None,
+                "{token}"
+            );
+        }
+        // Digits that overflow to infinity are refused too.
+        let huge = format!("{}:00:00.00", "9".repeat(400));
+        assert_eq!(parse_duration(&huge), None);
+        // The real spellings still parse, past 99 hours too.
+        assert_eq!(parse_duration("00:00:02.00, start: 0"), Some(2.0));
+        assert_eq!(parse_duration("123:04:05.50, start: 0"), Some(443045.5));
+        assert_eq!(parse_duration("00:00:07, start: 0"), Some(7.0));
+
+        // A frame rate must be finite and positive; the tbr
+        // fallback follows the same rule.
+        for rate in ["inf fps", "NaN fps", "0 fps", "-10 fps", "infinity fps"] {
+            let line = format!("  Stream #0:0: Video: h264, yuv420p, 64x48, {rate}, inf tbr");
+            assert_eq!(parse_video_stream(&line), Some((64, 48, None)), "{rate}");
+        }
+        let line = "  Stream #0:0: Video: h264, yuv420p, 64x48, inf fps, 25 tbr";
+        assert_eq!(parse_video_stream(line), Some((64, 48, Some(25.0))));
     }
 
     #[test]
@@ -1164,6 +1458,32 @@ exit 1\n",
             .unwrap_err();
         assert!(matches!(err, FrameError::Failed(_)), "{err}");
         assert!(err.to_string().contains("produced no frame"), "{err}");
+    }
+
+    #[test]
+    fn probe_refuses_a_report_past_the_cap() {
+        // Issue #402: source metadata can be long enough to
+        // push the real facts past the report cap, leaving
+        // only planted lines in the kept part. A report that
+        // passed the cap is refused instead of parsed.
+        let program = fake_tool(
+            "longreport",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\n\
+printf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Metadata:' '    k' \
+'  Duration: 00:00:00.05, start: 0.000000, bitrate: N/A' \
+'  Stream #0:0: Video: h264, yuv420p, 4000x3000, 0.001 fps' >&2\n\
+head -c {} /dev/zero | tr '\\000' 'x' >&2\n\
+printf '\\n%s\\n' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' \
+'  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\n\
+exit 1\n",
+                PROBE_REPORT_CAP
+            ),
+        );
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        let err = extractor.probe(b"video bytes").unwrap_err();
+        assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
+        assert!(err.to_string().contains("byte cap"), "{err}");
     }
 
     #[test]
@@ -1438,5 +1758,97 @@ exit 1\n",
                 .unwrap_err();
             assert!(matches!(err, FrameError::NotVideo(_)), "{script:?}: {err}");
         }
+    }
+
+    #[test]
+    fn real_tool_ignores_forged_metadata() {
+        // Issue #402 end to end: clips whose container
+        // metadata imitates the report's fact lines. A
+        // forged value is ignored and the selection lands
+        // where the real duration puts it; a key that
+        // plants whole lines makes the report a forgery,
+        // refused as a bad source.
+        let Some(ffmpeg) = ffmpeg_path() else {
+            return;
+        };
+        let dir = temp_dir("forged");
+        let make = |name: &str, extra: &[&str]| {
+            let clip = dir.join(name);
+            let status = Command::new(&ffmpeg)
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=red:size=64x48:rate=10:duration=1",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=green:size=64x48:rate=10:duration=1",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=blue:size=64x48:rate=10:duration=1",
+                    "-filter_complex",
+                    "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+                    "-map",
+                    "[v]",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .args(extra)
+                .arg(&clip)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name}");
+            std::fs::read(&clip).unwrap()
+        };
+        let extractor = VideoFrameExtractor::new(ffmpeg.clone(), Duration::from_secs(30)).unwrap();
+        for (name, extra) in [
+            (
+                "comment.mp4",
+                ["-metadata", "comment=Duration: 00:00:00.05, x"],
+            ),
+            ("nan.mp4", ["-metadata", "title=Duration: NaN:00:00.00, x"]),
+            ("inf.mp4", ["-metadata", "title=Duration: inf:00:00.00, x"]),
+            (
+                "stream.mp4",
+                [
+                    "-metadata",
+                    "title=Stream #0:0: Video: h264, 4000x3000, 0.001 fps",
+                ],
+            ),
+        ] {
+            let bytes = make(name, &extra);
+            let frame = extractor
+                .extract_frame(&bytes, FrameSelection::Seconds(1.5))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(frame.duration, Some(3.0), "{name}");
+            assert_eq!((frame.width, frame.height), (64, 48), "{name}");
+            assert_eq!(frame.timestamp, 1.5, "{name}");
+            let img = image::load_from_memory(&frame.png).unwrap().to_rgb8();
+            let p = img.get_pixel(32, 24);
+            assert!(
+                p[1] > 100 && p[0] < 60 && p[2] < 60,
+                "{name}: 1.5s is green: {p:?}"
+            );
+        }
+        let bytes = make(
+            "planted.mp4",
+            &[
+                "-movflags",
+                "use_metadata_tags",
+                "-metadata",
+                "k\n  Duration: 00:00:00.05, start: 0.000000, bitrate: N/A\n  z=v",
+            ],
+        );
+        let err = extractor
+            .extract_frame(&bytes, FrameSelection::Seconds(1.5))
+            .unwrap_err();
+        assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
     }
 }
