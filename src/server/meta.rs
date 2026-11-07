@@ -16,7 +16,8 @@ use std::time::Instant;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use super::{AI_GATE_WAIT, AppState};
+use super::AppState;
+use super::process::AI_GATE_WAIT;
 use crate::url::ImageFormat;
 
 /// Whether the client asked for the meta response: an explicit
