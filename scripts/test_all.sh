@@ -44,6 +44,28 @@ python3 spec/generate_operation_vectors.py --check
 step "Version consistency (every artifact and deploy pin agrees)"
 python3 scripts/check_versions.py
 
+step "npm dist-tag (a prerelease publishes under next, never latest)"
+for pair in "0.10.0 latest" "0.10.0-rc.1 next" "1.2.3-beta.2+sha.5 next" "1.2.3+build-7 latest"; do
+  set -- $pair
+  got=$(bash scripts/npm_dist_tag.sh "$1")
+  if [ "$got" != "$2" ]; then
+    echo "npm_dist_tag.sh $1 printed '$got', expected '$2'" >&2
+    exit 1
+  fi
+done
+for bad in "v0.10.0" "crabcrop-url/0.10.0" "0.10" "0.10.0-"; do
+  if bash scripts/npm_dist_tag.sh "$bad" >/dev/null 2>&1; then
+    echo "npm_dist_tag.sh accepted '$bad', which is not a version" >&2
+    exit 1
+  fi
+done
+# Both npm publish steps (@crabcrop/url and @crabcrop/mcp) pass the tag.
+if [ "$(grep -c 'npm publish --access public --tag "\$NPM_TAG"$' .github/workflows/release.yml)" -ne 2 ] \
+  || grep -q 'npm publish --access public$' .github/workflows/release.yml; then
+  echo "every npm publish in release.yml must pass --tag \"\$NPM_TAG\" from scripts/npm_dist_tag.sh" >&2
+  exit 1
+fi
+
 step "Build (debug binary: the MCP suite spawns it)"
 cargo build --locked
 
