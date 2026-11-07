@@ -49,6 +49,18 @@ jobs:
       - name: Run tests with AVIF decode
         run: cargo test --locked --verbose --features avif-decode
 
+  macos:
+
+    # The release ships macOS binaries, and some system
+    # APIs exist only on Linux, so a pull request must
+    # compile on macOS as well.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the crate compiles on macOS
+        run: cargo check --locked --all-targets
+
   msrv:
 
     runs-on: ubuntu-latest

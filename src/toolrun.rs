@@ -19,6 +19,11 @@
 //! meaningful work of its own in that window, and the
 //! wall-clock group kill covers the whole lifetime
 //! regardless.
+//!
+//! `prlimit` exists only on Linux and Android, so the
+//! limits apply there; on other platforms (macOS
+//! included) the wall clock and the group kill are the
+//! bounds, as docs/media.md states.
 
 use std::time::Duration;
 
@@ -65,10 +70,11 @@ fn cpu_limit_for(timeout: Duration, cores: usize) -> Duration {
 /// Apply the resource limits to a spawned tool child.
 /// Best effort: a limit the platform refuses is skipped
 /// (the wall-clock timeout and the process-group kill
-/// remain the primary bounds). Unix only; elsewhere this
-/// is a no-op, as before.
+/// remain the primary bounds). Linux and Android only,
+/// the platforms with `prlimit`; elsewhere (macOS
+/// included) this is a no-op.
 pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64) {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let Ok(raw) = i32::try_from(pid) else {
             return;
@@ -94,13 +100,13 @@ pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64)
             },
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = (pid, cpu_limit, max_address_space);
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
