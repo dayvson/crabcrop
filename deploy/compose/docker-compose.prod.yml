@@ -24,6 +24,10 @@ services:
     # without CRABCROP_SECRET in it.
     env_file:
       - ./crabcrop.env
+    # The image creates /var/cache/crabcrop owned by nobody,
+    # and a fresh named volume copies that ownership. Keep
+    # the path: the server exits at boot when the directory
+    # is not writable (see README.md for an older volume).
     environment:
       CRABCROP_RESULT_STORAGE_DIR: /var/cache/crabcrop
     volumes:

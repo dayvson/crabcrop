@@ -63,7 +63,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_PDF_TIMEOUT_SECS` | `30` | Hard wall-clock limit per external PDF tool run (one probe or one page render), 1 to 600 seconds. |
 | `CRABCROP_VIDEO_MAX_MB` | `64` | Output cap per video encode in megabytes, 1 to 1024. The encode aborts the moment it is crossed. |
 | `CRABCROP_FALLBACK_IMAGE` | unset | URL or local file path of the fallback image served when a source cannot be fetched or decoded. See [Fallback image](responses.md#fallback-image). |
-| `CRABCROP_RESULT_STORAGE_DIR` | unset | Directory for the disk-backed result store. Unset disables the second cache tier. |
+| `CRABCROP_RESULT_STORAGE_DIR` | unset | Directory for the disk-backed result store, created if missing. Unset disables the second cache tier. The server exits at boot when the directory is not writable by its user; the container images run as `nobody` (65534) and ship `/var/cache/crabcrop` owned by it, so mount the tier's volume there or make the mount writable by 65534. |
 | `CRABCROP_RESULT_BUCKET` | unset | S3 bucket for the shared result store (multi-replica third tier). Unset disables it. |
 | `CRABCROP_RESULT_PREFIX` | empty | Object prefix namespacing the shared result store's entries. |
 | `CRABCROP_RESULT_STORAGE_MAX_MB` | `512` | Disk result store budget in megabytes. `0` disables storage even with a directory set. |

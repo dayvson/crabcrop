@@ -34,7 +34,9 @@ kubectl create secret generic crabcrop \
 
 - `base/`: the workload as the chart's default values
   render it. Deployment (one replica, `/health` probes,
-  `PORT`, the secret reference) and Service. The base
+  `PORT`, the secret reference, and the pod
+  `securityContext.fsGroup: 65534` that lets the image's
+  `nobody` user write mounted volumes) and Service. The base
   ships no Secret on purpose (audit R2-40): create the
   one from The signing secret above before applying;
   until it exists, the pod cannot start. The Helm
@@ -50,7 +52,11 @@ kubectl create secret generic crabcrop \
   - `result-storage`: the disk result tier (PVC plus
     `CRABCROP_RESULT_STORAGE_DIR` and its budget). One pod's
     disk: do not share the claim across replicas unless it
-    is a genuinely shared (RWX) filesystem.
+    is a genuinely shared (RWX) filesystem. The server
+    exits at boot when the directory is not writable, and a
+    fresh claim mounts root-owned: the base's `fsGroup`
+    is what makes it writable, so keep it if you replace
+    the base's pod `securityContext`.
   - `ai`: the AI variant image (`Dockerfile.ai`) and a
     models volume referencing a claim named
     `crabcrop-models` that you provide, holding the ONNX
