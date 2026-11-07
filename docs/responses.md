@@ -34,6 +34,8 @@ Metadata follows an operator policy, `CRABCROP_METADATA`:
 
 Preservation copies the source segments rather than re-serializing them, with one patch: the EXIF orientation is rewritten to 1, because the pixels were already rotated at decode and the original value would double-rotate in viewers. EXIF orientation itself is always honored at decode, under either policy.
 
+Reading a source's profile and metadata is bounded, because PNG stores the profile, and can store the XMP packet, compressed. Only the first profile (`iCCP`), EXIF (`eXIf`), and XMP packet of a PNG are read, as libpng does; repeats are skipped unread. A profile that inflates past 4 MiB, or an XMP packet past 16 MiB, is dropped rather than truncated, and all of one source's metadata inflates within a single 20 MiB budget. Under `strip`, EXIF and XMP are not read at all; the profile always is, since it drives the color conversion.
+
 ### Fallback image
 
 With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at startup), a source that cannot be fetched or decoded degrades to the fallback instead of an error: the fallback runs through the same operations and is served with `200` and the header `X-Crabcrop-Fallback: 1`. Signature and parse failures never fall back, a `403` or `400` stays honest, and neither does a source-policy refusal. Fallback responses are never cached, so a recovered origin is picked up on the next request; they are also served with `Cache-Control: no-store`, so a CDN or browser never pins the placeholder in place of the real image. With no fallback configured, error behavior is unchanged.

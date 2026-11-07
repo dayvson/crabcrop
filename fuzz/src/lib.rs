@@ -223,7 +223,7 @@ pub fn check_decode(data: &[u8]) {
 /// color conversion runs too, since it parses the
 /// profile with a real color engine.
 pub fn check_meta(data: &[u8]) {
-    let meta = color::extract_source_meta(data);
+    let meta = color::extract_source_meta(data, true);
     if let Some(exif) = &meta.exif_tiff {
         let mut tiff = exif.clone();
         color::patch_tiff_orientation(&mut tiff);
