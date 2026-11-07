@@ -423,7 +423,28 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Compute version (tag without the leading v)
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          # A prerelease version carries a hyphen (as in
+          # 0.10.0-rc.1) and pushes only its own tag; the
+          # :latest tags move only on a plain release.
+          {
+            echo "BASE_TAGS<<EOF"
+            echo "ghcr.io/dayvson/crabcrop:$version"
+            case "$version" in
+              *-*) ;;
+              *) echo "ghcr.io/dayvson/crabcrop:latest" ;;
+            esac
+            echo "EOF"
+            echo "AI_TAGS<<EOF"
+            echo "ghcr.io/dayvson/crabcrop-ai:$version"
+            case "$version" in
+              *-*) ;;
+              *) echo "ghcr.io/dayvson/crabcrop-ai:latest" ;;
+            esac
+            echo "EOF"
+          } >> "$GITHUB_ENV"
       - name: Stage release binaries (issue #219)
         run: bash scripts/stage_image_binaries.sh "$VERSION" image-bin
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
@@ -440,9 +461,7 @@ jobs:
           file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/dayvson/crabcrop:${{ env.VERSION }}
-            ghcr.io/dayvson/crabcrop:latest
+          tags: ${{ env.BASE_TAGS }}
       - name: AI image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -452,13 +471,13 @@ jobs:
             BASE_IMAGE=ghcr.io/dayvson/crabcrop:${{ env.VERSION }}
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/dayvson/crabcrop-ai:${{ env.VERSION }}
-            ghcr.io/dayvson/crabcrop-ai:latest
+          tags: ${{ env.AI_TAGS }}
 
   publish-crate:
     name: Publish crabcrop-url to crates.io
-    needs: plan
+    needs:
+      - plan
+      - host
     if: ${{ !github.event.pull_request }}
     runs-on: ubuntu-22.04
     environment: release
@@ -479,7 +498,9 @@ jobs:
 
   publish-npm:
     name: Publish @crabcrop/url to npm
-    needs: plan
+    needs:
+      - plan
+      - host
     if: ${{ !github.event.pull_request }}
     runs-on: ubuntu-22.04
     environment: release
@@ -508,7 +529,9 @@ jobs:
 
   publish-pypi:
     name: Publish crabcrop_url to PyPI
-    needs: plan
+    needs:
+      - plan
+      - host
     if: ${{ !github.event.pull_request }}
     runs-on: ubuntu-22.04
     environment: release
