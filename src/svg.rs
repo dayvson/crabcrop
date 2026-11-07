@@ -30,6 +30,11 @@ const MAX_SVG_NODES: usize = 10_000;
 const MAX_SVG_DEPTH: usize = 64;
 const MAX_USE_ELEMENTS: usize = 256;
 const MAX_USE_DEPTH: usize = 16;
+/// The most nodes the renderer may draw, as
+/// [`count_expanded`] counts them: `<use>` clones, plus
+/// pattern, mask, clip-path, and `feImage` contents once
+/// for each reference resvg draws them through (issue
+/// #398).
 const MAX_EXPANDED_NODES: usize = 100_000;
 const MAX_SVG_DIMENSION: f64 = 100_000.0;
 
@@ -865,7 +870,8 @@ mod tests {
         let opt = usvg::Options::default();
         let tree = usvg::Tree::from_str(&text, &opt).unwrap();
         assert_eq!(count_expanded(tree.root(), 1_000), 1_001);
-        assert!(prepare(svg_document(&body).as_bytes()).is_err());
+        let err = prepare(svg_document(&body).as_bytes()).err().unwrap();
+        assert!(err.contains("node limit"), "{err}");
     }
 
     #[test]
