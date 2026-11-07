@@ -24,9 +24,9 @@
  * URLs with appended sizing need the server's unsafe mode
  * without presets-only, an open image proxy fit for local
  * development only (see the README's server modes). The
- * returned loader enforces the boundary: in a browser context the
- * secret is forced to null, so a factory created with one
- * still cannot sign (or leak it) client-side.
+ * returned loader enforces the boundary: in a browser
+ * context the secret is forced to null, so a factory created
+ * with one still cannot sign (or leak it) client-side.
  */
 import { buildURL } from "@crabcrop/url";
 

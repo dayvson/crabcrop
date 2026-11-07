@@ -29,6 +29,8 @@ export const images = createCrabcropLoader({
 />
 ```
 
+This setup builds unsigned URLs; read [Signing and server modes](#signing-and-server-modes) before you deploy it.
+
 ## Configuration
 
 `createCrabcropLoader({ base, preset?, secret?, expires?, origin? })`:

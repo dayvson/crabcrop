@@ -208,8 +208,8 @@ Which mode fits depends on where URLs are built:
 
 | Server mode | Accepts | Fits |
 | --- | --- | --- |
-| Signed (`CRABCROP_ALLOW_UNSAFE` off) | Any operations, with a valid signature | URLs built where the secret lives: server code and build steps |
+| Signed (`CRABCROP_ALLOW_UNSAFE` and `CRABCROP_ONLY_PRESETS` off) | Any operations, with a valid signature | URLs built where the secret lives: server code and build steps |
 | Presets-only (`CRABCROP_ONLY_PRESETS=1` with `CRABCROP_ALLOW_UNSAFE=1`) | Preset references, `exp:` and `maxage:`, and bare sources; anything else answers `400`, signed or not | URLs built anywhere from preset names alone, with the size inside the preset (`card-640 = 640x0/filters:format(webp)`) |
-| Unsafe alone (`CRABCROP_ALLOW_UNSAFE=1`) | Everything, unsigned | Local development only |
+| Unsafe alone (`CRABCROP_ALLOW_UNSAFE=1`, presets-only off) | Any operations, signed or not | Local development only |
 
 Because presets-only mode applies to signed requests too, one server cannot take both presets-only browser URLs and signed URLs with free-form sizing. The framework integrations in [`frameworks/`](../frameworks) append per-width sizing after the preset, which presets-only mode rejects; their READMEs describe the signed setup for production.
