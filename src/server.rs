@@ -58,9 +58,9 @@ impl std::fmt::Debug for NamedDetector {
 
 mod process;
 pub(in crate::server) use process::{
-    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, JobPermits, Lane, MetaFlight, PROCESS_GATE_WAIT,
-    ProcessFailure, ProcessJob, SharedMeta, VIDEO_GATE_WAIT, run_process, wants_animation_gate,
-    wants_slow_lane,
+    AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, Lane, MetaFlight,
+    PROCESS_GATE_WAIT, ProcessFailure, ProcessJob, SharedFlight, SharedResponse, VIDEO_GATE_WAIT,
+    run_process, wants_animation_gate, wants_slow_lane,
 };
 pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 #[cfg(test)]
@@ -2071,15 +2071,34 @@ async fn serve(
     // leads (one fetch, one encode, under the gates below);
     // concurrent requests for the same key wait for the
     // leader, then re-check the tiers and serve its entry.
-    // A leader whose result is not cached (an error, a
-    // fallback) releases its waiters to take the miss path
-    // themselves, one at a time, so a failing origin is
-    // retried by the waiters rather than masked. Waits are
-    // capped: a waiter whose leaders keep failing stops
-    // queueing and runs the miss path itself (issue #375),
-    // so it ends with the origin's real answer instead of
-    // a busy response masking it.
+    // A leader whose result no tier stored (an error, a
+    // fallback, a render with the caches off) leaves its
+    // response in the flight's slot instead, and a waiter
+    // whose request is identical to the leader's answers
+    // with it (issue #407): it is the answer the waiter
+    // would have produced itself, and taking it keeps a
+    // burst on a failing origin at one fetch per flight
+    // rather than one per waiter. Identical means the same
+    // raw path (the sealing, the cache groups, and the
+    // cache lifetime all come from it) and the same header
+    // inputs as the miss path sees them: the negotiated
+    // format, not the raw Accept (on this path errors are
+    // plain text whatever it says), and the quantized
+    // width, not the raw hint, so browsers that phrase the
+    // same request differently still share one flight. The
+    // conditional header is left out: each waiter applies
+    // its own. A waiter that cannot take the response
+    // (another spelling of the key, a body past the share
+    // cap, a leader whose request was dropped, a run a
+    // purge of the key overtook) leads or follows the next
+    // flight. Waits are capped: a waiter whose flights
+    // keep ending without an answer for it stops queueing
+    // and runs the miss path itself (issue #375), so it
+    // ends with the origin's real answer instead of a busy
+    // response masking it.
+    let flight_request = format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
     let mut waits = 0;
+    let mut followed: Option<Arc<FlightSlot>> = None;
     loop {
         if let Some((hit, cache_status)) = lookup_tiers(state, &cache_key, &groups).await {
             record.cache_hit = true;
@@ -2090,16 +2109,51 @@ async fn serve(
             finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
         }
+        let taken = followed
+            .take()
+            .and_then(|slot| {
+                slot.shared
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|shared| shared.request == flight_request)
+                    .cloned()
+            })
+            .filter(|shared| {
+                !state
+                    .purge_guard
+                    .purge_covers(shared.snapshot, &cache_key, &groups)
+            });
+        if let Some(shared) = taken {
+            record.bytes_out = shared.response.body.len();
+            record.fallback = shared.fallback;
+            let mut response = respond_shared(&shared.response);
+            if let Some(etag) = &shared.etag {
+                finalize_validators(&mut response, etag, if_none_match);
+            }
+            return (response, record);
+        }
         match state.inflight.lead(&cache_key) {
-            Flight::Leader(guard) => {
-                let (mut response, record, render_etag) = serve_miss(state, work, record).await;
+            Flight::Leader(guard, slot) => {
+                let snapshot = state.purge_guard.snapshot();
+                let (response, record, render_etag) = serve_miss(state, work, record).await;
+                let (mut response, shared) = share_response(response, FLIGHT_SHARE_CAP).await;
+                if let Some(shared) = shared {
+                    *slot.shared.lock().unwrap() = Some(SharedFlight {
+                        request: flight_request,
+                        snapshot,
+                        response: shared,
+                        etag: render_etag.clone(),
+                        fallback: record.fallback,
+                    });
+                }
                 drop(guard);
                 if let Some(etag) = &render_etag {
                     finalize_validators(&mut response, etag, if_none_match);
                 }
                 return (response, record);
             }
-            Flight::Follower(mut changed) => {
+            Flight::Follower(mut changed, slot) => {
                 if waits >= MAX_FLIGHT_WAITS {
                     // The wait cap is spent: run the miss
                     // path, the same settlement the meta
@@ -2124,10 +2178,19 @@ async fn serve(
                 // re-checks the tiers and may lead itself.
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(60), changed.changed())
                     .await;
+                followed = Some(slot);
             }
         }
     }
 }
+
+/// The body size above which an image flight's response
+/// is not shared with its followers (issue #407). The
+/// body is already in memory and followers share the
+/// leader's buffer rather than copying it, so the cap
+/// only bounds what one flight can pin for its followers;
+/// it sits well above any realistic still render.
+const FLIGHT_SHARE_CAP: usize = 64 * 1024 * 1024;
 
 /// The body size above which a meta document is not
 /// shared with a flight's followers (issue #295): real
@@ -2138,20 +2201,23 @@ const META_SHARE_CAP: usize = 4 * 1024 * 1024;
 /// Meta singleflight (issue #295): concurrent identical
 /// meta requests share one run of the miss path instead
 /// of each loading and rendering the same source. The
-/// leader runs `serve_miss` unchanged; on a 200 it
-/// collects the document into the flight's slot before
-/// its guard drops, and followers answer with a
-/// reconstructed response (the leader's status, headers,
-/// and body) and their own request record, which
-/// truthfully shows they ran no load and no process
-/// stage. Only 200 documents are shared: a flight that
-/// produced anything else leaves its slot empty, and its
-/// followers loop to lead or follow the next flight and
-/// finally run the miss path themselves, so errors are
-/// never shared and every request keeps the error
-/// semantics of a solo request. Nothing outlives the
-/// flight: meta remains uncached across time, exactly
-/// as before.
+/// leader runs `serve_miss` unchanged and collects its
+/// response into the flight's slot before its guard
+/// drops, and followers answer with a reconstructed
+/// response (the leader's status, headers, and body) and
+/// their own request record, which truthfully shows they
+/// ran no load and no process stage. Errors are shared
+/// too (issue #407): meta errors are always the JSON
+/// envelope, shaped only by inputs the flight key pins,
+/// so a follower receives exactly the failure a solo
+/// request gets, and a burst against a failing origin
+/// costs one fetch instead of one per follower. A flight
+/// that leaves its slot empty (a body past the share
+/// cap, a leader whose request was dropped) sends its
+/// followers to lead or follow the next flight, and
+/// finally to run the miss path themselves. Nothing
+/// outlives the flight: meta remains uncached across
+/// time, exactly as before.
 ///
 /// The two choices this settles, deliberately: request
 /// records stay per request with no flight marker (the
@@ -2172,13 +2238,9 @@ async fn serve_meta_flight(
         match state.inflight.lead_meta(key) {
             MetaFlight::Leader(guard, slot) => {
                 let (response, record, _) = serve_miss(state, work, record).await;
-                if response.status() == StatusCode::OK {
-                    let (response, shared) = share_meta_response(response).await;
-                    if let Some(shared) = shared {
-                        *slot.shared.lock().unwrap() = Some(shared);
-                    }
-                    drop(guard);
-                    return (response, record);
+                let (response, shared) = share_response(response, META_SHARE_CAP).await;
+                if let Some(shared) = shared {
+                    *slot.shared.lock().unwrap() = Some(shared);
                 }
                 drop(guard);
                 return (response, record);
@@ -2204,34 +2266,34 @@ async fn serve_meta_flight(
     }
 }
 
-/// Rebuild a response from a shared meta document: the
-/// leader's status and headers, its body bytes.
-fn respond_shared(shared: &SharedMeta) -> Response {
+/// Rebuild a response from a flight's shared response:
+/// the leader's status and headers, its body bytes.
+fn respond_shared(shared: &SharedResponse) -> Response {
     let mut response = Response::new(axum::body::Body::from(shared.body.clone()));
     *response.status_mut() = shared.status;
     *response.headers_mut() = shared.headers.clone();
     response
 }
 
-/// Split a 200 meta response into the shared form a
+/// Split a leader's response into the shared form a
 /// flight slot carries, rebuilding the leader's own
 /// response from the same parts. Returns `None` for the
 /// shared form when the body is not collected whole
-/// within the share cap; meta bodies are in-memory, so
-/// in practice only the cap refuses, and the leader's
+/// within `cap`; the miss path's bodies are in-memory,
+/// so in practice only the cap refuses, and the leader's
 /// response is rebuilt untouched in that case whenever
 /// the body was not consumed trying.
-async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta>) {
+async fn share_response(response: Response, cap: usize) -> (Response, Option<SharedResponse>) {
     let (parts, body) = response.into_parts();
     if <axum::body::Body as axum::body::HttpBody>::size_hint(&body)
         .exact()
-        .is_none_or(|n| n > META_SHARE_CAP as u64)
+        .is_none_or(|n| n > cap as u64)
     {
         return (Response::from_parts(parts, body), None);
     }
-    match axum::body::to_bytes(body, META_SHARE_CAP).await {
+    match axum::body::to_bytes(body, cap).await {
         Ok(bytes) => {
-            let shared = SharedMeta {
+            let shared = SharedResponse {
                 status: parts.status,
                 headers: parts.headers.clone(),
                 body: bytes,
@@ -2240,11 +2302,11 @@ async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta
             (response, Some(shared))
         }
         Err(_) => {
-            // Unreachable for the in-memory bodies meta
-            // answers with (the size hint above already
-            // vouched for the body); the status and
-            // headers survive, the body does not.
-            eprintln!("meta flight: leader body could not be collected for sharing");
+            // Unreachable for the in-memory bodies the
+            // miss path answers with (the size hint above
+            // already vouched for the body); the status
+            // and headers survive, the body does not.
+            eprintln!("flight: leader body could not be collected for sharing");
             (Response::from_parts(parts, axum::body::Body::empty()), None)
         }
     }
@@ -2253,7 +2315,10 @@ async fn share_meta_response(response: Response) -> (Response, Option<SharedMeta
 /// How many times one request may wait on another
 /// request's in-flight miss for the same key before it
 /// stops waiting and runs the miss path itself (audit
-/// R2-09, issue #375).
+/// R2-09, issue #375). Since issue #407 a burst of
+/// identical requests settles on the first flight, so the
+/// cap only comes into play for waiters no flight could
+/// answer.
 const MAX_FLIGHT_WAITS: u32 = 3;
 
 /// Whether a purge recorded after `snapshot` covers
@@ -14858,33 +14923,139 @@ mod tests {
         (format!("http://{addr}/src.png"), hits)
     }
 
-    /// Source server that counts its hits and answers
-    /// slowly with a 500, so a burst's leaders fail one
-    /// after another while their waiters are still queued.
-    async fn spawn_slow_failing_server(delay_ms: u64) -> (String, Arc<AtomicUsize>) {
+    /// Source server that answers slowly, with `body` as a
+    /// PNG or, for `None`, with a 500, so a burst's flights
+    /// overlap its requests. Returns its URL, its hit
+    /// count, and the most fetches it ever had open at once
+    /// (issue #407: a burst on one key must not fetch in
+    /// parallel).
+    async fn spawn_slow_peak_server(
+        body: Option<Vec<u8>>,
+        delay_ms: u64,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(AtomicUsize::new(0));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let counted = hits.clone();
+        let peaked = peak.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 counted.fetch_add(1, Ordering::SeqCst);
+                peaked.fetch_max(open.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                let open = open.clone();
+                let body = body.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
                     let _ = socket.read(&mut buf).await;
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    let _ = socket
-                        .write_all(
-                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await;
+                    match &body {
+                        Some(body) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(head.as_bytes()).await;
+                            let _ = socket.write_all(body).await;
+                        }
+                        None => {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
+                                .await;
+                        }
+                    }
+                    open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
-        (format!("http://{addr}/src.png"), hits)
+        (format!("http://{addr}/src.png"), hits, peak)
+    }
+
+    /// Persistent source server that answers slowly with
+    /// whatever body is current when the request arrives,
+    /// counting its hits: a source replaced while a render
+    /// of its old bytes is still in flight.
+    async fn spawn_slow_swappable_server(
+        body: Vec<u8>,
+        delay_ms: u64,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let current = Arc::new(std::sync::Mutex::new(body));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = hits.clone();
+        let served = current.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                // Taken before the hit counts, so a caller
+                // that sees the hit can swap the body
+                // without racing this request.
+                let body = served.lock().unwrap().clone();
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}/src.png"), hits, current)
+    }
+
+    /// Fire one GET per `(url, if_none_match)` pair at once
+    /// and collect each answer's status, ETag, and body, in
+    /// order.
+    async fn image_burst(
+        requests: Vec<(String, Option<String>)>,
+    ) -> Vec<(StatusCode, String, bytes::Bytes)> {
+        image_burst_with(
+            requests
+                .into_iter()
+                .map(|(url, inm)| (url, inm.map(|e| ("If-None-Match", e)).into_iter().collect()))
+                .collect(),
+        )
+        .await
+    }
+
+    /// Fire one GET per `(url, headers)` pair at once and
+    /// collect each answer's status, ETag, and body, in
+    /// order.
+    async fn image_burst_with(
+        requests: Vec<(String, Vec<(&'static str, String)>)>,
+    ) -> Vec<(StatusCode, String, bytes::Bytes)> {
+        let mut tasks = Vec::new();
+        for (url, headers) in requests {
+            tasks.push(tokio::spawn(async move {
+                let mut req = client().get(&url);
+                for (name, value) in headers {
+                    req = req.header(name, value);
+                }
+                let resp = req.send().await.unwrap();
+                let status = resp.status();
+                let etag = header(&resp, "etag");
+                (status, etag, resp.bytes().await.unwrap())
+            }));
+        }
+        let mut out = Vec::new();
+        for task in tasks {
+            out.push(task.await.unwrap());
+        }
+        out
     }
 
     #[tokio::test]
@@ -15003,26 +15174,217 @@ mod tests {
         // Issue #375: when leaders keep failing, a waiter
         // that spent its wait cap once shed with a 503
         // server_busy, masking the origin's real answer.
-        // The waiter now runs the miss path itself, so a
-        // burst against a slow failing origin ends the way
-        // a solo request does, for every request.
-        let (src, _hits) = spawn_slow_failing_server(300).await;
+        // Every request in a burst against a slow failing
+        // origin must end the way a solo request does.
+        // Issue #407: and the burst must not cost one
+        // origin fetch per request. Before, three flights
+        // failed one after another and then every waiter
+        // past the wait cap fetched at once (12 requests
+        // made 12 fetches, 9 of them in parallel); the
+        // waiters now take the leader's answer.
+        let (src, hits, peak) = spawn_slow_peak_server(None, 300).await;
         let base = spawn_app(false).await;
         let remainder = format!("50x30/{src}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
         let solo = client().get(&url).send().await.unwrap();
         let solo_status = solo.status();
-        assert_ne!(solo_status, StatusCode::SERVICE_UNAVAILABLE);
-        let mut tasks = Vec::new();
-        for _ in 0..6 {
-            let url = url.clone();
-            tasks.push(tokio::spawn(async move {
-                client().get(&url).send().await.unwrap().status()
-            }));
+        let solo_body = solo.bytes().await.unwrap();
+        assert_eq!(solo_status, StatusCode::BAD_GATEWAY);
+        let before = hits.load(Ordering::SeqCst);
+        let burst = image_burst(vec![(url.clone(), None); 12]).await;
+        for (status, _, body) in &burst {
+            assert_eq!(*status, solo_status);
+            assert_eq!(*body, solo_body);
         }
-        for task in tasks {
-            assert_eq!(task.await.unwrap(), solo_status);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+        let fetched = hits.load(Ordering::SeqCst) - before;
+        assert!(
+            fetched <= 2,
+            "12 identical requests made {fetched} origin fetches"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_share_a_render_no_tier_stored() {
+        // Issue #407: with every cache tier off, a leader's
+        // render is stored nowhere, so its waiters used to
+        // fetch and render again, one flight at a time and
+        // then all at once past the wait cap. They now take
+        // the leader's response, and each one still answers
+        // its own conditional request against the shared
+        // render's ETag.
+        let (src, hits, peak) = spawn_slow_peak_server(Some(test_png()), 300).await;
+        let base = spawn_app_full(std::collections::HashMap::new(), None, 0).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let solo = client().get(&url).send().await.unwrap();
+        assert_eq!(solo.status(), StatusCode::OK);
+        let etag = header(&solo, "etag");
+        assert!(!etag.is_empty());
+        let solo_body = solo.bytes().await.unwrap();
+        let before = hits.load(Ordering::SeqCst);
+        // Every other request revalidates the render it
+        // already holds; the rest ask for the bytes.
+        let requests = (0..8)
+            .map(|i| (url.clone(), (i % 2 == 0).then(|| etag.clone())))
+            .collect();
+        let burst = image_burst(requests).await;
+        for (i, (status, got_etag, body)) in burst.iter().enumerate() {
+            assert_eq!(*got_etag, etag, "request {i}");
+            if i % 2 == 0 {
+                assert_eq!(*status, StatusCode::NOT_MODIFIED, "request {i}");
+                assert!(body.is_empty(), "request {i}");
+            } else {
+                assert_eq!(*status, StatusCode::OK, "request {i}");
+                assert_eq!(*body, solo_body, "request {i}");
+            }
         }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+        let fetched = hits.load(Ordering::SeqCst) - before;
+        assert!(
+            fetched <= 2,
+            "8 identical requests made {fetched} origin fetches"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_take_only_an_identical_requests_answer() {
+        // Issue #407: one cache key serves spellings that
+        // answer differently. A sealed request answers a
+        // failure with the uniform refusal, so it must never
+        // take the plain spelling's 502 from a flight they
+        // share, nor the plain one the sealed refusal; each
+        // spelling still ends exactly as it does alone.
+        let (src, _hits, peak) = spawn_slow_peak_server(None, 300).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let plain = format!("{base}/{}/{remainder}", sign(&remainder));
+        let sealed = format!("{base}/{}", sealed_path(&remainder, None));
+        let solo = image_burst(vec![(plain.clone(), None), (sealed.clone(), None)]).await;
+        assert_eq!(solo[0].0, StatusCode::BAD_GATEWAY);
+        assert_eq!(solo[1].0, StatusCode::FORBIDDEN);
+        assert_eq!(solo[1].2.as_ref(), b"bad signature");
+        let requests = (0..8)
+            .map(|i| (if i % 2 == 0 { &plain } else { &sealed }.clone(), None))
+            .collect();
+        let burst = image_burst(requests).await;
+        for (i, (status, _, body)) in burst.iter().enumerate() {
+            let expected = &solo[i % 2];
+            assert_eq!((*status, body), (expected.0, &expected.2), "request {i}");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_share_across_headers_that_do_not_change_the_answer() {
+        // Issue #407: browsers phrase one request in
+        // different headers. These Accept strings all
+        // negotiate WebP, and the URL sizes the image
+        // itself, so no width hint applies: every request
+        // gets the same answer and must share one flight.
+        // Compared as raw headers, each of the five
+        // spellings needed a flight of its own, and the
+        // waiters of the last ones passed the wait cap and
+        // fetched at once.
+        let (src, hits, peak) = spawn_slow_peak_server(None, 300).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let spellings = [
+            ("image/webp", "300"),
+            ("image/webp,*/*", "310"),
+            ("image/webp,image/*;q=0.8", "320"),
+            ("image/png,image/webp", "330"),
+            ("image/webp;q=0.9,*/*;q=0.1", "340"),
+        ];
+        let solo =
+            image_burst_with(vec![(url.clone(), vec![("Accept", "image/webp".into())])]).await;
+        assert_eq!(solo[0].0, StatusCode::BAD_GATEWAY);
+        let before = hits.load(Ordering::SeqCst);
+        let requests = (0..15)
+            .map(|i| {
+                let (accept, width) = spellings[i % spellings.len()];
+                (
+                    url.clone(),
+                    vec![
+                        ("Accept", accept.to_string()),
+                        ("Sec-CH-Width", width.to_string()),
+                    ],
+                )
+            })
+            .collect();
+        let burst = image_burst_with(requests).await;
+        for (i, (status, _, body)) in burst.iter().enumerate() {
+            assert_eq!((*status, body), (solo[0].0, &solo[0].2), "request {i}");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+        let fetched = hits.load(Ordering::SeqCst) - before;
+        assert!(
+            fetched <= 2,
+            "15 requests for one answer made {fetched} origin fetches"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_waiters_do_not_take_a_render_a_purge_overtook() {
+        // Issue #407: a follower takes the leader's unstored
+        // response only while no purge of its key has
+        // landed since the leader's run began. Here the
+        // source is replaced and purged while the leader
+        // still renders the old bytes. The purge keeps that
+        // render out of the tiers (issue #350), and a
+        // request sent after the purge must get the new
+        // image, as the purge promises the next request,
+        // not the old render through the flight it joined.
+        let (src, hits, current) = spawn_slow_swappable_server(test_png(), 800).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("25x25/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let leader_url = url.clone();
+        let leader = tokio::spawn(async move { client().get(&leader_url).send().await.unwrap() });
+        for _ in 0..50 {
+            if hits.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the render never started");
+        *current.lock().unwrap() = test_png_red();
+        let purge_sig = crate::url::purge_signature(SECRET, &remainder);
+        let resp = client()
+            .post(format!("{base}/purge/{purge_sig}/{remainder}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The leader is still loading, so this request
+        // joins its flight.
+        let follower = client().get(&url).send().await.unwrap();
+        let leader = leader.await.unwrap();
+        assert_eq!(leader.status(), StatusCode::OK);
+        assert_eq!(follower.status(), StatusCode::OK);
+        assert_ne!(
+            header(&follower, "etag"),
+            header(&leader, "etag"),
+            "the request after the purge got the render the purge overtook"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     /// Fire `n` concurrent meta requests for one URL and
@@ -15128,11 +15490,11 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_meta_requests_keep_solo_error_semantics() {
-        // Issue #295: errors are never shared, and no
-        // waiter hangs or panics: when the origin fails,
-        // every request in the burst ends with the failure
-        // a solo request gets, from its own attempt at the
-        // miss path.
+        // Issue #295: no waiter hangs or panics: when the
+        // origin fails, every request in the burst ends
+        // with the failure a solo request gets (since issue
+        // #407, the leader's failure, shared through the
+        // flight).
         let (src, _hits) = spawn_counting_server(404, "image/png", Vec::new()).await;
         let base = spawn_app(false).await;
         let remainder = format!("50x30/{src}");
@@ -15147,6 +15509,40 @@ mod tests {
                 .iter()
                 .all(|(s, b)| *s == solo[0].0 && *b == solo[0].1),
             "every waiter failed the way the solo request did"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_meta_requests_share_a_failure_instead_of_refetching() {
+        // Issue #407: meta followers used to share only a
+        // 200 document, so a failing leader sent them to
+        // lead the next flights one by one and then, past
+        // the wait cap, to fetch all at once. They now take
+        // the leader's failure, which is the one they would
+        // have computed themselves.
+        let (src, hits, peak) = spawn_slow_peak_server(None, 300).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("50x30/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let solo = meta_burst(&url, "application/json", 1).await;
+        assert_eq!(solo[0].0, StatusCode::BAD_GATEWAY);
+        let before = hits.load(Ordering::SeqCst);
+        let burst = meta_burst(&url, "application/json", 12).await;
+        assert!(
+            burst
+                .iter()
+                .all(|(s, b)| *s == solo[0].0 && *b == solo[0].1),
+            "every follower failed the way the solo request did"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "fetches of one key overlapped"
+        );
+        let fetched = hits.load(Ordering::SeqCst) - before;
+        assert!(
+            fetched <= 2,
+            "12 identical meta requests made {fetched} origin fetches"
         );
     }
 

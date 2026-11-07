@@ -22,14 +22,16 @@ use crate::url::ImageFormat;
 /// and runs the fetch and the encode; concurrent requests
 /// for the same key wait on the leader instead of each
 /// fetching and encoding the same image, then re-check
-/// the tiers. The map holds one watch sender per key in
-/// flight; the leader's guard removes the key and wakes
-/// the waiters on drop, so every exit path (success,
-/// error, fallback) releases them exactly once.
+/// the tiers. A result no tier stored (an error, a
+/// fallback, a render with the caches off) reaches the
+/// waiters through the flight's slot instead (issue
+/// #407). The map holds one slot per key in flight; the
+/// leader's guard removes the key and wakes the waiters
+/// on drop, so every exit path (success, error,
+/// fallback) releases them exactly once.
 #[derive(Default)]
 pub struct Inflight {
-    leaders:
-        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::watch::Sender<bool>>>>,
+    leaders: std::sync::Mutex<std::collections::HashMap<String, Arc<FlightSlot>>>,
     /// Meta flights (issue #295): the same coalescing for
     /// meta requests, whose results are never cached, so
     /// the leader's document travels in a slot beside the
@@ -45,13 +47,59 @@ impl std::fmt::Debug for Inflight {
 
 /// The caller's role for one cache key.
 pub(in crate::server) enum Flight {
-    /// This request runs the miss path; dropping the
-    /// guard wakes the waiters.
-    Leader(LeaderGuard),
+    /// This request runs the miss path and leaves its
+    /// response in the slot; dropping the guard wakes the
+    /// waiters.
+    Leader(LeaderGuard, Arc<FlightSlot>),
     /// Another request is already running the miss path
     /// for this key; wait on the channel, then re-check
-    /// the tiers.
-    Follower(tokio::sync::watch::Receiver<bool>),
+    /// the tiers, then the slot.
+    Follower(tokio::sync::watch::Receiver<bool>, Arc<FlightSlot>),
+}
+
+/// The slot one image flight shares through (issue
+/// #407): the leader fills `shared` before its guard
+/// drops, and a woken follower whose tier lookup still
+/// misses takes the response from it when its own
+/// request is identical to the leader's.
+pub(in crate::server) struct FlightSlot {
+    sender: Arc<tokio::sync::watch::Sender<bool>>,
+    pub(in crate::server) shared: std::sync::Mutex<Option<SharedFlight>>,
+}
+
+/// One image flight's response (issue #407). Only the
+/// flight's followers ever see it: the slot dies with
+/// the flight, so nothing is shared across time.
+#[derive(Clone)]
+pub(in crate::server) struct SharedFlight {
+    /// Every input `serve` shaped the response from
+    /// besides the conditional headers, as the miss path
+    /// sees it (the raw path, the negotiated format, the
+    /// hints; see `serve`): a follower takes the response
+    /// only when its own request carries the same, since
+    /// one cache key can serve spellings that answer
+    /// differently (a sealed one answers errors with the
+    /// uniform refusal, a preset one names its cache
+    /// group).
+    pub(in crate::server) request: String,
+    /// The purge generation read before the leader's run
+    /// began. A follower may have arrived after a purge
+    /// that landed during the run (an overwritten upload,
+    /// a purged URL), and such a request is owed a fresh
+    /// render, so once a purge covering the key has been
+    /// recorded since this reading no follower takes the
+    /// response.
+    pub(in crate::server) snapshot: u64,
+    /// The response as the miss path produced it, before
+    /// the leader's own conditional headers were applied.
+    pub(in crate::server) response: SharedResponse,
+    /// The ETag of the rendered bytes when the response
+    /// serves a render, so every follower answers its own
+    /// conditional request against them.
+    pub(in crate::server) etag: Option<String>,
+    /// Whether the response is the configured fallback
+    /// image, for the follower's request record.
+    pub(in crate::server) fallback: bool,
 }
 
 /// Removes the key from the in-flight map and wakes its
@@ -59,13 +107,13 @@ pub(in crate::server) enum Flight {
 pub(in crate::server) struct LeaderGuard {
     inflight: Arc<Inflight>,
     key: String,
-    sender: Arc<tokio::sync::watch::Sender<bool>>,
+    slot: Arc<FlightSlot>,
 }
 
 impl Drop for LeaderGuard {
     fn drop(&mut self) {
-        self.inflight.remove(&self.key, &self.sender);
-        let _ = self.sender.send(true);
+        self.inflight.remove(&self.key, &self.slot);
+        let _ = self.slot.sender.send(true);
     }
 }
 
@@ -74,25 +122,31 @@ impl Inflight {
     /// already leading it.
     pub(in crate::server) fn lead(self: &Arc<Self>, key: &str) -> Flight {
         let mut leaders = self.leaders.lock().unwrap();
-        if let Some(sender) = leaders.get(key) {
-            return Flight::Follower(sender.subscribe());
+        if let Some(slot) = leaders.get(key) {
+            return Flight::Follower(slot.sender.subscribe(), slot.clone());
         }
         let (sender, _) = tokio::sync::watch::channel(false);
-        let sender = Arc::new(sender);
-        leaders.insert(key.to_string(), sender.clone());
-        Flight::Leader(LeaderGuard {
-            inflight: self.clone(),
-            key: key.to_string(),
-            sender,
-        })
+        let slot = Arc::new(FlightSlot {
+            sender: Arc::new(sender),
+            shared: std::sync::Mutex::new(None),
+        });
+        leaders.insert(key.to_string(), slot.clone());
+        Flight::Leader(
+            LeaderGuard {
+                inflight: self.clone(),
+                key: key.to_string(),
+                slot: slot.clone(),
+            },
+            slot,
+        )
     }
 
-    /// Remove `key` if `sender` is still its leader (a
+    /// Remove `key` if `slot` is still its leader (a
     /// waiter that already promoted itself must not lose
     /// its own claim to the previous leader's cleanup).
-    fn remove(&self, key: &str, sender: &Arc<tokio::sync::watch::Sender<bool>>) {
+    fn remove(&self, key: &str, slot: &Arc<FlightSlot>) {
         let mut leaders = self.leaders.lock().unwrap();
-        if leaders.get(key).is_some_and(|s| Arc::ptr_eq(s, sender)) {
+        if leaders.get(key).is_some_and(|s| Arc::ptr_eq(s, slot)) {
             leaders.remove(key);
         }
     }
@@ -130,14 +184,15 @@ impl Inflight {
     }
 }
 
-/// One shared meta document (issue #295): the leader's
+/// One response shared within a flight: the leader's
 /// status, headers, and body, handed to the followers
-/// that waited on its flight. Only 200 documents are
-/// shared, and only within the flight: the slot dies
-/// with the leader's guard, so meta stays uncached
-/// across time exactly as before.
+/// that waited on it. Meta flights share every document,
+/// errors included (issues #295, #407), and image flights
+/// share what the tiers did not store; only within the
+/// flight either way: the slot dies with the leader's
+/// guard, so nothing is cached across time by sharing.
 #[derive(Clone)]
-pub(in crate::server) struct SharedMeta {
+pub(in crate::server) struct SharedResponse {
     pub(in crate::server) status: StatusCode,
     pub(in crate::server) headers: HeaderMap,
     pub(in crate::server) body: bytes::Bytes,
@@ -150,7 +205,7 @@ pub(in crate::server) struct SharedMeta {
 /// produced nothing shareable.
 pub(in crate::server) struct MetaSlot {
     sender: Arc<tokio::sync::watch::Sender<bool>>,
-    pub(in crate::server) shared: std::sync::Mutex<Option<SharedMeta>>,
+    pub(in crate::server) shared: std::sync::Mutex<Option<SharedResponse>>,
 }
 
 /// The caller's role for one meta flight key.
