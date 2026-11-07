@@ -38,9 +38,9 @@ class CheckError(Exception):
     """A state the check cannot judge: the gate fails with this message."""
 
 
-def git(root, *args):
+def git(root, *args, text=True):
     return subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, text=True, check=False
+        ["git", *args], cwd=root, capture_output=True, text=text, check=False
     )
 
 
@@ -90,11 +90,14 @@ def tag_version(root, tag):
     return 0 if version is None else version
 
 
-def goldens(text, where):
+def goldens(raw, where):
+    # Raw bytes, so an undecodable file is a readable-corpus error like any
+    # other malformed one (UnicodeDecodeError is a ValueError), and a deeply
+    # nested one stops at the parser's recursion limit instead of a traceback.
     try:
-        entries = json.loads(text)["entries"]
+        entries = json.loads(raw)["entries"]
         by_id = {e["id"]: tuple(e.get(f) for f in GOLDEN_FIELDS) for e in entries}
-    except (ValueError, KeyError, TypeError) as err:
+    except (ValueError, KeyError, TypeError, RecursionError) as err:
         raise CheckError(f"{CORPUS} at {where} is not a readable corpus: {err!r}") from err
     if len(by_id) != len(entries):
         raise CheckError(f"{CORPUS} at {where} repeats an entry id")
@@ -106,14 +109,14 @@ def check(root):
     tag, reason = last_release_tag(root)
     if tag is None:
         return 0, f"rendering version check skipped: {reason}"
-    before = git(root, "show", f"{tag}:{CORPUS}")
+    before = git(root, "show", f"{tag}:{CORPUS}", text=False)
     if before.returncode != 0:
         return 0, f"rendering version check: {tag} has no {CORPUS}; nothing to compare"
     corpus_path = root / CORPUS
     if not corpus_path.is_file():
         raise CheckError(f"{CORPUS} is missing from the working tree")
     old = goldens(before.stdout, tag)
-    new = goldens(corpus_path.read_text(encoding="utf-8"), "the working tree")
+    new = goldens(corpus_path.read_bytes(), "the working tree")
     rebaselined = sorted(i for i in old.keys() & new.keys() if old[i] != new[i])
     was, now = tag_version(root, tag), current_version(root)
 

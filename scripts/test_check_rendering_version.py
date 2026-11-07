@@ -15,10 +15,29 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "check_rendering_version.py"
 
+
+def without_repository_variables(environ):
+    """The environment minus the variables that pick a repository.
+
+    A git hook exports GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE and the rest
+    of git's repository-local variables so the commands it runs find the
+    hook's repository. Inherited here (scripts/test_all.sh run from a
+    pre-push hook, say), they would point every command at that repository
+    instead of the throwaway one: `git add -A` and `git commit` would commit
+    the caller's uncommitted work and `git tag` would tag it. Git lists the
+    variables itself, so the set follows the installed version.
+    """
+    listed = subprocess.run(
+        ["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True
+    ).stdout.split()
+    return {k: v for k, v in environ.items() if k not in listed}
+
+
 # Isolated from the host's git configuration (signing, hooks, default
-# branch), so the cases behave the same on every machine.
+# branch) and from any repository the caller's environment names, so the
+# cases behave the same on every machine.
 GIT_ENV = {
-    **os.environ,
+    **without_repository_variables(os.environ),
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_AUTHOR_NAME": "test",
@@ -181,8 +200,14 @@ class RenderingVersionCheck(unittest.TestCase):
 
     def test_unreadable_corpus_fails_with_a_message(self):
         self.release([entry("a")], 1)
-        for broken in ("{not json", "[]", '{"entries": [{"sha256": "aa"}]}'):
-            (self.repo / "tests/upgrade/corpus.json").write_text(broken)
+        for broken in (
+            b"{not json",
+            b"[]",
+            b'{"entries": [{"sha256": "aa"}]}',
+            b'{"entries": [{"id": "a", "note": "\xff"}]}',
+            b"[" * 100_000,
+        ):
+            (self.repo / "tests/upgrade/corpus.json").write_bytes(broken)
             code, out = self.run_check()
             self.assertEqual(code, 1, out)
             self.assertIn("is not a readable corpus", out)
@@ -224,6 +249,34 @@ class RenderingVersionCheck(unittest.TestCase):
         code, out = self.run_check(plain, GIT_CEILING_DIRECTORIES=self.tmp.name)
         self.assertEqual(code, 0, out)
         self.assertIn("skipped: not a git checkout", out)
+
+    def test_a_hook_environment_leaves_the_callers_repository_alone(self):
+        # Run one case in a child that inherits GIT_DIR and GIT_WORK_TREE
+        # naming a caller repository with uncommitted work, as a hook would
+        # export them. The case must pass and the caller must be untouched.
+        caller = Path(self.tmp.name) / "caller"
+        caller.mkdir()
+        self.git("init", "-q", "-b", "main", cwd=caller)
+        (caller / "wip.txt").write_text("uncommitted work\n")
+        done = subprocess.run(
+            [
+                sys.executable, "-I", str(Path(__file__).resolve()),
+                "RenderingVersionCheck.test_rebaseline_with_bump_passes",
+            ],
+            env={**os.environ, "GIT_DIR": str(caller / ".git"), "GIT_WORK_TREE": str(caller)},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+        def caller_git(*args):
+            return subprocess.run(
+                ["git", *args], cwd=caller, env=GIT_ENV, capture_output=True, text=True
+            )
+
+        self.assertNotEqual(caller_git("rev-parse", "--verify", "-q", "HEAD").returncode, 0)
+        self.assertEqual(caller_git("tag").stdout, "")
+        self.assertEqual(caller_git("status", "--porcelain").stdout, "?? wip.txt\n")
 
 
 if __name__ == "__main__":
