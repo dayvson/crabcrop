@@ -14,6 +14,7 @@
 //! has no scripts or network access to begin with: defense in
 //! depth, with the sanitizer as the explicit, tested layer.
 
+use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 
 /// Bounds on SVG document complexity (audit E-7). The raster
@@ -359,42 +360,112 @@ fn check_document_bounds<'a, 'input>(root: roxmltree::Node<'a, 'input>) -> Resul
     Ok(())
 }
 
-/// Count nodes in a constructed usvg tree, `<use>` clones
-/// included: the expansion bound, checked before rendering.
-fn count_expanded(nodes: &[usvg::Node]) -> usize {
-    nodes
-        .iter()
-        .map(|node| match node {
-            usvg::Node::Group(group) => 1 + count_expanded(group.children()),
-            _ => 1,
-        })
-        .sum()
+/// Visit every node the renderer draws from a constructed
+/// usvg tree, depth first, until `f` breaks.
+///
+/// `Group::children()` alone is not that set (issue
+/// #398): usvg keeps pattern contents (path fills and
+/// strokes), mask and clip-path contents, filter
+/// `feImage` sources, the flattened form of text, and the
+/// tree of a nested SVG image outside it, and resvg
+/// draws all of them. A mask or clip path can itself be
+/// masked or clipped, and resvg follows that chain to
+/// its end, so this does too (usvg's `Node::subroots`
+/// stops after the second link). A subtree shared by
+/// several references, one pattern filling many paths,
+/// is visited once per reference, because resvg draws it
+/// once per reference.
+fn visit_rendered<F>(group: &usvg::Group, f: &mut F) -> ControlFlow<()>
+where
+    F: FnMut(&usvg::Node) -> ControlFlow<()>,
+{
+    let mut clip = group.clip_path();
+    while let Some(clip_path) = clip {
+        visit_rendered(clip_path.root(), f)?;
+        clip = clip_path.clip_path();
+    }
+    let mut next_mask = group.mask();
+    while let Some(mask) = next_mask {
+        visit_rendered(mask.root(), f)?;
+        next_mask = mask.mask();
+    }
+    for filter in group.filters() {
+        for primitive in filter.primitives() {
+            if let usvg::filter::Kind::Image(image) = primitive.kind() {
+                visit_rendered(image.root(), f)?;
+            }
+        }
+    }
+    for node in group.children() {
+        f(node)?;
+        match node {
+            usvg::Node::Group(child) => visit_rendered(child, f)?,
+            usvg::Node::Path(path) => {
+                let paints = [
+                    path.fill().map(usvg::Fill::paint),
+                    path.stroke().map(usvg::Stroke::paint),
+                ];
+                for paint in paints.into_iter().flatten() {
+                    if let usvg::Paint::Pattern(pattern) = paint {
+                        visit_rendered(pattern.root(), f)?;
+                    }
+                }
+            }
+            usvg::Node::Image(image) => {
+                if let usvg::ImageKind::SVG(tree) = image.kind() {
+                    visit_rendered(tree.root(), f)?;
+                }
+            }
+            usvg::Node::Text(text) => visit_rendered(text.flattened(), f)?,
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+/// Count the nodes the renderer draws from a constructed
+/// tree, `<use>` clones and every subtree
+/// [`visit_rendered`] reaches included: the expansion
+/// bound, checked before rendering. The count stops at
+/// `cap + 1`, so a tree that multiplies a shared subtree
+/// through many references costs at most the cap to
+/// refuse, however far it would expand.
+fn count_expanded(root: &usvg::Group, cap: usize) -> usize {
+    let mut count = 0usize;
+    let _ = visit_rendered(root, &mut |_| {
+        count += 1;
+        if count > cap {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    count
 }
 
 /// The decoded byte size of the raster payloads embedded
-/// in a constructed usvg tree (issue #360). An `<image>`
-/// element counts as one node in the expansion accounting
-/// above, but the renderer decodes its payload at the
-/// payload's own dimensions, so those pixels are charged
-/// here at four bytes per pixel (the RGBA decode), the
-/// same accounting the stills decode budget uses. A
-/// nested SVG payload recurses: its own embedded rasters
-/// count too.
-fn embedded_raster_bytes(nodes: &[usvg::Node]) -> u64 {
-    nodes
-        .iter()
-        .map(|node| match node {
-            usvg::Node::Group(group) => embedded_raster_bytes(group.children()),
-            usvg::Node::Image(image) => match image.kind() {
-                usvg::ImageKind::SVG(tree) => embedded_raster_bytes(tree.root().children()),
-                _ => {
-                    let size = image.size();
-                    (size.width() as u64) * (size.height() as u64) * 4
-                }
-            },
-            _ => 0,
-        })
-        .sum()
+/// in a constructed usvg tree (issues #360, #398). An
+/// `<image>` element counts as one node in the expansion
+/// accounting above, but the renderer decodes its payload
+/// at the payload's own dimensions, so those pixels are
+/// charged here at four bytes per pixel (the RGBA
+/// decode), the same accounting the stills decode budget
+/// uses. Every raster the renderer would decode counts,
+/// wherever [`visit_rendered`] finds it: in a pattern, a
+/// mask, a filter's `feImage`, or a nested SVG payload,
+/// once per time it is drawn.
+fn embedded_raster_bytes(root: &usvg::Group) -> u64 {
+    let mut total = 0u64;
+    let _ = visit_rendered(root, &mut |node| {
+        if let usvg::Node::Image(image) = node
+            && !matches!(image.kind(), usvg::ImageKind::SVG(_))
+        {
+            let size = image.size();
+            let bytes = (size.width() as u64) * (size.height() as u64) * 4;
+            total = total.saturating_add(bytes);
+        }
+        ControlFlow::Continue(())
+    });
+    total
 }
 
 /// Refuse an SVG whose embedded rasters decode past the
@@ -440,12 +511,14 @@ pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
         ..Default::default()
     };
     let tree = usvg::Tree::from_str(&clean, &opt).map_err(|e| format!("cannot parse SVG: {e}"))?;
-    if count_expanded(tree.root().children()) > MAX_EXPANDED_NODES {
+    if count_expanded(tree.root(), MAX_EXPANDED_NODES) > MAX_EXPANDED_NODES {
         return Err(format!(
             "SVG expands past the {MAX_EXPANDED_NODES} node limit"
         ));
     }
-    check_raster_budget(embedded_raster_bytes(tree.root().children()))?;
+    // Runs only once the count above has passed, so this
+    // walk visits at most MAX_EXPANDED_NODES nodes.
+    check_raster_budget(embedded_raster_bytes(tree.root()))?;
     Ok(Prepared { tree })
 }
 
@@ -566,7 +639,7 @@ mod tests {
         out
     }
 
-    fn svg_with_embedded_png(w: u32, h: u32) -> String {
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
         let png = image::RgbImage::from_pixel(w, h, image::Rgb([0, 128, 255]));
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgb8(png)
@@ -575,12 +648,87 @@ mod tests {
                 image::ImageFormat::Png,
             )
             .unwrap();
-        format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">\
-             <g><image href=\"data:image/png;base64,{}\" width=\"10\" height=\"10\"/></g></svg>",
-            b64(&bytes)
-        )
+        bytes
     }
+
+    /// A PNG that is only its signature and a well-formed
+    /// IHDR claiming `w` x `h`. usvg sizes an embedded
+    /// raster from its header, and prepare has to refuse
+    /// on that size before anything decodes, so a hostile
+    /// fixture can claim a gigabyte of pixels in 33 bytes.
+    fn png_header_only(w: u32, h: u32) -> Vec<u8> {
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut crc = flate2::Crc::new();
+        crc.update(b"IHDR");
+        crc.update(&ihdr);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&crc.sum().to_be_bytes());
+        png
+    }
+
+    fn png_data_uri(png: &[u8]) -> String {
+        format!("data:image/png;base64,{}", b64(png))
+    }
+
+    fn svg_document(body: &str) -> String {
+        format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">{body}</svg>")
+    }
+
+    fn svg_with_embedded_png(w: u32, h: u32) -> String {
+        svg_document(&format!(
+            "<g><image href=\"{}\" width=\"10\" height=\"10\"/></g>",
+            png_data_uri(&png_bytes(w, h))
+        ))
+    }
+
+    /// The places an SVG can draw an embedded raster from
+    /// outside `Group::children()` (issue #398), as body
+    /// templates whose `{IMG}` is an image `href`.
+    const SUBROOT_WRAPPERS: &[(&str, &str)] = &[
+        (
+            "pattern fill",
+            "<defs><pattern id=\"p\" width=\"10\" height=\"10\" patternUnits=\"userSpaceOnUse\">\
+             <image href=\"{IMG}\" width=\"10\" height=\"10\"/></pattern></defs>\
+             <rect width=\"10\" height=\"10\" fill=\"url(#p)\"/>",
+        ),
+        (
+            "pattern stroke",
+            "<defs><pattern id=\"p\" width=\"10\" height=\"10\" patternUnits=\"userSpaceOnUse\">\
+             <image href=\"{IMG}\" width=\"10\" height=\"10\"/></pattern></defs>\
+             <rect x=\"2\" y=\"2\" width=\"6\" height=\"6\" fill=\"none\" stroke=\"url(#p)\" stroke-width=\"2\"/>",
+        ),
+        (
+            "mask",
+            "<defs><mask id=\"m\"><image href=\"{IMG}\" width=\"10\" height=\"10\"/></mask></defs>\
+             <rect width=\"10\" height=\"10\" fill=\"#ff0000\" mask=\"url(#m)\"/>",
+        ),
+        (
+            // Three links: usvg's Node::subroots stops
+            // after the second, resvg draws all three.
+            "mask of a mask of a mask",
+            "<defs><mask id=\"m3\"><image href=\"{IMG}\" width=\"10\" height=\"10\"/></mask>\
+             <mask id=\"m2\" mask=\"url(#m3)\"><rect width=\"10\" height=\"10\" fill=\"#ffffff\"/></mask>\
+             <mask id=\"m1\" mask=\"url(#m2)\"><rect width=\"10\" height=\"10\" fill=\"#ffffff\"/></mask></defs>\
+             <rect width=\"10\" height=\"10\" fill=\"#ff0000\" mask=\"url(#m1)\"/>",
+        ),
+        (
+            "feImage",
+            "<defs><filter id=\"f\"><feImage href=\"{IMG}\"/></filter></defs>\
+             <rect width=\"10\" height=\"10\" filter=\"url(#f)\"/>",
+        ),
+        (
+            "feImage naming an image element",
+            "<defs><image id=\"i\" href=\"{IMG}\" width=\"10\" height=\"10\"/>\
+             <filter id=\"f\"><feImage href=\"#i\"/></filter></defs>\
+             <rect width=\"10\" height=\"10\" filter=\"url(#f)\"/>",
+        ),
+    ];
 
     #[test]
     fn embedded_rasters_are_charged_at_their_own_dimensions() {
@@ -590,13 +738,134 @@ mod tests {
         // the accounting charges the decoded RGBA bytes.
         let svg = svg_with_embedded_png(100, 50);
         let prepared = prepare(svg.as_bytes()).unwrap();
-        assert_eq!(
-            embedded_raster_bytes(prepared.tree.root().children()),
-            100 * 50 * 4
-        );
+        assert_eq!(embedded_raster_bytes(prepared.tree.root()), 100 * 50 * 4);
         // An SVG with no embedded raster charges nothing.
         let prepared = prepare(SIMPLE.as_bytes()).unwrap();
-        assert_eq!(embedded_raster_bytes(prepared.tree.root().children()), 0);
+        assert_eq!(embedded_raster_bytes(prepared.tree.root()), 0);
+    }
+
+    #[test]
+    fn rasters_outside_group_children_are_charged() {
+        // Issue #398: pattern, mask, and feImage contents
+        // live in usvg subroots, not Group::children(). A
+        // small payload in each wrapper still prepares, and
+        // is charged at its decoded size.
+        let small = png_data_uri(&png_bytes(100, 50));
+        for (name, template) in SUBROOT_WRAPPERS {
+            let svg = svg_document(&template.replace("{IMG}", &small));
+            let prepared = prepare(svg.as_bytes()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                embedded_raster_bytes(prepared.tree.root()),
+                100 * 50 * 4,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_rasters_outside_group_children_are_refused() {
+        // Issue #398: a 16000x16000 payload (about 1 GB as
+        // RGBA) was refused as a plain <image> but decoded
+        // at full size on the stills lane when wrapped in a
+        // pattern, a mask, or an feImage. Every wrapper is
+        // now refused by prepare with the budget error.
+        let plain = svg_document(&format!(
+            "<image href=\"{}\" width=\"10\" height=\"10\"/>",
+            png_data_uri(&png_header_only(16_000, 16_000))
+        ));
+        let err = prepare(plain.as_bytes()).err().unwrap();
+        assert!(err.contains("decode budget"), "plain image: {err}");
+        let huge = png_data_uri(&png_header_only(16_000, 16_000));
+        for (name, template) in SUBROOT_WRAPPERS {
+            let svg = svg_document(&template.replace("{IMG}", &huge));
+            let err = prepare(svg.as_bytes())
+                .err()
+                .unwrap_or_else(|| panic!("{name}: prepared"));
+            assert!(err.contains("decode budget"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn hostile_raster_in_a_nested_svg_pattern_is_refused() {
+        // A nested SVG payload is parsed by usvg straight
+        // from its data: URI; a pattern inside it is a
+        // subroot of the nested tree, and its rasters count.
+        let inner = svg_document(
+            &SUBROOT_WRAPPERS[0]
+                .1
+                .replace("{IMG}", &png_data_uri(&png_header_only(16_000, 16_000))),
+        );
+        let svg = svg_document(&format!(
+            "<image href=\"data:image/svg+xml;base64,{}\" width=\"10\" height=\"10\"/>",
+            b64(inner.as_bytes())
+        ));
+        let err = prepare(svg.as_bytes()).err().unwrap();
+        assert!(err.contains("decode budget"), "{err}");
+    }
+
+    #[test]
+    fn a_pattern_drawn_many_times_is_charged_each_time() {
+        // resvg renders a pattern's tile once per path it
+        // fills, decoding the tile's raster each time, so a
+        // shared pattern is charged once per reference:
+        // 100 fills of a 1000x1000 payload is 400 MB of
+        // decoding even though the payload appears once.
+        let mut body = format!(
+            "<defs><pattern id=\"p\" width=\"10\" height=\"10\" patternUnits=\"userSpaceOnUse\">\
+             <image href=\"{}\" width=\"10\" height=\"10\"/></pattern></defs>",
+            png_data_uri(&png_header_only(1_000, 1_000))
+        );
+        body.push_str(&"<rect width=\"10\" height=\"10\" fill=\"url(#p)\"/>".repeat(100));
+        let err = prepare(svg_document(&body).as_bytes()).err().unwrap();
+        assert!(err.contains("decode budget"), "{err}");
+    }
+
+    #[test]
+    fn pattern_expansion_is_capped_after_parse() {
+        // The expansion count walks subroots too: a
+        // 1_000-rect pattern filling 150 rects is drawn as
+        // ~150k nodes, with no <use> in the document.
+        let mut doc = String::from(
+            "<defs><pattern id=\"p\" width=\"10\" height=\"10\" patternUnits=\"userSpaceOnUse\">",
+        );
+        doc.push_str(&"<rect width=\"1\" height=\"1\"/>".repeat(1_000));
+        doc.push_str("</pattern></defs>");
+        let once = format!("{doc}<rect width=\"10\" height=\"10\" fill=\"url(#p)\"/>");
+        assert!(prepare(svg_document(&once).as_bytes()).is_ok());
+        doc.push_str(&"<rect width=\"10\" height=\"10\" fill=\"url(#p)\"/>".repeat(150));
+        let err = prepare(svg_document(&doc).as_bytes()).err().unwrap();
+        assert!(err.contains("node limit"), "{err}");
+    }
+
+    #[test]
+    fn expansion_count_stops_at_the_cap() {
+        // A chain of patterns, each filling ten rects with
+        // the one before, draws 10^6 rects from a ~60-node
+        // document; the count stops one past the cap.
+        let mut body = String::from(
+            "<defs><pattern id=\"p0\" width=\"10\" height=\"10\" patternUnits=\"userSpaceOnUse\">",
+        );
+        body.push_str(&"<rect width=\"1\" height=\"1\"/>".repeat(10));
+        body.push_str("</pattern>");
+        for level in 1..6 {
+            body.push_str(&format!(
+                "<pattern id=\"p{level}\" width=\"10\" height=\"10\" patternUnits=\"userSpaceOnUse\">"
+            ));
+            body.push_str(
+                &format!(
+                    "<rect width=\"1\" height=\"1\" fill=\"url(#p{})\"/>",
+                    level - 1
+                )
+                .repeat(10),
+            );
+            body.push_str("</pattern>");
+        }
+        body.push_str("</defs><rect width=\"10\" height=\"10\" fill=\"url(#p5)\"/>");
+        let text = sanitize(&svg_document(&body)).unwrap();
+        let opt = usvg::Options::default();
+        let tree = usvg::Tree::from_str(&text, &opt).unwrap();
+        assert_eq!(count_expanded(tree.root(), 1_000), 1_001);
+        assert!(prepare(svg_document(&body).as_bytes()).is_err());
     }
 
     #[test]
