@@ -3,16 +3,24 @@
 //! with CLIP ONNX exports. Only what the export format
 //! declares is implemented: whitespace-collapsing lowercase
 //! normalization, the export's pre-tokenizer split (letter
-//! runs, single digits, punctuation runs, contractions,
-//! whitespace pieces), the GPT-2 byte-to-unicode mapping,
+//! runs, single digits, punctuation runs, contractions, with
+//! whitespace dropped), the GPT-2 byte-to-unicode mapping,
 //! merges ranked by the file's merge list, the `</w>`
 //! end-of-word suffix, and SOT/EOT wrapping with padding
 //! to the model's 77-token context.
 //!
 //! The tokenizer is only ever fed operator label strings,
-//! which are short phrases; NFC normalization is the one
-//! declared step not reproduced (labels with combining
-//! characters should be written precomposed).
+//! which are short phrases. Two declared details are not
+//! reproduced exactly: NFC normalization (labels with
+//! combining characters should be written precomposed), and
+//! the pattern's `\p{L}` letter class, approximated with
+//! `char::is_alphabetic`, which admits everything Unicode
+//! calls Alphabetic: also letter numbers (Roman numerals),
+//! the combining vowel signs of scripts such as Devanagari
+//! or Thai, and a few symbols such as circled letters.
+//! Labels with those may split differently from the
+//! reference. ASCII labels, and precomposed accented
+//! letters, split exactly.
 
 use std::collections::HashMap;
 
@@ -210,73 +218,49 @@ fn normalize(text: &str) -> String {
 }
 
 /// Split normalized text the way the export's
-/// pre-tokenizer does: contractions (`'s`, `'t`, `'re`,
-/// `'ve`, `'m`, `'ll`, `'d`) stand alone, letter runs
-/// group, each digit stands alone, punctuation runs
-/// group, and a space prefixes the piece that follows
-/// it (the reference pattern's optional-space piece
-/// starts), so the space between two words joins the
-/// second word instead of forming a piece of its own.
-/// The splitter once emitted every whitespace run as
-/// its own piece, which encoded each space as a lone
-/// end-of-word space token and stripped the following
-/// word's space prefix, diverging from the reference
-/// tokenization of every multi-word text (issue #377).
-/// A run longer than one space leaves its extra spaces
-/// as a piece before the prefixed one, and a trailing
-/// run stands alone; the normalized text `encode` feeds
-/// here has runs of exactly one space, plus a possible
-/// leading or trailing one.
+/// pre-tokenizer does. CLIP's `tokenizer.json` declares a
+/// `Split` on `'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+`
+/// with `behavior: Removed, invert: true`: the matches are
+/// the pieces, and what lies between them, which can only be
+/// whitespace, is dropped before BPE (open_clip's
+/// `re.findall` on the same pattern does the same). So
+/// contractions (`'s`, `'t`, `'re`, `'ve`, `'m`, `'ll`, `'d`)
+/// stand alone, letter runs group, each digit stands alone,
+/// punctuation runs group, and no piece carries a space.
+/// Issue #377 replaced lone whitespace pieces with a space
+/// prefix on the following piece (GPT-2's ` ?\p{L}+`), which
+/// CLIP's pattern does not have; both put a space token CLIP
+/// never trained on between every two words (issue #404).
 fn pretokenize(text: &str) -> Vec<String> {
     const CONTRACTIONS: [&str; 7] = ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"];
     let chars: Vec<char> = text.chars().collect();
     let mut pieces: Vec<String> = Vec::new();
-    // A whitespace character waiting to prefix the next
-    // piece.
-    let mut prefix = String::new();
     let mut i = 0;
     while i < chars.len() {
         let ch = chars[i];
         if ch.is_whitespace() {
-            let start = i;
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            if i == chars.len() {
-                pieces.push(chars[start..i].iter().collect());
-                break;
-            }
-            if i - start > 1 {
-                pieces.push(chars[start..i - 1].iter().collect());
-            }
-            prefix = chars[i - 1].to_string();
+            i += 1;
             continue;
         }
         if ch == '\'' {
-            let rest: String = chars[i..].iter().collect();
-            if let Some(c) = CONTRACTIONS.iter().find(|c| rest.starts_with(**c)) {
-                let mut piece = std::mem::take(&mut prefix);
-                piece.push_str(c);
-                pieces.push(piece);
+            let contraction = CONTRACTIONS.iter().find(|c| {
+                let n = c.chars().count();
+                chars.len() - i >= n && c.chars().eq(chars[i..i + n].iter().copied())
+            });
+            if let Some(c) = contraction {
+                pieces.push(c.to_string());
                 i += c.chars().count();
                 continue;
             }
         }
+        let start = i;
         if ch.is_alphabetic() {
-            let start = i;
             while i < chars.len() && chars[i].is_alphabetic() {
                 i += 1;
             }
-            let mut piece = std::mem::take(&mut prefix);
-            piece.extend(&chars[start..i]);
-            pieces.push(piece);
         } else if ch.is_numeric() {
-            let mut piece = std::mem::take(&mut prefix);
-            piece.push(ch);
-            pieces.push(piece);
             i += 1;
         } else {
-            let start = i;
             while i < chars.len()
                 && !chars[i].is_whitespace()
                 && !chars[i].is_alphabetic()
@@ -284,10 +268,8 @@ fn pretokenize(text: &str) -> Vec<String> {
             {
                 i += 1;
             }
-            let mut piece = std::mem::take(&mut prefix);
-            piece.extend(&chars[start..i]);
-            pieces.push(piece);
         }
+        pieces.push(chars[start..i].iter().collect());
     }
     pieces
 }
@@ -350,16 +332,14 @@ mod tests {
         let t = toy();
         let (ids, _) = t.encode("ab").unwrap();
         assert_eq!(&ids[..3], &[0, 15, 1], "a + b</w> merge to ab</w>");
-        // No merge across pieces, and the space prefixes
-        // the second word (issue #377): "a b" is a</w>,
-        // then the piece " b" as the bare space byte and
-        // b</w>, never a lone end-of-word space token.
+        // No merge across pieces, and the space between them
+        // is dropped (issue #404): neither the bare space
+        // byte (16) nor the end-of-word space (12) appears.
         let (ids, _) = t.encode("a b").unwrap();
-        assert_eq!(&ids[..5], &[0, 10, 16, 11, 1]);
-        // A trailing space does stand alone, as the
-        // reference's trailing-whitespace piece.
-        let (ids, _) = t.encode("a ").unwrap();
-        assert_eq!(&ids[..4], &[0, 10, 12, 1]);
+        assert_eq!(&ids[..4], &[0, 10, 11, 1]);
+        // Leading and trailing spaces are dropped too.
+        let (ids, _) = t.encode(" a ").unwrap();
+        assert_eq!(&ids[..3], &[0, 10, 1]);
     }
 
     #[test]
@@ -407,21 +387,102 @@ mod tests {
     fn encode_lowercases_and_collapses_whitespace() {
         let t = toy();
         let (ids, _) = t.encode("A   B").unwrap();
-        assert_eq!(&ids[..5], &[0, 10, 16, 11, 1]);
+        assert_eq!(&ids[..4], &[0, 10, 11, 1]);
+        let (ids, _) = t.encode("\tA\n\u{3000}B ").unwrap();
+        assert_eq!(&ids[..4], &[0, 10, 11, 1]);
     }
 
     #[test]
     fn pretokenize_splits_like_the_export() {
-        // The space prefixes the following piece (issue
-        // #377); it is a piece of its own only when it
-        // trails, or as the extra spaces of a longer run.
-        assert_eq!(pretokenize("kite surfing"), ["kite", " surfing"]);
-        assert_eq!(pretokenize("top 10"), ["top", " 1", "0"]);
-        assert_eq!(pretokenize("it's me"), ["it", "'s", " me"]);
+        // Whitespace separates pieces and is dropped, never
+        // a piece or a prefix of its own (issue #404).
+        assert_eq!(pretokenize("kite surfing"), ["kite", "surfing"]);
+        assert_eq!(pretokenize("top 10"), ["top", "1", "0"]);
+        assert_eq!(pretokenize("it's me"), ["it", "'s", "me"]);
         assert_eq!(pretokenize("sun-set!"), ["sun", "-", "set", "!"]);
-        assert_eq!(pretokenize("kite "), ["kite", " "]);
-        assert_eq!(pretokenize("a  b"), ["a", " ", " b"]);
-        assert_eq!(pretokenize(" kite"), [" kite"]);
+        assert_eq!(pretokenize("kite "), ["kite"]);
+        assert_eq!(pretokenize("a  b"), ["a", "b"]);
+        assert_eq!(pretokenize(" kite"), ["kite"]);
+        assert_eq!(pretokenize("dog, cat"), ["dog", ",", "cat"]);
+        // A contraction only where the pattern has one; any
+        // other apostrophe joins its punctuation run.
+        assert_eq!(
+            pretokenize("'twas o'clock"),
+            ["'t", "was", "o", "'", "clock"]
+        );
+        assert_eq!(pretokenize("!'s"), ["!'", "s"]);
+        assert_eq!(pretokenize("rock'n'roll"), ["rock", "'", "n", "'", "roll"]);
+        assert_eq!(pretokenize("'"), ["'"]);
+        assert!(pretokenize("").is_empty());
+        assert!(pretokenize(" \t\n").is_empty());
+    }
+
+    /// Phrases with their token ids from the reference CLIP
+    /// tokenizer (Hugging Face `tokenizers` 0.23.3 on the
+    /// 49,408-entry vocabulary, matching open_clip's
+    /// `SimpleTokenizer`), not from this implementation. The
+    /// pre-#404 splitter produced, for the first,
+    /// `[49406, 320, 220, 1125, 220, 539, 220, 320, 220, 1929, 49407]`:
+    /// a bare space token (220) before every word but the
+    /// first.
+    const CLIP_REFERENCE_IDS: [(&str, &[i64]); 9] = [
+        (
+            "a photo of a dog",
+            &[49406, 320, 1125, 539, 320, 1929, 49407],
+        ),
+        (
+            "aerial view of a beach",
+            &[49406, 12440, 1093, 539, 320, 2117, 49407],
+        ),
+        ("kite surfing", &[49406, 19867, 15762, 49407]),
+        ("top 10", &[49406, 1253, 272, 271, 49407]),
+        ("it's me", &[49406, 585, 568, 614, 49407]),
+        ("sun-set!", &[49406, 2176, 268, 1167, 256, 49407]),
+        ("dog", &[49406, 1929, 49407]),
+        ("a dog, a cat", &[49406, 320, 1929, 267, 320, 2368, 49407]),
+        (
+            "  A\tPhoto   of a DOG\n",
+            &[49406, 320, 1125, 539, 320, 1929, 49407],
+        ),
+    ];
+
+    fn assert_reference_ids(t: &ClipTokenizer) {
+        for (phrase, expected) in CLIP_REFERENCE_IDS {
+            let (ids, mask) = t.encode(phrase).unwrap();
+            let n = mask.iter().filter(|&&m| m == 1).count();
+            assert_eq!(&ids[..n], expected, "{phrase:?}");
+        }
+    }
+
+    /// The fixture is an excerpt of OpenAI CLIP's BPE
+    /// vocabulary (`bpe_simple_vocab_16e6`, MIT License,
+    /// Copyright (c) 2021 OpenAI): the 49 entries with their
+    /// real ids, and the 39 merges in their real order, that
+    /// the phrases above touch. Every merge the full
+    /// vocabulary applies to these phrases is present, so BPE
+    /// on the excerpt takes the same steps as on the whole
+    /// file. It also carries the bare (220) and end-of-word
+    /// (476) space tokens, so a splitter that emits spaces
+    /// fails here with those ids rather than on a lookup.
+    #[test]
+    fn real_clip_ids_from_a_vocab_excerpt() {
+        let t = ClipTokenizer::from_json(include_str!(
+            "../tests/fixtures/clip-tokenizer-excerpt.json"
+        ))
+        .unwrap();
+        assert_reference_ids(&t);
+    }
+
+    /// The same ids against a full CLIP `tokenizer.json`.
+    /// Ignored: needs the file, CRABCROP_TEST_CLIP_TOKENIZER=...
+    /// (the ai-models workflow provides it).
+    #[test]
+    #[ignore = "needs a CLIP tokenizer.json (env-configured)"]
+    fn real_clip_ids_from_the_full_tokenizer() {
+        let Some(path) = crate::ai::env_or_skip("CRABCROP_TEST_CLIP_TOKENIZER") else {
+            return;
+        };
+        assert_reference_ids(&ClipTokenizer::load(&path).unwrap());
     }
 
     #[test]
