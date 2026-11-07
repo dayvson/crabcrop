@@ -1926,24 +1926,66 @@ pub fn blur_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicIm
     })
 }
 
-/// Pixelate every detected face region in `img`: each face is
-/// resampled down to a handful of blocks and back with nearest
-/// neighbor. Pixels outside the face boxes are untouched.
+/// The most mosaic cells a pixelated face spans along its
+/// longer side.
+const FACE_MOSAIC_CELLS: u32 = 8;
+
+/// Pixelate every detected face region in `img` into a coarse
+/// mosaic of averaged cells. The cell size comes from the face
+/// box: its longer side spans at most `FACE_MOSAIC_CELLS`
+/// cells, and a cell is never under 2 px, so a face only a few
+/// pixels wide is averaged away rather than passed through
+/// (issue #401: a 1 px block made the old nearest-neighbor
+/// round trip an identity for faces under 20 px, and sampling
+/// kept a quarter of the pixels of slightly larger ones).
+/// Pixels outside the face boxes are untouched.
 pub fn pixelate_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicImage {
     redact_faces(img, faces, |region, face| {
-        let block = (face.w / 10).max(1);
-        let (sw, sh) = (
-            (region.width() / block).max(1),
-            (region.height() / block).max(1),
-        );
-        region
-            .resize_exact(sw, sh, image::imageops::FilterType::Nearest)
-            .resize_exact(
-                region.width(),
-                region.height(),
-                image::imageops::FilterType::Nearest,
-            )
+        let cell = face.w.max(face.h).div_ceil(FACE_MOSAIC_CELLS).max(2);
+        mosaic(region, cell)
     })
+}
+
+/// Paint `img` as a grid of cells, each with the average of its
+/// pixels (alpha included). The grid has `side / cell` cells
+/// along each axis (at least one), spread evenly, so every cell
+/// is at least `cell` px on a side, or the whole axis when the
+/// image is shorter: unlike `pixelate`'s anchored blocks, no
+/// thin strip at the right or bottom edge keeps its detail.
+fn mosaic(img: &DynamicImage, cell: u32) -> DynamicImage {
+    let mut rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let cell = cell.max(1);
+    let (nx, ny) = ((w / cell).max(1), (h / cell).max(1));
+    // u64: with small cells on a long side, i * side passes
+    // u32::MAX.
+    let edge = |i: u32, side: u32, n: u32| (i as u64 * side as u64 / n as u64) as u32;
+    for j in 0..ny {
+        let (y0, y1) = (edge(j, h, ny), edge(j + 1, h, ny));
+        for i in 0..nx {
+            let (x0, x1) = (edge(i, w, nx), edge(i + 1, w, nx));
+            let mut sums = [0u64; 4];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = rgba.get_pixel(x, y);
+                    for c in 0..4 {
+                        sums[c] += p[c] as u64;
+                    }
+                }
+            }
+            let n = (x1 - x0) as u64 * (y1 - y0) as u64;
+            if n == 0 {
+                continue;
+            }
+            let avg = image::Rgba(sums.map(|s| ((s + n / 2) / n) as u8));
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    rgba.put_pixel(x, y, avg);
+                }
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(rgba)
 }
 
 /// Blur every detection's box in `img`, through the
@@ -3163,6 +3205,160 @@ mod tests {
         assert_eq!(rgb.get_pixel(5, 15).0, [255, 0, 0]);
         assert_eq!(rgb.get_pixel(35, 15).0, [0, 0, 255]);
         assert_eq!(rgb.get_pixel(19, 5).0, [255, 0, 0]);
+    }
+
+    fn face_box(x: u32, y: u32, w: u32, h: u32) -> crate::ai::FaceBox {
+        crate::ai::FaceBox {
+            x,
+            y,
+            w,
+            h,
+            score: 0.9,
+        }
+    }
+
+    /// A mid-gray 64x64 frame with a one-pixel black and white
+    /// checkerboard inside the box: the finest detail a face
+    /// can carry.
+    fn checker_face_scene(fx: u32, fy: u32, fw: u32, fh: u32) -> DynamicImage {
+        let mut img = image::RgbImage::from_pixel(64, 64, Rgb([90, 90, 90]));
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            if (fx..fx + fw).contains(&x) && (fy..fy + fh).contains(&y) {
+                *p = if (x + y) % 2 == 0 {
+                    Rgb([0, 0, 0])
+                } else {
+                    Rgb([255, 255, 255])
+                };
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    /// Asserts the checkerboard in the face box is gone: no
+    /// pixel inside keeps its checker value (the averages of
+    /// cells at least 2x2 px are never pure black or white),
+    /// and every pixel shares its value with a horizontal and a
+    /// vertical neighbor inside the box, so no per-pixel detail
+    /// survives anywhere, edges included. Pixels outside the
+    /// box must be untouched.
+    fn assert_checker_face_redacted(
+        src: &DynamicImage,
+        out: &DynamicImage,
+        (fx, fy, fw, fh): (u32, u32, u32, u32),
+    ) {
+        let (src, out) = (src.to_rgb8(), out.to_rgb8());
+        assert_eq!(out.dimensions(), src.dimensions());
+        let inside = |x: u32, y: u32| (fx..fx + fw).contains(&x) && (fy..fy + fh).contains(&y);
+        for (x, y, p) in out.enumerate_pixels() {
+            if !inside(x, y) {
+                assert_eq!(p, src.get_pixel(x, y), "outside pixel ({x}, {y}) changed");
+                continue;
+            }
+            assert_ne!(p, src.get_pixel(x, y), "face pixel ({x}, {y}) survived");
+            let same = |nx: u32, ny: u32| inside(nx, ny) && out.get_pixel(nx, ny) == p;
+            assert!(
+                (x > 0 && same(x - 1, y)) || same(x + 1, y),
+                "face pixel ({x}, {y}) differs from both horizontal neighbors"
+            );
+            assert!(
+                (y > 0 && same(x, y - 1)) || same(x, y + 1),
+                "face pixel ({x}, {y}) differs from both vertical neighbors"
+            );
+        }
+    }
+
+    #[test]
+    fn pixelate_faces_redacts_small_faces() {
+        // Issue #401: under 20 px the old block was 1 px and the
+        // face came back bit-identical; at 20-29 px nearest
+        // sampling kept a quarter of the pixels. The odd sizes
+        // would leave a 1 px strip under top-left-anchored
+        // 2 px blocks.
+        for (fw, fh) in [(12, 12), (24, 24), (8, 6), (13, 17), (19, 25), (29, 29)] {
+            let src = checker_face_scene(10, 11, fw, fh);
+            let out = pixelate_faces(&src, &[face_box(10, 11, fw, fh)]);
+            assert_checker_face_redacted(&src, &out, (10, 11, fw, fh));
+        }
+    }
+
+    #[test]
+    fn pixelate_faces_redacts_a_face_cut_by_the_frame() {
+        // The box hangs 20 px past the right edge: only the
+        // visible 6 px are redacted, and the cell size still
+        // comes from the whole face, so the strip is a single
+        // averaged cell wide.
+        let src = checker_face_scene(58, 20, 6, 26);
+        let out = pixelate_faces(&src, &[face_box(58, 20, 26, 26)]);
+        assert_checker_face_redacted(&src, &out, (58, 20, 6, 26));
+        let rgb = out.to_rgb8();
+        assert!((58..64).all(|x| rgb.get_pixel(x, 22) == rgb.get_pixel(58, 22)));
+    }
+
+    #[test]
+    fn pixelate_faces_caps_the_cells_across_a_face() {
+        // A 48 px face is 8 cells of 6 px across. A horizontal
+        // ramp gives every cell column its own average.
+        let mut img = image::RgbImage::from_pixel(64, 64, Rgb([90, 90, 90]));
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            if (8..56).contains(&x) && (8..56).contains(&y) {
+                let v = ((x - 8) * 5) as u8;
+                *p = Rgb([v, v, v]);
+            }
+        }
+        let out = pixelate_faces(&DynamicImage::ImageRgb8(img), &[face_box(8, 8, 48, 48)]);
+        let rgb = out.to_rgb8();
+        let runs = (9..56)
+            .filter(|&x| rgb.get_pixel(x, 30) != rgb.get_pixel(x - 1, 30))
+            .count()
+            + 1;
+        assert_eq!(runs, 8);
+        assert_eq!(rgb.get_pixel(8, 30).0, [13, 13, 13]);
+        assert_eq!(rgb.get_pixel(7, 30).0, [90, 90, 90]);
+    }
+
+    #[test]
+    fn mosaic_averages_alpha_too() {
+        let mut img = image::RgbaImage::new(4, 4);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let a = if (x + y) % 2 == 0 { 0 } else { 255 };
+            *p = image::Rgba([200, 10, 10, a]);
+        }
+        let out = mosaic(&DynamicImage::ImageRgba8(img), 2).to_rgba8();
+        assert!(out.pixels().all(|p| p.0 == [200, 10, 10, 128]));
+    }
+
+    #[test]
+    fn pixelate_faces_survives_degenerate_boxes() {
+        // Boxes come from a model: empty, off-frame, enormous
+        // and one-pixel boxes must neither panic nor touch
+        // pixels outside the frame's part of the box.
+        let src = checker_face_scene(0, 0, 64, 64);
+        let boxes = [
+            face_box(0, 0, 0, 0),
+            face_box(70, 70, 10, 10),
+            face_box(5, 5, 1, 1),
+            face_box(0, 0, u32::MAX, u32::MAX),
+        ];
+        for b in boxes {
+            let out = pixelate_faces(&src, &[b]);
+            assert_eq!((out.width(), out.height()), (64, 64));
+        }
+        let out = pixelate_faces(&src, &[face_box(0, 0, u32::MAX, u32::MAX)]);
+        let rgb = out.to_rgb8();
+        // The whole frame is one cell of a huge face.
+        assert!(rgb.pixels().all(|p| p == rgb.get_pixel(0, 0)));
+    }
+
+    #[test]
+    fn mosaic_cell_edges_do_not_overflow_on_long_sides() {
+        // 50,000 cells along 100,000 px: i * side passes
+        // u32::MAX, so the edges must be computed in u64.
+        let mut img = image::RgbaImage::new(100_000, 1);
+        img.put_pixel(99_999, 0, image::Rgba([255, 255, 255, 255]));
+        let out = mosaic(&DynamicImage::ImageRgba8(img), 2).to_rgba8();
+        assert_eq!(out.dimensions(), (100_000, 1));
+        assert_eq!(out.get_pixel(99_998, 0).0, [128, 128, 128, 128]);
+        assert_eq!(out.get_pixel(99_997, 0).0, [0, 0, 0, 0]);
     }
 
     fn striped() -> DynamicImage {
