@@ -4185,9 +4185,11 @@ mod tests {
 
     /// An app with a fake video decoder configured
     /// (issue #214): its probe prints `report` (printf
-    /// arguments, already quoted) on stderr, and its
-    /// extraction answers with the test PNG, so the whole
-    /// frame path runs without a real decoder.
+    /// arguments, already quoted) on stderr, with the
+    /// probe's `-dump_separator` after each stream's codec
+    /// name as the reference tool prints it (issue #402),
+    /// and its extraction answers with the test PNG, so the
+    /// whole frame path runs without a real decoder.
     async fn spawn_app_with_frame_decoder(report: &str) -> String {
         use std::io::Write as _;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4199,7 +4201,7 @@ mod tests {
         std::fs::write(dir.join("frame.png"), test_png()).unwrap();
         let frame_path = dir.join("frame.png").display().to_string();
         let script = format!(
-            "#!/bin/sh\ncat > /dev/null\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\ndone\nprintf '%s\\n' {report} >&2\nexit 1\n"
+            "#!/bin/sh\ncat > /dev/null\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' {report} | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n"
         );
         let path = dir.join("decoder.sh");
         let mut file = std::fs::File::create(&path).unwrap();
