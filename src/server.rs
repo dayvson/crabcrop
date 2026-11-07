@@ -6877,6 +6877,38 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn thousands_of_distinct_unknown_presets_are_still_unknown_preset() {
+        // Issue #409: the cache-group scan runs before
+        // expansion, and used to de-duplicate quadratically.
+        // A presets-only remainder of about 5,400 distinct
+        // names (just under hyper's URI cap) answers the same
+        // 400 unknown_preset, naming the first unknown, on
+        // the image route and on /explain, without a fetch.
+        let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+        let base = spawn_app_with_presets(preset_test_map(), true).await;
+        let mut remainder = String::from("preset:small/");
+        for i in 0..5_400 {
+            remainder.push_str(&format!("preset:{i:03x}/"));
+        }
+        remainder.push_str(&src);
+        assert!(remainder.len() > 60_000, "{}", remainder.len());
+        for route in ["", "explain/"] {
+            let resp = client()
+                .get(format!("{base}/{route}{}/{remainder}", sign(&remainder)))
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "/{route}");
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"], "unknown_preset", "/{route}");
+            assert_eq!(body["error"]["message"], "unknown preset: 000", "/{route}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
     /// Issue #247: with NO presets configured, a `preset:`
     /// segment used to skip expansion entirely and reach the
     /// loader as the source (502 `source fetch failed`). Every
