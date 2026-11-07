@@ -4,7 +4,7 @@ A custom loader for `next/image` that routes every image through your crabcrop d
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (or copy `sdks/typescript/src/index.ts` into your project and adjust the import).
+1. Install the builder: `npm install @crabcrop/url` (or copy `index.ts`, `operations.ts`, and `explain.ts` from `sdks/typescript/src/` into your project, since `index.ts` imports the other two, and adjust the import).
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project root.
 3. Point Next at it:
 

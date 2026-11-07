@@ -67,6 +67,11 @@ both SDKs must all pass.
 - One binary, configuration-gated: AI and provenance features are enabled
   by environment configuration in the same binary, not by separate builds
   or cargo features. Never commit model files, certificates, or keys.
+  The exception is throwaway C2PA test material: the test identity
+  (`tests/functional/c2pa_cert.pem` and `c2pa_key.pem`, the same pair
+  as `TEST_CHAIN` / `TEST_KEY` in `src/provenance.rs`) and the
+  negative-case key and certificate in that module's tests. None of
+  it chains to a trust list or is a deployment credential.
 - Source fetching stays inside the loader's policy (host allowlist,
   private-address protection, fetch and decode bounds). Do not widen what
   the server will fetch as a side effect of an unrelated change.

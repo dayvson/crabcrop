@@ -8,11 +8,14 @@ hosts. There is no hosted service and no account.
 
 The original media library is untouched: originals stay where
 WordPress put them, every rewrite happens at render time, and
-disabling the plugin returns the site to plain URLs. Failure is
-safe by construction: an unmapped size, a missing base URL, a
-signed mode without a secret, or an instance that is down or
-misconfigured all leave the original URL in place, never a broken
-image.
+disabling the plugin returns the site to plain URLs. A problem the
+plugin can see is safe: an unmapped size, a missing base URL, a
+signed mode without a secret, or a URL the builder rejects all
+leave the original URL in place. The plugin never contacts the
+instance, though, so it cannot see one that is down or
+misconfigured (a preset missing on the server, a secret that does
+not match): rewritten images then fail to load until the instance
+is fixed or the plugin is disabled.
 
 ## Install
 

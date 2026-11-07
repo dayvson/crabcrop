@@ -51,7 +51,7 @@ const group = purgeGroupSignature("your-secret", "thumb");
 // Pass an expiry (unix seconds) for a token that stops working
 // then; its path is /upload/<signature>/exp:<expiry>/<name>.
 const upload = uploadSignature("your-secret", "heroes/photo.jpg");
-const expiring = uploadSignature("your-secret", "heroes/photo.jpg", 1893456000);
+const expiringUpload = uploadSignature("your-secret", "heroes/photo.jpg", 1893456000);
 
 // Sealed URLs (issue #255): the whole remainder encrypted into an
 // opaque token in the signature slot, for public links whose recipe
@@ -88,7 +88,7 @@ A value the server would reject (`filter.quality(0)`, `filter.brighten(256)`, `o
 
 ## Runtime
 
-The package is TypeScript and runs directly on Node >= 22 (type stripping), which is also how the tests run:
+The published package is compiled JavaScript (`dist/`) for Node >= 22. The sources are TypeScript and run directly on Node 22.18 or newer (or 23.6 or newer), where type stripping is on by default, which is also how the tests run:
 
 ```bash
 node --test

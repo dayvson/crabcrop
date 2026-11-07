@@ -69,9 +69,9 @@ pub(in crate::server) use process::{SLOW_LANE_WAIT, apply_provenance};
 /// Shared state for the handlers.
 #[derive(Debug, Clone)]
 pub struct AppState {
-    /// HMAC secret, from `CRABCROP_SECRET`.
-    /// The signing keyring (issue #143): the current key
-    /// plus, during a rotation window, the previous one.
+    /// The signing keyring (issue #143), from `CRABCROP_SECRET`:
+    /// the current key plus, during a rotation window, the
+    /// previous one (`CRABCROP_SECRET_PREVIOUS`).
     pub keyring: crate::url::Keyring,
     /// Whether `unsafe` URLs are honored, from `CRABCROP_ALLOW_UNSAFE`.
     pub allow_unsafe: bool,
