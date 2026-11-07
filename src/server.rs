@@ -10428,6 +10428,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_width_hint_rasterizes_an_svg_at_the_hinted_width() {
+        // A vector has no pixels to invent: an SVG rasterizes
+        // at the size the request heads for, and the
+        // `no_upscale` cap is that raster, the same as for an
+        // explicit `filters:no_upscale` in the URL. So a hint
+        // past the intrinsic 100x10 still renders crisp at
+        // the hinted width, and the hint ceiling (issue #403)
+        // is what bounds it.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="10"><rect width="100" height="10" fill="#00ff00"/></svg>"##;
+        let (src, _) = spawn_counting_server(200, "image/svg+xml", svg.to_vec()).await;
+        let base = spawn_app(false).await;
+        let remainder = format!("filters:format(png)/{src}");
+        let dims_of = |resp: reqwest::Response| async {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.bytes().await.unwrap();
+            let img = image::load_from_memory(&bytes).unwrap();
+            (img.width(), img.height())
+        };
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "300")]).await;
+        assert_eq!(dims_of(resp).await, (300, 30));
+        let explicit = format!("300x0/filters:no_upscale:format(png)/{src}");
+        let resp = get_with_headers(&base, &explicit, &[]).await;
+        assert_eq!(dims_of(resp).await, (300, 30));
+        let resp = get_with_headers(&base, &remainder, &[("Sec-CH-Width", "9000")]).await;
+        assert_eq!(dims_of(resp).await, (MAX_HINT_WIDTH, 384));
+    }
+
+    #[tokio::test]
     async fn hints_past_the_ceiling_share_one_cache_entry() {
         let (src, hits) = spawn_counting_server(200, "image/png", png_of(640, 480)).await;
         let base = spawn_app(false).await;
