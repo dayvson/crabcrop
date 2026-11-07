@@ -22,12 +22,15 @@
 //! and built entirely here:
 //!
 //! - Probe: `-nostdin -v info -protocol_whitelist fd
-//!   -format_whitelist <containers> -i fd:`. No output
-//!   target is named, so the tool prints its input report
-//!   (duration, stream list) to stderr and exits nonzero;
-//!   the probe reads its facts from that report and treats
-//!   the exit status as meaningless. A source with no
-//!   video stream in the report (a non-video, an
+//!   -format_whitelist <containers> -dump_separator <token>
+//!   -i fd:`. No output target is named, so the tool
+//!   prints its input report (duration, stream list) to
+//!   stderr and exits nonzero; the probe reads its facts
+//!   from that report and treats the exit status as
+//!   meaningless. The report also prints the source's own
+//!   metadata, so the token, random per probe, marks the
+//!   real stream lines (see [`parse_probe`]). A source with
+//!   no video stream in the report (a non-video, an
 //!   audio-only file, a corrupt container) is
 //!   [`FrameError::NotVideo`].
 //! - Extract: `-nostdin -v info -protocol_whitelist fd
@@ -80,9 +83,13 @@ pub const MAX_FRAME_PNG_BYTES: usize = 256 * 1024 * 1024;
 const FORMAT_WHITELIST: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,flv,asf,ogg";
 
 /// How much of a tool's stderr report the probe keeps.
-/// The input report sits at the head of the output; this
-/// is generous headroom for chatty builds.
-const PROBE_REPORT_CAP: usize = 64 * 1024;
+/// The input report sits at the head of the output, and a
+/// real one is a few kilobytes; this is generous headroom
+/// for chatty builds and metadata-heavy sources. A probe
+/// report past the cap is refused, not parsed (issue
+/// #402): source metadata could have pushed the real facts
+/// past the cut and left only planted lines in view.
+const PROBE_REPORT_CAP: usize = 256 * 1024;
 
 /// What a probe learned about a video source.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -204,6 +211,7 @@ impl VideoFrameExtractor {
     /// shares one budget instead of a fresh timeout per
     /// invocation (issue #362).
     fn probe_until(&self, input: &File, deadline: Instant) -> Result<VideoProbe, FrameError> {
+        let separator = probe_separator();
         let run = self.run(
             &[
                 "-nostdin",
@@ -213,6 +221,8 @@ impl VideoFrameExtractor {
                 "fd",
                 "-format_whitelist",
                 FORMAT_WHITELIST,
+                "-dump_separator",
+                &separator,
                 "-i",
                 "fd:",
             ],
@@ -220,7 +230,13 @@ impl VideoFrameExtractor {
             0,
             deadline,
         )?;
-        parse_probe(&run.stderr).ok_or_else(|| {
+        if run.stderr_truncated {
+            return Err(FrameError::NotVideo(format!(
+                "the decoder's report on the source passed the {PROBE_REPORT_CAP} byte cap, \
+                 so its facts cannot be checked"
+            )));
+        }
+        parse_probe(&run.stderr, &separator).ok_or_else(|| {
             if run.stderr.contains("Protocol not found") {
                 // FFmpeg before 6.0 has no `fd` protocol: say
                 // so, rather than blame the source.
@@ -407,22 +423,22 @@ impl VideoFrameExtractor {
         });
 
         let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-        let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<(String, bool)>();
         let stderr_thread = std::thread::spawn(move || {
             let mut kept = Vec::new();
+            let mut truncated = false;
             let mut chunk = [0u8; 16 * 1024];
             loop {
                 match stderr_pipe.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if kept.len() < PROBE_REPORT_CAP {
-                            let take = (PROBE_REPORT_CAP - kept.len()).min(n);
-                            kept.extend_from_slice(&chunk[..take]);
-                        }
+                        let take = (PROBE_REPORT_CAP - kept.len()).min(n);
+                        kept.extend_from_slice(&chunk[..take]);
+                        truncated |= take < n;
                     }
                 }
             }
-            let _ = err_tx.send(String::from_utf8_lossy(&kept).into_owned());
+            let _ = err_tx.send((String::from_utf8_lossy(&kept).into_owned(), truncated));
         });
 
         // Wait for the exit status without ever blocking
@@ -505,7 +521,7 @@ impl VideoFrameExtractor {
         // is worth a short grace through its channel, no
         // more; the stdout result already arrived through
         // its own channel.
-        let stderr = err_rx
+        let (stderr, stderr_truncated) = err_rx
             .recv_timeout(Duration::from_millis(200))
             .unwrap_or_default();
         drop(stdout_thread);
@@ -514,6 +530,7 @@ impl VideoFrameExtractor {
             status,
             stdout,
             stderr,
+            stderr_truncated,
         })
     }
 }
@@ -565,6 +582,8 @@ struct ToolRun {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: String,
+    /// Whether stderr passed the report cap and was cut.
+    stderr_truncated: bool,
 }
 
 /// The frame interval a probe implies, for clamping and
@@ -620,12 +639,6 @@ fn format_seconds(value: f64) -> String {
     }
 }
 
-/// Parse the probe facts out of the tool's stderr
-/// report: the `Duration:` line and the first
-/// `Stream ...: Video:` line that carries dimensions.
-/// Returns `None` when no usable video stream appears,
-/// which is the not-a-video answer for every corrupt,
-/// audio-only, or non-video source.
 /// Demuxers that carry raw still images rather than
 /// video (issue #266): ffmpeg promotes a JPEG embedded
 /// in an arbitrary blob (a PDF, a zip, junk bytes) to a
@@ -663,37 +676,103 @@ const IMAGE_DEMUXERS: &[&str] = &[
     "svg_pipe",
 ];
 
-pub fn parse_probe(report: &str) -> Option<VideoProbe> {
-    let mut duration = None;
-    let mut stream: Option<(u32, u32, Option<f64>)> = None;
-    let mut demuxers: Vec<&str> = Vec::new();
-    for line in report.lines() {
-        if demuxers.is_empty()
-            && let Some(rest) = line.trim_start().strip_prefix("Input #")
-            && let Some((_, after)) = rest.split_once(", ")
-            && let Some((list, _)) = after.split_once(", from ")
-        {
-            demuxers = list.split(',').map(str::trim).collect();
-        }
-        if duration.is_none()
-            && let Some(rest) = line.split("Duration: ").nth(1)
-        {
-            duration = parse_duration(rest);
-        }
-        // An attached picture (album art) is not the
-        // video stream, even when it is the only one.
-        if stream.is_none()
-            && line.contains("Stream #")
-            && line.contains(": Video: ")
-            && !line.contains("(attached pic)")
-        {
-            stream = parse_video_stream(line);
-        }
-    }
+/// The media type markers a stream line can carry, as the
+/// report spells them (the type name, capitalized, between
+/// `: ` and `: `).
+const STREAM_KINDS: &[&str] = &[
+    ": Video: ",
+    ": Audio: ",
+    ": Subtitle: ",
+    ": Data: ",
+    ": Attachment: ",
+    ": Unknown: ",
+];
+
+/// A fresh field separator for one probe (issue #402),
+/// ` ~<16 hex digits>~ `, passed as the tool's
+/// `-dump_separator`. The tool prints it inside each
+/// stream's codec description and nowhere else, which is
+/// how [`parse_probe`] tells a real stream line from text
+/// the source planted, so whoever made the source must not
+/// be able to predict it: `RandomState` keys its hasher
+/// from the OS's random source and steps the keys for
+/// every instance, so even the digest of no input is a
+/// fresh 64-bit secret.
+fn probe_separator() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let token = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!(" ~{token:016x}~ ")
+}
+
+/// Parse the probe facts out of the tool's stderr report:
+/// the input's `Duration:` line and its first video stream
+/// that carries dimensions. Returns `None` when no usable
+/// video stream appears, which is the not-a-video answer
+/// for every corrupt, audio-only, or non-video source, and
+/// when the report carries a planted `Duration:` line,
+/// which is the same answer for a forged one.
+///
+/// The report interleaves the facts with source-controlled
+/// text: container, chapter, program, and stream metadata,
+/// and each stream's language tag inside its own stream
+/// line. A metadata value's continuation lines start with
+/// `: `, but keys, program names, and language tags print
+/// raw, newlines included, so a source can plant whole
+/// lines shaped like the facts, indentation and all, and a
+/// language tag can rewrite the start of a real stream line
+/// and push the real codec text onto a line of its own
+/// (issue #402, the video twin of the forged PDF page size
+/// in #363). No layout rule survives that, so the parse
+/// leans only on what a source cannot produce:
+///
+/// - The duration comes from the report's one `Duration:`
+///   line at exactly two spaces of indent (metadata
+///   entries print at four or more, so a long key that
+///   starts with `Duration: ` is not it). The real line
+///   always prints, so a second one is a planted copy, and
+///   the report is refused.
+/// - Stream facts come only from lines that carry
+///   `separator`, the probe's random field separator
+///   ([`probe_separator`]): the tool prints it inside each
+///   stream's codec description, right after the codec
+///   name, and a source cannot know it. On such a line the
+///   media type is the last type marker before the first
+///   separator; text a language tag adds sits before the
+///   real marker, and only table text (codec, profile,
+///   codec tag) sits between the marker and the separator.
+pub fn parse_probe(report: &str, separator: &str) -> Option<VideoProbe> {
+    let lines: Vec<&str> = report.lines().collect();
+    let demuxers: Vec<&str> = lines
+        .iter()
+        .find_map(|line| {
+            let rest = line.trim_start().strip_prefix("Input #")?;
+            let (_, after) = rest.split_once(", ")?;
+            let (list, _) = after.split_once(", from ")?;
+            Some(list.split(',').map(str::trim).collect())
+        })
+        .unwrap_or_default();
     if !demuxers.is_empty() && demuxers.iter().all(|d| IMAGE_DEMUXERS.contains(d)) {
         return None;
     }
-    let (width, height, fps) = stream?;
+
+    let mut duration_lines = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(at, line)| Some((at, line.strip_prefix("  Duration: ")?)));
+    let (duration_at, duration_rest) = duration_lines.next()?;
+    if duration_lines.next().is_some() {
+        return None;
+    }
+    let duration = parse_duration(duration_rest);
+
+    // Streams print after the Duration line, in the order
+    // the tool lists them; planted lines never carry the
+    // separator, so they never reach the stream parse.
+    let (width, height, fps) = lines[duration_at + 1..]
+        .iter()
+        .find_map(|line| parse_video_stream(line, separator))?;
     Some(VideoProbe {
         duration,
         width,
@@ -705,29 +784,60 @@ pub fn parse_probe(report: &str) -> Option<VideoProbe> {
 /// Parse an `HH:MM:SS.cc` duration token (the text right
 /// after `Duration: `, up to the comma). `N/A` and
 /// anything malformed mean the container reports no
-/// duration, which is a fact, not a failure.
+/// duration, which is a fact, not a failure. Every part
+/// must be plain digits: `str::parse::<f64>` alone would
+/// also take `NaN`, `inf`, signs, and exponents.
 fn parse_duration(rest: &str) -> Option<f64> {
     let token = rest.split(',').next()?.trim();
     let mut parts = token.split(':');
-    let hours: f64 = parts.next()?.parse().ok()?;
-    let minutes: f64 = parts.next()?.parse().ok()?;
-    let seconds: f64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || hours < 0.0 || minutes < 0.0 || seconds < 0.0 {
+    let (hours, minutes, seconds) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
         return None;
     }
-    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, "0"));
+    if !digits(hours) || !digits(minutes) || !digits(whole) || !digits(fraction) {
+        return None;
+    }
+    let total = hours.parse::<f64>().ok()? * 3600.0
+        + minutes.parse::<f64>().ok()? * 60.0
+        + seconds.parse::<f64>().ok()?;
+    total.is_finite().then_some(total)
 }
 
-/// Parse one video stream line: the first comma
-/// field whose leading token is exactly `<w>x<h>` (the
-/// field usually continues with `[SAR ... DAR ...]`),
-/// and the `<n> fps` field when present (with `<n> tbr`
-/// as the fallback rate). Leading-token matching plus a
-/// nonzero check keeps hex codec tags (`0x31637661`,
-/// which would split as 0 by 31637661) from reading as
-/// dimensions.
-fn parse_video_stream(line: &str) -> Option<(u32, u32, Option<f64>)> {
-    let after = line.split(": Video: ").nth(1)?;
+/// Parse one report line as a video stream's codec
+/// description. The line must carry the probe's
+/// `separator`, and its media type is the last type marker
+/// before the first one (see [`parse_probe`]); an attached
+/// picture (album art) is not the video stream, even when
+/// it is the only one. From the text after the marker,
+/// with each separator read as the tool's default `, `:
+/// the first comma field whose leading token is exactly
+/// `<w>x<h>` (the field usually continues with
+/// `[SAR ... DAR ...]`), and the `<n> fps` field when
+/// present (with `<n> tbr` as the fallback rate).
+/// Leading-token matching plus a nonzero check keeps hex
+/// codec tags (`0x31637661`, which would split as 0 by
+/// 31637661) from reading as dimensions.
+fn parse_video_stream(line: &str, separator: &str) -> Option<(u32, u32, Option<f64>)> {
+    let head = &line[..line.find(separator)?];
+    let (at, kind) = STREAM_KINDS
+        .iter()
+        .filter_map(|kind| Some((head.rfind(kind)?, *kind)))
+        .max_by_key(|(at, _)| *at)?;
+    if kind != ": Video: " {
+        return None;
+    }
+    let after = line[at + kind.len()..].replace(separator, ", ");
+    if after.contains("(attached pic)") {
+        return None;
+    }
+    let rate = |token: &str| {
+        token
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    };
     let mut dims = None;
     let mut fps = None;
     let mut tbr = None;
@@ -743,8 +853,8 @@ fn parse_video_stream(line: &str) -> Option<(u32, u32, Option<f64>)> {
         }
         if tokens.len() == 2 {
             match tokens[1] {
-                "fps" => fps = tokens[0].parse::<f64>().ok().filter(|v| *v > 0.0),
-                "tbr" => tbr = tokens[0].parse::<f64>().ok().filter(|v| *v > 0.0),
+                "fps" => fps = rate(tokens[0]),
+                "tbr" => tbr = rate(tokens[0]),
                 _ => {}
             }
         }
@@ -835,7 +945,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
 
     #[test]
     fn probe_parses_the_reference_report() {
-        let probe = parse_probe(MP4_REPORT).expect("a video stream parses");
+        let probe = parse_probe(MP4_REPORT, DEFAULT_SEP).expect("a video stream parses");
         assert_eq!(probe.duration, Some(3.0));
         assert_eq!((probe.width, probe.height), (64, 48));
         assert_eq!(probe.fps, Some(10.0));
@@ -844,15 +954,16 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
     #[test]
     fn probe_finds_no_video_in_audio_only_or_junk() {
         // Audio-only: a duration and streams, but no video.
-        assert!(parse_probe(AUDIO_REPORT).is_none());
+        assert!(parse_probe(AUDIO_REPORT, DEFAULT_SEP).is_none());
         // A corrupt container: no input report at all.
         assert!(
             parse_probe(
-                "[in#0 @ 0x1] Error opening input: Invalid data found when processing input\n"
+                "[in#0 @ 0x1] Error opening input: Invalid data found when processing input\n",
+                DEFAULT_SEP
             )
             .is_none()
         );
-        assert!(parse_probe("").is_none());
+        assert!(parse_probe("", DEFAULT_SEP).is_none());
     }
 
     #[test]
@@ -866,7 +977,7 @@ Input #0, mjpeg, from 'pipe:0':
   Duration: N/A, bitrate: N/A
   Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc), 800x600, 25 fps, 1200k tbr
 ";
-        assert!(parse_probe(report).is_none());
+        assert!(parse_probe(report, DEFAULT_SEP).is_none());
         // A plain JPEG probes through jpeg_pipe: also a
         // still, also refused.
         let report = "\
@@ -874,7 +985,7 @@ Input #0, jpeg_pipe, from 'pipe:0':
   Duration: N/A, bitrate: N/A
   Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc), 800x600, 25 fps, 25 tbr
 ";
-        assert!(parse_probe(report).is_none());
+        assert!(parse_probe(report, DEFAULT_SEP).is_none());
         // But MJPEG is a real video codec inside a
         // container: an AVI of it parses normally.
         let report = "\
@@ -882,7 +993,7 @@ Input #0, avi, from 'pipe:0':
   Duration: 00:00:05.00, start: 0.000000, bitrate: N/A
   Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc), 640x480, 25 fps, 25 tbr
 ";
-        let probe = parse_probe(report).expect("container MJPEG is a video");
+        let probe = parse_probe(report, DEFAULT_SEP).expect("container MJPEG is a video");
         assert_eq!((probe.width, probe.height), (640, 480));
         // An attached picture alone is not a video.
         let report = "\
@@ -891,7 +1002,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
   Stream #0:0: Audio: aac (LC), 44100 Hz, mono, fltp, 69 kb/s (default)
   Stream #0:1: Video: mjpeg (Baseline), yuvj420p(pc), 500x500, 90k tbr (attached pic)
 ";
-        assert!(parse_probe(report).is_none());
+        assert!(parse_probe(report, DEFAULT_SEP).is_none());
     }
 
     #[test]
@@ -901,7 +1012,7 @@ Input #0, matroska,webm, from 'pipe:0':
   Duration: N/A, start: 0.000000, bitrate: N/A
   Stream #0:0: Video: vp9 (Profile 0), yuv420p(tv), 320x240, SAR 1:1 DAR 4:3, 25 fps, 25 tbr (default)
 ";
-        let probe = parse_probe(report).expect("a video stream parses");
+        let probe = parse_probe(report, DEFAULT_SEP).expect("a video stream parses");
         assert_eq!(probe.duration, None);
         assert_eq!((probe.width, probe.height), (320, 240));
         assert_eq!(probe.fps, Some(25.0));
@@ -912,10 +1023,273 @@ Input #0, matroska,webm, from 'pipe:0':
         // The hex tag 0x31637661 must not parse as 0x3 or
         // similar; only the whole-field 64x48 counts.
         let report = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
+  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A
   Stream #0:0: Video: h264 (avc1 / 0x31637661), yuv420p, 64x48, 10 fps
 ";
-        let probe = parse_probe(report).unwrap();
+        let probe = parse_probe(report, DEFAULT_SEP).unwrap();
         assert_eq!((probe.width, probe.height), (64, 48));
+    }
+
+    /// The field separator the hostile reports below were
+    /// recorded with (`-dump_separator`), standing in for
+    /// the probe's random one.
+    const SEP: &str = " ~0123456789abcdef~ ";
+
+    /// The tool's own default separator, which the honest
+    /// recorded reports above use and a planted line can
+    /// imitate.
+    const DEFAULT_SEP: &str = ", ";
+
+    /// The report the reference tool (6.1) printed for a 2 s
+    /// 64x48 10 fps MP4 whose container metadata carries the
+    /// given lines, in the layout the metadata block uses,
+    /// probed with `SEP`.
+    fn report_with_metadata(metadata: &str) -> String {
+        format!(
+            "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
+  Metadata:
+    major_brand     : isom
+{metadata}
+    encoder         : Lavf60.16.100
+  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661){SEP}yuv420p(progressive), 64x48 [SAR 1:1 DAR 4:3], 4 kb/s{SEP}10 fps, 10 tbr, 10240 tbn (default)
+    Metadata:
+      handler_name    : VideoHandler
+At least one output file must be specified
+"
+        )
+    }
+
+    /// The report the reference tool (6.1) printed for a 2 s
+    /// Matroska clip, probed with `SEP`, with the given
+    /// stream lines.
+    fn mkv_report(streams: &str) -> String {
+        format!(
+            "\
+Input #0, matroska,webm, from 'pipe:0':
+  Metadata:
+    ENCODER         : Lavf60.16.100
+  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A
+{streams}
+At least one output file must be specified
+"
+        )
+    }
+
+    #[test]
+    fn probe_ignores_metadata_lines_shaped_like_facts() {
+        // Issue #402: container metadata prints above the
+        // real Duration line, and text there that looks like
+        // a fact must not steer the parse: finite, NaN, and
+        // infinite durations and a forged stream line in a
+        // value, a long key that starts like a fact (keys pad
+        // to 16 columns and print whole), a multi-line value
+        // (its lines continue with `: `), and a key holding
+        // newlines that plants a whole stream line at the
+        // report's own indent (an MP4 freeform key written
+        // with `-movflags use_metadata_tags`). Recorded from
+        // the reference tool on clips made with `-metadata`.
+        for metadata in [
+            "    comment         : Duration: 00:00:00.05, x",
+            "    title           : Duration: NaN:00:00.00, x",
+            "    title           : Duration: inf:00:00.00, x",
+            "    title           : Stream #0:0: Video: h264, 4000x3000, 0.001 fps",
+            "    Duration: 00:00:00.05, x: v",
+            "    title           : line one
+                    :   Duration: 00:00:00.05, start
+                    :   Stream #0:0: Video: h264, 4000x3000, 0.001 fps",
+            "    k
+  Stream #0:0: Video: h264, yuv420p, 4000x3000, 0.001 fps
+  z: v",
+        ] {
+            let probe = parse_probe(&report_with_metadata(metadata), SEP)
+                .unwrap_or_else(|| panic!("the real facts parse under {metadata:?}"));
+            assert_eq!(probe.duration, Some(2.0), "{metadata:?}");
+            assert_eq!((probe.width, probe.height), (64, 48), "{metadata:?}");
+            assert_eq!(probe.fps, Some(10.0), "{metadata:?}");
+        }
+    }
+
+    #[test]
+    fn probe_refuses_a_planted_duration_line() {
+        // Issue #402: a key holding newlines plants a whole
+        // Duration line at the report's own indent (recorded
+        // from the reference tool, MP4 freeform key). The
+        // real Duration line still prints after it, so two
+        // Duration lines are a forged report, refused
+        // whatever the planted one says.
+        for planted in [
+            "    k\n  Duration: 00:00:00.05, start: 0.000000, bitrate: N/A\n  z: v",
+            "    k\n  Duration: N/A, start: 0.000000, bitrate: N/A\n  z: v",
+            "    k\n  Duration: 00:00:02.00, start: 0.000000, bitrate: N/A\n  z: v",
+        ] {
+            assert!(
+                parse_probe(&report_with_metadata(planted), SEP).is_none(),
+                "{planted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_reads_streams_only_through_the_separator() {
+        // Issue #402: a Matroska language tag prints raw
+        // inside its own stream line, newlines included. It
+        // can put a forged type marker ahead of the real one,
+        // rewrite the whole first line of the real stream and
+        // push the real codec text onto a line of its own, or
+        // move that text under a fresh stream number; no
+        // layout rule tells the last two apart from a real
+        // report. The probe's random separator does: the tool
+        // prints it inside real codec descriptions alone. The
+        // stream lines are the reference tool's (6.1), for a
+        // 64x48 10 fps clip whose video stream carries the
+        // language tag shown.
+        let real = format!(
+            "h264 (High){SEP}yuv420p(progressive), 64x48 [SAR 1:1 DAR 4:3]{SEP}10 fps, 10 tbr, 1k tbn"
+        );
+        for streams in [
+            format!(
+                "  Stream #0:0(x): Video: h264, yuv420p, 4000x3000, 0.001 fps (): Video: {real}"
+            ),
+            format!(
+                "  Stream #0:0(x): Video: h264, yuv420p, 4000x3000, 0.001 fps\n    z): Video: {real}"
+            ),
+            format!(
+                "  Stream #0:0(x): Video: h264, yuv420p, 4000x3000, 0.001 fps\n  Stream #0:1(eng): Video: {real}"
+            ),
+        ] {
+            let probe = parse_probe(&mkv_report(&streams), SEP)
+                .unwrap_or_else(|| panic!("the real stream parses under {streams:?}"));
+            assert_eq!(probe.duration, Some(2.0), "{streams:?}");
+            assert_eq!((probe.width, probe.height), (64, 48), "{streams:?}");
+            assert_eq!(probe.fps, Some(10.0), "{streams:?}");
+        }
+        // A language tag cannot mark the real stream as an
+        // attached picture: the disposition is read only
+        // after the real marker.
+        let streams = format!("  Stream #0:0((attached pic)): Video: {real}");
+        assert!(parse_probe(&mkv_report(&streams), SEP).is_some());
+        // An audio-only source whose language tag plants a
+        // video stream line still has no video stream.
+        let streams = format!(
+            "  Stream #0:0(eng\n  Stream #0:5: Video: h264, yuv420p, 4000x3000, 0.001 fps\n  x): Audio: vorbis{SEP}44100 Hz, mono, fltp"
+        );
+        assert!(parse_probe(&mkv_report(&streams), SEP).is_none());
+        // A report without the separator (a tool that ignored
+        // `-dump_separator`, or planted lines alone) names no
+        // stream the probe can take at its word.
+        assert!(parse_probe(MP4_REPORT, SEP).is_none());
+
+        // Real layouts still parse: a stream listed under two
+        // programs prints twice (recorded, mpegts), and colour
+        // details that need a break put the separator before
+        // the dimensions too (recorded from 6.1; current
+        // FFmpeg's source prints the same).
+        let report = format!(
+            "\
+Input #0, mpegts, from 'pipe:0':
+  Duration: N/A, start: 1.600000, bitrate: N/A
+  Program 1
+    Metadata:
+      service_name    : One
+  Stream #0:0[0x100]: Video: h264 (High) ([27][0][0][0] / 0x001B){SEP}yuv420p(progressive), 64x48 [SAR 1:1 DAR 4:3]{SEP}10 fps, 10 tbr, 90k tbn
+  Program 2
+    Metadata:
+      service_name    : Two
+  Stream #0:0[0x100]: Video: h264 (High) ([27][0][0][0] / 0x001B){SEP}yuv420p(progressive), 64x48 [SAR 1:1 DAR 4:3]{SEP}10 fps, 10 tbr, 90k tbn
+"
+        );
+        let probe = parse_probe(&report, SEP).expect("a repeated stream parses");
+        assert_eq!((probe.width, probe.height), (64, 48));
+        assert_eq!(probe.duration, None);
+        let streams = format!(
+            "  Stream #0:0: Video: h264 (High){SEP}yuv420p(tv, bt2020nc/bt2020/smpte2084, progressive){SEP}64x48 [SAR 1:1 DAR 4:3]{SEP}24 fps, 24 tbr, 1k tbn"
+        );
+        let probe = parse_probe(&mkv_report(&streams), SEP).expect("an HDR stream parses");
+        assert_eq!((probe.width, probe.height), (64, 48));
+        assert_eq!(probe.fps, Some(24.0));
+        // And album art is still not a video (recorded, M4A).
+        let report = format!(
+            "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
+  Duration: 00:00:01.02, start: 0.000000, bitrate: N/A
+  Stream #0:0[0x1](und): Audio: aac (LC) (mp4a / 0x6134706D){SEP}44100 Hz, mono, fltp, 70 kb/s (default)
+  Stream #0:1[0x0]: Video: mjpeg (Baseline){SEP}yuvj420p(pc, bt470bg/unknown/unknown){SEP}50x50 [SAR 1:1 DAR 1:1]{SEP}90k tbr, 90k tbn (attached pic)
+"
+        );
+        assert!(parse_probe(&report, SEP).is_none());
+    }
+
+    #[test]
+    fn probe_separators_are_fresh_and_unforgeable() {
+        // Issue #402: the separator is the one thing in the
+        // report a source cannot write, so it must differ per
+        // probe and never be the tool's default.
+        let first = probe_separator();
+        let second = probe_separator();
+        assert_ne!(first, second);
+        for separator in [&first, &second] {
+            let token = separator
+                .strip_prefix(" ~")
+                .and_then(|rest| rest.strip_suffix("~ "))
+                .unwrap_or_else(|| panic!("{separator:?}"));
+            assert_eq!(token.len(), 16, "{separator:?}");
+            assert!(
+                token.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{separator:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_rejects_non_finite_and_malformed_numbers() {
+        // Issue #402: `str::parse::<f64>` takes NaN, inf,
+        // signs, and exponents; none of them is a duration
+        // the report prints, so each reads as no duration.
+        for token in [
+            "NaN:00:00.00",
+            "inf:00:00.00",
+            "00:00:NaN",
+            "00:00:inf",
+            "00:00:infinity",
+            "-1:00:00.00",
+            "+1:00:00.00",
+            "00:00:1e3",
+            "00:00:.5",
+            "00:00:5.",
+            "00::05.00",
+            "00:00:05.00:00",
+            "N/A",
+            "",
+        ] {
+            assert_eq!(
+                parse_duration(&format!("{token}, start: 0")),
+                None,
+                "{token}"
+            );
+        }
+        // Digits that overflow to infinity are refused too.
+        let huge = format!("{}:00:00.00", "9".repeat(400));
+        assert_eq!(parse_duration(&huge), None);
+        // The real spellings still parse, past 99 hours too.
+        assert_eq!(parse_duration("00:00:02.00, start: 0"), Some(2.0));
+        assert_eq!(parse_duration("123:04:05.50, start: 0"), Some(443045.5));
+        assert_eq!(parse_duration("00:00:07, start: 0"), Some(7.0));
+
+        // A frame rate must be finite and positive; the tbr
+        // fallback follows the same rule.
+        for rate in ["inf fps", "NaN fps", "0 fps", "-10 fps", "infinity fps"] {
+            let line = format!("  Stream #0:0: Video: h264{SEP}yuv420p, 64x48{SEP}{rate}, inf tbr");
+            assert_eq!(
+                parse_video_stream(&line, SEP),
+                Some((64, 48, None)),
+                "{rate}"
+            );
+        }
+        let line = format!("  Stream #0:0: Video: h264{SEP}yuv420p, 64x48{SEP}inf fps, 25 tbr");
+        assert_eq!(parse_video_stream(&line, SEP), Some((64, 48, Some(25.0))));
     }
 
     #[test]
@@ -977,16 +1351,22 @@ Input #0, matroska,webm, from 'pipe:0':
 
     /// A stand-in decoder with the reference tool's shape:
     /// the report on stderr and exit 1 for a probe, a PNG
-    /// on stdout for an extraction.
+    /// on stdout for an extraction. Like the reference tool,
+    /// it prints the probe's `-dump_separator` after the
+    /// codec name (issue #402).
     const FAKE_OK: &str = "#!/bin/sh\n\
 cat > /dev/null\n\
+sep=', '\n\
+prev=\n\
 for a in \"$@\"; do\n\
   if [ \"$a\" = \"image2pipe\" ]; then\n\
     printf '\\211PNG\\015\\012\\032\\012fakepng'\n\
     exit 0\n\
   fi\n\
+  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n\
+  prev=\"$a\"\n\
 done\n\
-printf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\n\
+printf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\n\
 exit 1\n";
 
     #[test]
@@ -1030,7 +1410,7 @@ exit 1\n";
         // line per run, and otherwise behaves like FAKE_OK.
         let record = temp_dir("whitelists").join("argv.log");
         let script = format!(
-            "#!/bin/sh\ncat > /dev/null\necho \"$@\" >> {}\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\nexit 1\n",
+            "#!/bin/sh\ncat > /dev/null\necho \"$@\" >> {}\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n",
             record.display()
         );
         let program = fake_tool("whitelists", &script);
@@ -1042,7 +1422,7 @@ exit 1\n";
         let recorded = std::fs::read_to_string(&record).unwrap();
         let lines: Vec<&str> = recorded.lines().collect();
         assert_eq!(lines.len(), 2, "{recorded}");
-        for line in lines {
+        for line in &lines {
             assert!(line.contains("-protocol_whitelist fd "), "{line}");
             let argv: Vec<&str> = line.split_whitespace().collect();
             assert!(argv.windows(2).any(|w| w == ["-i", "fd:"]), "{line}");
@@ -1052,6 +1432,11 @@ exit 1\n";
                 "{line}"
             );
         }
+        // Issue #402: the probe, and only the probe, asks for
+        // its random field separator, which this stand-in
+        // echoes the way the reference tool does.
+        assert!(lines[0].contains("-dump_separator  ~"), "{}", lines[0]);
+        assert!(!lines[1].contains("-dump_separator"), "{}", lines[1]);
     }
 
     #[cfg(target_os = "linux")]
@@ -1063,15 +1448,19 @@ exit 1\n";
         // start, though the runs share one staged file. The
         // stand-in records, per run, how many bytes it read,
         // whether stdin is a regular file, and what the
-        // descriptor points at.
+        // descriptor points at. Its probe report carries
+        // the run's dump separator the way the reference
+        // tool prints it (issue #402).
         let record = temp_dir("staged").join("stdin.log");
         let script = format!(
             "#!/bin/sh\n\
 n=$(cat | wc -c)\n\
 if [ -f /dev/stdin ]; then kind=file; else kind=other; fi\n\
 echo \"$n $kind $(readlink /proc/self/fd/0)\" >> {}\n\
-for a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\ndone\n\
-printf '%s\\n' 'Input #0, mov,mp4, from fd:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\n\
+sep=', '\n\
+prev=\n\
+for a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\n\
+printf '%s\\n' 'Input #0, mov,mp4, from fd:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\n\
 exit 1\n",
             record.display()
         );
@@ -1133,10 +1522,14 @@ exit 1\n",
             "failing",
             "#!/bin/sh\n\
 cat > /dev/null\n\
+sep=', '\n\
+prev=\n\
 for a in \"$@\"; do\n\
   if [ \"$a\" = \"image2pipe\" ]; then echo 'boom on stderr' >&2; exit 3; fi\n\
+  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n\
+  prev=\"$a\"\n\
 done\n\
-printf '%s\\n' '  Duration: 00:00:03.00, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps' >&2\n\
+printf '%s\\n' '  Duration: 00:00:03.00, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps' | sed \"/^  Stream #/s/, /$sep/\" >&2\n\
 exit 1\n",
         );
         let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
@@ -1152,10 +1545,14 @@ exit 1\n",
             "empty",
             "#!/bin/sh\n\
 cat > /dev/null\n\
+sep=', '\n\
+prev=\n\
 for a in \"$@\"; do\n\
   if [ \"$a\" = \"image2pipe\" ]; then exit 0; fi\n\
+  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n\
+  prev=\"$a\"\n\
 done\n\
-printf '%s\\n' '  Duration: 00:00:03.00, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps' >&2\n\
+printf '%s\\n' '  Duration: 00:00:03.00, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps' | sed \"/^  Stream #/s/, /$sep/\" >&2\n\
 exit 1\n",
         );
         let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
@@ -1164,6 +1561,32 @@ exit 1\n",
             .unwrap_err();
         assert!(matches!(err, FrameError::Failed(_)), "{err}");
         assert!(err.to_string().contains("produced no frame"), "{err}");
+    }
+
+    #[test]
+    fn probe_refuses_a_report_past_the_cap() {
+        // Issue #402: source metadata can be long enough to
+        // push the real facts past the report cap, leaving
+        // only planted lines in the kept part. A report that
+        // passed the cap is refused instead of parsed.
+        let program = fake_tool(
+            "longreport",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\n\
+printf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Metadata:' '    k' \
+'  Duration: 00:00:00.05, start: 0.000000, bitrate: N/A' \
+'  Stream #0:0: Video: h264, yuv420p, 4000x3000, 0.001 fps' >&2\n\
+head -c {} /dev/zero | tr '\\000' 'x' >&2\n\
+printf '\\n%s\\n' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' \
+'  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\n\
+exit 1\n",
+                PROBE_REPORT_CAP
+            ),
+        );
+        let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+        let err = extractor.probe(b"video bytes").unwrap_err();
+        assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
+        assert!(err.to_string().contains("byte cap"), "{err}");
     }
 
     #[test]
@@ -1177,7 +1600,7 @@ exit 1\n",
         // (1.2s in total) and succeed.
         let program = fake_tool(
             "slow",
-            "#!/bin/sh\ncat > /dev/null\nsleep 0.6\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' >&2\nexit 1\n",
+            "#!/bin/sh\ncat > /dev/null\nsleep 0.6\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n",
         );
         let extractor = VideoFrameExtractor::new(program, Duration::from_secs(1)).unwrap();
         let started = Instant::now();
@@ -1438,5 +1861,148 @@ exit 1\n",
                 .unwrap_err();
             assert!(matches!(err, FrameError::NotVideo(_)), "{script:?}: {err}");
         }
+    }
+
+    #[test]
+    fn real_tool_ignores_forged_metadata() {
+        // Issue #402 end to end: clips whose metadata
+        // imitates the report's fact lines. A forged value
+        // or language tag is ignored and the selection lands
+        // where the real duration and frame rate put it; a
+        // key that plants a second Duration line makes the
+        // report a forgery, refused as a bad source.
+        let Some(ffmpeg) = ffmpeg_path() else {
+            return;
+        };
+        let dir = temp_dir("forged");
+        let make = |name: &str, extra: &[&str]| {
+            let clip = dir.join(name);
+            let status = Command::new(&ffmpeg)
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=red:size=64x48:rate=10:duration=1",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=green:size=64x48:rate=10:duration=1",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=blue:size=64x48:rate=10:duration=1",
+                    "-filter_complex",
+                    "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+                    "-map",
+                    "[v]",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .args(extra)
+                .arg(&clip)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name}");
+            std::fs::read(&clip).unwrap()
+        };
+        let extractor = VideoFrameExtractor::new(ffmpeg.clone(), Duration::from_secs(30)).unwrap();
+        for (name, extra) in [
+            (
+                "comment.mp4",
+                ["-metadata", "comment=Duration: 00:00:00.05, x"],
+            ),
+            ("nan.mp4", ["-metadata", "title=Duration: NaN:00:00.00, x"]),
+            ("inf.mp4", ["-metadata", "title=Duration: inf:00:00.00, x"]),
+            (
+                "stream.mp4",
+                [
+                    "-metadata",
+                    "title=Stream #0:0: Video: h264, 4000x3000, 0.001 fps",
+                ],
+            ),
+            // Matroska language tags print raw inside the real
+            // stream line: a forged marker ahead of the real
+            // one, a newline that pushes the real codec text
+            // onto a line of its own, and one that moves it
+            // under a fresh stream number.
+            (
+                "sameline.mkv",
+                [
+                    "-metadata:s:v:0",
+                    "language=x): Video: h264, yuv420p, 4000x3000, 0.001 fps (",
+                ],
+            ),
+            (
+                "split.mkv",
+                [
+                    "-metadata:s:v:0",
+                    "language=x): Video: h264, yuv420p, 4000x3000, 0.001 fps\n    z",
+                ],
+            ),
+            (
+                "renumbered.mkv",
+                [
+                    "-metadata:s:v:0",
+                    "language=x): Video: h264, yuv420p, 4000x3000, 0.001 fps\n  Stream #0:1(eng",
+                ],
+            ),
+        ] {
+            let bytes = make(name, &extra);
+            let frame = extractor
+                .extract_frame(&bytes, FrameSelection::Seconds(1.5))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(frame.duration, Some(3.0), "{name}");
+            assert_eq!((frame.width, frame.height), (64, 48), "{name}");
+            assert_eq!(frame.timestamp, 1.5, "{name}");
+            let img = image::load_from_memory(&frame.png).unwrap().to_rgb8();
+            let p = img.get_pixel(32, 24);
+            assert!(
+                p[1] > 100 && p[0] < 60 && p[2] < 60,
+                "{name}: 1.5s is green: {p:?}"
+            );
+        }
+        let bytes = make(
+            "planted.mp4",
+            &[
+                "-movflags",
+                "use_metadata_tags",
+                "-metadata",
+                "k\n  Duration: 00:00:00.05, start: 0.000000, bitrate: N/A\n  z=v",
+            ],
+        );
+        let err = extractor
+            .extract_frame(&bytes, FrameSelection::Seconds(1.5))
+            .unwrap_err();
+        assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
+        // An audio-only clip whose language tag plants a video
+        // stream line is still not a video.
+        let clip = dir.join("audio.mkv");
+        let status = Command::new(&ffmpeg)
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=2",
+                "-c:a",
+                "flac",
+                "-metadata:s:a:0",
+                "language=eng\n  Stream #0:5: Video: h264, yuv420p, 4000x3000, 0.001 fps\n  x",
+            ])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let err = extractor
+            .extract_frame(&std::fs::read(&clip).unwrap(), FrameSelection::Poster)
+            .unwrap_err();
+        assert!(matches!(err, FrameError::NotVideo(_)), "{err}");
     }
 }

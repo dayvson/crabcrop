@@ -7930,9 +7930,12 @@ mod tests {
     const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDEO'\n";
 
     /// A fake frame extractor (issue #214): its probe
-    /// prints `report` on stderr, its extraction prints a
-    /// real 8x6 PNG. Returns the extractor (the script
-    /// lives in a temp dir keyed by `name`).
+    /// prints `report` on stderr, with the probe's
+    /// `-dump_separator` after each stream's codec name as
+    /// the reference tool prints it (issue #402), and its
+    /// extraction prints a real 8x6 PNG. Returns the
+    /// extractor (the script lives in a temp dir keyed by
+    /// `name`).
     fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameExtractor {
         use std::io::Write as _;
         let dir = std::env::temp_dir().join(format!(
@@ -7947,7 +7950,7 @@ mod tests {
         .unwrap();
         let frame_path = dir.join("frame.png").display().to_string();
         let script = format!(
-            "#!/bin/sh\ncat > /dev/null\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\ndone\nprintf '%s\\n' {report} >&2\nexit 1\n"
+            "#!/bin/sh\ncat > /dev/null\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' {report} | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n"
         );
         let path = dir.join("decoder.sh");
         let mut file = std::fs::File::create(&path).unwrap();
