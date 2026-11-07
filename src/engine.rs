@@ -982,11 +982,14 @@ impl Engine {
         // Source metadata, read from the raw bytes once:
         // the ICC profile drives color conversion below and
         // (policy permitting) the metadata injection at the
-        // end.
+        // end. EXIF and XMP are read only when the policy
+        // will keep them (issue #399): an XMP packet can be
+        // compressed, and inflating it for nothing is work a
+        // source chooses.
         // Replaced wholesale by the HEIC branch of the decode
         // chain, whose metadata comes from the decoder rather
         // than the container bytes.
-        let mut source_meta = crate::color::extract_source_meta(bytes);
+        let mut source_meta = crate::color::extract_source_meta(bytes, ctx.preserve_metadata);
         // An animated WebP source (one carrying an ANIM chunk)
         // gets the GIF treatment below; the probe also yields
         // the loop count the animated path carries over.
@@ -4696,7 +4699,11 @@ mod tests {
         }
         // And the converted output carries no profile: sRGB
         // is the assumed space now.
-        assert!(crate::color::extract_source_meta(&out.bytes).icc.is_none());
+        assert!(
+            crate::color::extract_source_meta(&out.bytes, true)
+                .icc
+                .is_none()
+        );
     }
 
     #[test]
@@ -4714,7 +4721,10 @@ mod tests {
             .unwrap();
         let img = image::load_from_memory(&out.bytes).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0).0, [200, 80, 40]);
-        assert_eq!(crate::color::extract_source_meta(&out.bytes).icc, Some(icc));
+        assert_eq!(
+            crate::color::extract_source_meta(&out.bytes, true).icc,
+            Some(icc)
+        );
     }
 
     #[test]
@@ -4816,7 +4826,7 @@ mod tests {
         let src = meta_jpeg();
         // Default: gone.
         let out = engine.process(&src, &[]).unwrap();
-        let meta = crate::color::extract_source_meta(&out.bytes);
+        let meta = crate::color::extract_source_meta(&out.bytes, true);
         assert!(meta.exif_tiff.is_none() && meta.xmp.is_none());
         // Preserve: both copied, orientation patched to 1
         // (the fixture's 6 already rotated the pixels).
@@ -4830,7 +4840,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let meta = crate::color::extract_source_meta(&out.bytes);
+        let meta = crate::color::extract_source_meta(&out.bytes, true);
         assert_eq!(
             meta.xmp.as_deref(),
             Some(b"<x:xmpmeta>fixture</x:xmpmeta>".as_slice())
@@ -4840,6 +4850,67 @@ mod tests {
             u16::from_le_bytes(tiff[8 + 2 + 8..8 + 2 + 10].try_into().unwrap()),
             1
         );
+    }
+
+    /// A zlib stream that inflates to `len` zero bytes, at
+    /// about a thousandth of that size.
+    fn zlib_bomb(len: usize) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&vec![0u8; len]).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// `png` with `chunks` inserted right after its IHDR.
+    fn with_chunks_after_ihdr(png: &[u8], chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut out = png[..33].to_vec();
+        for (kind, data) in chunks {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(*kind);
+            out.extend_from_slice(data);
+            let mut crc = flate2::Crc::new();
+            crc.update(*kind);
+            crc.update(data);
+            out.extend_from_slice(&crc.sum().to_be_bytes());
+        }
+        out.extend_from_slice(&png[33..]);
+        out
+    }
+
+    #[test]
+    fn png_metadata_bombs_render_like_the_plain_png() {
+        // Issue #399: 40 iCCP and 40 XMP iTXt chunks, each
+        // a ~16 KB stream that inflates one byte past its
+        // cap, in a file well under the fetch cap. Every
+        // chunk used to be inflated, on every request and
+        // under either policy; only the first of each kind
+        // is now (the XMP only when the policy keeps it),
+        // both are refused past their caps, and the render
+        // is byte-identical to the same PNG without them.
+        let plain = solid_png(8, 8, [30, 120, 200]);
+        let mut iccp = b"ICC Profile\0\0".to_vec();
+        iccp.extend_from_slice(&zlib_bomb(crate::color::MAX_ICC_BYTES + 1));
+        let mut itxt = b"XML:com.adobe.xmp\0\x01\0\0\0".to_vec();
+        itxt.extend_from_slice(&zlib_bomb(crate::color::MAX_META_BYTES + 1));
+        let mut chunks: Vec<(&[u8; 4], &[u8])> = Vec::new();
+        for _ in 0..40 {
+            chunks.push((b"iCCP", &iccp));
+            chunks.push((b"iTXt", &itxt));
+        }
+        let bombed = with_chunks_after_ihdr(&plain, &chunks);
+        assert!(bombed.len() < 1024 * 1024, "{} bytes", bombed.len());
+        let meta = crate::color::extract_source_meta(&bombed, true);
+        assert!(meta.icc.is_none() && meta.xmp.is_none());
+        let engine = Engine;
+        for preserve_metadata in [false, true] {
+            let ctx = || ProcessContext {
+                preserve_metadata,
+                ..Default::default()
+            };
+            let want = engine.process_preferred(&plain, &[], ctx()).unwrap();
+            let got = engine.process_preferred(&bombed, &[], ctx()).unwrap();
+            assert_eq!(got.bytes, want.bytes, "preserve {preserve_metadata}");
+        }
     }
 
     #[test]

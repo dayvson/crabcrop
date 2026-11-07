@@ -29,24 +29,35 @@ const PHOTOSHOP_JPEG_HEADER: &[u8] = b"Photoshop 3.0\0";
 /// allocate without bound.
 pub(crate) const MAX_ICC_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_META_BYTES: usize = 16 * 1024 * 1024;
+/// The most zlib output one source may inflate across all
+/// of its metadata chunks (issue #399): one ICC profile and
+/// one XMP packet, each at its own cap. The caps alone are
+/// per chunk, and 16 MiB of zeros deflates to about 16 KB,
+/// so a PNG under the fetch cap could otherwise carry
+/// hundreds of chunks that each inflate to the cap.
+pub(crate) const MAX_INFLATE_BYTES: usize = MAX_ICC_BYTES + MAX_META_BYTES;
 
-/// Extract the ICC profile and preservable metadata from a
-/// JPEG or PNG source. Other formats yield an empty result:
-/// their extraction is not supported in this pass.
-pub fn extract_source_meta(bytes: &[u8]) -> SourceMeta {
+/// Extract the ICC profile and, when `preserve` is set (the
+/// operator's metadata policy will copy them into the
+/// output), the preservable metadata from a JPEG or PNG
+/// source. The profile is always read: it drives color
+/// conversion. Other formats yield an empty result: their
+/// extraction is not supported in this pass.
+pub fn extract_source_meta(bytes: &[u8], preserve: bool) -> SourceMeta {
     if bytes.starts_with(&[0xFF, 0xD8]) {
-        extract_jpeg_meta(bytes)
+        extract_jpeg_meta(bytes, preserve)
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        extract_png_meta(bytes)
+        let mut inflate_budget = MAX_INFLATE_BYTES;
+        extract_png_meta(bytes, preserve, &mut inflate_budget)
     } else {
         SourceMeta::default()
     }
 }
 
 /// Walk JPEG segments up to SOS, collecting the ICC chunks
-/// (reassembled in sequence order), EXIF, XMP, and the
-/// Photoshop segment.
-fn extract_jpeg_meta(bytes: &[u8]) -> SourceMeta {
+/// (reassembled in sequence order) and, when `preserve` is
+/// set, EXIF, XMP, and the Photoshop segment.
+fn extract_jpeg_meta(bytes: &[u8], preserve: bool) -> SourceMeta {
     let mut meta = SourceMeta::default();
     let mut icc_chunks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut pos = 2; // past SOI
@@ -68,18 +79,18 @@ fn extract_jpeg_meta(bytes: &[u8]) -> SourceMeta {
         }
         let payload = &bytes[pos + 4..pos + 2 + len];
         match marker {
-            0xE1 if payload.starts_with(EXIF_JPEG_HEADER) => {
+            0xE1 if preserve && payload.starts_with(EXIF_JPEG_HEADER) => {
                 let mut tiff = payload[EXIF_JPEG_HEADER.len()..].to_vec();
                 patch_tiff_orientation(&mut tiff);
                 meta.exif_tiff = Some(tiff);
             }
-            0xE1 if payload.starts_with(XMP_JPEG_HEADER) => {
+            0xE1 if preserve && payload.starts_with(XMP_JPEG_HEADER) => {
                 meta.xmp = Some(payload[XMP_JPEG_HEADER.len()..].to_vec());
             }
             0xE2 if payload.len() > 14 && payload.starts_with(ICC_JPEG_HEADER) => {
                 icc_chunks.push((payload[12], payload[14..].to_vec()));
             }
-            0xED if payload.starts_with(PHOTOSHOP_JPEG_HEADER) => {
+            0xED if preserve && payload.starts_with(PHOTOSHOP_JPEG_HEADER) => {
                 meta.photoshop = Some(payload.to_vec());
             }
             _ => {}
@@ -104,10 +115,18 @@ fn extract_jpeg_meta(bytes: &[u8]) -> SourceMeta {
 }
 
 /// Walk PNG chunks up to IDAT, collecting the ICC profile
-/// (iCCP, inflated), EXIF (eXIf), and XMP (the iTXt whose
-/// keyword is `XML:com.adobe.xmp`).
-fn extract_png_meta(bytes: &[u8]) -> SourceMeta {
+/// (iCCP, inflated) and, when `preserve` is set, EXIF
+/// (eXIf) and XMP (the iTXt whose keyword is
+/// `XML:com.adobe.xmp`). Only the first chunk of each kind
+/// is read (the spec allows one iCCP and one eXIf, and
+/// libpng ignores repeats of either): later ones are
+/// skipped unread, so a source cannot repeat a compressed
+/// chunk to multiply the inflate work (issue #399). Every
+/// inflate is charged to `inflate_budget`, the bytes of
+/// zlib output this source may still produce.
+fn extract_png_meta(bytes: &[u8], preserve: bool, inflate_budget: &mut usize) -> SourceMeta {
     let mut meta = SourceMeta::default();
+    let (mut seen_iccp, mut seen_exif, mut seen_xmp) = (false, false, false);
     let mut pos = 8; // past the signature
     while pos + 12 <= bytes.len() {
         let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
@@ -116,20 +135,19 @@ fn extract_png_meta(bytes: &[u8]) -> SourceMeta {
             break;
         };
         match kind {
-            b"iCCP" => {
-                if let Some(icc) = parse_iccp(data) {
-                    meta.icc = Some(icc);
-                }
+            b"iCCP" if !seen_iccp => {
+                seen_iccp = true;
+                meta.icc = parse_iccp(data, inflate_budget);
             }
-            b"eXIf" => {
+            b"eXIf" if preserve && !seen_exif => {
+                seen_exif = true;
                 let mut tiff = data.to_vec();
                 patch_tiff_orientation(&mut tiff);
                 meta.exif_tiff = Some(tiff);
             }
-            b"iTXt" if data.starts_with(b"XML:com.adobe.xmp\0") => {
-                if let Some(xmp) = parse_itxt_text(data) {
-                    meta.xmp = Some(xmp);
-                }
+            b"iTXt" if preserve && !seen_xmp && data.starts_with(b"XML:com.adobe.xmp\0") => {
+                seen_xmp = true;
+                meta.xmp = parse_itxt_text(data, inflate_budget);
             }
             b"IDAT" => break,
             _ => {}
@@ -139,27 +157,43 @@ fn extract_png_meta(bytes: &[u8]) -> SourceMeta {
     meta
 }
 
+/// Inflate a zlib stream whose output may be at most `cap`
+/// bytes, charging the output to `budget`. None when the
+/// stream is corrupt or inflates past `cap` or past what
+/// is left of the budget; inflating stops one byte past
+/// the smaller of the two either way.
+fn inflate_capped(stream: &[u8], cap: usize, budget: &mut usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let limit = cap.min(*budget);
+    let mut out = Vec::new();
+    let read = flate2::read::ZlibDecoder::new(stream)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out);
+    // The byte past the limit only detects the overflow and
+    // is not charged: a refused stream must not eat into
+    // the cap of the next one, or the profile (which drives
+    // the pixels) would depend on whether an XMP packet
+    // ahead of it was read, that is, on the policy.
+    *budget -= out.len().min(limit);
+    read.ok()?;
+    (out.len() <= limit).then_some(out)
+}
+
 /// The profile inside an iCCP chunk payload: profile name,
 /// a compression byte (0 = zlib), then the stream.
-fn parse_iccp(data: &[u8]) -> Option<Vec<u8>> {
+fn parse_iccp(data: &[u8], inflate_budget: &mut usize) -> Option<Vec<u8>> {
     let nul = data.iter().position(|&b| b == 0)?;
     if data.get(nul + 1) != Some(&0) {
         return None;
     }
     let stream = &data[nul + 2..];
-    use std::io::Read as _;
-    let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(stream)
-        .take(MAX_ICC_BYTES as u64 + 1)
-        .read_to_end(&mut out)
-        .ok()?;
-    (out.len() <= MAX_ICC_BYTES && !out.is_empty()).then_some(out)
+    inflate_capped(stream, MAX_ICC_BYTES, inflate_budget).filter(|out| !out.is_empty())
 }
 
 /// The text of an iTXt chunk: keyword, compression flag and
 /// method, language and translated keywords (each
 /// null-terminated), then the (possibly compressed) text.
-fn parse_itxt_text(data: &[u8]) -> Option<Vec<u8>> {
+fn parse_itxt_text(data: &[u8], inflate_budget: &mut usize) -> Option<Vec<u8>> {
     // Every cursor step is bounds-checked (issue #372):
     // a chunk shorter than the fixed fields it is walked
     // through yields no text, never a slice panic.
@@ -179,15 +213,9 @@ fn parse_itxt_text(data: &[u8]) -> Option<Vec<u8>> {
     skip_cstr(data, &mut cursor)?; // translated keyword
     let text = data.get(cursor..)?;
     if compressed == 0 {
-        Some(text.to_vec())
+        (text.len() <= MAX_META_BYTES).then(|| text.to_vec())
     } else {
-        use std::io::Read as _;
-        let mut out = Vec::new();
-        flate2::read::ZlibDecoder::new(text)
-            .take(MAX_META_BYTES as u64 + 1)
-            .read_to_end(&mut out)
-            .ok()?;
-        Some(out)
+        inflate_capped(text, MAX_META_BYTES, inflate_budget)
     }
 }
 
@@ -550,7 +578,7 @@ mod tests {
             photoshop: Some(b"Photoshop 3.0\0rest".to_vec()),
         };
         let out = inject_jpeg(&src, meta_in.icc.as_deref(), &meta_in, true);
-        let got = extract_jpeg_meta(&out);
+        let got = extract_jpeg_meta(&out, true);
         assert_eq!(got.icc, meta_in.icc);
         assert_eq!(got.xmp, meta_in.xmp);
         assert_eq!(got.photoshop, meta_in.photoshop);
@@ -563,7 +591,7 @@ mod tests {
         );
         // Without preservation only the ICC survives.
         let out = inject_jpeg(&src, meta_in.icc.as_deref(), &meta_in, false);
-        let got = extract_jpeg_meta(&out);
+        let got = extract_jpeg_meta(&out, true);
         assert_eq!(got.icc, meta_in.icc);
         assert!(got.exif_tiff.is_none() && got.xmp.is_none());
     }
@@ -584,7 +612,7 @@ mod tests {
             photoshop: None,
         };
         let out = inject_png(&src, meta_in.icc.as_deref(), &meta_in, true);
-        let got = extract_png_meta(&out);
+        let got = extract_source_meta(&out, true);
         assert_eq!(got.icc, meta_in.icc);
         assert_eq!(got.xmp, meta_in.xmp);
         assert!(got.exif_tiff.is_some());
@@ -601,11 +629,19 @@ mod tests {
         let mut full = b"XML:com.adobe.xmp\0".to_vec();
         full.extend_from_slice(&[0, 0, 0, 0]);
         full.extend_from_slice(b"<x:xmpmeta/>");
-        assert_eq!(parse_itxt_text(&full), Some(b"<x:xmpmeta/>".to_vec()));
+        let mut budget = MAX_INFLATE_BYTES;
+        assert_eq!(
+            parse_itxt_text(&full, &mut budget),
+            Some(b"<x:xmpmeta/>".to_vec())
+        );
         // The fixed fields end at byte 22; every shorter
         // truncation answers None.
         for len in 0..22 {
-            assert_eq!(parse_itxt_text(&full[..len]), None, "len {len}");
+            assert_eq!(
+                parse_itxt_text(&full[..len], &mut budget),
+                None,
+                "len {len}"
+            );
         }
         // End to end: the 19-byte chunk (keyword plus the
         // compression flag, no method byte) inside a PNG
@@ -620,7 +656,7 @@ mod tests {
         assert_eq!(chunk.len(), 19);
         src.extend_from_slice(&png_chunk(b"iTXt", &chunk));
         src.extend_from_slice(&png_chunk(b"IEND", &[]));
-        assert!(extract_png_meta(&src).xmp.is_none());
+        assert!(extract_source_meta(&src, true).xmp.is_none());
     }
 
     #[test]
@@ -769,17 +805,20 @@ mod tests {
         let mut src = vec![0xFF, 0xD8];
         src.extend_from_slice(&jpeg_segment(0xE1, b"Exif\0\0II").unwrap());
         src.extend_from_slice(&[0xFF, 0xD9]);
-        let meta = extract_jpeg_meta(&src);
+        let meta = extract_jpeg_meta(&src, true);
         assert_eq!(meta.exif_tiff.as_deref(), Some(b"II".as_slice()));
         // A segment whose declared length runs past the end
         // of the data ends the walk: nothing is extracted.
         let mut src = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x10, 0x00];
         src.extend_from_slice(b"Exif\0\0II*\0");
-        let meta = extract_jpeg_meta(&src);
+        let meta = extract_jpeg_meta(&src, true);
         assert!(meta.exif_tiff.is_none() && meta.icc.is_none());
         // Even a bare SOI (or nothing) extracts to empty.
-        assert_eq!(extract_source_meta(&[0xFF, 0xD8]), SourceMeta::default());
-        assert_eq!(extract_source_meta(&[]), SourceMeta::default());
+        assert_eq!(
+            extract_source_meta(&[0xFF, 0xD8], true),
+            SourceMeta::default()
+        );
+        assert_eq!(extract_source_meta(&[], true), SourceMeta::default());
         // PNG: a truncated eXIf TIFF is carried the same
         // way, and a corrupt iCCP profile (not zlib) drops
         // to no profile instead of failing.
@@ -791,8 +830,224 @@ mod tests {
         png.extend_from_slice(&png_chunk(b"eXIf", b"MM"));
         png.extend_from_slice(&png_chunk(b"iCCP", b"name\0\0not-zlib"));
         png.extend_from_slice(&png_chunk(b"IEND", &[]));
-        let meta = extract_png_meta(&png);
+        let meta = extract_source_meta(&png, true);
         assert_eq!(meta.exif_tiff.as_deref(), Some(b"MM".as_slice()));
         assert!(meta.icc.is_none());
+    }
+
+    /// A zlib stream of `len` zero bytes: about a
+    /// thousandth of `len` on the wire, `len` once inflated.
+    fn zlib_zeros(len: usize) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let block = vec![0u8; 1024 * 1024];
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(block.len());
+            encoder.write_all(&block[..n]).unwrap();
+            left -= n;
+        }
+        encoder.finish().unwrap()
+    }
+
+    /// A 1x1 PNG with `chunks` between IHDR and IDAT.
+    fn png_with_chunks(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&png_chunk(
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0],
+        ));
+        for (kind, data) in chunks {
+            png.extend_from_slice(&png_chunk(kind, data));
+        }
+        png.extend_from_slice(&png_chunk(b"IDAT", &zlib_zeros(4)));
+        png.extend_from_slice(&png_chunk(b"IEND", &[]));
+        png
+    }
+
+    fn iccp_payload(stream: &[u8]) -> Vec<u8> {
+        let mut data = b"ICC Profile\0\0".to_vec();
+        data.extend_from_slice(stream);
+        data
+    }
+
+    fn compressed_xmp_payload(stream: &[u8]) -> Vec<u8> {
+        let mut data = b"XML:com.adobe.xmp\0".to_vec();
+        data.extend_from_slice(&[1, 0, 0, 0]); // compressed, zlib, no language/translation
+        data.extend_from_slice(stream);
+        data
+    }
+
+    #[test]
+    fn repeated_metadata_bombs_inflate_once_per_kind() {
+        // Issue #399: every iCCP and every XMP iTXt before
+        // IDAT used to be inflated to its own cap, so 40 of
+        // each (a 700 KB file) cost 40 x 20 MiB of inflate.
+        // Only the first of each kind is read now, and the
+        // whole walk stays inside the per-source budget.
+        let iccp = iccp_payload(&zlib_zeros(MAX_ICC_BYTES));
+        let itxt = compressed_xmp_payload(&zlib_zeros(MAX_META_BYTES));
+        let mut chunks: Vec<(&[u8; 4], &[u8])> = Vec::new();
+        for _ in 0..40 {
+            chunks.push((b"iCCP", &iccp));
+            chunks.push((b"iTXt", &itxt));
+        }
+        let png = png_with_chunks(&chunks);
+        // A small fraction of the default 10 MiB fetch cap.
+        assert!(png.len() < 1024 * 1024, "{} bytes", png.len());
+        // Policy keeps metadata: one profile, one packet.
+        let mut budget = MAX_INFLATE_BYTES;
+        let meta = extract_png_meta(&png, true, &mut budget);
+        assert_eq!(MAX_INFLATE_BYTES - budget, MAX_ICC_BYTES + MAX_META_BYTES);
+        assert_eq!(meta.icc.map(|icc| icc.len()), Some(MAX_ICC_BYTES));
+        assert_eq!(meta.xmp.map(|xmp| xmp.len()), Some(MAX_META_BYTES));
+        // Default policy (strip): the XMP is never
+        // inflated; only the first profile is.
+        let mut budget = MAX_INFLATE_BYTES;
+        let meta = extract_png_meta(&png, false, &mut budget);
+        assert_eq!(MAX_INFLATE_BYTES - budget, MAX_ICC_BYTES);
+        assert!(meta.xmp.is_none());
+    }
+
+    #[test]
+    fn the_inflate_budget_is_shared_across_chunks() {
+        // One budget spans every chunk of a source: what
+        // the profile inflates is no longer available to
+        // the XMP packet, and an exhausted budget refuses
+        // the next stream after at most one byte.
+        let xmp = b"<x:xmpmeta>budget</x:xmpmeta>";
+        let xmp_stream = {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(xmp).unwrap();
+            encoder.finish().unwrap()
+        };
+        let png = png_with_chunks(&[
+            (b"iCCP", &iccp_payload(&zlib_zeros(1000))),
+            (b"iTXt", &compressed_xmp_payload(&xmp_stream)),
+        ]);
+        // Room for both.
+        let mut budget = 1000 + xmp.len();
+        let meta = extract_png_meta(&png, true, &mut budget);
+        assert_eq!(meta.icc.map(|icc| icc.len()), Some(1000));
+        assert_eq!(meta.xmp.as_deref(), Some(xmp.as_slice()));
+        assert_eq!(budget, 0);
+        // The profile leaves too little for the packet.
+        let mut budget = 1000 + xmp.len() - 1;
+        let meta = extract_png_meta(&png, true, &mut budget);
+        assert!(meta.icc.is_some());
+        assert!(meta.xmp.is_none());
+        assert_eq!(budget, 0);
+        // Too little for the profile: refused one byte
+        // past the budget, and nothing is left for the
+        // packet.
+        let mut budget = 999;
+        let meta = extract_png_meta(&png, true, &mut budget);
+        assert!(meta.icc.is_none() && meta.xmp.is_none());
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn only_the_first_chunk_of_each_kind_is_read() {
+        // As in libpng, the first iCCP is the profile and
+        // later ones are ignored, even when the first is
+        // corrupt; the same holds for eXIf and the XMP
+        // packet.
+        let profile = |byte: u8| {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&[byte; 64]).unwrap();
+            iccp_payload(&encoder.finish().unwrap())
+        };
+        let mut xmp_first = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+        xmp_first.extend_from_slice(b"<first/>");
+        let mut xmp_second = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+        xmp_second.extend_from_slice(b"<second/>");
+        let png = png_with_chunks(&[
+            (b"iCCP", &profile(1)),
+            (b"eXIf", b"MM-first"),
+            (b"iTXt", &xmp_first),
+            (b"iCCP", &profile(2)),
+            (b"eXIf", b"MM-second"),
+            (b"iTXt", &xmp_second),
+        ]);
+        let meta = extract_source_meta(&png, true);
+        assert_eq!(meta.icc, Some(vec![1u8; 64]));
+        assert_eq!(meta.exif_tiff.as_deref(), Some(b"MM-first".as_slice()));
+        assert_eq!(meta.xmp.as_deref(), Some(b"<first/>".as_slice()));
+        let png = png_with_chunks(&[(b"iCCP", b"name\0\0not-zlib"), (b"iCCP", &profile(2))]);
+        assert!(extract_source_meta(&png, true).icc.is_none());
+    }
+
+    #[test]
+    fn metadata_is_read_only_when_the_policy_keeps_it() {
+        // The profile drives color conversion and is always
+        // read; EXIF, XMP, and the Photoshop segment are
+        // only read when the policy will copy them.
+        let meta_in = SourceMeta {
+            icc: Some(b"fake-profile-bytes".to_vec()),
+            exif_tiff: Some(tiff_with_orientation(3, true)),
+            xmp: Some(b"<x:xmpmeta/>".to_vec()),
+            photoshop: Some(b"Photoshop 3.0\0fixture".to_vec()),
+        };
+        let png = inject_png(
+            &png_with_chunks(&[]),
+            meta_in.icc.as_deref(),
+            &meta_in,
+            true,
+        );
+        let jpeg = inject_jpeg(
+            &[0xFF, 0xD8, 0xFF, 0xD9],
+            meta_in.icc.as_deref(),
+            &meta_in,
+            true,
+        );
+        for (name, src) in [("png", &png), ("jpeg", &jpeg)] {
+            let kept = extract_source_meta(src, true);
+            assert_eq!(kept.icc, meta_in.icc, "{name}");
+            assert!(kept.exif_tiff.is_some() && kept.xmp.is_some(), "{name}");
+            let stripped = extract_source_meta(src, false);
+            assert_eq!(stripped.icc, meta_in.icc, "{name}");
+            assert_eq!(
+                (stripped.exif_tiff, stripped.xmp, stripped.photoshop),
+                (None, None, None),
+                "{name}"
+            );
+        }
+        assert!(extract_source_meta(&jpeg, true).photoshop.is_some());
+    }
+
+    #[test]
+    fn an_xmp_packet_past_its_cap_is_dropped_not_truncated() {
+        // The packet used to come back as the first
+        // MAX_META_BYTES + 1 bytes of the stream, a
+        // truncated document carried into the output.
+        let itxt = compressed_xmp_payload(&zlib_zeros(MAX_META_BYTES + 1));
+        let png = png_with_chunks(&[(b"iTXt", &itxt)]);
+        let mut budget = MAX_INFLATE_BYTES;
+        assert!(extract_png_meta(&png, true, &mut budget).xmp.is_none());
+        // Charged up to the cap; the byte that detected the
+        // overflow is not.
+        assert_eq!(MAX_INFLATE_BYTES - budget, MAX_META_BYTES);
+    }
+
+    #[test]
+    fn the_profile_does_not_depend_on_the_metadata_policy() {
+        // The profile drives the pixels, so both policies
+        // must read the same one. An over-cap XMP packet
+        // ahead of the iCCP chunk (iTXt may come anywhere
+        // before IDAT) is read only under preserve; it must
+        // not leave a profile at its cap short of budget.
+        let itxt = compressed_xmp_payload(&zlib_zeros(MAX_META_BYTES + 1));
+        let iccp = iccp_payload(&zlib_zeros(MAX_ICC_BYTES));
+        let png = png_with_chunks(&[(b"iTXt", &itxt), (b"iCCP", &iccp)]);
+        let stripped = extract_source_meta(&png, false);
+        assert_eq!(stripped.icc.as_ref().map(Vec::len), Some(MAX_ICC_BYTES));
+        let kept = extract_source_meta(&png, true);
+        assert!(kept.xmp.is_none());
+        assert_eq!(kept.icc.as_ref().map(Vec::len), Some(MAX_ICC_BYTES));
+        assert!(kept.icc == stripped.icc);
     }
 }
