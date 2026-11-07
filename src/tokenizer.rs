@@ -14,10 +14,13 @@
 //! reproduced exactly: NFC normalization (labels with
 //! combining characters should be written precomposed), and
 //! the pattern's `\p{L}` letter class, approximated with
-//! `char::is_alphabetic`, which also admits letter numbers
-//! and the combining vowel signs of scripts such as
-//! Devanagari or Thai; labels in those scripts may split
-//! differently from the reference.
+//! `char::is_alphabetic`, which admits everything Unicode
+//! calls Alphabetic: also letter numbers (Roman numerals),
+//! the combining vowel signs of scripts such as Devanagari
+//! or Thai, and a few symbols such as circled letters.
+//! Labels with those may split differently from the
+//! reference. ASCII labels, and precomposed accented
+//! letters, split exactly.
 
 use std::collections::HashMap;
 
