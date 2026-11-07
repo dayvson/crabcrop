@@ -165,7 +165,7 @@ pub fn apply_filters_filled(
                 img = map_rgb_image(img, auto_levels);
             }
             Filter::Rotate(degrees) => {
-                let normalized = ((degrees % 360.0) + 360.0) % 360.0;
+                let normalized = fold_degrees(*degrees);
                 img = if normalized == 90.0 {
                     img.rotate90()
                 } else if normalized == 180.0 {
@@ -254,9 +254,29 @@ pub fn apply_filters_filled(
 /// quarter turns swap the axes, an arbitrary angle gets the
 /// rotated bounding box. Shared with the engine, which
 /// checks the canvas against the output pixel budget before
-/// the rotation allocates it (issue #182, audit R2-12).
-pub(crate) fn rotated_canvas(w: u32, h: u32, degrees: f32) -> (u32, u32) {
-    let normalized = ((degrees % 360.0) + 360.0) % 360.0;
+/// the rotation allocates it (issue #182, audit R2-12), and
+/// with the fuzz harness, which asserts every rotation lands
+/// on it (issue #415).
+pub fn rotated_canvas(w: u32, h: u32, degrees: f32) -> (u32, u32) {
+    folded_canvas(w, h, fold_degrees(degrees))
+}
+
+/// An angle in degrees folded into `[0, 360)`, the form
+/// every rotation computes with.
+fn fold_degrees(degrees: f32) -> f32 {
+    ((degrees % 360.0) + 360.0) % 360.0
+}
+
+/// [`rotated_canvas`] for an angle [`fold_degrees`] has
+/// already folded. Folding is not idempotent in `f32`:
+/// folding a folded negative angle again can move its last
+/// bits (`rotate(-113.0128)` folds to 246.98721, which
+/// folds again to 246.98718), and on a 640x480 image the
+/// two angles' bounding boxes differ by a pixel. So the
+/// rotation sizes its canvas from the exact angle it
+/// samples with, and the prediction above folds once too
+/// (issue #415).
+fn folded_canvas(w: u32, h: u32, normalized: f32) -> (u32, u32) {
     if normalized == 90.0 || normalized == 270.0 {
         return (h, w);
     }
@@ -279,6 +299,7 @@ pub(crate) fn rotated_canvas(w: u32, h: u32, degrees: f32) -> (u32, u32) {
 /// the image carries alpha, otherwise the request's fill
 /// color, defaulting to white like `pad`. Positive angles
 /// turn clockwise, matching the quarter-turn filters.
+/// `degrees` arrives folded by [`fold_degrees`].
 fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> DynamicImage {
     let has_alpha = img.color().has_alpha();
     let background: [u8; 4] = if has_alpha {
@@ -292,7 +313,7 @@ fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> D
     let (w, h) = (sw as f32, sh as f32);
     let theta = degrees.to_radians();
     let (sin, cos) = theta.sin_cos();
-    let (new_w, new_h) = rotated_canvas(sw, sh, degrees);
+    let (new_w, new_h) = folded_canvas(sw, sh, degrees);
     let (scx, scy) = ((w - 1.0) / 2.0, (h - 1.0) / 2.0);
     let (dcx, dcy) = ((new_w as f32 - 1.0) / 2.0, (new_h as f32 - 1.0) / 2.0);
     let src_raw = src.as_raw();
@@ -3339,6 +3360,36 @@ mod tests {
     }
 
     #[test]
+    fn rotations_land_on_the_predicted_canvas() {
+        // The engine checks `rotated_canvas` against the pixel
+        // budget before rotating, so the rotation must
+        // allocate exactly that canvas. The negative angles
+        // here fold to a value that a second fold moves, the
+        // case where the two used to disagree by a pixel
+        // (issue #415): -113.0128 on 640x480 predicted 692x777
+        // and allocated 693x777.
+        for (w, h, degrees) in [
+            (640u32, 480u32, -113.0128f32),
+            (1000, 1, -105.01277),
+            (1000, 1, -108.00192),
+            (24, 18, 91.0),
+            (24, 18, 45.0),
+            (24, 18, -30.25),
+            (7, 3, 359.9),
+            (7, 3, 0.0001),
+        ] {
+            let (out, _) = apply_filters(DynamicImage::new_rgb8(w, h), &[Filter::Rotate(degrees)]);
+            assert_eq!(
+                (out.width(), out.height()),
+                rotated_canvas(w, h, degrees),
+                "rotate({degrees}) of {w}x{h}"
+            );
+        }
+        assert_eq!(rotated_canvas(640, 480, -113.0128), (692, 777));
+        assert_eq!(rotated_canvas(24, 18, 91.0), (19, 25));
+    }
+
+    #[test]
     fn rotate_swaps_dimensions() {
         let (img, _) = apply_filters(DynamicImage::new_rgb8(4, 2), &[Filter::Rotate(90.0)]);
         assert_eq!((img.width(), img.height()), (2, 4));
@@ -4485,7 +4536,7 @@ mod w3proofs {
         let (w, h) = (src.width() as f32, src.height() as f32);
         let theta = degrees.to_radians();
         let (sin, cos) = theta.sin_cos();
-        let (new_w, new_h) = rotated_canvas(src.width(), src.height(), degrees);
+        let (new_w, new_h) = folded_canvas(src.width(), src.height(), degrees);
         let (scx, scy) = ((w - 1.0) / 2.0, (h - 1.0) / 2.0);
         let (dcx, dcy) = ((new_w as f32 - 1.0) / 2.0, (new_h as f32 - 1.0) / 2.0);
         let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
