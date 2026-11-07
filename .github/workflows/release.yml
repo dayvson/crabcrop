@@ -22,7 +22,8 @@
 # checksum-pinned cargo-dist and rustup installs, and
 # version-pinned pip tooling. If `cargo dist generate`
 # rewrites the dist jobs, re-apply these changes (and the
-# crabcrop jobs at the bottom, as before).
+# crabcrop jobs at the bottom, as before), including the
+# host job's wait on the ai-models release gate (issue #414).
 
 name: Release
 # Default to read-only; the jobs that create the GitHub
@@ -313,8 +314,12 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
+      # crabcrop (issue #414): the release gate. host creates
+      # the GitHub Release and every publishing job needs host,
+      # so nothing publishes unless the real-model tests pass.
+      - ai-models
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && needs.ai-models.result == 'success' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -408,6 +413,18 @@ jobs:
   # crabcrop additions (not dist-generated; re-append after any
   # `cargo dist generate`). Everything below runs on tag pushes only.
   # ---------------------------------------------------------------------
+
+  # The release gate (issue #414): the real-model AI tests,
+  # run from ai-models.yml in parallel with the builds. The
+  # host job above waits for it, so a tag whose AI code fails
+  # against the real models never creates a release, pushes an
+  # image, or publishes a package.
+  ai-models:
+    name: Real-model AI tests (release gate)
+    if: ${{ !github.event.pull_request }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ai-models.yml
 
   build-images:
     name: Build and push container images

@@ -39,9 +39,16 @@ both SDKs must all pass.
   `cargo clippy --locked --all-targets -- -D warnings`, which test_all.sh
   does not run. Run both locally before pushing or the first CI run fails
   on style alone.
-- AI functional groups need local model files and an ONNX Runtime library.
-  Models are deployment artifacts, never repo content; a group that cannot
-  run locally for lack of models is verified in CI instead.
+- The real-model AI tests are `#[ignore]`d in the normal gate: they need
+  model files and an ONNX Runtime library, which are deployment artifacts,
+  never repo content. `.github/workflows/ai-models.yml` downloads the
+  pinned artifacts and runs them (`cargo test -- --ignored`) on pull
+  requests and main pushes that touch `src/ai.rs`, `src/tokenizer.rs`, or
+  their fixture photo, on every release tag before anything publishes,
+  weekly, and by hand. When you cannot run them locally, that pull-request
+  run is where an AI change is verified.
+- The AI functional groups (`tests/functional`, tier `local`) run in no CI
+  workflow: only a local run with the models verifies them.
 
 ## Invariants
 

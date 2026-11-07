@@ -6,12 +6,43 @@ name: AI models (real inference)
 # artifacts, verifies them against the same sha256 pins as
 # Dockerfile.ai (plus the pins recorded for the test-only models),
 # recreates the tiny authored fixture models, and runs the
-# ignored AI tests for real. Manual dispatch plus a weekly run.
+# ignored AI tests for real.
+#
+# When it runs (issue #414): on pull requests and main pushes
+# that touch the AI code (src/ai.rs, src/tokenizer.rs), the
+# fixture photo the real-model tests read, or this workflow;
+# from release.yml on every release tag, where publishing waits
+# for it to pass; weekly, so drift in the pinned downloads shows
+# up between changes; and by hand.
 
 on:
   workflow_dispatch:
+  workflow_call:
   schedule:
     - cron: "17 5 * * 1"
+  pull_request:
+    paths:
+      - src/ai.rs
+      - src/tokenizer.rs
+      - tests/fixtures/portrait.jpg
+      - .github/workflows/ai-models.yml
+  push:
+    branches: [ "main" ]
+    paths:
+      - src/ai.rs
+      - src/tokenizer.rs
+      - tests/fixtures/portrait.jpg
+      - .github/workflows/ai-models.yml
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request supersedes a run that
+# is still downloading or testing; main, tag and scheduled runs
+# always finish.
+concurrency:
+  group: ai-models-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
