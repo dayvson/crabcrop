@@ -20,9 +20,11 @@
  * read configuration from the environment per module: build
  * the loader in a server module (for example a `+layout.server`
  * load or a `$lib/server` module reading
- * `$env/static/private`) when a secret is involved, or prefer
- * a preset, which needs no secret anywhere. The returned
- * loader enforces the boundary: in a browser context the
+ * `$env/static/private`) when a secret is involved. Unsigned
+ * URLs with appended sizing need the server's unsafe mode
+ * without presets-only, an open image proxy fit for local
+ * development only (see the README's server modes). The
+ * returned loader enforces the boundary: in a browser context the
  * secret is forced to null, so a factory created with one
  * still cannot sign (or leak it) client-side.
  */

@@ -26,7 +26,17 @@ export default defineNuxtConfig({
 });
 ```
 
-Provider options: `base` (required), `preset` (recommended: the transform policy stays server-side and no secret is needed client-side; pair with the server running `CRABCROP_ALLOW_UNSAFE=1`, since presets-only mode rejects the geometry and filters appended after the preset), `secret` (optional, server-only contexts).
+Provider options: `base` (required), `preset` (recommended: the transform policy stays on the server), `secret` (optional, server-only contexts). The provider builds unsigned URLs whenever it runs in the browser; read [Signing and server modes](#signing-and-server-modes) before you deploy it.
+
+## Signing and server modes
+
+`@nuxt/image` calls the provider during server rendering and again in the browser, and every sized image appends its geometry after the preset (one width per srcset entry with `sizes`). The browser calls cannot sign. That decides which server mode fits:
+
+- **Signed (production).** Run the server without `CRABCROP_ALLOW_UNSAFE`. Build the URLs in server-only code (a Nitro route under `server/`, reading the secret from private runtime config) with `buildURL` or `buildSrcSet` from `@crabcrop/url`, and render them with a plain `<img>`. The provider's browser calls produce unsigned URLs, which a signed server answers with `403`.
+- **Presets-only (no secret anywhere).** `CRABCROP_ONLY_PRESETS=1` with `CRABCROP_ALLOW_UNSAFE=1` accepts URLs that carry a preset reference alone and rejects the geometry and filters the provider appends with `400`. It fits only images rendered without size, format, or quality modifiers, with the size inside the preset (`card-640 = 640x0/filters:format(webp)`).
+- **Unsafe alone (local development only).** With `CRABCROP_ALLOW_UNSAFE=1` and presets-only off, the provider works as is, but the server then honors any unsigned operation chain on any public source: the preset constrains nothing, because a client can drop it or append anything after it. That is an open image proxy and CPU sink. Use it to try the provider locally, never as the public deployment.
+
+[Presets](../../docs/operations.md#presets) compares the three modes.
 
 ## Modifier mapping
 

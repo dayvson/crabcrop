@@ -23,11 +23,13 @@
  *   fetch on their own.
  *
  * Signing: a custom loader also runs in the browser, where a
- * secret must never ship. Use a preset (with the server's
- * unsafe mode) as the normal configuration.
- * If CRABCROP_SECRET is set, it is used for the loader calls
- * that happen during server rendering only; browser-side
- * calls fall back to unsigned URLs.
+ * secret must never ship. If CRABCROP_SECRET is set, it is
+ * used for the loader calls that happen during server
+ * rendering only; browser-side calls fall back to unsigned
+ * URLs. Unsigned URLs with appended sizing need the server's
+ * unsafe mode without presets-only, an open image proxy fit
+ * for local development only; production builds signed URLs
+ * in server code (see the README's server modes).
  */
 import { buildURL } from "@crabcrop/url";
 
