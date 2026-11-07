@@ -859,10 +859,7 @@ pub trait SegmentProvider: Send + Sync + std::fmt::Debug {
 pub fn segment_preprocess(img: &DynamicImage) -> Vec<f32> {
     const MEAN: [f32; 3] = [123.675, 116.28, 103.53];
     const STD: [f32; 3] = [58.395, 57.12, 57.375];
-    let (w, h) = (img.width(), img.height());
-    let scale = SEGMENT_INPUT as f32 / w.max(h) as f32;
-    let nw = ((w as f32 * scale).round() as u32).max(1);
-    let nh = ((h as f32 * scale).round() as u32).max(1);
+    let (nw, nh) = segment_input_dims(img.width(), img.height());
     let resized = fir_resize_rgb(&img.to_rgb8(), nw, nh);
     let size = SEGMENT_INPUT as usize;
     let mut out = vec![0f32; 3 * size * size];
@@ -893,14 +890,40 @@ pub fn segment_box_coords(img_w: u32, img_h: u32, bbox: (u32, u32, u32, u32)) ->
     ]
 }
 
-/// Charge one decoder mask's plane against the shared
-/// output pixel budget before anything copies it
-/// (issue #359). The decoder returns masks at the
-/// source's own resolution by contract, and the decode
-/// budgets keep every real source under this cap, so the
-/// check binds only a model whose claimed shape exceeds
-/// anything the pipeline could have fed it: that is a
-/// bad output, not a mask to materialize.
+/// The size `segment_preprocess` resizes a `w` x `h` frame
+/// to before padding: the longest side at the encoder's
+/// edge, aspect kept, at least 1 px a side.
+fn segment_input_dims(w: u32, h: u32) -> (u32, u32) {
+    let scale = SEGMENT_INPUT as f32 / w.max(h) as f32;
+    (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    )
+}
+
+/// The mask plane, as (w, h), the decoder is asked to
+/// answer for an `img_w` x `img_h` frame (its
+/// `orig_im_size` input): the frame itself when it fits the
+/// encoder's input, else the frame at the encoder's scale,
+/// the size `segment_preprocess` resized it to. The decoder
+/// answers one f32 plane of that size per mask candidate,
+/// upsampled from a 256x256 field, so asking for the full
+/// frame added no detail and made every box cost hundreds
+/// of MB on large frames (issue #410). Either way the plane
+/// is at most `SEGMENT_INPUT` px a side.
+fn segment_mask_dims(img_w: u32, img_h: u32) -> (u32, u32) {
+    if img_w.max(img_h) <= SEGMENT_INPUT {
+        (img_w.max(1), img_h.max(1))
+    } else {
+        segment_input_dims(img_w, img_h)
+    }
+}
+
+/// Charge the decoder's mask plane against the shared
+/// output pixel budget before the decoder runs (issues
+/// #359 and #410). `segment_mask_dims` keeps the plane at
+/// the encoder's scale, so this cannot bind today; it
+/// keeps the invariant explicit if that bound ever moves.
 fn check_mask_plane(mw: u32, mh: u32) -> Result<(), AiError> {
     if mw as u64 * mh as u64 > crate::engine::MAX_OUTPUT_PIXELS {
         return Err(AiError::BadOutput(format!(
@@ -911,13 +934,167 @@ fn check_mask_plane(mw: u32, mh: u32) -> Result<(), AiError> {
     Ok(())
 }
 
-/// One decoder mask channel (logits) as soft strengths:
-/// the logistic function scaled to 0..255.
-fn sigmoid_strengths(logits: &[f32]) -> Vec<u8> {
-    logits
+/// One decoder mask logit as a soft strength: the logistic
+/// function scaled to 0..255.
+fn sigmoid_strength(logit: f32) -> u8 {
+    (255.0 / (1.0 + (-logit).exp())).round() as u8
+}
+
+/// One box prompt in the decoder's terms: the box's
+/// corners in encoder space, and the mask plane it is
+/// asked to answer (`orig_im_size`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MaskPrompt {
+    coords: [f32; 4],
+    mask_w: u32,
+    mask_h: u32,
+}
+
+/// The decoder's answer to one prompt, borrowed from its
+/// output tensors: the mask logits' dims (1 x candidates x
+/// h x w) and values, and the predicted-IoU scores, one per
+/// candidate.
+struct MaskAnswer<'a> {
+    dims: &'a [i64],
+    logits: &'a [f32],
+    scores: &'a [f32],
+}
+
+/// The callback a decoder run hands its answer to.
+type MaskFinish<'f> = dyn FnMut(MaskAnswer<'_>) -> Result<GrayImage, AiError> + 'f;
+
+/// Decode one box prompt into the box's soft mask. `run`
+/// executes the decoder for the prompt and passes its
+/// answer, still borrowed from the output tensors, to the
+/// callback it is given: the ONNX session in production, a
+/// fake in tests. The plane is bounded and charged before
+/// `run`, and only the best candidate's box region is read
+/// back, so neither the decoder's answer nor anything
+/// copied from it grows with the frame (issue #410).
+fn decode_box(
+    img_w: u32,
+    img_h: u32,
+    bbox: (u32, u32, u32, u32),
+    run: impl FnOnce(&MaskPrompt, &mut MaskFinish<'_>) -> Result<GrayImage, AiError>,
+) -> Result<GrayImage, AiError> {
+    let (_, _, w, h) = bbox;
+    if w == 0 || h == 0 {
+        return Ok(GrayImage::new(w, h));
+    }
+    let (mask_w, mask_h) = segment_mask_dims(img_w, img_h);
+    check_mask_plane(mask_w, mask_h)?;
+    let prompt = MaskPrompt {
+        coords: segment_box_coords(img_w, img_h, bbox),
+        mask_w,
+        mask_h,
+    };
+    run(&prompt, &mut |answer| {
+        box_mask(&answer, &prompt, img_w, img_h, bbox)
+    })
+}
+
+/// The box's soft mask from a decoder answer: the best
+/// candidate by predicted IoU, read at the box's pixel
+/// centers and passed through the logistic function. The
+/// plane covers the whole frame; when it is smaller than
+/// the frame, each pixel is sampled bilinearly with the
+/// half-pixel mapping the decoder's own resize uses, so
+/// only the box region is ever resampled. A plane larger
+/// than the one asked for, or one whose claimed shape the
+/// values do not fill, is a bad output. A box reaching
+/// past the frame (a detector's rounding) clips, and the
+/// missing strip stays background, so the answer is always
+/// the box's own size.
+fn box_mask(
+    answer: &MaskAnswer<'_>,
+    prompt: &MaskPrompt,
+    img_w: u32,
+    img_h: u32,
+    bbox: (u32, u32, u32, u32),
+) -> Result<GrayImage, AiError> {
+    let dims = answer.dims;
+    let bad_shape = || AiError::BadOutput(format!("unexpected mask output shape: {dims:?}"));
+    if dims.len() != 4 || dims[0] != 1 {
+        return Err(bad_shape());
+    }
+    let candidates = usize::try_from(dims[1]).map_err(|_| bad_shape())?;
+    let mh = u32::try_from(dims[2]).map_err(|_| bad_shape())?;
+    let mw = u32::try_from(dims[3]).map_err(|_| bad_shape())?;
+    if candidates == 0 || answer.scores.len() < candidates {
+        return Err(AiError::BadOutput(format!(
+            "the model produced {candidates} mask candidates but {} scores",
+            answer.scores.len()
+        )));
+    }
+    if mw == 0 || mh == 0 || mw > prompt.mask_w || mh > prompt.mask_h {
+        return Err(AiError::BadOutput(format!(
+            "the decoder answered a {mw}x{mh} mask plane for a {}x{} request",
+            prompt.mask_w, prompt.mask_h
+        )));
+    }
+    // The predicted-IoU scores are unbounded model
+    // predictions (a near-perfect mask can score over
+    // 1.0): they rank the candidates, nothing more.
+    let best = answer.scores[..candidates]
         .iter()
-        .map(|&v| (255.0 / (1.0 + (-v).exp())).round() as u8)
-        .collect()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    // The claimed shape must fit the values actually
+    // returned before anything slices by it (issue #267).
+    let plane = mw as usize * mh as usize;
+    let end = (best + 1)
+        .checked_mul(plane)
+        .ok_or_else(|| AiError::BadOutput(format!("mask shape overflows: {dims:?}")))?;
+    if answer.logits.len() < end {
+        return Err(AiError::BadOutput(format!(
+            "mask output has {} values, short of the {end} its shape claims",
+            answer.logits.len()
+        )));
+    }
+    let channel = &answer.logits[best * plane..end];
+    let (x, y, w, h) = bbox;
+    let cx = x.min(img_w);
+    let cy = y.min(img_h);
+    let cw = w.min(img_w - cx);
+    let ch = h.min(img_h - cy);
+    let mut boxed = GrayImage::new(w, h);
+    let (mw_us, mh_us) = (mw as usize, mh as usize);
+    if (mw, mh) == (img_w, img_h) {
+        for by in 0..ch {
+            let row = (cy + by) as usize * mw_us;
+            for bx in 0..cw {
+                let v = channel[row + (cx + bx) as usize];
+                boxed.put_pixel(bx, by, image::Luma([sigmoid_strength(v)]));
+            }
+        }
+        return Ok(boxed);
+    }
+    // Source taps for one output coordinate: the pixel
+    // center mapped into the plane, clamped to its edges.
+    let taps = |dst: u32, scale: f32, n: usize| -> (usize, usize, f32) {
+        let s = ((dst as f32 + 0.5) * scale - 0.5).max(0.0);
+        let i0 = (s.floor() as usize).min(n - 1);
+        let i1 = (i0 + 1).min(n - 1);
+        (i0, i1, (s - i0 as f32).clamp(0.0, 1.0))
+    };
+    let (kx, ky) = (mw as f32 / img_w as f32, mh as f32 / img_h as f32);
+    let columns: Vec<_> = (0..cw).map(|bx| taps(cx + bx, kx, mw_us)).collect();
+    for by in 0..ch {
+        let (y0, y1, fy) = taps(cy + by, ky, mh_us);
+        let (r0, r1) = (
+            &channel[y0 * mw_us..][..mw_us],
+            &channel[y1 * mw_us..][..mw_us],
+        );
+        for (bx, &(x0, x1, fx)) in (0..cw).zip(&columns) {
+            let top = r0[x0] + (r0[x1] - r0[x0]) * fx;
+            let bottom = r1[x0] + (r1[x1] - r1[x0]) * fx;
+            let v = top + (bottom - top) * fy;
+            boxed.put_pixel(bx, by, image::Luma([sigmoid_strength(v)]));
+        }
+    }
+    Ok(boxed)
 }
 
 /// The geometry of one segmentation mask (issue #175):
@@ -1140,10 +1317,24 @@ impl SegmentProvider for OnnxSegmentProvider {
         img_h: u32,
         bbox: (u32, u32, u32, u32),
     ) -> Result<GrayImage, AiError> {
-        let (x, y, w, h) = bbox;
-        if w == 0 || h == 0 {
-            return Ok(GrayImage::new(w, h));
-        }
+        decode_box(img_w, img_h, bbox, |prompt, finish| {
+            self.run_decoder(embedding, prompt, finish)
+        })
+    }
+}
+
+impl OnnxSegmentProvider {
+    /// Run the decoder for one prompt and pass its masks
+    /// and predicted-IoU outputs to `finish`, borrowed from
+    /// the session's output tensors: no output is copied
+    /// here (`collect_outputs` used to copy every candidate's
+    /// whole plane).
+    fn run_decoder(
+        &self,
+        embedding: &SegmentEmbedding,
+        prompt: &MaskPrompt,
+        finish: &mut MaskFinish<'_>,
+    ) -> Result<GrayImage, AiError> {
         let want = SEGMENT_CHANNELS * SEGMENT_GRID * SEGMENT_GRID;
         if embedding.data.len() != want {
             return Err(AiError::BadOutput(format!(
@@ -1152,7 +1343,7 @@ impl SegmentProvider for OnnxSegmentProvider {
                 embedding.data.len()
             )));
         }
-        let coords = segment_box_coords(img_w, img_h, bbox);
+        let coords = prompt.coords;
         let embeddings_tensor = ort::value::Tensor::from_array((
             [1, SEGMENT_CHANNELS, SEGMENT_GRID, SEGMENT_GRID],
             embedding.data.clone().into_boxed_slice(),
@@ -1177,7 +1368,7 @@ impl SegmentProvider for OnnxSegmentProvider {
             )?;
         let size_tensor = ort::value::Tensor::from_array((
             [2],
-            vec![img_h as f32, img_w as f32].into_boxed_slice(),
+            vec![prompt.mask_h as f32, prompt.mask_w as f32].into_boxed_slice(),
         ))
         .map_err(|e| AiError::Inference(format!("cannot build the size tensor: {e}")))?;
         let mut session = self.decoder.lock().map_err(|_| AiError::LockPoisoned)?;
@@ -1191,92 +1382,30 @@ impl SegmentProvider for OnnxSegmentProvider {
                 self.size_input.as_str() => size_tensor
             ])
             .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
-        let outputs = collect_outputs(outputs)?;
-        let find = |want: &str| -> Option<&(String, Vec<i64>, Vec<f32>)> {
+        fn read(value: &ort::value::DynValue) -> Result<(&ort::value::Shape, &[f32]), AiError> {
+            value
+                .try_extract_tensor::<f32>()
+                .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))
+        }
+        // By name, falling back to the outputs' order.
+        let output = |name: &str, index: usize| {
             outputs
-                .iter()
-                .find(|(name, _, _)| name.eq_ignore_ascii_case(want))
+                .get(name)
+                .or_else(|| outputs.keys().nth(index).and_then(|k| outputs.get(k)))
         };
-        let (_, mask_dims, mask_data) = find(&self.masks_output)
-            .or_else(|| outputs.first())
+        let masks = output(&self.masks_output, 0)
             .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
-        let (_, _, score_data) = find(&self.scores_output)
-            .or_else(|| outputs.get(1))
-            .ok_or_else(|| {
-                AiError::BadOutput("the model produced no IoU predictions".to_string())
-            })?;
-        if mask_dims.len() != 4 || mask_dims[0] != 1 {
-            return Err(AiError::BadOutput(format!(
-                "unexpected mask output shape: {mask_dims:?}"
-            )));
-        }
-        let (candidates, mh, mw) = (
-            mask_dims[1] as usize,
-            mask_dims[2] as u32,
-            mask_dims[3] as u32,
-        );
-        if candidates == 0 || score_data.len() < candidates {
-            return Err(AiError::BadOutput(format!(
-                "the model produced {candidates} mask candidates but {} scores",
-                score_data.len()
-            )));
-        }
-        // The predicted-IoU scores are unbounded model
-        // predictions (a near-perfect mask can score over
-        // 1.0): they rank the candidates, nothing more.
-        let best = score_data[..candidates]
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        // The claimed mask shape must fit the values
-        // actually returned before anything slices by it
-        // (issue #267), with overflow treated as a bad
-        // output rather than a wrap or a panic.
-        let Some(plane) = (mw as usize).checked_mul(mh as usize) else {
-            return Err(AiError::BadOutput(format!(
-                "mask shape overflows: {mask_dims:?}"
-            )));
-        };
-        let Some(end) = (best + 1).checked_mul(plane) else {
-            return Err(AiError::BadOutput(format!(
-                "mask shape overflows: {mask_dims:?}"
-            )));
-        };
-        if mask_data.len() < end {
-            return Err(AiError::BadOutput(format!(
-                "mask output has {} values, short of the {end} its shape claims",
-                mask_data.len()
-            )));
-        }
-        check_mask_plane(mw, mh)?;
-        let channel = &mask_data[best * plane..end];
-        let full = GrayImage::from_raw(mw, mh, sigmoid_strengths(channel)).ok_or_else(|| {
-            AiError::BadOutput("the mask channel does not fit its shape".to_string())
+        let scores = output(&self.scores_output, 1).ok_or_else(|| {
+            AiError::BadOutput("the model produced no IoU predictions".to_string())
         })?;
-        let full = if (mw, mh) == (img_w, img_h) {
-            full
-        } else {
-            fir_resize_gray(&full, img_w, img_h)
-        };
-        // Crop the box out of the full-size mask. A box
-        // reaching past the frame (a detector's rounding)
-        // clips, and the missing strip stays background, so
-        // the answer is always the box's own size.
-        let cx = x.min(img_w);
-        let cy = y.min(img_h);
-        let cw = w.min(img_w - cx);
-        let ch = h.min(img_h - cy);
-        if (cw, ch) == (w, h) {
-            return Ok(image::imageops::crop_imm(&full, cx, cy, cw, ch).to_image());
-        }
-        let mut boxed = GrayImage::new(w, h);
-        if cw > 0 && ch > 0 {
-            let crop = image::imageops::crop_imm(&full, cx, cy, cw, ch).to_image();
-            image::imageops::overlay(&mut boxed, &crop, 0, 0);
-        }
-        Ok(boxed)
+        let (mask_shape, logits) = read(masks)?;
+        let (_, scores) = read(scores)?;
+        let dims: Vec<i64> = mask_shape.iter().copied().collect();
+        finish(MaskAnswer {
+            dims: &dims,
+            logits,
+            scores,
+        })
     }
 }
 
@@ -1919,7 +2048,8 @@ mod tests {
 
     #[test]
     fn sigmoid_strengths_map_logits_to_a_soft_mask() {
-        assert_eq!(sigmoid_strengths(&[-100.0, 0.0, 100.0]), vec![0, 128, 255]);
+        let strengths: Vec<u8> = [-100.0, 0.0, 100.0].map(sigmoid_strength).to_vec();
+        assert_eq!(strengths, vec![0, 128, 255]);
     }
 
     #[test]
@@ -2005,6 +2135,18 @@ mod tests {
             .decode(&embedding, 200, 150, (60, 35, 80, 80))
             .unwrap();
         assert_eq!(again, mask);
+        // The same scene at 10x, past the encoder's 1024:
+        // the decoder answers at the encoder's scale and
+        // the box is resampled to its own size (issue #410).
+        let big = image::imageops::resize(&img.to_rgb8(), 2000, 1500, FilterType::Nearest);
+        let mask = provider
+            .segment(&DynamicImage::ImageRgb8(big), (600, 350, 800, 800))
+            .unwrap();
+        assert_eq!((mask.width(), mask.height()), (800, 800));
+        assert!(mask.get_pixel(400, 400)[0] > 200, "center");
+        assert!(mask.get_pixel(20, 20)[0] < 30, "corner");
+        let g = mask_geometry(&mask).expect("the disc has geometry");
+        assert!((0.6..0.92).contains(&g.coverage), "coverage {}", g.coverage);
     }
 
     /// A missing file in the pair fails as Load, the same
@@ -2844,6 +2986,206 @@ mod clip_tests {
         assert!(check_mask_plane(8000, 8000).is_ok());
         let err = check_mask_plane(20000, 20000).unwrap_err();
         assert!(matches!(err, AiError::BadOutput(_)), "{err}");
+    }
+
+    #[test]
+    fn segment_mask_dims_stay_at_the_encoder_scale() {
+        // Issue #410: frames that fit the encoder ask for
+        // themselves; larger ones ask for the size the
+        // encoder saw, never more than 1024 a side.
+        let cases = [
+            ((64, 48), (64, 48)),
+            ((1024, 1024), (1024, 1024)),
+            ((1025, 10), (1024, 10)),
+            ((8192, 8192), (1024, 1024)),
+            ((16384, 900), (1024, 56)),
+            ((3000, 100_000), (31, 1024)),
+            ((100_000, 3), (1024, 1)),
+            ((0, 0), (1, 1)),
+        ];
+        for ((w, h), want) in cases {
+            let got = segment_mask_dims(w, h);
+            assert_eq!(got, want, "{w}x{h}");
+            assert!(got.0 <= SEGMENT_INPUT && got.1 <= SEGMENT_INPUT);
+        }
+        // Above the bound, the plane is exactly what
+        // segment_preprocess resized the frame to.
+        assert_eq!(
+            segment_mask_dims(4000, 3000),
+            segment_input_dims(4000, 3000)
+        );
+    }
+
+    /// A fake SAM decoder for `decode_box`: like the
+    /// `SamOnnxModel` export it answers exactly the plane it
+    /// is asked for, here four candidates. Candidate 2 has
+    /// the best predicted IoU and draws the object, an inner
+    /// rectangle a quarter of the box's area (logit +8
+    /// inside, -8 outside), at each plane pixel's center in
+    /// frame coordinates; the others claim the whole frame.
+    /// Records every plane it is asked for.
+    fn fake_decode(
+        img_w: u32,
+        img_h: u32,
+        bbox: (u32, u32, u32, u32),
+        asked: &mut Vec<(u32, u32)>,
+    ) -> Result<GrayImage, AiError> {
+        let (x, y, w, h) = bbox;
+        let object = (
+            x as f32 + w as f32 / 4.0,
+            y as f32 + h as f32 / 4.0,
+            x as f32 + w as f32 * 0.75,
+            y as f32 + h as f32 * 0.75,
+        );
+        decode_box(img_w, img_h, bbox, |prompt, finish| {
+            let (mw, mh) = (prompt.mask_w, prompt.mask_h);
+            asked.push((mw, mh));
+            let plane = (mw * mh) as usize;
+            let mut logits = vec![8.0f32; 4 * plane];
+            let (kx, ky) = (img_w as f32 / mw as f32, img_h as f32 / mh as f32);
+            for py in 0..mh {
+                for px in 0..mw {
+                    let (fx, fy) = ((px as f32 + 0.5) * kx, (py as f32 + 0.5) * ky);
+                    let inside =
+                        (object.0..object.2).contains(&fx) && (object.1..object.3).contains(&fy);
+                    logits[2 * plane + (py * mw + px) as usize] = if inside { 8.0 } else { -8.0 };
+                }
+            }
+            finish(MaskAnswer {
+                dims: &[1, 4, mh as i64, mw as i64],
+                logits: &logits,
+                scores: &[0.2, 0.5, 0.97, 0.1],
+            })
+        })
+    }
+
+    #[test]
+    fn decode_box_never_asks_for_more_than_the_encoder_scale() {
+        // Issue #410: the decoder used to be asked for the
+        // whole frame, candidates x H x W floats per box. The
+        // box mask must still come back at box size and
+        // agree with a full-resolution answer away from the
+        // object's edge.
+        let cases = [
+            (200, 150, (60, 35, 80, 80)),
+            (8192, 8192, (2000, 3000, 1600, 1200)),
+            (12_000, 9_000, (11_000, 100, 1_000, 500)),
+            // Past the right edge: the strip beyond the
+            // frame stays background.
+            (16_384, 900, (16_000, 800, 600, 200)),
+        ];
+        for (img_w, img_h, bbox) in cases {
+            let mut asked = Vec::new();
+            let mask = fake_decode(img_w, img_h, bbox, &mut asked).unwrap();
+            assert_eq!(asked, [segment_mask_dims(img_w, img_h)], "{img_w}x{img_h}");
+            assert!(asked[0].0 <= SEGMENT_INPUT && asked[0].1 <= SEGMENT_INPUT);
+            let (x, y, w, h) = bbox;
+            assert_eq!((mask.width(), mask.height()), (w, h), "{img_w}x{img_h}");
+            // One plane pixel in frame units, the blur the
+            // bounded plane adds at the object's edge.
+            let cell = (img_w as f32 / asked[0].0 as f32).max(img_h as f32 / asked[0].1 as f32);
+            let (ox0, oy0) = (x as f32 + w as f32 / 4.0, y as f32 + h as f32 / 4.0);
+            let (ox1, oy1) = (x as f32 + w as f32 * 0.75, y as f32 + h as f32 * 0.75);
+            for (bx, by, p) in mask.enumerate_pixels() {
+                let (fx, fy) = ((x + bx) as f32 + 0.5, (y + by) as f32 + 0.5);
+                if x + bx >= img_w || y + by >= img_h {
+                    assert_eq!(p[0], 0, "off-frame ({bx}, {by})");
+                    continue;
+                }
+                let edge = (fx - ox0)
+                    .abs()
+                    .min((fx - ox1).abs())
+                    .min((fy - oy0).abs())
+                    .min((fy - oy1).abs());
+                if edge <= 2.0 * cell {
+                    continue;
+                }
+                let inside = (ox0..ox1).contains(&fx) && (oy0..oy1).contains(&fy);
+                let want = if inside { 255 } else { 0 };
+                assert_eq!(p[0], want, "{img_w}x{img_h} box pixel ({bx}, {by})");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_box_samples_a_smaller_plane_over_the_frame() {
+        // A decoder answering a coarser plane than asked (a
+        // low-resolution export) still yields a box-sized
+        // mask, the plane stretched over the frame.
+        let mask = decode_box(4000, 2000, (1000, 500, 400, 300), |_, finish| {
+            let mut logits = vec![-8.0f32; 64 * 32];
+            // Plane pixel (16, 8) covers frame x 1000..1062,
+            // y 500..562: the box's top-left corner.
+            logits[8 * 64 + 16] = 8.0;
+            finish(MaskAnswer {
+                dims: &[1, 1, 32, 64],
+                logits: &logits,
+                scores: &[0.9],
+            })
+        })
+        .unwrap();
+        assert_eq!((mask.width(), mask.height()), (400, 300));
+        assert_eq!(mask.get_pixel(31, 31)[0], 255);
+        assert_eq!(mask.get_pixel(399, 299)[0], 0);
+    }
+
+    #[test]
+    fn decode_box_rejects_answers_that_do_not_fit_the_request() {
+        let run = |dims: [i64; 4], values: usize, scores: Vec<f32>| {
+            decode_box(8192, 8192, (100, 100, 50, 50), |_, finish| {
+                finish(MaskAnswer {
+                    dims: &dims,
+                    logits: &vec![0.0; values],
+                    scores: &scores,
+                })
+            })
+        };
+        // A plane bigger than the 1024x1024 asked for: the
+        // decoder ignored orig_im_size.
+        let err = run([1, 1, 8192, 8192], 16, vec![0.9]).unwrap_err();
+        assert!(err.to_string().contains("for a 1024x1024 request"), "{err}");
+        // Fewer values than the claimed shape.
+        let err = run([1, 2, 1024, 1024], 1024 * 1024, vec![0.1, 0.9]).unwrap_err();
+        assert!(err.to_string().contains("short of"), "{err}");
+        // More candidates than scores, a negative dim, a
+        // wrong rank, an empty plane.
+        for (dims, scores) in [
+            ([1, 3, 1024, 1024], vec![0.9]),
+            ([1, 1, -1, 1024], vec![0.9]),
+            ([2, 1, 1024, 1024], vec![0.9]),
+            ([1, 1, 0, 1024], vec![0.9]),
+            ([1, 0, 1024, 1024], vec![]),
+        ] {
+            let err = run(dims, 1024 * 1024, scores).unwrap_err();
+            assert!(matches!(err, AiError::BadOutput(_)), "{dims:?}: {err}");
+        }
+        // An empty box never reaches the decoder.
+        let mask = decode_box(8192, 8192, (10, 10, 0, 5), |_, _| {
+            panic!("an empty box must not run the decoder")
+        })
+        .unwrap();
+        assert_eq!((mask.width(), mask.height()), (0, 5));
+    }
+
+    #[test]
+    fn decode_box_reads_an_exact_plane_without_resampling() {
+        // A frame that fits the encoder gets its own size
+        // back, and each box pixel is the logistic of its
+        // own logit, as before issue #410.
+        let logits: Vec<f32> = (0..20 * 10).map(|i| (i % 7) as f32 - 3.0).collect();
+        let mask = decode_box(20, 10, (3, 2, 5, 4), |prompt, finish| {
+            assert_eq!((prompt.mask_w, prompt.mask_h), (20, 10));
+            finish(MaskAnswer {
+                dims: &[1, 1, 10, 20],
+                logits: &logits,
+                scores: &[0.9],
+            })
+        })
+        .unwrap();
+        for (bx, by, p) in mask.enumerate_pixels() {
+            let v = logits[((2 + by) * 20 + 3 + bx) as usize];
+            assert_eq!(p[0], sigmoid_strength(v), "({bx}, {by})");
+        }
     }
 
     #[test]
