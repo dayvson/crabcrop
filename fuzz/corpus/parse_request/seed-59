@@ -1,0 +1,1 @@
+/unsafe/filters:blur_region(0,0,50,50):pixelate_region(10,10,20,20):remove_region(5,5,10,10)/example.com/img.jpg
