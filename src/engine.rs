@@ -270,10 +270,14 @@ pub fn validate_source_image(bytes: &[u8]) -> Result<(), EngineError> {
 pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError> {
     ensure_jxl_decoder();
     if crate::svg::is_svg(bytes) {
-        crate::svg::prepare(bytes).map_err(EngineError::Decode)?;
-        let stored = crate::svg::sanitized_bytes(bytes).map_err(EngineError::Decode)?;
+        // The parse runs in the SVG worker (issue #447); what
+        // is stored is the sanitized document it parsed.
+        let screened = crate::svg::screen(bytes).map_err(EngineError::Decode)?;
+        screened
+            .intrinsic_size(None)
+            .map_err(|e| EngineError::Decode(e.to_string()))?;
         return Ok(PreparedUpload {
-            stored,
+            stored: screened.into_bytes(),
             media: UploadMedia::Svg,
         });
     }
@@ -405,15 +409,26 @@ pub struct SourceProbe {
     pub dimensions: Option<(u32, u32)>,
 }
 
+/// How long the explain probe waits for an SVG's intrinsic
+/// size: a parse with no render, which takes milliseconds
+/// for any document within the bounds.
+const SVG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Probe source bytes for the explain report: kind and
 /// dimensions, headers only (see [`SourceProbe`]).
 pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
     if crate::svg::is_svg(bytes) {
-        let dimensions = crate::svg::prepare(bytes).ok().and_then(|prepared| {
-            let (w, h) = prepared.intrinsic();
-            let (w, h) = (w.round() as u32, h.round() as u32);
-            if w >= 1 && h >= 1 { Some((w, h)) } else { None }
-        });
+        // The intrinsic size takes a parse, which runs in the
+        // SVG worker (issue #447) under the probe's own short
+        // deadline: the explain handler waits on it.
+        let deadline = std::time::Instant::now() + SVG_PROBE_TIMEOUT;
+        let dimensions = crate::svg::screen(bytes)
+            .ok()
+            .and_then(|screened| screened.intrinsic_size(Some(deadline)).ok())
+            .and_then(|(w, h)| {
+                let (w, h) = (w.round() as u32, h.round() as u32);
+                if w >= 1 && h >= 1 { Some((w, h)) } else { None }
+            });
         return SourceProbe {
             kind: "svg",
             dimensions,
@@ -705,12 +720,12 @@ fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), 
 /// frame or page selection) and what sniffing them settled:
 /// the format their content declares, and whether they take
 /// the HEIC or the SVG decode path (an SVG arrives sanitized
-/// and parsed).
+/// and screened; the worker parses it at decode).
 struct SniffedSource<'b> {
     bytes: &'b [u8],
     detected: ImageFormat,
     heic: bool,
-    svg: Option<crate::svg::Prepared>,
+    svg: Option<crate::svg::Screened>,
 }
 
 /// What the decode stage of [`Engine::process_preferred`]
@@ -1011,11 +1026,11 @@ impl Engine {
         // path instead of the generic one.
         let heic = is_heic(bytes);
         // SVG sources are sniffed by content (the declared type
-        // can lie), sanitized, and parsed up front: the raster
+        // can lie), sanitized, and screened up front: the raster
         // becomes the decoded image below, and the output
         // format defaults to PNG (SVG has no raster format).
         let svg = if crate::svg::is_svg(bytes) {
-            Some(crate::svg::prepare(bytes).map_err(EngineError::Decode)?)
+            Some(crate::svg::screen(bytes).map_err(EngineError::Decode)?)
         } else {
             None
         };
@@ -1275,14 +1290,24 @@ impl Engine {
                     .expect("decode_webp_frames returns at least one frame")
                     .into_buffer(),
             )
-        } else if let Some(prep) = &source.svg {
+        } else if let Some(screened) = &source.svg {
             // Rasterize at the size the request is heading for
             // (or the intrinsic size when it asks for none), so
             // vectors stay crisp; the normal pipeline runs on
-            // the raster from here.
-            let (tw, th) =
-                svg_raster_target(ops, prep.intrinsic(), dpr_factor(directives.dpr, ctx));
-            prep.render(tw, th).map_err(EngineError::Decode)?
+            // the raster from here. The parse and the render
+            // run in the SVG worker (issue #447), killed at the
+            // request's deadline.
+            let dpr = dpr_factor(directives.dpr, ctx);
+            screened
+                .rasterize(ctx.deadline, |intrinsic| {
+                    svg_raster_target(ops, intrinsic, dpr)
+                })
+                .map_err(|e| match e {
+                    crate::svg::RenderError::TimedOut(_) if ctx.deadline.is_some() => {
+                        EngineError::Timeout
+                    }
+                    e => EngineError::Decode(e.to_string()),
+                })?
         } else if source.heic {
             // HEIC/HEIF: the oxideav decode applies the EXIF
             // orientation from the decoder's own metadata (the

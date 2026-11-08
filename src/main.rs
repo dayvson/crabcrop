@@ -5,7 +5,9 @@
 //! from the library's modules, and serves signed image URLs
 //! of the form `/<signature>/<operations...>/<image-url>`.
 //! When the first argument names a CLI verb, that verb runs
-//! instead of the server (see [`cli`]).
+//! instead of the server (see [`cli`]). The server also
+//! starts this binary as its SVG worker, with
+//! `--svg-worker` (see `crabcrop::svg`).
 //!
 //! Every environment variable is documented in
 //! `docs/configuration.md`, the single reference for
@@ -31,8 +33,19 @@ use crate::loader::{Loader, SourceConfig, SourcePolicy};
 use crate::observe::Metrics;
 use crate::server::{AppState, app};
 
+fn main() {
+    // An SVG worker (issue #447) is this binary started by
+    // the server to parse and render one document: it caps
+    // itself and exits without a runtime or configuration,
+    // so it branches before either exists.
+    if crabcrop::svg::is_worker_invocation() {
+        std::process::exit(crabcrop::svg::worker_main());
+    }
+    start();
+}
+
 #[tokio::main]
-async fn main() {
+async fn start() {
     // CLI verbs run instead of the server when the first
     // argument names one. A first argument that is not a
     // flag and names nothing is an error, never a server
@@ -60,6 +73,15 @@ async fn main() {
             }
         }
         return;
+    }
+    // The server parses and renders every SVG in a worker
+    // started from its own binary (issue #447).
+    match crabcrop::svg::WorkerCommand::current_binary() {
+        Ok(worker) => crabcrop::svg::isolate_in_child(worker),
+        Err(e) => {
+            eprintln!("crabcrop: cannot locate this binary to start SVG workers: {e}");
+            std::process::exit(1);
+        }
     }
     if let Err(e) = run().await {
         eprintln!("crabcrop: {e}");
