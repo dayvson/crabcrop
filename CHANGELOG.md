@@ -8,6 +8,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Release runs check the approval gate and CI before they build, and adopt a release that already exists (issue #457). A new preflight job stops a tag run unless the `release` environment has a Required reviewers rule and the tagged commit passed `rust.yml` on main. The host job updates an existing release for the tag instead of failing on it, which every tag run from v0.9.8 to v0.9.11 did on its first attempt. The one-off `mcp-publish-v010.yml` workflow is gone.
 
+- ThumbHash strings are the same bytes on every platform (issue #458). The encoder now takes its cosines from the portable `libm` crate instead of the system math library, whose last bit differs between glibc and Apple's libm. A coefficient that lands exactly on a rounding tie can therefore come out one step different from before on Linux, which changes that image's `thumbhash` in meta responses. Meta responses are never cached, so no stored entry is affected.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added
