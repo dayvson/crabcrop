@@ -671,6 +671,9 @@ mod tests {
         // on it is killed at the deadline, grandchild and all.
         let pid_file =
             std::env::temp_dir().join(format!("crabcrop-toolrun-group-{}.pid", std::process::id()));
+        // A file left by an earlier run under the same PID
+        // would name some other process, alive or not.
+        let _ = std::fs::remove_file(&pid_file);
         let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
         let argv = ["-c", script.as_str()];
         let mut command = shell(&argv, ToolInput::Bytes(b""));
