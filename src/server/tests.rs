@@ -8394,7 +8394,19 @@ fn tier_test_entry() -> CachedImage {
         quality: Some(80),
         groups: Vec::new(),
         etag: crate::cache::etag_for_bytes(b"tier-test-pixels"),
+        written: None,
     }
+}
+
+/// How many cache entry objects the fake bucket holds,
+/// leaving out purge tombstones (issue #461).
+fn entry_objects(fake: &crate::s3store::test_support::FakeS3) -> usize {
+    fake.objects
+        .lock()
+        .unwrap()
+        .keys()
+        .filter(|k| k.ends_with(".bin"))
+        .count()
 }
 
 /// Poll a lookup future exactly once, then drop it:
@@ -12536,8 +12548,9 @@ async fn purge_during_a_render_keeps_the_entry_out_of_every_tier() {
     // Give the background shared-tier write every
     // chance to land: it must never appear.
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    assert!(
-        fake.objects.lock().unwrap().is_empty(),
+    assert_eq!(
+        entry_objects(&fake),
+        0,
         "the shared tier holds the purged render"
     );
     let on_disk = std::fs::read_dir(&dir)
@@ -12626,6 +12639,7 @@ struct WalkFixture {
     dir: std::path::PathBuf,
     hits: Arc<AtomicUsize>,
     probe: AppState,
+    server: tokio::task::JoinHandle<()>,
     base: String,
     url: String,
     object: String,
@@ -12644,7 +12658,7 @@ impl WalkFixture {
         let probe = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             axum::serve(listener, app(state)).await.unwrap();
         });
         let preset = format!("preset:small/{src}");
@@ -12688,12 +12702,43 @@ impl WalkFixture {
             dir,
             hits,
             probe,
+            server,
             base,
             url,
             object,
             key,
             stale,
         }
+    }
+
+    /// Whether the bucket copy is the stale one.
+    fn bucket_holds_stale(&self) -> bool {
+        self.fake
+            .objects
+            .lock()
+            .unwrap()
+            .get(&self.object)
+            .and_then(|data| {
+                crate::storage::parse_entry(data, &crate::url::entry_key(b"disk-key-test"))
+            })
+            .is_some_and(|(_, image)| image.etag == self.stale.etag)
+    }
+
+    /// Put the stale copy back in the bucket, as the walk
+    /// left it: unreached.
+    async fn restore_stale_bucket_copy(&self) {
+        let shared = self.probe.shared_store.clone().unwrap();
+        shared.put(&self.key, &self.stale).await;
+        assert!(self.bucket_holds_stale());
+    }
+
+    /// A replica over the fixture's bucket that did not
+    /// receive the purge, with its own disk tier at `dir`
+    /// when given.
+    fn other_replica(&self, dir: Option<&std::path::Path>) -> AppState {
+        let mut state = tier_test_state(dir, &self.fake.endpoint);
+        state.presets = preset_test_map();
+        state
     }
 
     /// Purge group `small` and wait until its background
@@ -12786,7 +12831,7 @@ async fn lookups_during_a_background_purge_walk_do_not_resurrect_the_entry() {
             .lock()
             .unwrap()
             .iter()
-            .any(|r| r == &format!("DELETE {}", fx.object)),
+            .any(|r| r == &format!("DELETE {} if-match", fx.object)),
         "the lookup did not delete the purged bucket copy"
     );
     fx.finish_walk().await;
@@ -12859,11 +12904,220 @@ async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
     shared.put(key, &tier_test_entry()).await;
     assert!(lookup_tiers(&state, key, &[]).await.is_none());
     assert!(shared.get(key).await.is_none());
+    // A copy rendered after the purge began is not
+    // covered (issue #446): it serves while the purge runs.
+    let fresh = CachedImage {
+        written: Some(state.purge_guard.stamp()),
+        ..tier_test_entry()
+    };
+    shared.put(key, &fresh).await;
+    let (_, status) = lookup_tiers(&state, key, &[]).await.unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
     drop(active);
+    // Once the purge has ended, its tombstone still covers
+    // copies older than it for the grace period (issue
+    // #461), but not fresh ones.
+    state.cache.remove(key);
+    store.remove(key);
     shared.put(key, &tier_test_entry()).await;
+    assert!(lookup_tiers(&state, key, &[]).await.is_none());
+    shared.put(key, &fresh).await;
     let (_, status) = lookup_tiers(&state, key, &[]).await.unwrap();
     assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_render_after_a_purge_began_keeps_caching_during_the_walk() {
+    // Issue #446: while a purge's background walk runs,
+    // the receiving server treated every disk or bucket
+    // copy the purge covers as purged, including copies
+    // rendered after the purge began: each lookup deleted
+    // the fresh render and rendered again, and the walk
+    // deleted (and counted) the render too. A copy written
+    // after the purge began now keeps serving from every
+    // persistent tier, and the walk leaves it in place.
+    let fx = WalkFixture::new("walk-fresh").await;
+    fx.purge_and_park_walk().await;
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    let fresh = header(&resp, "etag");
+    assert_ne!(fresh, fx.stale.etag);
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+    let shared = fx.probe.shared_store.clone().unwrap();
+    let store = fx.probe.store.clone().unwrap();
+    // The render's write-through lands in the bucket.
+    for _ in 0..250 {
+        if shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh));
+    let deletes = || {
+        fx.fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with(&format!("DELETE {}", fx.object)))
+            .count()
+    };
+    let deletes_after_render = deletes();
+    // With memory cleared, the next lookup hits the disk
+    // tier, while the walk is still parked...
+    fx.probe.cache.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"disk\""
+    );
+    assert_eq!(header(&resp, "etag"), fresh);
+    // ...and with the disk copy gone too, the bucket.
+    fx.probe.cache.remove(&fx.key);
+    store.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"shared\""
+    );
+    assert_eq!(header(&resp, "etag"), fresh);
+    assert_eq!(
+        fx.hits.load(Ordering::SeqCst),
+        2,
+        "a fresh copy re-rendered"
+    );
+    assert_eq!(
+        fx.probe.purge_guard.active_count(),
+        1,
+        "the walk ended early"
+    );
+    // The walk then reaches the object, reads a copy
+    // written after the purge began, and leaves it: no
+    // delete, so nothing counted.
+    fx.finish_walk().await;
+    assert_eq!(deletes(), deletes_after_render);
+    assert!(shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh));
+    fx.probe.cache.remove(&fx.key);
+    store.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"shared\""
+    );
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
+    // Issue #461: the guard that kept a purge effective
+    // during its walk lived only in memory, and so did the
+    // walk's remainder. A restart mid-walk lost both: the
+    // unreached bucket copy then served again on every
+    // replica, the receiving one included. The purge's
+    // tombstone in the bucket now keeps it effective.
+    let fx = WalkFixture::new("walk-restart").await;
+    // A replica already running, which never receives the
+    // purge: it read the bucket's tombstones at boot.
+    let running = fx.other_replica(None);
+    start_purge_tombstones(&running).await;
+    fx.purge_and_park_walk().await;
+    // The receiving server stops mid-walk: its memory, its
+    // guard, and the walk's remainder are gone. The bucket
+    // still holds the unreached copy and the tombstone, not
+    // marked ended.
+    fx.server.abort();
+    assert!(fx.bucket_holds_stale());
+    let tombstone = {
+        let objects = fx.fake.objects.lock().unwrap();
+        let (_, data) = objects
+            .iter()
+            .find(|(name, _)| name.starts_with("purges/"))
+            .expect("the purge left a tombstone in the bucket");
+        crate::storage::parse_tombstone(data, &crate::url::entry_key(b"disk-key-test")).unwrap()
+    };
+    assert_eq!(
+        tombstone.target,
+        crate::cache::PurgeTarget::Group("small".into())
+    );
+    assert_eq!(tombstone.ended_ms, None);
+    // The running replica learns the purge at its next
+    // refresh and misses on the unreached copy.
+    let shared = running.shared_store.clone().unwrap();
+    assert!(shared.refresh_tombstones(&running.purge_guard).await);
+    assert!(lookup_tiers(&running, &fx.key, &[]).await.is_none());
+    assert!(
+        !fx.bucket_holds_stale(),
+        "the copy was not removed on sight"
+    );
+    // A replica that boots after the purge, with a disk of
+    // its own that kept a pre-purge copy, misses on both.
+    fx.restore_stale_bucket_copy().await;
+    let other_dir = fx.dir.with_extension("other");
+    let _ = std::fs::remove_dir_all(&other_dir);
+    let booted = fx.other_replica(Some(&other_dir));
+    let booted_disk = booted.store.clone().unwrap();
+    booted_disk.put(&fx.key, &fx.stale);
+    start_purge_tombstones(&booted).await;
+    assert!(lookup_tiers(&booted, &fx.key, &[]).await.is_none());
+    assert!(booted_disk.get(&fx.key).is_none(), "the disk copy survived");
+    assert!(!fx.bucket_holds_stale(), "the bucket copy survived");
+    let _ = std::fs::remove_dir_all(&other_dir);
+    // The restarted receiving server, over the same disk
+    // and bucket with fresh memory, misses on the purged
+    // URL and renders it again from the origin.
+    fx.restore_stale_bucket_copy().await;
+    let restarted = fx.other_replica(Some(&fx.dir));
+    start_purge_tombstones(&restarted).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app(restarted)).await.unwrap();
+    });
+    let url = fx.url.replace(&fx.base, &base);
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_ne!(header(&resp, "etag"), fx.stale.etag);
+    assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+    assert!(!fx.bucket_holds_stale());
+}
+
+#[tokio::test]
+async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
+    // Issue #461: a replica that held a copy from before
+    // another replica's purge must not write it back to
+    // the shared tier once it knows the purge, or the copy
+    // would outlive the walk that removed it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let holder = tier_test_state(None, &fake.endpoint);
+    let purger = tier_test_state(None, &fake.endpoint);
+    let key = "40x24/example.com/i.png#cfgtest";
+    holder.cache.put(key.to_string(), tier_test_entry());
+    let (active, tombstone) = begin_purge(
+        &purger,
+        crate::cache::PurgeTarget::Key("40x24/example.com/i.png".into()),
+    )
+    .await;
+    assert!(tombstone.is_some());
+    let shared = holder.shared_store.clone().unwrap();
+    assert!(shared.refresh_tombstones(&holder.purge_guard).await);
+    // The memory hit still serves (another process's
+    // memory is out of a purge's reach), but the group it
+    // learns does not carry the copy back to the bucket.
+    let (_, status) = lookup_tiers(&holder, key, &["thumb".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(status, "crabcrop; hit");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        entry_objects(&fake),
+        0,
+        "the pre-purge copy was written back"
+    );
+    drop(active);
 }
 
 /// An app over a disk tier under a chosen
