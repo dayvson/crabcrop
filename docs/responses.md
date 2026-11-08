@@ -78,7 +78,7 @@ Operational failures carry these codes:
 | `pdf_render_failed` | `502` | The configured PDF renderer failed. |
 | `processing_timeout` | `504` | Processing ran past the process deadline. |
 | `processing_failed` | `500` | The processing job itself failed. |
-| `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate waited past its timeout; the response carries `Retry-After`. |
+| `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate, or the source buffer budget (`CRABCROP_SOURCE_BUFFER_MAX_MB`), waited past its timeout; the response carries `Retry-After`. |
 | `invalid_purge_group` | `400` | A purge-group name is empty or contains a slash. |
 | `uploads_not_configured` | `404` | Reserved for a `PUT` to `/upload/...` when uploads are not configured. Not sent today: without an upload destination the route is not registered, so that request answers `not_found`. |
 | `invalid_upload_name` | `400` | The upload name is not valid. |
