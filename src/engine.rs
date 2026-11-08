@@ -692,6 +692,52 @@ fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), 
     Ok(())
 }
 
+/// The source bytes the still pipeline decodes (after any
+/// frame or page selection) and what sniffing them settled:
+/// the format their content declares, and whether they take
+/// the HEIC or the SVG decode path (an SVG arrives sanitized
+/// and parsed).
+struct SniffedSource<'b> {
+    bytes: &'b [u8],
+    detected: ImageFormat,
+    heic: bool,
+    svg: Option<crate::svg::Prepared>,
+}
+
+/// What the decode stage of [`Engine::process_preferred`]
+/// hands on.
+enum Decoded {
+    /// The still image the operation chain runs on (an
+    /// animated source's first frame when the output is a
+    /// still format), with the source metadata.
+    Still(DynamicImage, crate::color::SourceMeta),
+    /// An animated source the animated or video path
+    /// rendered whole: the request's result.
+    Rendered(Box<ProcessedImage>),
+}
+
+/// The quality directive resolved for the still encode.
+struct StillQuality {
+    /// The quality the first encode runs at; `None` keeps
+    /// the encoder default.
+    encode_quality: Option<u8>,
+    /// The quality reported back, set when the service
+    /// picked it (`quality(auto)`, the Save-Data step).
+    chosen_quality: Option<u8>,
+    /// Whether `quality(auto)` verifies its pick through
+    /// SSIMULACRA2 (JPEG and JPEG XL outputs).
+    perceptual: bool,
+}
+
+/// The still encode's result: the bytes, the quality the
+/// service chose for them (reported back), and their
+/// SSIMULACRA2 score when the perceptual loop verified them.
+struct StillEncode {
+    bytes: Vec<u8>,
+    chosen_quality: Option<u8>,
+    ssim: Option<f64>,
+}
+
 /// Decodes, resizes, and encodes images.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Engine;
@@ -715,6 +761,12 @@ impl Engine {
     /// Like [`Engine::process`], with the caller's context: a
     /// negotiated format preference, resolved watermark images,
     /// the placeholder switch, and the AI providers.
+    ///
+    /// The stages run in order: frame and page selection,
+    /// sniffing, preflight, decode, the operation chain
+    /// (`apply_operations`), the still encode, and metadata
+    /// embedding. The functions after this one hold every
+    /// stage but the chain.
     pub fn process_preferred(
         &self,
         bytes: &[u8],
@@ -726,121 +778,14 @@ impl Engine {
         // the pipeline reads (issue #136); nothing below
         // re-walks the list looking for them.
         let directives = crate::url::RequestDirectives::analyze(ops);
-        // Frame selection (issue #214): a `frame:` segment
-        // makes the source a video whose selected frame
-        // becomes the source image for everything below.
-        // The extractor is required (a deployment without
-        // one answers NotConfigured, like video output
-        // without an encoder); an image source is refused
-        // as a bad source, because frame selection is
-        // video-only and animated GIF and WebP sources keep
-        // their own handling; and the extracted PNG
-        // replaces the bytes, so the format detection, the
-        // validation preflights, the source metadata, and
-        // the decode chain below all see the frame.
-        let frame_png;
-        let mut video_meta: Option<VideoSourceMeta> = None;
-        let bytes = if let Some(selection) = directives.frame {
-            let extractor = ctx.frame_extractor.ok_or_else(|| {
-                EngineError::NotConfigured(
-                    "frame extraction is not configured on this server (no CRABCROP_VIDEO_DECODER)"
-                        .to_string(),
-                )
-            })?;
-            if image::guess_format(bytes).is_ok()
-                || is_jxl(bytes)
-                || is_heic(bytes)
-                || crate::svg::is_svg(bytes)
-            {
-                return Err(EngineError::Decode(
-                    "frame selection needs a video source, but this source is an image".to_string(),
-                ));
-            }
-            let frame = extractor
-                .extract_frame(bytes, selection)
-                .map_err(|err| match err {
-                    crate::frames::FrameError::NotVideo(why) => EngineError::Decode(why),
-                    crate::frames::FrameError::Unsupported(why) => EngineError::Unsupported(why),
-                    crate::frames::FrameError::Failed(why) => EngineError::Frame(why),
-                })?;
-            video_meta = Some(VideoSourceMeta {
-                duration_seconds: frame.duration,
-                width: frame.width,
-                height: frame.height,
-                frame_seconds: frame.timestamp,
-            });
-            frame_png = frame.png;
-            &frame_png
-        } else {
-            bytes
-        };
-        // Page selection (issue #215): a `page:` segment
-        // makes the source a PDF whose selected page
-        // becomes the source image for everything below,
-        // the frame branch's shape exactly. The renderer
-        // is required (a deployment without one answers
-        // NotConfigured, like frame extraction without a
-        // decoder); the engine sniffs before the renderer
-        // spawns anything, so image bytes and non-PDF
-        // bytes are refused as a bad source here and never
-        // reach the tool; and the rendered PNG replaces
-        // the bytes, so the format detection, the
-        // validation preflights, and the decode chain
-        // below all see the page.
-        let page_png;
-        let mut pdf_meta: Option<PdfSourceMeta> = None;
-        let bytes = if let Some(page) = directives.page {
-            let renderer = ctx.pdf_renderer.ok_or_else(|| {
-                EngineError::NotConfigured(
-                    "page rendering is not configured on this server (no CRABCROP_PDF_RENDERER)"
-                        .to_string(),
-                )
-            })?;
-            if image::guess_format(bytes).is_ok()
-                || is_jxl(bytes)
-                || is_heic(bytes)
-                || crate::svg::is_svg(bytes)
-                || !crate::pdf::sniff_pdf(bytes)
-            {
-                return Err(EngineError::Decode(
-                    "page selection needs a PDF source, but this source is not a PDF".to_string(),
-                ));
-            }
-            let rendered = renderer.render_page(bytes, page).map_err(|err| match err {
-                crate::pdf::PdfError::NotPdf(why) => EngineError::Decode(why),
-                crate::pdf::PdfError::Unsupported(why) => EngineError::Unsupported(why),
-                crate::pdf::PdfError::Failed(why) => EngineError::Pdf(why),
-            })?;
-            pdf_meta = Some(PdfSourceMeta {
-                pages: rendered.pages,
-                page: rendered.page,
-                page_width: rendered.page_width,
-                page_height: rendered.page_height,
-            });
-            page_png = rendered.png;
-            &page_png
-        } else {
-            bytes
-        };
-        // HEIC/HEIF sources are detected explicitly: they decode
-        // through the pure-Rust oxideav stack (issue #163), in the
-        // decode chain below, so the format gets its own metadata
-        // path instead of the generic one.
-        let heic_source = is_heic(bytes);
-        // SVG sources are sniffed by content (the declared type
-        // can lie), sanitized, and parsed up front: the raster
-        // becomes the decoded image below, and the output
-        // format defaults to PNG (SVG has no raster format).
-        let prepared_svg = if crate::svg::is_svg(bytes) {
-            Some(crate::svg::prepare(bytes).map_err(EngineError::Decode)?)
-        } else {
-            None
-        };
-        let detected = if prepared_svg.is_some() {
-            ImageFormat::Png
-        } else {
-            detect_format(bytes)
-        };
+        // A selected video frame or PDF page replaces the
+        // source bytes for every stage below.
+        let frame = Self::select_frame(bytes, &directives, &ctx)?;
+        let bytes = frame.as_ref().map_or(bytes, |(png, _)| png.as_slice());
+        let page = Self::select_page(bytes, &directives, &ctx)?;
+        let bytes = page.as_ref().map_or(bytes, |(png, _)| png.as_slice());
+        let source = Self::sniff_source(bytes)?;
+        let detected = source.detected;
         // keep_profile is convert-or-tag (issue #374): the
         // kept profile is embedded at encode time, which
         // only JPEG and PNG outputs carry in this pipeline.
@@ -857,6 +802,238 @@ impl Engine {
             .unwrap_or(detected);
         let keep_profile = directives.keep_profile
             && matches!(resolved_output, ImageFormat::Jpeg | ImageFormat::Png);
+        Self::preflight(&directives, &ctx, detected)?;
+        let (img, source_meta) =
+            match self.decode_source(&source, ops, &ctx, &directives, keep_profile)? {
+                Decoded::Still(img, source_meta) => (img, source_meta),
+                Decoded::Rendered(processed) => return Ok(*processed),
+            };
+        let mut format = detected;
+        let (source_width, source_height) = (img.width(), img.height());
+        // `no_upscale` is a request-wide directive, like the encoding
+        // directives: wherever it appears, it caps every resize in
+        // the request at the (oriented) source dimensions.
+        let cap = if directives.no_upscale {
+            Some((img.width(), img.height()))
+        } else {
+            None
+        };
+        ctx.check_deadline()?;
+        let (img, encode_opts, studio, inpaint, segments, objects_crop) = apply_operations(
+            img,
+            ops,
+            cap,
+            dpr_factor(directives.dpr, &ctx),
+            &ctx,
+            &directives,
+            None,
+        )?;
+        ctx.check_deadline()?;
+        // Placeholders describe the final pixels, so they are
+        // computed here, before encoding.
+        let placeholder = if ctx.placeholders {
+            Some(crate::placeholder::compute(&img))
+        } else {
+            None
+        };
+        if let Some(f) = encode_opts.format {
+            format = f;
+        } else if let Some(p) = ctx.preferred {
+            format = p;
+        }
+        // A video format that reaches the still pipeline is
+        // a still source asking for video: animated sources
+        // returned through `process_video` at decode. There is
+        // no first-frame fallback: the request named a video
+        // and this source cannot become one.
+        if format.is_video() {
+            if directives.debug_focal {
+                return Err(EngineError::Unsupported(format!(
+                    "debug:focal renders a diagnostic image and cannot be served as \
+                     format({}), which encodes video",
+                    crate::url::format_text(format)
+                )));
+            }
+            return Err(EngineError::Unsupported(format!(
+                "format({}) encodes video and needs an animated source \
+                 (an animated GIF or WebP); this source is a still image",
+                crate::url::format_text(format)
+            )));
+        }
+        let encoded = Self::encode_still(&img, format, &encode_opts, &ctx)?;
+        let bytes = Self::embed_source_meta(
+            encoded.bytes,
+            format,
+            encode_opts.keep_profile,
+            &source_meta,
+            &ctx,
+        );
+        Ok(ProcessedImage {
+            bytes,
+            format,
+            quality: encoded.chosen_quality,
+            width: img.width(),
+            height: img.height(),
+            source_width,
+            source_height,
+            placeholder,
+            studio,
+            inpaint,
+            segments,
+            objects_crop,
+            ssimulacra2: encoded.ssim,
+            video: frame.as_ref().map(|(_, meta)| *meta),
+            pdf: page.as_ref().map(|(_, meta)| *meta),
+            provenance: None,
+        })
+    }
+
+    /// Frame selection (issue #214), the first stage of
+    /// [`Engine::process_preferred`]: a `frame:` segment
+    /// makes the source a video whose selected frame
+    /// becomes the source image for the rest of the
+    /// pipeline. The extractor is required (a deployment
+    /// without one answers NotConfigured, like video output
+    /// without an encoder); an image source is refused
+    /// as a bad source, because frame selection is
+    /// video-only and animated GIF and WebP sources keep
+    /// their own handling; and the extracted PNG
+    /// replaces the bytes, so the format detection, the
+    /// validation preflights, the source metadata, and
+    /// the decode chain all see the frame. `None` when
+    /// the request selects no frame.
+    fn select_frame(
+        bytes: &[u8],
+        directives: &crate::url::RequestDirectives,
+        ctx: &ProcessContext<'_>,
+    ) -> Result<Option<(Vec<u8>, VideoSourceMeta)>, EngineError> {
+        let Some(selection) = directives.frame else {
+            return Ok(None);
+        };
+        let extractor = ctx.frame_extractor.ok_or_else(|| {
+            EngineError::NotConfigured(
+                "frame extraction is not configured on this server (no CRABCROP_VIDEO_DECODER)"
+                    .to_string(),
+            )
+        })?;
+        if image::guess_format(bytes).is_ok()
+            || is_jxl(bytes)
+            || is_heic(bytes)
+            || crate::svg::is_svg(bytes)
+        {
+            return Err(EngineError::Decode(
+                "frame selection needs a video source, but this source is an image".to_string(),
+            ));
+        }
+        let frame = extractor
+            .extract_frame(bytes, selection)
+            .map_err(|err| match err {
+                crate::frames::FrameError::NotVideo(why) => EngineError::Decode(why),
+                crate::frames::FrameError::Unsupported(why) => EngineError::Unsupported(why),
+                crate::frames::FrameError::Failed(why) => EngineError::Frame(why),
+            })?;
+        let video_meta = VideoSourceMeta {
+            duration_seconds: frame.duration,
+            width: frame.width,
+            height: frame.height,
+            frame_seconds: frame.timestamp,
+        };
+        Ok(Some((frame.png, video_meta)))
+    }
+
+    /// Page selection (issue #215), after frame selection:
+    /// a `page:` segment makes the source a PDF whose
+    /// selected page becomes the source image for the rest
+    /// of the pipeline, the frame stage's shape exactly. The
+    /// renderer is required (a deployment without one
+    /// answers NotConfigured, like frame extraction without
+    /// a decoder); the engine sniffs before the renderer
+    /// spawns anything, so image bytes and non-PDF bytes
+    /// are refused as a bad source here and never reach
+    /// the tool; and the rendered PNG replaces the bytes,
+    /// so the format detection, the validation preflights,
+    /// and the decode chain all see the page. `None` when
+    /// the request selects no page.
+    fn select_page(
+        bytes: &[u8],
+        directives: &crate::url::RequestDirectives,
+        ctx: &ProcessContext<'_>,
+    ) -> Result<Option<(Vec<u8>, PdfSourceMeta)>, EngineError> {
+        let Some(page) = directives.page else {
+            return Ok(None);
+        };
+        let renderer = ctx.pdf_renderer.ok_or_else(|| {
+            EngineError::NotConfigured(
+                "page rendering is not configured on this server (no CRABCROP_PDF_RENDERER)"
+                    .to_string(),
+            )
+        })?;
+        if image::guess_format(bytes).is_ok()
+            || is_jxl(bytes)
+            || is_heic(bytes)
+            || crate::svg::is_svg(bytes)
+            || !crate::pdf::sniff_pdf(bytes)
+        {
+            return Err(EngineError::Decode(
+                "page selection needs a PDF source, but this source is not a PDF".to_string(),
+            ));
+        }
+        let rendered = renderer.render_page(bytes, page).map_err(|err| match err {
+            crate::pdf::PdfError::NotPdf(why) => EngineError::Decode(why),
+            crate::pdf::PdfError::Unsupported(why) => EngineError::Unsupported(why),
+            crate::pdf::PdfError::Failed(why) => EngineError::Pdf(why),
+        })?;
+        let pdf_meta = PdfSourceMeta {
+            pages: rendered.pages,
+            page: rendered.page,
+            page_width: rendered.page_width,
+            page_height: rendered.page_height,
+        };
+        Ok(Some((rendered.png, pdf_meta)))
+    }
+
+    /// Sniff the source bytes by content: the format they
+    /// declare, and whether they take the HEIC or the SVG
+    /// decode path.
+    fn sniff_source(bytes: &[u8]) -> Result<SniffedSource<'_>, EngineError> {
+        // HEIC/HEIF sources are detected explicitly: they decode
+        // through the pure-Rust oxideav stack (issue #163), in the
+        // decode chain below, so the format gets its own metadata
+        // path instead of the generic one.
+        let heic = is_heic(bytes);
+        // SVG sources are sniffed by content (the declared type
+        // can lie), sanitized, and parsed up front: the raster
+        // becomes the decoded image below, and the output
+        // format defaults to PNG (SVG has no raster format).
+        let svg = if crate::svg::is_svg(bytes) {
+            Some(crate::svg::prepare(bytes).map_err(EngineError::Decode)?)
+        } else {
+            None
+        };
+        let detected = if svg.is_some() {
+            ImageFormat::Png
+        } else {
+            detect_format(bytes)
+        };
+        Ok(SniffedSource {
+            bytes,
+            detected,
+            heic,
+            svg,
+        })
+    }
+
+    /// Preflight: refuse, before any real work, a request
+    /// this deployment cannot serve (a feature whose model,
+    /// encoder, or font is not configured) or whose
+    /// resolved output format cannot carry what it asks
+    /// for. The checks run in a fixed order, so a request
+    /// that fails several gets the first one's error.
+    fn preflight(
+        directives: &crate::url::RequestDirectives,
+        ctx: &ProcessContext<'_>,
+        detected: ImageFormat,
+    ) -> Result<(), EngineError> {
         // Background removal is validated before any real work:
         // its output is transparency, so the resolved format
         // must carry alpha, and a provider must be configured.
@@ -941,7 +1118,7 @@ impl Engine {
             ));
         }
         if directives.has_class_redaction() {
-            let providers = detection_providers(&ctx);
+            let providers = detection_providers(ctx);
             if providers.is_empty() {
                 return Err(EngineError::NotConfigured(
                     "class redaction is not configured on this server (no detection model)"
@@ -965,7 +1142,7 @@ impl Engine {
         // crop fallback covers "the model ran and found
         // none of the classes", decided in the crop itself.
         if directives.objects_crop {
-            let providers = detection_providers(&ctx);
+            let providers = detection_providers(ctx);
             if providers.is_empty() {
                 return Err(EngineError::NotConfigured(
                     "object crop is not configured on this server (no detection model)".to_string(),
@@ -979,6 +1156,25 @@ impl Engine {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Decode the sniffed source into the still image the
+    /// operation chain runs on, with the source metadata the
+    /// embedding stage reads. An animated GIF or WebP source
+    /// whose output stays animated (or becomes video) is
+    /// rendered whole by the animated or video path instead,
+    /// and comes back as [`Decoded::Rendered`].
+    fn decode_source(
+        &self,
+        source: &SniffedSource<'_>,
+        ops: &[Operation],
+        ctx: &ProcessContext<'_>,
+        directives: &crate::url::RequestDirectives,
+        keep_profile: bool,
+    ) -> Result<Decoded, EngineError> {
+        let bytes = source.bytes;
+        let detected = source.detected;
         // Source metadata, read from the raw bytes once:
         // the ICC profile drives color conversion below and
         // (policy permitting) the metadata injection at the
@@ -1018,10 +1214,12 @@ impl Engine {
                     ctx.preferred,
                 );
                 if matches!(resolved, ImageFormat::Gif | ImageFormat::WebP) {
-                    return self.process_animated(frames, ops, &ctx, resolved, None);
+                    let processed = self.process_animated(frames, ops, ctx, resolved, None)?;
+                    return Ok(Decoded::Rendered(Box::new(processed)));
                 }
                 if resolved.is_video() {
-                    return self.process_video(frames, ops, &ctx, resolved);
+                    let processed = self.process_video(frames, ops, ctx, resolved)?;
+                    return Ok(Decoded::Rendered(Box::new(processed)));
                 }
             }
             DynamicImage::ImageRgba8(
@@ -1052,10 +1250,13 @@ impl Engine {
                     ctx.preferred,
                 );
                 if matches!(resolved, ImageFormat::WebP | ImageFormat::Gif) {
-                    return self.process_animated(frames, ops, &ctx, resolved, Some(loop_count));
+                    let processed =
+                        self.process_animated(frames, ops, ctx, resolved, Some(loop_count))?;
+                    return Ok(Decoded::Rendered(Box::new(processed)));
                 }
                 if resolved.is_video() {
-                    return self.process_video(frames, ops, &ctx, resolved);
+                    let processed = self.process_video(frames, ops, ctx, resolved)?;
+                    return Ok(Decoded::Rendered(Box::new(processed)));
                 }
             }
             DynamicImage::ImageRgba8(
@@ -1065,15 +1266,15 @@ impl Engine {
                     .expect("decode_webp_frames returns at least one frame")
                     .into_buffer(),
             )
-        } else if let Some(prep) = &prepared_svg {
+        } else if let Some(prep) = &source.svg {
             // Rasterize at the size the request is heading for
             // (or the intrinsic size when it asks for none), so
             // vectors stay crisp; the normal pipeline runs on
             // the raster from here.
             let (tw, th) =
-                svg_raster_target(ops, prep.intrinsic(), dpr_factor(directives.dpr, &ctx));
+                svg_raster_target(ops, prep.intrinsic(), dpr_factor(directives.dpr, ctx));
             prep.render(tw, th).map_err(EngineError::Decode)?
-        } else if heic_source {
+        } else if source.heic {
             // HEIC/HEIF: the oxideav decode applies the EXIF
             // orientation from the decoder's own metadata (the
             // container bytes carry no orientation the generic
@@ -1115,58 +1316,17 @@ impl Engine {
             }
             img
         };
-        let mut format = detected;
-        let (source_width, source_height) = (img.width(), img.height());
-        // `no_upscale` is a request-wide directive, like the encoding
-        // directives: wherever it appears, it caps every resize in
-        // the request at the (oriented) source dimensions.
-        let cap = if directives.no_upscale {
-            Some((img.width(), img.height()))
-        } else {
-            None
-        };
-        ctx.check_deadline()?;
-        let (img, encode_opts, studio, inpaint, segments, objects_crop) = apply_operations(
-            img,
-            ops,
-            cap,
-            dpr_factor(directives.dpr, &ctx),
-            &ctx,
-            &directives,
-            None,
-        )?;
-        ctx.check_deadline()?;
-        // Placeholders describe the final pixels, so they are
-        // computed here, before encoding.
-        let placeholder = if ctx.placeholders {
-            Some(crate::placeholder::compute(&img))
-        } else {
-            None
-        };
-        if let Some(f) = encode_opts.format {
-            format = f;
-        } else if let Some(p) = ctx.preferred {
-            format = p;
-        }
-        // A video format that reaches the still pipeline is
-        // a still source asking for video: animated sources
-        // returned through `process_video` above. There is
-        // no first-frame fallback: the request named a video
-        // and this source cannot become one.
-        if format.is_video() {
-            if directives.debug_focal {
-                return Err(EngineError::Unsupported(format!(
-                    "debug:focal renders a diagnostic image and cannot be served as \
-                     format({}), which encodes video",
-                    crate::url::format_text(format)
-                )));
-            }
-            return Err(EngineError::Unsupported(format!(
-                "format({}) encodes video and needs an animated source \
-                 (an animated GIF or WebP); this source is a still image",
-                crate::url::format_text(format)
-            )));
-        }
+        Ok(Decoded::Still(img, source_meta))
+    }
+
+    /// Resolve the quality directive against the final image
+    /// and the settled output format, for the still encode.
+    fn resolve_still_quality(
+        img: &DynamicImage,
+        format: ImageFormat,
+        encode_opts: &EncodeOptions,
+        ctx: &ProcessContext<'_>,
+    ) -> StillQuality {
         // Resolve the quality directive against the final image.
         // A per-format quality (issue #319) resolves here, now
         // that format negotiation has settled: the entry for
@@ -1178,10 +1338,10 @@ impl Engine {
             .quality
             .as_ref()
             .and_then(|q| q.resolved_for(format));
-        let (encode_quality, mut chosen_quality) = match resolved_quality {
+        let (encode_quality, chosen_quality) = match resolved_quality {
             Some(Quality::Value(q)) => (Some(q), None),
             Some(Quality::Auto) => {
-                let q = auto_quality(&img);
+                let q = auto_quality(img);
                 (Some(q), Some(q))
             }
             // resolved_for never returns the list itself.
@@ -1209,8 +1369,30 @@ impl Engine {
         // the first guess. Other formats keep the one-shot pick.
         let perceptual = matches!(resolved_quality, Some(Quality::Auto))
             && matches!(format, ImageFormat::Jpeg | ImageFormat::Jxl);
+        StillQuality {
+            encode_quality,
+            chosen_quality,
+            perceptual,
+        }
+    }
+
+    /// Encode the final still image: one encode at the
+    /// resolved quality (or the SSIMULACRA2 bisection for a
+    /// perceptual `quality(auto)`), then the `max_bytes`
+    /// ladder, all drawing on one per-request encode budget.
+    fn encode_still(
+        img: &DynamicImage,
+        format: ImageFormat,
+        encode_opts: &EncodeOptions,
+        ctx: &ProcessContext<'_>,
+    ) -> Result<StillEncode, EngineError> {
+        let StillQuality {
+            encode_quality,
+            mut chosen_quality,
+            perceptual,
+        } = Self::resolve_still_quality(img, format, encode_opts, ctx);
         let mut ssim: Option<f64> = None;
-        let enc_src = EncodeBuffers::new(&img);
+        let enc_src = EncodeBuffers::new(img);
         let mut encode_budget = MAX_REQUEST_ENCODES;
         let mut bytes = if perceptual {
             let first_guess = encode_quality.expect("auto quality resolves a value");
@@ -1236,7 +1418,7 @@ impl Engine {
                     )?;
                     let score = decode_image(&candidate)
                         .ok()
-                        .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
+                        .and_then(|decoded| crate::quality::ssimulacra2(img, &decoded));
                     Ok::<_, EngineError>((candidate, score))
                 },
             )?;
@@ -1314,53 +1496,45 @@ impl Engine {
             // served: re-score the final encode once.
             ssim = decode_image(&bytes)
                 .ok()
-                .and_then(|decoded| crate::quality::ssimulacra2(&img, &decoded));
+                .and_then(|decoded| crate::quality::ssimulacra2(img, &decoded));
         }
-        // Metadata and profile embedding happen on the final
-        // bytes: the ICC goes in when the request kept the
-        // profile (it was not converted away), preserved
-        // metadata when the operator policy allows it. Only
-        // JPEG and PNG outputs carry either in this pass.
-        let keep_profile = encode_opts.keep_profile;
-        let bytes = if (keep_profile && source_meta.icc.is_some()) || ctx.preserve_metadata {
+        Ok(StillEncode {
+            bytes,
+            chosen_quality,
+            ssim,
+        })
+    }
+
+    /// Metadata and profile embedding happen on the final
+    /// bytes: the ICC goes in when the request kept the
+    /// profile (it was not converted away), preserved
+    /// metadata when the operator policy allows it. Only
+    /// JPEG and PNG outputs carry either in this pass.
+    fn embed_source_meta(
+        bytes: Vec<u8>,
+        format: ImageFormat,
+        keep_profile: bool,
+        source_meta: &crate::color::SourceMeta,
+        ctx: &ProcessContext<'_>,
+    ) -> Vec<u8> {
+        if (keep_profile && source_meta.icc.is_some()) || ctx.preserve_metadata {
             let embed_icc = if keep_profile {
                 source_meta.icc.as_deref()
             } else {
                 None
             };
             match format {
-                ImageFormat::Jpeg => crate::color::inject_jpeg(
-                    &bytes,
-                    embed_icc,
-                    &source_meta,
-                    ctx.preserve_metadata,
-                ),
+                ImageFormat::Jpeg => {
+                    crate::color::inject_jpeg(&bytes, embed_icc, source_meta, ctx.preserve_metadata)
+                }
                 ImageFormat::Png => {
-                    crate::color::inject_png(&bytes, embed_icc, &source_meta, ctx.preserve_metadata)
+                    crate::color::inject_png(&bytes, embed_icc, source_meta, ctx.preserve_metadata)
                 }
                 _ => bytes,
             }
         } else {
             bytes
-        };
-        Ok(ProcessedImage {
-            bytes,
-            format,
-            quality: chosen_quality,
-            width: img.width(),
-            height: img.height(),
-            source_width,
-            source_height,
-            placeholder,
-            studio,
-            inpaint,
-            segments,
-            objects_crop,
-            ssimulacra2: ssim,
-            video: video_meta,
-            pdf: pdf_meta,
-            provenance: None,
-        })
+        }
     }
 
     /// Process an animated source (GIF or WebP) frame by frame:
@@ -2481,58 +2655,158 @@ fn apply_operations(
     dpr: f32,
     ctx: &ProcessContext<'_>,
     directives: &crate::url::RequestDirectives,
-    mut smart_windows: Option<&mut SmartWindows>,
+    smart_windows: Option<&mut SmartWindows>,
 ) -> Result<ApplyOutcome, EngineError> {
     check_operation_count(ops)?;
-    let mut encode_opts = EncodeOptions::default();
-    let mut face_memo: FaceMemo = None;
-    // One detection memo per provider, in resolution order
-    // (issue #166).
-    let detect_providers = detection_providers(ctx);
-    let mut detection_memos: Vec<DetectionMemo> = vec![None; detect_providers.len()];
-    // The pending focal rectangle from a `focal:` segment,
-    // consumed by the next crop.
-    let mut focal: Option<(u32, u32, u32, u32)> = None;
-    // The pending focal point from a `focalpoint:` segment
-    // (issue #313), consumed the same way. Setting either
-    // focal form clears the other, so the last one in the
-    // chain is the one the crop obeys.
-    let mut focal_point: Option<(f32, f32, f32)> = None;
-    // The `debug:focal` state: armed by the segment, captured
-    // by the first crop that follows it. The capture holds
-    // the values that crop actually used (threaded out of the
-    // crop functions, never recomputed), and the response is
-    // the rendered capture instead of the transform result.
-    let mut debug_armed = false;
-    let mut debug_capture: Option<crate::debugview::FocalCapture> = None;
-    // The studio record (issue #197): the last `studio(...)`
-    // filter in the chain wins, since its composite is the
-    // look the response carries.
-    let mut studio_record: Option<crate::studio::StudioRecord> = None;
-    // The region-removal record (issue #176): every
-    // `remove_region(...)` in the chain, in order.
-    let mut inpaint_regions: Vec<(u32, u32, u32, u32)> = Vec::new();
-    // The segmentation state (issue #175): the encoder
-    // memo (one encoding per image state, however many
-    // class operations decode against it) and the record
-    // of what was segmented, in chain order.
-    let mut segment_memo: SegmentMemo = None;
-    let mut segment_objects: Vec<SegmentObject> = Vec::new();
-    // The objects-crop record (issue #318): the last
-    // `objects` crop in the chain wins, like the studio
-    // record, since its framing is the one the response
-    // carries.
-    let mut objects_crop_record: Option<ObjectsCropRecord> = None;
-    // The crop+resize fusion plan (issue #287): when the
-    // chain qualifies, the crop-rect arm records its window
-    // instead of materializing it, and the resize arm
-    // resamples the window straight from the frame in hand.
-    let fusion = fusion_plan(ops);
-    let mut fused_window: Option<(u32, u32, u32, u32)> = None;
+    let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, smart_windows);
     for (op_index, op) in ops.iter().enumerate() {
         ctx.check_deadline()?;
+        img = chain.apply_op(img, op_index, op)?;
+        // Every operation other than the filters segment
+        // sizes, crops, or pads, so the detection memos never
+        // survive one (issue #373); the filters arm
+        // invalidates per filter instead, and the no-op
+        // arms (frame, page, debug) simply pay a fresh
+        // inference in a chain that mixes them with
+        // detection, which no real chain does.
+        if !matches!(op, Operation::Filters(_)) {
+            invalidate_detection_memos(
+                &mut chain.face_memo,
+                &mut chain.detection_memos,
+                &mut chain.segment_memo,
+            );
+        }
+        // The running image stays inside the output budget
+        // after every operation, not only after the ones
+        // that size it (issue #182, audit R2-12). While a
+        // fused window is pending (issue #287) the image in
+        // hand is still the pre-crop frame: the two-step
+        // path checks the window at this point, and the
+        // fused crop ran that same check on the window when
+        // it recorded it.
+        if chain.fused_window.is_none() {
+            check_output_pixels(img.width(), img.height())?;
+        }
+    }
+    chain.finish(img)
+}
+
+/// The running state of one [`apply_operations`] pass: the
+/// chain's inputs, the encode options the filters collect,
+/// the focal and debug state a crop consumes, the inference
+/// memos for the image state in hand, and the records the
+/// meta response carries.
+struct ChainState<'r, 'a> {
+    /// The `no_upscale` cap: the (oriented) source
+    /// dimensions, when the request asked for it.
+    cap: Option<(u32, u32)>,
+    /// The effective DPR factor (see `dpr_factor`).
+    dpr: f32,
+    ctx: &'r ProcessContext<'a>,
+    directives: &'r crate::url::RequestDirectives,
+    /// The smart crop windows an animated render shares
+    /// across its frames (issue #376); `None` on a still.
+    smart_windows: Option<&'r mut SmartWindows>,
+    encode_opts: EncodeOptions,
+    face_memo: FaceMemo,
+    /// The detection providers in resolution order, with
+    /// one detection memo per provider (issue #166).
+    detect_providers: Vec<&'a dyn crate::ai::DetectionProvider>,
+    detection_memos: Vec<DetectionMemo>,
+    /// The pending focal rectangle from a `focal:` segment,
+    /// consumed by the next crop.
+    focal: Option<(u32, u32, u32, u32)>,
+    /// The pending focal point from a `focalpoint:` segment
+    /// (issue #313), consumed the same way. Setting either
+    /// focal form clears the other, so the last one in the
+    /// chain is the one the crop obeys.
+    focal_point: Option<(f32, f32, f32)>,
+    /// The `debug:focal` state: armed by the segment, captured
+    /// by the first crop that follows it. The capture holds
+    /// the values that crop actually used (threaded out of the
+    /// crop functions, never recomputed), and the response is
+    /// the rendered capture instead of the transform result.
+    debug_armed: bool,
+    debug_capture: Option<crate::debugview::FocalCapture>,
+    /// The studio record (issue #197): the last `studio(...)`
+    /// filter in the chain wins, since its composite is the
+    /// look the response carries.
+    studio_record: Option<crate::studio::StudioRecord>,
+    /// The region-removal record (issue #176): every
+    /// `remove_region(...)` in the chain, in order.
+    inpaint_regions: Vec<(u32, u32, u32, u32)>,
+    /// The segmentation state (issue #175): the encoder
+    /// memo (one encoding per image state, however many
+    /// class operations decode against it) and the record
+    /// of what was segmented, in chain order.
+    segment_memo: SegmentMemo,
+    segment_objects: Vec<SegmentObject>,
+    /// The objects-crop record (issue #318): the last
+    /// `objects` crop in the chain wins, like the studio
+    /// record, since its framing is the one the response
+    /// carries.
+    objects_crop_record: Option<ObjectsCropRecord>,
+    /// The crop+resize fusion plan (issue #287): when the
+    /// chain qualifies, the crop-rect arm records its window
+    /// instead of materializing it, and the resize arm
+    /// resamples the window straight from the frame in hand.
+    fusion: Option<FusionPlan>,
+    fused_window: Option<(u32, u32, u32, u32)>,
+}
+
+/// What a class filter paints (see
+/// [`ChainState::class_targets`]): the segmentation masks
+/// when a segment provider is configured, the detection
+/// boxes when not.
+enum ClassTargets {
+    Masked(Vec<crate::filters::MaskedDetection>),
+    Boxes(Vec<crate::ai::Detection>),
+}
+
+impl<'r, 'a> ChainState<'r, 'a> {
+    fn new(
+        ops: &[Operation],
+        cap: Option<(u32, u32)>,
+        dpr: f32,
+        ctx: &'r ProcessContext<'a>,
+        directives: &'r crate::url::RequestDirectives,
+        smart_windows: Option<&'r mut SmartWindows>,
+    ) -> Self {
+        let detect_providers = detection_providers(ctx);
+        let detection_memos = vec![None; detect_providers.len()];
+        ChainState {
+            cap,
+            dpr,
+            ctx,
+            directives,
+            smart_windows,
+            encode_opts: EncodeOptions::default(),
+            face_memo: None,
+            detect_providers,
+            detection_memos,
+            focal: None,
+            focal_point: None,
+            debug_armed: false,
+            debug_capture: None,
+            studio_record: None,
+            inpaint_regions: Vec::new(),
+            segment_memo: None,
+            segment_objects: Vec::new(),
+            objects_crop_record: None,
+            fusion: fusion_plan(ops),
+            fused_window: None,
+        }
+    }
+
+    /// Apply one operation of the chain to the image in hand.
+    fn apply_op(
+        &mut self,
+        mut img: DynamicImage,
+        op_index: usize,
+        op: &Operation,
+    ) -> Result<DynamicImage, EngineError> {
         match op {
-            Operation::DebugFocal => debug_armed = true,
+            Operation::DebugFocal => self.debug_armed = true,
             // Frame selection already happened at decode
             // (issue #214): the frame is the source image
             // this chain runs on, so there is nothing left
@@ -2543,28 +2817,34 @@ fn apply_operations(
             // runs on.
             Operation::Page(_) => {}
             Operation::Size(size) => {
-                img = if fusion.is_some_and(|plan| plan.size_index == op_index) {
-                    let window = fused_window
+                img = if self.fusion.is_some_and(|plan| plan.size_index == op_index) {
+                    let window = self
+                        .fused_window
                         .take()
                         .expect("the fusion plan pairs this resize with its crop");
                     apply_size_cropped(
                         img,
                         window,
                         size,
-                        cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
-                        dpr,
+                        self.cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
+                        self.dpr,
                     )?
                 } else {
-                    apply_size(img, size, cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)), dpr)?
+                    apply_size(
+                        img,
+                        size,
+                        self.cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
+                        self.dpr,
+                    )?
                 }
             }
             Operation::FitIn { size, adaptive } => {
-                img = apply_fit_in(img, size, *adaptive, cap, dpr)?
+                img = apply_fit_in(img, size, *adaptive, self.cap, self.dpr)?
             }
             Operation::Pad { size, fill } => {
                 let (tw, th) = match (size.width, size.height) {
                     (Dimension::Pixels(w), Dimension::Pixels(h)) => {
-                        (scale_px(w, dpr), scale_px(h, dpr))
+                        (scale_px(w, self.dpr), scale_px(h, self.dpr))
                     }
                     _ => {
                         return Err(EngineError::Unsupported(
@@ -2572,7 +2852,7 @@ fn apply_operations(
                         ));
                     }
                 };
-                img = apply_pad(img, tw, th, *fill, directives.fill, cap)?;
+                img = apply_pad(img, tw, th, *fill, self.directives.fill, self.cap)?;
             }
             Operation::FocalRect {
                 left,
@@ -2590,15 +2870,15 @@ fn apply_operations(
                         img.height()
                     )));
                 }
-                focal = Some((*left, *top, *right, *bottom));
-                focal_point = None;
+                self.focal = Some((*left, *top, *right, *bottom));
+                self.focal_point = None;
             }
             Operation::FocalPoint { x, y, zoom } => {
                 // Fractions of the image in effect at this
                 // point, so there is no bounds failure to
                 // make: any image can carry the point.
-                focal_point = Some((*x, *y, *zoom));
-                focal = None;
+                self.focal_point = Some((*x, *y, *zoom));
+                self.focal = None;
             }
             Operation::CropRect {
                 left,
@@ -2613,7 +2893,7 @@ fn apply_operations(
                         img.height()
                     )));
                 }
-                if fusion.is_some_and(|plan| plan.crop_index == op_index) {
+                if self.fusion.is_some_and(|plan| plan.crop_index == op_index) {
                     // Issue #287: the bounds validation above
                     // already ran, so an out-of-bounds
                     // rectangle errors exactly as the two-step
@@ -2624,323 +2904,12 @@ fn apply_operations(
                     // the window now, so an oversized window
                     // refuses the same way.
                     check_output_pixels(right - left, bottom - top)?;
-                    fused_window = Some((*left, *top, right - left, bottom - top));
+                    self.fused_window = Some((*left, *top, right - left, bottom - top));
                 } else {
                     img = img.crop_imm(*left, *top, right - left, bottom - top);
                 }
             }
-            Operation::Crop { size, align } => {
-                let (tw, th) = match (size.width, size.height) {
-                    (Dimension::Pixels(w), Dimension::Pixels(h)) => {
-                        (scale_px(w, dpr), scale_px(h, dpr))
-                    }
-                    _ => {
-                        return Err(EngineError::Unsupported(
-                            "crop with non-pixel dimensions".to_string(),
-                        ));
-                    }
-                };
-                // The crop consumes any pending focal rectangle.
-                // Center and smart crops position on it (smart
-                // skips face and saliency detection entirely);
-                // face and directional alignments were explicit
-                // caller instructions and ignore it.
-                let focal_rect = focal
-                    .take()
-                    .filter(|_| *align == Align::Center || *align == Align::Smart);
-                // A pending focal point behaves the same way
-                // (issue #313): center and smart crops center
-                // on it, explicit alignments ignore it.
-                let focal_pt = focal_point
-                    .take()
-                    .filter(|_| *align == Align::Center || *align == Align::Smart);
-                // With the debug view armed, this crop is the
-                // one the view annotates: clone the canvas it
-                // operates on and run the traced crop variants,
-                // which report the decision they actually made.
-                let want_trace = debug_armed && debug_capture.is_none();
-                let canvas = want_trace.then(|| img.clone());
-                img = if let Some(rect) = focal_rect {
-                    if want_trace {
-                        let (cropped, window) =
-                            crate::crop::crop_to_aspect_focal_traced(img, tw, th, rect);
-                        let canvas = canvas.expect("want_trace clones the canvas");
-                        let (cw, ch) = (canvas.width(), canvas.height());
-                        debug_capture = Some(crate::debugview::FocalCapture {
-                            canvas,
-                            focal: Some((
-                                ((rect.0 + rect.2) / 2).min(cw.saturating_sub(1)),
-                                ((rect.1 + rect.3) / 2).min(ch.saturating_sub(1)),
-                            )),
-                            focal_rect: Some(rect),
-                            window,
-                            faces: Vec::new(),
-                            objects: Vec::new(),
-                        });
-                        cropped
-                    } else {
-                        crate::crop::crop_to_aspect_focal(img, tw, th, rect)
-                    }
-                } else if let Some(pt) = focal_pt {
-                    if want_trace {
-                        let (cropped, window) =
-                            crate::crop::crop_to_aspect_point_traced(img, tw, th, pt);
-                        let canvas = canvas.expect("want_trace clones the canvas");
-                        let (cw, ch) = (canvas.width(), canvas.height());
-                        debug_capture = Some(crate::debugview::FocalCapture {
-                            canvas,
-                            focal: Some((
-                                ((pt.0 * cw as f32).round() as u32).min(cw.saturating_sub(1)),
-                                ((pt.1 * ch as f32).round() as u32).min(ch.saturating_sub(1)),
-                            )),
-                            focal_rect: None,
-                            window,
-                            faces: Vec::new(),
-                            objects: Vec::new(),
-                        });
-                        cropped
-                    } else {
-                        crate::crop::crop_to_aspect_point(img, tw, th, pt)
-                    }
-                } else if *align == Align::Face {
-                    // Crop around the largest detected face. A
-                    // detection failure or an empty result falls
-                    // back to the saliency smart crop: a crop
-                    // always exists, so it never fails the
-                    // request.
-                    match detect_faces(&mut face_memo, &img, ctx) {
-                        Ok(faces) if !faces.is_empty() => {
-                            let face = *faces
-                                .iter()
-                                .max_by_key(|f| f.w as u64 * f.h as u64)
-                                .expect("faces is non-empty");
-                            if want_trace {
-                                let (cropped, window) = crate::crop::crop_around_face_traced(
-                                    img,
-                                    tw,
-                                    th,
-                                    &face,
-                                    directives.face_padding,
-                                );
-                                debug_capture = Some(crate::debugview::FocalCapture {
-                                    canvas: canvas.expect("want_trace clones the canvas"),
-                                    focal: Some((face.x + face.w / 2, face.y + face.h / 2)),
-                                    focal_rect: Some((
-                                        face.x,
-                                        face.y,
-                                        face.x + face.w,
-                                        face.y + face.h,
-                                    )),
-                                    window,
-                                    faces,
-                                    objects: Vec::new(),
-                                });
-                                cropped
-                            } else {
-                                crate::crop::crop_around_face(
-                                    img,
-                                    tw,
-                                    th,
-                                    &face,
-                                    directives.face_padding,
-                                )
-                            }
-                        }
-                        Ok(_) | Err(EngineError::Inference(_)) => {
-                            if want_trace {
-                                let (cropped, trace) = crate::crop::crop_to_aspect_traced(
-                                    img,
-                                    tw,
-                                    th,
-                                    Align::Smart,
-                                    None,
-                                    ctx.focal_provider,
-                                );
-                                if let Some(trace) = trace {
-                                    debug_capture = Some(capture_from_trace(
-                                        canvas.expect("want_trace clones the canvas"),
-                                        trace,
-                                    ));
-                                }
-                                cropped
-                            } else {
-                                crate::crop::crop_to_aspect_with(
-                                    img,
-                                    tw,
-                                    th,
-                                    Align::Smart,
-                                    None,
-                                    ctx.focal_provider,
-                                )
-                            }
-                        }
-                        Err(e) => return Err(e),
-                    }
-                } else if let Align::Objects { classes, scale } = align {
-                    // Crop to the union of the detected
-                    // objects of the named classes (issue
-                    // #318). Preflight already refused the
-                    // request when no detection provider is
-                    // configured or a named class is unknown,
-                    // so what remains is the model's answer:
-                    // a union to frame, or none. None (and a
-                    // detection failure, downgraded exactly
-                    // like the face crop's) falls back to the
-                    // plain crop of the same size; the record
-                    // states which path was taken either way.
-                    let mut used: Vec<crate::ai::Detection> = Vec::new();
-                    let mut answered = true;
-                    for class in classes {
-                        match detect_for_class(&mut detection_memos, &detect_providers, &img, class)
-                        {
-                            Ok(found) => used.extend(found),
-                            Err(EngineError::Inference(_)) => {
-                                answered = false;
-                                break;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    let union = if answered {
-                        crate::crop::union_box(&used)
-                    } else {
-                        None
-                    };
-                    match union {
-                        Some(union) => {
-                            objects_crop_record = Some(ObjectsCropRecord {
-                                classes: classes.clone(),
-                                objects: used.clone(),
-                                union: Some((
-                                    union.0,
-                                    union.1,
-                                    union.2 - union.0,
-                                    union.3 - union.1,
-                                )),
-                                scale: *scale,
-                                fallback: false,
-                            });
-                            if want_trace {
-                                let (cropped, window) = crate::crop::crop_around_objects_traced(
-                                    img, tw, th, union, *scale,
-                                );
-                                debug_capture = Some(crate::debugview::FocalCapture {
-                                    canvas: canvas.expect("want_trace clones the canvas"),
-                                    focal: Some(((union.0 + union.2) / 2, (union.1 + union.3) / 2)),
-                                    focal_rect: Some(union),
-                                    window,
-                                    faces: Vec::new(),
-                                    objects: used,
-                                });
-                                cropped
-                            } else {
-                                crate::crop::crop_around_objects(img, tw, th, union, *scale)
-                            }
-                        }
-                        None => {
-                            objects_crop_record = Some(ObjectsCropRecord {
-                                classes: classes.clone(),
-                                objects: Vec::new(),
-                                union: None,
-                                scale: *scale,
-                                fallback: true,
-                            });
-                            if want_trace {
-                                let (cropped, trace) = crate::crop::crop_to_aspect_traced(
-                                    img,
-                                    tw,
-                                    th,
-                                    Align::Center,
-                                    None,
-                                    None,
-                                );
-                                if let Some(trace) = trace {
-                                    debug_capture = Some(capture_from_trace(
-                                        canvas.expect("want_trace clones the canvas"),
-                                        trace,
-                                    ));
-                                }
-                                cropped
-                            } else {
-                                crate::crop::crop_to_aspect_with(
-                                    img,
-                                    tw,
-                                    th,
-                                    Align::Center,
-                                    None,
-                                    None,
-                                )
-                            }
-                        }
-                    }
-                } else if want_trace {
-                    let (cropped, trace) = crate::crop::crop_to_aspect_traced(
-                        img,
-                        tw,
-                        th,
-                        align.clone(),
-                        ctx.face_provider,
-                        ctx.focal_provider,
-                    );
-                    if let Some(trace) = trace {
-                        debug_capture = Some(capture_from_trace(
-                            canvas.expect("want_trace clones the canvas"),
-                            trace,
-                        ));
-                    }
-                    cropped
-                } else if *align == Align::Smart && smart_windows.is_some() {
-                    // An animated render sharing windows
-                    // across frames (issue #376): the first
-                    // frame decides through the traced crop
-                    // (the trace reports the very window the
-                    // crop used) and later frames replay that
-                    // window verbatim, so the analysis runs
-                    // once and the framing cannot jitter.
-                    let windows = smart_windows
-                        .as_deref_mut()
-                        .expect("the arm guard checked the option");
-                    let key = (op_index, img.width(), img.height());
-                    if let Some((x, y, cw, ch)) = windows.get(key) {
-                        DynamicImage::ImageRgba8(
-                            image::imageops::crop_imm(&img, x, y, cw, ch).to_image(),
-                        )
-                    } else {
-                        let (cropped, trace) = crate::crop::crop_to_aspect_traced(
-                            img,
-                            tw,
-                            th,
-                            align.clone(),
-                            ctx.face_provider,
-                            ctx.focal_provider,
-                        );
-                        if let Some(trace) = trace {
-                            windows.set(key, trace.window);
-                        }
-                        cropped
-                    }
-                } else {
-                    crate::crop::crop_to_aspect_with(
-                        img,
-                        tw,
-                        th,
-                        align.clone(),
-                        ctx.face_provider,
-                        ctx.focal_provider,
-                    )
-                };
-                img = apply_size(
-                    img,
-                    &ImageSize {
-                        width: Dimension::Pixels(tw),
-                        height: Dimension::Pixels(th),
-                        flip_horizontal: false,
-                        flip_vertical: false,
-                    },
-                    cap.map(|(cw, ch)| SizeCap::Fit(cw, ch)),
-                    1.0,
-                )?;
-            }
+            Operation::Crop { size, align } => img = self.crop(img, op_index, size, align)?,
             Operation::Filters(filters) => {
                 // One filter at a time, in order: watermark
                 // filters resolve against the server-fetched
@@ -2953,250 +2922,17 @@ fn apply_operations(
                 // `filters:`) runs far past the deadline the
                 // runner already reported to the client.
                 for filter in filters {
-                    ctx.check_deadline()?;
-                    match filter {
-                        Filter::Watermark { url, x, y, alpha } => {
-                            let wm = ctx.watermarks.and_then(|m| m.get(url)).ok_or_else(|| {
-                                EngineError::Unsupported(format!(
-                                    "watermark was not resolved: {url}"
-                                ))
-                            })?;
-                            img = overlay_watermark(&img, wm, *x, *y, *alpha);
-                        }
-                        Filter::Overlay {
-                            url,
-                            x,
-                            y,
-                            alpha,
-                            blend,
-                            width,
-                        } => {
-                            let ov = ctx.watermarks.and_then(|m| m.get(url)).ok_or_else(|| {
-                                EngineError::Unsupported(format!("overlay was not resolved: {url}"))
-                            })?;
-                            img = blend_overlay(ctx, &img, ov, *x, *y, *alpha, *blend, *width)?;
-                        }
-                        Filter::RemoveBg => {
-                            let provider = ctx.mask_provider.ok_or_else(|| {
-                                EngineError::NotConfigured(
-                                    "removebg is not configured on this server".to_string(),
-                                )
-                            })?;
-                            let mask = provider.mask(&img).map_err(EngineError::Inference)?;
-                            img = crate::ai::apply_mask(&img, &mask);
-                        }
-                        Filter::Studio(spec) => {
-                            // Studio runs the removebg mask
-                            // model, then expands in
-                            // `crate::studio`: product mode
-                            // composites (mask, defringe,
-                            // backdrop and shadow, pad; issue
-                            // #197), scene mode reframes and
-                            // corrects (mask, crop, correct;
-                            // issue #198). The record rides
-                            // out with the result for meta.
-                            let provider = ctx.mask_provider.ok_or_else(|| {
-                                EngineError::NotConfigured(
-                                    "studio is not configured on this server (no mask model)"
-                                        .to_string(),
-                                )
-                            })?;
-                            let t_timing = std::time::Instant::now();
-                            let mask = provider.mask(&img).map_err(EngineError::Inference)?;
-                            let confidence = provider.confidence(&img, &mask);
-                            crate::studio::timing_mark("inference", t_timing);
-                            let outcome = match spec.mode {
-                                crate::url::StudioMode::Product => crate::studio::composite(
-                                    &img,
-                                    &mask,
-                                    confidence,
-                                    spec,
-                                    ctx.brand_color,
-                                ),
-                                crate::url::StudioMode::Scene => {
-                                    crate::studio::scene(&img, &mask, confidence, spec)
-                                }
-                            };
-                            img = outcome.image;
-                            studio_record = Some(outcome.record);
-                        }
-                        Filter::BlurFaces => {
-                            // A detection failure fails the
-                            // request: serving the image
-                            // unredacted would be the real
-                            // failure.
-                            let faces = detect_faces(&mut face_memo, &img, ctx)?;
-                            img = crate::filters::blur_faces(&img, &faces);
-                        }
-                        Filter::PixelateFaces => {
-                            let faces = detect_faces(&mut face_memo, &img, ctx)?;
-                            img = crate::filters::pixelate_faces(&img, &faces);
-                        }
-                        Filter::BlurClass(class) => {
-                            // The #42 rule, inherited: a
-                            // detection failure fails the
-                            // request rather than serve the
-                            // image unredacted.
-                            let boxes = detect_for_class(
-                                &mut detection_memos,
-                                &detect_providers,
-                                &img,
-                                class,
-                            )?;
-                            img = match ctx.segment_provider {
-                                // Mask-tight when a segment
-                                // provider is configured
-                                // (issue #175): the object's
-                                // silhouette, not its box.
-                                Some(provider) => {
-                                    let (masked, mut objects) = segment_for_class(
-                                        &mut segment_memo,
-                                        provider,
-                                        &img,
-                                        &boxes,
-                                    )?;
-                                    segment_objects.append(&mut objects);
-                                    crate::filters::blur_detections_masked(&img, &masked)
-                                }
-                                None => crate::filters::blur_detections(&img, &boxes),
-                            };
-                        }
-                        Filter::PixelateClass(class) => {
-                            let boxes = detect_for_class(
-                                &mut detection_memos,
-                                &detect_providers,
-                                &img,
-                                class,
-                            )?;
-                            img = match ctx.segment_provider {
-                                Some(provider) => {
-                                    let (masked, mut objects) = segment_for_class(
-                                        &mut segment_memo,
-                                        provider,
-                                        &img,
-                                        &boxes,
-                                    )?;
-                                    segment_objects.append(&mut objects);
-                                    crate::filters::pixelate_detections_masked(&img, &masked)
-                                }
-                                None => crate::filters::pixelate_detections(&img, &boxes),
-                            };
-                        }
-                        Filter::RecolorClass(class, color) => {
-                            // The class rules are the
-                            // redaction filters': detection
-                            // resolves the class, and a
-                            // failure fails the request.
-                            // The paint follows the
-                            // silhouette when a segment
-                            // provider is configured, the
-                            // box when not (issue #175).
-                            let boxes = detect_for_class(
-                                &mut detection_memos,
-                                &detect_providers,
-                                &img,
-                                class,
-                            )?;
-                            img = match ctx.segment_provider {
-                                Some(provider) => {
-                                    let (masked, mut objects) = segment_for_class(
-                                        &mut segment_memo,
-                                        provider,
-                                        &img,
-                                        &boxes,
-                                    )?;
-                                    segment_objects.append(&mut objects);
-                                    crate::filters::recolor_detections_masked(&img, &masked, *color)
-                                }
-                                None => crate::filters::recolor_detections(&img, &boxes, *color),
-                            };
-                        }
-                        // Padding is read from the request as a
-                        // whole by the face crop; no pixels here.
-                        Filter::FacePad(_) => {}
-                        Filter::Upscale(factor) => {
-                            let provider = ctx.upscale_provider.ok_or_else(|| {
-                                EngineError::NotConfigured(
-                                    "upscale is not configured on this server".to_string(),
-                                )
-                            })?;
-                            img = upscale_image(img, *factor, provider)?;
-                        }
-                        Filter::BlurRegion { x, y, w, h } => {
-                            check_region("blur_region", *x, *y, *w, *h, &img)?;
-                            img = crate::filters::blur_region(&img, *x, *y, *w, *h);
-                        }
-                        Filter::PixelateRegion { x, y, w, h } => {
-                            check_region("pixelate_region", *x, *y, *w, *h, &img)?;
-                            img = crate::filters::pixelate_region(&img, *x, *y, *w, *h);
-                        }
-                        Filter::RemoveRegion { x, y, w, h } => {
-                            // Same bounds discipline as the
-                            // other region filters: a rectangle
-                            // that overflows the image in
-                            // effect here fails the request
-                            // rather than erasing less than
-                            // the caller named (issue #176).
-                            check_region("remove_region", *x, *y, *w, *h, &img)?;
-                            let provider = ctx.inpaint_provider.ok_or_else(|| {
-                                EngineError::NotConfigured(
-                                    "remove_region is not configured on this server".to_string(),
-                                )
-                            })?;
-                            let mask =
-                                crate::ai::region_mask(img.width(), img.height(), *x, *y, *w, *h);
-                            img = provider
-                                .inpaint(&img, &mask)
-                                .map_err(EngineError::Inference)?;
-                            inpaint_regions.push((*x, *y, *w, *h));
-                        }
-                        Filter::Text {
-                            text,
-                            size,
-                            color,
-                            anchor,
-                        } => {
-                            let renderer = ctx.text_renderer.ok_or_else(|| {
-                                EngineError::NotConfigured(
-                                    "text is not configured on this server (no font)".to_string(),
-                                )
-                            })?;
-                            img = renderer
-                                .draw(&img, text, *size, *color, *anchor)
-                                .map_err(EngineError::Render)?;
-                        }
-                        other => {
-                            // Arbitrary-angle rotation is
-                            // the one plain filter that grows
-                            // the canvas: check the canvas it
-                            // is about to allocate before it
-                            // allocates (issue #182, R2-12).
-                            if let Filter::Rotate(degrees) = other {
-                                let (cw, ch) = crate::filters::rotated_canvas(
-                                    img.width(),
-                                    img.height(),
-                                    *degrees,
-                                );
-                                check_output_pixels(cw, ch)?;
-                            }
-                            let (new_img, options) = crate::filters::apply_filters_filled(
-                                img,
-                                std::slice::from_ref(other),
-                                directives.fill,
-                            );
-                            img = new_img;
-                            encode_opts.absorb(options);
-                        }
-                    }
+                    self.ctx.check_deadline()?;
+                    img = self.apply_filter(img, filter)?;
                     // A filter that moves content leaves the
                     // detection memos describing a state the
                     // pixels have left (issue #373): the next
                     // detection consumer must re-detect.
                     if !filter_preserves_positions(filter) {
                         invalidate_detection_memos(
-                            &mut face_memo,
-                            &mut detection_memos,
-                            &mut segment_memo,
+                            &mut self.face_memo,
+                            &mut self.detection_memos,
+                            &mut self.segment_memo,
                         );
                     }
                     // Every filter leaves the image inside
@@ -3207,81 +2943,648 @@ fn apply_operations(
                 }
             }
         }
-        // Every operation above the filters segment sizes,
-        // crops, or pads, so the detection memos never
-        // survive one (issue #373); the filters arm
-        // invalidates per filter instead, and the no-op
-        // arms (frame, page, debug) simply pay a fresh
-        // inference in a chain that mixes them with
-        // detection, which no real chain does.
-        if !matches!(op, Operation::Filters(_)) {
-            invalidate_detection_memos(&mut face_memo, &mut detection_memos, &mut segment_memo);
-        }
-        // The running image stays inside the output budget
-        // after every operation, not only after the ones
-        // that size it (issue #182, audit R2-12). While a
-        // fused window is pending (issue #287) the image in
-        // hand is still the pre-crop frame: the two-step
-        // path checks the window at this point, and the
-        // fused crop ran that same check on the window when
-        // it recorded it.
-        if fused_window.is_none() {
-            check_output_pixels(img.width(), img.height())?;
+        Ok(img)
+    }
+
+    /// The `crop:` operation: crop to the target's aspect
+    /// ratio, positioned by a pending focal rectangle or
+    /// point, or else by the alignment, then resize to
+    /// exactly the target.
+    fn crop(
+        &mut self,
+        img: DynamicImage,
+        op_index: usize,
+        size: &ImageSize,
+        align: &Align,
+    ) -> Result<DynamicImage, EngineError> {
+        let (tw, th) = match (size.width, size.height) {
+            (Dimension::Pixels(w), Dimension::Pixels(h)) => {
+                (scale_px(w, self.dpr), scale_px(h, self.dpr))
+            }
+            _ => {
+                return Err(EngineError::Unsupported(
+                    "crop with non-pixel dimensions".to_string(),
+                ));
+            }
+        };
+        // The crop consumes any pending focal rectangle.
+        // Center and smart crops position on it (smart
+        // skips face and saliency detection entirely);
+        // face and directional alignments were explicit
+        // caller instructions and ignore it.
+        let focal_rect = self
+            .focal
+            .take()
+            .filter(|_| *align == Align::Center || *align == Align::Smart);
+        // A pending focal point behaves the same way
+        // (issue #313): center and smart crops center
+        // on it, explicit alignments ignore it.
+        let focal_pt = self
+            .focal_point
+            .take()
+            .filter(|_| *align == Align::Center || *align == Align::Smart);
+        // With the debug view armed, this crop is the
+        // one the view annotates: clone the canvas it
+        // operates on and run the traced crop variants,
+        // which report the decision they actually made.
+        let want_trace = self.debug_armed && self.debug_capture.is_none();
+        let canvas = want_trace.then(|| img.clone());
+        let img = if let Some(rect) = focal_rect {
+            self.focal_rect_crop(img, (tw, th), rect, canvas)
+        } else if let Some(pt) = focal_pt {
+            self.focal_point_crop(img, (tw, th), pt, canvas)
+        } else if *align == Align::Face {
+            self.face_crop(img, (tw, th), canvas)?
+        } else if let Align::Objects { classes, scale } = align {
+            self.objects_crop(img, (tw, th), classes, *scale, canvas)?
+        } else if let Some(canvas) = canvas {
+            let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                img,
+                tw,
+                th,
+                align.clone(),
+                self.ctx.face_provider,
+                self.ctx.focal_provider,
+            );
+            if let Some(trace) = trace {
+                self.debug_capture = Some(capture_from_trace(canvas, trace));
+            }
+            cropped
+        } else if *align == Align::Smart && self.smart_windows.is_some() {
+            self.shared_smart_crop(img, (tw, th), op_index, align)
+        } else {
+            crate::crop::crop_to_aspect_with(
+                img,
+                tw,
+                th,
+                align.clone(),
+                self.ctx.face_provider,
+                self.ctx.focal_provider,
+            )
+        };
+        apply_size(
+            img,
+            &ImageSize {
+                width: Dimension::Pixels(tw),
+                height: Dimension::Pixels(th),
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            self.cap.map(|(cw, ch)| SizeCap::Fit(cw, ch)),
+            1.0,
+        )
+    }
+
+    /// A center or smart crop positioned on a pending focal
+    /// rectangle. `canvas` is set when the debug view
+    /// annotates this crop.
+    fn focal_rect_crop(
+        &mut self,
+        img: DynamicImage,
+        (tw, th): (u32, u32),
+        rect: (u32, u32, u32, u32),
+        canvas: Option<DynamicImage>,
+    ) -> DynamicImage {
+        if let Some(canvas) = canvas {
+            let (cropped, window) = crate::crop::crop_to_aspect_focal_traced(img, tw, th, rect);
+            let (cw, ch) = (canvas.width(), canvas.height());
+            self.debug_capture = Some(crate::debugview::FocalCapture {
+                canvas,
+                focal: Some((
+                    ((rect.0 + rect.2) / 2).min(cw.saturating_sub(1)),
+                    ((rect.1 + rect.3) / 2).min(ch.saturating_sub(1)),
+                )),
+                focal_rect: Some(rect),
+                window,
+                faces: Vec::new(),
+                objects: Vec::new(),
+            });
+            cropped
+        } else {
+            crate::crop::crop_to_aspect_focal(img, tw, th, rect)
         }
     }
-    if debug_armed {
-        // The debug view replaces the transform result. With
-        // no capture, no crop followed the segment: the view
-        // shows the focal analysis of the final image. With
-        // one, it shows the decision that crop actually made,
-        // on the canvas it operated on.
-        let capture = match debug_capture {
-            Some(capture) => capture,
+
+    /// A center or smart crop centered on a pending focal
+    /// point (issue #313). `canvas` is set when the debug
+    /// view annotates this crop.
+    fn focal_point_crop(
+        &mut self,
+        img: DynamicImage,
+        (tw, th): (u32, u32),
+        pt: (f32, f32, f32),
+        canvas: Option<DynamicImage>,
+    ) -> DynamicImage {
+        if let Some(canvas) = canvas {
+            let (cropped, window) = crate::crop::crop_to_aspect_point_traced(img, tw, th, pt);
+            let (cw, ch) = (canvas.width(), canvas.height());
+            self.debug_capture = Some(crate::debugview::FocalCapture {
+                canvas,
+                focal: Some((
+                    ((pt.0 * cw as f32).round() as u32).min(cw.saturating_sub(1)),
+                    ((pt.1 * ch as f32).round() as u32).min(ch.saturating_sub(1)),
+                )),
+                focal_rect: None,
+                window,
+                faces: Vec::new(),
+                objects: Vec::new(),
+            });
+            cropped
+        } else {
+            crate::crop::crop_to_aspect_point(img, tw, th, pt)
+        }
+    }
+
+    /// Crop around the largest detected face. A detection
+    /// failure or an empty result falls back to the saliency
+    /// smart crop: a crop always exists, so it never fails
+    /// the request. `canvas` is set when the debug view
+    /// annotates this crop.
+    fn face_crop(
+        &mut self,
+        img: DynamicImage,
+        (tw, th): (u32, u32),
+        canvas: Option<DynamicImage>,
+    ) -> Result<DynamicImage, EngineError> {
+        let cropped = match detect_faces(&mut self.face_memo, &img, self.ctx) {
+            Ok(faces) if !faces.is_empty() => {
+                let face = *faces
+                    .iter()
+                    .max_by_key(|f| f.w as u64 * f.h as u64)
+                    .expect("faces is non-empty");
+                if let Some(canvas) = canvas {
+                    let (cropped, window) = crate::crop::crop_around_face_traced(
+                        img,
+                        tw,
+                        th,
+                        &face,
+                        self.directives.face_padding,
+                    );
+                    self.debug_capture = Some(crate::debugview::FocalCapture {
+                        canvas,
+                        focal: Some((face.x + face.w / 2, face.y + face.h / 2)),
+                        focal_rect: Some((face.x, face.y, face.x + face.w, face.y + face.h)),
+                        window,
+                        faces,
+                        objects: Vec::new(),
+                    });
+                    cropped
+                } else {
+                    crate::crop::crop_around_face(img, tw, th, &face, self.directives.face_padding)
+                }
+            }
+            Ok(_) | Err(EngineError::Inference(_)) => {
+                if let Some(canvas) = canvas {
+                    let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                        img,
+                        tw,
+                        th,
+                        Align::Smart,
+                        None,
+                        self.ctx.focal_provider,
+                    );
+                    if let Some(trace) = trace {
+                        self.debug_capture = Some(capture_from_trace(canvas, trace));
+                    }
+                    cropped
+                } else {
+                    crate::crop::crop_to_aspect_with(
+                        img,
+                        tw,
+                        th,
+                        Align::Smart,
+                        None,
+                        self.ctx.focal_provider,
+                    )
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(cropped)
+    }
+
+    /// Crop to the union of the detected objects of the named
+    /// classes (issue #318). Preflight already refused the
+    /// request when no detection provider is configured or a
+    /// named class is unknown, so what remains is the model's
+    /// answer: a union to frame, or none. None (and a
+    /// detection failure, downgraded exactly like the face
+    /// crop's) falls back to the plain crop of the same size;
+    /// the record states which path was taken either way.
+    /// `canvas` is set when the debug view annotates this
+    /// crop.
+    fn objects_crop(
+        &mut self,
+        img: DynamicImage,
+        (tw, th): (u32, u32),
+        classes: &[String],
+        scale: f32,
+        canvas: Option<DynamicImage>,
+    ) -> Result<DynamicImage, EngineError> {
+        let mut used: Vec<crate::ai::Detection> = Vec::new();
+        let mut answered = true;
+        for class in classes {
+            match detect_for_class(
+                &mut self.detection_memos,
+                &self.detect_providers,
+                &img,
+                class,
+            ) {
+                Ok(found) => used.extend(found),
+                Err(EngineError::Inference(_)) => {
+                    answered = false;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let union = if answered {
+            crate::crop::union_box(&used)
+        } else {
+            None
+        };
+        let cropped = match union {
+            Some(union) => {
+                self.objects_crop_record = Some(ObjectsCropRecord {
+                    classes: classes.to_vec(),
+                    objects: used.clone(),
+                    union: Some((union.0, union.1, union.2 - union.0, union.3 - union.1)),
+                    scale,
+                    fallback: false,
+                });
+                if let Some(canvas) = canvas {
+                    let (cropped, window) =
+                        crate::crop::crop_around_objects_traced(img, tw, th, union, scale);
+                    self.debug_capture = Some(crate::debugview::FocalCapture {
+                        canvas,
+                        focal: Some(((union.0 + union.2) / 2, (union.1 + union.3) / 2)),
+                        focal_rect: Some(union),
+                        window,
+                        faces: Vec::new(),
+                        objects: used,
+                    });
+                    cropped
+                } else {
+                    crate::crop::crop_around_objects(img, tw, th, union, scale)
+                }
+            }
             None => {
-                let (point, faces) =
-                    crate::focus::focal_point_chained(&img, ctx.face_provider, ctx.focal_provider);
-                let (w, h) = (img.width(), img.height());
-                crate::debugview::FocalCapture {
-                    canvas: img.clone(),
-                    focal: Some((
-                        ((point.x * w as f32).round() as u32).min(w.saturating_sub(1)),
-                        ((point.y * h as f32).round() as u32).min(h.saturating_sub(1)),
-                    )),
-                    focal_rect: None,
-                    window: None,
-                    faces,
+                self.objects_crop_record = Some(ObjectsCropRecord {
+                    classes: classes.to_vec(),
                     objects: Vec::new(),
+                    union: None,
+                    scale,
+                    fallback: true,
+                });
+                if let Some(canvas) = canvas {
+                    let (cropped, trace) =
+                        crate::crop::crop_to_aspect_traced(img, tw, th, Align::Center, None, None);
+                    if let Some(trace) = trace {
+                        self.debug_capture = Some(capture_from_trace(canvas, trace));
+                    }
+                    cropped
+                } else {
+                    crate::crop::crop_to_aspect_with(img, tw, th, Align::Center, None, None)
                 }
             }
         };
-        img = crate::debugview::render(&capture);
+        Ok(cropped)
     }
-    // The last word on size: whatever the chain did, the
-    // image that goes to the encoder is inside the output
-    // budget (issue #182, audit R2-12).
-    check_output_pixels(img.width(), img.height())?;
-    let inpaint_record = if inpaint_regions.is_empty() {
-        None
-    } else {
-        Some(InpaintRecord {
-            regions: inpaint_regions,
+
+    /// A smart crop in an animated render sharing windows
+    /// across frames (issue #376): the first frame decides
+    /// through the traced crop (the trace reports the very
+    /// window the crop used) and later frames replay that
+    /// window verbatim, so the analysis runs once and the
+    /// framing cannot jitter.
+    fn shared_smart_crop(
+        &mut self,
+        img: DynamicImage,
+        (tw, th): (u32, u32),
+        op_index: usize,
+        align: &Align,
+    ) -> DynamicImage {
+        let windows = self
+            .smart_windows
+            .as_deref_mut()
+            .expect("the crop checked the option");
+        let key = (op_index, img.width(), img.height());
+        if let Some((x, y, cw, ch)) = windows.get(key) {
+            DynamicImage::ImageRgba8(image::imageops::crop_imm(&img, x, y, cw, ch).to_image())
+        } else {
+            let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                img,
+                tw,
+                th,
+                align.clone(),
+                self.ctx.face_provider,
+                self.ctx.focal_provider,
+            );
+            if let Some(trace) = trace {
+                windows.set(key, trace.window);
+            }
+            cropped
+        }
+    }
+
+    /// Apply one filter of a `filters:` segment: watermark
+    /// and overlay filters resolve against the
+    /// server-fetched images, the model and font filters run
+    /// through their providers, and everything else is a
+    /// plain filter (see [`ChainState::plain_filter`]).
+    fn apply_filter(
+        &mut self,
+        mut img: DynamicImage,
+        filter: &Filter,
+    ) -> Result<DynamicImage, EngineError> {
+        match filter {
+            Filter::Watermark { url, x, y, alpha } => {
+                let wm = self
+                    .ctx
+                    .watermarks
+                    .and_then(|m| m.get(url))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(format!("watermark was not resolved: {url}"))
+                    })?;
+                img = overlay_watermark(&img, wm, *x, *y, *alpha);
+            }
+            Filter::Overlay {
+                url,
+                x,
+                y,
+                alpha,
+                blend,
+                width,
+            } => {
+                let ov = self
+                    .ctx
+                    .watermarks
+                    .and_then(|m| m.get(url))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(format!("overlay was not resolved: {url}"))
+                    })?;
+                img = blend_overlay(self.ctx, &img, ov, *x, *y, *alpha, *blend, *width)?;
+            }
+            Filter::RemoveBg => {
+                let provider = self.ctx.mask_provider.ok_or_else(|| {
+                    EngineError::NotConfigured(
+                        "removebg is not configured on this server".to_string(),
+                    )
+                })?;
+                let mask = provider.mask(&img).map_err(EngineError::Inference)?;
+                img = crate::ai::apply_mask(&img, &mask);
+            }
+            Filter::Studio(spec) => img = self.studio(&img, spec)?,
+            Filter::BlurFaces => {
+                // A detection failure fails the
+                // request: serving the image
+                // unredacted would be the real
+                // failure.
+                let faces = detect_faces(&mut self.face_memo, &img, self.ctx)?;
+                img = crate::filters::blur_faces(&img, &faces);
+            }
+            Filter::PixelateFaces => {
+                let faces = detect_faces(&mut self.face_memo, &img, self.ctx)?;
+                img = crate::filters::pixelate_faces(&img, &faces);
+            }
+            Filter::BlurClass(class) => {
+                img = match self.class_targets(&img, class)? {
+                    ClassTargets::Masked(masked) => {
+                        crate::filters::blur_detections_masked(&img, &masked)
+                    }
+                    ClassTargets::Boxes(boxes) => crate::filters::blur_detections(&img, &boxes),
+                };
+            }
+            Filter::PixelateClass(class) => {
+                img = match self.class_targets(&img, class)? {
+                    ClassTargets::Masked(masked) => {
+                        crate::filters::pixelate_detections_masked(&img, &masked)
+                    }
+                    ClassTargets::Boxes(boxes) => crate::filters::pixelate_detections(&img, &boxes),
+                };
+            }
+            Filter::RecolorClass(class, color) => {
+                // The class rules are the
+                // redaction filters': detection
+                // resolves the class, and a
+                // failure fails the request.
+                // The paint follows the
+                // silhouette when a segment
+                // provider is configured, the
+                // box when not (issue #175).
+                img = match self.class_targets(&img, class)? {
+                    ClassTargets::Masked(masked) => {
+                        crate::filters::recolor_detections_masked(&img, &masked, *color)
+                    }
+                    ClassTargets::Boxes(boxes) => {
+                        crate::filters::recolor_detections(&img, &boxes, *color)
+                    }
+                };
+            }
+            // Padding is read from the request as a
+            // whole by the face crop; no pixels here.
+            Filter::FacePad(_) => {}
+            Filter::Upscale(factor) => {
+                let provider = self.ctx.upscale_provider.ok_or_else(|| {
+                    EngineError::NotConfigured(
+                        "upscale is not configured on this server".to_string(),
+                    )
+                })?;
+                img = upscale_image(img, *factor, provider)?;
+            }
+            Filter::BlurRegion { x, y, w, h } => {
+                check_region("blur_region", *x, *y, *w, *h, &img)?;
+                img = crate::filters::blur_region(&img, *x, *y, *w, *h);
+            }
+            Filter::PixelateRegion { x, y, w, h } => {
+                check_region("pixelate_region", *x, *y, *w, *h, &img)?;
+                img = crate::filters::pixelate_region(&img, *x, *y, *w, *h);
+            }
+            Filter::RemoveRegion { x, y, w, h } => {
+                // Same bounds discipline as the
+                // other region filters: a rectangle
+                // that overflows the image in
+                // effect here fails the request
+                // rather than erasing less than
+                // the caller named (issue #176).
+                check_region("remove_region", *x, *y, *w, *h, &img)?;
+                let provider = self.ctx.inpaint_provider.ok_or_else(|| {
+                    EngineError::NotConfigured(
+                        "remove_region is not configured on this server".to_string(),
+                    )
+                })?;
+                let mask = crate::ai::region_mask(img.width(), img.height(), *x, *y, *w, *h);
+                img = provider
+                    .inpaint(&img, &mask)
+                    .map_err(EngineError::Inference)?;
+                self.inpaint_regions.push((*x, *y, *w, *h));
+            }
+            Filter::Text {
+                text,
+                size,
+                color,
+                anchor,
+            } => {
+                let renderer = self.ctx.text_renderer.ok_or_else(|| {
+                    EngineError::NotConfigured(
+                        "text is not configured on this server (no font)".to_string(),
+                    )
+                })?;
+                img = renderer
+                    .draw(&img, text, *size, *color, *anchor)
+                    .map_err(EngineError::Render)?;
+            }
+            other => img = self.plain_filter(img, other)?,
+        }
+        Ok(img)
+    }
+
+    /// Studio runs the removebg mask model, then expands in
+    /// `crate::studio`: product mode composites (mask,
+    /// defringe, backdrop and shadow, pad; issue #197), scene
+    /// mode reframes and corrects (mask, crop, correct; issue
+    /// #198). The record rides out with the result for meta.
+    fn studio(
+        &mut self,
+        img: &DynamicImage,
+        spec: &crate::url::StudioSpec,
+    ) -> Result<DynamicImage, EngineError> {
+        let provider = self.ctx.mask_provider.ok_or_else(|| {
+            EngineError::NotConfigured(
+                "studio is not configured on this server (no mask model)".to_string(),
+            )
+        })?;
+        let t_timing = std::time::Instant::now();
+        let mask = provider.mask(img).map_err(EngineError::Inference)?;
+        let confidence = provider.confidence(img, &mask);
+        crate::studio::timing_mark("inference", t_timing);
+        let outcome = match spec.mode {
+            crate::url::StudioMode::Product => {
+                crate::studio::composite(img, &mask, confidence, spec, self.ctx.brand_color)
+            }
+            crate::url::StudioMode::Scene => crate::studio::scene(img, &mask, confidence, spec),
+        };
+        self.studio_record = Some(outcome.record);
+        Ok(outcome.image)
+    }
+
+    /// What a class filter paints: the detections of `class`
+    /// in `img`, segmented into masks when a segment provider
+    /// is configured (issue #175: mask-tight, the object's
+    /// silhouette rather than its box), with the segmented
+    /// objects added to the record. The #42 rule, inherited:
+    /// a detection or segmentation failure fails the request
+    /// rather than serve the image unredacted.
+    fn class_targets(
+        &mut self,
+        img: &DynamicImage,
+        class: &str,
+    ) -> Result<ClassTargets, EngineError> {
+        let boxes = detect_for_class(
+            &mut self.detection_memos,
+            &self.detect_providers,
+            img,
+            class,
+        )?;
+        Ok(match self.ctx.segment_provider {
+            Some(provider) => {
+                let (masked, mut objects) =
+                    segment_for_class(&mut self.segment_memo, provider, img, &boxes)?;
+                self.segment_objects.append(&mut objects);
+                ClassTargets::Masked(masked)
+            }
+            None => ClassTargets::Boxes(boxes),
         })
-    };
-    let segment_record = if segment_objects.is_empty() {
-        None
-    } else {
-        Some(SegmentRecord {
-            objects: segment_objects,
-        })
-    };
-    Ok((
-        img,
-        encode_opts,
-        studio_record,
-        inpaint_record,
-        segment_record,
-        objects_crop_record,
-    ))
+    }
+
+    /// A plain filter: pixels in, pixels out through
+    /// `apply_filters_filled`, with any encoding directive it
+    /// carries absorbed into the chain's encode options.
+    fn plain_filter(
+        &mut self,
+        img: DynamicImage,
+        filter: &Filter,
+    ) -> Result<DynamicImage, EngineError> {
+        // Arbitrary-angle rotation is
+        // the one plain filter that grows
+        // the canvas: check the canvas it
+        // is about to allocate before it
+        // allocates (issue #182, R2-12).
+        if let Filter::Rotate(degrees) = filter {
+            let (cw, ch) = crate::filters::rotated_canvas(img.width(), img.height(), *degrees);
+            check_output_pixels(cw, ch)?;
+        }
+        let (new_img, options) = crate::filters::apply_filters_filled(
+            img,
+            std::slice::from_ref(filter),
+            self.directives.fill,
+        );
+        self.encode_opts.absorb(options);
+        Ok(new_img)
+    }
+
+    /// Close the chain: render the debug view when
+    /// `debug:focal` armed it, check the final image against
+    /// the output budget, and hand back the image with the
+    /// encode options and the records.
+    fn finish(self, mut img: DynamicImage) -> Result<ApplyOutcome, EngineError> {
+        if self.debug_armed {
+            // The debug view replaces the transform result. With
+            // no capture, no crop followed the segment: the view
+            // shows the focal analysis of the final image. With
+            // one, it shows the decision that crop actually made,
+            // on the canvas it operated on.
+            let capture = match self.debug_capture {
+                Some(capture) => capture,
+                None => {
+                    let (point, faces) = crate::focus::focal_point_chained(
+                        &img,
+                        self.ctx.face_provider,
+                        self.ctx.focal_provider,
+                    );
+                    let (w, h) = (img.width(), img.height());
+                    crate::debugview::FocalCapture {
+                        canvas: img.clone(),
+                        focal: Some((
+                            ((point.x * w as f32).round() as u32).min(w.saturating_sub(1)),
+                            ((point.y * h as f32).round() as u32).min(h.saturating_sub(1)),
+                        )),
+                        focal_rect: None,
+                        window: None,
+                        faces,
+                        objects: Vec::new(),
+                    }
+                }
+            };
+            img = crate::debugview::render(&capture);
+        }
+        // The last word on size: whatever the chain did, the
+        // image that goes to the encoder is inside the output
+        // budget (issue #182, audit R2-12).
+        check_output_pixels(img.width(), img.height())?;
+        let inpaint_record = if self.inpaint_regions.is_empty() {
+            None
+        } else {
+            Some(InpaintRecord {
+                regions: self.inpaint_regions,
+            })
+        };
+        let segment_record = if self.segment_objects.is_empty() {
+            None
+        } else {
+            Some(SegmentRecord {
+                objects: self.segment_objects,
+            })
+        };
+        Ok((
+            img,
+            self.encode_opts,
+            self.studio_record,
+            inpaint_record,
+            segment_record,
+            self.objects_crop_record,
+        ))
+    }
 }
 
 /// Build the debug capture for a crop that reported a

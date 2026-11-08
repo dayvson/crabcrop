@@ -52,7 +52,7 @@ scripts/test_all.sh              # everything
 scripts/test_all.sh --skip-rust  # just the non-Rust suites
 ```
 
-The JavaScript suites need Node 22 or newer.
+The JavaScript suites need Node 22.18 or newer: they run the TypeScript sources directly, and type stripping is on by default from 22.18.
 
 ## Code style
 

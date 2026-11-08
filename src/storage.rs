@@ -7,11 +7,14 @@
 //! (format, quality, and the original key, so purge-by-path
 //! works after a restart) followed by the raw image bytes.
 //! Writes go to a temporary file that is renamed into place,
-//! so a crash can leave an orphan temp file but never a
-//! partial entry; a file that fails to parse is a miss, is
-//! deleted, and is overwritten by the next store. The byte
-//! budget evicts least recently used entries, with recency
-//! tracked in memory and re-seeded from file times at open.
+//! so a process crash can leave an orphan temp file but never
+//! a partial entry. Nothing is synced to disk first, so a
+//! power loss or kernel crash can truncate an entry; the
+//! header's length and MAC checks then fail it. A file that
+//! fails to parse is a miss, is deleted, and is overwritten
+//! by the next store. The byte budget evicts least recently
+//! used entries, with recency tracked in memory and re-seeded
+//! from file times at open.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

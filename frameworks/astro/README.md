@@ -4,7 +4,7 @@ An [Astro image service](https://docs.astro.build/en/reference/image-service-ref
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (or copy `sdks/typescript/src/index.ts` into your project and adjust the import).
+1. Install the builder: `npm install @crabcrop/url`.
 2. Copy [`crabcrop-service.ts`](crabcrop-service.ts) into your project.
 3. Register it as the image service in `astro.config`:
 
@@ -73,4 +73,4 @@ The [`example/`](example) directory is a minimal page and config that render an 
 
 ## Tests
 
-`npm test` in this directory runs the service hooks against exact expected URLs; the signed cases reproduce the canonical spec test vectors byte for byte, and the remaining signatures are cross-checked with `node:crypto` directly. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs`; in a real project the installed package resolves it.
+`npm test` in this directory runs the service hooks against exact expected URLs; the signed cases reproduce the canonical spec test vectors byte for byte, and the remaining signatures are cross-checked with `node:crypto` directly. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
