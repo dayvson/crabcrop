@@ -324,15 +324,28 @@ def build_sealed_url(
     return f"{trimmed}/{segment}"
 
 
+# Characters a browser rewrites in a URL path (issue #472): an
+# ``<img src>`` or ``fetch()`` URL is parsed by WHATWG rules, which
+# turn ``\`` into ``/`` and percent-encode the rest (Chrome encodes
+# ``^`` and ``|`` too). The server verifies the raw path, so a URL
+# signed over one of them answers 403 from a page.
+_BROWSER_REWRITTEN = frozenset('"<>\\^`{|}')
+
+
 def _validate_url_text(text: str, what: str) -> None:
     """Fail loudly on inputs that can never verify (audit
     P-4): the remainder travels as a raw URL path, so ``?`` /
-    ``#`` would truncate it and whitespace, control, and
-    non-ASCII characters cannot be sent as-is."""
+    ``#`` would truncate it, whitespace, control, and
+    non-ASCII characters cannot be sent as-is, and a browser
+    rewrites the ``_BROWSER_REWRITTEN`` set."""
     for c in text:
-        if c in "?#" or not c.isascii() or ord(c) <= 0x20 or ord(c) == 0x7F:
+        rewritten = c in _BROWSER_REWRITTEN
+        if c in "?#" or not c.isascii() or ord(c) <= 0x20 or ord(c) == 0x7F or rewritten:
+            hint = (
+                f" (browsers rewrite it; percent-encode it as %{ord(c):02X})" if rewritten else ""
+            )
             raise ValueError(
-                f"{what} contains a character that cannot appear in a crabcrop URL: {c!r}"
+                f"{what} contains a character that cannot appear in a crabcrop URL: {c!r}{hint}"
             )
 
 

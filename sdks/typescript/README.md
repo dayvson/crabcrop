@@ -69,9 +69,11 @@ const remainder = unseal("your-secret", seal("your-secret", "300x200/https://exa
 
 Pass `null` as the secret to produce the literal `unsafe` signature segment, for servers running with `CRABCROP_ALLOW_UNSAFE` or in presets-only mode.
 
+The builders throw on operations or a source that can never verify: `?`, `#`, whitespace, control and non-ASCII characters, and `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, which a browser rewrites before an `<img src>` or `fetch()` request leaves the page (`\` becomes `/`, the rest are percent-encoded). Percent-encode those in the source first (`x{y}.jpg` as `x%7By%7D.jpg`); the error names the encoding. The full rules are in [`spec/url-signing.md`](../../spec/url-signing.md#building-urls).
+
 ## Typed operations
 
-The operation string is the spec, and passing it verbatim stays the primary API. For callers who would rather build it, `ops` and `filter` are typed builders that validate each argument against the server's grammar and return the canonical spelling, so the typed and hand-written forms sign byte-identical URLs (the test suite pins this against the canonical corpus):
+The operation string is the spec, and passing it verbatim stays the primary API. For callers who would rather build it, `ops` and `filter` are typed builders that validate each argument against the server's grammar and return the canonical spelling, so the typed and hand-written forms sign byte-identical URLs (the test suite pins this against the canonical corpus). Numbers and names are canonical too: a decimal argument is spelled the way the server prints it, which for every parameter but the convolution kernel's 64-bit values is the shortest decimal that reads back as the same 32-bit float (`ops.focalPoint(0.1 + 0.2, 0.4, 2)` is `focalpoint:0.3x0.4:2`), and a class name is spelled trimmed (`ops.cropObjects(100, 100, [" person "])` is `crop:100x100:objects(person):1`). For example:
 
 ```ts
 import { buildURL, filter, joinOps, ops } from "@crabcrop/url";

@@ -30,6 +30,8 @@ VECTORS = json.loads(
 
 SIGNED_VECTORS = [v for v in VECTORS if "signature" in v]
 SEALED_VECTORS = [v for v in VECTORS if v.get("sealed")]
+REFUSAL_VECTORS = [v for v in VECTORS if "refuses" in v]
+BROWSER_REWRITTEN = '"<>\\^`{|}'
 HAS_CRYPTOGRAPHY = __import__("importlib").util.find_spec("cryptography") is not None
 
 
@@ -52,6 +54,46 @@ class TestVectors(unittest.TestCase):
                     verify(v["secret"], v["signature"].upper(), v["remainder"])
                 )
         self.assertFalse(verify("s", "not-a-signature", "300x200/https://e.com/a.jpg"))
+
+    def test_refusal_vectors(self):
+        # Issue #472: every builder refuses each input, signed
+        # or not, plain or sealed, naming the input and the
+        # character; a character a browser rewrites comes with
+        # its percent-encoding. The refusal happens before any
+        # sealing, so it needs no cryptography extra.
+        self.assertGreaterEqual(len(REFUSAL_VECTORS), 17)
+        base = "https://img.example.com"
+        for v in REFUSAL_VECTORS:
+            what = v["refuses"]["input"]
+            c = v["refuses"]["character"]
+            message = f"{what} contains a character that cannot appear in a crabcrop URL: {c!r}"
+            if c in BROWSER_REWRITTEN:
+                message += f" (browsers rewrite it; percent-encode it as %{ord(c):02X})"
+            calls = [
+                lambda: build_url(base, "s3cr3t", v["operations"], v["source"]),
+                lambda: build_url(base, None, v["operations"], v["source"]),
+                lambda: build_url(base, "s3cr3t", v["operations"], v["source"], key_id="k2"),
+                lambda: build_sealed_url(base, "s3cr3t", v["operations"], v["source"]),
+            ]
+            if what == "source":
+                calls.append(lambda: build_srcset(base, "s3cr3t", v["source"], [320]))
+            for call in calls:
+                with self.subTest(description=v["description"]):
+                    with self.assertRaises(ValueError) as caught:
+                        call()
+                    self.assertEqual(str(caught.exception), message)
+
+    def test_percent_encoded_source_builds_and_signs_as_written(self):
+        # The spelling the refusal message asks for: nothing in
+        # it is rewritten by a browser, and it signs as written
+        # (the spec vector for this remainder).
+        self.assertEqual(
+            build_url(
+                "https://img.example.com", "s3cr3t", "100x0", "https://example.com/x%7By%7D.jpg"
+            ),
+            "https://img.example.com/185ec1ffdc665285c43ca7af231f4bef87fe8c6f102709006e46e8ace401da57"
+            "/100x0/https://example.com/x%7By%7D.jpg",
+        )
 
 
 class TestPurgeSignatures(unittest.TestCase):

@@ -136,4 +136,6 @@ precedence and the rewrite rules are exercised end to end through
 the stubs, and the URL builder runs the canonical vectors from
 [`spec/test-vectors.json`](../../spec/test-vectors.json), the same
 suite every other implementation runs, so the PHP signatures cannot
-drift from the server's.
+drift from the server's. The refusal vectors hold it to the same
+character rules: a source with a character a browser rewrites in a
+path (such as `{` or `\`) keeps its original URL.

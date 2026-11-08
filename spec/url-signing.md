@@ -77,7 +77,13 @@ A builder assembles, in order:
 
 then signs the joined remainder and prefixes `{base}/{signature}/`. With a null secret the signature segment is the literal `unsafe` and no HMAC is computed.
 
-Builders reject inputs that can never verify, at build time: an expiry that is not a non-negative integer, and operations or sources containing `?`, `#`, whitespace, control, or non-ASCII characters. The remainder travels as a raw path and those characters cannot be represented in it (percent-encoding them produces a different remainder, which fails verification just the same). Only a null secret means `unsafe`: an empty-string secret is a real key and signs.
+Builders reject inputs that can never verify, at build time: an expiry that is not a non-negative integer, and operations or sources containing any of these characters:
+
+- `?` and `#`, which end the path, so the server would never see the rest of the remainder;
+- whitespace, control characters (U+0000 to U+001F and U+007F), and anything outside ASCII, which cannot travel in a request path as-is;
+- `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, which a browser rewrites before the request leaves the page. An `<img src>` or `fetch()` URL is parsed by the WHATWG URL rules, which turn `\` into `/` and percent-encode `"` `<` `>` `` ` `` `{` `}` in a path; Chrome percent-encodes `^` and `|` as well. A URL signed over the raw character verifies when sent by curl and answers `403` when a page requests it.
+
+The server verifies the bytes it receives, so a character that is rewritten or encoded in transit fails verification. The fix is to percent-encode such characters in the source before building (`x{y}.jpg` becomes `x%7By%7D.jpg`): the encoded spelling travels unchanged and signs as written, and an HTTP origin decodes it. The refusal message for the browser-rewritten set names the encoding. Only a null secret means `unsafe`: an empty-string secret is a real key and signs.
 
 ## Srcset building
 
@@ -103,7 +109,7 @@ Implementations: `seal` / `seal_with_nonce` (the deterministic seam the vectors 
 
 ## Test vectors
 
-`test-vectors.json` in this directory is the canonical set: each signing entry gives a `secret`, a `remainder`, and the expected `signature`; each sealed entry (marked `"sealed": true`) gives a `secret`, an optional `key_id`, a `nonce` (hex), a `remainder`, and the expected `token`, which every implementation must reproduce byte for byte with the injected nonce and open back. Every shipped implementation runs these vectors as its test suite. The first entry is the long-standing known-answer vector (secret `Jefe`); the second is the worked example from the README, computed with OpenSSL. The rest were computed with Python's `hmac` module, independently of the server code. In Rust they run as the `crabcrop-url` crate's tests (`cargo test --workspace`), and the server verifies signatures by calling that crate's `verify`.
+`test-vectors.json` in this directory is the canonical set: each signing entry gives a `secret`, a `remainder`, and the expected `signature`; each sealed entry (marked `"sealed": true`) gives a `secret`, an optional `key_id`, a `nonce` (hex), a `remainder`, and the expected `token`, which every implementation must reproduce byte for byte with the injected nonce and open back; each refusal entry gives `operations`, a `source`, and `refuses`, naming the `input` (`operations` or `source`) and the first `character` a builder must refuse there, with or without a secret, for plain and sealed URLs alike. Every shipped implementation runs these vectors as its test suite. The first entry is the long-standing known-answer vector (secret `Jefe`); the second is the worked example from the README, computed with OpenSSL. The rest were computed with Python's `hmac` module, independently of the server code. In Rust they run as the `crabcrop-url` crate's tests (`cargo test --workspace`), and the server verifies signatures by calling that crate's `verify`.
 
 ## Versioning
 
