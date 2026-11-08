@@ -39,7 +39,7 @@ jobs:
       - name: Check versions
         run: python3 scripts/check_versions.py
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build
         run: cargo build --locked --verbose
       - name: Run tests
@@ -51,15 +51,33 @@ jobs:
 
   macos:
 
-    # The release ships macOS binaries, and some system
-    # APIs exist only on Linux, so a pull request must
-    # compile on macOS as well.
+    # The release ships macOS binaries built with the
+    # avif-decode feature (dist-workspace.toml), and some
+    # system APIs exist only on Linux, so a pull request
+    # must build that feature set on macOS and pass the
+    # library tests there as well.
     runs-on: macos-latest
+
+    env:
+      # Vendored static dav1d, as the release builds it.
+      SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Check the crate compiles on macOS
-        run: cargo check --locked --all-targets
+      - name: Install meson, ninja, and nasm (vendored dav1d)
+        run: |
+          # The release build's pinned tools: see the step of
+          # the same name in docs/release-workflow.yml.
+          req="$RUNNER_TEMP/meson-requirements.txt"
+          printf '%s\n' 'meson==1.12.1 --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02' > "$req"
+          python3 -m pip install --user --break-system-packages --require-hashes -r "$req"
+          python3 -m pip install --user --break-system-packages "ninja==1.13.2"
+          brew install nasm
+          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+      - name: Check every target compiles on macOS with the shipped features
+        run: cargo check --locked --all-targets --features avif-decode
+      - name: Run the library tests on macOS with the shipped features
+        run: cargo test --locked --features avif-decode --lib
 
   msrv:
 
@@ -100,6 +118,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The full history and the tags: the rendering
+          # version check compares the corpus with the last
+          # release tag, and skips itself in a shallow clone.
+          fetch-depth: 0
       - name: Install nasm (rav1e SIMD build)
         run: sudo apt-get update && sudo apt-get install -y nasm
       - name: Set up Node.js

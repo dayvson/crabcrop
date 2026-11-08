@@ -38,6 +38,9 @@ for pair in "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml
   fi
 done
 
+step "Functional tier (a pull request's diff picks smoke or full)"
+python3 scripts/test_functional_tier.py
+
 step "npm dist-tag (a prerelease publishes under next, never latest)"
 for pair in "0.10.0 latest" "0.10.0-rc.1 next" "1.2.3-beta.2+sha.5 next" "1.2.3+build-7 latest"; do
   set -- $pair
@@ -72,7 +75,9 @@ step "Version consistency (every artifact and deploy pin agrees)"
 python3 scripts/check_versions.py
 
 step "Rendering version (a corpus re-baseline since the last release tag raises it)"
-python3 scripts/check_rendering_version.py
+# CI checks out the full history, so there a skip means the checkout
+# lost the tags: --strict fails it instead.
+python3 scripts/check_rendering_version.py ${GITHUB_ACTIONS:+--strict}
 python3 scripts/test_check_rendering_version.py
 
 step "Build (debug binary: the MCP suite spawns it)"

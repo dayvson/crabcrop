@@ -15,11 +15,13 @@ RENDERING_VERSION must be greater than it was at the tag. Added and removed
 entries are not re-baselines, and neither is a re-minted path whose recorded
 outcome is unchanged (the sealed entry gets a fresh nonce on every freeze).
 
-A clone without the tag (CI's shallow checkout fetches no tags) cannot make
-the comparison; the check says so and exits 0. Run it from a full clone, as
-the release steps in RELEASING.md do.
+A clone without the tag (a shallow clone fetches none) cannot make the
+comparison; the check says so and exits 0, or exits 1 under --strict. CI
+checks out the full history and passes --strict (scripts/test_all.sh does when
+GITHUB_ACTIONS is set), so a checkout that loses the tags fails there instead
+of skipping. Run it from a full clone, as the release steps in RELEASING.md do.
 
-Usage: scripts/check_rendering_version.py [--root DIR]
+Usage: scripts/check_rendering_version.py [--root DIR] [--strict]
 """
 import argparse
 import json
@@ -104,10 +106,12 @@ def goldens(raw, where):
     return by_id
 
 
-def check(root):
-    """Return (exit code, message)."""
+def check(root, strict=False):
+    """Return (exit code, message). Under strict, a skip is a failure."""
     tag, reason = last_release_tag(root)
     if tag is None:
+        if strict:
+            return 1, f"rendering version check could not run (--strict): {reason}"
         return 0, f"rendering version check skipped: {reason}"
     before = git(root, "show", f"{tag}:{CORPUS}", text=False)
     if before.returncode != 0:
@@ -149,9 +153,14 @@ def check(root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="repository checkout to check")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="fail instead of skipping when no release tag is reachable (CI passes it)",
+    )
     args = parser.parse_args(argv)
     try:
-        code, message = check(args.root.resolve())
+        code, message = check(args.root.resolve(), strict=args.strict)
     except CheckError as err:
         code, message = 1, f"rendering version check failed: {err}"
     print(message, file=sys.stderr if code else sys.stdout)
