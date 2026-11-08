@@ -9914,7 +9914,23 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
         worst, 1,
         "live jobs must never exceed the lane permit count; log: {log}"
     );
-    assert_eq!(state.slow_gate.available_permits(), 1);
+    // The encoder logs its end marker before it exits,
+    // and the detached job drops its permit only after
+    // the encode returns, so the permit can still be
+    // out for a moment after the second "E" lands. Wait
+    // for it the way the drain test above does.
+    let mut back = false;
+    for _ in 0..200 {
+        if state.slow_gate.available_permits() == 1 {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        back,
+        "the slow-lane permit must return when the second job drains"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
