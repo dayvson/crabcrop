@@ -435,6 +435,15 @@ class TreeChecks(unittest.TestCase):
         self.assertNotIn("uploads_not_configured", (self.root / "src/server.rs").read_text())
         self.assertEqual(self.problems(), [])
 
+    def test_codes_reserved_code_the_server_builds(self):
+        self.edit(
+            "src/server.rs",
+            '(StatusCode::SERVICE_UNAVAILABLE, "server_busy", busy),',
+            '(StatusCode::SERVICE_UNAVAILABLE, "server_busy", busy),\n'
+            '        EngineError::Off => (StatusCode::NOT_FOUND, "uploads_not_configured", m),',
+        )
+        self.assertOnly("codes", "RESERVED lists uploads_not_configured, which the server builds")
+
     def test_codes_reserved_entry_must_be_documented(self):
         with mock.patch.object(check_docs, "RESERVED", {"uploads_not_configured", "retired_code"}):
             self.assertOnly(

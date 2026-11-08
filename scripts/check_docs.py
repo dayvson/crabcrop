@@ -18,7 +18,8 @@ src/ outside its #[cfg(test)] modules; test code is those modules plus tests/.
              configuration table's Default column says the same.
   codes      Every (StatusCode, "code") pair server code builds has a row in
              docs/responses.md with that status, and every row's code is
-             built unless it is RESERVED. The parser's codes
+             built unless it is RESERVED, which lists only codes the server
+             does not build. The parser's codes
              (ParseError::code in src/url.rs) are the documented grammar list,
              except one the code table already documents as a 400.
   statuses   The statuses table lists exactly the statuses the codes use.
@@ -566,6 +567,8 @@ def check_codes(root, sources):
         )
     for code in sorted(RESERVED - set(rows)):
         problems.append(f"RESERVED lists {code}, which {RESPONSES} does not document: remove it")
+    for code in sorted(RESERVED & set(built)):
+        problems.append(f"RESERVED lists {code}, which the server builds: remove it")
     # A parser code that the server also builds (unsupported_operation once the
     # parser caps the operation count) is documented by its table row, which
     # must then say 400, the status of every grammar failure.
