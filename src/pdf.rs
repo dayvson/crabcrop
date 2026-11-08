@@ -552,7 +552,6 @@ fn not_pdf() -> PdfError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     /// A whole-document probe report, recorded from the
     /// reference probe on a real two-page document.

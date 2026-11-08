@@ -23,6 +23,13 @@
 //! a restart, while its walk runs and for a grace period
 //! after.
 //!
+//! Walks are paced (issue #462): one walk reads
+//! [`PURGE_READS_AT_ONCE`] headers at a time, at most
+//! [`PURGE_WALKS_AT_ONCE`] walks run in the background at
+//! once, and a purge whose target already has a walk
+//! running in this process joins that walk instead of
+//! starting another (see [`S3Store::lead_or_join`]).
+//!
 //! Like the disk store, every operation is best-effort: a
 //! network or service error degrades to a miss or a dropped
 //! write, never a failed request, because a cache must not
@@ -36,11 +43,14 @@
 //! S3-compatible development stores.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::cache::{CachedImage, PurgeCutoff, PurgeGuard, PurgeTarget, Tombstone, now_ms};
+use crate::cache::{
+    ActivePurge, CachedImage, PurgeCutoff, PurgeGuard, PurgeTarget, Tombstone, now_ms,
+};
 use crate::sigv4::{self, Credentials};
 use crate::storage::{
     HeaderProbe, MAX_ENTRY_BYTES, MAX_TOMBSTONE_BYTES, key_stem, parse_entry, parse_entry_header,
@@ -58,6 +68,23 @@ const TOMBSTONE_DIR: &str = "purges/";
 /// the cap bounds the reads a hostile or neglected prefix
 /// can cost a refresh.
 const MAX_SHARED_TOMBSTONES: usize = 1024;
+
+/// How many entry headers one purge walk reads at once
+/// (issue #462). Each read is a ranged GET, one round trip
+/// to the store, so a walk over N objects takes about
+/// N x RTT / 16 instead of N x RTT, and one walk still
+/// keeps no more than this many requests open.
+pub const PURGE_READS_AT_ONCE: usize = 16;
+
+/// How many purge walks run in the background at once
+/// (issue #462); the others wait their turn, first come
+/// first served. A walk lists the whole prefix and reads
+/// every entry header, so walks side by side only split
+/// the store's request rate between them, while each one
+/// keeps its purge running (its tombstone open) until it
+/// ends. A purge's inline part (issue #368) is bounded on
+/// its own and never waits for a turn.
+pub const PURGE_WALKS_AT_ONCE: usize = 2;
 
 /// The outcome of a conditional raw write
 /// ([`S3Store::put_raw_if_absent`]).
@@ -98,6 +125,14 @@ pub struct S3Store {
     /// a refresh fetches only the objects that are new or
     /// changed since.
     tombstones: std::sync::Mutex<HashMap<String, (String, Tombstone)>>,
+    /// The purge walks running in this process, by target,
+    /// each with the identical purges that joined it and
+    /// wait for its re-list (issue #462).
+    walks: std::sync::Mutex<HashMap<PurgeTarget, Vec<SharedPurge>>>,
+    /// Background walk turns (issue #462):
+    /// [`PURGE_WALKS_AT_ONCE`] permits, granted in arrival
+    /// order.
+    walk_turns: tokio::sync::Semaphore,
     /// Tier failures, counted and logged as they happen
     /// (issue #367): the shared tier stays best-effort,
     /// but a store that rejects every write must be
@@ -155,6 +190,8 @@ impl S3Store {
             creds,
             entry_key,
             tombstones: std::sync::Mutex::new(HashMap::new()),
+            walks: std::sync::Mutex::new(HashMap::new()),
+            walk_turns: tokio::sync::Semaphore::new(PURGE_WALKS_AT_ONCE),
             max_entry_bytes: MAX_ENTRY_BYTES,
             errors: std::sync::atomic::AtomicU64::new(0),
         })
@@ -693,27 +730,26 @@ impl S3Store {
 
     /// Purge the current epoch's enumerable variants of a
     /// key directly by object name (audit R2-24), under the
-    /// same stamp rule as the walk.
-    async fn purge_epoch_variants(
+    /// same stamp rule as the walk. Five reads, bounded by
+    /// construction: every per-URL purge runs them inline,
+    /// including one that joins a running walk (issue #462).
+    pub async fn purge_epoch_variants(
         &self,
         epoch_base: &str,
         target: &PurgeTarget,
         cutoff: PurgeCutoff,
     ) -> usize {
-        let mut removed = 0;
-        for candidate in [
+        let objects: Vec<String> = [
             epoch_base.to_string(),
             format!("{epoch_base}#avif"),
             format!("{epoch_base}#jxl"),
             format!("{epoch_base}#webp"),
             format!("{epoch_base}#source"),
-        ] {
-            let object = self.object_key(&key_stem(&candidate));
-            if self.purge_object(&object, target, cutoff).await {
-                removed += 1;
-            }
-        }
-        removed
+        ]
+        .iter()
+        .map(|candidate| self.object_key(&key_stem(candidate)))
+        .collect();
+        self.purge_objects(objects, target, cutoff).await
     }
 
     /// Remove every entry belonging to `group`. Returns
@@ -751,33 +787,95 @@ impl S3Store {
 
     /// The shared purge walk: read each entry's header,
     /// delete the covered copies (see
-    /// [`S3Store::purge_object`]). Reads are header-sized
-    /// (see [`S3Store::read_entry_header`]), never whole
-    /// entries.
+    /// [`S3Store::purge_object`]), the first `budget`
+    /// objects now and the rest handed back. Reads are
+    /// header-sized (see [`S3Store::read_entry_header`]),
+    /// never whole entries.
     async fn purge_walk(
         &self,
         target: &PurgeTarget,
         cutoff: PurgeCutoff,
-        objects: Vec<String>,
+        mut objects: Vec<String>,
         budget: usize,
     ) -> (usize, Option<PendingPurge>) {
-        let mut removed = 0;
-        for (index, object) in objects.iter().enumerate() {
-            if index >= budget {
-                return (
-                    removed,
-                    Some(PendingPurge {
-                        target: target.clone(),
-                        cutoff,
-                        objects: objects[index..].to_vec(),
-                    }),
-                );
-            }
-            if self.purge_object(object, target, cutoff).await {
-                removed += 1;
-            }
+        let rest = (objects.len() > budget).then(|| objects.split_off(budget));
+        let removed = self.purge_objects(objects, target, cutoff).await;
+        let pending = rest.map(|objects| PendingPurge {
+            target: target.clone(),
+            cutoff,
+            objects,
+        });
+        (removed, pending)
+    }
+
+    /// Purge each of `objects` (see
+    /// [`S3Store::purge_object`]), [`PURGE_READS_AT_ONCE`]
+    /// at a time (issue #462): a header read is one round
+    /// trip, and one after another they made a walk's time
+    /// the object count times the store's latency. Returns
+    /// how many covered copies were deleted.
+    async fn purge_objects(
+        &self,
+        objects: Vec<String>,
+        target: &PurgeTarget,
+        cutoff: PurgeCutoff,
+    ) -> usize {
+        use futures_util::StreamExt as _;
+        // Each name moves into its read: a stream of borrowed
+        // names makes the spawned walk fail the compiler's
+        // Send check (a known limitation with higher-ranked
+        // lifetimes).
+        futures_util::stream::iter(objects)
+            .map(move |object| async move { self.purge_object(&object, target, cutoff).await })
+            .buffer_unordered(PURGE_READS_AT_ONCE)
+            .fold(0, |removed, deleted| {
+                std::future::ready(removed + usize::from(deleted))
+            })
+            .await
+    }
+
+    /// Lead or join the walk of `purge`'s target (issue
+    /// #462). With no walk of an equal target running in
+    /// this process, the caller leads one: the purge comes
+    /// back with a [`WalkLease`] that marks the target as
+    /// walking until the walk and its re-lists are done.
+    /// Otherwise the purge joins the running walk and `None`
+    /// comes back: the walk's leader takes the purge over,
+    /// walks the bucket once more for it after its current
+    /// pass, and ends it then.
+    ///
+    /// The extra pass is what keeps a joined purge whole.
+    /// The running pass judges copies by the earlier purge's
+    /// start, so it spares a copy rendered between the two
+    /// purges, and its listing may predate that copy
+    /// altogether; the joined purge's tombstone hides such a
+    /// copy only until it expires, a grace period after the
+    /// walk ends, so without a pass of its own the copy
+    /// would serve again then.
+    pub fn lead_or_join(self: &Arc<Self>, purge: SharedPurge) -> Option<(WalkLease, SharedPurge)> {
+        let target = purge.active.tombstone().target.clone();
+        let mut walks = self.walks.lock().unwrap();
+        if let Some(joined) = walks.get_mut(&target) {
+            joined.push(purge);
+            return None;
         }
-        (removed, None)
+        walks.insert(target.clone(), Vec::new());
+        drop(walks);
+        let lease = WalkLease {
+            store: Arc::clone(self),
+            target,
+            done: false,
+        };
+        Some((lease, purge))
+    }
+
+    /// Wait for a background walk's turn (issue #462): at
+    /// most [`PURGE_WALKS_AT_ONCE`] walks hold one at a
+    /// time, and the others queue in arrival order. The
+    /// semaphore is never closed, so the permit is always
+    /// there; it is returned when dropped.
+    pub async fn walk_turn(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.walk_turns.acquire().await.ok()
     }
 
     fn tombstone_prefix(&self) -> String {
@@ -922,6 +1020,70 @@ pub struct PendingPurge {
     objects: Vec<String>,
 }
 
+/// A purge on its way through the shared tier (issues
+/// #461, #462): the handle that keeps it running, its
+/// tombstone's object name in the bucket (`None` when it
+/// could not be recorded there), and the audit event and
+/// target its walk's end is logged under.
+#[derive(Debug)]
+pub struct SharedPurge {
+    pub active: ActivePurge,
+    pub tombstone: Option<String>,
+    pub event: &'static str,
+    pub log_target: String,
+}
+
+/// A target's walk, held by the purge that leads it
+/// (issue #462) until no identical purge is waiting on it.
+/// Dropping the lease before then (the walk's task panicked
+/// or was torn down) frees the target and drops the purges
+/// that joined: each one's bucket tombstone, never marked
+/// ended, stays in force like that of a walk whose process
+/// stopped, until a later purge of the target finishes its
+/// walk.
+pub struct WalkLease {
+    store: Arc<S3Store>,
+    target: PurgeTarget,
+    done: bool,
+}
+
+impl WalkLease {
+    /// The purges that joined the walk since the last call.
+    /// Empty means the walk is over: the target is freed in
+    /// the same step, so an identical purge that arrives
+    /// after it leads a walk of its own instead of joining
+    /// one that has ended.
+    pub fn take_joined(&mut self) -> Vec<SharedPurge> {
+        let mut walks = self.store.walks.lock().unwrap();
+        let joined = walks
+            .get_mut(&self.target)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        if joined.is_empty() {
+            walks.remove(&self.target);
+            self.done = true;
+        }
+        joined
+    }
+}
+
+impl Drop for WalkLease {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let joined = self
+            .store
+            .walks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.target);
+        // Dropped with the registry unlocked: each purge
+        // takes the guard's lock as it ends.
+        drop(joined);
+    }
+}
+
 /// The outcome of reading one entry's header for a purge:
 /// what the header claims, and the object's ETag at the
 /// moment it was read, for a conditional delete.
@@ -1000,9 +1162,47 @@ fn xml_unescape(s: &str) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The fake's instruments for pacing purge walks (issue
+    /// #462).
+    #[derive(Default)]
+    pub struct WalkProbe {
+        /// While set, a ranged GET of an object whose name
+        /// starts with this waits until it is cleared, so a
+        /// test can park walks on chosen objects while the
+        /// others pass.
+        pub hold_prefix: StdMutex<Option<String>>,
+        /// Ranged GETs `hold_prefix` parks right now, and the
+        /// most it has parked at once.
+        pub held: AtomicUsize,
+        pub held_peak: AtomicUsize,
+        /// How long each ranged GET waits before it is
+        /// answered: a stand-in for the store's round trip.
+        pub delay_ms: AtomicU64,
+        /// Ranged GETs waiting on that delay right now, and
+        /// the most at once.
+        pub delayed: AtomicUsize,
+        pub delayed_peak: AtomicUsize,
+        /// The prefix of every listing served, in order.
+        pub lists: StdMutex<Vec<String>>,
+    }
+
+    impl WalkProbe {
+        /// How many listings of `prefix` itself were served:
+        /// the purge walks' passes over a store under that
+        /// prefix (a tombstone refresh lists a sub-prefix).
+        pub fn lists_of(&self, prefix: &str) -> usize {
+            self.lists
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == prefix)
+                .count()
+        }
+    }
 
     /// Injectable failure switches for the error-path
     /// tests: while a flag is set, the matching operation
@@ -1051,6 +1251,8 @@ pub(crate) mod test_support {
         pub hold_deletes: Arc<AtomicBool>,
         /// DELETEs held right now.
         pub held_deletes: Arc<AtomicUsize>,
+        /// Purge walk pacing instruments (issue #462).
+        pub walk: Arc<WalkProbe>,
         pub endpoint: String,
     }
 
@@ -1071,6 +1273,7 @@ pub(crate) mod test_support {
         let held_object_gets = Arc::new(AtomicUsize::new(0));
         let hold_deletes = Arc::new(AtomicBool::new(false));
         let held_deletes = Arc::new(AtomicUsize::new(0));
+        let walk = Arc::new(WalkProbe::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = objects.clone();
@@ -1082,6 +1285,7 @@ pub(crate) mod test_support {
         let shared_held_objects = held_object_gets.clone();
         let shared_hold_deletes = hold_deletes.clone();
         let shared_held_deletes = held_deletes.clone();
+        let shared_walk = walk.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let objects = shared.clone();
@@ -1093,6 +1297,7 @@ pub(crate) mod test_support {
                 let held_object_gets = shared_held_objects.clone();
                 let hold_deletes = shared_hold_deletes.clone();
                 let held_deletes = shared_held_deletes.clone();
+                let walk = shared_walk.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -1164,6 +1369,18 @@ pub(crate) mod test_support {
                         {
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
+                        pace_ranged_get(&walk, &target).await;
+                    }
+                    if method == "GET" && target.contains("list-type=2") {
+                        let prefix = target
+                            .split_once('?')
+                            .map(|(_, query)| query)
+                            .unwrap_or("")
+                            .split('&')
+                            .find_map(|p| p.strip_prefix("prefix="))
+                            .map(percent_decode)
+                            .unwrap_or_default();
+                        walk.lists.lock().unwrap().push(prefix);
                     }
                     {
                         let (path, _) = match target.split_once('?') {
@@ -1231,7 +1448,38 @@ pub(crate) mod test_support {
             held_object_gets,
             hold_deletes,
             held_deletes,
+            walk,
             endpoint: format!("http://127.0.0.1:{port}"),
+        }
+    }
+
+    /// Apply the walk probe's hold and delay to one ranged
+    /// GET of the object `target` names.
+    async fn pace_ranged_get(walk: &WalkProbe, target: &str) {
+        let path = target.split_once('?').map_or(target, |(p, _)| p);
+        let rest = path.trim_start_matches('/');
+        let object = percent_decode(rest.split_once('/').map(|(_, k)| k).unwrap_or(""));
+        let held = || {
+            walk.hold_prefix
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|prefix| object.starts_with(prefix))
+        };
+        if held() {
+            let now = walk.held.fetch_add(1, Ordering::SeqCst) + 1;
+            walk.held_peak.fetch_max(now, Ordering::SeqCst);
+            while held() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            walk.held.fetch_sub(1, Ordering::SeqCst);
+        }
+        let delay = walk.delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            let now = walk.delayed.fetch_add(1, Ordering::SeqCst) + 1;
+            walk.delayed_peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            walk.delayed.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -1616,6 +1864,148 @@ mod tests {
             deletes.iter().all(|r| r.ends_with(" if-match")),
             "{deletes:?}"
         );
+    }
+
+    /// Fill the fake bucket with `count` objects named
+    /// `{name}-NNNN` that are not cache entries: a walk reads
+    /// each one's header and leaves it.
+    fn seed_fillers(fake: &super::test_support::FakeS3, name: &str, count: usize) {
+        let mut objects = fake.objects.lock().unwrap();
+        for i in 0..count {
+            objects.insert(format!("{name}-{i:04}"), b"not a cache entry".to_vec());
+        }
+    }
+
+    /// Poll `done` every 10 ms for up to five seconds, or
+    /// fail with `what`.
+    async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    #[tokio::test]
+    async fn a_walk_reads_sixteen_headers_at_a_time() {
+        // Issue #462: the walk read one entry header after
+        // another, each a round trip to the store. It now
+        // keeps PURGE_READS_AT_ONCE reads in flight, and no
+        // more: with every read parked, exactly that many
+        // arrive, and the rest wait for a free place.
+        use std::sync::atomic::Ordering::SeqCst;
+        let fake = start_fake().await;
+        let s = Arc::new(store(&fake.endpoint));
+        seed_fillers(&fake, "cache/f", 64);
+        *fake.walk.hold_prefix.lock().unwrap() = Some("cache/f-".into());
+        let walker = s.clone();
+        let walk = tokio::spawn(async move { walker.purge_group("hero").await });
+        wait_for("the walk parks its reads", || {
+            fake.walk.held.load(SeqCst) >= PURGE_READS_AT_ONCE
+        })
+        .await;
+        // Nothing else arrives while those are parked.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(fake.walk.held.load(SeqCst), PURGE_READS_AT_ONCE);
+        assert_eq!(fake.ranged_gets.load(SeqCst), PURGE_READS_AT_ONCE);
+        *fake.walk.hold_prefix.lock().unwrap() = None;
+        assert_eq!(walk.await.unwrap(), 0);
+        assert_eq!(fake.ranged_gets.load(SeqCst), 64);
+        assert_eq!(fake.walk.held_peak.load(SeqCst), PURGE_READS_AT_ONCE);
+    }
+
+    #[tokio::test]
+    async fn a_walk_over_n_objects_takes_about_n_round_trips_over_sixteen() {
+        // Issue #462, against a bucket that answers each
+        // header read after a delay standing in for the
+        // store's round trip: one read at a time, a walk
+        // over N objects took N round trips. Sixteen at a
+        // time, it can take no fewer than N / 16 (no more
+        // than sixteen are ever in flight), and it takes
+        // about that many, far fewer than N.
+        use std::sync::atomic::Ordering::SeqCst;
+        const N: u64 = 160;
+        const RTT_MS: u64 = 40;
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        seed_fillers(&fake, "cache/f", N as usize);
+        fake.walk.delay_ms.store(RTT_MS, SeqCst);
+        let started = std::time::Instant::now();
+        assert_eq!(s.purge_group("hero").await, 0);
+        let took = started.elapsed();
+        assert_eq!(fake.ranged_gets.load(SeqCst), N as usize);
+        assert!(fake.walk.delayed_peak.load(SeqCst) <= PURGE_READS_AT_ONCE);
+        let floor = std::time::Duration::from_millis(N / 16 * RTT_MS);
+        let one_at_a_time = std::time::Duration::from_millis(N * RTT_MS);
+        assert!(took >= floor, "{took:?} is under {floor:?}");
+        // Within four times the ideal, a quarter of the
+        // one-at-a-time walk: slack for a loaded machine.
+        assert!(
+            took < one_at_a_time / 4,
+            "{took:?} against {one_at_a_time:?}"
+        );
+    }
+
+    /// A running purge of `group` for the walk registry
+    /// tests.
+    fn group_purge(guard: &Arc<PurgeGuard>, group: &str) -> SharedPurge {
+        SharedPurge {
+            active: guard.begin(PurgeTarget::Group(group.into())),
+            tombstone: None,
+            event: "purge-group",
+            log_target: format!("purge-group/{group}"),
+        }
+    }
+
+    #[test]
+    fn identical_purges_join_the_running_walk_until_it_ends() {
+        // Issue #462: a purge whose target already has a walk
+        // running here joins it instead of walking again; a
+        // different target walks on its own; and once the
+        // leader finds nobody waiting, the target is free.
+        let s = Arc::new(store("http://127.0.0.1:1"));
+        let guard = Arc::new(PurgeGuard::new());
+        let (mut lease, first) = s.lead_or_join(group_purge(&guard, "hero")).unwrap();
+        assert!(s.lead_or_join(group_purge(&guard, "hero")).is_none());
+        assert!(s.lead_or_join(group_purge(&guard, "hero")).is_none());
+        let (mut side_lease, side) = s.lead_or_join(group_purge(&guard, "side")).unwrap();
+        assert_eq!(guard.active_count(), 4);
+        // The leader takes over both joiners at once, and the
+        // target stays taken while it walks for them.
+        let joined = lease.take_joined();
+        assert_eq!(joined.len(), 2);
+        assert!(s.lead_or_join(group_purge(&guard, "hero")).is_none());
+        assert_eq!(lease.take_joined().len(), 1);
+        // Nobody left waiting: the walk is over, and the next
+        // identical purge leads a walk of its own.
+        assert!(lease.take_joined().is_empty());
+        drop(lease);
+        let (mut again, next) = s.lead_or_join(group_purge(&guard, "hero")).unwrap();
+        assert!(again.take_joined().is_empty());
+        assert!(side_lease.take_joined().is_empty());
+        drop((first, side, joined, next));
+        assert_eq!(guard.active_count(), 0);
+    }
+
+    #[test]
+    fn a_dropped_walk_lease_frees_its_target_and_ends_its_joiners() {
+        // Issue #462: if the task walking for a target dies
+        // (a panic, a runtime teardown), the target must not
+        // stay taken, or every later identical purge would
+        // join a walk that never comes. The joined purges end
+        // with the lease; their bucket tombstones, never
+        // marked ended, keep them in force.
+        let s = Arc::new(store("http://127.0.0.1:1"));
+        let guard = Arc::new(PurgeGuard::new());
+        let (lease, first) = s.lead_or_join(group_purge(&guard, "hero")).unwrap();
+        assert!(s.lead_or_join(group_purge(&guard, "hero")).is_none());
+        assert_eq!(guard.active_count(), 2);
+        drop(lease);
+        assert_eq!(guard.active_count(), 1);
+        drop(first);
+        assert!(s.lead_or_join(group_purge(&guard, "hero")).is_some());
     }
 
     #[tokio::test]
