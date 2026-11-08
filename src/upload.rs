@@ -471,17 +471,17 @@ mod tests {
         assert!(validate_upload_name(&at_limit).is_ok());
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("crabcrop-upload-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::canonicalize(&dir).unwrap()
+    /// A scratch directory and its canonical path, which
+    /// the store is built with.
+    fn temp_dir(tag: &str) -> (crate::test_support::ScratchDir, PathBuf) {
+        let scratch = crate::test_support::scratch_dir(&format!("upload-{tag}"));
+        let dir = std::fs::canonicalize(&scratch).unwrap();
+        (scratch, dir)
     }
 
     #[tokio::test]
     async fn local_store_round_trips_and_names_source_refs() {
-        let dir = temp_dir("local");
+        let (_scratch, dir) = temp_dir("local");
         let store = UploadStore::local(dir.clone(), 1024, false);
         assert_eq!(store.source_ref("heroes/cat.jpg"), "file:///heroes/cat.jpg");
         // With the upload dir nested under the file root,
@@ -506,7 +506,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_put_new_creates_exactly_once() {
-        let dir = temp_dir("local-new");
+        let (_scratch, dir) = temp_dir("local-new");
         let store = UploadStore::local(dir.clone(), 1024, false);
         store.put_new("heroes/cat.jpg", b"first").await.unwrap();
         // The conditional create refuses the second writer
@@ -537,8 +537,8 @@ mod tests {
         // a symlink to a directory outside it: a write for
         // a name under it must be refused, and nothing may
         // land outside (audit R2-25).
-        let dir = temp_dir("local-escape");
-        let outside = temp_dir("local-outside");
+        let (_scratch, dir) = temp_dir("local-escape");
+        let (_outside_scratch, outside) = temp_dir("local-outside");
         std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap();
         let store = UploadStore::local(dir.clone(), 1024, true);
         let err = store.put("linked/evil.jpg", b"pixels").await;

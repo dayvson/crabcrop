@@ -1,6 +1,6 @@
 # @crabcrop/mcp
 
-A first-party MCP (Model Context Protocol) server for crabcrop, so coding agents can sign URLs, debug them, inspect results, and purge the cache without hand-rolling the scheme. It is a thin wrapper over [`@crabcrop/url`](../typescript) and the server's HTTP surface. The explainer comes from `@crabcrop/url`; the [playground](../../playground) ships its own copy of the same grammar, and both are pinned by a mirrored grammar corpus in their test suites, while signing everywhere runs the canonical `spec/test-vectors.json`.
+A first-party MCP (Model Context Protocol) server for crabcrop, so coding agents can sign URLs, debug them, inspect results, and purge the cache without hand-rolling the scheme. It is a thin wrapper over [`@crabcrop/url`](../typescript) and the server's HTTP surface. The explainer comes from `@crabcrop/url`, as does the [playground](../../playground)'s, so every JavaScript surface reads one implementation of the grammar, pinned by the shared grammar corpora in `spec/`, while signing everywhere runs the canonical `spec/test-vectors.json`.
 
 ## Tools
 
