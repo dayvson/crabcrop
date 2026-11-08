@@ -63,9 +63,9 @@ jobs:
   # dist generate`, like the jobs at the bottom of this file):
   # a tag run stops here, before anything builds, unless the
   # `release` environment still has a Required reviewers rule
-  # and the tagged commit passed rust.yml on main. plan waits
-  # for this job and every other job waits for plan. Pull
-  # request runs skip it.
+  # and the tagged commit passed rust.yml on main. plan and
+  # the ai-models gate wait for this job, and every other job
+  # waits for one of them. Pull request runs skip it.
   preflight:
     name: Release preflight (approval gate and CI)
     if: ${{ !github.event.pull_request }}
@@ -457,9 +457,11 @@ jobs:
   # run from ai-models.yml in parallel with the builds. The
   # host job above waits for it, so a tag whose AI code fails
   # against the real models never creates a release, pushes an
-  # image, or publishes a package.
+  # image, or publishes a package. Like plan, it starts only
+  # once the preflight passed (issue #457).
   ai-models:
     name: Real-model AI tests (release gate)
+    needs: preflight
     if: ${{ !github.event.pull_request }}
     permissions:
       contents: read

@@ -380,6 +380,44 @@ class Workflow(unittest.TestCase):
         self.assertIn("python3 scripts/release_preflight.py", job)
         self.assertRegex(job, r'"?actions"?: "?read"?')
 
+    def needs(self, name):
+        """The jobs `name` lists under needs:, in any of YAML's three spellings."""
+        lines = self.jobs.get(name, [])
+        for at, line in enumerate(lines):
+            found = re.fullmatch(r"    needs:\s*(.*?)\s*", line)
+            if not found:
+                continue
+            value = found.group(1)
+            if value.startswith("["):
+                return [item.strip() for item in value.strip("[]").split(",") if item.strip()]
+            if value:
+                return [value]
+            listed = []
+            for item in lines[at + 1 :]:
+                if item.lstrip().startswith("#"):
+                    continue
+                entry = re.fullmatch(r"      - ([A-Za-z0-9_-]+)\s*", item)
+                if not entry:
+                    break
+                listed.append(entry.group(1))
+            return listed
+        return []
+
+    def test_every_job_waits_for_preflight(self):
+        # A job that does not wait builds or tests a commit the
+        # preflight refused: the ai-models gate (issue #414) did.
+        for name in self.jobs:
+            if name == "preflight":
+                continue
+            with self.subTest(job=name):
+                waits_for, pending = set(), [name]
+                while pending:
+                    for dependency in self.needs(pending.pop()):
+                        if dependency not in waits_for:
+                            waits_for.add(dependency)
+                            pending.append(dependency)
+                self.assertIn("preflight", waits_for, f"{name} does not wait for the preflight")
+
     def test_plan_waits_for_preflight(self):
         plan = self.job("plan")
         self.assertTrue(re.search(r"needs:\s*\n\s*- preflight\n", plan), "plan does not need preflight")
