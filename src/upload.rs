@@ -20,10 +20,11 @@
 //!   root at the directory when no root is configured
 //!   (and refuses a directory outside a configured root).
 //! - An S3 bucket (or S3-compatible endpoint), reusing
-//!   the source S3 configuration (endpoint, region,
-//!   ambient AWS credentials) exactly like the shared
-//!   result store does. Its objects are served back as
-//!   `s3://` sources.
+//!   the source S3 configuration (endpoint, region, and
+//!   the AWS credentials read once from the environment
+//!   at startup) exactly like the shared result store
+//!   does. Its objects are served back as `s3://`
+//!   sources.
 //!
 //! There is no GCS destination: `gs://` sources are
 //! read-only in this codebase (the loader fetches them

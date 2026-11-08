@@ -17,11 +17,12 @@
 //! write, never a failed request, because a cache must not
 //! take the pipeline down with it. Requests are signed with
 //! SigV4 exactly like the source loader's (`sigv4`), with the
-//! same credentials: `AWS_ACCESS_KEY_ID`,
-//! `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`, read
-//! once from the environment at startup (no credential chain
-//! is consulted). With no credentials the requests go
-//! unsigned, for local S3-compatible development stores.
+//! same credentials: `AWS_ACCESS_KEY_ID` and
+//! `AWS_SECRET_ACCESS_KEY`, plus the optional
+//! `AWS_SESSION_TOKEN`, read once from the environment at
+//! startup (no credential chain is consulted). With no
+//! credentials the requests go unsigned, for local
+//! S3-compatible development stores.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
