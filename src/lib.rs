@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ai;
+mod avif;
 pub mod cache;
 pub mod cli;
 pub mod color;
