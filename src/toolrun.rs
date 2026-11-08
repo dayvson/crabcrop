@@ -137,6 +137,13 @@ pub(crate) enum ToolError {
 /// temporary directory as the working directory, its own
 /// process group, the kernel limits, and the deadline.
 pub(crate) fn run_tool(command: ToolCommand<'_>) -> Result<ToolRun, ToolError> {
+    run_tool_in(command, &std::env::temp_dir())
+}
+
+/// [`run_tool`] with the working directory named: the
+/// temporary directory, or, in tests, a directory that
+/// does not exist.
+fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, ToolError> {
     let ToolCommand {
         program,
         args,
@@ -155,8 +162,17 @@ pub(crate) fn run_tool(command: ToolCommand<'_>) -> Result<ToolRun, ToolError> {
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_clear()
-        .current_dir(std::env::temp_dir());
+        .env_clear();
+    // The temporary directory as the working directory gives
+    // a tool that writes under a relative path a scratch
+    // place, not the server's own directory. It is hygiene,
+    // not a bound: when the directory is missing (a TMPDIR
+    // naming no directory), the tool runs where the server
+    // runs instead of failing every run at spawn with an
+    // error that reads like a missing program.
+    if work_dir.is_dir() {
+        cmd.current_dir(work_dir);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -546,5 +562,53 @@ mod tests {
         limit_child(child.id(), Duration::from_secs(30), 1 << 30);
         let out = child.wait_with_output().unwrap();
         assert!(!out.status.success(), "{}", out.status);
+    }
+
+    /// A shell one-liner as a tool run, under generous
+    /// bounds.
+    fn shell<'a>(script: &'a [&'a str; 2], input: ToolInput<'a>) -> ToolCommand<'a> {
+        ToolCommand {
+            program: Path::new("/bin/sh"),
+            args: script,
+            input,
+            max_stdout: 64 * 1024,
+            max_stderr: 64 * 1024,
+            deadline: std::time::Instant::now() + Duration::from_secs(20),
+            cpu_limit: Duration::from_secs(20),
+        }
+    }
+
+    /// The directory a run's stdout names, resolved the way
+    /// the tool's `pwd -P` resolves it.
+    fn printed_dir(run: &ToolRun) -> std::path::PathBuf {
+        assert!(run.status.success(), "{}: {}", run.status, run.stderr);
+        let printed = String::from_utf8(run.stdout.clone()).unwrap();
+        std::fs::canonicalize(printed.trim()).unwrap()
+    }
+
+    #[test]
+    fn tools_run_in_the_temporary_directory() {
+        // Issue #481: every tool's working directory is the
+        // temporary directory, never the server's own.
+        let run = run_tool(shell(&["-c", "pwd -P"], ToolInput::Bytes(b""))).unwrap();
+        assert_eq!(
+            printed_dir(&run),
+            std::fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_missing_temporary_directory_does_not_fail_the_run() {
+        // A TMPDIR that names no directory used to fail every
+        // run at spawn, with an error that blamed the program.
+        // The tool now runs where the server runs.
+        let missing =
+            std::env::temp_dir().join(format!("crabcrop-toolrun-missing-{}", std::process::id()));
+        assert!(!missing.exists());
+        let run = run_tool_in(shell(&["-c", "pwd -P"], ToolInput::Bytes(b"")), &missing).unwrap();
+        assert_eq!(
+            printed_dir(&run),
+            std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap()
+        );
     }
 }
