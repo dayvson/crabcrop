@@ -130,6 +130,10 @@ step "Browser bundles (client builds of the integrations: Vite, and a full Nuxt 
 step "WordPress plugin"
 (cd plugins/wordpress && php tests/run.php)
 
+step "One JavaScript grammar (the playground serves the SDK's explainer build, and no second copy exists)"
+python3 scripts/sync_playground_sdk.py --check
+python3 scripts/test_sync_playground_sdk.py
+
 step "Playground (unit)"
 (cd playground && npm test)
 

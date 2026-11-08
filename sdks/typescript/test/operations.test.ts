@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildURL, filter, joinOps, ops } from "../src/index.ts";
+import { buildURL, explainUrl, filter, joinOps, ops } from "../src/index.ts";
 
 // AP-24: the typed builders compile to the grammar's canonical
 // strings, byte for byte. Every expected string below is the
@@ -479,4 +479,25 @@ test("typed builders match the generated builder corpus", () => {
       assert.equal(fn(...args), entry.segment, entry.call);
     }
   }
+});
+
+// Issue #482: the builders validate with the explainer's own
+// checks, so the two cannot disagree on the corpus: every
+// segment a builder emits explains cleanly, and every segment
+// a builder refuses (the spelling it would have produced) is
+// one the explainer rejects.
+test("the explainer accepts what the builders emit and rejects what they refuse", () => {
+  let checked = 0;
+  for (const entry of builderCorpus.builder_cases) {
+    if (entry.segment === undefined) continue;
+    const segment = entry.call.startsWith("filter.") ? `filters:${entry.segment}` : entry.segment;
+    const out = explainUrl(`/unsafe/${segment}/https://example.com/a.jpg`);
+    assert.equal(
+      out.errors.length > 0,
+      entry.throws === true,
+      `${entry.call} ${segment}: ${JSON.stringify(out.errors)}`,
+    );
+    checked += 1;
+  }
+  assert.ok(checked > 100, `only ${checked} builder segments checked`);
 });
