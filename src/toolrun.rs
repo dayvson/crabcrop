@@ -796,8 +796,8 @@ mod tests {
         // A TMPDIR that names no directory used to fail every
         // run at spawn, with an error that blamed the program.
         // The tool now runs where the server runs.
-        let missing =
-            std::env::temp_dir().join(format!("crabcrop-toolrun-missing-{}", std::process::id()));
+        let scratch = crate::test_support::scratch_dir("toolrun-missing");
+        let missing = scratch.join("missing");
         assert!(!missing.exists());
         let run = run_tool_in(shell(&["-c", "pwd -P"], ToolInput::Bytes(b"")), &missing).unwrap();
         assert_eq!(
@@ -811,11 +811,10 @@ mod tests {
         // Every tool, not only the encoder (audit R2-31): a
         // wrapper that forks a long-lived grandchild and waits
         // on it is killed at the deadline, grandchild and all.
-        let pid_file =
-            std::env::temp_dir().join(format!("crabcrop-toolrun-group-{}.pid", std::process::id()));
-        // A file left by an earlier run under the same PID
+        // A fresh directory: a file left by an earlier run
         // would name some other process, alive or not.
-        let _ = std::fs::remove_file(&pid_file);
+        let dir = crate::test_support::scratch_dir("toolrun-group");
+        let pid_file = dir.join("grandchild.pid");
         let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
         let argv = ["-c", script.as_str()];
         let mut command = shell(&argv, ToolInput::Bytes(b""));

@@ -239,6 +239,24 @@ test("explainer verdicts match the generated combination corpus", () => {
   }
 });
 
+// Issue #482: the page's explainer is the SDK's own build
+// (../sdk/, written by scripts/sync_playground_sdk.py, whose
+// --check pins the bytes to a fresh build). This pins the
+// behavior as well: on every remainder of both corpora, the
+// page answers exactly what the SDK's source answers.
+test("the explainer is the SDK's: every corpus answer matches it exactly", () => {
+  const inputs = [
+    ...verdictCorpus.cases.map(({ remainder }) => `https://img.example.com/${SIG}/${remainder}`),
+    ...operationVectors.cases.map(
+      ({ remainder }) => `https://img.example.com/${operationVectors.signature}/${remainder}`,
+    ),
+  ];
+  assert.ok(inputs.length > 900, `only ${inputs.length} corpus remainders`);
+  for (const input of inputs) {
+    assert.deepEqual(explainUrl(input, 1700000000), sdk.explainUrl(input, 1700000000), input);
+  }
+});
+
 test("encoder options and per-format quality explain (issue #319)", () => {
   const good = explainUrl(
     `https://x/${SIG}/filters:format(jpeg,progressive,subsampling:444):quality(80,webp:75,jpeg:90)/https://e.com/a.jpg`,

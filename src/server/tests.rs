@@ -470,12 +470,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
 /// canned behavior, so the whole video path runs without
 /// a real encoder.
 async fn spawn_app_with_video(script: &str) -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-video-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-video");
     let path = dir.join("encoder.sh");
     crate::test_support::write_script(&path, script);
     let encoder =
@@ -537,6 +532,9 @@ async fn spawn_app_with_video(script: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        // The scripts last as long as the server: the
+        // test's runtime drops this task when it ends.
+        let _scripts = dir;
         axum::serve(listener, app(state)).await.unwrap();
     });
     format!("http://{addr}")
@@ -550,12 +548,7 @@ async fn spawn_app_with_video(script: &str) -> String {
 /// and its extraction answers with the test PNG, so the
 /// whole frame path runs without a real decoder.
 async fn spawn_app_with_frame_decoder(report: &str) -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-frames-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-frames");
     std::fs::write(dir.join("frame.png"), test_png()).unwrap();
     let frame_path = dir.join("frame.png").display().to_string();
     let script = format!(
@@ -621,6 +614,9 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        // The scripts last as long as the server: the
+        // test's runtime drops this task when it ends.
+        let _scripts = dir;
         axum::serve(listener, app(state)).await.unwrap();
     });
     format!("http://{addr}")
@@ -690,7 +686,8 @@ async fn missing_sources_answer_404_and_transport_failures_502() {
     // A symlink out of the root: the canonicalized path
     // escapes, and the answer must be indistinguishable
     // from the missing file above.
-    let outside = std::env::temp_dir().join(format!("crabcrop-srv-outside-{}", std::process::id()));
+    let outside_dir = crate::test_support::scratch_dir("srv-outside");
+    let outside = outside_dir.join("secret.jpg");
     std::fs::write(&outside, b"secret").unwrap();
     std::os::unix::fs::symlink(&outside, dir.join("link.jpg")).unwrap();
     let remainder = "50x30/file:///link.jpg";
@@ -826,12 +823,7 @@ async fn explain_labels_a_video_source() {
 /// the bytes is a password refusal, CORRUPT is
 /// unreadable.
 async fn spawn_app_with_pdf_renderer() -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-pages-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-pages");
     std::fs::write(dir.join("page.png"), test_png()).unwrap();
     let page_path = dir.join("page.png").display().to_string();
     let write_tool = |name: &str, script: String| {
@@ -905,6 +897,9 @@ async fn spawn_app_with_pdf_renderer() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        // The scripts last as long as the server: the
+        // test's runtime drops this task when it ends.
+        let _scripts = dir;
         axum::serve(listener, app(state)).await.unwrap();
     });
     format!("http://{addr}")
@@ -3188,8 +3183,8 @@ async fn generated_corpus_error_codes_match_the_http_envelope() {
 /// `spec/explain-verdicts.json` and the generated
 /// combinations in `spec/operation-vectors.json`. Every
 /// surface that reads a remainder (the Rust parser, the
-/// TypeScript explainer, the playground's copy) runs the
-/// same files in its own suite; a disagreement anywhere
+/// TypeScript explainer, the playground's build of it) runs
+/// the same files in its own suite; a disagreement anywhere
 /// fails the gate here or there, and the mismatch list is
 /// printed whole so one run shows every divergence.
 /// These tests were put here rather than in url.rs while
@@ -7759,8 +7754,7 @@ async fn cache_status_reports_miss_then_memory_hit() {
 
 #[tokio::test]
 async fn cache_status_reports_a_disk_hit_with_its_tier() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-tier-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-tier");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     // Memory tier disabled: the repeat must come from disk.
     let base = spawn_app_full(preset_test_map(), Some(&dir), 0).await;
@@ -7899,8 +7893,7 @@ async fn purge_group_refuses_transplanted_purge_signatures() {
 
 #[tokio::test]
 async fn group_purge_reaches_the_disk_tier() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-gdisk-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-gdisk");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let base = spawn_app_full(preset_test_map(), Some(&dir), 0).await;
     let remainder = format!("preset:small/{src}");
@@ -8438,8 +8431,7 @@ async fn shared_learns_group(shared: &crate::s3store::S3Store, key: &str, group:
 #[tokio::test]
 async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-drop3-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-drop3");
     let state = tier_test_state(Some(&dir), &fake.endpoint);
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
@@ -8461,8 +8453,7 @@ async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
 #[tokio::test]
 async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-drop4-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-drop4");
     let state = tier_test_state(Some(&dir), &fake.endpoint);
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/i.png";
@@ -8478,8 +8469,7 @@ async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
 
 #[tokio::test]
 async fn disk_task_panic_degrades_and_counts_the_error() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-panic-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-panic");
     let store = std::sync::Arc::new(
         crate::storage::DiskStore::open(
             &dir,
@@ -8506,8 +8496,7 @@ async fn disk_task_panic_degrades_and_counts_the_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn blocked_disk_read_leaves_health_responsive() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-fifo-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-fifo");
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let base = spawn_app_with_storage(&dir).await;
     let remainder = format!("25x25/{src}");
@@ -8568,8 +8557,7 @@ async fn blocked_disk_read_leaves_health_responsive() {
 
 #[tokio::test]
 async fn disk_results_survive_a_fresh_instance_and_purge_invalidates() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-store-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-store");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let remainder = format!("25x25/{src}");
     let sig = sign(&remainder);
@@ -8996,8 +8984,7 @@ async fn rotation_window_verifies_both_keys_and_routes_by_key_id() {
 #[tokio::test]
 async fn shared_results_serve_a_second_replica_and_promote_to_disk() {
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-shared-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-shared");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let remainder = format!("25x25/{src}");
     let sig = sign(&remainder);
@@ -9081,8 +9068,7 @@ async fn a_purge_reaches_the_shared_stores_but_not_another_process_memory() {
     // resurrect it; it does not reach into another
     // process's memory, whose copy keeps serving.
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-p351-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-p351");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let remainder = format!("25x25/{src}");
     let sig = sign(&remainder);
@@ -9692,11 +9678,7 @@ async fn timed_out_encode_releases_the_process_gate() {
     // get a genuine encode attempt on the freed gate
     // instead of the gate-held 503 (Busy) the soak's
     // follow-up requests got.
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-server-stuck-encode-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-stuck-encode");
     let script_path = dir.join("encoder.sh");
     crate::test_support::write_script(
         &script_path,
@@ -10017,10 +9999,7 @@ async fn video_and_animation_permits_are_held_until_the_job_finishes() {
     // its deadline leaves them held while the detached
     // encode drains instead of freeing them for a
     // second encode to stack onto.
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-server-held-permits-{}",
-        std::process::id()
-    ));
+    let dir = crate::test_support::scratch_dir("server-held-permits");
     let encoder = fake_long_encoder(&dir, 9);
     let state = lane_test_state(std::time::Duration::from_millis(300), 2, 1);
     let job = lane_test_job(
@@ -10090,15 +10069,13 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
     // budget, still has budget left when the lane
     // drains at 6 s, so it enters its own encode
     // instead of aborting at its first checkpoint.
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-lane-bound-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-lane-bound");
     let log_path = dir.join("runs.log");
     let script_path = dir.join("encoder.sh");
     crate::test_support::write_script(
         &script_path,
         &format!(
-            "#!/bin/sh\ncat > /dev/null\necho S >> {}\nsleep 6\necho E >> {}\nprintf 'x'\n",
+            "#!/bin/sh\ncat > /dev/null\necho S >> '{}'\nsleep 6\necho E >> '{}'\nprintf 'x'\n",
             log_path.display(),
             log_path.display()
         ),
@@ -10617,8 +10594,7 @@ async fn slow_lane_saturation_leaves_stills_at_full_capacity() {
     // promptly on the untouched stills lane, where
     // before this issue the encode's process permit
     // was one of the stills pool's own.
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-slow-lane-{}", std::process::id()));
+    let dir = crate::test_support::scratch_dir("server-slow-lane");
     let encoder = fake_long_encoder(&dir, 9);
     let state = lane_test_state(std::time::Duration::from_millis(300), 2, 1);
     let stuck_job = lane_test_job(
@@ -11641,11 +11617,8 @@ async fn spawn_app_with_upload_gate(
     format!("http://{addr}")
 }
 
-fn upload_dir(tag: &str) -> std::path::PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-srv-upload-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+fn upload_dir(tag: &str) -> crate::test_support::ScratchDir {
+    crate::test_support::scratch_dir(&format!("srv-upload-{tag}"))
 }
 
 #[tokio::test]
@@ -12623,8 +12596,7 @@ async fn group_membership_learned_on_a_hit_survives_a_restart() {
     // purge after a restart still finds the entry.
     // Before the fix the union lived only in the first
     // instance's memory and the purge below removed 0.
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-gprop-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-gprop");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let base = spawn_app_full(preset_test_map(), Some(&dir), 16 * 1024 * 1024).await;
     // The plain spelling stores the entry group-free
@@ -12676,8 +12648,7 @@ async fn purge_during_a_render_keeps_the_entry_out_of_every_tier() {
     // so the finished render cannot restore the entry
     // to any tier.
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-pdr-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-pdr");
     let (src, hits) = spawn_slow_counting_server(test_png(), 1200).await;
     let base = spawn_app_with_shared(Some(&dir), &fake.endpoint).await;
     let remainder = format!("25x25/{src}");
@@ -12740,8 +12711,7 @@ async fn group_purge_during_a_render_keeps_the_entry_out() {
     // Issue #350, the group form: a group purge that
     // lands while a grouped render is in flight keeps
     // the finished render out of the tiers.
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-gpdr-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-gpdr");
     let (src, hits) = spawn_slow_counting_server(test_png(), 1200).await;
     let base = spawn_app_full(preset_test_map(), Some(&dir), 16 * 1024 * 1024).await;
     let preset = format!("preset:small/{src}");
@@ -12797,7 +12767,7 @@ async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 /// its walk reaches the entry.
 struct WalkFixture {
     fake: crate::s3store::test_support::FakeS3,
-    dir: std::path::PathBuf,
+    dir: crate::test_support::ScratchDir,
     hits: Arc<AtomicUsize>,
     probe: AppState,
     server: tokio::task::JoinHandle<()>,
@@ -12811,8 +12781,7 @@ struct WalkFixture {
 impl WalkFixture {
     async fn new(name: &str) -> Self {
         let fake = crate::s3store::test_support::start_fake().await;
-        let dir = std::env::temp_dir().join(format!("crabcrop-srv-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_support::scratch_dir(&format!("srv-{name}"));
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
         let mut state = tier_test_state(Some(&dir), &fake.endpoint);
         state.presets = preset_test_map();
@@ -12958,12 +12927,6 @@ impl WalkFixture {
     }
 }
 
-impl Drop for WalkFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
 #[tokio::test]
 async fn lookups_during_a_background_purge_walk_do_not_resurrect_the_entry() {
     // Issue #400: a shared purge walk that outgrows the
@@ -13042,8 +13005,7 @@ async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
     // still serve, and once the purge ends a fresh copy
     // serves again.
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-active-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-active");
     let state = tier_test_state(Some(&dir), &fake.endpoint);
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
@@ -13215,8 +13177,7 @@ async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
     // A replica that boots after the purge, with a disk of
     // its own that kept a pre-purge copy, misses on both.
     fx.restore_stale_bucket_copy().await;
-    let other_dir = fx.dir.with_extension("other");
-    let _ = std::fs::remove_dir_all(&other_dir);
+    let other_dir = crate::test_support::scratch_dir("srv-walk-other");
     let booted = fx.other_replica(Some(&other_dir));
     let booted_disk = booted.store.clone().unwrap();
     booted_disk.put(&fx.key, &fx.stale);
@@ -13224,7 +13185,6 @@ async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
     assert!(lookup_tiers(&booted, &fx.key, &[]).await.is_none());
     assert!(booted_disk.get(&fx.key).is_none(), "the disk copy survived");
     assert!(!fx.bucket_holds_stale(), "the bucket copy survived");
-    let _ = std::fs::remove_dir_all(&other_dir);
     // The restarted receiving server, over the same disk
     // and bucket with fresh memory, misses on the purged
     // URL and renders it again from the origin.

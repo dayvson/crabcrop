@@ -157,25 +157,25 @@ fn model_identities_report_file_names_not_paths() {
     assert_eq!(report.model, "clip_vision.onnx");
 }
 
-/// Write bytes to a fresh temp file and return its
-/// path: the load() failure tests need real files
-/// (a garbage model) without committing fixtures.
-fn temp_file(tag: &str, contents: &[u8]) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "crabcrop-moderation-load-{tag}-{}.bin",
-        std::process::id()
-    ));
+/// Write bytes to a fresh temp file and return the
+/// scratch directory it lives in and its path: the
+/// load() failure tests need real files (a garbage
+/// model) without committing fixtures (issue #526).
+fn temp_file(tag: &str, contents: &[u8]) -> (crate::test_support::ScratchDir, String) {
+    let dir = crate::test_support::scratch_dir(&format!("moderation-load-{tag}"));
+    let path = dir
+        .join(format!("{tag}.bin"))
+        .to_string_lossy()
+        .into_owned();
     std::fs::write(&path, contents).unwrap();
-    path.to_string_lossy().into_owned()
+    (dir, path)
 }
 
-/// A path inside the temp dir that is never created.
+/// A path that does not exist: a name inside a scratch
+/// directory that is removed again before this returns.
 fn missing_path(tag: &str) -> String {
-    std::env::temp_dir()
-        .join(format!(
-            "crabcrop-moderation-load-missing-{tag}-{}.onnx",
-            std::process::id()
-        ))
+    crate::test_support::scratch_dir(&format!("moderation-load-missing-{tag}"))
+        .join(format!("{tag}.onnx"))
         .to_string_lossy()
         .into_owned()
 }
@@ -279,7 +279,7 @@ fn moderation_load_missing_model_file_is_a_load_error() {
 #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
 fn moderation_load_garbage_model_file_is_a_load_error() {
     let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-    let garbage = temp_file("moderation-garbage", b"this is not an onnx model at all");
+    let (_model, garbage) = temp_file("moderation-garbage", b"this is not an onnx model at all");
     let message = expect_load(OnnxModerationProvider::load(Some(&dylib), &garbage, None));
     assert!(message.contains("cannot load the model"), "{message}");
 }

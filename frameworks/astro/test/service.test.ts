@@ -181,3 +181,12 @@ test("dimensions and the base follow the rule all five integrations share (issue
     emptyBase: () => service.getURL({ src: table.SRC, width: 100 }, cfg({ base: "" })),
   });
 });
+
+test("format and quality follow the SDK's grammar (issue #482)", async () => {
+  const grammar = await import("../../grammar-table.mjs");
+  const config = cfg({ base: table.BASE });
+  grammar.checkFormatTable({
+    format: (format: string) => service.getURL({ src: table.SRC, format }, config),
+    quality: (quality: number) => service.getURL({ src: table.SRC, quality }, config),
+  });
+});
