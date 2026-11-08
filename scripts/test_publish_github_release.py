@@ -65,7 +65,7 @@ class PublishGithubRelease(unittest.TestCase):
     def publish(self, release, *args, fail=""):
         """Run the script against a stub repository; returns (exit code, gh calls)."""
         if not args:
-            args = ("v0.9.11", COMMIT, "0.9.11 - 2026-11-07", str(self.notes), "false", *self.assets)
+            args = ("v1.2.3", COMMIT, "1.2.3 - 2026-11-07", str(self.notes), "false", *self.assets)
         env = {
             **os.environ,
             "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -78,19 +78,19 @@ class PublishGithubRelease(unittest.TestCase):
         self.output = done.stdout + done.stderr
         return done.returncode, calls
 
-    def view(self, tag="v0.9.11"):
+    def view(self, tag="v1.2.3"):
         return ["release", "view", "--json", "tagName,isDraft", "--", tag]
 
-    def create(self, tag="v0.9.11", title="0.9.11 - 2026-11-07", prerelease="false", assets=None):
+    def create(self, tag="v1.2.3", title="1.2.3 - 2026-11-07", prerelease="false", assets=None):
         return [
             "release", "create", "--target", COMMIT, f"--prerelease={prerelease}",
             "--title", title, "--notes-file", str(self.notes), "--", tag, *(assets or self.assets),
         ]
 
-    def upload(self, tag="v0.9.11", assets=None):
+    def upload(self, tag="v1.2.3", assets=None):
         return ["release", "upload", "--clobber", "--", tag, *(assets or self.assets)]
 
-    def edit(self, tag="v0.9.11", title="0.9.11 - 2026-11-07", prerelease="false"):
+    def edit(self, tag="v1.2.3", title="1.2.3 - 2026-11-07", prerelease="false"):
         return [
             "release", "edit", "--target", COMMIT, "--title", title, "--notes-file", str(self.notes),
             f"--prerelease={prerelease}", "--draft=false", "--", tag,
@@ -146,7 +146,7 @@ class PublishGithubRelease(unittest.TestCase):
         root = Path(self.tmp.name)
         asset = root / "-x.tar.xz"
         asset.write_text("x")
-        tag, title = "-v0.9.11", "--draft"
+        tag, title = "-v1.2.3", "--draft"
         for release in ("absent", "published"):
             with self.subTest(release=release):
                 self.log.unlink(missing_ok=True)
@@ -160,15 +160,15 @@ class PublishGithubRelease(unittest.TestCase):
                         self.assertEqual(call[call.index("--title") + 1], title)
 
     def test_values_are_passed_verbatim(self):
-        title = "0.9.11 $(touch pwned) `id` ; rm -rf / \"quoted\"\nsecond line"
-        code, calls = self.publish("absent", "v0.9.11", COMMIT, title, str(self.notes), "false", *self.assets)
+        title = "1.2.3 $(touch pwned) `id` ; rm -rf / \"quoted\"\nsecond line"
+        code, calls = self.publish("absent", "v1.2.3", COMMIT, title, str(self.notes), "false", *self.assets)
         self.assertEqual(code, 0, self.output)
         self.assertEqual(calls[-1], self.create(title=title))
         self.assertFalse((Path.cwd() / "pwned").exists())
 
     def test_invalid_arguments_make_no_gh_call(self):
         missing = str(Path(self.tmp.name) / "missing")
-        good = ["v0.9.11", COMMIT, "title", str(self.notes), "false", *self.assets]
+        good = ["v1.2.3", COMMIT, "title", str(self.notes), "false", *self.assets]
         cases = {
             "too few arguments": good[:5],
             "no assets": good[:5],

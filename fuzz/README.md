@@ -78,8 +78,10 @@ never enter a normal build.
 
 `Cargo.lock` here pins the same versions as the root
 lockfile. Because the package builds the server library,
-a dependency added or bumped in the root manifest (or a
-release version bump) can leave it stale, and the
+a dependency added or bumped in the root manifest can
+leave it stale (a release version bump does not:
+`scripts/bump_version.py` moves this lockfile's
+`crabcrop` and `crabcrop-url` entries), and the
 smoke's `--locked` build (in `scripts/test_all.sh` and
 CI) then fails until it is refreshed. Refresh it from
 the root lockfile:

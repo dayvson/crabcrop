@@ -71,8 +71,9 @@ fi
 step "Operation vectors (the generated corpus is current)"
 python3 spec/generate_operation_vectors.py --check
 
-step "Version consistency (every artifact and deploy pin agrees)"
+step "Version consistency (every artifact and deploy pin agrees, and a bump moves them all)"
 python3 scripts/check_versions.py
+python3 scripts/test_version_tools.py
 
 step "Rendering version (a corpus re-baseline since the last release tag raises it)"
 python3 scripts/check_rendering_version.py
