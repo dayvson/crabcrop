@@ -87,7 +87,9 @@ python3 scripts/sync_playground_sdk.py
 
 `scripts/test_all.sh` runs the script with `--check`, which fails when
 `playground/sdk/` is stale or when a second copy of the grammar appears in the
-JavaScript sources.
+JavaScript sources. The copy is `tsc` output, so a TypeScript bump in
+`sdks/typescript` (a Dependabot pull request, say) can change it: run the
+script on that branch too.
 
 ## Changelog
 

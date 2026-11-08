@@ -1,6 +1,6 @@
 # crabcrop playground
 
-A static page for building, signing, previewing, and debugging crabcrop URLs. No build step, no server state: serve this directory from any static host (or open `index.html` from disk) and point it at your crabcrop endpoint.
+A static page for building, signing, previewing, and debugging crabcrop URLs. No build step, no server state: serve this directory from any static host and point it at your crabcrop endpoint. Browsers do not load module scripts from `file://`, so opening `index.html` from disk does not work.
 
 ```bash
 python3 -m http.server --directory playground 8910

@@ -102,9 +102,21 @@ class SyncTest(unittest.TestCase):
         self.tree.write("frameworks/astro/x.astro", "<script>const re = /^[\\p{L}\\p{N} _.\\-/]+$/u;</script>\n")
         self.tree.write("sdks/mcp/src/index.ts", "const table = {\n  explainSegment(seg) {\n  },\n};\n")
         self.tree.write("sdks/typescript/src/operations.ts", 'throw new Error("the server rejects this filter");\n')
+        # A renamed copy still prints the explainer's messages, or
+        # spells the charset the long way.
+        self.tree.write("frameworks/sveltekit/grammar.js", (
+            'const charset = /^[\\p{Letter}\\p{Number} _.\\-/]+$/u;\n'
+            'const none = ["no signature segment: the path is a single segment"];\n'
+            "const big = `expiry overflows the server's u64 parser: ${seg}`;\n"
+            "const view = `unsupported debug view: ${seg}`;\n"
+        ))
         self.assertEqual(sps.grammar_copies(self.root), [
             "frameworks/astro/x.astro:1: <script>const re = /^[\\p{L}\\p{N} _.\\-/]+$/u;</script>",
             "frameworks/nuxt/crabcrop.ts:1: const isSizeShaped = (seg: string) => false;",
+            "frameworks/sveltekit/grammar.js:1: const charset = /^[\\p{Letter}\\p{Number} _.\\-/]+$/u;",
+            'frameworks/sveltekit/grammar.js:2: const none = ["no signature segment: the path is a single segment"];',
+            "frameworks/sveltekit/grammar.js:3: const big = `expiry overflows the server's u64 parser: ${seg}`;",
+            "frameworks/sveltekit/grammar.js:4: const view = `unsupported debug view: ${seg}`;",
             "playground/lib.mjs:1: function validateFilter(name, args) {",
             "sdks/mcp/src/index.ts:2: explainSegment(seg) {",
             'sdks/typescript/src/operations.ts:1: throw new Error("the server rejects this filter");',

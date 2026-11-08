@@ -19,9 +19,14 @@ generated-file header. --check changes nothing and fails when:
   or is left over from an older build (a grammar change that was not
   synced, or a hand edit);
 - a JavaScript or TypeScript source anywhere else defines the grammar
-  again: a function named like one of the explainer's, the explainer's
-  rejection text, or the class-name charset. Tests are not scanned:
-  they quote the explainer's messages to check them.
+  again: a function named like one of the explainer's, one of the
+  explainer's own messages, or the class-name charset. Tests are not
+  scanned: they quote the explainer's messages to check them.
+
+The copy scan reads names and text only, so a copy renamed and reworded
+throughout gets past it. It catches a paste or a lightly edited one;
+the corpus tests (every surface against spec/operation-vectors.json and
+spec/explain-verdicts.json) catch a copy that behaves differently.
 
 scripts/test_all.sh runs --check; scripts/test_sync_playground_sdk.py
 tests this script.
@@ -47,7 +52,8 @@ HEADER = (
 )
 
 # What a second copy of the grammar looks like: the explainer's own
-# function names, its rejection text, and the class-name charset.
+# function names, messages only it prints, and the class-name charset
+# (in either property-name spelling).
 GRAMMAR_FUNCTIONS = (
     "validateFilter",
     "explainFilters",
@@ -61,7 +67,10 @@ MARKERS = [
     re.compile(r"\b(?:const|let|var)\s+(?:%s)\s*=" % "|".join(GRAMMAR_FUNCTIONS)),
     re.compile(r"\b(?:%s)\s*\([^)]*\)\s*(?::[^{]*)?\{" % "|".join(GRAMMAR_FUNCTIONS)),
     re.compile(r"the server rejects this filter"),
-    re.compile(r"\\p\{L\}\\p\{N\}"),
+    re.compile(r"no signature segment: the path is a single segment"),
+    re.compile(r"expiry overflows the server's u64 parser"),
+    re.compile(r"unsupported debug view"),
+    re.compile(r"\\p\{(?:L|Letter)\}\\p\{(?:N|Number)\}"),
 ]
 SOURCE_SUFFIXES = {
     ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx",
