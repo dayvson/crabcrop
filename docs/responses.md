@@ -23,18 +23,20 @@ Entries in the persistent tiers are authenticated: each stored entry carries an 
 
 ### Color management and metadata
 
-Pixels are decoded in the source profile's space. When the source embeds an ICC profile (JPEG and PNG sources are read), crabcrop converts to sRGB with an embedded-profile color transform before any operation runs, so sizes, crops, and filters all work in one known space; a source with no profile is assumed to be sRGB already. `filters:keep_profile` opts out per request: no conversion, and the source profile is embedded into JPEG and PNG outputs instead. CMYK JPEGs decode through the JPEG decoder's own CMYK conversion (embedded CMYK profiles are not honored yet); grayscale profiles are not transformed.
+Pixels are decoded in the source profile's space. When the source embeds an ICC profile (JPEG and PNG sources are read), crabcrop converts to sRGB with an embedded-profile color transform before any operation runs, so sizes, crops, and filters all work in one known space; a source with no profile is assumed to be sRGB already. `filters:keep_profile` opts out per request: no conversion, and the source profile is embedded into JPEG and PNG outputs instead. Only a well-formed profile of at most 256 KiB is embedded: its header's size field must match its length, and the `acsp` signature must be in place. Any other profile is converted to sRGB even under `keep_profile`, as for output formats that cannot carry a profile, since pixels left in a space nothing labels would show wrong colors. CMYK JPEGs decode through the JPEG decoder's own CMYK conversion (embedded CMYK profiles are not honored yet); grayscale profiles are not transformed.
 
 Metadata follows an operator policy, `CRABCROP_METADATA`:
 
 | Value | Behavior |
 | --- | --- |
 | `strip` (default) | Outputs carry no source metadata. |
-| `preserve` | JPEG outputs gain the source's EXIF, XMP, and Photoshop (IPTC) segments; PNG outputs gain EXIF and XMP. Other output formats do not carry preserved metadata. |
+| `preserve` | JPEG outputs gain the source's EXIF, XMP, and Photoshop (IPTC) segments; PNG outputs gain EXIF and XMP (the XMP packet compressed if the source stored it compressed, plain text otherwise). Other output formats do not carry preserved metadata. |
 
 Preservation copies the source segments rather than re-serializing them, with one patch: the EXIF orientation is rewritten to 1, because the pixels were already rotated at decode and the original value would double-rotate in viewers. EXIF orientation itself is always honored at decode, under either policy.
 
-Reading a source's profile and metadata is bounded, because PNG stores the profile, and can store the XMP packet, compressed. Only the first profile (`iCCP`), EXIF (`eXIf`), and XMP packet of a PNG are read; repeats are skipped unread (libpng likewise honors only the first profile). A profile that inflates past 4 MiB, or an XMP packet past 16 MiB, is dropped rather than truncated, and all of one source's metadata inflates within a single 20 MiB budget. Under `strip`, the EXIF, XMP, and Photoshop segments of JPEG and PNG sources are not extracted at all (the EXIF orientation is still read and honored at decode); the profile always is, since it drives the color conversion.
+Reading a source's profile and metadata is bounded, because PNG stores the profile, and can store the XMP packet, compressed. Only the first profile (`iCCP`), EXIF (`eXIf`), and XMP packet of a PNG are read; repeats are skipped unread (libpng likewise honors only the first profile). A profile that inflates past 4 MiB, or an XMP packet past 256 KiB, is dropped rather than truncated, and all of one source's metadata inflates within a single 4.25 MiB budget. Under `strip`, the EXIF, XMP, and Photoshop segments of JPEG and PNG sources are not extracted at all (the EXIF orientation is still read and honored at decode); the profile always is, since it drives the color conversion.
+
+Writing metadata back out is bounded too. A PNG output stores the profile compressed, and the XMP packet compressed whenever the source did, so each weighs at most about what it weighed in the source. A JPEG output stores both uncompressed, so the caps set the ceiling there: the profile adds at most 256 KiB, and an XMP packet that does not fit one 64 KiB segment is left out. EXIF and Photoshop segments are copied at the size they had in the source.
 
 ### Fallback image
 
