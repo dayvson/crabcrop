@@ -2,7 +2,7 @@
 //! Credentials a source carries, and sign outputs when the
 //! operator configured a signing identity.
 //!
-//! Design settled by the spike (2026-10-28):
+//! The design:
 //!
 //! - A manifest never survives this pipeline byte-wise:
 //!   decode and re-encode drop the JPEG APP11 / PNG chunk a
@@ -282,8 +282,8 @@ pub fn webp_is_animated(bytes: &[u8]) -> bool {
         && bytes[20] & 0x02 != 0
 }
 
-/// Which output formats v1 signs: the still formats the
-/// spike proved end to end. GIF, JPEG XL, and video
+/// Which output formats are signed: the still formats
+/// proven end to end. GIF, JPEG XL, and video
 /// outputs are served unsigned (meta reports the output
 /// as carrying no manifest).
 pub fn signable_mime(format: crate::url::ImageFormat) -> Option<&'static str> {

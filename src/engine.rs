@@ -99,10 +99,10 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     }
     // Fast paths for the two hottest source formats, taken only
     // where they are output-identical to the generic decode
-    // below (perf wave 3, codecs lane; the probe above has
-    // already enforced the dimension and allocation budgets).
-    // Any fast-path failure falls through to the generic decode,
-    // so error behavior for corrupt or exotic files is unchanged.
+    // below (the probe above has already enforced the
+    // dimension and allocation budgets). Any fast-path failure
+    // falls through to the generic decode, so corrupt or exotic
+    // files get the generic decode's error behavior.
     match image::guess_format(bytes) {
         Ok(image::ImageFormat::Jpeg) => {
             if let Some(img) = decode_jpeg_direct(bytes) {
@@ -1261,10 +1261,10 @@ impl Engine {
         // per format so a budget cannot multiply an expensive
         // encode without limit, and the descent is planned against
         // the attempts that remain (see `next_quality`), so the
-        // last allowed attempt always lands on the quality floor:
-        // the walk used to stop wherever the encode pool ran out
-        // (quality 15 from a 95 start), leaving tighter budgets
-        // silently unchased (issue #229).
+        // last allowed attempt always lands on the quality floor
+        // instead of wherever the encode pool runs out, and a
+        // tight budget is never left silently unchased (issue
+        // #229).
         let quality_bearing = matches!(
             format,
             ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
@@ -1778,18 +1778,18 @@ fn decode_webp_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
 
 /// Encode frames as an animated WebP through libwebp's
 /// animated encoder (the `webp` crate's `AnimEncoder`, method
-/// 4), since issue #323. The pure-Rust encoder it replaces
-/// (oxideav-webp) writes lossless VP8L frames only and has no
-/// lossy animation mode, so animated output had no quality
-/// lever and a cold encode of a real animation ran past the
+/// 4; issue #323). The pure-Rust alternative (oxideav-webp)
+/// writes lossless VP8L frames only and has no lossy
+/// animation mode, so animated output through it has no
+/// quality lever, and a cold encode of a real animation ran past the
 /// 600 s processing deadline on the production soak host
 /// (issue #310). The quality mapping matches the still path
-/// in [`encode::encode_webp`]: the default quality is 80, quality
+/// in `encode::encode_webp`: the default quality is 80, quality
 /// below 100 is a lossy encode at that quality, and quality
 /// 100 is a lossless encode through the same libwebp encoder.
 /// The lossless corner stays on libwebp because its animated
-/// lossless encode is faster than the oxideav lossless encode
-/// it replaces, not slower: on the soak site files the oxideav
+/// lossless encode is faster than the oxideav lossless
+/// encode, not slower: on the soak site files the oxideav
 /// encode did not finish inside the 600 s deadline at all,
 /// while libwebp lossless took 23.6 s for the 40 frame mascot
 /// and 148.5 s for the 120 frame snap-toy (measured in the
@@ -1972,10 +1972,6 @@ fn upscale_image(
     Ok(img)
 }
 
-/// Apply the operations to one image, collecting the encoding
-/// directives along the way. Shared by the still pipeline and
-/// the animated paths (GIF and WebP), which run it once per
-/// frame.
 /// The effective DPR factor: an explicit `dpr(...)` directive
 /// wins, then the client hint carried on the context, else 1.
 fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
@@ -2306,8 +2302,8 @@ type ApplyOutcome = (
 /// and resampling that. The backend computes its convolution
 /// coefficients against the full-source geometry when a crop
 /// box is set, so the fused result differs from the two-step
-/// chain by rounding-class deltas: the wave-3 pipeline lane
-/// measured 1.0 to 3.5 percent of pixels differing, a max
+/// chain by rounding-class deltas, measured at 1.0 to 3.5
+/// percent of pixels differing, a max
 /// delta of 4 on downscales and 10 on upscales, and a mean
 /// delta of at most 0.027, for a 1.5 to 3.6x speedup on the
 /// fused shapes. Any chain the gates in [`fusion_plan`] do
@@ -2415,16 +2411,6 @@ fn fusion_plan(ops: &[Operation]) -> Option<FusionPlan> {
     })
 }
 
-/// Smart crop windows shared across the frames of one
-/// animated render (issue #376): the first frame's smart
-/// crop decides its window, and every later frame replays
-/// that window instead of running the focal analysis
-/// again, so the crop cannot jitter frame to frame and
-/// the analysis behind it (saliency, plus face detection
-/// when a provider feeds it) runs once per render, not
-/// once per frame. Entries key on the crop's position in
-/// the chain and the frame dimensions it decided on, so
-/// a frame of a different size decides for itself.
 /// One shared smart crop window: the chain position and
 /// frame dimensions it was decided on, and the window
 /// itself as (x, y, width, height).
@@ -2436,6 +2422,16 @@ struct SmartWindow {
     window: (u32, u32, u32, u32),
 }
 
+/// Smart crop windows shared across the frames of one
+/// animated render (issue #376): the first frame's smart
+/// crop decides its window, and every later frame replays
+/// that window instead of running the focal analysis
+/// again, so the crop cannot jitter frame to frame and
+/// the analysis behind it (saliency, plus face detection
+/// when a provider feeds it) runs once per render, not
+/// once per frame. Entries key on the crop's position in
+/// the chain and the frame dimensions it decided on, so
+/// a frame of a different size decides for itself.
 #[derive(Debug, Default)]
 struct SmartWindows {
     entries: Vec<SmartWindow>,
@@ -2467,6 +2463,10 @@ impl SmartWindows {
     }
 }
 
+/// Apply the operations to one image, collecting the encoding
+/// directives along the way. Shared by the still pipeline and
+/// the animated paths (GIF and WebP), which run it once per
+/// frame.
 fn apply_operations(
     mut img: DynamicImage,
     ops: &[Operation],
@@ -2938,7 +2938,7 @@ fn apply_operations(
                 // One filter at a time, in order: watermark
                 // filters resolve against the server-fetched
                 // images, everything else goes through
-                // `apply_filters` as before. The deadline is
+                // `apply_filters_filled`. The deadline is
                 // checked between filters, not only between
                 // operations: a segment is one operation to
                 // the per-operation check, so without this a
@@ -3814,7 +3814,7 @@ fn apply_size_windowed(
 /// Lanczos3. Same filter as the image crate's Lanczos3 up to
 /// rounding (max diff 1 per channel on photo content), except
 /// alpha: the backend resamples premultiplied alpha, so colors
-/// stored under transparent pixels no longer bleed into visible
+/// stored under transparent pixels do not bleed into visible
 /// ones. Pixel types the backend does not cover fall back to
 /// the image crate.
 pub(crate) fn resize_lanczos3(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {

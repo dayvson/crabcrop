@@ -4,10 +4,7 @@
 //! objects crop), plus the process context threaded
 //! through the operations.
 //!
-//! Extracted from engine.rs as a pure code move: every
-//! type keeps its name, fields, and behavior, and
-//! engine.rs re-exports them, so existing paths do not
-//! change.
+//! engine.rs re-exports these types.
 
 use super::EngineError;
 use crate::filters::WatermarkImages;

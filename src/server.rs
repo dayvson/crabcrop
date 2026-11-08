@@ -589,7 +589,6 @@ async fn fallback_source_bytes(state: &AppState) -> Option<Vec<u8>> {
     }
 }
 
-/// `GET /explain/<signature>/<operations...>/<image-url>`:
 /// Whether a probe head settles the explain report's
 /// source facts: the probe knows the kind, and it either
 /// has the dimensions or the kind is one whose dimensions
@@ -600,6 +599,7 @@ fn probe_settled(head: &[u8]) -> bool {
     probe.kind != "unknown" && (probe.dimensions.is_some() || matches!(probe.kind, "video" | "pdf"))
 }
 
+/// `GET /explain/<signature>/<operations...>/<image-url>`:
 /// the self-explaining URL report (issue #196; the report
 /// itself is built in [`crate::explain`]).
 ///
@@ -825,20 +825,6 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
     error_response(status, code, message, accept)
 }
 
-/// `POST /purge/<signature>/<path>`: invalidate every stored
-/// variant of one result. The removal spans this process's
-/// tiers (its memory, its disk store, and the shared store);
-/// it does not reach another process's memory, so a replica
-/// can keep serving its own copy until it evicts or restarts
-/// (issue #351). The signature is an HMAC over the
-/// path under a purge subkey derived from the secret (see
-/// [`crate::url::purge_key`]), so only the secret holder can
-/// purge and an image signature can never be replayed here; a
-/// bad signature is a 403 and purges nothing. Idempotent:
-/// purging an absent entry answers 200 with a count of 0.
-/// One structured line per purge request (audit PL-8): the
-/// destructive, secret-gated endpoint must be auditable. The
-/// target is hashed; a raw target can carry signed URLs.
 /// How many shared-tier objects one purge request scans
 /// inline (issue #368): the shared walk reads entry
 /// headers one at a time, so its inline cost must not
@@ -873,6 +859,9 @@ fn spawn_shared_purge_rest(
     }
 }
 
+/// One structured line per purge request (audit PL-8): the
+/// destructive, secret-gated endpoint must be auditable. The
+/// target is hashed; a raw target can carry signed URLs.
 fn purge_log(event: &str, target: &str, removed: Option<usize>) {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(target.as_bytes());
@@ -885,6 +874,17 @@ fn purge_log(event: &str, target: &str, removed: Option<usize>) {
     }
 }
 
+/// `POST /purge/<signature>/<path>`: invalidate every stored
+/// variant of one result. The removal spans this process's
+/// tiers (its memory, its disk store, and the shared store);
+/// it does not reach another process's memory, so a replica
+/// can keep serving its own copy until it evicts or restarts
+/// (issue #351). The signature is an HMAC over the
+/// path under a purge subkey derived from the secret (see
+/// [`crate::url::purge_key`]), so only the secret holder can
+/// purge and an image signature can never be replayed here; a
+/// bad signature is a 403 and purges nothing. Idempotent:
+/// purging an absent entry answers 200 with a count of 0.
 async fn purge_handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -1002,7 +1002,7 @@ async fn purge_handle(
     // caller disconnects mid-purge; dropping the
     // JoinHandle detaches the task instead of cancelling
     // it. The caller waits for the count, so the response
-    // is unchanged.
+    // still carries it.
     let task_state = state.clone();
     let task_target = target.to_string();
     let removed = tokio::spawn(async move {
@@ -1202,39 +1202,6 @@ async fn run_upload_validation(state: &AppState, bytes: Vec<u8>) -> UploadValida
     }
 }
 
-/// `PUT /upload/<signature>/<name>`: store one original
-/// (issue #168). The route is registered only when a
-/// destination is configured, so `upload` here is always
-/// `Some`; the handler still answers 404 without one, so
-/// the rule holds however the state was built.
-///
-/// The signature is an HMAC over the name under an upload
-/// subkey derived from the secret (see
-/// [`crate::url::verify_upload`]): only the secret holder
-/// can upload, an image or purge signature can never be
-/// replayed here, and `unsafe` is never honored. The
-/// expiring form (issue #192) signs
-/// `exp:<unix-seconds>/<name>` instead and presents as
-/// `/upload/<signature>/exp:<unix-seconds>/<name>`; the
-/// expiry is inside the signed string, so it can neither
-/// be stripped nor extended, and an expired token is a
-/// 403 like an expired image URL. The checks run cheapest
-/// first: signature, expiry, name shape, body size (read
-/// with the cap as a hard bound, so an oversize body is
-/// never fully buffered), the overwrite policy (so a
-/// refused duplicate never pays a decode), and image
-/// decode through the pipeline's own validation, run
-/// under the process gate like any transform. What is
-/// stored is the prepared form: the sanitized document
-/// for an SVG, the caller's bytes for anything else, and
-/// only when the name's extension matches the media kind
-/// the body validated as. With overwriting off, the
-/// final write is a conditional create, so the 409 the
-/// policy promises holds even against a racing upload.
-/// On success the body of the response is the exact
-/// source reference to embed in transform URLs: `201`
-/// for a new object, `200` when an allowed overwrite
-/// replaced one.
 /// Remove every cached derivative of `source` from all
 /// three of this process's tiers; returns the total
 /// removed. The upload
@@ -1276,6 +1243,39 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
     .unwrap_or(0)
 }
 
+/// `PUT /upload/<signature>/<name>`: store one original
+/// (issue #168). The route is registered only when a
+/// destination is configured, so `upload` here is always
+/// `Some`; the handler still answers 404 without one, so
+/// the rule holds however the state was built.
+///
+/// The signature is an HMAC over the name under an upload
+/// subkey derived from the secret (see
+/// [`crate::url::verify_upload`]): only the secret holder
+/// can upload, an image or purge signature can never be
+/// replayed here, and `unsafe` is never honored. The
+/// expiring form (issue #192) signs
+/// `exp:<unix-seconds>/<name>` instead and presents as
+/// `/upload/<signature>/exp:<unix-seconds>/<name>`; the
+/// expiry is inside the signed string, so it can neither
+/// be stripped nor extended, and an expired token is a
+/// 403 like an expired image URL. The checks run cheapest
+/// first: signature, expiry, name shape, body size (read
+/// with the cap as a hard bound, so an oversize body is
+/// never fully buffered), the overwrite policy (so a
+/// refused duplicate never pays a decode), and image
+/// decode through the pipeline's own validation, run
+/// under the process gate like any transform. What is
+/// stored is the prepared form: the sanitized document
+/// for an SVG, the caller's bytes for anything else, and
+/// only when the name's extension matches the media kind
+/// the body validated as. With overwriting off, the
+/// final write is a conditional create, so the 409 the
+/// policy promises holds even against a racing upload.
+/// On success the body of the response is the exact
+/// source reference to embed in transform URLs: `201`
+/// for a new object, `200` when an allowed overwrite
+/// replaced one.
 async fn upload_handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
     let accept = req
         .headers()
@@ -1671,6 +1671,7 @@ async fn handle(
     response
 }
 
+/// Run one image request, timing each stage into the returned record.
 async fn serve(
     state: &AppState,
     path: &str,
@@ -2041,8 +2042,7 @@ async fn serve(
         max_age,
         sealed,
     };
-    // Debug requests keep bypassing everything, per
-    // request, as before.
+    // Debug requests bypass everything, per request.
     if debug {
         let (response, record, _) = serve_miss(state, work, record).await;
         return (response, record);
@@ -2216,8 +2216,8 @@ const META_SHARE_CAP: usize = 4 * 1024 * 1024;
 /// cap, a leader whose request was dropped) sends its
 /// followers to lead or follow the next flight, and
 /// finally to run the miss path themselves. Nothing
-/// outlives the flight: meta remains uncached across
-/// time, exactly as before.
+/// outlives the flight: meta stays uncached across
+/// time.
 ///
 /// The two choices this settles, deliberately: request
 /// records stay per request with no flight marker (the
@@ -2315,8 +2315,8 @@ async fn share_response(response: Response, cap: usize) -> (Response, Option<Sha
 /// How many times one request may wait on another
 /// request's in-flight miss for the same key before it
 /// stops waiting and runs the miss path itself (audit
-/// R2-09, issue #375). Since issue #407 a burst of
-/// identical requests settles on the first flight, so the
+/// R2-09, issue #375). A burst of identical requests
+/// settles on the first flight (issue #407), so the
 /// cap only comes into play for waiters no flight could
 /// answer.
 const MAX_FLIGHT_WAITS: u32 = 3;
@@ -2917,7 +2917,7 @@ async fn serve_miss(
     // #324): long-running work goes to the slow lane, so
     // its saturation sheds slow requests only and stills
     // keep their full capacity; everything else takes
-    // the stills lane as before.
+    // the stills lane.
     let lane = if wants_slow_lane(animated_webp, wants_video, wants_frame, wants_page) {
         Lane::Slow
     } else {
@@ -3094,7 +3094,7 @@ async fn serve_miss(
         // running keeps the entry out of every tier, while
         // the response below still serves the render
         // itself. The shared tier's write stays off the
-        // response path, as before.
+        // response path.
         put_memory_tier(state, write_snapshot, &cache_key, &entry);
         // The shared write is spawned before the disk
         // write waits (issue #347): it is already off the
@@ -3108,9 +3108,8 @@ async fn serve_miss(
     // run_process holds it until the work finishes, which
     // on this success path has already happened, so the
     // gate is free and the annotation paths acquire it per
-    // section like any other request. (They once ran under
-    // the request's own held permit, audit R2-29; that
-    // permit no longer outlives the run.)
+    // section like any other request. (The request's own
+    // AI permit does not outlive the run, audit R2-29.)
     let ai_gated = false;
     // The annotation sections share one deadline, the
     // same process budget the render ran under: a

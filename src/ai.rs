@@ -1329,8 +1329,7 @@ impl OnnxSegmentProvider {
     /// Run the decoder for one prompt and pass its masks
     /// and predicted-IoU outputs to `finish`, borrowed from
     /// the session's output tensors: no output is copied
-    /// here (`collect_outputs` used to copy every candidate's
-    /// whole plane).
+    /// here.
     fn run_decoder(
         &self,
         embedding: &SegmentEmbedding,
@@ -1608,9 +1607,8 @@ fn iou(a: &FaceBox, b: &FaceBox) -> f32 {
 /// caller early-returns and the test skips instead of
 /// panicking: provisioning is a deliberate choice, and the
 /// ai-models workflow sets only some of the variables. A set
-/// variable keeps the old behavior exactly, including the
-/// panic on a non-UTF-8 value and any failure for a missing
-/// or invalid file it points at.
+/// variable is used as given: a non-UTF-8 value panics, and
+/// a missing or invalid file it points at fails the test.
 ///
 /// Not `cfg(test)`: the binary's own tests (`src/main.rs`, a
 /// separate crate from this library) call it too.
