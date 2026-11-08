@@ -14591,26 +14591,40 @@ async fn computed_sizes_past_max_dimension_answer_400() {
 /// `no_upscale`, so it keeps the size it started from and
 /// works nothing out. The first cut of the per-axis check
 /// refused it at the step, turning an advisory hint into a
-/// 400. Since issue #528 the output itself is held to the
-/// limit, so the URL answers 400 with and without a hint,
-/// for the same reason.
+/// 400 for a URL that rendered. Since issue #528 the output
+/// itself is held to the limit: a URL that leaves the source
+/// at the ceiling answers 400 with and without a hint, and
+/// one that brings it within the limit renders with and
+/// without one.
 #[tokio::test]
-async fn a_width_hint_passes_a_decode_ceiling_source_through() {
+async fn a_width_hint_answers_a_decode_ceiling_source_as_the_url_does() {
     let src = spawn_bytes_server(png_of(1, 16384)).await;
     let base = spawn_app(false).await;
-    let remainder = format!("filters:format(png)/{src}");
+    let left = format!("filters:format(png)/{src}");
+    let resized = format!("0x8192/filters:format(png)/{src}");
     for hints in [
         &[][..],
         &[("Sec-CH-Width", "400")][..],
         &[("Width", "3840"), ("Sec-CH-DPR", "2")][..],
     ] {
-        let resp = get_with_headers(&base, &remainder, hints).await;
+        let resp = get_with_headers(&base, &left, hints).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{hints:?}");
         assert_eq!(
             resp.text().await.unwrap(),
-            "output 1x16384 exceeds the 16383 pixel limit per axis; resize or crop it to fit",
+            "requested output 1x16384 exceeds the 16383 pixel limit per axis; \
+             resize or crop it to fit",
             "{hints:?}"
         );
+    }
+    for hints in [
+        &[][..],
+        &[("Sec-CH-Width", "400")][..],
+        &[("Width", "3840")][..],
+    ] {
+        let resp = get_with_headers(&base, &resized, hints).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{hints:?}");
+        let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!((img.width(), img.height()), (1, 8192), "{hints:?}");
     }
 }
 
@@ -14639,7 +14653,8 @@ async fn a_decode_ceiling_source_answers_400_never_500() {
     let animated = spawn_bytes_server(gif).await;
     let base = spawn_app(true).await;
     let browser = "image/avif;q=0,image/webp,image/apng,image/*,*/*;q=0.8";
-    let refused = "output 16384x1 exceeds the 16383 pixel limit per axis; resize or crop it to fit";
+    let refused =
+        "requested output 16384x1 exceeds the 16383 pixel limit per axis; resize or crop it to fit";
     for src in [&still, &animated] {
         for (ops, accept) in [
             ("", browser),

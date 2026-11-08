@@ -3675,13 +3675,37 @@ fn check_final_output_bounds_each_axis_with_no_exemption() {
         assert_eq!(
             err.to_string(),
             format!(
-                "unsupported operation: output {w}x{h} exceeds the 16383 pixel limit per axis; \
+                "unsupported operation: requested output {w}x{h} exceeds the 16383 pixel limit per axis; \
                  resize or crop it to fit"
             )
         );
     }
     let err = check_final_output(max, 6104).unwrap_err();
     assert!(err.to_string().ends_with("100000000 pixel limit"), "{err}");
+}
+
+#[test]
+fn the_final_output_refusal_reads_as_an_output_size_refusal() {
+    // The final check refuses an output size, as the step
+    // checks do, only later: `8192x0` on a 16384x2 source
+    // scaled by a DPR factor of 2 asks for the source's own
+    // 16384x2, which the step lets through and this check
+    // refuses (issue #528). A DPR client hint steps down on
+    // an output-size refusal and tells one from other
+    // refusals by its wording (issue #529), so all three
+    // read `requested output WxH exceeds`.
+    let max = crate::url::MAX_DIMENSION;
+    for err in [
+        check_output_size(max + 1, 2, (8192, 1)).unwrap_err(),
+        check_output_pixels(max, 6104).unwrap_err(),
+        check_final_output(max + 1, 2).unwrap_err(),
+    ] {
+        assert!(
+            err.to_string()
+                .starts_with("unsupported operation: requested output "),
+            "{err}"
+        );
+    }
 }
 
 #[test]
@@ -3757,7 +3781,7 @@ fn steps_that_keep_the_size_pass_a_decode_ceiling_source() {
         assert_eq!(
             chain_dims(ceiling(16_384, 2), remainder).map_err(|e| e.to_string()),
             Err(
-                "unsupported operation: output 16384x2 exceeds the 16383 pixel limit per axis; \
+                "unsupported operation: requested output 16384x2 exceeds the 16383 pixel limit per axis; \
                  resize or crop it to fit"
                     .to_string()
             ),
@@ -3776,7 +3800,7 @@ fn steps_that_keep_the_size_pass_a_decode_ceiling_source() {
         assert_eq!(
             chain_dims(ceiling(1, 16_384), remainder).map_err(|e| e.to_string()),
             Err(
-                "unsupported operation: output 1x16384 exceeds the 16383 pixel limit per axis; \
+                "unsupported operation: requested output 1x16384 exceeds the 16383 pixel limit per axis; \
                  resize or crop it to fit"
                     .to_string()
             ),
@@ -3899,7 +3923,7 @@ fn a_decode_ceiling_source_is_refused_unless_a_step_brings_it_within_the_limit()
         assert_eq!(
             err.to_string(),
             format!(
-                "unsupported operation: output {refused} exceeds the 16383 pixel limit per axis; \
+                "unsupported operation: requested output {refused} exceeds the 16383 pixel limit per axis; \
                  resize or crop it to fit"
             ),
             "{remainder:?} {preferred:?}"

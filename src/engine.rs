@@ -542,11 +542,16 @@ fn check_output_size(width: u32, height: u32, input: (u32, u32)) -> Result<(), E
 /// every other format served an output past the documented
 /// limit. There is no later step to bring the size within
 /// the limit, so this check has no such exemption.
+///
+/// The refusal starts `requested output WxH exceeds`, as
+/// the steps' refusals do: it is the same refusal of an
+/// output size, made later, and whatever tells output-size
+/// refusals from others by that wording must count it too.
 fn check_final_output(width: u32, height: u32) -> Result<(), EngineError> {
     let max = crate::url::MAX_DIMENSION;
     if width > max || height > max {
         return Err(EngineError::Unsupported(format!(
-            "output {width}x{height} exceeds the {max} pixel limit per axis; \
+            "requested output {width}x{height} exceeds the {max} pixel limit per axis; \
              resize or crop it to fit"
         )));
     }
