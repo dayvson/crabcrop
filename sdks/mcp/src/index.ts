@@ -26,6 +26,42 @@ const PROTOCOL = "2024-11-05";
 const envBase = process.env.CRABCROP_BASE ?? "";
 const envSecret = process.env.CRABCROP_SECRET ?? null;
 
+/**
+ * CRABCROP_BASE as purge_result's POST target, parsed once
+ * (issue #459): the purge URL is built from this with the
+ * URL API, never concatenated from tool arguments. The rule
+ * is the one source roots follow: an absolute http(s) URL
+ * with no userinfo, query, or fragment. A query or fragment
+ * would swallow the /purge/ suffix appended to the path, and
+ * fetch refuses userinfo with an error that echoes it back.
+ * The href test also catches an empty `?` or `#`, which the
+ * parser keeps but `search` and `hash` report as "".
+ */
+function parsePurgeBase(raw: string): URL | string {
+  if (!raw) {
+    return "purge_result requires CRABCROP_BASE to be set: it only purges on the configured server's origin";
+  }
+  const invalid =
+    "purge_result: CRABCROP_BASE must be an absolute http(s) URL with no userinfo, query, or fragment";
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return invalid;
+  }
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username ||
+    url.password ||
+    /[?#]/.test(url.href)
+  ) {
+    return invalid;
+  }
+  return url;
+}
+
+const purgeBase = parsePurgeBase(envBase);
+
 function textResult(text: string, isError = false) {
   return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
 }
@@ -107,12 +143,14 @@ async function readCapped(resp: Response, cap: number): Promise<string | null> {
  * exactly `.` or `..`, with dots inside a name (`a.b`,
  * `c..d`) counting as ordinary content. Because the string
  * is later parsed as a WHATWG URL, the percent-encoded
- * spellings (`%2e`, `.%2e`, `%2e.`, `%2e%2e`) count too, and
+ * spellings (`%2e`, `.%2e`, `%2e.`, `%2e%2e`) count too,
  * backslashes are separators for http(s) URLs, so components
- * are split on both.
+ * are split on both, and ASCII tabs and newlines are dropped
+ * first, as the parser drops them: `.<TAB>.` reaches the
+ * server as `..` (issue #459).
  */
 function hasDotSegment(path: string): boolean {
-  return path.split(/[/\\]/).some((segment) => {
+  return path.replace(/[\t\n\r]/g, "").split(/[/\\]/).some((segment) => {
     const decoded = segment.toLowerCase().replaceAll("%2e", ".");
     return decoded === "." || decoded === "..";
   });
@@ -272,48 +310,41 @@ const TOOLS = [
       "URL's remainder after its signature (operations and source; a preset " +
       "URL works as-is, the server expands it). Requires the signing secret (argument or " +
       "CRABCROP_SECRET). Returns how many entries were removed. " +
-      "For safety the request only goes to the configured CRABCROP_BASE " +
-      "origin (a base argument must match it) and paths with dot segments " +
-      "are refused: this tool will not POST to arbitrary endpoints.",
+      "For safety the request only goes to /purge/ under the configured " +
+      "CRABCROP_BASE (a base argument must equal it) and paths with dot " +
+      "segments are refused: this tool will not POST to arbitrary endpoints.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Remainder of the cached URL, e.g. \"300x200/https://example.com/a.jpg\"." },
-        base: { type: "string", description: "crabcrop endpoint origin. Defaults to CRABCROP_BASE; its origin must match CRABCROP_BASE." },
+        base: { type: "string", description: "Redundant: the request always goes to CRABCROP_BASE, and a base argument must equal it (trailing slashes aside). Omit it." },
         secret: { type: "string", description: "Signing secret. Defaults to CRABCROP_SECRET. Sensitive, deprecated: prefer the CRABCROP_SECRET environment variable; a per-call secret is kept in client transcripts." },
       },
       required: ["path"],
       additionalProperties: false,
     },
     async run(args: Record<string, unknown>) {
-      // The fetch_meta treatment (audit PL-1, extended by
-      // R2-10): the POST may only ever go to the configured
-      // server's origin. Without the check, a caller-chosen
-      // base made the tool an SSRF oracle: it POSTed to
-      // internal endpoints and read the responses back, and
-      // dot segments in the path resolved out of the
-      // /purge/ prefix onto arbitrary paths on that host.
-      // Refusing before any fetch keeps every disallowed or
-      // unreachable target indistinguishable: no request is
-      // sent, so there is no timing, status, or body signal
-      // to tell them apart.
-      if (!envBase) {
-        return textResult(
-          "purge_result requires CRABCROP_BASE to be set: it only purges on the configured server's origin",
-          true,
-        );
+      // The POST may only ever go to /purge/ under the
+      // configured base (audit PL-1, R2-10, issue #459).
+      // A caller-chosen base made the tool an SSRF oracle
+      // that POSTed to internal endpoints and read the
+      // responses back, and an origin check alone left a
+      // path, query, or fragment on the configured origin
+      // free to move the POST anywhere on that host. So the
+      // target is built from CRABCROP_BASE alone, and a base
+      // argument is only checked against it. Refusing before
+      // any fetch keeps every disallowed or unreachable
+      // target indistinguishable: no request is sent, so
+      // there is no timing, status, or body signal to tell
+      // them apart.
+      if (typeof purgeBase === "string") {
+        return textResult(purgeBase, true);
       }
-      const configuredOrigin = new URL(envBase).origin;
-      const base = (optionalStringArg(args, "base") ?? envBase).replace(/\/+$/, "");
-      let baseOrigin: string;
-      try {
-        baseOrigin = new URL(base).origin;
-      } catch {
-        return textResult(`purge_result: not a valid base URL: ${base}`, true);
-      }
-      if (baseOrigin !== configuredOrigin) {
+      const configured = envBase.replace(/\/+$/, "");
+      const baseArg = optionalStringArg(args, "base");
+      if (baseArg !== undefined && baseArg.replace(/\/+$/, "") !== configured) {
         return textResult(
-          `purge_result: refusing to purge ${baseOrigin}; only the configured server origin (${configuredOrigin}) is allowed`,
+          `purge_result: refusing base ${baseArg}; a base argument must equal CRABCROP_BASE (${configured})`,
           true,
         );
       }
@@ -330,13 +361,23 @@ const TOOLS = [
       // domain-separated from image signatures (audit P-1),
       // and the derivation lives in exactly one place.
       const signature = purgeSignature(secret, target);
+      // Set as a path, a `?` or `#` in the target is
+      // percent-encoded instead of starting a query or
+      // fragment. The prefix check is the invariant itself,
+      // whatever spelling a path finds past hasDotSegment.
+      const url = new URL(purgeBase);
+      const prefix = `${url.pathname.replace(/\/+$/, "")}/purge/${signature}/`;
+      url.pathname = prefix + target;
+      if (!url.pathname.startsWith(prefix)) {
+        return textResult("purge_result: refusing a path that resolves out of the purge prefix", true);
+      }
       // The same network hygiene as fetch_meta: no
       // redirects, a bounded wait, and a capped body, so a
       // hung or hostile endpoint cannot hang the tool call
       // or stream an unbounded response.
       let resp: Response;
       try {
-        resp = await fetch(`${base}/purge/${signature}/${target}`, {
+        resp = await fetch(url, {
           method: "POST",
           redirect: "error",
           signal: AbortSignal.timeout(10_000),

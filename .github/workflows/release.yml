@@ -26,9 +26,8 @@
 # host job's wait on the ai-models release gate (issue #414).
 
 name: Release
-# Default to read-only; the jobs that create the GitHub
-# Release (plan and host) opt back into write for
-# themselves below.
+# Default to read-only; host, the job that creates the
+# GitHub Release, opts back into write for itself below.
 permissions:
   "contents": "read"
 
@@ -60,13 +59,48 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # crabcrop addition (issue #457; re-apply after any `cargo
+  # dist generate`, like the jobs at the bottom of this file):
+  # a tag run stops here, before anything builds, unless the
+  # `release` environment still has a Required reviewers rule
+  # and the tagged commit passed rust.yml on main. plan and
+  # the ai-models gate wait for this job, and every other job
+  # waits for one of them. Pull request runs skip it.
+  preflight:
+    name: Release preflight (approval gate and CI)
+    if: ${{ !github.event.pull_request }}
+    runs-on: "ubuntu-22.04"
+    # Reading an environment's protection rules and a
+    # workflow's runs takes `actions: read`.
+    permissions:
+      "actions": "read"
+      "contents": "read"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the approval gate and the commit's CI
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python3 scripts/release_preflight.py --repo "$GITHUB_REPOSITORY" --sha "$RELEASE_COMMIT"
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    # crabcrop (issue #457): a tag run plans only once the
+    # preflight passed; a pull request run, which skips the
+    # preflight, plans as before.
+    needs:
+      - preflight
+    if: ${{ !cancelled() && (needs.preflight.result == 'success' || (github.event.pull_request && needs.preflight.result == 'skipped')) }}
     runs-on: "ubuntu-22.04"
-    # `dist host --steps=create` creates the GitHub Release,
-    # so this job keeps write; every other dist job reads.
+    # Read-only like the other dist jobs: for GitHub hosting,
+    # `dist host --steps=create` only records the release's
+    # download URLs in the manifest (dist 0.33.1, src/host.rs);
+    # the GitHub Release itself is created in the host job.
     permissions:
-      "contents": "write"
+      "contents": "read"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -377,18 +411,23 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
-      - name: Create GitHub Release
+      # crabcrop (issue #457): a plain `gh release create`
+      # failed whenever a release for the tag already existed,
+      # which every tag run from v0.9.8 to v0.9.11 hit on its
+      # first attempt. The script creates the release, or
+      # uploads to and updates the one already there.
+      - name: Create or update GitHub Release
         env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
+          PRERELEASE: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && 'true' || 'false' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
           RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
-          gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          bash scripts/publish_github_release.sh "$RELEASE_TAG" "$RELEASE_COMMIT" "$ANNOUNCEMENT_TITLE" "$RUNNER_TEMP/notes.txt" "$PRERELEASE" artifacts/*
 
   announce:
     permissions:
@@ -418,9 +457,11 @@ jobs:
   # run from ai-models.yml in parallel with the builds. The
   # host job above waits for it, so a tag whose AI code fails
   # against the real models never creates a release, pushes an
-  # image, or publishes a package.
+  # image, or publishes a package. Like plan, it starts only
+  # once the preflight passed (issue #457).
   ai-models:
     name: Real-model AI tests (release gate)
+    needs: preflight
     if: ${{ !github.event.pull_request }}
     permissions:
       contents: read

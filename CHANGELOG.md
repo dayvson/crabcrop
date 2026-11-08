@@ -2,6 +2,12 @@
 
 All notable changes to crabcrop are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and crabcrop uses [Semantic Versioning](https://semver.org/) with one version number across every artifact (server binaries, container images, the `crabcrop-url` crate, the TypeScript and Python SDKs, the MCP server, and the Helm chart). See RELEASING.md for how a release is made.
 
+## [Unreleased]
+
+### Changed
+
+- Release runs check the approval gate and CI before they build, and adopt a release that already exists (issue #457). A new preflight job stops a tag run unless the `release` environment has a Required reviewers rule and the tagged commit passed `rust.yml` on main. The host job updates an existing release for the tag instead of failing on it, which every tag run from v0.9.8 to v0.9.11 did on its first attempt. The one-off `mcp-publish-v010.yml` workflow is gone.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added
@@ -103,6 +109,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 - PNG metadata inflation is bounded per source (issue #399). Only the first ICC profile, EXIF, and XMP chunk is read, repeats are skipped unread, and every inflate draws on one shared 20 MiB budget, so a small PNG can no longer carry hundreds of chunks that each inflate to its own cap. An XMP packet past its cap is dropped instead of copied in truncated form, and under the default `strip` policy the EXIF, XMP, and Photoshop segments are not inflated at all.
 
 - The container recipes start with a writable disk result tier (issue #396). The images create `/var/cache/crabcrop` owned by `nobody` and the kustomize base sets `fsGroup: 65534`, so the compose production stack and the kustomize full overlay boot with the disk tier live instead of exiting on an unwritable directory; a compose `results` volume that already holds root-owned files needs the one-off chown in deploy/compose/README.md.
+
+- The server builds for macOS again (#442). The external tool kernel limits called `prlimit`, which exists only on Linux, so both darwin legs of the first v0.9.11 release run failed; the limits now apply on Linux and Android only, as docs/media.md describes, and CI checks a macOS build on every push and pull request.
 
 ## [0.9.10] - 2026-11-06
 
