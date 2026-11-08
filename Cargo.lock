@@ -1035,6 +1035,7 @@ dependencies = [
  "oxideav-heif",
  "oxideav-webp",
  "png",
+ "proptest",
  "quantizr",
  "reqwest 0.13.5",
  "resvg",
@@ -1060,6 +1061,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac",
+ "proptest",
  "serde_json",
  "sha2 0.11.1",
 ]

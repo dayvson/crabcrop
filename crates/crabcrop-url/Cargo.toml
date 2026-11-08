@@ -20,3 +20,7 @@ sha2 = "0.11"
 
 [dev-dependencies]
 serde_json = "1"
+# Property tests (issue #478): tests/proptest_sign.rs. Same
+# feature set as the root package's; its rust-version (1.88)
+# is this crate's MSRV.
+proptest = { version = "1.12", default-features = false, features = ["std"] }
