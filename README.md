@@ -27,9 +27,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dayvson/crabcrop/releas
 **Docker:** the base image, and the AI variant with background removal and face detection on board:
 
 ```bash
-docker pull ghcr.io/dayvson/crabcrop:0.9.11
-docker pull ghcr.io/dayvson/crabcrop-ai:0.9.11
-docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.9.11
+docker pull ghcr.io/dayvson/crabcrop:0.10.0
+docker pull ghcr.io/dayvson/crabcrop-ai:0.10.0
+docker run -e CRABCROP_SECRET=your-secret-change-me -p 3000:3000 ghcr.io/dayvson/crabcrop:0.10.0
 ```
 
 A secret of at least 16 bytes is the only required configuration; the server will not start without one. By default the loader fetches public sources and refuses sources that resolve to private addresses, and an allowlist names any exceptions. See [Configuration](docs/configuration.md).
