@@ -11,6 +11,13 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// The library's test helpers are not visible to an
+// integration test: its scratch directories come in by
+// path. Not every item is used here.
+#[allow(dead_code)]
+#[path = "../src/test_support/scratch.rs"]
+mod test_support;
+
 /// Kill the child on drop, so a failed assert cannot
 /// leak a listening server into later runs.
 struct ServerGuard(Child);
@@ -36,8 +43,7 @@ fn free_port() -> u16 {
 #[test]
 fn the_binary_boots_and_answers_health() {
     let port = free_port();
-    let workdir = std::env::temp_dir().join(format!("crabcrop-boot-smoke-{}", std::process::id()));
-    std::fs::create_dir_all(&workdir).unwrap();
+    let workdir = test_support::scratch_dir("boot-smoke");
     let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
         .current_dir(&workdir)
         // A hermetic environment: only what boot needs, so
@@ -100,25 +106,25 @@ fn an_unknown_dash_argument_exits_with_an_error_and_never_serves() {
             .unwrap();
         let mut process = ServerGuard(child);
 
+        // No probe of `port` here: the other tests in this
+        // file run in parallel, each binding a port that
+        // free_port released, so a connection to `port` can
+        // reach another test's server and fail this one for
+        // nothing. A binary that served would never exit, so
+        // the deadline catches it, and a server would print
+        // its listening line, which the empty stdout below
+        // rules out.
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
             if let Some(status) = process.0.try_wait().unwrap() {
                 break status;
             }
             assert!(
-                TcpStream::connect(("127.0.0.1", port)).is_err(),
-                "`crabcrop {arg}` started a server on port {port}"
-            );
-            assert!(
                 Instant::now() < deadline,
-                "`crabcrop {arg}` neither exited nor served before the deadline"
+                "`crabcrop {arg}` did not exit before the deadline (it may be serving on port {port})"
             );
             std::thread::sleep(Duration::from_millis(50));
         };
-        assert!(
-            TcpStream::connect(("127.0.0.1", port)).is_err(),
-            "`crabcrop {arg}`: something is listening on port {port}"
-        );
         let mut stdout = String::new();
         let mut stderr = String::new();
         process
@@ -293,13 +299,13 @@ fn boot_warns_when_pinned_source_fetches_bypass_a_proxy() {
 }
 
 /// A model file that exists, so a boot failure is about
-/// the runtime, never about a missing model.
-fn configured_model() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("crabcrop-boot-model-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// the runtime, never about a missing model, and the
+/// directory it lives in.
+fn configured_model() -> (test_support::ScratchDir, std::path::PathBuf) {
+    let dir = test_support::scratch_dir("boot-model");
     let model = dir.join("model.onnx");
     std::fs::write(&model, b"not a real model").unwrap();
-    model
+    (dir, model)
 }
 
 #[test]
@@ -310,7 +316,7 @@ fn boot_with_a_model_but_no_loadable_runtime_fails_with_the_diagnostic() {
     // the fallback resolution ort performs when
     // CRABCROP_ORT_DYLIB is unset, and it keeps the test
     // hermetic on hosts that do have a system runtime.
-    let model = configured_model();
+    let (_dir, model) = configured_model();
     let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
@@ -342,7 +348,7 @@ fn boot_with_a_model_but_no_runtime_anywhere_fails_with_the_diagnostic() {
     // why this is ignored by default. Run it where no
     // system runtime exists:
     // cargo test --test boot_smoke -- --ignored boot_with_a_model_but_no_runtime_anywhere
-    let model = configured_model();
+    let (_dir, model) = configured_model();
     let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
@@ -490,8 +496,7 @@ fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
 /// loader does.
 #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
 fn boot_without_ca_roots(vars: &[(&str, &str)]) -> std::process::Output {
-    let dir = std::env::temp_dir().join(format!("crabcrop-boot-no-roots-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_support::scratch_dir("boot-no-roots");
     let bundle = dir.join("empty-ca.pem");
     std::fs::write(&bundle, b"").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))

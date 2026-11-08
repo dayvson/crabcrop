@@ -704,11 +704,8 @@ Page size:       792 x 612 pts (letter)
         );
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("crabcrop-pdf-test-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::ScratchDir {
+        crate::test_support::scratch_dir(&format!("pdf-test-{name}"))
     }
 
     fn write_tool(dir: &Path, name: &str, script: &str) -> PathBuf {
@@ -719,12 +716,17 @@ Page size:       792 x 612 pts (letter)
 
     /// A fake tool pair in one directory: the probe
     /// prints a recorded-shape report, the renderer
-    /// prints a PNG. Returns the renderer path to build
-    /// the extractor with.
-    fn fake_pair(name: &str, info_script: &str, render_script: &str) -> PathBuf {
+    /// prints a PNG. Returns the directory and the
+    /// renderer path to build the extractor with.
+    fn fake_pair(
+        name: &str,
+        info_script: &str,
+        render_script: &str,
+    ) -> (crate::test_support::ScratchDir, PathBuf) {
         let dir = temp_dir(name);
         write_tool(&dir, "pdfinfo", info_script);
-        write_tool(&dir, "pdftocairo", render_script)
+        let renderer = write_tool(&dir, "pdftocairo", render_script);
+        (dir, renderer)
     }
 
     const INFO_OK: &str = "#!/bin/sh\n\
@@ -770,7 +772,7 @@ exit 0\n";
 
     #[test]
     fn render_runs_probe_then_renderer() {
-        let program = fake_pair("ok", INFO_OK, RENDER_OK);
+        let (_tools, program) = fake_pair("ok", INFO_OK, RENDER_OK);
         let renderer = PdfRenderer::new(program.clone(), Duration::from_secs(10)).unwrap();
         assert_eq!(
             renderer.probe_program,
@@ -785,7 +787,7 @@ exit 0\n";
 
     #[test]
     fn render_refuses_a_password_document_from_the_probe() {
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "password",
             "#!/bin/sh\ncat > /dev/null\nprintf 'Command Line Error: Incorrect password\\n' >&2\nexit 1\n",
             RENDER_OK,
@@ -798,7 +800,7 @@ exit 0\n";
 
     #[test]
     fn render_maps_an_unreadable_probe_to_not_pdf() {
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "junk",
             "#!/bin/sh\ncat > /dev/null\nprintf 'Syntax Error: Couldn't find trailer dictionary\\n' >&2\nexit 1\n",
             RENDER_OK,
@@ -816,7 +818,7 @@ exit 0\n";
         let marker = dir.join("rendered");
         write_tool(&dir, "pdfinfo", INFO_OK);
         let render = format!(
-            "#!/bin/sh\ncat > /dev/null\ntouch {}\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
+            "#!/bin/sh\ncat > /dev/null\ntouch '{}'\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
             marker.display()
         );
         let program = write_tool(&dir, "pdftocairo", &render);
@@ -829,7 +831,7 @@ exit 0\n";
 
         // Over the page cap: the probe answers, the
         // document is refused as a bad source.
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "overcap",
             "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Pages:           5000' 'Encrypted:       no' 'Page size:       612 x 792 pts'\nexit 0\n",
             RENDER_OK,
@@ -856,7 +858,7 @@ exit 0\n";
             "#!/bin/sh\ncat > /dev/null\ntouch \"{}\"\nprintf '\\211PNG\\r\\n\\032\\n'\nexit 0\n",
             marker.display()
         );
-        let program = fake_pair("range-fallback", &info, &render);
+        let (_tools, program) = fake_pair("range-fallback", &info, &render);
         let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
         let err = renderer.render_page(b"%PDF- fake", 9).unwrap_err();
         assert!(matches!(err, PdfError::Unsupported(_)), "{err}");
@@ -874,7 +876,7 @@ exit 0\n";
         // Exit 99 is the reference renderer's own
         // out-of-range answer: the same class as the
         // pre-check, should the two ever disagree.
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "exit99",
             "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Pages:           100' 'Encrypted:       no' 'Page size:       612 x 792 pts'\nexit 0\n",
             "#!/bin/sh\ncat > /dev/null\nprintf 'Wrong page range given\\n' >&2\nexit 99\n",
@@ -885,7 +887,7 @@ exit 0\n";
 
         // A password refusal at render time lands in the
         // password class too.
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "render-password",
             INFO_OK,
             "#!/bin/sh\ncat > /dev/null\nprintf 'Command Line Error: Incorrect password\\n' >&2\nexit 1\n",
@@ -897,7 +899,7 @@ exit 0\n";
 
         // Any other nonzero exit is a tool failure, with
         // the stderr excerpt in the cause.
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "failing",
             INFO_OK,
             "#!/bin/sh\ncat > /dev/null\necho 'boom on stderr' >&2\nexit 3\n",
@@ -909,13 +911,13 @@ exit 0\n";
 
         // A clean run with no output, and one whose
         // output is not a PNG, are tool failures.
-        let program = fake_pair("empty", INFO_OK, "#!/bin/sh\ncat > /dev/null\nexit 0\n");
+        let (_tools, program) = fake_pair("empty", INFO_OK, "#!/bin/sh\ncat > /dev/null\nexit 0\n");
         let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
         let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
         assert!(matches!(err, PdfError::Failed(_)), "{err}");
         assert!(err.to_string().contains("no output"), "{err}");
 
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "notpng",
             INFO_OK,
             "#!/bin/sh\ncat > /dev/null\nprintf 'definitely not a png'\nexit 0\n",
@@ -928,7 +930,7 @@ exit 0\n";
 
     #[test]
     fn run_caps_tool_output() {
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "chatty",
             INFO_OK,
             "#!/bin/sh\ncat > /dev/null\ndd if=/dev/zero bs=1024 count=4 2>/dev/null\nexit 0\n",
@@ -950,7 +952,7 @@ exit 0\n";
 
     #[test]
     fn render_times_out_on_a_hung_renderer() {
-        let program = fake_pair("sleeper", INFO_OK, "#!/bin/sh\nsleep 30\n");
+        let (_tools, program) = fake_pair("sleeper", INFO_OK, "#!/bin/sh\nsleep 30\n");
         let renderer = PdfRenderer::new(program, Duration::from_secs(1)).unwrap();
         let started = Instant::now();
         let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();

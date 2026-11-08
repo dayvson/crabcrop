@@ -8,6 +8,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Release runs check the approval gate and CI before they build, and adopt a release that already exists (issue #457). A new preflight job stops a tag run unless the `release` environment has a Required reviewers rule and the tagged commit passed `rust.yml` on main. The host job updates an existing release for the tag instead of failing on it, which every tag run from v0.9.8 to v0.9.11 did on its first attempt. The one-off `mcp-publish-v010.yml` workflow is gone.
 
+- A step that works out an output size past 16383 px on an axis is refused with `400 unsupported_operation`, as a written size past the limit already is (issue #521). Before, `16383x1/0x2` rendered 32766x2, and so did a fit-in, a crop followed by a resize, `dpr()`, a pad canvas or a rotated canvas that grew a side past the limit; with WebP output these failed with `500` instead. Every URL that rendered within the limit renders the same bytes. `/explain` reports the refusal as `over_dimension`, and its forecast now follows the engine for SVG sources (their raster size), `no_upscale` caps, `rotate(...)` and trims.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added
