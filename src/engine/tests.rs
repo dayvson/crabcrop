@@ -7541,6 +7541,145 @@ fn blurfaces_without_a_model_is_a_clean_error() {
     }
 }
 
+/// The boxes `alpha_redaction_scene` hides: the known face,
+/// the known person, and a free region.
+const ALPHA_HIDDEN_BOXES: [(u32, u32, u32, u32); 3] =
+    [(140, 30, 40, 40), (10, 10, 60, 80), (80, 100, 40, 40)];
+
+/// Issue #444: a black and white checkerboard stored as RGBA,
+/// opaque except for `ALPHA_HIDDEN_BOXES`, which are at
+/// `alpha`. The fake detectors report the boxes whatever the
+/// alpha, as YuNet does (it reads RGB only).
+fn alpha_redaction_scene(alpha: u8) -> Vec<u8> {
+    let img = image::RgbaImage::from_fn(200, 160, |x, y| {
+        let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+        let hidden = ALPHA_HIDDEN_BOXES
+            .iter()
+            .any(|&(bx, by, bw, bh)| (bx..bx + bw).contains(&x) && (by..by + bh).contains(&y));
+        image::Rgba([v, v, v, if hidden { alpha } else { 255 }])
+    });
+    png_bytes(&DynamicImage::ImageRgba8(img))
+}
+
+#[test]
+fn redaction_leaves_no_original_color_under_alpha() {
+    // Issue #444, end to end: a face, an object, or a region
+    // stored at alpha 0 or 128 came back with all or a third
+    // of its original color, and JPEG output (which drops
+    // alpha) served it. The measure is the issue's: the slope
+    // of the output's red against the source's inside the
+    // redacted area, about 1 for a pass-through and 0 for
+    // none.
+    let engine = Engine;
+    let segment = LeftHalfSegment::default();
+    let ctx = |models: &str| match models {
+        "face" => ProcessContext {
+            face_provider: Some(&KnownFace),
+            ..Default::default()
+        },
+        "objects" => detect_ctx(&KnownObjects),
+        "masks" => segment_ctx(&KnownObjects, &segment),
+        _ => ProcessContext::default(),
+    };
+    let person = || "person".to_string();
+    let face = (140, 30, 40, 40);
+    let (rx, ry, rw, rh) = (80, 100, 40, 40);
+    let cases = [
+        ("blurfaces", Filter::BlurFaces, "face", face),
+        ("pixelatefaces", Filter::PixelateFaces, "face", face),
+        (
+            "blurclass",
+            Filter::BlurClass(person()),
+            "objects",
+            (10, 10, 60, 80),
+        ),
+        (
+            "pixelateclass",
+            Filter::PixelateClass(person()),
+            "objects",
+            (10, 10, 60, 80),
+        ),
+        // The silhouette is the box's left half.
+        (
+            "blurclass masked",
+            Filter::BlurClass(person()),
+            "masks",
+            (10, 10, 30, 80),
+        ),
+        (
+            "pixelateclass masked",
+            Filter::PixelateClass(person()),
+            "masks",
+            (10, 10, 30, 80),
+        ),
+        (
+            "blur_region",
+            Filter::BlurRegion {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            },
+            "none",
+            (rx, ry, rw, rh),
+        ),
+        (
+            "pixelate_region",
+            Filter::PixelateRegion {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            },
+            "none",
+            (rx, ry, rw, rh),
+        ),
+    ];
+    for alpha in [0u8, 128] {
+        let source = alpha_redaction_scene(alpha);
+        let src = image::load_from_memory(&source).unwrap().to_rgba8();
+        for (name, filter, models, (bx, by, bw, bh)) in &cases {
+            for format in [ImageFormat::Jpeg, ImageFormat::Png] {
+                let out = engine
+                    .process_preferred(
+                        &source,
+                        &[Operation::Filters(vec![
+                            filter.clone(),
+                            Filter::Format(FormatSpec::plain(format)),
+                            Filter::Quality(Quality::Value(100)),
+                        ])],
+                        ctx(models),
+                    )
+                    .unwrap();
+                let result = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+                let pairs: Vec<(f64, f64)> = (*by..by + bh)
+                    .flat_map(|y| (*bx..bx + bw).map(move |x| (x, y)))
+                    .map(|(x, y)| {
+                        (
+                            src.get_pixel(x, y)[0] as f64,
+                            result.get_pixel(x, y)[0] as f64,
+                        )
+                    })
+                    .collect();
+                let n = pairs.len() as f64;
+                let ms = pairs.iter().map(|p| p.0).sum::<f64>() / n;
+                let mo = pairs.iter().map(|p| p.1).sum::<f64>() / n;
+                let cov: f64 = pairs.iter().map(|(s, o)| (s - ms) * (o - mo)).sum();
+                let var: f64 = pairs.iter().map(|(s, _)| (s - ms).powi(2)).sum();
+                let slope = cov / var;
+                assert!(
+                    slope.abs() < 0.1,
+                    "{name} at alpha {alpha} to {format:?}: slope {slope:.3}"
+                );
+                if format == ImageFormat::Png {
+                    // The redacted area keeps the source's alpha.
+                    assert_eq!(result.get_pixel(*bx + 1, *by + 1)[3], alpha, "{name}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn chained_face_ops_detect_once() {
     let engine = Engine;
