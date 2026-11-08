@@ -127,3 +127,12 @@ test("dimensions and the base follow the rule all five integrations share (issue
     emptyBase: () => createCrabcropLoader({ base: "" }),
   });
 });
+
+test("format and quality follow the SDK's grammar (issue #482)", async () => {
+  const grammar = await import("../../grammar-table.mjs");
+  const loader = createCrabcropLoader({ base: table.BASE });
+  grammar.checkFormatTable({
+    format: (format: string) => loader.url(table.SRC, { format }),
+    quality: (quality: number) => loader.url(table.SRC, { quality }),
+  });
+});

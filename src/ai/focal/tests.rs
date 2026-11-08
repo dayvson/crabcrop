@@ -100,13 +100,8 @@ fn focal_live_point_tracks_the_brightest_block() {
 #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
 fn focal_load_missing_model_file_is_a_load_error() {
     let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-    let missing = std::env::temp_dir()
-        .join(format!(
-            "crabcrop-focal-missing-{}.onnx",
-            std::process::id()
-        ))
-        .to_string_lossy()
-        .into_owned();
+    let scratch = crate::test_support::scratch_dir("focal-missing");
+    let missing = scratch.join("missing.onnx").to_string_lossy().into_owned();
     let message = expect_load(OnnxFocalProvider::load(Some(&dylib), &missing));
     assert!(message.contains("cannot load the model"), "{message}");
 }
@@ -118,8 +113,8 @@ fn focal_load_missing_model_file_is_a_load_error() {
 #[ignore = "needs the ONNX runtime and a focal model (env-configured)"]
 fn focal_load_garbage_model_file_is_a_load_error() {
     let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-    let path =
-        std::env::temp_dir().join(format!("crabcrop-focal-garbage-{}.bin", std::process::id()));
+    let scratch = crate::test_support::scratch_dir("focal-garbage");
+    let path = scratch.join("garbage.bin");
     std::fs::write(&path, b"this is not an onnx model at all").unwrap();
     let message = expect_load(OnnxFocalProvider::load(
         Some(&dylib),

@@ -1079,10 +1079,8 @@ mod tests {
         assert!(tmp_name("abc").starts_with("abc.tmp-"));
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("crabcrop-store-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    fn temp_dir(tag: &str) -> crate::test_support::ScratchDir {
+        crate::test_support::scratch_dir(&format!("store-{tag}"))
     }
 
     /// The entry MAC key the test stores run under.

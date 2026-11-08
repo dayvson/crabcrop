@@ -231,23 +231,25 @@ fn detect_live_finds_people_and_vehicles() {
     );
 }
 
-/// Write bytes to a fresh temp file and return its
-/// path: the load() failure tests need a real label
-/// file without committing fixtures.
-fn temp_file(tag: &str, contents: &[u8]) -> String {
-    let path =
-        std::env::temp_dir().join(format!("crabcrop-ai-load-{tag}-{}.bin", std::process::id()));
+/// Write bytes to a fresh temp file and return the
+/// scratch directory it lives in and its path: the
+/// load() failure tests need a real label file without
+/// committing fixtures (issue #526).
+fn temp_file(tag: &str, contents: &[u8]) -> (crate::test_support::ScratchDir, String) {
+    let dir = crate::test_support::scratch_dir(&format!("ai-load-{tag}"));
+    let path = dir
+        .join(format!("{tag}.bin"))
+        .to_string_lossy()
+        .into_owned();
     std::fs::write(&path, contents).unwrap();
-    path.to_string_lossy().into_owned()
+    (dir, path)
 }
 
-/// A path inside the temp dir that is never created.
+/// A path that does not exist: a name inside a scratch
+/// directory that is removed again before this returns.
 fn missing_path(tag: &str) -> String {
-    std::env::temp_dir()
-        .join(format!(
-            "crabcrop-ai-load-missing-{tag}-{}.onnx",
-            std::process::id()
-        ))
+    crate::test_support::scratch_dir(&format!("ai-load-missing-{tag}"))
+        .join(format!("{tag}.onnx"))
         .to_string_lossy()
         .into_owned()
 }
@@ -286,7 +288,7 @@ fn detection_load_missing_model_file_is_a_load_error() {
 #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
 fn detection_load_garbage_model_file_is_a_load_error() {
     let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-    let garbage = temp_file("detect-garbage", b"this is not an onnx model at all");
+    let (_model, garbage) = temp_file("detect-garbage", b"this is not an onnx model at all");
     let message = expect_load(OnnxDetectionProvider::load(
         Some(&dylib),
         &garbage,
@@ -344,7 +346,7 @@ fn detection_load_missing_labels_file_is_a_load_error() {
 fn detection_load_non_yolo_model_is_a_load_error() {
     let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
     let model = std::env::var("CRABCROP_TEST_REMOVEBG_MODEL").unwrap();
-    let labels = temp_file("detect-labels", b"person\ncar\n");
+    let (_labels, labels) = temp_file("detect-labels", b"person\ncar\n");
     let message = expect_load(OnnxDetectionProvider::load(
         Some(&dylib),
         &model,
@@ -428,7 +430,7 @@ fn declared_load_missing_model_file_is_a_load_error() {
 #[ignore = "needs the ONNX runtime and a detection model (env-configured)"]
 fn declared_load_garbage_model_file_is_a_load_error() {
     let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-    let garbage = temp_file("declared-garbage", b"this is not an onnx model at all");
+    let (_model, garbage) = temp_file("declared-garbage", b"this is not an onnx model at all");
     let message = expect_load(OnnxDetectionProvider::load_with_classes(
         Some(&dylib),
         &garbage,

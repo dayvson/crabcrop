@@ -116,3 +116,13 @@ test("dimensions and the base follow the rule all five integrations share (issue
     emptyBase: () => unsigned({ width: 100 }, ""),
   });
 });
+
+test("format and quality follow the SDK's grammar (issue #482)", async () => {
+  const grammar = await import("../../grammar-table.mjs");
+  const unsigned = (modifiers: Record<string, unknown>) =>
+    getImage(table.SRC, { modifiers, base: table.BASE }, {}).url;
+  grammar.checkFormatTable({
+    format: (format: string) => unsigned({ format }),
+    quality: (quality: number) => unsigned({ quality }),
+  });
+});

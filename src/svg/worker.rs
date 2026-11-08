@@ -852,14 +852,12 @@ mod tests {
         // Hung before the size, and hung after it, mid-render:
         // both end at the deadline as a timeout, and the
         // worker's process group is gone afterwards.
-        let pid_file = std::env::temp_dir().join(format!(
-            "crabcrop-svg-worker-test-{}.pid",
-            std::process::id()
-        ));
+        let dir = crate::test_support::scratch_dir("svg-worker-test");
+        let pid_file = dir.join("worker.pid");
         let pid_path = pid_file.display().to_string();
         for script in [
-            format!("echo $$ > {pid_path}; exec sleep 30"),
-            format!("echo $$ > {pid_path}; printf '{SIZE_FRAME}'; exec sleep 30"),
+            format!("echo $$ > '{pid_path}'; exec sleep 30"),
+            format!("echo $$ > '{pid_path}'; printf '{SIZE_FRAME}'; exec sleep 30"),
         ] {
             let _ = std::fs::remove_file(&pid_file);
             let (result, took) = run_shell(&script, Duration::from_millis(500));

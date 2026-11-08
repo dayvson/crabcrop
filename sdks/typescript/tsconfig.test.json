@@ -4,6 +4,6 @@
     "noEmit": true,
     "rootDir": "."
   },
-  "files": ["test/exports.test.ts"],
+  "files": ["test/exports.test.ts", "test/grammar-sets.test.ts"],
   "include": []
 }
