@@ -12,6 +12,29 @@ const vectors = JSON.parse(
 );
 
 for (const v of vectors) {
+  if (v.refuses !== undefined) {
+    // Issue #472: the playground refuses what every builder
+    // refuses, with the SDK's message, signed or not.
+    test(`refusal vector: ${v.description}`, async () => {
+      const { input, character } = v.refuses;
+      const base = "https://img.example.com";
+      let expected;
+      try {
+        sdk.buildURL(base, "s3cr3t", v.operations, v.source);
+      } catch (e) {
+        expected = e.message;
+      }
+      assert.ok(expected?.startsWith(`${input} contains`), expected);
+      assert.ok(expected.includes(JSON.stringify(character)), expected);
+      for (const secret of ["s3cr3t", null]) {
+        await assert.rejects(
+          buildPlaygroundUrl({ base, secret, operations: v.operations, source: v.source }),
+          { message: expected },
+        );
+      }
+    });
+    continue;
+  }
   if (v.signature === undefined) {
     // Sealed entries carry a token, not a signature; the
     // playground does not seal (issue #255 lives in the

@@ -257,6 +257,52 @@ test("a typed pipeline is byte-identical to the string pipeline", () => {
   );
 });
 
+test("decimal arguments spell the f32 the server prints (issue #472)", () => {
+  // The server parses these arguments as f32 and prints them
+  // as the shortest decimal that reads back as the same f32;
+  // a double's 17-digit spelling would be a second URL for
+  // the same render. Expected values are Rust's f32 Display.
+  const cases: [string, string][] = [
+    [ops.focalPoint(0.1 + 0.2, 0.4, 2), "focalpoint:0.3x0.4:2"],
+    [ops.cropObjects(100, 100, ["dog"], 0.1 + 0.2), "crop:100x100:objects(dog):0.3"],
+    [filter.blur(1 / 3), "blur(0.33333334)"],
+    [filter.facePad(Math.PI / 2), "facepad(1.5707964)"],
+    [filter.rotate(45.1 + 1e-12), "rotate(45.1)"],
+    [filter.saturation(254.99999999), "saturation(255)"],
+    [filter.sharpen(1e-7), "sharpen(0.0000001)"],
+    [filter.sharpen(3e38), `sharpen(3${"0".repeat(38)})`],
+    [filter.exposure(-0.1), "exposure(-0.1)"],
+    [filter.contrast(-0), "contrast(0)"],
+    // The convolution kernel is f64 on the server, so its
+    // values keep the double's shortest spelling.
+    [
+      filter.convolution([0.1 + 0.2, 0, 0, 0, 1, 0, 0, 0, 0]),
+      "convolution(0.30000000000000004,0,0,0,1,0,0,0,0,0)",
+    ],
+  ];
+  for (const [got, want] of cases) {
+    assert.equal(got, want);
+  }
+  // Past the f32 range the server reads infinity, and a
+  // positive value below it reads as zero: both refused.
+  assert.throws(() => filter.sharpen(1e39), /sharpen amount must be a positive number/);
+  assert.throws(() => filter.sharpen(1e-50), /sharpen amount must be a positive number/);
+});
+
+test("class names spell trimmed, as the server keys them (issue #472)", () => {
+  const cases: [string, string][] = [
+    [ops.cropObjects(100, 100, [" person "]), "crop:100x100:objects(person):1"],
+    [ops.cropObjects(100, 100, [" person", "PERSON\t"]), "crop:100x100:objects(person):1"],
+    [ops.cropObjects(100, 100, [" traffic light "]), "crop:100x100:objects(traffic%20light):1"],
+    [filter.blurClass(" person "), "blurclass(person)"],
+    [filter.pixelateClass("\nperson"), "pixelateclass(person)"],
+    [filter.recolorClass("person ", "ff0000"), "recolorclass(person,ff0000)"],
+  ];
+  for (const [got, want] of cases) {
+    assert.equal(got, want);
+  }
+});
+
 test("typed builders reject what the server would reject", () => {
   const bad: (() => string)[] = [
     () => filter.quality(0),

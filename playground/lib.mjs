@@ -63,12 +63,22 @@ export async function buildPlaygroundUrl({ base, secret, operations, source, exp
   return `${trimmedBase}/${signature}/${remainder}`;
 }
 
+// Characters a browser rewrites in a URL path (issue #472):
+// `\` becomes `/` and the rest are percent-encoded, so a URL
+// signed over one of them answers 403 when a page requests it.
+// The SDK's assertUrlText refuses the same set.
+const BROWSER_REWRITTEN = "\"<>\\^`{|}";
+
 function assertUrlText(text, what) {
   for (const c of text) {
     const code = c.codePointAt(0);
-    if (c === "?" || c === "#" || code <= 0x20 || code === 0x7f || code > 0x7e) {
+    const rewritten = BROWSER_REWRITTEN.includes(c);
+    if (c === "?" || c === "#" || code <= 0x20 || code === 0x7f || code > 0x7e || rewritten) {
+      const hint = rewritten
+        ? ` (browsers rewrite it; percent-encode it as %${code.toString(16).toUpperCase()})`
+        : "";
       throw new Error(
-        `${what} contains a character that cannot appear in a crabcrop URL: ${JSON.stringify(c)}`,
+        `${what} contains a character that cannot appear in a crabcrop URL: ${JSON.stringify(c)}${hint}`,
       );
     }
   }

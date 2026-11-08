@@ -281,18 +281,32 @@ export function buildSealedURL(
 }
 
 /**
+ * Characters a browser rewrites in a URL path (issue #472): an
+ * `<img src>` or `fetch()` URL is parsed by WHATWG rules, which
+ * turn `\` into `/` and percent-encode the rest (Chrome encodes
+ * `^` and `|` too). The server verifies the raw path, so a URL
+ * signed over one of them answers 403 from a page.
+ */
+const BROWSER_REWRITTEN = "\"<>\\^`{|}";
+
+/**
  * Fail loudly on inputs that can never produce a verifiable URL
  * (audit P-4, P-5): the remainder travels as a raw URL path, so
- * `?`/`#` would truncate it and whitespace, control, and
- * non-ASCII characters cannot be sent as-is; an expiry must be
- * a non-negative integer the server's u64 parser accepts.
+ * `?`/`#` would truncate it, whitespace, control, and non-ASCII
+ * characters cannot be sent as-is, and a browser rewrites the
+ * {@link BROWSER_REWRITTEN} set; an expiry must be a
+ * non-negative integer the server's u64 parser accepts.
  */
 function assertUrlText(text: string, what: string): void {
   for (const c of text) {
     const code = c.codePointAt(0) as number;
-    if (c === "?" || c === "#" || code <= 0x20 || code === 0x7f || code > 0x7e) {
+    const rewritten = BROWSER_REWRITTEN.includes(c);
+    if (c === "?" || c === "#" || code <= 0x20 || code === 0x7f || code > 0x7e || rewritten) {
+      const hint = rewritten
+        ? ` (browsers rewrite it; percent-encode it as %${code.toString(16).toUpperCase()})`
+        : "";
       throw new Error(
-        `${what} contains a character that cannot appear in a crabcrop URL: ${JSON.stringify(c)}`,
+        `${what} contains a character that cannot appear in a crabcrop URL: ${JSON.stringify(c)}${hint}`,
       );
     }
   }
