@@ -1,8 +1,12 @@
-//! The table's own tests: every row round-trips through the
-//! parser and the canonical spelling, every kind refuses the
-//! spellings just past its bounds with the row's error code,
-//! and the table names exactly the filters docs/filters.md
-//! documents.
+//! The table's own tests. They check that the table agrees
+//! with itself: every row round-trips through the parser and
+//! the canonical spelling, and every kind refuses the
+//! spellings one step past its bounds with the code its row
+//! declares. The bounds and codes themselves are pinned
+//! outside the table, by spec/operation-vectors.json and the
+//! url tests; the own-code filters are also pinned here, by
+//! literal errors. The table also names exactly the filters
+//! docs/filters.md documents.
 
 use std::collections::BTreeSet;
 use std::fmt::Display;
@@ -30,7 +34,8 @@ pub(super) trait Samples {
     fn refused(&self) -> Vec<String>;
 }
 
-/// The spellings one step past a numeric bound.
+/// The spellings one step past a numeric bound: the next
+/// integer, or the next representable float.
 trait Neighbors: Copy + Display {
     fn below(self) -> String;
     fn beyond(self) -> String;
@@ -53,21 +58,21 @@ integer_neighbors!(u8, u16, u32, u64, i32);
 
 impl Neighbors for f32 {
     fn below(self) -> String {
-        (f64::from(self) - 1.0).to_string()
+        self.next_down().to_string()
     }
     fn beyond(self) -> String {
-        if self == f32::MAX {
-            "inf".to_string()
-        } else {
-            (f64::from(self) + 1.0).to_string()
-        }
+        // Display spells the shortest text that reads back
+        // to the same float, and f32::MAX's next is infinity.
+        self.next_up().to_string()
     }
 }
 
 impl<T: FromStr + PartialOrd + Neighbors> Samples for Number<T> {
     fn accepted(&self) -> Vec<String> {
         let mut out = vec![self.spell(&self.max)];
-        if !self.open {
+        if self.open {
+            out.push(self.min.beyond());
+        } else {
             out.insert(0, self.spell(&self.min));
         }
         out
@@ -94,12 +99,15 @@ impl<T: FromStr + PartialEq + Neighbors> Samples for OneOf<T> {
     }
 }
 
-impl<T: Copy + PartialEq> Samples for Keyword<T> {
+impl<T: Copy> Samples for Keyword<T> {
     fn accepted(&self) -> Vec<String> {
-        self.0.iter().map(|(name, _)| name.to_string()).collect()
+        self.values.iter().map(|v| self.spell(v)).collect()
     }
     fn refused(&self) -> Vec<String> {
-        self.0.iter().map(|(name, _)| name.to_uppercase()).collect()
+        self.accepted()
+            .iter()
+            .map(|name| name.to_uppercase())
+            .collect()
     }
 }
 
@@ -363,6 +371,42 @@ fn names_answer_invalid_filters_in_the_wrong_shape() {
     }
     for text in ["frobnicate", "frobnicate(1)", "Grayscale", "(1)"] {
         assert_eq!(parse_one(text), invalid(text));
+    }
+}
+
+/// The rows with an error code of their own answer it for a
+/// bad argument list, pinned here by literal messages rather
+/// than through the table's own `argument_error`.
+#[test]
+fn own_code_rows_answer_their_own_code() {
+    let cases: [(&str, &str, &[&str]); 4] = [
+        (
+            "invalid_noise",
+            "invalid noise filter in segment",
+            &["noise(101)", "noise(-1)", "noise(5,5)"],
+        ),
+        (
+            "invalid_curve",
+            "invalid curve filter in segment",
+            &["curve(rgb,0,0)", "curve(rgb,0,0,256,255)"],
+        ),
+        (
+            "invalid_convolution",
+            "invalid convolution filter in segment",
+            &["convolution(1,1,1)", "convolution(1,1,1,1,1,1,1,1,1,2)"],
+        ),
+        (
+            "invalid_filters",
+            "invalid filters segment",
+            &["contrast(101)", "noise", "curve()"],
+        ),
+    ];
+    for (code, message, texts) in cases {
+        for text in texts {
+            let error = parse_one(text).expect_err(text);
+            assert_eq!(error.code(), code, "{text}");
+            assert_eq!(error.to_string(), format!("{message}: filters:{text}"));
+        }
     }
 }
 

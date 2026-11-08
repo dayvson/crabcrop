@@ -124,28 +124,27 @@ impl<T: FromStr + PartialEq + Display> Kind for OneOf<T> {
     }
 }
 
-/// A keyword naming one value of an enum.
-struct Keyword<T: 'static>(&'static [(&'static str, T)]);
+/// A keyword naming one value of an enum: `values` are the
+/// ones a URL may name, and `name` spells each with an
+/// exhaustive match, so a new variant does not compile until
+/// it has a keyword.
+struct Keyword<T: 'static> {
+    values: &'static [T],
+    name: fn(T) -> &'static str,
+}
 
-impl<T: Copy + PartialEq> Kind for Keyword<T> {
+impl<T: Copy> Kind for Keyword<T> {
     type Value = T;
 
     fn read(&self, text: &str) -> Option<T> {
-        self.0
+        self.values
             .iter()
-            .find(|(name, _)| *name == text)
-            .map(|&(_, value)| value)
+            .copied()
+            .find(|&value| (self.name)(value) == text)
     }
 
     fn spell(&self, value: &T) -> String {
-        // Only `read` builds these values, so every one has
-        // its keyword in the table.
-        let (name, _) = self
-            .0
-            .iter()
-            .find(|(_, v)| v == value)
-            .expect("a keyword value comes from its own table");
-        name.to_string()
+        (self.name)(*value).to_string()
     }
 }
 
@@ -235,10 +234,13 @@ const COLOR: Hex = Hex;
 /// `pixelate` block size.
 const PIXELATE_BLOCK: Number<u32> = Number::closed(1, MAX_DIMENSION);
 /// `flip` directions.
-const FLIP_DIRECTIONS: Keyword<FlipDirection> = Keyword(&[
-    ("h", FlipDirection::Horizontal),
-    ("v", FlipDirection::Vertical),
-]);
+const FLIP_DIRECTIONS: Keyword<FlipDirection> = Keyword {
+    values: &[FlipDirection::Horizontal, FlipDirection::Vertical],
+    name: |direction| match direction {
+        FlipDirection::Horizontal => "h",
+        FlipDirection::Vertical => "v",
+    },
+};
 /// The corner of a redaction region.
 const REGION_ORIGIN: Number<u32> = Number::closed(0, MAX_DIMENSION);
 /// The width or height of a redaction region.
@@ -248,10 +250,13 @@ const CORNER_RADIUS: Number<u32> = Number::closed(0, MAX_DIMENSION);
 /// `border` width.
 const BORDER_WIDTH: Number<u32> = Number::closed(0, MAX_DIMENSION);
 /// `mask` shapes.
-const MASK_SHAPES: Keyword<MaskShape> = Keyword(&[
-    ("circle", MaskShape::Circle),
-    ("ellipse", MaskShape::Ellipse),
-]);
+const MASK_SHAPES: Keyword<MaskShape> = Keyword {
+    values: &[MaskShape::Circle, MaskShape::Ellipse],
+    name: |shape| match shape {
+        MaskShape::Circle => "circle",
+        MaskShape::Ellipse => "ellipse",
+    },
+};
 /// `palette` colors.
 const PALETTE_COLORS: Number<u16> = Number::closed(2, 256);
 /// `max_bytes` budget.
@@ -264,12 +269,20 @@ const OFFSET: Number<i32> = Number::closed(i32::MIN, i32::MAX);
 /// A watermark or overlay opacity.
 const OPACITY: Number<u8> = Number::closed(0, 100);
 /// `overlay` blend modes.
-const BLEND_MODES: Keyword<BlendMode> = Keyword(&[
-    ("normal", BlendMode::Normal),
-    ("multiply", BlendMode::Multiply),
-    ("screen", BlendMode::Screen),
-    ("overlay", BlendMode::Overlay),
-]);
+const BLEND_MODES: Keyword<BlendMode> = Keyword {
+    values: &[
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+    ],
+    name: |mode| match mode {
+        BlendMode::Normal => "normal",
+        BlendMode::Multiply => "multiply",
+        BlendMode::Screen => "screen",
+        BlendMode::Overlay => "overlay",
+    },
+};
 /// `overlay` width, percent of the base image's width.
 const OVERLAY_WIDTH: Number<u32> = Number::closed(1, 400);
 /// `text` size, in pixels.
