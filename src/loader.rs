@@ -199,12 +199,13 @@ impl SourceBudget {
 /// #403): the bytes its loads hold, and the wait it has
 /// left for more. A charged load reserves a body's declared
 /// length (the fetch cap when undeclared) only once the
-/// origin has answered, holds that grant for at most
-/// [`BODY_GRANT`], and from then on holds what it has
-/// actually received, growing as more arrives. A stalled
-/// or slow origin therefore holds only the bytes it has
-/// delivered, never budget it has not used. Dropping the
-/// charge returns its bytes to the budget.
+/// origin has answered, and holds that grant while the
+/// body keeps arriving. A body that goes [`BODY_GRANT`]
+/// without a byte drops to what it has actually received,
+/// growing again as more arrives, so a stalled origin
+/// holds only the bytes it has delivered, never budget it
+/// is not filling. Dropping the charge returns its bytes
+/// to the budget.
 #[derive(Debug)]
 pub struct SourceCharge {
     budget: SourceBudget,
@@ -292,12 +293,17 @@ impl SourceCharge {
     }
 }
 
-/// How long a charged body read keeps the grant for its
-/// declared length (issue #403) before it holds only what
-/// it has received: long enough for a healthy origin to
-/// deliver a source at the fetch cap without charging per
-/// chunk, short enough that an origin that answers and then
-/// stalls cannot keep budget it is not filling.
+/// How long a charged body read may go without a byte
+/// before its grant for the declared length ends and it
+/// holds only what it has received (issue #403): far
+/// longer than a healthy origin pauses between packets,
+/// short enough that an origin that answers and then
+/// stalls cannot keep budget it is not filling. Each byte
+/// that arrives renews the grant. A body still arriving
+/// keeps it, however long the whole body takes: given
+/// back, the rest of the body would be charged behind
+/// every load still waiting for a grant of its own, and
+/// under a burst the load would be shed half-read.
 pub const BODY_GRANT: Duration = Duration::from_secs(1);
 
 /// The step a charged body grows by once its grant is over,
@@ -313,7 +319,8 @@ struct BodyCharge<'a> {
     charge: &'a SourceCharge,
     /// What the request held before this body.
     base: usize,
-    /// The bytes granted up front, and until when.
+    /// The bytes granted up front, and when the grant ends
+    /// unless another byte arrives first.
     grant: Option<(usize, tokio::time::Instant)>,
     /// The most this body may hold: the fetch cap.
     cap: usize,
@@ -350,8 +357,16 @@ impl<'a> BodyCharge<'a> {
         self.grant.map(|(_, ends)| ends)
     }
 
-    /// End the grant: from here the body holds what it has
-    /// received.
+    /// The body is still arriving: keep the grant for
+    /// another [`BODY_GRANT`].
+    fn renew_grant(&mut self) {
+        if let Some((_, ends)) = &mut self.grant {
+            *ends = tokio::time::Instant::now() + BODY_GRANT;
+        }
+    }
+
+    /// End the grant (the body went quiet): from here it
+    /// holds what it has received.
     fn end_grant(&mut self, received: usize) {
         if self.grant.take().is_some() {
             self.charge.shrink_to(self.base + received);
@@ -625,8 +640,9 @@ impl Loader {
     /// [`Loader::load_media`], charging the body against
     /// `charge` as it arrives (issue #403): nothing before
     /// the origin answers, then the body's declared length
-    /// for at most [`BODY_GRANT`], then what has actually
-    /// been received. The charge keeps the body's bytes
+    /// while it keeps arriving, and only what has actually
+    /// been received once it goes [`BODY_GRANT`] without a
+    /// byte. The charge keeps the body's bytes
     /// when the load succeeds and drops them when it fails.
     /// [`LoadError::Busy`] when the request's wait for
     /// budget ran out.
@@ -870,13 +886,8 @@ impl Loader {
                     limit: self.max_bytes,
                 });
             }
-            if part
-                .grant_ends()
-                .is_some_and(|ends| tokio::time::Instant::now() >= ends)
-            {
-                part.end_grant(body.len());
-            }
             part.cover(received).await?;
+            part.renew_grant();
             body.extend_from_slice(&bytes);
         }
         part.finish(body.len());
@@ -2871,5 +2882,81 @@ mod tests {
             peak <= BUDGET,
             "{peak} bytes held under a {BUDGET} byte budget"
         );
+    }
+
+    /// An origin that sends every body as `chunks` writes of
+    /// `chunk` bytes, `every` apart: healthy, but slower than
+    /// [`BODY_GRANT`] per body.
+    async fn spawn_paced_server(chunks: usize, chunk: usize, every: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        chunks * chunk
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    for i in 0..chunks {
+                        if i > 0 {
+                            sleep(every).await;
+                        }
+                        if socket.write_all(&vec![0u8; chunk]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_body_still_arriving_keeps_its_grant_under_a_burst() {
+        // Four loads of bodies that take 1.5 s to arrive but
+        // never pause for a whole BODY_GRANT, under a budget
+        // of two bodies: two at a time, all four served. A
+        // load that gave its grant back while its body was
+        // still arriving would have to charge the rest behind
+        // the loads still waiting for a whole grant, and,
+        // with nothing left to free, be shed half-read.
+        const CHUNK: usize = 32 * 1024;
+        const CHUNKS: usize = 6;
+        const BODY: usize = CHUNK * CHUNKS;
+        let every = Duration::from_millis(300);
+        assert!(every * (CHUNKS as u32 - 1) > BODY_GRANT);
+        let budget = SourceBudget::new(2 * BODY);
+        let loader = Loader::new(1 << 20, Duration::from_secs(20))
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let base = spawn_paced_server(CHUNKS, CHUNK, every).await;
+        let loads: Vec<_> = (0..4)
+            .map(|i| {
+                let (loader, budget, base) = (loader.clone(), budget.clone(), base.clone());
+                tokio::spawn(async move {
+                    let charge = budget.charge(Duration::from_secs(5));
+                    let body = loader
+                        .load_media_charged(
+                            &format!("{base}/s{i}.png"),
+                            MediaAdmission::default(),
+                            &charge,
+                        )
+                        .await?;
+                    // Held a moment, as a render would.
+                    sleep(Duration::from_millis(50)).await;
+                    Ok::<usize, LoadError>(body.len())
+                })
+            })
+            .collect();
+        for load in loads {
+            assert_eq!(load.await.unwrap(), Ok(BODY));
+        }
+        assert_eq!(budget.in_use(), 0, "every charge came back");
     }
 }
