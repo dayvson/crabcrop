@@ -53,11 +53,14 @@ On `SIGTERM` or Ctrl-C the server drains, then exits with status 0:
 
 One deadline bounds the first two steps together: `CRABCROP_SHUTDOWN_GRACE_SECS` (8 seconds by default) from the signal on. At the deadline the process exits with whatever is still running: a request still in flight is cut off, and a bucket write still in flight is dropped; stderr says how many writes were dropped. A dropped render write-through costs one render on the next replica that misses. A dropped group write-back leaves the bucket copy outside a later purge of that group, as a failed bucket write does. A second `SIGTERM` or Ctrl-C during the drain ends it at once, in the same way. The server never runs past the grace, so give the platform a stop timeout longer than it, or the platform kills the process mid-drain:
 
-- Kubernetes: the Helm chart passes `shutdownGraceSeconds` (default 8) to the server and sets the pod's `terminationGracePeriodSeconds` to it plus 5, so set the grace there. Elsewhere `terminationGracePeriodSeconds` defaults to 30 seconds, which covers the default grace.
+- Kubernetes: the Helm chart passes `shutdownGraceSeconds` (default 8) to the server and sets the pod's `terminationGracePeriodSeconds` to it plus 5, so set the grace there; the chart refuses `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`. Elsewhere `terminationGracePeriodSeconds` defaults to 30 seconds, which covers the default grace.
 - `docker stop` and Compose: 10 seconds by default. A grace of 10 or more needs `docker stop --time` or Compose's `stop_grace_period` raised to match.
 - Cloud Run: 10 seconds, fixed. Keep the grace under it.
+- ECS on Fargate: the container's `stopTimeout` in the task definition, 30 seconds by default (120 at most).
+- Azure Container Apps: `terminationGracePeriodSeconds` under the app's `template`, 30 seconds by default.
+- systemd (the VM unit): `TimeoutStopSec=` in the unit, 90 seconds by default.
 
-The listener closes at the signal, so a load balancer that still routes to the instance gets refused connections until it notices. Where the platform removes the instance from the balancer while it signals it, as Kubernetes does, a `preStop` hook that sleeps a few seconds keeps it serving meanwhile; add the sleep to `terminationGracePeriodSeconds`.
+The listener closes at the signal, so a load balancer that still routes to the instance gets refused connections until it notices. Where the platform removes the instance from the balancer while it signals it, as Kubernetes does, a `preStop` hook that sleeps a few seconds keeps it serving meanwhile; add the sleep to `terminationGracePeriodSeconds`. The Helm chart sets no such hook, and its 5-second margin is not room for one.
 
 #### Lock down the edge
 

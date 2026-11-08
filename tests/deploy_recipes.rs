@@ -302,4 +302,34 @@ fn the_helm_chart_gives_the_pod_more_than_the_server_drain() {
         Some("value: {{ .Values.shutdownGraceSeconds | quote }}"),
         "deployment.yaml: CRABCROP_SHUTDOWN_GRACE_SECS comes from shutdownGraceSeconds"
     );
+
+    // The same name in `env` or `ai.env` would render a
+    // second entry, which wins and leaves the pod's grace
+    // short of the server's: the chart refuses it.
+    let guard = deployment
+        .lines()
+        .position(|l| l.trim() == "{{- if hasKey $allEnv \"CRABCROP_SHUTDOWN_GRACE_SECS\" }}")
+        .expect("deployment.yaml: refuses CRABCROP_SHUTDOWN_GRACE_SECS in env");
+    assert!(
+        deployment
+            .lines()
+            .nth(guard + 1)
+            .is_some_and(|l| l.trim().starts_with("{{- fail ")),
+        "deployment.yaml: the guard fails the render"
+    );
+    let merged = deployment
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("set $allEnv $k $v"))
+        .map(|(i, _)| i)
+        .last()
+        .expect("deployment.yaml: env and ai.env merge into $allEnv");
+    let listed = deployment
+        .lines()
+        .position(|l| l.contains("range $k := keys $allEnv"))
+        .expect("deployment.yaml: $allEnv is listed");
+    assert!(
+        merged < guard && guard < listed,
+        "deployment.yaml: the guard checks the merged env before it is listed"
+    );
 }

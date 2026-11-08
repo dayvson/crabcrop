@@ -39,7 +39,8 @@ containerPort: 3000
 # (CRABCROP_SHUTDOWN_GRACE_SECS): requests in flight finish,
 # then the shared-tier writes they left. The pod's
 # terminationGracePeriodSeconds is this plus 5, so set the
-# grace here rather than in env.
+# grace here: the chart refuses CRABCROP_SHUTDOWN_GRACE_SECS
+# in env.
 shutdownGraceSeconds: 8
 
 # Presets, name = operations, delivered as a ConfigMap and

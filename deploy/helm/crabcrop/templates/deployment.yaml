@@ -102,6 +102,11 @@ spec:
             {{- $_ := set $allEnv $k $v }}
             {{- end }}
             {{- end }}
+            {{- /* A second CRABCROP_SHUTDOWN_GRACE_SECS would win over the
+                 one above and leave terminationGracePeriodSeconds short. */}}
+            {{- if hasKey $allEnv "CRABCROP_SHUTDOWN_GRACE_SECS" }}
+            {{- fail "set shutdownGraceSeconds, not CRABCROP_SHUTDOWN_GRACE_SECS in env or ai.env: the pod's terminationGracePeriodSeconds follows shutdownGraceSeconds" }}
+            {{- end }}
             {{- range $k := keys $allEnv | sortAlpha }}
             - name: {{ $k }}
               value: {{ index $allEnv $k | quote }}
