@@ -1441,6 +1441,12 @@ pub(crate) mod test_support {
         pub hold_deletes: Arc<AtomicBool>,
         /// DELETEs held right now.
         pub held_deletes: Arc<AtomicUsize>,
+        /// While set, a PUT waits before it is handled, so
+        /// a test can keep write-throughs in flight (issue
+        /// #463).
+        pub hold_puts: Arc<AtomicBool>,
+        /// PUTs held right now.
+        pub held_puts: Arc<AtomicUsize>,
         /// Purge walk pacing instruments (issue #462).
         pub walk: Arc<WalkProbe>,
         pub endpoint: String,
@@ -1463,6 +1469,8 @@ pub(crate) mod test_support {
         let held_object_gets = Arc::new(AtomicUsize::new(0));
         let hold_deletes = Arc::new(AtomicBool::new(false));
         let held_deletes = Arc::new(AtomicUsize::new(0));
+        let hold_puts = Arc::new(AtomicBool::new(false));
+        let held_puts = Arc::new(AtomicUsize::new(0));
         let walk = Arc::new(WalkProbe::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1475,6 +1483,8 @@ pub(crate) mod test_support {
         let shared_held_objects = held_object_gets.clone();
         let shared_hold_deletes = hold_deletes.clone();
         let shared_held_deletes = held_deletes.clone();
+        let shared_hold_puts = hold_puts.clone();
+        let shared_held_puts = held_puts.clone();
         let shared_walk = walk.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
@@ -1487,6 +1497,8 @@ pub(crate) mod test_support {
                 let held_object_gets = shared_held_objects.clone();
                 let hold_deletes = shared_hold_deletes.clone();
                 let held_deletes = shared_held_deletes.clone();
+                let hold_puts = shared_hold_puts.clone();
+                let held_puts = shared_held_puts.clone();
                 let walk = shared_walk.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
@@ -1549,6 +1561,13 @@ pub(crate) mod test_support {
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                         held_deletes.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    if method == "PUT" && hold_puts.load(Ordering::SeqCst) {
+                        held_puts.fetch_add(1, Ordering::SeqCst);
+                        while hold_puts.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        held_puts.fetch_sub(1, Ordering::SeqCst);
                     }
                     if method == "GET" && range_end.is_some() {
                         let seen = ranged_gets.fetch_add(1, Ordering::SeqCst);
@@ -1638,6 +1657,8 @@ pub(crate) mod test_support {
             held_object_gets,
             hold_deletes,
             held_deletes,
+            hold_puts,
+            held_puts,
             walk,
             endpoint: format!("http://127.0.0.1:{port}"),
         }

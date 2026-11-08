@@ -257,3 +257,49 @@ fn recipes_start_the_server_with_no_arguments() {
         vec!["    args: [\"--x\"]", "  - command:"]
     );
 }
+
+#[test]
+fn the_helm_chart_gives_the_pod_more_than_the_server_drain() {
+    // Issue #463: the server drains for its shutdown grace
+    // and then exits. The chart passes its grace to the
+    // server and sets the pod's termination grace from the
+    // same value plus a margin, so the kubelet cannot kill
+    // the pod mid-drain; the default matches the server's.
+    let values = read("deploy/helm/crabcrop/values.yaml");
+    let grace: Vec<&str> = values
+        .lines()
+        .filter_map(|l| l.strip_prefix("shutdownGraceSeconds:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        grace,
+        [crabcrop::server::DEFAULT_SHUTDOWN_GRACE_SECS.to_string()],
+        "values.yaml: shutdownGraceSeconds is the server's default grace"
+    );
+
+    let deployment = read("deploy/helm/crabcrop/templates/deployment.yaml");
+    let pod_grace: Vec<&str> = deployment
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("terminationGracePeriodSeconds:"))
+        .map(str::trim)
+        .collect();
+    let [pod_grace] = pod_grace[..] else {
+        panic!("deployment.yaml: one terminationGracePeriodSeconds, got {pod_grace:?}");
+    };
+    let margin = pod_grace
+        .strip_prefix("{{ add .Values.shutdownGraceSeconds ")
+        .and_then(|rest| rest.strip_suffix(" }}"))
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("deployment.yaml: {pod_grace:?} is not the grace plus a margin"));
+    assert!(margin > 0, "{pod_grace}");
+
+    let env = deployment
+        .lines()
+        .position(|l| l.trim() == "- name: CRABCROP_SHUTDOWN_GRACE_SECS")
+        .expect("deployment.yaml: the server gets CRABCROP_SHUTDOWN_GRACE_SECS");
+    assert_eq!(
+        deployment.lines().nth(env + 1).map(str::trim),
+        Some("value: {{ .Values.shutdownGraceSeconds | quote }}"),
+        "deployment.yaml: CRABCROP_SHUTDOWN_GRACE_SECS comes from shutdownGraceSeconds"
+    );
+}

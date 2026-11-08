@@ -35,6 +35,13 @@ metricsToken:
 # Port the server listens on (the PORT environment variable).
 containerPort: 3000
 
+# How long the server drains after SIGTERM before it exits
+# (CRABCROP_SHUTDOWN_GRACE_SECS): requests in flight finish,
+# then the shared-tier writes they left. The pod's
+# terminationGracePeriodSeconds is this plus 5, so set the
+# grace here rather than in env.
+shutdownGraceSeconds: 8
+
 # Presets, name = operations, delivered as a ConfigMap and
 # wired through CRABCROP_PRESETS_FILE automatically.
 # Example:

@@ -114,7 +114,7 @@ env:
   CRABCROP_ALLOWED_SOURCES: "images.example.com,upload.wikimedia.org"
 ```
 
-The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer <redacted>, from an existing Secret), `resultStorage` (the disk tier and its claim), and `resultBucket` (the shared tier). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
+The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer <redacted>, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here rather than in `env`). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
 
 ## Smoke checklist
 

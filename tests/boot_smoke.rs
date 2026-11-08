@@ -535,3 +535,284 @@ fn boot_fails_cleanly_when_a_bucket_store_client_cannot_be_built() {
         assert!(!stderr.contains("panicked"), "{stderr}");
     }
 }
+
+/// A slow shared bucket and the image origin on one
+/// listener, for the shutdown tests (issue #463). It answers
+/// listings (empty) and object reads (404) at once, serves
+/// the source image, and holds every PUT, reporting it as it
+/// arrives, until the test lets the PUTs through.
+#[cfg(unix)]
+struct SlowBucket {
+    endpoint: String,
+    /// One message per PUT, sent when it arrives.
+    puts: std::sync::mpsc::Receiver<String>,
+    /// Set to answer the held PUTs.
+    release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// PUTs answered so far.
+    answered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl SlowBucket {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (put_tx, puts) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let answered = Arc::new(AtomicUsize::new(0));
+        let (held, done) = (release.clone(), answered.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (put_tx, held, done) = (put_tx.clone(), held.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let Some((method, target)) = read_request(&mut stream) else {
+                        return;
+                    };
+                    let (status, body): (&str, &[u8]) = if target == "/img/src.jpg" {
+                        ("200 OK", include_bytes!("fixtures/portrait.jpg"))
+                    } else if method == "PUT" {
+                        let _ = put_tx.send(target);
+                        let (lock, cvar) = &*held;
+                        let mut go = lock.lock().unwrap();
+                        while !*go {
+                            go = cvar.wait(go).unwrap();
+                        }
+                        done.fetch_add(1, Ordering::SeqCst);
+                        ("200 OK", b"")
+                    } else if target.contains("list-type=2") {
+                        (
+                            "200 OK",
+                            b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                        )
+                    } else if method == "GET" {
+                        ("404 Not Found", b"")
+                    } else {
+                        ("204 No Content", b"")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body);
+                });
+            }
+        });
+        SlowBucket {
+            endpoint,
+            puts,
+            release,
+            answered,
+        }
+    }
+
+    /// Answer every held PUT, and every later one at once.
+    fn let_puts_through(&self) {
+        let (lock, cvar) = &*self.release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+}
+
+/// Read one request's head and its body; the method and
+/// the request target.
+#[cfg(unix)]
+fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let head_end = loop {
+        let n = stream.read(&mut chunk).ok().filter(|&n| n > 0)?;
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let length: usize = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    while buf.len() < head_end + length {
+        let n = stream.read(&mut chunk).ok().filter(|&n| n > 0)?;
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let mut parts = head.split_whitespace();
+    Some((parts.next()?.to_string(), parts.next()?.to_string()))
+}
+
+/// A server over `bucket` with a shutdown grace of
+/// `grace_secs`, which has rendered one image and has its
+/// write-through to the bucket in flight; and the lines it
+/// prints, as they come.
+#[cfg(unix)]
+fn serving_with_a_held_put(
+    bucket: &SlowBucket,
+    grace_secs: u64,
+) -> (ServerGuard, std::sync::mpsc::Receiver<String>) {
+    use std::io::BufRead;
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+        .env_clear()
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+        .env("PORT", port.to_string())
+        .env("CRABCROP_ALLOW_UNSAFE", "1")
+        .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
+        .env("CRABCROP_RESULT_BUCKET", "results")
+        .env("CRABCROP_S3_ENDPOINT", &bucket.endpoint)
+        .env("CRABCROP_SHUTDOWN_GRACE_SECS", grace_secs.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = ServerGuard(child);
+    let stdout = server.0.stdout.take().unwrap();
+    let (line_tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if line_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    wait_for_line(&lines, "crabcrop listening on port");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let request = format!(
+        "GET /unsafe/40x30/{}/img/src.jpg HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+        bucket.endpoint
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.lines().next().unwrap_or("").contains("200"),
+        "{}",
+        response.lines().next().unwrap_or("")
+    );
+    // The render's write-through reaches the bucket, which
+    // holds it.
+    let put = bucket
+        .puts
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the render's write-through reaches the bucket");
+    assert!(put.starts_with("/results/"), "{put}");
+    (server, lines)
+}
+
+/// Wait for a printed line that contains `needle`, and
+/// return it.
+#[cfg(unix)]
+fn wait_for_line(lines: &std::sync::mpsc::Receiver<String>, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match lines.recv_timeout(left) {
+            Ok(line) if line.contains(needle) => return line,
+            Ok(line) => seen.push(line),
+            Err(_) => break,
+        }
+    }
+    panic!("no line with {needle:?}; saw {seen:#?}");
+}
+
+/// Send SIGTERM to the server, as a platform stopping it does.
+#[cfg(unix)]
+fn terminate(server: &ServerGuard) {
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&server.0),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+}
+
+/// Wait for the server to exit; its status and stderr.
+#[cfg(unix)]
+fn exit_of(server: &mut ServerGuard, within: Duration) -> (std::process::ExitStatus, String) {
+    let deadline = Instant::now() + within;
+    let status = loop {
+        if let Some(status) = server.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server did not exit within {within:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    server
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status, stderr)
+}
+
+#[test]
+#[cfg(unix)]
+fn sigterm_waits_for_an_in_flight_shared_write_then_exits() {
+    // Issue #463: at SIGTERM the connections drained and the
+    // process exited, dropping the write-throughs still in
+    // flight. Now it waits for them, within its grace.
+    let bucket = SlowBucket::start();
+    let (mut server, lines) = serving_with_a_held_put(&bucket, 120);
+    terminate(&server);
+    wait_for_line(&lines, "shutdown: draining");
+    // Draining, with the write held at the bucket: the
+    // process is still there.
+    assert!(server.0.try_wait().unwrap().is_none());
+    assert_eq!(bucket.answered.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // The bucket answers; the write lands, and the process
+    // exits on its own, long before the grace is spent.
+    let released = Instant::now();
+    bucket.let_puts_through();
+    let (status, stderr) = exit_of(&mut server, Duration::from_secs(60));
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(released.elapsed() < Duration::from_secs(60));
+    assert_eq!(bucket.answered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    wait_for_line(&lines, "shutdown: done");
+    assert!(!stderr.contains("dropped"), "{stderr}");
+}
+
+#[test]
+#[cfg(unix)]
+fn sigterm_stops_waiting_for_a_stalled_shared_write_at_the_grace() {
+    // Issue #463: a write the bucket never answers holds the
+    // shutdown only until the grace, CRABCROP_SHUTDOWN_GRACE_SECS
+    // from the signal on, and then the process exits.
+    let grace = Duration::from_secs(2);
+    let bucket = SlowBucket::start();
+    let (mut server, lines) = serving_with_a_held_put(&bucket, grace.as_secs());
+    let signalled = Instant::now();
+    terminate(&server);
+    wait_for_line(&lines, "shutdown: draining");
+    let (status, stderr) = exit_of(&mut server, Duration::from_secs(60));
+    let took = signalled.elapsed();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(took >= grace, "exited after {took:?}, inside the grace");
+    assert!(
+        took < grace + Duration::from_secs(30),
+        "exited after {took:?}"
+    );
+    assert!(
+        stderr.contains("shutdown: 1 background writes still running at the deadline are dropped"),
+        "{stderr}"
+    );
+    assert_eq!(bucket.answered.load(std::sync::atomic::Ordering::SeqCst), 0);
+    wait_for_line(&lines, "shutdown: done");
+    // Let the abandoned PUT's thread finish.
+    bucket.let_puts_through();
+}

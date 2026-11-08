@@ -88,6 +88,12 @@ async fn start() {
         eprintln!("crabcrop: {e}");
         std::process::exit(1);
     }
+    // The drain is over (issue #463). Exit here rather than
+    // in the runtime's drop, which waits without bound for
+    // blocking work still running, such as a render past
+    // the grace or a disk write, and would hold the process
+    // past the deadline the drain just kept.
+    std::process::exit(0);
 }
 
 /// Load the preset configuration: the presets file (one
@@ -565,6 +571,26 @@ fn source_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, Str
     Ok(secs)
 }
 
+/// How long a stopping server drains (issue #463):
+/// `CRABCROP_SHUTDOWN_GRACE_SECS`, 1 to 600 like the other
+/// wall-clock limits, defaulting to 8 s, under the 10 s
+/// `docker stop` and Cloud Run allow. It bounds the
+/// connection drain and the background write drain
+/// together, from the signal on.
+fn shutdown_grace_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String> {
+    let secs: u64 = parse_env_value(
+        "CRABCROP_SHUTDOWN_GRACE_SECS",
+        get("CRABCROP_SHUTDOWN_GRACE_SECS"),
+        crate::server::DEFAULT_SHUTDOWN_GRACE_SECS,
+    )?;
+    if !(1..=600).contains(&secs) {
+        return Err(format!(
+            "CRABCROP_SHUTDOWN_GRACE_SECS must be between 1 and 600, got {secs}"
+        ));
+    }
+    Ok(secs)
+}
+
 /// The proxy variables the HTTP client honours, as pairs
 /// it reads in order: the first of a pair that is set
 /// wins, even when it is empty.
@@ -835,6 +861,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the upload cap derive from the same cap.
     let fetch_cap_mb = source_max_mb(&|name: &str| env::var(name).ok())?;
     let fetch_timeout_secs = source_timeout_secs(&|name: &str| env::var(name).ok())?;
+    let shutdown_grace =
+        std::time::Duration::from_secs(shutdown_grace_secs(&|name: &str| env::var(name).ok())?);
     let source_buffer_bytes = source_buffer_budget(
         |name| env::var(name).ok(),
         process_permits + slow_lane_permits,
@@ -1072,6 +1100,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         inflight: Arc::new(crate::server::Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: crate::server::Background::default(),
         config_fingerprint,
     };
     println!(
@@ -1083,10 +1112,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Purges recorded in the shared bucket hold here before
     // the first request (issue #461).
     crate::server::start_purge_tombstones(&state).await;
+    let background = state.background.clone();
     println!("crabcrop listening on port {port}");
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Shutdown (issue #463): at SIGTERM or Ctrl-C the
+    // listener closes, idle connections close, and requests
+    // in flight finish; then the background writes they and
+    // earlier requests left (shared-tier write-throughs,
+    // purges whose caller left) finish. One deadline, the
+    // grace from the signal on, bounds both waits, and the
+    // process exits at it with whatever is still running.
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut serve = axum::serve(listener, app(state))
+        .with_graceful_shutdown(stop.clone().cancelled_owned())
+        .into_future();
+    tokio::select! {
+        served = &mut serve => return served.map_err(Into::into),
+        () = shutdown_signal() => stop.cancel(),
+    }
+    let deadline = tokio::time::Instant::now() + shutdown_grace;
+    println!(
+        "shutdown: draining requests and background writes for up to {}s",
+        shutdown_grace.as_secs()
+    );
+    match tokio::time::timeout_at(deadline, serve).await {
+        Ok(served) => served?,
+        Err(_) => eprintln!("shutdown: requests still in flight at the deadline are cut off"),
+    }
+    let left = background.drain(deadline).await;
+    if left.writes > 0 {
+        eprintln!(
+            "shutdown: {} background writes still running at the deadline are dropped",
+            left.writes
+        );
+    }
+    if left.walks > 0 {
+        // A walk cut short leaves its purge's tombstone in
+        // force (issue #461): copies it covers stay misses
+        // until a later purge of the target finishes its walk.
+        println!(
+            "shutdown: stopping {} background purge walks; their tombstones keep the purges in force",
+            left.walks
+        );
+    }
+    println!("shutdown: done");
     Ok(())
 }
 
@@ -3458,6 +3526,25 @@ mod tests {
             let err = expect_err(timeout(bad));
             assert!(
                 err.contains("CRABCROP_SOURCE_TIMEOUT_SECS"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shutdown_grace_defaults_under_ten_seconds_and_checks_its_range() {
+        // Issue #463: unset, the drain ends before the 10 s
+        // `docker stop` and Cloud Run allow.
+        let grace = shutdown_grace_secs(&env_of(&[])).unwrap();
+        assert_eq!(grace, crate::server::DEFAULT_SHUTDOWN_GRACE_SECS);
+        assert!(grace < 10, "{grace}");
+        let set = |v: &str| shutdown_grace_secs(&env_of(&[("CRABCROP_SHUTDOWN_GRACE_SECS", v)]));
+        assert_eq!(set("1").unwrap(), 1);
+        assert_eq!(set("600").unwrap(), 600);
+        for bad in ["0", "601", "-1", "2.5", "8s", "", "never"] {
+            let err = expect_err(set(bad));
+            assert!(
+                err.contains("CRABCROP_SHUTDOWN_GRACE_SECS"),
                 "{bad:?}: {err}"
             );
         }
