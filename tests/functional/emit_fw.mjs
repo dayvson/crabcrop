@@ -48,17 +48,20 @@ expected["hydro-secret-exp"] = buildURL(BASE, SECRET, "100x0", SRC, { expires: 1
 const { getImage } = await import(
   new URL("../../frameworks/nuxt/crabcrop.ts", import.meta.url)
 );
-const nuxtOpts = { options: { base: BASE, secret: SECRET } };
-const nuxt = (src, mods, opts) => getImage(src, { modifiers: mods }, opts).url;
-out["nuxt-cover"] = nuxt(SRC, { width: 800, height: 450 }, nuxtOpts);
+// @nuxt/image passes the provider options in the second argument,
+// beside the modifiers, and its own context (with the private runtime
+// config that holds the secret) as the third (#381).
+const nuxtCtx = { options: { runtimeConfig: { crabcropSecret: SECRET } } };
+const nuxt = (src, mods, opts, ctx) => getImage(src, { modifiers: mods, ...opts }, ctx).url;
+out["nuxt-cover"] = nuxt(SRC, { width: 800, height: 450 }, { base: BASE }, nuxtCtx);
 expected["nuxt-cover"] = buildURL(BASE, SECRET, "crop:800x450:smart", SRC);
-out["nuxt-contain"] = nuxt(SRC, { width: 800, height: 450, fit: "contain" }, nuxtOpts);
+out["nuxt-contain"] = nuxt(SRC, { width: 800, height: 450, fit: "contain" }, { base: BASE }, nuxtCtx);
 expected["nuxt-contain"] = buildURL(BASE, SECRET, "pad:800x450:blur", SRC);
-out["nuxt-inside"] = nuxt(SRC, { width: 800, height: 450, fit: "inside" }, nuxtOpts);
+out["nuxt-inside"] = nuxt(SRC, { width: 800, height: 450, fit: "inside" }, { base: BASE }, nuxtCtx);
 expected["nuxt-inside"] = buildURL(BASE, SECRET, "fit-in:800x450", SRC);
-out["nuxt-fill-fmt"] = nuxt(SRC, { width: 800, height: 450, fit: "fill", format: "jpg", quality: 70 }, nuxtOpts);
+out["nuxt-fill-fmt"] = nuxt(SRC, { width: 800, height: 450, fit: "fill", format: "jpg", quality: 70 }, { base: BASE }, nuxtCtx);
 expected["nuxt-fill-fmt"] = buildURL(BASE, SECRET, "800x450/filters:format(jpeg)/filters:quality(70)", SRC);
-out["nuxt-preset-w"] = nuxt(SRC, { width: 500 }, { options: { base: BASE, preset: "thumb" } });
+out["nuxt-preset-w"] = nuxt(SRC, { width: 500 }, { base: BASE, preset: "thumb" });
 expected["nuxt-preset-w"] = buildURL(BASE, null, "preset:thumb/500x0", SRC);
 
 console.log(JSON.stringify({ out, expected }));
