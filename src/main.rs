@@ -41,11 +41,30 @@ fn main() {
     if crabcrop::svg::is_worker_invocation() {
         std::process::exit(crabcrop::svg::worker_main());
     }
-    start();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("crabcrop: cannot start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    // A server that has drained (issue #463) stops its
+    // runtime by the drain's deadline: blocking work nothing
+    // tracks, such as a disk write whose request went or a
+    // render past the grace, gets what is left of the grace
+    // and is then left behind. Dropping the runtime would
+    // wait for that work without bound, past the deadline.
+    if let Some(deadline) = runtime.block_on(start()) {
+        runtime.shutdown_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
 }
 
-#[tokio::main]
-async fn start() {
+/// Run a CLI verb, or the server. For the server, returns
+/// the deadline by which its runtime must stop.
+async fn start() -> Option<std::time::Instant> {
     // CLI verbs run instead of the server when the first
     // argument names one, and only a bare `crabcrop` starts
     // the server, which reads the environment and takes no
@@ -73,7 +92,7 @@ async fn start() {
                 std::process::exit(1);
             }
         }
-        return;
+        return None;
     }
     // The server parses and renders every SVG in a worker
     // started from its own binary (issue #447).
@@ -84,9 +103,12 @@ async fn start() {
             std::process::exit(1);
         }
     }
-    if let Err(e) = run().await {
-        eprintln!("crabcrop: {e}");
-        std::process::exit(1);
+    match run().await {
+        Ok(deadline) => Some(deadline),
+        Err(e) => {
+            eprintln!("crabcrop: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -565,6 +587,26 @@ fn source_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, Str
     Ok(secs)
 }
 
+/// How long a stopping server drains (issue #463):
+/// `CRABCROP_SHUTDOWN_GRACE_SECS`, 1 to 600 like the other
+/// wall-clock limits, defaulting to 8 s, under the 10 s
+/// `docker stop` and Cloud Run allow. It bounds the
+/// connection drain and the background write drain
+/// together, from the signal on.
+fn shutdown_grace_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String> {
+    let secs: u64 = parse_env_value(
+        "CRABCROP_SHUTDOWN_GRACE_SECS",
+        get("CRABCROP_SHUTDOWN_GRACE_SECS"),
+        crate::server::DEFAULT_SHUTDOWN_GRACE_SECS,
+    )?;
+    if !(1..=600).contains(&secs) {
+        return Err(format!(
+            "CRABCROP_SHUTDOWN_GRACE_SECS must be between 1 and 600, got {secs}"
+        ));
+    }
+    Ok(secs)
+}
+
 /// The proxy variables the HTTP client honours, as pairs
 /// it reads in order: the first of a pair that is set
 /// wins, even when it is empty.
@@ -780,7 +822,7 @@ fn build_upload_store(
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let keyring = build_keyring(|name| env::var(name).ok())?;
     let allow_unsafe = parse_bool("CRABCROP_ALLOW_UNSAFE", false)?;
     // CRABCROP_PORT is the namespaced alias for PORT and
@@ -835,6 +877,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the upload cap derive from the same cap.
     let fetch_cap_mb = source_max_mb(&|name: &str| env::var(name).ok())?;
     let fetch_timeout_secs = source_timeout_secs(&|name: &str| env::var(name).ok())?;
+    let shutdown_grace =
+        std::time::Duration::from_secs(shutdown_grace_secs(&|name: &str| env::var(name).ok())?);
     let source_buffer_bytes = source_buffer_budget(
         |name| env::var(name).ok(),
         process_permits + slow_lane_permits,
@@ -1072,6 +1116,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         inflight: Arc::new(crate::server::Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: crate::server::Background::default(),
         config_fingerprint,
     };
     println!(
@@ -1083,31 +1128,95 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Purges recorded in the shared bucket hold here before
     // the first request (issue #461).
     crate::server::start_purge_tombstones(&state).await;
+    let background = state.background.clone();
+    let signalled = shutdown_signal();
     println!("crabcrop listening on port {port}");
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+    // Shutdown (issue #463): at SIGTERM or Ctrl-C the
+    // listener closes, idle connections close, and requests
+    // in flight finish; then the background writes they and
+    // earlier requests left (shared-tier write-throughs,
+    // purges whose caller left) finish. One deadline, the
+    // grace from the signal on, bounds both waits, and the
+    // process exits at it with whatever is still running.
+    // A second signal ends the drain at once.
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut serve = axum::serve(listener, app(state))
+        .with_graceful_shutdown(stop.clone().cancelled_owned())
+        .into_future();
+    tokio::select! {
+        served = &mut serve => {
+            served?;
+            return Ok(std::time::Instant::now());
+        }
+        () = signalled => stop.cancel(),
+    }
+    let deadline = tokio::time::Instant::now() + shutdown_grace;
+    let signalled_again = shutdown_signal();
+    println!(
+        "shutdown: draining requests and background writes for up to {}s",
+        shutdown_grace.as_secs()
+    );
+    let drain = async {
+        match tokio::time::timeout_at(deadline, serve).await {
+            Ok(served) => served?,
+            Err(_) => eprintln!("shutdown: requests still in flight at the deadline are cut off"),
+        }
+        Ok::<_, std::io::Error>(background.drain(deadline).await)
+    };
+    // The runtime stops by `stop_by`: the deadline after a
+    // drain, at once after a second signal.
+    let (left, when, stop_by) = tokio::select! {
+        left = drain => (left?, "at the deadline", deadline.into_std()),
+        () = signalled_again => {
+            eprintln!("shutdown: a second signal ends the drain; what is still running is cut off");
+            (background.running(), "at the second signal", std::time::Instant::now())
+        }
+    };
+    if left.writes > 0 {
+        eprintln!(
+            "shutdown: {} background writes still running {when} are dropped",
+            left.writes
+        );
+    }
+    if left.walks > 0 {
+        // A walk cut short leaves its purge's bucket
+        // tombstone in force (issue #461): copies it covers
+        // stay misses until a later purge of the target
+        // finishes its walk. A purge whose tombstone the
+        // bucket refused held in this process only.
+        println!(
+            "shutdown: stopping {} background purge walks; a purge whose tombstone reached the bucket stays in force",
+            left.walks
+        );
+    }
+    println!("shutdown: done");
+    Ok(stop_by)
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
+/// Resolves at the next SIGTERM or Ctrl-C. The handlers
+/// are installed when this is called, not when it is first
+/// polled, so a signal that arrives in between still counts;
+/// a signal from before the call does not.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt()).expect("install Ctrl-C handler");
+    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+}
+
+/// SIGTERM or Ctrl-C, as for unix; only Ctrl-C elsewhere.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
         tokio::signal::ctrl_c()
             .await
             .expect("install Ctrl-C handler");
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
     }
 }
 
@@ -3526,6 +3635,25 @@ mod tests {
             let err = expect_err(timeout(bad));
             assert!(
                 err.contains("CRABCROP_SOURCE_TIMEOUT_SECS"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shutdown_grace_defaults_under_ten_seconds_and_checks_its_range() {
+        // Issue #463: unset, the drain ends before the 10 s
+        // `docker stop` and Cloud Run allow.
+        let grace = shutdown_grace_secs(&env_of(&[])).unwrap();
+        assert_eq!(grace, crate::server::DEFAULT_SHUTDOWN_GRACE_SECS);
+        assert!(grace < 10, "{grace}");
+        let set = |v: &str| shutdown_grace_secs(&env_of(&[("CRABCROP_SHUTDOWN_GRACE_SECS", v)]));
+        assert_eq!(set("1").unwrap(), 1);
+        assert_eq!(set("600").unwrap(), 600);
+        for bad in ["0", "601", "-1", "2.5", "8s", "", "never"] {
+            let err = expect_err(set(bad));
+            assert!(
+                err.contains("CRABCROP_SHUTDOWN_GRACE_SECS"),
                 "{bad:?}: {err}"
             );
         }

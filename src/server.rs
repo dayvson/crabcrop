@@ -56,6 +56,8 @@ impl std::fmt::Debug for NamedDetector {
     }
 }
 
+mod background;
+pub use background::{Background, DEFAULT_SHUTDOWN_GRACE_SECS, Drained, SHARED_PUTS_AT_ONCE};
 mod process;
 pub(in crate::server) use process::{
     AI_GATE_WAIT, ANIM_GATE_WAIT, Flight, FlightSlot, JobPermits, JobSource, Lane, MetaFlight,
@@ -309,6 +311,12 @@ pub struct AppState {
     /// promotion that began before a purge cannot restore
     /// what the purge removed when its writes land.
     pub purge_guard: Arc<crate::cache::PurgeGuard>,
+    /// The work handlers leave running (issue #463):
+    /// shared-tier write-throughs, bounded to
+    /// [`SHARED_PUTS_AT_ONCE`] in flight, purge fan-outs,
+    /// disk-hit follow-ups and purge walks, all tracked, so
+    /// a shutdown can drain the writes up to its deadline.
+    pub background: Background,
     /// Fingerprint of the output-shaping configuration
     /// (audit R2-08), computed at boot in `main`: embedded
     /// in every cache key, so changing the metadata
@@ -392,6 +400,7 @@ impl std::fmt::Debug for AppState {
             anim_gate,
             inflight,
             purge_guard,
+            background,
             config_fingerprint
         );
         out.finish()
@@ -579,7 +588,8 @@ fn source_buffer_metrics(state: &AppState) -> String {
 /// Cache tier failures for `/metrics` (issue #367): the
 /// stores count their own failures as they log them; the
 /// exposition reads the counters live at scrape time,
-/// one series per configured tier.
+/// one series per configured tier. With a shared tier, its
+/// write-through slots and skips follow (issue #463).
 fn tier_metrics(state: &AppState) -> String {
     let mut out = String::new();
     out.push_str("# HELP crabcrop_cache_tier_errors_total Cache tier operations that failed.\n");
@@ -594,6 +604,24 @@ fn tier_metrics(state: &AppState) -> String {
         out.push_str(&format!(
             "crabcrop_cache_tier_errors_total{{tier=\"shared\"}} {}\n",
             store.errors()
+        ));
+        // The write bound (issue #463): in flight against
+        // its slots, and the render write-throughs skipped
+        // because every slot was taken.
+        let background = &state.background;
+        out.push_str(&format!(
+            "# HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.\n\
+             # TYPE crabcrop_cache_shared_puts_in_flight gauge\n\
+             crabcrop_cache_shared_puts_in_flight {}\n\
+             # HELP crabcrop_cache_shared_puts_capacity Shared tier writes allowed in flight.\n\
+             # TYPE crabcrop_cache_shared_puts_capacity gauge\n\
+             crabcrop_cache_shared_puts_capacity {}\n\
+             # HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.\n\
+             # TYPE crabcrop_cache_shared_puts_skipped_total counter\n\
+             crabcrop_cache_shared_puts_skipped_total {}\n",
+            background.puts_in_flight(),
+            background.put_capacity(),
+            background.puts_skipped()
         ));
     }
     out
@@ -1012,7 +1040,8 @@ async fn begin_purge(
 /// is walking the bucket in this process, this one leads a
 /// walk: it scans at most [`SHARED_PURGE_INLINE_SCAN`]
 /// objects inline and hands the remainder, if any, to a
-/// background task that waits for a walk turn. When one is
+/// background task that waits for a walk turn, tracked on
+/// `background` (issue #463). When one is
 /// walking, this purge joins that walk instead (see
 /// [`crate::s3store::S3Store::lead_or_join`]), which
 /// re-lists the bucket for it once its current pass ends.
@@ -1022,6 +1051,7 @@ async fn begin_purge(
 /// the inline part removed.
 async fn purge_shared_tier(
     shared: &Arc<crate::s3store::S3Store>,
+    background: &Background,
     active: crate::cache::ActivePurge,
     tombstone: Option<String>,
     epoch_base: Option<String>,
@@ -1057,7 +1087,7 @@ async fn purge_shared_tier(
     let shared = shared.clone();
     match pending {
         Some(pending) => {
-            tokio::spawn(async move {
+            background.spawn_walk(async move {
                 let rest = {
                     let _turn = shared.walk_turn().await;
                     shared.finish_purge(pending).await
@@ -1073,7 +1103,7 @@ async fn purge_shared_tier(
             end_purge(&shared, purge, inline.complete).await;
             let joined = lease.take_joined();
             if !joined.is_empty() {
-                tokio::spawn(async move { walk_for_joined(&shared, lease, joined).await });
+                background.spawn_walk(async move { walk_for_joined(&shared, lease, joined).await });
             }
         }
     }
@@ -1150,6 +1180,10 @@ pub async fn start_purge_tombstones(state: &AppState) {
     };
     shared.refresh_tombstones(&state.purge_guard).await;
     let guard = state.purge_guard.clone();
+    // One task per process, started at boot and never
+    // ending, so it stays off the shutdown drain (issue
+    // #463), which waits only for work that finishes; it
+    // stops with the process.
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(TOMBSTONE_REFRESH);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1304,10 +1338,11 @@ async fn purge_handle(
     // caller disconnects mid-purge; dropping the
     // JoinHandle detaches the task instead of cancelling
     // it. The caller waits for the count, so the response
-    // still carries it.
+    // still carries it. The task is tracked (issue #463),
+    // so a shutdown waits for a purge whose caller left.
     let task_state = state.clone();
     let task_target = target.to_string();
-    let removed = tokio::spawn(async move {
+    let task = state.background.spawn(async move {
         // The tombstones land before any tier is touched
         // (issues #350, #461): a write begun before this
         // purge can then see it whenever it tries to land,
@@ -1337,6 +1372,7 @@ async fn purge_handle(
             let epoch_form = format!("{key_form}#cfg{}", task_state.config_fingerprint);
             removed += purge_shared_tier(
                 shared,
+                &task_state.background,
                 active,
                 tombstone,
                 Some(epoch_form),
@@ -1348,9 +1384,8 @@ async fn purge_handle(
         task_state.metrics.record_purge();
         purge_log("purge", &task_target, Some(removed));
         removed
-    })
-    .await
-    .unwrap_or(0);
+    });
+    let removed = task.await.unwrap_or(0);
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
 }
 
@@ -1422,7 +1457,7 @@ async fn purge_group_handle(
     let task_state = state.clone();
     let task_target = target.clone();
     let group = group.to_string();
-    let removed = tokio::spawn(async move {
+    let task = state.background.spawn(async move {
         // Tombstones first, tiers second (issues #350,
         // #461), as in the per-URL purge.
         let (active, tombstone) =
@@ -1437,16 +1472,22 @@ async fn purge_group_handle(
                 .unwrap_or(0);
         }
         if let Some(shared) = &task_state.shared_store {
-            removed +=
-                purge_shared_tier(shared, active, tombstone, None, "purge-group", &task_target)
-                    .await;
+            removed += purge_shared_tier(
+                shared,
+                &task_state.background,
+                active,
+                tombstone,
+                None,
+                "purge-group",
+                &task_target,
+            )
+            .await;
         }
         task_state.metrics.record_purge();
         purge_log("purge-group", &task_target, Some(removed));
         removed
-    })
-    .await
-    .unwrap_or(0);
+    });
+    let removed = task.await.unwrap_or(0);
     (StatusCode::OK, format!("purged {removed}\n")).into_response()
 }
 
@@ -1554,7 +1595,7 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
     // dropped mid-purge. The caller waits for the count.
     let task_state = state.clone();
     let source = source.to_string();
-    tokio::spawn(async move {
+    let task = state.background.spawn(async move {
         // Tombstones first, tiers second (issues #350,
         // #461), as in the per-URL purge.
         let (active, tombstone) = begin_purge(
@@ -1572,14 +1613,21 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
                 .unwrap_or(0);
         }
         if let Some(shared) = &task_state.shared_store {
-            removed +=
-                purge_shared_tier(shared, active, tombstone, None, "purge-source", &source).await;
+            removed += purge_shared_tier(
+                shared,
+                &task_state.background,
+                active,
+                tombstone,
+                None,
+                "purge-source",
+                &source,
+            )
+            .await;
         }
         purge_log("purge-source", &source, Some(removed));
         removed
-    })
-    .await
-    .unwrap_or(0)
+    });
+    task.await.unwrap_or(0)
 }
 
 /// `PUT /upload/<signature>/<name>`: store one original
@@ -2801,6 +2849,23 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
         .await;
 }
 
+/// Why a shared-tier write is made, which decides what it
+/// does when every write slot is taken (issue #463).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedWrite {
+    /// A fresh render's write-through, on a miss. Skipped
+    /// when every slot is taken: the bucket only misses a
+    /// copy that the next replica to miss renders again.
+    Render,
+    /// A tier hit's write-back of the request's cache groups
+    /// onto the stored copy (issue #350). Never skipped: the
+    /// local merge has already recorded the groups, so no
+    /// later hit sends them again, and a bucket copy that
+    /// never learns a group outlives a purge of it on every
+    /// replica. It waits for a slot in its own task instead.
+    Groups,
+}
+
 /// Write `entry` through to the shared tier in the
 /// background under the purge guard (issue #350): the
 /// same skip-and-reconcile discipline as the local
@@ -2809,14 +2874,54 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
 /// the network write. The reconcile deletes only the
 /// object it read back (issue #446), so a fresher render
 /// that replaced it meanwhile stays.
-fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedImage) {
+///
+/// At most [`SHARED_PUTS_AT_ONCE`] writes are in flight
+/// (issue #463), each holding its entry until the bucket
+/// answers. With every slot taken, a stalled bucket's
+/// backlog, a [`SharedWrite::Render`] is skipped and counted
+/// on /metrics: the local tiers hold the entry, so the cost
+/// is a render on the next replica that misses. A
+/// [`SharedWrite::Groups`] write-back is never skipped: it
+/// waits for a slot in its own task.
+fn spawn_shared_put(
+    state: &AppState,
+    snapshot: u64,
+    key: &str,
+    entry: CachedImage,
+    write: SharedWrite,
+) {
     let Some(shared) = &state.shared_store else {
         return;
     };
     let guard = state.purge_guard.clone();
+    // A write a purge already covers would be dropped in the
+    // task anyway: checked before it takes a slot, so it is
+    // not counted as a skip.
+    if guard.write_covered(snapshot, key, &entry.groups, entry.written) {
+        return;
+    }
+    let slot = match write {
+        SharedWrite::Render => match state.background.put_slot() {
+            Some(slot) => Some(slot),
+            None => return,
+        },
+        SharedWrite::Groups => None,
+    };
+    let background = state.background.clone();
     let shared = shared.clone();
     let key = key.to_string();
-    tokio::spawn(async move {
+    // The handle is dropped: the write is detached, and
+    // tracked for the shutdown drain.
+    let _detached = state.background.spawn(async move {
+        let _slot = match slot {
+            Some(slot) => slot,
+            None => match background.wait_put_slot().await {
+                Some(slot) => slot,
+                None => return,
+            },
+        };
+        // Checked again with the slot held: a purge can begin
+        // while the write waits for one.
         if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
             return;
         }
@@ -2880,7 +2985,7 @@ async fn lookup_tiers(
                 // able to strand it.
                 let mut entry = hit.clone();
                 entry.groups = merged.clone();
-                spawn_shared_put(state, snapshot, cache_key, entry);
+                spawn_shared_put(state, snapshot, cache_key, entry, SharedWrite::Groups);
             }
             if let Some(store) = &state.store {
                 // The merge and its reconcile run as one
@@ -2912,14 +3017,15 @@ async fn lookup_tiers(
         // task instead of cancelling it, so a client that
         // disconnects while the disk answers cannot leave
         // the disk entry holding a group the shared tier
-        // never learned (issue #350).
+        // never learned (issue #350). Tracked like every
+        // detached task (issue #463).
         let task_state = state.clone();
         let key = cache_key.to_string();
         let lookup_groups = groups.to_vec();
-        let joined = tokio::spawn(async move {
+        let task = state.background.spawn(async move {
             lookup_disk_tier(&task_state, snapshot, &key, &lookup_groups).await
-        })
-        .await;
+        });
+        let joined = task.await;
         if let Ok(Some(image)) = joined {
             return Some((image, "crabcrop; hit; detail=\"disk\""));
         }
@@ -2943,9 +3049,15 @@ async fn lookup_tiers(
             let merged = crate::cache::union_groups(&image.groups, groups);
             if merged != image.groups {
                 image.groups = merged;
-                // Best-effort, off the response path, like
-                // the write-through put.
-                spawn_shared_put(state, snapshot, cache_key, image.clone());
+                // Off the response path, like the
+                // write-through put, but never skipped.
+                spawn_shared_put(
+                    state,
+                    snapshot,
+                    cache_key,
+                    image.clone(),
+                    SharedWrite::Groups,
+                );
             }
         }
         put_memory_tier(state, snapshot, cache_key, &image);
@@ -2999,7 +3111,13 @@ async fn lookup_disk_tier(
     if grew {
         // The merge grew the disk entry's set; the
         // shared tier's copy learns it too (issue #350).
-        spawn_shared_put(state, snapshot, cache_key, image.clone());
+        spawn_shared_put(
+            state,
+            snapshot,
+            cache_key,
+            image.clone(),
+            SharedWrite::Groups,
+        );
     }
     put_memory_tier(state, snapshot, cache_key, &image);
     Some(image)
@@ -3576,7 +3694,13 @@ async fn serve_miss(
         // write waits (issue #347): it is already off the
         // response path, and the order means a request
         // dropped during the disk write cannot strand it.
-        spawn_shared_put(state, write_snapshot, &cache_key, entry.clone());
+        spawn_shared_put(
+            state,
+            write_snapshot,
+            &cache_key,
+            entry.clone(),
+            SharedWrite::Render,
+        );
         put_disk_tier(state, write_snapshot, &cache_key, &entry).await;
     }
     record.bytes_out = processed.bytes.len();
