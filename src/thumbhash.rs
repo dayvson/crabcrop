@@ -3,10 +3,14 @@
 //! crate's encoder output diverges from the reference
 //! implementation on most test fixtures, including a solid
 //! color. This is Evan Wallace's published algorithm,
-//! ported operation for operation so the hashes are
-//! byte-identical to the reference encoder; the test
-//! vectors below were produced by that reference encoder
-//! over the same fixture pixels.
+//! ported operation for operation so the hashes match the
+//! reference encoder; the test vectors below were produced
+//! by that reference encoder over the same fixture pixels.
+//! The cosines come from the portable `libm` crate, not the
+//! system math library, so a hash is the same bytes on every
+//! OS and CPU. A coefficient that lands on a rounding tie can
+//! therefore differ by one step from a reference run whose
+//! cos() rounds the other way (see the vector test).
 //!
 //! A ThumbHash is a compact string (base64 of ~20-25 bytes)
 //! that client libraries decode into a blurred preview with
@@ -97,11 +101,11 @@ pub fn encode_rgba(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
             let mut cx = 0usize;
             while cx * ny < nx * (ny - cy) {
                 let fx: Vec<f64> = (0..w)
-                    .map(|x| (pi / w as f64 * cx as f64 * (x as f64 + 0.5)).cos())
+                    .map(|x| libm::cos(pi / w as f64 * cx as f64 * (x as f64 + 0.5)))
                     .collect();
                 let mut f = 0.0f64;
                 for y in 0..h {
-                    let fy = (pi / h as f64 * cy as f64 * (y as f64 + 0.5)).cos();
+                    let fy = libm::cos(pi / h as f64 * cy as f64 * (y as f64 + 0.5));
                     for x in 0..w {
                         f += channel[x + y * w] * fx[x] * fy;
                     }
@@ -240,10 +244,18 @@ mod tests {
     fn matches_the_reference_encoders_vectors() {
         // Base64 of the reference implementation's output for
         // the identical pixels (verification spike, #60).
+        // fixture_d differs from the reference in one AC
+        // nibble ("...iIeI..." where the reference has
+        // "...iHeI..."): that coefficient lands on a rounding
+        // tie, so it depends on the last bit of cos(). glibc
+        // and V8 round it one way, Apple's libm and the
+        // portable `libm` crate the other. The encoder uses
+        // `libm::cos` so a hash is the same bytes on every
+        // platform; the expectation is that portable result.
         let cases: [(Fixture, &str); 3] = [
             (fixture_a, "H/gNDZyAh4dxeHiHiHiHiI+AB/iI"),
             (fixture_b, "4bmGFIoLQFmHh4d3CHR4v3jI+Y6Jqq7ZBQ=="),
-            (fixture_d, "IRiKLRQrkIeQh3h4iJCQCPl2gIeIiHeIiA=="),
+            (fixture_d, "IRiKLRQrkIeQh3h4iJCQCPl2gIeIiIeIiA=="),
         ];
         for (make, want) in cases {
             let (w, h, rgba) = make();
