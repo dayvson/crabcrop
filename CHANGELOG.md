@@ -6,6 +6,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Changed
 
+- This release starts a new cache epoch. Changes below alter the bytes served for URLs that already exist (video output with a 16383 px side, some PDF pages near the 16383 px raster limit, and sources with a 16384 px side and no sizing step in the URL, which are now refused, issue #528), so the rendering version in the configuration fingerprint moves from 3 to 4 and the default configuration no longer prints the 0.10.0 fingerprint, `4ea5a14db70a1f23`. The first start on this version begins a new epoch: entries written by 0.10.0 and earlier stay in the disk and shared tiers under their old keys, unreachable, until they age out, and during a rolling upgrade old and new replicas read and write separate entries instead of serving each other's renders. Expect a cold cache after the upgrade.
+
+- Every output stays within 16383 px per axis (issue #528). A source with a 16384 px side, which decodes, kept that side through a chain with no sizing step: a WebP output failed with `500 image encoding failed`, whether `format(webp)` named it or `Accept` negotiated it, and every other format served 16384 px, past the documented limit. Such a request now answers `400 unsupported_operation` in every format, with a message that asks for a resize or crop, and `/explain` reports it as `over_dimension`; a chain that brings the side within the limit renders as before. Video output no longer pads a 16383 px side up to 16384 for H.264 and VP9: that side crops its last row or column to 16382 instead. A PDF page's render scale is clamped to the 16383 px output limit instead of the 16384 px decode cap, with a pixel of margin for the probe's rounding, so a page that rendered at the old cap is served without a resize, unless its media box is larger than the crop box the probe measures.
+
 - The boot line `crabcrop listening on port N` names the port the server bound (issue #536). It printed the configured port, so `PORT=0`, which binds a free port, printed port 0; it now prints the port the system picked. For a fixed port the line is unchanged.
 
 ## [0.10.0] - 2026-11-08
