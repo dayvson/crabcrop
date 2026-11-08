@@ -14016,6 +14016,80 @@ async fn zero_pixel_sides_answer_400() {
     }
 }
 
+/// A size the engine works out past the per-axis limit is
+/// refused like a size written past it (issue #521):
+/// `/unsafe/16383x1/0x2/...` rendered 32766x2, wider than
+/// WebP encodes. `/explain` forecasts the same refusal.
+#[tokio::test]
+async fn computed_sizes_past_max_dimension_answer_400() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(true).await;
+    for (ops, refused) in [
+        ("16383x1/0x2", "32766x2"),
+        ("16383x1/fit-in:0x2", "32766x2"),
+        ("crop:16383x1:smart/0x2", "32766x2"),
+        ("4096x1/0x2/filters:dpr(2)", "16384x4"),
+    ] {
+        let url = format!("{base}/unsafe/{ops}/{src}");
+        let plain = client().get(&url).send().await.unwrap();
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::BAD_REQUEST,
+            "unsupported_operation",
+            &format!("requested output {refused} exceeds the 16383 pixel limit per axis"),
+        )
+        .await;
+        let resp = client()
+            .get(format!("{base}/explain/unsafe/{ops}/{src}"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{ops}");
+        let report: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(report["forecast"]["over_dimension"], true, "{ops}");
+    }
+    // A chain that lands exactly on the limit renders.
+    let resp = client()
+        .get(format!("{base}/unsafe/5461x1/0x3/{src}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!((img.width(), img.height()), (16383, 3));
+}
+
+/// A width hint on a source at the 16384 px decode ceiling
+/// answers what the URL answers without it (issue #521):
+/// the hint's `Wx0` op is held at the source by its
+/// `no_upscale`, so it keeps the size it started from and
+/// works nothing out. The first cut of the per-axis check
+/// refused it, turning an advisory hint into a 400.
+#[tokio::test]
+async fn a_width_hint_passes_a_decode_ceiling_source_through() {
+    let src = spawn_bytes_server(png_of(1, 16384)).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("filters:format(png)/{src}");
+    for hints in [
+        &[][..],
+        &[("Sec-CH-Width", "400")][..],
+        &[("Width", "3840"), ("Sec-CH-DPR", "2")][..],
+    ] {
+        let resp = get_with_headers(&base, &remainder, hints).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{hints:?}");
+        let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!((img.width(), img.height()), (1, 16384), "{hints:?}");
+    }
+}
+
 #[test]
 fn negotiation_honors_q_values() {
     use crate::url::ImageFormat::{Avif, Jxl, WebP};
