@@ -23,7 +23,8 @@ src/ outside its #[cfg(test)] modules; test code is those modules plus tests/.
              (ParseError::code in src/url.rs) are the documented grammar list,
              except one the code table already documents as a 400.
   statuses   The statuses table lists exactly the statuses the codes use.
-  filters    Every filter parse_filters accepts has a row in a Filter or
+  filters    Every filter parse_filters accepts (a row of the filter_specs!
+             table in src/url/filters.rs) has a row in a Filter or
              Directive table of docs/filters.md, or a `filters:<name>(`
              signature line, and every such row or line names one it accepts.
   changelog  CHANGELOG.md's first section is ## [Unreleased].
@@ -54,6 +55,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIGURATION = "docs/configuration.md"
 RESPONSES = "docs/responses.md"
 FILTERS = "docs/filters.md"
+FILTER_TABLE = "src/url/filters.rs"
 CHANGELOG = "CHANGELOG.md"
 UNRELEASED = "## [Unreleased]"
 
@@ -601,14 +603,16 @@ def check_statuses(root, sources):
 
 
 def parsed_filters(root):
-    text = read(root, "src/url.rs")
-    m = re.search(r"\bfn parse_filters\([^)]*\)[^{]*\{", text)
+    """The names of the filter table's rows: a row starts its line with the
+    quoted name, or `shorthand` and the name, then `(` or `=>`."""
+    text = read(root, FILTER_TABLE)
+    m = re.search(r"^filter_specs!\s*\{", text, re.M)
     if not m:
-        raise CheckError("src/url.rs has no parse_filters to read the filter names from")
+        raise CheckError(f"{FILTER_TABLE} has no filter_specs! table to read the filter names from")
     body = text[m.end() : matching_brace(text, m.end() - 1)]
-    names = set(re.findall(r'^\s*\|?\s*\(\s*"([a-z][a-z0-9_]*)"\s*,', body, re.M))
+    names = set(re.findall(r'^\s*(?:shorthand\s+)?"([a-z][a-z0-9_]*)"\s*[(=]', body, re.M))
     if not names:
-        raise CheckError("parse_filters in src/url.rs has no match arm this check can read")
+        raise CheckError(f"the filter table in {FILTER_TABLE} has no row this check can read")
     return names
 
 
