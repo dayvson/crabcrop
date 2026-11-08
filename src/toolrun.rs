@@ -22,6 +22,11 @@
 //! kernel limits exist only there; on other platforms
 //! the wall clock and the group kill are the bounds, as
 //! they were before this module.
+//!
+//! A child that is this binary (the SVG worker, issue
+//! #447) caps itself instead, with `limit_self` as it
+//! starts: `setrlimit` on oneself has no startup window
+//! and works on macOS as well.
 
 use std::time::Duration;
 
@@ -60,7 +65,7 @@ pub(crate) fn tool_cpu_limit(timeout: Duration) -> Duration {
 /// rounds a fractional CPU quota down (1.5 CPUs count as
 /// one), and a child under that quota can still spend 1.5
 /// CPU seconds per wall-clock second.
-fn cpu_limit_for(timeout: Duration, cores: usize) -> Duration {
+pub(crate) fn cpu_limit_for(timeout: Duration, cores: usize) -> Duration {
     let cores = u32::try_from(cores).unwrap_or(u32::MAX).saturating_add(1);
     timeout.saturating_mul(cores).saturating_add(TOOL_CPU_GRACE)
 }
@@ -103,6 +108,59 @@ pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64)
     {
         let _ = (pid, cpu_limit, max_address_space);
     }
+}
+
+/// Apply the resource limits to the calling process
+/// itself (issue #447): the SVG worker caps itself as it
+/// starts. `setrlimit` on oneself works on every Unix,
+/// macOS included, unlike `prlimit` on another process.
+/// A limit is never raised past the hard limit the process
+/// inherited, and one the platform refuses is skipped (the
+/// parent's wall-clock kill stays the bound that always
+/// holds). Core dumps are switched off as well: a hostile
+/// document that aborts the worker must not leave a core
+/// file behind per request.
+pub(crate) fn limit_self(cpu_limit: Duration, max_address_space: u64) {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let cap = |resource: Resource, value: u64| {
+            let value = getrlimit(resource)
+                .maximum
+                .map_or(value, |max| max.min(value));
+            let _ = setrlimit(
+                resource,
+                Rlimit {
+                    current: Some(value),
+                    maximum: Some(value),
+                },
+            );
+        };
+        cap(Resource::Cpu, cpu_limit.as_secs().max(1));
+        cap(Resource::As, max_address_space);
+        cap(Resource::Core, 0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cpu_limit, max_address_space);
+    }
+}
+
+/// Kill a child spawned as the leader of its own process
+/// group, with the whole group, so nothing it started
+/// outlives it. Best effort: a child that has already
+/// exited is left for the caller's `wait` to reap.
+pub(crate) fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 #[cfg(all(test, unix))]
@@ -232,6 +290,88 @@ mod tests {
             "the spinner ended after {:?}",
             started.elapsed()
         );
+    }
+
+    /// Not a test on its own: the process that
+    /// `limit_self_caps_the_calling_process` starts, by
+    /// re-running this test binary, caps itself here and
+    /// reports what the caps did through its exit code.
+    #[test]
+    #[ignore = "a helper the self-limit test runs as its child"]
+    fn limit_self_helper() {
+        let Ok(mode) = std::env::var("CRABCROP_TEST_LIMIT_SELF") else {
+            return;
+        };
+        use rustix::process::{Resource, getrlimit};
+        // A test run under a tighter inherited cap keeps it:
+        // limit_self never raises a limit.
+        let space = getrlimit(Resource::As)
+            .maximum
+            .map_or(2 << 30, |max| max.min(2 << 30));
+        limit_self(Duration::from_secs(1), 2 << 30);
+        if getrlimit(Resource::Cpu).current != Some(1)
+            || getrlimit(Resource::Core).current != Some(0)
+        {
+            std::process::exit(3);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if getrlimit(Resource::As).current != Some(space) {
+            std::process::exit(3);
+        }
+        let _ = space;
+        if mode == "spin" {
+            let mut n = 0u64;
+            loop {
+                n = std::hint::black_box(n.wrapping_add(1));
+            }
+        }
+        // Linux enforces the address-space cap: 4 GiB no
+        // longer fits. (macOS accepts the limit but does not
+        // enforce it, so only the read-back above runs there.)
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if Vec::<u8>::new().try_reserve_exact(4 << 30).is_ok() {
+            std::process::exit(4);
+        }
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn limit_self_caps_the_calling_process() {
+        // Issue #447: the SVG worker caps itself with
+        // setrlimit as it starts. In a child (the caps are
+        // permanent), the CPU, core, and address-space limits
+        // read back as set, a 4 GiB reservation fails under
+        // the 2 GiB cap, and a spinner dies at its CPU limit.
+        let helper = |mode: &str| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "toolrun::tests::limit_self_helper",
+                    "--ignored",
+                    "--test-threads=1",
+                    "--quiet",
+                ])
+                .env("CRABCROP_TEST_LIMIT_SELF", mode)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let status = helper("check").wait().unwrap();
+        assert!(status.success(), "the caps did not hold: {status}");
+        let mut spinner = helper("spin");
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = spinner.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                let _ = spinner.kill();
+                panic!("the CPU limit did not stop the spinner");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(!status.success(), "{status}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

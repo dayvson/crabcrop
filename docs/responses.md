@@ -66,7 +66,7 @@ Operational failures carry these codes:
 | `source_not_an_image` | `502` | The origin answered with a non-image `Content-Type`. |
 | `source_too_large` | `502` | The source is larger than the fetch limit. |
 | `source_timeout` | `504` | The source fetch timed out. |
-| `decode_failed` | `502` | The fetched bytes could not be decoded as an image. |
+| `decode_failed` | `502` | The fetched bytes could not be decoded as an image, including an SVG whose render worker crashed or ran out of memory. |
 | `encode_failed` | `500` | Encoding the output failed. |
 | `unsupported_operation` | `400` | The operation is not supported for this source or output. |
 | `not_configured` | `501` | The operation needs a model or resource this server was not configured with. |
@@ -76,7 +76,7 @@ Operational failures carry these codes:
 | `video_encode_failed` | `502` | The configured video encoder failed. |
 | `frame_extract_failed` | `502` | The configured frame extractor failed. |
 | `pdf_render_failed` | `502` | The configured PDF renderer failed. |
-| `processing_timeout` | `504` | Processing ran past the process deadline. |
+| `processing_timeout` | `504` | Processing ran past the process deadline. An SVG still rendering then is killed with its worker process. |
 | `processing_failed` | `500` | The processing job itself failed. |
 | `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate, or the source buffer budget (`CRABCROP_SOURCE_BUFFER_MAX_MB`), waited past its timeout; the response carries `Retry-After`. |
 | `invalid_purge_group` | `400` | A purge-group name is empty or contains a slash. |
