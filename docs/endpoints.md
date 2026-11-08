@@ -83,7 +83,7 @@ Every image request also writes one structured JSON log line to stdout, with the
 
 ## Command line
 
-The `crabcrop` binary doubles as its own operator CLI. With no arguments it starts the server, which reads its configuration from the environment and takes no arguments. With any argument it runs the CLI instead: the first argument names a verb (or is `--help` or `--version`), that runs, and the process exits. Any other first argument, a flag included (`crabcrop --verison`, `crabcrop -x`), exits 1 with `unknown verb` and the usage on stderr; it never starts the server. `crabcrop --help` lists every verb and flag.
+The `crabcrop` binary doubles as its own operator CLI. With no arguments it starts the server, which reads its configuration from the environment and takes no arguments. With any argument it runs the CLI instead: the first argument must name a verb (or be `--help` or `--version`), which runs, and the process exits. Any other first argument, a flag included (`crabcrop --verison`, `crabcrop -x`), exits 1 with `unknown verb` and the usage on stderr; it never starts the server. `crabcrop --help` lists every verb and flag.
 
 Configuration comes from flags over environment variables, the same convention as the MCP server: `--base` / `--secret` / `--key-id` over `CRABCROP_BASE` / `CRABCROP_SECRET` / `CRABCROP_SECRET_KEY_ID`, with the base defaulting to `http://localhost:3000`. Flags go after the verb.
 
