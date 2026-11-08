@@ -925,6 +925,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config_fingerprint,
     };
     println!("configuration fingerprint: {}", state.config_fingerprint);
+    // Purges recorded in the shared bucket hold here before
+    // the first request (issue #461).
+    crate::server::start_purge_tombstones(&state).await;
     println!("crabcrop listening on port {port}");
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
