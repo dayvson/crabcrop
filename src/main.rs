@@ -2681,10 +2681,16 @@ mod tests {
     /// need real files (a presets file, a fallback image, an
     /// encoder program) without committing fixtures. Each
     /// starts in an empty directory, so no test sees a file
-    /// an earlier test process left (issue #526).
+    /// an earlier test process left (issue #526). The file
+    /// is named after its tag too, so two files that must
+    /// differ only in content (the fingerprint tests) differ
+    /// in more than their directory.
     fn temp_file(tag: &str, contents: &[u8]) -> TempFile {
         let dir = crate::test_support::scratch_dir(&format!("boot-{tag}"));
-        let path = dir.join("file.tmp").to_string_lossy().into_owned();
+        let path = dir
+            .join(format!("{tag}.tmp"))
+            .to_string_lossy()
+            .into_owned();
         std::fs::write(&path, contents).unwrap();
         TempFile { path, _dir: dir }
     }
@@ -3170,8 +3176,13 @@ mod tests {
         // Built where the temp dir is, never at a fixed
         // /tmp: TMPDIR moves it (issue #526).
         let scratch = crate::test_support::scratch_dir("boot-upload");
-        let root = scratch.to_string_lossy().into_owned();
-        let uploads = scratch.join("uploads").to_string_lossy().into_owned();
+        let root_dir = scratch.join("root");
+        std::fs::create_dir(&root_dir).unwrap();
+        let root = root_dir.to_string_lossy().into_owned();
+        let uploads = root_dir.join("uploads").to_string_lossy().into_owned();
+        // Its name starts with the root's, and it is not
+        // under the root.
+        let sibling = scratch.join("root-other").to_string_lossy().into_owned();
         // Neither destination: uploads are off, not an error.
         assert!(build_upload_store(env_of(&[]), &plain).unwrap().is_none());
         // Both destinations: a startup error.
@@ -3216,20 +3227,26 @@ mod tests {
         // A local destination outside a configured file
         // root is refused: its objects could never serve.
         let rooted = build_source_config(env_of(&[("CRABCROP_FILE_ROOT", root.as_str())])).unwrap();
-        // A directory inside the root is under it.
-        assert!(
-            build_upload_store(
-                env_of(&[("CRABCROP_UPLOAD_DIR", uploads.as_str())]),
-                &rooted
-            )
-            .unwrap()
-            .is_some()
-        );
-        let err = expect_err(build_upload_store(
-            env_of(&[("CRABCROP_UPLOAD_DIR", "/")]),
-            &rooted,
-        ));
-        assert!(err.contains("CRABCROP_FILE_ROOT"), "{err}");
+        // The root itself and a directory inside it are under
+        // it, and their objects are named from the root.
+        for (dir, object) in [
+            (root.as_str(), "file:///a.jpg"),
+            (uploads.as_str(), "file:///uploads/a.jpg"),
+        ] {
+            let store = build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", dir)]), &rooted)
+                .unwrap()
+                .unwrap();
+            assert_eq!(store.source_ref("a.jpg"), object, "{dir}");
+        }
+        // The check compares path components, not strings:
+        // the sibling is refused like `/`.
+        for outside in ["/", sibling.as_str()] {
+            let err = expect_err(build_upload_store(
+                env_of(&[("CRABCROP_UPLOAD_DIR", outside)]),
+                &rooted,
+            ));
+            assert!(err.contains("CRABCROP_FILE_ROOT"), "{outside}: {err}");
+        }
         // A bucket destination with credentials must be in
         // the readable allowlist, or its objects could
         // never serve back.
@@ -3786,23 +3803,35 @@ mod tests {
     /// renderer, scripts already marked executable. Their
     /// "missing" and "not executable" refusals then
     /// constructed. Plant those leftovers under this
-    /// process's ID and run the three tests over them.
+    /// process's ID and run the three tests over them, each
+    /// twice: under a name built from the ID alone, however
+    /// spelled, the second run would meet what the first one
+    /// left.
     #[cfg(unix)]
     #[test]
     fn construction_tests_ignore_files_left_under_a_reused_pid() {
+        use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
         let pid = std::process::id();
         let temp = std::env::temp_dir();
         let pdf_dir = temp.join(format!("crabcrop-boot-pdf-{pid}"));
-        let planted = [
+        // Only what this test creates is removed afterwards:
+        // a file already under one of these names is the same
+        // kind of leftover, and not this test's to delete.
+        let made_pdf_dir = std::fs::create_dir(&pdf_dir).is_ok();
+        let mut planted = Vec::new();
+        for path in [
             pdf_dir.join("pdfinfo"),
             temp.join(format!("crabcrop-boot-encoder-plain-{pid}.tmp")),
             temp.join(format!("crabcrop-boot-decoder-plain-{pid}.tmp")),
-        ];
-        std::fs::create_dir_all(&pdf_dir).unwrap();
-        for path in &planted {
-            std::fs::write(path, b"#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ] {
+            let Ok(mut file) = std::fs::File::create_new(&path) else {
+                continue;
+            };
+            file.write_all(b"#!/bin/sh\n").unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            planted.push(path);
         }
         let tests: [(&str, fn()); 3] = [
             (
@@ -3820,13 +3849,15 @@ mod tests {
         ];
         let failed: Vec<&str> = tests
             .into_iter()
-            .filter(|(_, test)| std::panic::catch_unwind(test).is_err())
+            .filter(|(_, test)| (0..2).any(|_| std::panic::catch_unwind(test).is_err()))
             .map(|(name, _)| name)
             .collect();
-        for path in &planted[1..] {
+        for path in &planted {
             let _ = std::fs::remove_file(path);
         }
-        let _ = std::fs::remove_dir_all(&pdf_dir);
+        if made_pdf_dir {
+            let _ = std::fs::remove_dir(&pdf_dir);
+        }
         assert!(
             failed.is_empty(),
             "failed over the planted files: {failed:?}"
