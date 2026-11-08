@@ -68,7 +68,7 @@ pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 pub(in crate::server) use process::{SLOW_LANE_WAIT, apply_provenance};
 
 /// Shared state for the handlers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     /// The signing keyring (issue #143), from `CRABCROP_SECRET`:
     /// the current key plus, during a rotation window, the
@@ -317,6 +317,85 @@ pub struct AppState {
     /// instead of silently serving entries rendered under
     /// the old configuration from the persistent tiers.
     pub config_fingerprint: String,
+}
+
+impl std::fmt::Debug for AppState {
+    /// The fields a derive would print, except that the
+    /// `/metrics` token prints as `[redacted]`; the keyring,
+    /// the loader's credentials, and the stores redact their
+    /// own secrets (issue #455). A new field that holds a
+    /// secret must be redacted here too.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("AppState");
+        // Labels come from the field names themselves, so a
+        // label cannot drift from its field, and none is a
+        // snake_case string literal, which the error-code
+        // inventory (`every_error_code_is_documented`) would
+        // read as a response code.
+        macro_rules! fields {
+            ($($name:ident),* $(,)?) => {
+                $(out.field(stringify!($name), &self.$name);)*
+            };
+        }
+        fields!(
+            keyring,
+            allow_unsafe,
+            loader,
+            engine,
+            process_timeout,
+            metrics
+        );
+        out.field(
+            stringify!(metrics_token),
+            &self.metrics_token.as_ref().map(|_| crate::redact::Redacted),
+        );
+        fields!(
+            cache,
+            removebg,
+            upscale,
+            inpaint,
+            segment,
+            face,
+            tagger,
+            tag_threshold,
+            moderation,
+            embeddings,
+            aesthetic,
+            ocr,
+            detect,
+            detectors,
+            focal,
+            font,
+            fallback,
+            store,
+            shared_store,
+            upload,
+            meta_enabled,
+            ai_gate,
+            process_gate,
+            slow_gate,
+            ssim_target,
+            avif_speed,
+            jxl_speed,
+            width_step,
+            preserve_metadata,
+            brand_color,
+            presets,
+            only_presets,
+            source_roots,
+            default_ops,
+            video_encoder,
+            frame_extractor,
+            pdf_renderer,
+            provenance_signer,
+            video_gate,
+            anim_gate,
+            inflight,
+            purge_guard,
+            config_fingerprint
+        );
+        out.finish()
+    }
 }
 
 /// Build the router.

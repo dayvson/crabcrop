@@ -33,6 +33,7 @@ pub mod pdf;
 pub mod placeholder;
 pub mod provenance;
 pub mod quality;
+mod redact;
 pub mod s3store;
 pub mod server;
 pub mod sigv4;

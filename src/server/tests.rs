@@ -8338,14 +8338,17 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
                 .unwrap(),
             )
         }),
-        shared_store: Some(Arc::new(crate::s3store::S3Store::new(
-            "results".into(),
-            String::new(),
-            Some(endpoint.into()),
-            "us-east-1".into(),
-            None,
-            crate::url::entry_key(b"disk-key-test"),
-        ))),
+        shared_store: Some(Arc::new(
+            crate::s3store::S3Store::new(
+                "results".into(),
+                String::new(),
+                Some(endpoint.into()),
+                "us-east-1".into(),
+                None,
+                crate::url::entry_key(b"disk-key-test"),
+            )
+            .unwrap(),
+        )),
         upload: None,
         meta_enabled: true,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),

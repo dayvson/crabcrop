@@ -3654,11 +3654,32 @@ pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
 /// caches like any other entry. An unknown key ID consults
 /// nothing and fails as a bad signature, indistinguishable
 /// from any other forgery attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` prints the key IDs and redacts the keys
+/// (issue #455). It is not `PartialEq`: nothing compares
+/// rings, and a derived comparison of key bytes would not be
+/// constant-time.
+#[derive(Clone)]
 pub struct Keyring {
     pub current_id: String,
     pub current: Vec<u8>,
     pub previous: Option<(String, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for Keyring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keyring")
+            .field("current_id", &self.current_id)
+            .field("current", &crate::redact::Redacted)
+            .field(
+                "previous",
+                &self
+                    .previous
+                    .as_ref()
+                    .map(|(id, _)| (id, crate::redact::Redacted)),
+            )
+            .finish()
+    }
 }
 
 impl Keyring {
