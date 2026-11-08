@@ -83,14 +83,18 @@ Every cacheable image response also carries a strong `ETag`: a digest of the res
 
 ### Output size
 
-A size written in the URL is at most 16383 px per axis, the strictest encoder limit in the pipeline (WebP's): `16384x100` does not parse, and fails with `400` (`invalid_size`). The same limit holds for every size the server works out from the request rather than reads from it: a proportional or `orig` side, a `fit-in` scale, a `crop` or `pad` target, any of these scaled by `dpr(...)` or a DPR client hint, and the larger canvas a `rotate(...)` filter draws on. Each step's output is also held to 100 megapixels in total. A step whose size passes either bound fails the whole request with `400` (`unsupported_operation`) before the step allocates its image, wherever the step sits in the chain and whatever follows it; the size is never clamped. With `no_upscale`, the cap shrinks the size first, and the limit applies to what is left.
+A size written in the URL is at most 16383 px per axis, the strictest encoder limit in the pipeline (WebP's): `16384x100` does not parse, and fails with `400` (`invalid_size`). The same limit holds for every size the server works out from the request rather than reads from it: a proportional or `orig` side, a `fit-in` scale, a `crop` or `pad` target, any of these scaled by `dpr(...)` or a DPR client hint, and the larger canvas a `rotate(...)` filter draws on. Each step's output is also held to 100 megapixels in total. A step whose size passes either bound fails the whole request with `400` (`unsupported_operation`) before the step allocates its image, wherever the step sits in the chain and whatever follows it; the size is never clamped. With `no_upscale`, the cap shrinks a resize, `fit-in`, or `crop` first, and the limit applies to what is left; a `pad` canvas is never shrunk, so a pad past the limit is refused with or without it.
 
 ```text
 /unsafe/16383x1/0x2/https://example.com/photo.jpg   400: the second step keeps the 16383:1 aspect ratio at height 2, so it asks for 32766x2
 /unsafe/5461x1/0x3/https://example.com/photo.jpg    200: 16383x3, exactly the limit
 ```
 
-The refusal names the size it refused: `requested output 32766x2 exceeds the 16383 pixel limit per axis`. The [`/explain`](endpoints.md#self-explaining-urls) forecast applies the same rule, and reports `over_dimension: true` for such a chain. A source can decode at up to 16384 px per axis (see below): a chain with no step that works out a size passes it through as decoded, and a step that resolves to that full size (`0x0`, or an `orig` side) is refused like any other.
+The refusal names the size it refused: `requested output 32766x2 exceeds the 16383 pixel limit per axis`.
+
+A source can decode at up to 16384 px per axis (see below), one past the limit. A step that ends at the size it started from works nothing out, so the per-axis limit never refuses it: a chain with no sizing step, `0x0`, `fit-in:0x0`, `rotate(180)`, and a resize that `no_upscale` or a width client hint holds at the source all pass such a source through as decoded. A step that changes the size is held to the limit, a quarter turn included: `origx1` on a 16384x2 source asks for 16384x1, and `rotate(90)` for 2x16384, so both are refused. An SVG source is rasterized before the chain runs, at the size its first resize, `fit-in`, or `crop` asks for and at most 4096 px per axis, and the chain's sizes resolve against that raster.
+
+The [`/explain`](endpoints.md#self-explaining-urls) forecast applies the same rule to resize, `fit-in`, `crop`, `pad`, and `rotate(...)` steps, and reports `over_dimension: true` for such a chain. It works from the source's stored size and the URL alone, so it does not see an EXIF orientation turn the source, it reports no dimensions from a `trim` on (the trimmed size depends on the pixels), and it leaves out the client hints.
 
 ### Source images
 
