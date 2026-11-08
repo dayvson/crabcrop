@@ -87,7 +87,9 @@ Every image request also writes one structured JSON log line to stdout, with the
 
 ## Command line
 
-The `crabcrop` binary doubles as its own operator CLI: when the first argument is a verb, it runs the verb and exits instead of starting the server. Configuration comes from flags over environment variables, the same convention as the MCP server: `--base` / `--secret` over `CRABCROP_BASE` / `CRABCROP_SECRET`, with the base defaulting to `http://localhost:3000`.
+The `crabcrop` binary doubles as its own operator CLI. With no arguments it starts the server, which reads its configuration from the environment and takes no arguments. With any argument it runs the CLI instead: the first argument must name a verb (or be `--help` or `--version`), which runs, and the process exits. Any other first argument, a flag included (`crabcrop --verison`, `crabcrop -x`), exits 1 with `unknown verb` and the usage on stderr; it never starts the server. `crabcrop --help` lists every verb and flag.
+
+Configuration comes from flags over environment variables, the same convention as the MCP server: `--base` / `--secret` / `--key-id` over `CRABCROP_BASE` / `CRABCROP_SECRET` / `CRABCROP_SECRET_KEY_ID`, with the base defaulting to `http://localhost:3000`. Flags go after the verb.
 
 ```bash
 export CRABCROP_BASE=http://localhost:3000
@@ -122,3 +124,16 @@ crabcrop upload ./photo.jpg heroes/photo.jpg
 # Convert a Thumbor URL (re-signed; losses are reported on stderr)
 crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
 ```
+
+Every flag the verbs take. A value flag is spelled `--flag <value>` or `--flag=<value>`, and an unknown flag after the verb (`--key-ids`) is an error too.
+
+| Flag | Environment | Verbs | Meaning |
+|---|---|---|---|
+| `--base <url>` | `CRABCROP_BASE` | all | The server's base URL. Default `http://localhost:3000`. |
+| `--secret <secret>` | `CRABCROP_SECRET` | all | The signing secret. |
+| `--key-id <id>` | `CRABCROP_SECRET_KEY_ID` | `sign`, `seal`, `purge`, `purge-group`, `upload` | The key ID stamped on the signature or token the verb mints (`<key-id>:<tag>`), for [rotating the secret](configuration.md#rotating-the-secret): 1 to 32 characters of `[A-Za-z0-9_-]`. Unset, the verbs mint with no key ID. |
+| `--placeholders` | | `meta` | Include the placeholder fields. |
+| `--detections` | | `meta` | Include the detection boxes. |
+| `--expires <unix-seconds>` | | `upload` | Mint an upload token that stops working at that second. |
+| `--help`, `-h` | | any position | Print the usage and exit 0. |
+| `--version`, `-V` | | first argument only | Print the version and exit 0. |
