@@ -1,0 +1,1 @@
+/unsafe/filters:pixelate(8):flip(h):flip(v):mask(ellipse)/example.com/img.png
