@@ -3556,6 +3556,220 @@ fn rotate_chains_inside_the_budget_still_work() {
     assert_eq!(decode_dims(&out.bytes), (201, 201));
 }
 
+/// Run `remainder` (operations only) through the engine on
+/// `src`, as the server would for that URL.
+fn process_remainder(src: &[u8], remainder: &str) -> Result<ProcessedImage, EngineError> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    Engine.process(src, &ops)
+}
+
+#[test]
+fn computed_sizes_past_max_dimension_are_refused() {
+    // Issue #521: the parser holds every size a URL spells
+    // to 16383 per axis, but a size the engine works out
+    // was unchecked, so `16383x1/0x2` rendered 32766x2
+    // (inside the pixel budget, past what WebP encodes).
+    // Each step that resolves its own size now refuses one
+    // past the limit, as a written size is.
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, refused) in [
+        // The issue's URL: the second step keeps the 16383:1
+        // aspect ratio at height 2.
+        ("16383x1/0x2", "32766x2"),
+        // A later step that would bring the size back
+        // never runs: the refusal is at the step.
+        ("16383x1/0x2/100x100", "32766x2"),
+        ("16383x1/fit-in:0x2", "32766x2"),
+        ("16383x1/fit-in:0x2:adaptive", "32766x2"),
+        // A smart crop sizes its window to the target, and
+        // the resize after it scales on from there.
+        ("crop:16383x1:smart/0x2", "32766x2"),
+        ("crop:16383x1/0x2", "32766x2"),
+        // DPR scales a proportional chain, a written size,
+        // a crop target, and a pad canvas past the limit.
+        ("4096x1/0x2/filters:dpr(2)", "16384x4"),
+        ("12000x10/filters:dpr(2)", "24000x20"),
+        ("crop:12000x10/filters:dpr(2)", "24000x20"),
+        ("pad:9000x100/filters:dpr(2)", "18000x200"),
+    ] {
+        let err = match process_remainder(&src, remainder) {
+            Err(err) => err,
+            Ok(out) => panic!("{remainder} rendered {:?}", decode_dims(&out.bytes)),
+        };
+        assert!(
+            matches!(err, EngineError::Unsupported(_)),
+            "{remainder}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported operation: requested output {refused} exceeds the 16383 pixel limit per axis"
+            ),
+            "{remainder}"
+        );
+    }
+}
+
+#[test]
+fn computed_sizes_at_max_dimension_still_render() {
+    // The limit is inclusive, and a chain that stays inside
+    // it renders as before (issue #521).
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, dims) in [
+        // 5461 * 3 = 16383: a proportional side that lands
+        // exactly on the limit.
+        ("5461x1/0x3", (16383, 3)),
+        ("5461x1/fit-in:0x3", (16383, 3)),
+        ("16383x1/0x1", (16383, 1)),
+        ("4096x1/0x2", (8192, 2)),
+    ] {
+        let out =
+            process_remainder(&src, remainder).unwrap_or_else(|err| panic!("{remainder}: {err}"));
+        assert_eq!(decode_dims(&out.bytes), dims, "{remainder}");
+    }
+    // `no_upscale` caps the step at the source before the
+    // check, so a DPR-scaled crop target past the limit
+    // renders inside the source.
+    let out = process_remainder(&src, "crop:16383x10/filters:dpr(2):no_upscale").unwrap();
+    let (w, h) = decode_dims(&out.bytes);
+    assert!(w <= 64 && h <= 48, "{w}x{h}");
+}
+
+#[test]
+fn check_output_size_bounds_each_axis_then_the_budget() {
+    let max = crate::url::MAX_DIMENSION;
+    let input = (64, 48);
+    assert!(check_output_size(max, 1, input).is_ok());
+    assert!(check_output_size(1, max, input).is_ok());
+    for (w, h) in [(max + 1, 1), (1, max + 1), (u32::MAX, u32::MAX)] {
+        let err = check_output_size(w, h, input).unwrap_err();
+        assert!(err.to_string().contains("pixel limit per axis"), "{err}");
+    }
+    // Inside the per-axis limit, the pixel budget still
+    // applies: 16383 x 6104 is just past 100 million.
+    let err = check_output_size(max, 6104, input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 16383x6104 exceeds the 100000000 pixel limit"
+    );
+    // A step that keeps the size it started from works
+    // nothing out: a 16384 px side the decoder admitted
+    // passes the per-axis check, but never the budget.
+    assert!(check_output_size(max + 1, 2, (max + 1, 2)).is_ok());
+    assert!(check_output_size(2, max + 1, (max + 1, 2)).is_err());
+    let err = check_output_size(max + 1, 8000, (max + 1, 8000)).unwrap_err();
+    assert!(err.to_string().ends_with("100000000 pixel limit"), "{err}");
+}
+
+#[test]
+fn rotate_canvas_is_checked_per_axis() {
+    // A 16383x1000 image rotated 3.5 degrees needs a canvas
+    // about 16413 px wide: about 33 million pixels, inside
+    // the budget, but past the per-axis limit (issue #521).
+    // The canvas check refuses it before the rotation
+    // allocates.
+    let img = DynamicImage::ImageLuma8(image::GrayImage::new(16_383, 1000));
+    let ops = [Operation::Filters(vec![Filter::Rotate(3.5)])];
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let ctx = ProcessContext::default();
+    let (cw, ch) = crate::filters::rotated_canvas(16_383, 1000, 3.5);
+    assert!(cw > crate::url::MAX_DIMENSION && (cw as u64 * ch as u64) < MAX_OUTPUT_PIXELS);
+    // A match, not unwrap_err: on a regression the Ok value
+    // is a 16414x1999 image, and its Debug form would flood
+    // the test log.
+    let err = match apply_operations(img, &ops, None, 1.0, &ctx, &directives, None) {
+        Err(err) => err,
+        Ok((out, ..)) => panic!("rotated to {}x{}", out.width(), out.height()),
+    };
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "unsupported operation: requested output {cw}x{ch} exceeds the 16383 pixel limit per axis"
+        )
+    );
+}
+
+/// Run `remainder` (operations only) over `img` through
+/// [`apply_operations`] with the `no_upscale` cap and DPR the
+/// request asks for, and report the output size or the
+/// refusal.
+fn chain_dims(img: DynamicImage, remainder: &str) -> Result<(u32, u32), EngineError> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let cap = directives.no_upscale.then_some((img.width(), img.height()));
+    let ctx = ProcessContext::default();
+    let dpr = directives.dpr.unwrap_or(1.0);
+    apply_operations(img, &ops, cap, dpr, &ctx, &directives, None)
+        .map(|(out, ..)| (out.width(), out.height()))
+}
+
+#[test]
+fn steps_that_keep_the_size_pass_a_decode_ceiling_source() {
+    // A source decodes at up to 16384 px per axis, one past
+    // the output limit. A step that keeps the size it starts
+    // from works nothing out and passes, as a chain with no
+    // sizing step does; a step that changes the size is held
+    // to the limit (issue #521). Before this, `0x0` and
+    // `rotate(180)` were refused while `fit-in:0x0` passed,
+    // and a width hint (`400x0` plus `no_upscale`, held at
+    // the source) refused a source that renders without it.
+    let ceiling = |w, h| DynamicImage::ImageLuma8(image::GrayImage::new(w, h));
+    for remainder in [
+        "0x0",
+        "origxorig",
+        "fit-in:0x0",
+        "filters:rotate(0)",
+        "filters:rotate(180)",
+        "filters:grayscale",
+        "0x4/filters:no_upscale",
+        "fit-in:0x4/filters:no_upscale",
+        // The crop's window is the whole image.
+        "crop:8192x1/filters:dpr(2)",
+    ] {
+        assert_eq!(
+            chain_dims(ceiling(16_384, 2), remainder).map_err(|e| e.to_string()),
+            Ok((16_384, 2)),
+            "{remainder}"
+        );
+    }
+    // The width hint's synthesized op on a tall source.
+    assert_eq!(
+        chain_dims(ceiling(1, 16_384), "400x0/filters:no_upscale").map_err(|e| e.to_string()),
+        Ok((1, 16_384))
+    );
+    for (img, remainder, refused) in [
+        (ceiling(16_384, 2), "origx1", "16384x1"),
+        (ceiling(16_384, 2), "filters:rotate(90)", "2x16384"),
+        (ceiling(16_384, 4), "crop:8192x1/filters:dpr(2)", "16384x2"),
+        (ceiling(8_192, 1), "0x2", "16384x2"),
+    ] {
+        let err = chain_dims(img, remainder).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported operation: requested output {refused} exceeds the 16383 pixel limit per axis"
+            ),
+            "{remainder}"
+        );
+    }
+}
+
+#[test]
+fn a_crop_past_the_limit_is_refused_before_detection() {
+    // The crop's target is checked before the crop analysis
+    // runs (issue #521): with no detection provider, an
+    // objects crop inside the limit fails on the missing
+    // provider, and one past it fails on its size first.
+    let img = || DynamicImage::ImageLuma8(image::GrayImage::new(64, 48));
+    let err = chain_dims(img(), "crop:100x10:objects(dog)").unwrap_err();
+    assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+    let err = chain_dims(img(), "crop:12000x10:objects(dog)/filters:dpr(2)").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 24000x20 exceeds the 16383 pixel limit per axis"
+    );
+}
+
 #[test]
 fn operation_count_cap_rejects_overlong_chains() {
     let engine = Engine;
@@ -4983,7 +5197,6 @@ fn animated_gif_probe_survives_hostile_input() {
 /// A fake video encoder for the video tests: drains
 /// stdin and answers with the script's canned behavior.
 fn video_test_encoder(script: &str) -> crate::video::VideoEncoder {
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -4991,14 +5204,7 @@ fn video_test_encoder(script: &str) -> crate::video::VideoEncoder {
         std::env::temp_dir().join(format!("crabcrop-engine-video-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(&path, script);
     crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
         .unwrap()
 }
@@ -5013,7 +5219,6 @@ const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDE
 /// extractor (the script lives in a temp dir keyed by
 /// `name`).
 fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameExtractor {
-    use std::io::Write as _;
     let dir = std::env::temp_dir().join(format!(
         "crabcrop-engine-frame-{}-{name}",
         std::process::id()
@@ -5029,14 +5234,7 @@ fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameEx
         "#!/bin/sh\ncat > /dev/null\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' {report} | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n"
     );
     let path = dir.join("decoder.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(&path, &script);
     crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap()
 }
 
@@ -5399,7 +5597,6 @@ fn frame_percentage_without_a_duration_is_unsupported() {
 /// prints a real 8x6 PNG. Returns the renderer (the
 /// scripts live in a temp dir keyed by `name`).
 fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
-    use std::io::Write as _;
     let dir =
         std::env::temp_dir().join(format!("crabcrop-engine-pdf-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -5411,14 +5608,7 @@ fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
     let page_path = dir.join("page.png").display().to_string();
     let write = |file: &str, script: String| {
         let path = dir.join(file);
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(script.as_bytes()).unwrap();
-        drop(f);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, &script);
         path
     };
     write(

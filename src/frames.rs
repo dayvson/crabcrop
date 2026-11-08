@@ -59,11 +59,11 @@
 //! it unchanged.
 
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{Seek, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::toolrun::{ToolCommand, ToolError, ToolInput, ToolRun, run_tool, tool_cpu_limit};
 use crate::url::FrameSelection;
 
 /// Cap on the extracted frame's PNG bytes. Tied to the
@@ -243,7 +243,7 @@ impl VideoFrameExtractor {
                 return FrameError::Failed(format!(
                     "the video decoder cannot read the fd protocol \
                      (frame extraction needs FFmpeg 6.0 or newer): {}",
-                    stderr_excerpt(&run.stderr)
+                    run.stderr_excerpt()
                 ));
             }
             FrameError::NotVideo(
@@ -349,20 +349,17 @@ impl VideoFrameExtractor {
             return Err(FrameError::Failed(format!(
                 "video decoder exited with {}: {}",
                 run.status,
-                stderr_excerpt(&run.stderr)
+                run.stderr_excerpt()
             )));
         }
         Ok(run.stdout)
     }
 
-    /// Run the program once under the standing bounds:
-    /// the staged source on stdin, read from its start
-    /// (every run shares the file's offset), stdout capped at
-    /// `max_stdout` (past the cap the process group is
-    /// killed and the run fails), stderr kept up to the
-    /// report cap while the rest is drained so the tool
-    /// never blocks on a full pipe, an empty environment,
-    /// and the wall-clock timeout.
+    /// Run the program once through the shared runner
+    /// ([`crate::toolrun::run_tool`]): the staged source on
+    /// stdin, read from its start (every run shares the
+    /// file's offset), stdout capped at `max_stdout`, and the
+    /// probe report kept up to its cap.
     fn run(
         &self,
         args: &[&str],
@@ -375,162 +372,30 @@ impl VideoFrameExtractor {
         };
         let mut stdin = input.try_clone().map_err(staging_failed)?;
         stdin.rewind().map_err(staging_failed)?;
-        let mut cmd = Command::new(&self.program);
-        cmd.args(args)
-            .stdin(Stdio::from(stdin))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear()
-            .current_dir(std::env::temp_dir());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        let mut child = cmd.spawn().map_err(|e| {
-            FrameError::Failed(format!(
-                "could not start the video decoder {}: {e}",
-                self.program.display()
-            ))
-        })?;
-        let pid = child.id();
-        crate::toolrun::limit_child(
-            pid,
-            crate::toolrun::tool_cpu_limit(self.timeout),
-            crate::toolrun::TOOL_MAX_ADDRESS_SPACE,
-        );
-
-        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
-        let stdout_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 64 * 1024];
-            let result = loop {
-                match stdout_pipe.read(&mut chunk) {
-                    Ok(0) => break Ok(buf),
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.len() > max_stdout {
-                            break Err(format!(
-                                "the decoder's output passed the {max_stdout} byte cap"
-                            ));
-                        }
-                    }
-                    Err(e) => break Err(format!("reading the decoder's output failed: {e}")),
+        run_tool(ToolCommand {
+            program: &self.program,
+            args,
+            input: ToolInput::File(stdin),
+            max_stdout,
+            max_stderr: PROBE_REPORT_CAP,
+            deadline,
+            cpu_limit: tool_cpu_limit(self.timeout),
+        })
+        .map_err(|e| {
+            FrameError::Failed(match e {
+                ToolError::Spawn(e) => format!(
+                    "could not start the video decoder {}: {e}",
+                    self.program.display()
+                ),
+                ToolError::OutputCap(cap) => {
+                    format!("the decoder's output passed the {cap} byte cap")
                 }
-            };
-            let _ = out_tx.send(result);
-        });
-
-        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-        let (err_tx, err_rx) = std::sync::mpsc::channel::<(String, bool)>();
-        let stderr_thread = std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut truncated = false;
-            let mut chunk = [0u8; 16 * 1024];
-            loop {
-                match stderr_pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let take = (PROBE_REPORT_CAP - kept.len()).min(n);
-                        kept.extend_from_slice(&chunk[..take]);
-                        truncated |= take < n;
-                    }
+                ToolError::Read(e) => format!("reading the decoder's output failed: {e}"),
+                ToolError::TimedOut => {
+                    format!("video decoder timed out after {}s", self.timeout.as_secs())
                 }
-            }
-            let _ = err_tx.send((String::from_utf8_lossy(&kept).into_owned(), truncated));
-        });
-
-        // Wait for the exit status without ever blocking
-        // past the deadline: a tool that closed its stdout
-        // and then hung still gets killed on time.
-        let wait_status =
-            |child: &mut std::process::Child| -> Result<std::process::ExitStatus, FrameError> {
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => return Ok(status),
-                        Ok(None) => {
-                            if Instant::now() >= deadline {
-                                kill_process_group(pid);
-                                let _ = child.wait();
-                                return Err(FrameError::Failed(format!(
-                                    "video decoder timed out after {}s",
-                                    self.timeout.as_secs()
-                                )));
-                            }
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(e) => {
-                            return Err(FrameError::Failed(format!(
-                                "waiting on the video decoder failed: {e}"
-                            )));
-                        }
-                    }
-                }
-            };
-        let (status, stdout) = loop {
-            match out_rx.try_recv() {
-                Ok(Ok(bytes)) => {
-                    let status = wait_status(&mut child)?;
-                    break (status, bytes);
-                }
-                Ok(Err(why)) => {
-                    kill_process_group(pid);
-                    let _ = child.wait();
-                    return Err(FrameError::Failed(why));
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if Instant::now() >= deadline {
-                        kill_process_group(pid);
-                        let _ = child.wait();
-                        return Err(FrameError::Failed(format!(
-                            "video decoder timed out after {}s",
-                            self.timeout.as_secs()
-                        )));
-                    }
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            // The process is gone; its stdout
-                            // reader finishes at EOF. Give it
-                            // a moment, then take what arrived.
-                            match out_rx.recv_timeout(Duration::from_secs(2)) {
-                                Ok(Ok(bytes)) => break (status, bytes),
-                                Ok(Err(why)) => return Err(FrameError::Failed(why)),
-                                Err(_) => break (status, Vec::new()),
-                            }
-                        }
-                        Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                        Err(e) => {
-                            return Err(FrameError::Failed(format!(
-                                "waiting on the video decoder failed: {e}"
-                            )));
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    let status = wait_status(&mut child)?;
-                    break (status, Vec::new());
-                }
-            }
-        };
-        // The reader threads are deliberately never
-        // joined (issue #263, the video.rs pattern): a
-        // grandchild that inherited the pipes and holds
-        // them open would block a join for its whole
-        // lifetime, defeating the timeout above. stderr
-        // is worth a short grace through its channel, no
-        // more; the stdout result already arrived through
-        // its own channel.
-        let (stderr, stderr_truncated) = err_rx
-            .recv_timeout(Duration::from_millis(200))
-            .unwrap_or_default();
-        drop(stdout_thread);
-        drop(stderr_thread);
-        Ok(ToolRun {
-            status,
-            stdout,
-            stderr,
-            stderr_truncated,
+                ToolError::Wait(e) => format!("waiting on the video decoder failed: {e}"),
+            })
         })
     }
 }
@@ -575,15 +440,6 @@ fn stage_input(video: &[u8]) -> Result<File, FrameError> {
     std::fs::remove_file(&path).map_err(failed)?;
     file.write_all(video).map_err(failed)?;
     Ok(file)
-}
-
-/// One finished tool run.
-struct ToolRun {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: String,
-    /// Whether stderr passed the report cap and was cut.
-    stderr_truncated: bool,
 }
 
 /// The frame interval a probe implies, for clamping and
@@ -876,46 +732,10 @@ fn parse_dims(token: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-/// The tail of a tool's stderr, for error text: capped,
-/// the same as the encoder's excerpts.
-fn stderr_excerpt(stderr: &str) -> String {
-    let tail: String = stderr
-        .chars()
-        .rev()
-        .take(500)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    let tail = tail.trim();
-    if tail.is_empty() {
-        "no error output".to_string()
-    } else {
-        tail.to_string()
-    }
-}
-
-/// Kill a runaway tool's whole process group (it may
-/// have spawned helpers). Mirrors the encoder's
-/// discipline exactly. The group kill is the whole
-/// mechanism (issue #272): a descendant that detaches
-/// (setsid, double-fork) escapes it by design of the
-/// tool contract, which forbids daemonizing.
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    if let Ok(pid) = i32::try_from(pid)
-        && let Some(pid) = rustix::process::Pid::from_raw(pid)
-    {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     /// The probe report the extractor parses, recorded
     /// from the reference tool on a real file.
@@ -1339,13 +1159,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
     fn fake_tool(name: &str, script: &str) -> PathBuf {
         let dir = temp_dir(name);
         let path = dir.join("fake-decoder");
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, script);
         path
     }
 

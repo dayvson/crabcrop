@@ -331,19 +331,7 @@ pub fn crop_to_aspect_point_traced(
     if src_ratio == dst_ratio {
         return (img, Some((0, 0, w, h)));
     }
-    // The fill window: the largest target-aspect window in
-    // the frame, the window the other crops cut.
-    let (fill_w, fill_h) = if src_ratio > dst_ratio {
-        (
-            ((h as u64 * target_w as u64) / target_h as u64).max(1) as u32,
-            h,
-        )
-    } else {
-        (
-            w,
-            ((w as u64 * target_h as u64) / target_w as u64).max(1) as u32,
-        )
-    };
+    let (fill_w, fill_h) = fill_window(w, h, target_w, target_h);
     let (fx, fy, zoom) = point;
     // The grammar guarantees the point and zoom ranges; the
     // sanitization keeps a hand-built call from reaching the
@@ -364,8 +352,17 @@ pub fn crop_to_aspect_point_traced(
     } else {
         1.0
     };
-    let cw = ((fill_w as f32 / zoom).round() as u32).clamp(1, fill_w);
-    let ch = ((fill_h as f32 / zoom).round() as u32).clamp(1, fill_h);
+    // Zoom the exact fill size, then round once: zooming the
+    // whole-pixel fill window rounded a rounded-down side
+    // again and could leave the window more than a pixel off
+    // the target aspect (issue #478).
+    let (exact_w, exact_h) = if src_ratio > dst_ratio {
+        (h as f64 * target_w as f64 / target_h as f64, h as f64)
+    } else {
+        (w as f64, w as f64 * target_h as f64 / target_w as f64)
+    };
+    let cw = ((exact_w / zoom as f64).round() as u32).clamp(1, fill_w);
+    let ch = ((exact_h / zoom as f64).round() as u32).clamp(1, fill_h);
     let x = point_start(fx, cw, w);
     let y = point_start(fy, ch, h);
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
@@ -482,6 +479,27 @@ pub fn crop_around_objects_traced(
     )
 }
 
+/// The fill window of a `target_w:target_h` crop of a `w`
+/// by `h` image (both targets non-zero): the largest window
+/// of the target aspect the frame holds, in whole pixels,
+/// the full extent on one axis and the other rounded down
+/// (at least 1). The aspect and focal crops cut exactly this
+/// window; the point and subject-region crops cut it or a
+/// smaller one, never a larger one.
+fn fill_window(w: u32, h: u32, target_w: u32, target_h: u32) -> (u32, u32) {
+    if w as u64 * target_h as u64 > target_w as u64 * h as u64 {
+        (
+            ((h as u64 * target_w as u64) / target_h as u64).max(1) as u32,
+            h,
+        )
+    } else {
+        (
+            w,
+            ((w as u64 * target_h as u64) / target_w as u64).max(1) as u32,
+        )
+    }
+}
+
 /// The shared subject-region crop behind the face and
 /// objects crops: the smallest `target_w:target_h` region
 /// holding a `pw` by `ph` subject box centered at
@@ -517,8 +535,13 @@ fn crop_region_traced(
     }
     let ox = (cx - rw / 2.0).clamp(0.0, (w - rw).max(0.0));
     let oy = (cy - rh / 2.0).clamp(0.0, (h - rh).max(0.0));
-    let cw = (rw.round() as u32).clamp(1, img.width());
-    let ch = (rh.round() as u32).clamp(1, img.height());
+    // Capped by the fill window, not the frame: a region the
+    // frame clamped to the fill size has a fractional side,
+    // which used to round up one pixel past the window every
+    // other crop cuts (issue #478).
+    let (fill_w, fill_h) = fill_window(img.width(), img.height(), target_w, target_h);
+    let cw = (rw.round() as u32).clamp(1, fill_w);
+    let ch = (rh.round() as u32).clamp(1, fill_h);
     let x = (ox.round() as u32).min(img.width() - cw);
     let y = (oy.round() as u32).min(img.height() - ch);
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();

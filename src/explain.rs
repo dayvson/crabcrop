@@ -72,6 +72,15 @@ pub struct Forecast {
     /// walk stops there, so the dimensions and pixels are
     /// `None`: the image request has no output to forecast.
     pub zero_side: bool,
+    /// True when a resize, fit-in, crop, pad, or `rotate(...)`
+    /// works out a size past [`crate::url::MAX_DIMENSION`] on
+    /// an axis (`16383x1/0x2` asks for 32766x2), which the
+    /// engine refuses wherever the step sits in the chain
+    /// (issue #521). A step that keeps the size it started
+    /// from is never flagged, as the engine never refuses
+    /// one. The walk stops there, so the dimensions are the
+    /// size the engine refuses.
+    pub over_dimension: bool,
 }
 
 /// Everything the handler verified and probed, ready to
@@ -179,12 +188,16 @@ pub fn debug_focal_remainder(ops: &[Operation], source: &str) -> Option<String> 
 /// image request runs and `url_ops` the URL's own part of
 /// it, which tells a URL's format from a default one. The
 /// arithmetic mirrors the engine's own size resolution
-/// (DPR scaling of pixel axes, the adaptive fit-in box
-/// swap, proportional axes resolved against the running
-/// size, `no_upscale` capping resizes at the source),
+/// (an SVG source's raster size, DPR scaling of pixel axes,
+/// the adaptive fit-in box swap, proportional axes resolved
+/// against the running size, `no_upscale` capping resizes,
+/// fit-ins and crops at the source, a rotated canvas),
 /// simplified where the engine's answer depends on decoded
-/// pixels: a step it cannot settle makes the dimensions
-/// unknown from there on, never a guess. Sizes and the
+/// pixels: a step it cannot settle (a trim, a cap against a
+/// source of unknown size) makes the dimensions unknown
+/// from there on, never a guess. The probe reads the stored
+/// dimensions, before any EXIF orientation turns them, and
+/// the client hints are not part of the URL. Sizes and the
 /// pixel count saturate rather than overflow: a crop-rect
 /// takes u32 corners and each upscale multiplies the
 /// running size, so a hostile chain can pass `u64::MAX`,
@@ -192,8 +205,31 @@ pub fn debug_focal_remainder(ops: &[Operation], source: &str) -> Option<String> 
 fn forecast(ops: &[Operation], url_ops: &[Operation], probe: &SourceProbe) -> Forecast {
     let directives = RequestDirectives::analyze(ops);
     let dpr = directives.dpr.unwrap_or(1.0);
-    let mut cur: Option<(u64, u64)> = probe.dimensions.map(|(w, h)| (w as u64, h as u64));
+    // An SVG source is rasterized before the chain runs, at
+    // the size the engine picks for it (held to 4096 px per
+    // axis), and every step resolves against that raster.
+    let source = probe.dimensions.map(|(w, h)| match probe.kind {
+        "svg" => crate::engine::svg_raster_target(ops, (w as f32, h as f32), dpr),
+        _ => (w, h),
+    });
+    // The engine's `no_upscale` cap: the source size, per axis
+    // for a resize, proportionally for a fit-in or a crop.
+    // Without a source size the capped result is unknown.
+    let capped = |resolved: Option<(u64, u64)>, per_axis: bool| {
+        if !directives.no_upscale {
+            return resolved;
+        }
+        let ((w, h), (cw, ch)) = (resolved?, source?);
+        Some(if per_axis {
+            (w.min(cw as u64), h.min(ch as u64))
+        } else {
+            let (w, h) = crate::engine::cap_dimensions(saturate(w), saturate(h), (cw, ch));
+            (w as u64, h as u64)
+        })
+    };
+    let mut cur: Option<(u64, u64)> = source.map(|(w, h)| (w as u64, h as u64));
     let mut zero_side = false;
+    let mut over_dimension = false;
     for op in ops {
         // The engine refuses the request here, whatever follows.
         if let Operation::Size(size) | Operation::FitIn { size, .. } = op
@@ -203,20 +239,16 @@ fn forecast(ops: &[Operation], url_ops: &[Operation], probe: &SourceProbe) -> Fo
             cur = None;
             break;
         }
+        let before = cur;
         cur = match op {
-            Operation::Size(size) => {
-                let resolved = resolve_size(size, cur, dpr);
-                match (resolved, cur) {
-                    (Some((w, h)), Some((cw, ch))) if directives.no_upscale => {
-                        Some((w.min(cw), h.min(ch)))
-                    }
-                    (resolved, _) => resolved,
-                }
+            Operation::Size(size) => capped(resolve_size(size, cur, dpr), true),
+            Operation::Crop { size, .. } => capped(resolve_size(size, cur, dpr), false),
+            // A pad canvas is never capped: `no_upscale` only
+            // fits the image inside it.
+            Operation::Pad { size, .. } => resolve_size(size, cur, dpr),
+            Operation::FitIn { size, adaptive } => {
+                capped(fit_in_forecast(size, *adaptive, cur, dpr), false)
             }
-            Operation::Crop { size, .. } | Operation::Pad { size, .. } => {
-                resolve_size(size, cur, dpr)
-            }
-            Operation::FitIn { size, adaptive } => fit_in_forecast(size, *adaptive, cur, dpr),
             Operation::CropRect {
                 left,
                 top,
@@ -239,14 +271,50 @@ fn forecast(ops: &[Operation], url_ops: &[Operation], probe: &SourceProbe) -> Fo
             Operation::Filters(filters) => {
                 let mut cur = cur;
                 for filter in filters {
-                    if let Filter::Upscale(n) = filter {
-                        let n = *n as u64;
-                        cur = cur.map(|(w, h)| (w.saturating_mul(n), h.saturating_mul(n)));
+                    let before = cur;
+                    match filter {
+                        Filter::Upscale(n) => {
+                            let n = *n as u64;
+                            cur = cur.map(|(w, h)| (w.saturating_mul(n), h.saturating_mul(n)));
+                        }
+                        Filter::Rotate(degrees) => {
+                            cur = cur.map(|(w, h)| {
+                                let (w, h) = crate::filters::rotated_canvas(
+                                    saturate(w),
+                                    saturate(h),
+                                    *degrees,
+                                );
+                                (w as u64, h as u64)
+                            });
+                            if past_dimension_limit(before, cur) {
+                                over_dimension = true;
+                                break;
+                            }
+                        }
+                        // The trimmed size depends on the pixels.
+                        Filter::Trim(_) | Filter::TrimSides(..) => cur = None,
+                        _ => {}
                     }
                 }
                 cur
             }
         };
+        // The engine checks the size each of these steps
+        // resolves against the per-axis limit, and refuses the
+        // request there, whatever follows (issue #521).
+        let resolves = matches!(
+            op,
+            Operation::Size(_)
+                | Operation::FitIn { .. }
+                | Operation::Crop { .. }
+                | Operation::Pad { .. }
+        );
+        if resolves && past_dimension_limit(before, cur) {
+            over_dimension = true;
+        }
+        if over_dimension {
+            break;
+        }
     }
     let (width, height) = match cur {
         Some((w, h)) => (
@@ -271,9 +339,24 @@ fn forecast(ops: &[Operation], url_ops: &[Operation], probe: &SourceProbe) -> Fo
         format_from_default,
         format_from_operation,
         zero_side,
+        over_dimension,
         pixels,
         over_budget: pixels.is_some_and(|p| p > crate::engine::MAX_OUTPUT_PIXELS),
     }
+}
+
+/// Whether a step that took the running size from `before`
+/// to `after` works out a side past
+/// [`crate::url::MAX_DIMENSION`]: the engine's per-axis
+/// rule, which passes a step that keeps the size it started
+/// from (issue #521).
+fn past_dimension_limit(before: Option<(u64, u64)>, after: Option<(u64, u64)>) -> bool {
+    after.is_some_and(|(w, h)| before != after && w.max(h) > u64::from(crate::url::MAX_DIMENSION))
+}
+
+/// A running size as the engine's `u32` arithmetic sees it.
+fn saturate(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 /// The container a request with no explicit format and no
@@ -458,6 +541,7 @@ impl Report {
                 "pixel_budget": crate::engine::MAX_OUTPUT_PIXELS,
                 "over_budget": self.forecast.over_budget,
                 "zero_side": self.forecast.zero_side,
+                "over_dimension": self.forecast.over_dimension,
             },
             "canonical": input.canonical,
             "cache_group": input.cache_group,
@@ -548,6 +632,12 @@ impl Report {
         match (self.forecast.width, self.forecast.height) {
             _ if self.forecast.zero_side => {
                 out.push_str("<li>Output: none; a size asks for a zero pixel side, so the image request itself would be refused</li>\n");
+            }
+            (Some(w), Some(h)) if self.forecast.over_dimension => {
+                out.push_str(&format!(
+                    "<li>Output: {w}x{h}, past the {} pixel limit per axis, so the image request itself would be refused</li>\n",
+                    crate::url::MAX_DIMENSION
+                ));
             }
             (Some(w), Some(h)) => {
                 out.push_str(&format!("<li>Output: {w}x{h}</li>\n"));
@@ -783,6 +873,239 @@ mod tests {
         assert_eq!(
             (report.forecast.width, report.forecast.height),
             (Some(150), Some(100))
+        );
+    }
+
+    #[test]
+    fn forecast_agrees_with_the_dimension_refusal() {
+        // A step that resolves a size past MAX_DIMENSION on an
+        // axis is refused by the engine wherever it sits in
+        // the chain (issue #521). The forecast used to report
+        // 32766x2 as a servable output; now it flags the step
+        // and stops there, on the size the engine refuses.
+        for (remainder, refused) in [
+            ("16383x1/0x2", (32766, 2)),
+            ("16383x1/0x2/100x100", (32766, 2)),
+            ("16383x1/fit-in:0x2", (32766, 2)),
+            ("crop:16383x1:smart/0x2", (32766, 2)),
+            ("4096x1/0x2/filters:dpr(2)", (16384, 4)),
+            ("12000x10/filters:dpr(2)", (24000, 20)),
+            ("pad:9000x100/filters:dpr(2)", (18000, 200)),
+        ] {
+            let report = report_for(
+                &format!("{remainder}/https://example.com/photo.jpg"),
+                png_probe(),
+            );
+            assert!(report.forecast.over_dimension, "{remainder}");
+            assert_eq!(
+                (report.forecast.width, report.forecast.height),
+                (Some(refused.0), Some(refused.1)),
+                "{remainder}"
+            );
+            assert_eq!(report.to_json()["forecast"]["over_dimension"], true);
+            let html = report.to_html();
+            assert!(
+                html.contains(&format!(
+                    "<li>Output: {}x{}, past the 16383 pixel limit per axis, so the image request itself would be refused</li>",
+                    refused.0, refused.1
+                )),
+                "{html}"
+            );
+        }
+        // Exactly the limit renders.
+        for (remainder, size) in [("5461x1/0x3", (16383, 3)), ("16383x1/0x1", (16383, 1))] {
+            let report = report_for(
+                &format!("{remainder}/https://example.com/photo.jpg"),
+                png_probe(),
+            );
+            assert!(!report.forecast.over_dimension, "{remainder}");
+            assert_eq!(
+                (report.forecast.width, report.forecast.height),
+                (Some(size.0), Some(size.1)),
+                "{remainder}"
+            );
+            assert_eq!(report.to_json()["forecast"]["over_dimension"], false);
+            let html = report.to_html();
+            assert!(
+                html.contains(&format!("<li>Output: {}x{}</li>", size.0, size.1)),
+                "{html}"
+            );
+        }
+        // `no_upscale` holds a crop's target inside the source
+        // before the engine checks it, so the request renders,
+        // at the size the engine's proportional cap leaves.
+        let report = report_for(
+            "crop:16383x10/filters:dpr(2):no_upscale/https://example.com/photo.jpg",
+            png_probe(),
+        );
+        assert!(!report.forecast.over_dimension);
+        assert_eq!(
+            (report.forecast.width, report.forecast.height),
+            (Some(2400), Some(1))
+        );
+    }
+
+    /// A PNG probe of the given stored size.
+    fn png_of(width: u32, height: u32) -> SourceProbe {
+        SourceProbe {
+            kind: "png",
+            dimensions: Some((width, height)),
+        }
+    }
+
+    /// The forecast for `remainder` on `probe`: the dimensions
+    /// and the `over_dimension` flag.
+    fn forecast_of(remainder: &str, probe: SourceProbe) -> ((Option<u32>, Option<u32>), bool) {
+        let report = report_for(&format!("{remainder}/https://example.com/a.png"), probe);
+        (
+            (report.forecast.width, report.forecast.height),
+            report.forecast.over_dimension,
+        )
+    }
+
+    #[test]
+    fn forecast_caps_no_upscale_at_the_source_like_the_engine() {
+        // The engine caps a resize per axis and a fit-in or a
+        // crop proportionally at the source size, before the
+        // per-axis check (issue #521). The forecast used to cap
+        // a resize at the running size and a fit-in or crop
+        // not at all, so it flagged chains that render.
+        // 16383x1: the fit-in caps at the source, and so does
+        // the resize after it.
+        assert_eq!(
+            forecast_of("fit-in:0x2/0x2/filters:no_upscale", png_of(16383, 1)),
+            ((Some(16383), Some(1)), false)
+        );
+        assert_eq!(
+            forecast_of("fit-in:0x16383/0x2/filters:no_upscale", png_of(16383, 1)),
+            ((Some(16383), Some(1)), false)
+        );
+        // A step the cap holds at the source's own size keeps
+        // it, so a source at the 16384 px decode ceiling passes.
+        assert_eq!(
+            forecast_of("fit-in:0x2/filters:no_upscale", png_of(16384, 1)),
+            ((Some(16384), Some(1)), false)
+        );
+        // A step that grows a side to the ceiling is refused:
+        // 8192x1 doubles to 16384x2, capped per axis to 16384x1.
+        assert_eq!(
+            forecast_of("8192x1/0x2/filters:no_upscale", png_of(16384, 1)),
+            ((Some(16384), Some(1)), true)
+        );
+        // Without a source size the cap is unknown, and so is
+        // the output: never a guess.
+        let unknown = SourceProbe {
+            kind: "png",
+            dimensions: None,
+        };
+        assert_eq!(
+            forecast_of("300x200/filters:no_upscale", unknown),
+            ((None, None), false)
+        );
+        // A pad canvas is never capped, so `no_upscale` does
+        // not save one past the limit.
+        assert_eq!(
+            forecast_of("pad:9000x100/filters:dpr(2):no_upscale", png_probe()),
+            ((Some(18000), Some(200)), true)
+        );
+    }
+
+    #[test]
+    fn forecast_resolves_against_the_svg_raster() {
+        // The engine rasterizes an SVG at the first size the
+        // chain asks for, held to 4096 px per axis, and runs
+        // the chain on that raster (issue #521): 0x2 on a
+        // 16383x1 vector rasterizes at 4096x1 and renders
+        // 8192x2, so the forecast must not flag 32766x2.
+        let svg = |width, height| SourceProbe {
+            kind: "svg",
+            dimensions: Some((width, height)),
+        };
+        assert_eq!(
+            forecast_of("0x2", svg(16383, 1)),
+            ((Some(8192), Some(2)), false)
+        );
+        assert_eq!(
+            forecast_of("fit-in:0x2", svg(16383, 1)),
+            ((Some(8192), Some(2)), false)
+        );
+        assert_eq!(
+            forecast_of("0x0", svg(16384, 1)),
+            ((Some(4096), Some(1)), false)
+        );
+        assert_eq!(
+            forecast_of("2x0", svg(1, 100_000)),
+            ((Some(2), Some(8192)), false)
+        );
+        // A vector inside the raster bound renders at its size.
+        assert_eq!(
+            forecast_of("filters:grayscale", svg(300, 200)),
+            ((Some(300), Some(200)), false)
+        );
+    }
+
+    #[test]
+    fn forecast_turns_rotations_and_leaves_trims_unknown() {
+        // The engine checks the canvas a rotation draws on per
+        // axis (issue #521): 16383x1000 turned 3.5 degrees
+        // needs a canvas past the limit.
+        let canvas = crate::filters::rotated_canvas(16383, 1000, 3.5);
+        assert_eq!(
+            forecast_of("16383x1000/filters:rotate(3.5)", png_probe()),
+            ((Some(canvas.0), Some(canvas.1)), true)
+        );
+        // A quarter turn swaps the sides, and the resize after
+        // it scales the long side on from there; a half turn
+        // keeps the size.
+        assert_eq!(
+            forecast_of("filters:rotate(90)/2x0", png_of(16383, 1)),
+            ((Some(2), Some(32766)), true)
+        );
+        assert_eq!(
+            forecast_of("filters:rotate(180)", png_of(16384, 2)),
+            ((Some(16384), Some(2)), false)
+        );
+        assert_eq!(
+            forecast_of("filters:rotate(90)", png_of(16384, 2)),
+            ((Some(2), Some(16384)), true)
+        );
+        // A trim's size depends on the pixels: unknown from
+        // there on, never flagged on a guess.
+        assert_eq!(
+            forecast_of("filters:trim/0x2", png_of(16383, 3)),
+            ((None, None), false)
+        );
+    }
+
+    #[test]
+    fn forecast_passes_steps_that_keep_a_decode_ceiling_size() {
+        // A source can decode at 16384 px per axis. A step
+        // that keeps that size works nothing out, and the
+        // engine passes it; one that changes the size is held
+        // to the limit (issue #521).
+        for remainder in [
+            "0x0",
+            "fit-in:0x0",
+            "filters:rotate(0)",
+            "filters:grayscale",
+        ] {
+            assert_eq!(
+                forecast_of(remainder, png_of(16384, 2)),
+                ((Some(16384), Some(2)), false),
+                "{remainder}"
+            );
+        }
+        assert_eq!(
+            forecast_of("origx1", png_of(16384, 2)),
+            ((Some(16384), Some(1)), true)
+        );
+        assert_eq!(
+            forecast_of("crop:8192x1/filters:dpr(2)", png_of(16384, 4)),
+            ((Some(16384), Some(2)), true)
+        );
+        assert_eq!(
+            forecast_of("crop:8192x1/filters:dpr(2)", png_of(16384, 2)),
+            ((Some(16384), Some(2)), false)
         );
     }
 

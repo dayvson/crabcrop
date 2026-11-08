@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ai;
+mod avif;
 pub mod cache;
 pub mod cli;
 pub mod color;
@@ -40,6 +41,8 @@ pub mod sigv4;
 pub mod storage;
 pub mod studio;
 pub mod svg;
+#[cfg(test)]
+mod test_support;
 pub mod text;
 pub mod thumbhash;
 pub mod tokenizer;

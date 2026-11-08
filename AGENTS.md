@@ -25,9 +25,11 @@ both SDKs must all pass.
   state in `engine/state.rs`), HTTP and caching in `server.rs`
   (request coalescing in `server/process.rs`, metadata responses in
   `server/meta.rs`), source fetching policy in `loader.rs`, AI
-  features in `ai.rs` and `studio.rs`. A large module keeps its unit
-  tests in `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
-  `server.rs` and `engine.rs` do.
+  features in `ai/` (provider traits in `ai/mod.rs`, one file per
+  provider family, all re-exported from `crate::ai`) and
+  `studio.rs`. A large module keeps its unit tests in
+  `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
+  `server.rs`, `engine.rs` and the files under `ai/` do.
 - `crates/crabcrop-url`: the client-side library: signing, sealing,
   verification, and URL building. It does not parse operations; the
   server's parser is `src/url.rs`.
@@ -53,7 +55,7 @@ both SDKs must all pass.
   model files and an ONNX Runtime library, which are deployment artifacts,
   never repo content. `.github/workflows/ai-models.yml` downloads the
   pinned artifacts and runs them (`cargo test -- --ignored`) on pull
-  requests and main pushes that touch `src/ai.rs`, `src/tokenizer.rs`,
+  requests and main pushes that touch `src/ai/`, `src/tokenizer.rs`,
   `tests/fixtures/portrait.jpg` or the workflow itself, on every release
   tag before anything publishes, weekly, and by hand. When you cannot run
   them locally, that pull-request run is where an AI change is verified.
@@ -71,8 +73,12 @@ both SDKs must all pass.
   it resets cache keys and invalidates existing URLs. Treat grammar work
   accordingly.
 - `Cargo.lock` moves with any version or dependency change. Version bumps
-  run through `scripts/bump_version.py` plus a lockfile refresh; a bump
-  without the lockfile update fails every `--locked` build.
+  run through `scripts/bump_version.py`, which moves every site listed in
+  `scripts/version_sites.py` (the lockfiles' own entries included) and
+  then runs `scripts/check_versions.py` over the same list. Never move a
+  site by hand: a file that starts carrying the release version joins
+  that list, or `scripts/test_version_tools.py` fails the gate on the
+  old version a bump leaves in it.
   `fuzz/Cargo.lock` moves too: the fuzz package builds the server
   library, so a dependency change that the root lockfile records needs
   the refresh in `fuzz/README.md`, or the fuzz smoke's `--locked` build

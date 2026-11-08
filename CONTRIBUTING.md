@@ -42,6 +42,22 @@ cargo test
 cargo test -p crabcrop-url   # the signing crate
 ```
 
+Both include property tests ([proptest](https://docs.rs/proptest)):
+`tests/proptest_url.rs` (generated operation chains parse back to the
+operations they spell and canonicalize to a fixed point),
+`tests/proptest_crop.rs` (every crop window is non-empty, inside the image,
+no larger than the fill window, and at the target aspect within a pixel), and
+`crates/crabcrop-url/tests/proptest_sign.rs` (signatures and sealed tokens
+round-trip, and any one changed byte fails them). Each property runs 64 cases
+by default; `PROPTEST_CASES` runs more:
+
+```bash
+PROPTEST_CASES=10000 cargo test --workspace --test proptest_url --test proptest_crop --test proptest_sign
+```
+
+A failing case is saved as a seed in the `.proptest-regressions` file next to
+its suite and replayed first on every later run. Commit the seed with the fix.
+
 The full cross-language suite (Rust, the TypeScript and Python SDKs, the MCP
 server, the Nuxt module, and the playground, plus a fuzz smoke test) runs from
 one script, which starts and stops the local servers the integration tests
@@ -53,6 +69,12 @@ scripts/test_all.sh --skip-rust  # just the non-Rust suites
 ```
 
 The JavaScript suites need Node 22.18 or newer: they run the TypeScript sources directly, and type stripping is on by default from 22.18.
+
+A unit test that stands a script in for an external tool (FFmpeg,
+pdftocairo, pdfinfo) writes it with `crate::test_support::write_script`, not
+`std::fs::write`. A script written through the test process's own file
+descriptor can fail to start with "Text file busy" when another test thread
+spawns a child at the same moment (issue #523).
 
 ## Code style
 
@@ -96,6 +118,25 @@ script on that branch too.
 Give user-facing changes an entry under `## [Unreleased]` in
 [CHANGELOG.md](CHANGELOG.md). The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+The changelog workflow enforces this: a pull request that touches `src/`,
+`sdks/`, `frameworks/`, or `plugins/` fails until it adds a line under
+`## [Unreleased]`. When nothing user-facing changed (a refactor, a test, a
+dependency bump), a maintainer adds the `no-changelog` label instead, and the
+check passes. To run the same check locally, against the branch point with
+`main`:
+
+```bash
+python3 scripts/check_docs.py --changelog-entry origin/main
+```
+
+## Reference docs
+
+The reference pages in `docs/` move with the code. `scripts/check_docs.py`,
+which `scripts/test_all.sh` runs, fails when an environment variable, a
+default, an error code or status, or a filter is in the code but not the docs
+(or the other way round), and when a documented error code is named in no test.
+Its output names the file and the entry to fix.
 
 ## Security
 

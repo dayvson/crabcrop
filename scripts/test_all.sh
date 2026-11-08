@@ -31,7 +31,7 @@ fi
 step() { printf '\n=== %s ===\n' "$1"; }
 
 step "Workflow mirrors (docs copies match the live workflows)"
-for pair in "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml" "release.yml release-workflow.yml" "rust.yml rust-workflow.yml"; do
+for pair in "changelog.yml changelog-workflow.yml" "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml" "release.yml release-workflow.yml" "rust.yml rust-workflow.yml"; do
   set -- $pair
   if ! cmp -s ".github/workflows/$1" "docs/$2"; then
     echo "workflow mirror drift: docs/$2 differs from .github/workflows/$1; sync the mirror to the live workflow" >&2
@@ -71,8 +71,9 @@ fi
 step "Operation vectors (the generated corpus is current)"
 python3 spec/generate_operation_vectors.py --check
 
-step "Version consistency (every artifact and deploy pin agrees)"
+step "Version consistency (every artifact and deploy pin agrees, and a bump moves them all)"
 python3 scripts/check_versions.py
+python3 scripts/test_version_tools.py
 
 step "Rendering version (a corpus re-baseline since the last release tag raises it)"
 python3 scripts/check_rendering_version.py
@@ -81,6 +82,10 @@ python3 scripts/test_check_rendering_version.py
 step "Release scripts (the preflight checks, and creating or updating the GitHub Release)"
 python3 scripts/test_release_preflight.py
 python3 scripts/test_publish_github_release.py
+
+step "Docs sync (env vars, error codes, filters and the CHANGELOG heading match the code)"
+python3 scripts/check_docs.py
+python3 scripts/test_check_docs.py
 
 step "Build (debug binary: the MCP suite spawns it)"
 cargo build --locked
