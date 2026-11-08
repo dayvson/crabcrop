@@ -138,6 +138,15 @@ class VersionToolsTest(unittest.TestCase):
         self.assertNotIn("Traceback", err)
         self.assertEqual([line[2:] for line in err.splitlines() if line.startswith("  ")], problems)
 
+    def assert_nothing_left(self):
+        self.assertEqual(
+            self.leftovers(self.version),
+            [],
+            "the bump left the old version behind: add each site to scripts/version_sites.py; "
+            "a mention that is not a pin of this release (a test input, another project's "
+            "version, generated text) is reworded, or its file joins EXAMPLES in this test",
+        )
+
     def requirement(self):
         text = (self.tree / "Cargo.toml").read_text(encoding="utf-8")
         return re.search(r'^crabcrop-url = \{[^}\n]*\bversion = "([^"]+)"', text, re.M).group(1)
@@ -146,12 +155,7 @@ class VersionToolsTest(unittest.TestCase):
         new = bumped(self.version, "patch")
         requirement = self.requirement()
         self.bump(new)
-        self.assertEqual(
-            self.leftovers(self.version),
-            [],
-            "the bump left the old version behind: add each site to scripts/version_sites.py, "
-            "or reword a mention that is not a version pin",
-        )
+        self.assert_nothing_left()
         self.check_passes(new)
         self.assertEqual(self.requirement(), requirement, "a patch bump keeps the crabcrop-url requirement")
 
@@ -175,7 +179,7 @@ class VersionToolsTest(unittest.TestCase):
     def test_a_minor_bump_moves_the_crabcrop_url_requirement(self):
         new = bumped(self.version, "minor")
         self.bump(new)
-        self.assertEqual(self.leftovers(self.version), [])
+        self.assert_nothing_left()
         self.assertEqual(self.requirement(), new.rsplit(".", 1)[0])
         self.check_passes(new)
 
@@ -187,7 +191,7 @@ class VersionToolsTest(unittest.TestCase):
         new = f"{int(major) + 1}.{minor}.{patch}0"
         self.assertGreater(len(new), len(self.version))
         self.bump(new)
-        self.assertEqual(self.leftovers(self.version), [])
+        self.assert_nothing_left()
         self.assertEqual(self.requirement(), new.rsplit(".", 1)[0])
         self.check_passes(new)
 
