@@ -1128,7 +1128,9 @@ async fn shutdown_signal() {
 /// 3: the first release after 0.9.11, which changes output
 /// for existing URLs (interlaced PNG output from a 16-bit
 /// source writes its samples big-endian instead of
-/// byte-swapped #464).
+/// byte-swapped #464; focal forms carried through the
+/// geometry between their segment and the crop, and one
+/// trim window for every frame of an animation #465).
 const RENDERING_VERSION: u32 = 3;
 
 /// Fingerprint the configuration that shapes rendered
