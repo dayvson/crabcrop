@@ -70,7 +70,7 @@ jobs:
                 Cargo.lock|Cargo.toml|crates/*/Cargo.toml) tier=full ;;
                 src/engine.rs|src/engine/*|src/filters.rs|src/quality.rs) tier=full ;;
                 src/color.rs|src/crop.rs|src/heic.rs|src/svg.rs) tier=full ;;
-                src/text.rs|src/video.rs|src/studio.rs|src/ai.rs) tier=full ;;
+                src/text.rs|src/video.rs|src/studio.rs|src/ai/*) tier=full ;;
                 src/frames.rs|src/pdf.rs|src/loader.rs|src/url.rs) tier=full ;;
                 tests/functional/*) tier=full ;;
               esac

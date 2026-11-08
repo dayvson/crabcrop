@@ -189,6 +189,20 @@
    }
   ],
   "group": "sizing",
+  "id": "size-chained-overcap",
+  "ops": "16383x1/0x2",
+  "src": "dog.jpg",
+  "why": "a proportional side the engine works out past the per-axis cap (32766x2) is refused like a written one (#521)",
+  "tier": "full"
+ },
+ {
+  "assert": [
+   {
+    "eq": 400,
+    "t": "status"
+   }
+  ],
+  "group": "sizing",
   "id": "size-garbage",
   "ops": "abcx100",
   "src": "dog.jpg",

@@ -103,3 +103,7 @@ Rotation never invalidates a URL that is already in the wild, in three steps:
 3. **Close the window.** When the old key's URLs have aged out of your caches and pages (the result cache's `max-age` is one year, but in practice your own TTLs and page lifetimes govern), remove `CRABCROP_SECRET_PREVIOUS` and restart. From that moment the old secret verifies nothing: its remaining URLs answer `403`, which is the point of rotating.
 
 An unknown key ID is indistinguishable from a bad signature, by design: `403`, no hint about which IDs exist.
+
+### Diagnostics
+
+`CRABCROP_STUDIO_TIMING`, set to any value, prints the elapsed time of each `studio(...)` pipeline stage to stderr, one `[studio-timing] <stage>: <ms> ms` line per stage. It is a profiling aid, read once per process: responses, cache keys, and the configuration fingerprint are unchanged. Leave it unset in production.

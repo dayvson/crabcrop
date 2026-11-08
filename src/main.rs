@@ -1245,7 +1245,10 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// source writes its samples big-endian instead of
 /// byte-swapped #464; focal forms carried through the
 /// geometry between their segment and the crop, and one
-/// trim window for every frame of an animation #465).
+/// trim window for every frame of an animation #465; a
+/// step that works out a size past 16383 px on an axis,
+/// such as `16383x1/0x2`, refused instead of rendered
+/// #521).
 const RENDERING_VERSION: u32 = 3;
 
 /// Fingerprint the configuration that shapes rendered

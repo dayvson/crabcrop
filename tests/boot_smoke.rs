@@ -100,25 +100,25 @@ fn an_unknown_dash_argument_exits_with_an_error_and_never_serves() {
             .unwrap();
         let mut process = ServerGuard(child);
 
+        // No probe of `port` here: the other tests in this
+        // file run in parallel, each binding a port that
+        // free_port released, so a connection to `port` can
+        // reach another test's server and fail this one for
+        // nothing. A binary that served would never exit, so
+        // the deadline catches it, and a server would print
+        // its listening line, which the empty stdout below
+        // rules out.
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
             if let Some(status) = process.0.try_wait().unwrap() {
                 break status;
             }
             assert!(
-                TcpStream::connect(("127.0.0.1", port)).is_err(),
-                "`crabcrop {arg}` started a server on port {port}"
-            );
-            assert!(
                 Instant::now() < deadline,
-                "`crabcrop {arg}` neither exited nor served before the deadline"
+                "`crabcrop {arg}` did not exit before the deadline (it may be serving on port {port})"
             );
             std::thread::sleep(Duration::from_millis(50));
         };
-        assert!(
-            TcpStream::connect(("127.0.0.1", port)).is_err(),
-            "`crabcrop {arg}`: something is listening on port {port}"
-        );
         let mut stdout = String::new();
         let mut stderr = String::new();
         process
