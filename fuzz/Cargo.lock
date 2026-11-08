@@ -989,7 +989,7 @@ dependencies = [
  "kamadak-exif",
  "moxcms 0.9.1",
  "ort",
- "oxideav-h265 0.0.16",
+ "oxideav-h265",
  "oxideav-heif",
  "oxideav-webp",
  "png",
@@ -3046,15 +3046,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-h265"
-version = "0.0.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21827a9248a60d7901f49b92bb649328797ee5b99a054ee4b58fd39e5b77f331"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
 name = "oxideav-h266"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3073,7 +3064,7 @@ dependencies = [
  "oxideav-av1",
  "oxideav-core",
  "oxideav-h264",
- "oxideav-h265 0.0.17",
+ "oxideav-h265",
  "oxideav-h266",
 ]
 
