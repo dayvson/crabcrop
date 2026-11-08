@@ -978,6 +978,7 @@ dependencies = [
  "fast_image_resize",
  "fdeflate",
  "flate2",
+ "futures-util",
  "gif",
  "hex",
  "hmac",

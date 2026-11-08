@@ -12,6 +12,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The TypeScript SDK's `explainUrl` and `ops.cropObjects`, and the playground's explainer, fold repeated `objects(...)` class names ASCII-only, as the server does (issue #482). `É` and `é` (or `K` and the Kelvin sign) are two classes, so a list that reaches 33 distinct classes that way is now refused instead of passing the SDK and failing on the server with `400 invalid_crop`, and a shorter list keeps both spellings, as the server's canonical form does. The playground's explainer is now a generated build of the SDK's own, so its `studio(...)` description matches the SDK's.
 
+- Shared-tier purges are paced and coalesced (issue #462). A purge reads entry headers 16 at a time instead of one by one, purge requests share a budget of 32 reads in flight, and at most two background walks run at once. A purge whose target is already being walked joins that walk instead of listing the bucket again, and one re-list afterwards removes copies rendered in between. A walk that the bucket fails part way (a listing, read or delete with no answer) no longer ends its purge: the tombstone stays in force until a later purge of the same target completes a walk, and each failure counts in `crabcrop_cache_tier_errors_total`.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added
