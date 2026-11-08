@@ -73,7 +73,7 @@ The builders throw on operations or a source that can never verify: `?`, `#`, wh
 
 ## Typed operations
 
-The operation string is the spec, and passing it verbatim stays the primary API. For callers who would rather build it, `ops` and `filter` are typed builders that validate each argument against the server's grammar and return the canonical spelling, so the typed and hand-written forms sign byte-identical URLs (the test suite pins this against the canonical corpus). Numbers and names are canonical too: a decimal argument is spelled the way the server prints it, the shortest decimal that reads back as the same 32-bit float (`ops.focalPoint(0.1 + 0.2, 0.4, 2)` is `focalpoint:0.3x0.4:2`), and a class name is spelled trimmed (`ops.cropObjects(100, 100, [" person "])` is `crop:100x100:objects(person):1`). For example:
+The operation string is the spec, and passing it verbatim stays the primary API. For callers who would rather build it, `ops` and `filter` are typed builders that validate each argument against the server's grammar and return the canonical spelling, so the typed and hand-written forms sign byte-identical URLs (the test suite pins this against the canonical corpus). Numbers and names are canonical too: a decimal argument is spelled the way the server prints it, which for every parameter but the convolution kernel's 64-bit values is the shortest decimal that reads back as the same 32-bit float (`ops.focalPoint(0.1 + 0.2, 0.4, 2)` is `focalpoint:0.3x0.4:2`), and a class name is spelled trimmed (`ops.cropObjects(100, 100, [" person "])` is `crop:100x100:objects(person):1`). For example:
 
 ```ts
 import { buildURL, filter, joinOps, ops } from "@crabcrop/url";

@@ -362,7 +362,10 @@ export const ops = {
         names.push(encoded);
       }
     }
-    if (!Number.isFinite(scale) || scale <= 0 || scale > 100) {
+    // Checked as the f32 the server reads (as are zoom, blur
+    // and gamma below): a positive double that rounds to f32
+    // zero would otherwise be spelled `0`, which it refuses.
+    if (!Number.isFinite(scale) || Math.fround(scale) <= 0 || scale > 100) {
       fail("crop objects scale", scale, "a number above 0 and at most 100");
     }
     const box = pixelBox("crop", width, height);
@@ -401,7 +404,7 @@ export const ops = {
       }
       return v;
     };
-    if (!Number.isFinite(zoom) || zoom <= 0 || zoom > 100) {
+    if (!Number.isFinite(zoom) || Math.fround(zoom) <= 0 || zoom > 100) {
       fail("focalpoint zoom", zoom, "a number above 0 and at most 100");
     }
     return `focalpoint:${num(frac("focalpoint x", x))}x${num(frac("focalpoint y", y))}:${num(zoom)}`;
@@ -499,7 +502,8 @@ export const filter = {
 
   /** Gaussian blur by sigma: positive, at most the server's 512 cap. */
   blur(sigma: number): string {
-    if (!Number.isFinite(sigma) || sigma <= 0 || sigma > 512) {
+    // The server also refuses a subnormal f32 sigma.
+    if (!Number.isFinite(sigma) || Math.fround(sigma) < 2 ** -126 || sigma > 512) {
       fail("blur sigma", sigma, "a positive number up to 512");
     }
     return `blur(${num(sigma)})`;
@@ -518,7 +522,7 @@ export const filter = {
   },
   /** Gamma correction divisor: 0 < g <= 10 (1 unchanged; above 1 brightens midtones). */
   gamma(value: number): string {
-    if (!Number.isFinite(value) || value <= 0 || value > 10) {
+    if (!Number.isFinite(value) || Math.fround(value) <= 0 || value > 10) {
       fail("gamma", value, "a number above 0 and at most 10");
     }
     return `gamma(${num(value)})`;

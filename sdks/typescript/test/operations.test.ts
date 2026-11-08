@@ -287,6 +287,15 @@ test("decimal arguments spell the f32 the server prints (issue #472)", () => {
   // positive value below it reads as zero: both refused.
   assert.throws(() => filter.sharpen(1e39), /sharpen amount must be a positive number/);
   assert.throws(() => filter.sharpen(1e-50), /sharpen amount must be a positive number/);
+  // The other positive-only f32 arguments hold the same line,
+  // so no builder spells a value it accepted as `0` (and blur
+  // also refuses a subnormal f32 sigma, as the server does).
+  assert.throws(() => filter.blur(1e-50), /blur sigma/);
+  assert.throws(() => filter.blur(1e-40), /blur sigma/);
+  assert.equal(filter.blur(2 ** -126), `blur(${"0.".padEnd(39, "0")}11754944)`);
+  assert.throws(() => filter.gamma(1e-50), /gamma must be/);
+  assert.throws(() => ops.focalPoint(0.5, 0.5, 1e-50), /focalpoint zoom/);
+  assert.throws(() => ops.cropObjects(100, 100, ["dog"], 1e-50), /crop objects scale/);
 });
 
 test("class names spell trimmed, as the server keys them (issue #472)", () => {
