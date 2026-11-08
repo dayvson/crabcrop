@@ -247,3 +247,35 @@ fn aesthetic_head_rejects_a_storage_shorter_than_the_tensor() {
     let err = expect_load(AestheticHead::load(&path));
     assert!(err.contains("overruns its storage"), "{err}");
 }
+
+#[test]
+fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
+    // A shape whose element count overflows usize (issue
+    // #484) is a load error naming the overflow, never a
+    // multiply that panics (debug) or wraps to a small
+    // count (release) before the storage bound is checked.
+    let pkl = head_pickle(3, 1);
+    // The weight's size tuple (1, 3): BININT1 1, BININT2 3,
+    // TUPLE2. Swap in (2^32, 2^32) as two LONG1 values.
+    let size: &[u8] = b"K\x01M\x03\x00\x86";
+    let at: Vec<usize> = (0..pkl.len())
+        .filter(|&i| pkl[i..].starts_with(size))
+        .collect();
+    assert_eq!(at.len(), 1, "the size tuple is unique");
+    let huge = [0x8a, 5, 0, 0, 0, 0, 1];
+    let mut patched = pkl[..at[0]].to_vec();
+    patched.extend_from_slice(&huge);
+    patched.extend_from_slice(&huge);
+    patched.push(0x86);
+    patched.extend_from_slice(&pkl[at[0] + size.len()..]);
+    let archive = head_archive(
+        &patched,
+        &[
+            ("archive/data/0", &floats_bytes(&[0.5, -0.25, 2.0])),
+            ("archive/data/1", &floats_bytes(&[0.75])),
+        ],
+    );
+    let path = temp_file("head-size-overflow", &archive);
+    let err = expect_load(AestheticHead::load(&path));
+    assert!(err.contains("the tensor size overflows"), "{err}");
+}

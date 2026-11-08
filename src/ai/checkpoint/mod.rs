@@ -64,7 +64,14 @@ pub(super) fn parse_aesthetic_head(bytes: &[u8]) -> Result<(Vec<f32>, f32), Stri
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect();
-        let count = tensor.size.iter().product::<usize>();
+        // The shape is file data: an unchecked product
+        // would panic in a debug build and wrap to a small
+        // count in a release one.
+        let count = tensor
+            .size
+            .iter()
+            .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+            .ok_or("the tensor size overflows")?;
         let end = tensor
             .offset
             .checked_add(count)
