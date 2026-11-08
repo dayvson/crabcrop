@@ -41,11 +41,30 @@ fn main() {
     if crabcrop::svg::is_worker_invocation() {
         std::process::exit(crabcrop::svg::worker_main());
     }
-    start();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("crabcrop: cannot start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    // A server that has drained (issue #463) stops its
+    // runtime by the drain's deadline: blocking work nothing
+    // tracks, such as a disk write whose request went or a
+    // render past the grace, gets what is left of the grace
+    // and is then left behind. Dropping the runtime would
+    // wait for that work without bound, past the deadline.
+    if let Some(deadline) = runtime.block_on(start()) {
+        runtime.shutdown_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
 }
 
-#[tokio::main]
-async fn start() {
+/// Run a CLI verb, or the server. For the server, returns
+/// the deadline by which its runtime must stop.
+async fn start() -> Option<std::time::Instant> {
     // CLI verbs run instead of the server when the first
     // argument names one, and only a bare `crabcrop` starts
     // the server, which reads the environment and takes no
@@ -73,7 +92,7 @@ async fn start() {
                 std::process::exit(1);
             }
         }
-        return;
+        return None;
     }
     // The server parses and renders every SVG in a worker
     // started from its own binary (issue #447).
@@ -84,16 +103,13 @@ async fn start() {
             std::process::exit(1);
         }
     }
-    if let Err(e) = run().await {
-        eprintln!("crabcrop: {e}");
-        std::process::exit(1);
+    match run().await {
+        Ok(deadline) => Some(deadline),
+        Err(e) => {
+            eprintln!("crabcrop: {e}");
+            std::process::exit(1);
+        }
     }
-    // The drain is over (issue #463). Exit here rather than
-    // in the runtime's drop, which waits without bound for
-    // blocking work still running, such as a render past
-    // the grace or a disk write, and would hold the process
-    // past the deadline the drain just kept.
-    std::process::exit(0);
 }
 
 /// Load the preset configuration: the presets file (one
@@ -806,7 +822,7 @@ fn build_upload_store(
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let keyring = build_keyring(|name| env::var(name).ok())?;
     let allow_unsafe = parse_bool("CRABCROP_ALLOW_UNSAFE", false)?;
     // CRABCROP_PORT is the namespaced alias for PORT and
@@ -1113,6 +1129,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the first request (issue #461).
     crate::server::start_purge_tombstones(&state).await;
     let background = state.background.clone();
+    let signalled = shutdown_signal();
     println!("crabcrop listening on port {port}");
     // Shutdown (issue #463): at SIGTERM or Ctrl-C the
     // listener closes, idle connections close, and requests
@@ -1121,61 +1138,85 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // purges whose caller left) finish. One deadline, the
     // grace from the signal on, bounds both waits, and the
     // process exits at it with whatever is still running.
+    // A second signal ends the drain at once.
     let stop = tokio_util::sync::CancellationToken::new();
     let mut serve = axum::serve(listener, app(state))
         .with_graceful_shutdown(stop.clone().cancelled_owned())
         .into_future();
     tokio::select! {
-        served = &mut serve => return served.map_err(Into::into),
-        () = shutdown_signal() => stop.cancel(),
+        served = &mut serve => {
+            served?;
+            return Ok(std::time::Instant::now());
+        }
+        () = signalled => stop.cancel(),
     }
     let deadline = tokio::time::Instant::now() + shutdown_grace;
+    let signalled_again = shutdown_signal();
     println!(
         "shutdown: draining requests and background writes for up to {}s",
         shutdown_grace.as_secs()
     );
-    match tokio::time::timeout_at(deadline, serve).await {
-        Ok(served) => served?,
-        Err(_) => eprintln!("shutdown: requests still in flight at the deadline are cut off"),
-    }
-    let left = background.drain(deadline).await;
+    let drain = async {
+        match tokio::time::timeout_at(deadline, serve).await {
+            Ok(served) => served?,
+            Err(_) => eprintln!("shutdown: requests still in flight at the deadline are cut off"),
+        }
+        Ok::<_, std::io::Error>(background.drain(deadline).await)
+    };
+    // The runtime stops by `stop_by`: the deadline after a
+    // drain, at once after a second signal.
+    let (left, when, stop_by) = tokio::select! {
+        left = drain => (left?, "at the deadline", deadline.into_std()),
+        () = signalled_again => {
+            eprintln!("shutdown: a second signal ends the drain; what is still running is cut off");
+            (background.running(), "at the second signal", std::time::Instant::now())
+        }
+    };
     if left.writes > 0 {
         eprintln!(
-            "shutdown: {} background writes still running at the deadline are dropped",
+            "shutdown: {} background writes still running {when} are dropped",
             left.writes
         );
     }
     if left.walks > 0 {
-        // A walk cut short leaves its purge's tombstone in
-        // force (issue #461): copies it covers stay misses
-        // until a later purge of the target finishes its walk.
+        // A walk cut short leaves its purge's bucket
+        // tombstone in force (issue #461): copies it covers
+        // stay misses until a later purge of the target
+        // finishes its walk. A purge whose tombstone the
+        // bucket refused held in this process only.
         println!(
-            "shutdown: stopping {} background purge walks; their tombstones keep the purges in force",
+            "shutdown: stopping {} background purge walks; a purge whose tombstone reached the bucket stays in force",
             left.walks
         );
     }
     println!("shutdown: done");
-    Ok(())
+    Ok(stop_by)
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
+/// Resolves at the next SIGTERM or Ctrl-C. The handlers
+/// are installed when this is called, not when it is first
+/// polled, so a signal that arrives in between still counts;
+/// a signal from before the call does not.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt()).expect("install Ctrl-C handler");
+    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+}
+
+/// SIGTERM or Ctrl-C, as for unix; only Ctrl-C elsewhere.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
         tokio::signal::ctrl_c()
             .await
             .expect("install Ctrl-C handler");
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
     }
 }
 

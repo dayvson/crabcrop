@@ -746,11 +746,13 @@ fn wait_for_line(lines: &std::sync::mpsc::Receiver<String>, needle: &str) -> Str
 /// Send SIGTERM to the server, as a platform stopping it does.
 #[cfg(unix)]
 fn terminate(server: &ServerGuard) {
-    rustix::process::kill_process(
-        rustix::process::Pid::from_child(&server.0),
-        rustix::process::Signal::TERM,
-    )
-    .unwrap();
+    signal(server, rustix::process::Signal::TERM);
+}
+
+/// Send `sig` to the server.
+#[cfg(unix)]
+fn signal(server: &ServerGuard, sig: rustix::process::Signal) {
+    rustix::process::kill_process(rustix::process::Pid::from_child(&server.0), sig).unwrap();
 }
 
 /// Wait for the server to exit; its status and stderr.
@@ -896,4 +898,35 @@ fn sigterm_cuts_off_a_hung_request_at_the_grace() {
         "{stderr}"
     );
     wait_for_line(&lines, "shutdown: done");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_second_signal_ends_the_drain_at_once() {
+    // Issue #463 review: the signal handlers stay installed
+    // once the drain starts, so with a long grace a second
+    // Ctrl-C did nothing and only SIGKILL stopped the server.
+    // Now a second signal abandons the drain.
+    let bucket = SlowBucket::start();
+    let (mut server, lines) = serving_with_a_held_put(&bucket, 120);
+    terminate(&server);
+    wait_for_line(&lines, "shutdown: draining");
+    let signalled = Instant::now();
+    signal(&server, rustix::process::Signal::INT);
+    let (status, stderr) = exit_of(&mut server, Duration::from_secs(60));
+    let took = signalled.elapsed();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    // Well inside the grace, and before the S3 client's own
+    // 10 s request timeout could end the held write.
+    assert!(took < Duration::from_secs(5), "exited {took:?} after it");
+    assert!(
+        stderr.contains("shutdown: a second signal ends the drain"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("1 background writes still running"),
+        "{stderr}"
+    );
+    assert_eq!(bucket.answered.load(std::sync::atomic::Ordering::SeqCst), 0);
+    bucket.let_puts_through();
 }
