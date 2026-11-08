@@ -13985,6 +13985,29 @@ async fn computed_sizes_past_max_dimension_answer_400() {
     assert_eq!((img.width(), img.height()), (16383, 3));
 }
 
+/// A width hint on a source at the 16384 px decode ceiling
+/// answers what the URL answers without it (issue #521):
+/// the hint's `Wx0` op is held at the source by its
+/// `no_upscale`, so it keeps the size it started from and
+/// works nothing out. The first cut of the per-axis check
+/// refused it, turning an advisory hint into a 400.
+#[tokio::test]
+async fn a_width_hint_passes_a_decode_ceiling_source_through() {
+    let src = spawn_bytes_server(png_of(1, 16384)).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("filters:format(png)/{src}");
+    for hints in [
+        &[][..],
+        &[("Sec-CH-Width", "400")][..],
+        &[("Width", "3840"), ("Sec-CH-DPR", "2")][..],
+    ] {
+        let resp = get_with_headers(&base, &remainder, hints).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{hints:?}");
+        let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!((img.width(), img.height()), (1, 16384), "{hints:?}");
+    }
+}
+
 #[test]
 fn negotiation_honors_q_values() {
     use crate::url::ImageFormat::{Avif, Jxl, WebP};

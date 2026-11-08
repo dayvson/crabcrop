@@ -507,9 +507,17 @@ fn check_output_pixels(width: u32, height: u32) -> Result<(), EngineError> {
 /// for 32766x2, which WebP cannot encode. The step
 /// is refused, as a written side past the limit is, rather
 /// than clamped to a size nobody asked for.
-fn check_output_size(width: u32, height: u32) -> Result<(), EngineError> {
+///
+/// `input` is the size the step starts from. A step that
+/// ends at that same size works nothing out (`0x0`,
+/// `fit-in:0x0`, `rotate(180)`, a width hint or `no_upscale`
+/// held at the source), so it is held to the budget only: a
+/// source at the 16384 px decode ceiling passes through it
+/// as decoded, as it passes through a chain with no sizing
+/// step at all.
+fn check_output_size(width: u32, height: u32, input: (u32, u32)) -> Result<(), EngineError> {
     let max = crate::url::MAX_DIMENSION;
-    if width > max || height > max {
+    if (width, height) != input && (width > max || height > max) {
         return Err(EngineError::Unsupported(format!(
             "requested output {width}x{height} exceeds the {max} pixel limit per axis"
         )));
@@ -3429,6 +3437,17 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 ));
             }
         };
+        // The resize that closes the crop lands on this size
+        // (the same `no_upscale` fit as below): refuse one past
+        // the limit here, before any detection or saliency
+        // pass runs on a crop that cannot be served (issue
+        // #521). A target that keeps the image in hand as it
+        // is passes, like any step that keeps its size.
+        let target = match self.cap {
+            Some(cap) => cap_dimensions(tw, th, cap),
+            None => (tw, th),
+        };
+        check_output_size(target.0, target.1, (img.width(), img.height()))?;
         // The crop consumes any pending focal form, mapped
         // onto the image in hand by the steps since its
         // segment (issue #465). Center and smart crops
@@ -3977,7 +3996,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // per axis too (issue #521).
         if let Filter::Rotate(degrees) = filter {
             let (cw, ch) = crate::filters::rotated_canvas(img.width(), img.height(), *degrees);
-            check_output_size(cw, ch)?;
+            check_output_size(cw, ch, (img.width(), img.height()))?;
         }
         let (new_img, options) = crate::filters::apply_filters_filled(
             img,
@@ -4125,7 +4144,7 @@ fn clamp_raster(w: u32, h: u32) -> (u32, u32) {
 /// operation's target (DPR-scaled, resolved against the
 /// intrinsic size exactly as the pipeline will resolve it), or
 /// the intrinsic size when the request asks for none.
-fn svg_raster_target(ops: &[Operation], intrinsic: (f32, f32), dpr: f32) -> (u32, u32) {
+pub(crate) fn svg_raster_target(ops: &[Operation], intrinsic: (f32, f32), dpr: f32) -> (u32, u32) {
     let (iw, ih) = (
         (intrinsic.0.round() as u32).max(1),
         (intrinsic.1.round() as u32).max(1),
@@ -4137,9 +4156,7 @@ fn svg_raster_target(ops: &[Operation], intrinsic: (f32, f32), dpr: f32) -> (u32
                     Dimension::Pixels(n) => scale_px(n, dpr),
                     Dimension::Original => iw,
                     Dimension::Proportional => match size.height {
-                        Dimension::Pixels(h) => {
-                            ((iw as u64 * scale_px(h, dpr) as u64) / ih as u64).max(1) as u32
-                        }
+                        Dimension::Pixels(h) => proportional_side(iw, scale_px(h, dpr), ih),
                         _ => iw,
                     },
                 };
@@ -4147,9 +4164,7 @@ fn svg_raster_target(ops: &[Operation], intrinsic: (f32, f32), dpr: f32) -> (u32
                     Dimension::Pixels(n) => scale_px(n, dpr),
                     Dimension::Original => ih,
                     Dimension::Proportional => match size.width {
-                        Dimension::Pixels(w) => {
-                            ((ih as u64 * scale_px(w, dpr) as u64) / iw as u64).max(1) as u32
-                        }
+                        Dimension::Pixels(w) => proportional_side(ih, scale_px(w, dpr), iw),
                         _ => ih,
                     },
                 };
@@ -4442,7 +4457,7 @@ fn flatten(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
 
 /// Shrink `(w, h)` proportionally to fit inside `cap`. Never
 /// grows the size.
-fn cap_dimensions(w: u32, h: u32, (cw, ch): (u32, u32)) -> (u32, u32) {
+pub(crate) fn cap_dimensions(w: u32, h: u32, (cw, ch): (u32, u32)) -> (u32, u32) {
     if w <= cw && h <= ch {
         return (w, h);
     }
@@ -4548,6 +4563,15 @@ fn check_nonzero_size(size: &ImageSize) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// `side * to / from`: the proportional side of a resize
+/// following the other side from `from` to `to`, floored and
+/// never below 1. A quotient past `u32` saturates rather than
+/// wraps, so the per-axis check always sees it (issue #521).
+fn proportional_side(side: u32, to: u32, from: u32) -> u32 {
+    let q = (side as u64 * to as u64) / from.max(1) as u64;
+    u32::try_from(q).unwrap_or(u32::MAX).max(1)
+}
+
 fn apply_size_windowed(
     img: DynamicImage,
     size: &ImageSize,
@@ -4570,7 +4594,7 @@ fn apply_size_windowed(
         Dimension::Pixels(n) => n,
         Dimension::Original => sw,
         Dimension::Proportional => match size.height {
-            Dimension::Pixels(h) => ((sw as u64 * h as u64) / sh as u64).max(1) as u32,
+            Dimension::Pixels(h) => proportional_side(sw, h, sh),
             _ => sw,
         },
     };
@@ -4578,7 +4602,7 @@ fn apply_size_windowed(
         Dimension::Pixels(n) => n,
         Dimension::Original => sh,
         Dimension::Proportional => match size.width {
-            Dimension::Pixels(w) => ((sh as u64 * w as u64) / sw as u64).max(1) as u32,
+            Dimension::Pixels(w) => proportional_side(sh, w, sw),
             _ => sh,
         },
     };
@@ -4587,7 +4611,7 @@ fn apply_size_windowed(
         Some(SizeCap::Fit(cw, ch)) => cap_dimensions(w, h, (cw, ch)),
         None => (w, h),
     };
-    check_output_size(w, h)?;
+    check_output_size(w, h, (sw, sh))?;
     let mut img = if w == sw && h == sh {
         match window {
             // No resample runs: the two-step path returns
@@ -4719,7 +4743,7 @@ fn apply_pad(
         let whole = (0, 0, img.width(), img.height());
         return Ok((img, whole));
     }
-    check_output_size(target_w, target_h)?;
+    check_output_size(target_w, target_h, (img.width(), img.height()))?;
     let fitted = apply_fit_in(
         img.clone(),
         &ImageSize {
@@ -4839,7 +4863,7 @@ fn apply_fit_in(
         Some(c) => cap_dimensions(w, h, c),
         None => (w, h),
     };
-    check_output_size(w, h)?;
+    check_output_size(w, h, (sw, sh))?;
     if w == sw && h == sh {
         Ok(img)
     } else {

@@ -3638,19 +3638,27 @@ fn computed_sizes_at_max_dimension_still_render() {
 #[test]
 fn check_output_size_bounds_each_axis_then_the_budget() {
     let max = crate::url::MAX_DIMENSION;
-    assert!(check_output_size(max, 1).is_ok());
-    assert!(check_output_size(1, max).is_ok());
+    let input = (64, 48);
+    assert!(check_output_size(max, 1, input).is_ok());
+    assert!(check_output_size(1, max, input).is_ok());
     for (w, h) in [(max + 1, 1), (1, max + 1), (u32::MAX, u32::MAX)] {
-        let err = check_output_size(w, h).unwrap_err();
+        let err = check_output_size(w, h, input).unwrap_err();
         assert!(err.to_string().contains("pixel limit per axis"), "{err}");
     }
     // Inside the per-axis limit, the pixel budget still
     // applies: 16383 x 6104 is just past 100 million.
-    let err = check_output_size(max, 6104).unwrap_err();
+    let err = check_output_size(max, 6104, input).unwrap_err();
     assert_eq!(
         err.to_string(),
         "unsupported operation: requested output 16383x6104 exceeds the 100000000 pixel limit"
     );
+    // A step that keeps the size it started from works
+    // nothing out: a 16384 px side the decoder admitted
+    // passes the per-axis check, but never the budget.
+    assert!(check_output_size(max + 1, 2, (max + 1, 2)).is_ok());
+    assert!(check_output_size(2, max + 1, (max + 1, 2)).is_err());
+    let err = check_output_size(max + 1, 8000, (max + 1, 8000)).unwrap_err();
+    assert!(err.to_string().ends_with("100000000 pixel limit"), "{err}");
 }
 
 #[test]
@@ -3666,12 +3674,99 @@ fn rotate_canvas_is_checked_per_axis() {
     let ctx = ProcessContext::default();
     let (cw, ch) = crate::filters::rotated_canvas(16_383, 1000, 3.5);
     assert!(cw > crate::url::MAX_DIMENSION && (cw as u64 * ch as u64) < MAX_OUTPUT_PIXELS);
-    let err = apply_operations(img, &ops, None, 1.0, &ctx, &directives, None).unwrap_err();
+    // A match, not unwrap_err: on a regression the Ok value
+    // is a 16414x1999 image, and its Debug form would flood
+    // the test log.
+    let err = match apply_operations(img, &ops, None, 1.0, &ctx, &directives, None) {
+        Err(err) => err,
+        Ok((out, ..)) => panic!("rotated to {}x{}", out.width(), out.height()),
+    };
     assert_eq!(
         err.to_string(),
         format!(
             "unsupported operation: requested output {cw}x{ch} exceeds the 16383 pixel limit per axis"
         )
+    );
+}
+
+/// Run `remainder` (operations only) over `img` through
+/// [`apply_operations`] with the `no_upscale` cap and DPR the
+/// request asks for, and report the output size or the
+/// refusal.
+fn chain_dims(img: DynamicImage, remainder: &str) -> Result<(u32, u32), EngineError> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let cap = directives.no_upscale.then_some((img.width(), img.height()));
+    let ctx = ProcessContext::default();
+    let dpr = directives.dpr.unwrap_or(1.0);
+    apply_operations(img, &ops, cap, dpr, &ctx, &directives, None)
+        .map(|(out, ..)| (out.width(), out.height()))
+}
+
+#[test]
+fn steps_that_keep_the_size_pass_a_decode_ceiling_source() {
+    // A source decodes at up to 16384 px per axis, one past
+    // the output limit. A step that keeps the size it starts
+    // from works nothing out and passes, as a chain with no
+    // sizing step does; a step that changes the size is held
+    // to the limit (issue #521). Before this, `0x0` and
+    // `rotate(180)` were refused while `fit-in:0x0` passed,
+    // and a width hint (`400x0` plus `no_upscale`, held at
+    // the source) refused a source that renders without it.
+    let ceiling = |w, h| DynamicImage::ImageLuma8(image::GrayImage::new(w, h));
+    for remainder in [
+        "0x0",
+        "origxorig",
+        "fit-in:0x0",
+        "filters:rotate(0)",
+        "filters:rotate(180)",
+        "filters:grayscale",
+        "0x4/filters:no_upscale",
+        "fit-in:0x4/filters:no_upscale",
+        // The crop's window is the whole image.
+        "crop:8192x1/filters:dpr(2)",
+    ] {
+        assert_eq!(
+            chain_dims(ceiling(16_384, 2), remainder).map_err(|e| e.to_string()),
+            Ok((16_384, 2)),
+            "{remainder}"
+        );
+    }
+    // The width hint's synthesized op on a tall source.
+    assert_eq!(
+        chain_dims(ceiling(1, 16_384), "400x0/filters:no_upscale").map_err(|e| e.to_string()),
+        Ok((1, 16_384))
+    );
+    for (img, remainder, refused) in [
+        (ceiling(16_384, 2), "origx1", "16384x1"),
+        (ceiling(16_384, 2), "filters:rotate(90)", "2x16384"),
+        (ceiling(16_384, 4), "crop:8192x1/filters:dpr(2)", "16384x2"),
+        (ceiling(8_192, 1), "0x2", "16384x2"),
+    ] {
+        let err = chain_dims(img, remainder).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported operation: requested output {refused} exceeds the 16383 pixel limit per axis"
+            ),
+            "{remainder}"
+        );
+    }
+}
+
+#[test]
+fn a_crop_past_the_limit_is_refused_before_detection() {
+    // The crop's target is checked before the crop analysis
+    // runs (issue #521): with no detection provider, an
+    // objects crop inside the limit fails on the missing
+    // provider, and one past it fails on its size first.
+    let img = || DynamicImage::ImageLuma8(image::GrayImage::new(64, 48));
+    let err = chain_dims(img(), "crop:100x10:objects(dog)").unwrap_err();
+    assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+    let err = chain_dims(img(), "crop:12000x10:objects(dog)/filters:dpr(2)").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 24000x20 exceeds the 16383 pixel limit per axis"
     );
 }
 
