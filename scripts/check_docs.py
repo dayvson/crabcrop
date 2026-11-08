@@ -19,7 +19,8 @@ src/ outside its #[cfg(test)] modules; test code is those modules plus tests/.
   codes      Every (StatusCode, "code") pair server code builds has a row in
              docs/responses.md with that status, and every row's code is
              built unless it is RESERVED. The parser's codes
-             (ParseError::code in src/url.rs) are the documented grammar list.
+             (ParseError::code in src/url.rs) are the documented grammar list,
+             except one the code table already documents as a 400.
   statuses   The statuses table lists exactly the statuses the codes use.
   filters    Every filter parse_filters accepts has a row in a Filter or
              Directive table of docs/filters.md, or a `filters:<name>(`
@@ -131,8 +132,10 @@ ENV_CALL = re.compile(r'env::var(?:_os)?\(\s*"([A-Z][A-Z0-9_]*)"\s*\)')
 ENV_TOKEN = re.compile(r"\bCRABCROP_[A-Z0-9_]*[A-Z0-9]\b")
 STATUS_PAIR = re.compile(r'StatusCode::([A-Z_]+)\s*,\s*"([a-z][a-z0-9_]*)"')
 TICKED = re.compile(r"`([^`]+)`")
+# `#[cfg(test)]`, or `#[cfg(all(test, ...))]` as src/toolrun.rs gates its tests.
 CFG_TEST_MOD = re.compile(
-    r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])"
+    r"#\[cfg\((?:test|all\(\s*test\s*,[^\]]*\))\)\]\s*(?:#\[[^\]]*\]\s*)*"
+    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])"
 )
 
 # A default the check can judge is a literal or a constant's path; anything
@@ -567,14 +570,20 @@ def check_codes(root, sources):
         )
     for code in sorted(RESERVED - set(rows)):
         problems.append(f"RESERVED lists {code}, which {RESPONSES} does not document: remove it")
-    for code in sorted(parser - grammar):
+    # A parser code that the server also builds (unsupported_operation once the
+    # parser caps the operation count) is documented by its table row, which
+    # must then say 400, the status of every grammar failure.
+    for code in sorted(parser - grammar - set(rows)):
         problems.append(f"parser code {code} is missing from the grammar list in {RESPONSES}")
+    for code in sorted(parser & set(rows)):
+        if rows[code] != 400:
+            problems.append(
+                f"parser code {code} answers 400, but {RESPONSES} documents it as {rows[code]}"
+            )
     for code in sorted(grammar - parser):
         problems.append(
             f"{RESPONSES} lists {code} as a grammar failure, which the parser never returns"
         )
-    for code in sorted(grammar & set(rows)):
-        problems.append(f"{RESPONSES} lists {code} both as a grammar failure and in the code table")
     return problems
 
 

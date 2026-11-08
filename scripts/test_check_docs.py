@@ -308,6 +308,20 @@ class TreeChecks(unittest.TestCase):
         )
         self.assertOnly("env", "documents CRABCROP_ONLY_IN_A_TEST, which no server code reads")
 
+    def test_env_variable_read_only_by_a_cfg_all_test_module_is_not_read(self):
+        # src/toolrun.rs gates its tests on #[cfg(all(test, unix))].
+        self.write(
+            "src/toolrun.rs",
+            "#[cfg(all(test, unix))]\nmod tests {\n"
+            '    const X: &str = "CRABCROP_ONLY_IN_A_UNIX_TEST";\n}\n',
+        )
+        self.edit(
+            "docs/configuration.md",
+            "| `PORT`",
+            "| `CRABCROP_ONLY_IN_A_UNIX_TEST` | unset | No. |\n| `PORT`",
+        )
+        self.assertOnly("env", "documents CRABCROP_ONLY_IN_A_UNIX_TEST, which no server code reads")
+
     def test_env_code_after_a_test_module_is_server_code(self):
         # The braces inside the module's strings, comment and char literal
         # must not end it early or late: CRABCROP_LATE, read after it, counts.
@@ -474,6 +488,41 @@ class TreeChecks(unittest.TestCase):
                 "docs/responses.md lists invalid_gone as a grammar failure, which the parser never returns",
             ),
             problems,
+        )
+
+    def test_codes_parser_code_the_table_documents_as_a_400(self):
+        # A parser code the server also builds, as a 400, is documented by
+        # its table row; the grammar list may name it too.
+        self.edit("src/server.rs", "StatusCode::SERVICE_UNAVAILABLE", "StatusCode::BAD_REQUEST")
+        self.edit("docs/responses.md", "| `server_busy` | `503` |", "| `server_busy` | `400` |")
+        self.edit("docs/responses.md", "| `503` | Shed. |\n", "")
+        self.edit(
+            "src/url.rs",
+            '=> "invalid_size",',
+            '=> "invalid_size",\n            ParseError::TooMany(_) => "server_busy",',
+        )
+        self.assertEqual(self.problems(), [])
+        self.edit(
+            "docs/responses.md",
+            "`empty_path`, `invalid_size`",
+            "`empty_path`, `invalid_size`, `server_busy`",
+        )
+        self.assertEqual(self.problems(), [])
+
+    def test_codes_parser_code_the_table_documents_with_another_status(self):
+        self.edit(
+            "src/url.rs",
+            '=> "invalid_size",',
+            '=> "invalid_size",\n            ParseError::TooMany(_) => "server_busy",',
+        )
+        self.edit(
+            "docs/responses.md",
+            "`empty_path`, `invalid_size`",
+            "`empty_path`, `invalid_size`, `server_busy`",
+        )
+        self.assertOnly(
+            "codes",
+            "parser code server_busy answers 400, but docs/responses.md documents it as 503",
         )
 
     def test_codes_listed_twice(self):
