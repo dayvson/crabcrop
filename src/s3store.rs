@@ -329,8 +329,9 @@ impl S3Store {
     /// #446): a copy a lookup found purged is removed, but a
     /// fresh render that replaced it since is left alone.
     /// Without an ETag the delete is unconditional. A store
-    /// that ignores the precondition deletes unconditionally,
-    /// the behavior before it.
+    /// that ignores the precondition, or refuses it as not
+    /// implemented, deletes unconditionally, the behavior
+    /// before it.
     pub async fn remove_if_match(&self, key: &str, etag: Option<&str>) {
         let object = self.object_key(&key_stem(key));
         self.delete_object_if_match(&object, etag).await;
@@ -569,6 +570,20 @@ impl S3Store {
             .request_h("DELETE", object, &[], Vec::new(), &headers)
             .await
         {
+            // A store without conditional deletes may refuse
+            // the precondition outright instead of ignoring
+            // it. The caller has just read this copy and
+            // found it purged, so delete it as before
+            // preconditions were sent; otherwise no purge
+            // could remove anything from such a store.
+            Some(resp)
+                if etag.is_some() && resp.status() == reqwest::StatusCode::NOT_IMPLEMENTED =>
+            {
+                match self.request("DELETE", object, &[], Vec::new()).await {
+                    Some(resp) => resp.status().is_success(),
+                    None => false,
+                }
+            }
             Some(resp) => resp.status().is_success(),
             None => false,
         }
@@ -974,6 +989,9 @@ pub(crate) mod test_support {
         pub put: bool,
         pub delete: bool,
         pub list: bool,
+        /// Answer a conditional DELETE with 501, as a store
+        /// without conditional deletes may.
+        pub if_match_delete: bool,
     }
 
     /// A minimal in-process S3: PUT/GET/DELETE plus
@@ -1320,6 +1338,9 @@ pub(crate) mod test_support {
                 None => ("404 Not Found".into(), Vec::new(), String::new()),
             },
             ("DELETE", _) if fail.delete => error,
+            ("DELETE", _) if fail.if_match_delete && if_match.is_some() => {
+                ("501 Not Implemented".into(), Vec::new(), String::new())
+            }
             ("DELETE", _) => {
                 let mut objects = objects.lock().unwrap();
                 match (if_match, objects.get(&key)) {
@@ -1623,6 +1644,38 @@ mod tests {
         let (_, etag) = s.get_tagged("k").await.unwrap();
         s.remove_if_match("k", etag.as_deref()).await;
         assert!(s.get("k").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_store_that_refuses_conditional_deletes_still_purges() {
+        // A store without conditional deletes may answer an
+        // If-Match DELETE with 501 instead of ignoring the
+        // header. Purges must still remove the copies they
+        // found purged, in the walk and on sight, or nothing
+        // would ever leave such a store.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        fake.fail.lock().unwrap().if_match_delete = true;
+        let cutoff = hero_cutoff();
+        s.put("old", &stamped(b"1", &["hero"], &cutoff, -1)).await;
+        s.put("fresh", &stamped(b"2", &["hero"], &cutoff, 1)).await;
+        let hero = PurgeTarget::Group("hero".into());
+        let (removed, pending) = s.purge_bounded(&hero, None, cutoff, 128).await;
+        assert_eq!(removed, 1);
+        assert!(pending.is_none());
+        assert!(s.get("old").await.is_none());
+        assert!(s.get("fresh").await.is_some());
+        s.put("k", &image(b"one", &[])).await;
+        let (_, etag) = s.get_tagged("k").await.unwrap();
+        s.remove_if_match("k", etag.as_deref()).await;
+        assert!(s.get("k").await.is_none());
+        // Each removal was tried with the precondition first.
+        let requests = fake.requests.lock().unwrap().clone();
+        let conditional = requests
+            .iter()
+            .filter(|r| r.starts_with("DELETE") && r.ends_with(" if-match"))
+            .count();
+        assert_eq!(conditional, 2, "{requests:?}");
     }
 
     fn tombstone_for(group: &str, cutoff: PurgeCutoff, ended_ms: Option<u64>) -> Tombstone {
