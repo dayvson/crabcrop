@@ -30,6 +30,8 @@ both SDKs must all pass.
   `studio.rs`. A large module keeps its unit tests in
   `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
   `server.rs`, `engine.rs` and the files under `ai/` do.
+  `config.rs` belongs to the binary: it reads and validates the
+  configuration that `main.rs` builds the server from.
 - `crates/crabcrop-url`: the client-side library: signing, sealing,
   verification, and URL building. It does not parse operations; the
   server's parser is `src/url.rs`.

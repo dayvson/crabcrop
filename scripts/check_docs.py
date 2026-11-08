@@ -11,8 +11,10 @@ src/ outside its #[cfg(test)] modules; test code is those modules plus tests/.
              Test variables (CRABCROP_TEST_*) stay out of the docs, and the
              operator CLI's variables (CLI_ENV) are documented on their own
              page. The other variables server code reads by name (PORT, AWS_*,
-             ORT_DYLIB_PATH) are named somewhere in README.md or docs/, and
-             every CRABCROP_* name those pages mention is read.
+             ORT_DYLIB_PATH), through env::var or the injected get(...) lookup
+             the boot configuration reads through, are named somewhere in
+             README.md or docs/, and every CRABCROP_* name those pages mention
+             is read.
   defaults   Where parse_env, parse_env_value, parse_bool or parse_bool_value
              takes a literal default, or a constant defined as one, the
              configuration table's Default column says the same.
@@ -126,6 +128,10 @@ STATUS_NUMBERS = {
 ENV_LITERAL = re.compile(r'"(CRABCROP_[A-Z0-9_]+)"')
 AWS_LITERAL = re.compile(r'"(AWS_[A-Z0-9_]+)"')
 ENV_CALL = re.compile(r'env::var(?:_os)?\(\s*"([A-Z][A-Z0-9_]*)"\s*\)')
+# The boot configuration (src/config.rs, issue #477) reads every variable
+# through an injected lookup, `get("NAME")`: a bare call, where `.get("DPR")`
+# on a header map or a table is not a variable.
+GET_CALL = re.compile(r'(?<![.\w])get\(\s*"([A-Z][A-Z0-9_]*)"\s*\)')
 ENV_TOKEN = re.compile(r"\bCRABCROP_[A-Z0-9_]*[A-Z0-9]\b")
 STATUS_PAIR = re.compile(r'StatusCode::([A-Z_]+)\s*,\s*"([a-z][a-z0-9_]*)"')
 TICKED = re.compile(r"`([^`]+)`")
@@ -354,7 +360,12 @@ def read_env(sources):
     if not own:
         raise CheckError("found no CRABCROP_* name in server code")
     other = set(AWS_LITERAL.findall(code))
-    other.update(n for n in ENV_CALL.findall(code) if not n.startswith("CRABCROP_"))
+    other.update(
+        n
+        for pattern in (ENV_CALL, GET_CALL)
+        for n in pattern.findall(code)
+        if not n.startswith("CRABCROP_")
+    )
     return own, other
 
 

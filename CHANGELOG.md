@@ -12,6 +12,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The boot line `crabcrop listening on port N` names the port the server bound (issue #536). It printed the configured port, so `PORT=0`, which binds a free port, printed port 0; it now prints the port the system picked. For a fixed port the line is unchanged.
 
+- In the library target, `cli::exec` and `cli::convert_thumbor` return a typed `cli::CliError` instead of a `String`, whose `Display` is the old message, and boot checks every setting before it binds the port, opens a store, or loads a model, so a bad setting is reported ahead of a model, font, tool, or store that would also fail (issue #477).
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
