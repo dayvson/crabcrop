@@ -9914,7 +9914,23 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
         worst, 1,
         "live jobs must never exceed the lane permit count; log: {log}"
     );
-    assert_eq!(state.slow_gate.available_permits(), 1);
+    // The encoder logs its end marker before it exits,
+    // and the detached job drops its permit only after
+    // the encode returns, so the permit can still be
+    // out for a moment after the second "E" lands. Wait
+    // for it the way the drain test above does.
+    let mut back = false;
+    for _ in 0..200 {
+        if state.slow_gate.available_permits() == 1 {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        back,
+        "the slow-lane permit must return when the second job drains"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -12997,6 +13013,58 @@ async fn upload_rejects_names_that_misstate_the_media() {
             want == StatusCode::CREATED,
             "{name}"
         );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn undocumented_formats_fail_as_sources_and_uploads() {
+    // Issue #466: the image crate's long-tail decoders are
+    // not compiled in, and a HEIF file coded with anything
+    // but HEVC is refused before decoding. As a source each
+    // sample is a 502 decode_failed; as an upload it is a
+    // 415 whatever name it claims, and nothing is stored.
+    let mut samples = crate::engine::test_formats::undocumented_samples();
+    samples.push(("av1-in-mif1", crate::engine::test_formats::av1_in_mif1()));
+    let base = spawn_app(false).await;
+    for (kind, bytes) in &samples {
+        let src = spawn_bytes_server(bytes.clone()).await;
+        let remainder = format!("100x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{kind}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "decode_failed", "{kind}");
+    }
+    let dir = upload_dir("long-tail");
+    let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+    for (kind, bytes) in &samples {
+        for name in [
+            format!("{kind}/promo.html"),
+            format!("{kind}/page.svg"),
+            format!("{kind}/x.png"),
+            format!("{kind}/plain"),
+        ] {
+            let sig = crate::url::upload_signature(SECRET, &name);
+            let resp = client()
+                .put(format!("{base}/upload/{sig}/{name}"))
+                .body(bytes.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{name}");
+            let text = resp.text().await.unwrap();
+            assert!(
+                text.contains("not an image this server can decode"),
+                "{name}: {text}"
+            );
+            assert!(!dir.join(&name).exists(), "{name}");
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

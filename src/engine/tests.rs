@@ -78,6 +78,130 @@ fn prepare_upload_reports_media_and_stores_the_sanitized_svg() {
     );
 }
 
+/// A named source sample, the upload media kind it binds
+/// to, and the source dimensions the pipeline must report.
+type FormatSample = (&'static str, Vec<u8>, UploadMedia, (u32, u32));
+
+/// One sample per documented source format (issue #466).
+fn documented_format_samples() -> Vec<FormatSample> {
+    use image::ImageFormat as Raster;
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 16, |x, y| {
+        image::Rgb([(x * 10) as u8, (y * 15) as u8, 128])
+    }));
+    let raster = |name, format, media| -> FormatSample {
+        // The ICO decoder reads embedded PNGs as RGBA only,
+        // as real icons carry them.
+        let img = if format == Raster::Ico {
+            DynamicImage::ImageRgba8(img.to_rgba8())
+        } else {
+            img.clone()
+        };
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, format).unwrap();
+        (name, buf.into_inner(), media, (24, 16))
+    };
+    let png = raster("png", Raster::Png, UploadMedia::Png);
+    let jxl = Engine
+        .process(
+            &png.1,
+            &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                ImageFormat::Jxl,
+            ))])],
+        )
+        .unwrap()
+        .bytes;
+    let heic = include_bytes!("../../tests/fixtures/orient6.heic").to_vec();
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="16"><rect width="24" height="16" fill="red"/></svg>"#;
+    vec![
+        raster("jpeg", Raster::Jpeg, UploadMedia::Jpeg),
+        png,
+        raster("gif", Raster::Gif, UploadMedia::Gif),
+        raster("webp", Raster::WebP, UploadMedia::WebP),
+        raster("tiff", Raster::Tiff, UploadMedia::Tiff),
+        raster("bmp", Raster::Bmp, UploadMedia::Bmp),
+        raster("ico", Raster::Ico, UploadMedia::Ico),
+        ("jxl", jxl, UploadMedia::Jxl, (24, 16)),
+        // Stored 64x48 under EXIF orientation 6.
+        ("heic", heic, UploadMedia::Heic, (48, 64)),
+        ("svg", svg.to_vec(), UploadMedia::Svg, (24, 16)),
+    ]
+}
+
+#[test]
+fn every_documented_source_format_decodes_and_binds() {
+    // The format matrix (issue #466): every format the docs
+    // promise as a source decodes through the pipeline, and
+    // validates as an upload bound to its own media kind.
+    for (name, bytes, media, dims) in documented_format_samples() {
+        let out = Engine
+            .process(&bytes, &[])
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!((out.source_width, out.source_height), dims, "{name}");
+        let prepared = prepare_upload(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(prepared.media, media, "{name}");
+    }
+    // AVIF decodes in builds with the avif-decode feature,
+    // and fails naming the feature without it.
+    let mut avif = Vec::new();
+    image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut avif, 10, 80)
+        .write_image(&[90u8; 24 * 16 * 3], 24, 16, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    #[cfg(feature = "avif-decode")]
+    {
+        let out = Engine.process(&avif, &[]).unwrap();
+        assert_eq!((out.source_width, out.source_height), (24, 16));
+        assert_eq!(prepare_upload(&avif).unwrap().media, UploadMedia::Avif);
+    }
+    #[cfg(not(feature = "avif-decode"))]
+    match Engine.process(&avif, &[]) {
+        Err(EngineError::Decode(msg)) => assert!(msg.contains("avif-decode"), "{msg}"),
+        other => panic!("expected the feature error, got {other:?}"),
+    }
+}
+
+#[test]
+fn undocumented_formats_are_refused_as_sources_and_uploads() {
+    // The image crate sniffs these by magic bytes alone, so
+    // with their decoders compiled in, any source or upload
+    // reached them (issue #466). Each sample is a valid file
+    // in its format: the refusal is the missing decoder.
+    for (name, bytes) in crate::engine::test_formats::undocumented_samples() {
+        assert!(
+            image::guess_format(&bytes).is_ok(),
+            "{name}: the sample must still be sniffed as its format"
+        );
+        match decode_image(&bytes) {
+            Err(EngineError::Decode(_)) => {}
+            other => panic!("{name}: expected a decode error, got {other:?}"),
+        }
+        match Engine.process(&bytes, &[]) {
+            Err(EngineError::Decode(_)) => {}
+            other => panic!("{name}: expected a decode error, got {other:?}"),
+        }
+        match prepare_upload(&bytes) {
+            Err(EngineError::Decode(_)) => {}
+            other => panic!("{name}: expected the upload refused, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_non_hevc_heif_is_refused_as_source_and_upload() {
+    // An AV1 still under a generic HEIF brand takes the HEIC
+    // branch; the AV1 item is refused before any decoder runs
+    // (issue #466), as a source and as an upload alike.
+    let bytes = crate::engine::test_formats::av1_in_mif1();
+    for result in [
+        Engine.process(&bytes, &[]).map(|_| ()),
+        prepare_upload(&bytes).map(|_| ()),
+    ] {
+        match result {
+            Err(EngineError::Decode(msg)) => assert!(msg.contains("not HEVC"), "{msg}"),
+            other => panic!("expected the non-HEVC refusal, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn round_trips_png() {
     let engine = Engine;
@@ -3777,30 +3901,6 @@ fn float_sources_encode_to_every_still_format() {
             assert!(!out.bytes.is_empty(), "{format}");
         }
     }
-}
-
-/// A Radiance HDR source takes the same route as a float TIFF.
-#[test]
-fn radiance_hdr_sources_encode_to_png_and_avif() {
-    let hdr_img = DynamicImage::ImageRgb32F(image::Rgb32FImage::from_fn(48, 32, |x, y| {
-        image::Rgb([x as f32 / 47.0, y as f32 / 31.0, 0.25])
-    }));
-    let mut hdr = Vec::new();
-    hdr_img
-        .write_to(&mut Cursor::new(&mut hdr), image::ImageFormat::Hdr)
-        .unwrap();
-    let png = process_spelled(&hdr, "filters:format(png)", None);
-    assert_eq!(
-        image::load_from_memory(&png.bytes).unwrap(),
-        float_expected(&hdr)
-    );
-    let interlaced = process_spelled(&hdr, "filters:format(png,interlace)", None);
-    assert_eq!(
-        image::load_from_memory(&interlaced.bytes).unwrap(),
-        float_expected(&hdr)
-    );
-    let avif = process_spelled(&hdr, "", Some(ImageFormat::Avif));
-    assert_eq!(avif.format, ImageFormat::Avif);
 }
 
 /// Float samples are source content: NaN, the infinities,

@@ -4,7 +4,10 @@
 //! external tool. Decode speed is what it is (measured at
 //! roughly 3.7x FFmpeg's wall time on large single-stream
 //! photos); the trade buys a decoder that ships in every
-//! artifact.
+//! artifact. Only HEVC-coded items are decoded: the container
+//! crate also carries AV1, H.264, and H.266 codecs, and a file
+//! that would reach any of them is refused before the decoder
+//! runs (issue #466).
 //!
 //! The decoded pixels join the normal pipeline: this module
 //! returns the image with the EXIF orientation already applied
@@ -23,6 +26,19 @@ use crate::engine::{EngineError, MAX_DECODE_ALLOC, MAX_DECODE_DIMENSION};
 /// The decode budget in pixels: the 256 MiB allocation limit
 /// expressed as RGBA pixels.
 const MAX_DECODE_PIXELS: u64 = MAX_DECODE_ALLOC / 4;
+
+/// The coded item types the HEVC codec handles (issue #466):
+/// `hvc1` and `hev1` (parameter sets out of band or in band),
+/// `hvt1` (an HEVC tile), and `lhv1` (layered HEVC).
+/// Every other coded type (`av01`, `avc1`, `vvc1`, `jpeg`, and
+/// anything newer) is refused before decoding, so source bytes
+/// never reach the crate's other, pre-1.0 codecs.
+const HEVC_ITEM_TYPES: [[u8; 4]; 4] = [
+    oxideav_heif::meta::ITEM_TYPE_HVC1,
+    oxideav_heif::meta::ITEM_TYPE_HEV1,
+    oxideav_heif::meta::ITEM_TYPE_HVT1,
+    oxideav_heif::meta::ITEM_TYPE_LHV1,
+];
 
 /// How far an H.265 coded picture may run past its item's
 /// declared size before the file is rejected as mismatched.
@@ -64,21 +80,21 @@ fn decode_failed(cause: impl std::fmt::Display) -> EngineError {
 /// primary's derivation tree with its alpha and depth
 /// auxiliaries, the gain map item, and the primary's `altr`
 /// alternatives, which the decoder falls back to when the
-/// primary itself fails) and checks each one twice:
+/// primary itself fails) and checks each one three times:
 ///
+/// - its codec: a coded item (or a tiled item's tiles) must be
+///   HEVC, through [`check_hevc_coded`] (issue #466), so the
+///   SPS checks below cover every coded picture the decode can
+///   reach, and no other codec ever sees the bytes;
 /// - its announced size against the shared budget, through
 ///   [`check_announced_size`], and
 /// - every HEVC SPS it carries, in its configuration record
 ///   and in band in its payload, against that announced size,
 ///   through [`check_coded_geometry`].
 ///
-/// Residuals, honestly: non-HEVC coded items (AV1, AVC, VVC)
-/// carry no SPS this module can parse with the crates at hand,
-/// so their coded geometry is bounded only by the announced
-/// size check, the decoder's own frame cap, and the post-decode
-/// recheck in [`decode_heic`]; and the `tili` packed-tile
-/// stream is not a plain NAL stream to scan, so a tiled item is
-/// covered through its configuration record only.
+/// Residual, honestly: the `tili` packed-tile stream is not a
+/// plain NAL stream to scan, so a tiled item is covered through
+/// its configuration record only.
 fn validate_decode_budget(bytes: &[u8]) -> Result<(), EngineError> {
     let file = oxideav_heif::HeifFile::parse_borrowed(bytes).map_err(decode_failed)?;
     let mut seen = std::collections::HashSet::new();
@@ -136,6 +152,7 @@ fn validate_node<D: AsRef<[u8]>>(
     if !seen.insert(node.item.id) {
         return Ok(());
     }
+    check_hevc_coded(node)?;
     if let Ok((width, height)) = node.output_size() {
         check_announced_size(node.item.id, width, height)?;
     }
@@ -150,6 +167,33 @@ fn validate_node<D: AsRef<[u8]>>(
         validate_node(file, depth, seen)?;
     }
     Ok(())
+}
+
+/// Refuse a node whose pixels would come from a codec other
+/// than HEVC (issue #466): a coded item of another type, or a
+/// tiled item whose in-file tiles are. Derived items (grid,
+/// overlay, identity, tone map, colour enhancement) code no
+/// pixels themselves; their inputs are checked as the walk
+/// recurses. A tiled item with external tiles names no codec
+/// here, and the decoder refuses external tiles itself.
+fn check_hevc_coded(node: &oxideav_heif::ImageNode) -> Result<(), EngineError> {
+    let coded = match &node.kind {
+        oxideav_heif::ImageKind::Coded(item_type) => Some(item_type),
+        oxideav_heif::ImageKind::Tiled(tiled) => tiled
+            .config
+            .in_file_tiles
+            .as_ref()
+            .map(|(tile_type, _)| tile_type),
+        _ => None,
+    };
+    match coded {
+        Some(item_type) if !HEVC_ITEM_TYPES.contains(item_type) => Err(decode_failed(format!(
+            "item {} is coded as '{}', not HEVC; only HEVC-coded items are decoded",
+            node.item.id,
+            item_type.escape_ascii()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// One item's announced size against the shared decode budget:
@@ -719,6 +763,80 @@ mod tests {
                 assert!(msg.contains("codes 256x256"), "{msg}")
             }
             other => panic!("expected a coded-geometry rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_hevc_items_are_refused_before_decoding() {
+        // An AV1 still with its major brand patched to mif1
+        // (issue #466): a valid HEIF file the container parses,
+        // whose primary item is av01. The refusal names the
+        // codec, which only the pre-decode check produces, so
+        // the AV1 bytes never reach a decoder.
+        let bytes = crate::engine::test_formats::av1_in_mif1();
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        let node = oxideav_heif::build_primary_graph(&file).unwrap();
+        assert!(matches!(node.kind, oxideav_heif::ImageKind::Coded(t) if &t == b"av01"));
+        match decode_heic(&bytes) {
+            Err(EngineError::Decode(msg)) => {
+                assert!(msg.contains("coded as 'av01', not HEVC"), "{msg}")
+            }
+            other => panic!("expected the non-HEVC refusal, got {other:?}"),
+        }
+        // The rule itself: the four HEVC item types pass, every
+        // other coded type is refused, whatever the container
+        // around it.
+        let mut node = node;
+        for item_type in HEVC_ITEM_TYPES {
+            node.kind = oxideav_heif::ImageKind::Coded(item_type);
+            check_hevc_coded(&node).unwrap();
+        }
+        for item_type in [*b"av01", *b"avc1", *b"vvc1", *b"jpeg", *b"\0\0\0\0"] {
+            node.kind = oxideav_heif::ImageKind::Coded(item_type);
+            assert!(check_hevc_coded(&node).is_err(), "{item_type:?}");
+        }
+        // A tiled item is held to its tiles' codec.
+        let tiled = |tile_type: [u8; 4]| {
+            oxideav_heif::ImageKind::Tiled(oxideav_heif::derived::TiledItem::new(
+                oxideav_heif::props::TilC::new(64, 64, Vec::new(), Some((tile_type, Vec::new()))),
+                oxideav_heif::props::ItemProperties::default(),
+            ))
+        };
+        node.kind = tiled(*b"hvc1");
+        check_hevc_coded(&node).unwrap();
+        node.kind = tiled(*b"av01");
+        assert!(check_hevc_coded(&node).is_err());
+        // Derived items code nothing themselves: their inputs
+        // are checked as the walk recurses.
+        node.kind = oxideav_heif::ImageKind::Identity;
+        check_hevc_coded(&node).unwrap();
+    }
+
+    #[test]
+    fn mutated_non_hevc_files_fail_cleanly() {
+        // Hostile shapes around the refusal (issue #466): every
+        // truncation and single-byte mutation of the AV1-in-mif1
+        // file is a decode error, never a panic and never pixels.
+        let bytes = crate::engine::test_formats::av1_in_mif1();
+        for end in 0..bytes.len() {
+            assert!(decode_heic(&bytes[..end]).is_err(), "truncated at {end}");
+        }
+        let mut mutated = bytes.clone();
+        for i in 0..bytes.len() {
+            for value in [0x00, 0xff, bytes[i] ^ 0x01, bytes[i] ^ 0x80] {
+                mutated[i] = value;
+                assert!(decode_heic(&mutated).is_err(), "byte {i} = {value:#04x}");
+            }
+            mutated[i] = bytes[i];
+        }
+    }
+
+    #[test]
+    fn hevc_fixtures_pass_the_codec_check() {
+        // Every HEVC fixture, grid tiles and 10-bit included,
+        // still decodes: the refusal is for other codecs only.
+        for bytes in [GRID, MAIN10, VUI_LIMITED, P3, ORIENT6] {
+            validate_decode_budget(bytes).unwrap();
         }
     }
 
