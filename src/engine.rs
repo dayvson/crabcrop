@@ -584,6 +584,12 @@ pub enum EngineError {
     /// between operations and frames and aborts instead
     /// of running unbounded. The server maps it to 504.
     Timeout,
+    /// Signing the output failed because the C2PA timestamp
+    /// authority did not answer in time, refused, or sent
+    /// something that is not a timestamp (issue #467). A
+    /// dependency outage a retry may clear, so the server
+    /// maps it to 503 with `Retry-After`. Carries the cause.
+    ProvenanceUnavailable(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -618,6 +624,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::Timeout => {
                 write!(f, "processing exceeded the time budget")
+            }
+            EngineError::ProvenanceUnavailable(cause) => {
+                write!(f, "C2PA timestamp authority failed: {cause}")
             }
         }
     }

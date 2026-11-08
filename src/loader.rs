@@ -62,6 +62,15 @@ const MAX_REDIRECTS: usize = 5;
 pub enum LoadError {
     /// DNS, connect, TLS, or body-stream failure. Carries the cause.
     Network(String),
+    /// The source text the request named is not one the
+    /// loader can fetch: it does not parse, names a scheme
+    /// the loader does not serve, or is a malformed bucket
+    /// or file locator. The fault is the caller's own URL,
+    /// so it is not a gateway failure (issue #467). Only
+    /// the first hop: a redirect to such a URL is the
+    /// origin's answer and stays [`LoadError::Network`].
+    /// Carries the cause.
+    InvalidSource(String),
     /// The source does not exist: a file missing under a file
     /// root, a path that resolves outside every root, or an
     /// origin (an object store included) that answered 404.
@@ -91,6 +100,7 @@ impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoadError::Network(cause) => write!(f, "network error: {cause}"),
+            LoadError::InvalidSource(cause) => write!(f, "invalid source: {cause}"),
             LoadError::NotFound => write!(f, "source not found"),
             LoadError::BadStatus(code) => write!(f, "source answered HTTP {code}"),
             LoadError::TooLarge { limit } => {
@@ -757,14 +767,18 @@ impl Loader {
         mode: BodyMode<'_>,
     ) -> Result<LoadBody, LoadError> {
         let mut parsed =
-            Url::parse(url).map_err(|e| LoadError::Network(format!("invalid url: {e}")))?;
+            Url::parse(url).map_err(|e| LoadError::InvalidSource(format!("invalid url: {e}")))?;
         let mut hops = 0;
         loop {
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
-                return Err(LoadError::Network(format!(
-                    "unsupported scheme: {}",
-                    parsed.scheme()
-                )));
+                let cause = format!("unsupported scheme: {}", parsed.scheme());
+                // The first hop is the caller's own text; a
+                // redirect elsewhere is the origin's answer.
+                return Err(if hops == 0 {
+                    LoadError::InvalidSource(cause)
+                } else {
+                    LoadError::Network(cause)
+                });
             }
             let pin = self.check_policy(&parsed).await?;
             let client = match &pin {
@@ -1069,7 +1083,7 @@ impl Loader {
             ));
         };
         let parsed =
-            Url::parse(url).map_err(|e| LoadError::Network(format!("invalid url: {e}")))?;
+            Url::parse(url).map_err(|e| LoadError::InvalidSource(format!("invalid url: {e}")))?;
         match parsed.host_str() {
             None | Some("") | Some("localhost") => {}
             Some(host) => {
@@ -1080,7 +1094,9 @@ impl Loader {
         }
         let decoded = percent_decode(parsed.path());
         if decoded.contains('\0') {
-            return Err(LoadError::Network("invalid file source path".to_string()));
+            return Err(LoadError::InvalidSource(
+                "invalid file source path".to_string(),
+            ));
         }
         let candidate = root.join(decoded.trim_start_matches('/'));
         let canonical = tokio::fs::canonicalize(&candidate)
@@ -1373,7 +1389,7 @@ fn has_dot_segment(path: &str) -> bool {
 /// are required; the key may itself contain slashes.
 fn split_bucket_key<'a>(rest: &'a str, scheme: &str) -> Result<(&'a str, &'a str), LoadError> {
     let invalid = || {
-        LoadError::Network(format!(
+        LoadError::InvalidSource(format!(
             "invalid {scheme} url: expected {scheme}://bucket/key"
         ))
     };
@@ -1618,6 +1634,10 @@ mod tests {
         assert_eq!(
             LoadError::TooLarge { limit: 10 }.to_string(),
             "source exceeded the 10-byte limit"
+        );
+        assert_eq!(
+            LoadError::InvalidSource("unsupported scheme: ftp".to_string()).to_string(),
+            "invalid source: unsupported scheme: ftp"
         );
     }
 
@@ -1959,6 +1979,68 @@ mod tests {
             "chain ran for {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn source_text_the_loader_cannot_fetch_is_an_invalid_source() {
+        // Issue #467: the caller's own URL is at fault, not
+        // an origin, so these are InvalidSource (a 400), not
+        // Network (a 502). Hostile spellings included: none
+        // reaches the network, and none panics. The ftp
+        // source names a port that is listening, and the
+        // listener sees no connection.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let long = format!("http://{}", "\u{0}".repeat(64 * 1024));
+        let sources = [
+            format!("ftp://127.0.0.1:{port}/a.jpg"),
+            "ftp://8.8.8.8/a.jpg".to_string(),
+            "notaurl".to_string(),
+            String::new(),
+            "http://".to_string(),
+            "https://[::1/a.jpg".to_string(),
+            "http://example.com:99999/a.jpg".to_string(),
+            "http://exa mple.com/a.jpg".to_string(),
+            "javascript:alert(1)".to_string(),
+            "data:image/png;base64,iVBORw0KGgo=".to_string(),
+            "S3://bucket/key.jpg".to_string(),
+            "s3://".to_string(),
+            "s3://bucketonly".to_string(),
+            "s3://bucket/".to_string(),
+            "gs://x".to_string(),
+            "gs:///key".to_string(),
+            long,
+        ];
+        let loader = Loader::with_defaults().unwrap();
+        for source in &sources {
+            let err = loader.load(source).await.unwrap_err();
+            let shown: String = source.chars().take(40).collect();
+            assert!(
+                matches!(err, LoadError::InvalidSource(_)),
+                "{shown}: {err:?}"
+            );
+        }
+        assert!(
+            listener.accept().is_err(),
+            "an unsupported scheme never connects"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_scheme_stays_a_network_error() {
+        // Issue #467: only the first hop is the caller's
+        // text. A redirect to a scheme the loader does not
+        // fetch is the origin's answer, a gateway failure.
+        let redirect_resp = response(
+            "302 Found",
+            "Location: ftp://127.0.0.1/a.jpg\r\nContent-Length: 0\r\n",
+            b"",
+        );
+        let base = spawn_server(Respond::Bytes(redirect_resp)).await;
+        let loader = Loader::with_defaults().unwrap();
+        let err = fetch(&loader, &base).await.unwrap_err();
+        assert!(matches!(err, LoadError::Network(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -2440,7 +2522,8 @@ mod tests {
     async fn malformed_bucket_urls_error() {
         let loader = Loader::with_defaults().unwrap();
         for url in ["s3://", "s3://bucketonly", "s3://bucket/", "gs:///key"] {
-            assert!(loader.load(url).await.is_err(), "{url}");
+            let err = loader.load(url).await.unwrap_err();
+            assert!(matches!(err, LoadError::InvalidSource(_)), "{url}: {err:?}");
         }
     }
 
@@ -2530,6 +2613,10 @@ mod tests {
         let unconfigured = Loader::with_defaults().unwrap();
         let err = unconfigured.load("file:///pic.jpg").await.unwrap_err();
         assert!(matches!(err, LoadError::Forbidden(_)), "{err:?}");
+        // A NUL in the path is the caller's malformed
+        // locator (issue #467), never a read attempt.
+        let err = loader.load("file:///pic%00.jpg").await.unwrap_err();
+        assert!(matches!(err, LoadError::InvalidSource(_)), "{err:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

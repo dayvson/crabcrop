@@ -93,7 +93,7 @@ filters:watermark(<url>,<x>,<y>,<alpha>)
 | `x`, `y` | Position of the watermark's top-left corner, in pixels. Negative values anchor from the right and bottom edges. |
 | `alpha` | Opacity, 0 (invisible) to 100 (opaque). The watermark's own alpha is honored. |
 
-The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`) instead of being skipped.
+The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`, or `400 invalid_source` when its URL is not one the server can fetch at all) instead of being skipped.
 
 ```bash
 # Overlay https://cdn.example.com/logo.png at the bottom right, 80% opaque
