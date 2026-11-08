@@ -644,9 +644,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "c2pa"
-version = "0.91.7"
+version = "0.91.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f258d5bfe6465d1a5c570d32b70a261f35e4e45a753e7122a88d3ba0472999b0"
+checksum = "f8e2a752d002206ccd431a9fe22cdc1205023d316c118dd60c4bf568cd493dea"
 dependencies = [
  "asn1-rs",
  "async-generic",
@@ -739,9 +739,9 @@ dependencies = [
 
 [[package]]
 name = "c2pa_raw_crypto"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38287179bf40cb58a3fafef09ee121b7221d560a76bb6b672742445a2c8db08d"
+checksum = "f7e31e5d6f61e52360fd157cecc52efb38098f32b668acb27231ffedac89434f"
 dependencies = [
  "const-hex",
  "ecdsa",
@@ -941,6 +941,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1029,9 +1038,9 @@ dependencies = [
  "jxl-image-rs-integration",
  "kamadak-exif",
  "libm",
- "moxcms",
+ "moxcms 0.9.2",
  "ort",
- "oxideav-h265",
+ "oxideav-h265 0.0.16",
  "oxideav-heif",
  "oxideav-webp",
  "png",
@@ -2251,7 +2260,7 @@ dependencies = [
  "exr",
  "gif",
  "image-webp",
- "moxcms",
+ "moxcms 0.8.1",
  "mp4parse",
  "num-traits",
  "png",
@@ -2830,6 +2839,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxcms"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "561875e11b3d8618524f974f85e4bbd05a64a112b8f7541ffcc236b5166c0564"
+dependencies = [
+ "num-traits",
+ "pxfm",
+]
+
+[[package]]
 name = "mp4parse"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3127,6 +3146,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxideav-h265"
+version = "0.0.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e3a6b34d2c009977b06424cc1cede2fdf5a54b4ff63848a5b9e0deed3433d16"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
 name = "oxideav-h266"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3145,7 +3173,7 @@ dependencies = [
  "oxideav-av1",
  "oxideav-core",
  "oxideav-h264",
- "oxideav-h265",
+ "oxideav-h265 0.0.15",
  "oxideav-h266",
 ]
 
@@ -5982,17 +6010,20 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.1.3"
+version = "9.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
+checksum = "df3845f734baabdd02de353a20580e30ceccd03897def44a4eb8e9654992e294"
 dependencies = [
+ "constant_time_eq",
  "crc32fast",
  "getrandom 0.4.3",
  "indexmap 2.14.2",
+ "libc",
  "memchr",
  "nix",
  "typed-path",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

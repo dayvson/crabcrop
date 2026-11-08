@@ -552,7 +552,6 @@ fn not_pdf() -> PdfError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     /// A whole-document probe report, recorded from the
     /// reference probe on a real two-page document.
@@ -714,13 +713,7 @@ Page size:       792 x 612 pts (letter)
 
     fn write_tool(dir: &Path, name: &str, script: &str) -> PathBuf {
         let path = dir.join(name);
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, script);
         path
     }
 

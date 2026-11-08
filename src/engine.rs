@@ -67,8 +67,11 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// checked in our own code, because decoder adherence to
 /// `max_alloc` varies by format; a probe failure is not fatal
 /// (some valid files have headers the probe cannot read), the
-/// limited decode behind it is the second line. Public
-/// for the fuzz harness's decode target (issue #417).
+/// limited decode behind it is the second line. An AVIF
+/// container is screened before either (issue #522): its
+/// parser reserves what the boxes declare, ahead of every
+/// limit here. Public for the fuzz harness's decode target
+/// (issue #417).
 pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     // AVIF decoding is compiled in only with the avif-decode
     // feature (issue #141): dav1d is a C dependency the
@@ -82,6 +85,8 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
             "AVIF sources cannot be decoded in this build (built without AVIF decoding: the Docker image and release binaries include it; source builds enable it with --features avif-decode)".to_string(),
         ));
     }
+    let screened = crate::avif::screen(bytes)?;
+    let bytes: &[u8] = &screened;
     let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
     if let Ok(probe) = probe
         && let Ok((width, height)) = probe.into_dimensions()
@@ -471,10 +476,15 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
         _ if crate::pdf::sniff_pdf(bytes) => "pdf",
         _ => "unknown",
     };
-    let dimensions = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|probe| probe.into_dimensions().ok());
+    // The probe parses an AVIF container too, so it is
+    // screened first (issue #522); a refused one states no
+    // dimensions.
+    let dimensions = crate::avif::screen(bytes).ok().and_then(|bytes| {
+        image::ImageReader::new(Cursor::new(&*bytes))
+            .with_guessed_format()
+            .ok()
+            .and_then(|probe| probe.into_dimensions().ok())
+    });
     SourceProbe { kind, dimensions }
 }
 

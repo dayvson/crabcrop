@@ -419,14 +419,7 @@ mod tests {
     /// Write a fake encoder script and make it executable.
     fn fake_encoder(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("fake-encoder.sh");
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(body.as_bytes()).unwrap();
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, body);
         path
     }
 
