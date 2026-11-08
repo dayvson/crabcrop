@@ -84,7 +84,7 @@ const operations = joinOps(
 const url = buildURL("https://images.example.com", "your-secret", operations, "https://example.com/photo.jpg");
 ```
 
-A value the server would reject (`filter.quality(0)`, `filter.brighten(256)`, `ops.crop(0, 100)`) throws at build time instead of minting a URL that fails at the edge. The closed sets are exported as types (`ImageFormat`, `PerFormatQualityFormat`, `CropAlign`, `Anchor`, `BlendMode`, `MaskShape`, `CurveChannel`, `StudioMode`, `StudioShadow`, `Dimension`), and so are the option objects (`FormatOptions` for `filter.format`, `StudioOptions` for `filter.studio`). `MAX_DIMENSION` is the server's per-axis pixel cap, 16383, which every pixel-count check here uses, and which the [framework integrations](../../frameworks) import for theirs. `FILTER_DESCRIPTIONS` is the filter metadata table the explainer uses.
+A value the server would reject (`filter.quality(0)`, `filter.brighten(256)`, `ops.crop(0, 100)`) throws at build time instead of minting a URL that fails at the edge. The closed sets are exported as types (`ImageFormat`, `PerFormatQualityFormat`, `CropAlign`, `Anchor`, `BlendMode`, `MaskShape`, `CurveChannel`, `StudioMode`, `StudioShadow`, `Dimension`), and so are the option objects (`FormatOptions` for `filter.format`, `StudioOptions` for `filter.studio`). `MAX_DIMENSION` is the server's per-axis pixel cap, 16383. The size, box, region, border, radius, and pixelate builders check against it (source coordinates, as in `ops.cropRect` and `ops.focal`, are not capped), and the [framework integrations](../../frameworks) import it for their own checks. `FILTER_DESCRIPTIONS` is the filter metadata table the explainer uses.
 
 ```ts
 import { filter, MAX_DIMENSION, ops, type FormatOptions } from "@crabcrop/url";
