@@ -37,6 +37,10 @@ fast_image_resize = { version = "6.1", features = ["image"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hex = "0.4"
 hmac = "0.13"
+# Platform-independent cosine for thumbhash, so a placeholder is
+# the same bytes on every OS (the system libm differs in the last
+# bit between glibc and Apple). Already in the tree via image deps.
+libm = "0.2"
 jixel = "0.5"
 jpeg-encoder = { version = "0.7", features = ["simd"] }
 # Default features off (issue #466): the defaults compile

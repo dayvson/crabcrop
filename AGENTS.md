@@ -51,9 +51,9 @@ both SDKs must all pass.
   MCP, frameworks, playground, fuzz). Everything must pass before a change
   lands.
 - CI also enforces `cargo fmt --check` and
-  `cargo clippy --locked --all-targets -- -D warnings`, which test_all.sh
-  does not run. Run both locally before pushing or the first CI run fails
-  on style alone.
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`,
+  which test_all.sh does not run. Run both locally before pushing or
+  the first CI run fails on style alone.
 - The real-model AI tests are `#[ignore]`d in the normal gate: they need
   model files and an ONNX Runtime library, which are deployment artifacts,
   never repo content. `.github/workflows/ai-models.yml` downloads the
