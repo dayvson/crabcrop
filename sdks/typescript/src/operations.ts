@@ -11,6 +11,7 @@
  * `buildSrcSet` does for widths: a value the server would 400
  * never gets signed.
  */
+import { MAX_DIMENSION } from "./limits.ts";
 
 /** Output formats the `format(...)` filter accepts. */
 export type ImageFormat = "jpeg" | "jpg" | "png" | "webp" | "jxl" | "avif" | "gif" | "mp4" | "webm";
@@ -99,13 +100,11 @@ export interface StudioOptions {
 }
 
 /**
- * One side of a size: a pixel count (1..16383), 0 for
- * proportional, a negative count to flip that axis, or
+ * One side of a size: a pixel count (1..{@link MAX_DIMENSION}),
+ * 0 for proportional, a negative count to flip that axis, or
  * `"orig"` for the source's own dimension.
  */
 export type Dimension = number | "orig";
-
-const MAX_DIMENSION = 16383;
 
 function fail(what: string, value: unknown, rule: string): never {
   throw new Error(`${what} must be ${rule}, got ${JSON.stringify(value)}`);
@@ -751,7 +750,7 @@ export const filter = {
   monochrome(color: string): string {
     return `monochrome(${hex6("monochrome color", color)})`;
   },
-  /** Mosaic block size in pixels: 1..16383. */
+  /** Mosaic block size in pixels: 1..{@link MAX_DIMENSION}. */
   pixelate(blockSize: number): string {
     return `pixelate(${intIn("pixelate size", blockSize, 1, MAX_DIMENSION)})`;
   },

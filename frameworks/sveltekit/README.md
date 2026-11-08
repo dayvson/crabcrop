@@ -4,7 +4,7 @@ A loader factory for SvelteKit apps that routes image URLs through your crabcrop
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url`.
+1. Install the builder: `npm install @crabcrop/url` (0.9.12 or later, which exports the `MAX_DIMENSION` this file imports).
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project, for example under `src/lib/`.
 3. Create the loader in a shared module:
 
@@ -51,7 +51,9 @@ This setup builds unsigned URLs; read [Signing and server modes](#signing-and-se
 | `quality` | `filters:quality(...)` |
 | `srcset(src, widths)` | one `{width}x0` URL per width, as `{url} {width}w` entries |
 
-With a preset configured, `preset:<name>` leads and the geometry and filters above append after it. A `srcset` varies the width alone, carrying any `format` and `quality` options through to every entry. Dimensions past the server's 16383 cap, unsupported formats, and out-of-range qualities throw where the mistake is made, instead of minting a URL the server would reject.
+With a preset configured, `preset:<name>` leads and the geometry and filters above append after it. A `srcset` varies the width alone, carrying any `format` and `quality` options through to every entry. Unsupported formats and out-of-range qualities throw where the mistake is made, instead of minting a URL the server would reject.
+
+Dimensions follow one rule: a fraction rounds to whole pixels, a value that is not a size (0, negative, or not a number) is left out so the URL serves the source's own size, and a value past the server's per-axis cap (`MAX_DIMENSION` in `@crabcrop/url`) throws, as does `createCrabcropLoader` without a `base`, instead of minting a URL that cannot load. All five crabcrop integrations share this rule. A `srcset` width is also spelled into its `w` descriptor, so it must be a positive whole number no larger than the cap, or the call throws.
 
 The [`example/`](example) directory is a minimal loader module and page that render an image through a local crabcrop using only a preset name: the page names no operations at all. It builds unsigned URLs for a local server in unsafe mode, a development setup (see below).
 
@@ -67,6 +69,6 @@ A loader created without a secret, or running in the browser, builds unsigned UR
 
 ## Tests
 
-`npm test` in this directory runs the loader against exact expected URLs; the signed cases reproduce the canonical spec test vectors byte for byte, and the remaining signatures are cross-checked with `node:crypto` directly. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
+`npm test` in this directory runs the loader against exact expected URLs; the signed cases reproduce the canonical spec test vectors byte for byte, and the remaining signatures are cross-checked with `node:crypto` directly. It also runs the dimension table all five integrations share ([`dimension-table.mjs`](../dimension-table.mjs)), so one mistake has one outcome in each. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
 
 [`tests/browser-bundles`](../../tests/browser-bundles) builds this loader into a browser bundle with Vite and runs it with a browser's globals and none of Node's.
