@@ -972,5 +972,23 @@ mod tests {
         assert!(!report.forecast.format_from_operation);
         assert!(!report.forecast.format_from_default);
         assert_eq!(report.to_json()["forecast"]["format_from"], "source");
+
+        // The debug view is a remainder to sign, and the
+        // image path merges the defaults into it again, so
+        // it keeps to the URL's own operations while the
+        // canonical form carries the defaults.
+        let report = report_with_defaults(
+            "filters:format(webp):dpr(2)",
+            "crop:100x100/https://example.com/photo.jpg",
+            png_probe(),
+        );
+        assert_eq!(
+            report.debug_focal_remainder.as_deref(),
+            Some("debug:focal/crop:100x100/https://example.com/photo.jpg")
+        );
+        assert_eq!(
+            report.to_json()["canonical"],
+            "filters:format(webp):dpr(2)/crop:100x100/https://example.com/photo.jpg"
+        );
     }
 }

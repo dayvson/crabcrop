@@ -8546,11 +8546,6 @@ async fn explain_forecasts_the_merged_default_operations() {
         canonical.starts_with("filters:format(webp):dpr(2)/50x0/"),
         "{canonical}"
     );
-    // The debug view is a remainder to sign, so it keeps
-    // to the URL's own operations: the image path merges
-    // the defaults into it again.
-    assert!(json["links"]["debug_focal"].is_null());
-
     // The image request agrees with the forecast.
     let image = client()
         .get(format!("{base}/{sig}/{remainder}"))
@@ -8627,6 +8622,34 @@ async fn explain_survives_an_overflowing_forecast() {
     assert_eq!(hits.load(Ordering::SeqCst), 2);
     let health = client().get(format!("{base}/health")).send().await.unwrap();
     assert_eq!(health.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn explain_admits_a_video_source_by_a_default_frame() {
+    // The image path admits a video source when its merged
+    // operations select a frame, a default `frame:`
+    // included. The explain probe admits by the same merged
+    // list (issue #468), so it reports the source the image
+    // request fetches instead of refusing it (on main it
+    // answered 502). The operation list stays the URL's own.
+    let (src, hits) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+    let base = spawn_app_with_defaults("frame:1.5", false).await;
+    let remainder = format!("100x0/{src}");
+    let resp = client()
+        .get(format!("{base}/explain/{}/{remainder}", sign(&remainder)))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["source"]["kind"], "video");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let operations = json["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 1, "{operations:?}");
+    assert_eq!(operations[0]["segment"], "100x0");
+    let canonical = json["canonical"].as_str().unwrap();
+    assert!(canonical.starts_with("frame:1.5/100x0/"), "{canonical}");
 }
 
 #[tokio::test]
