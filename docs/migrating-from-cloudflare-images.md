@@ -55,7 +55,7 @@ Three operational differences matter. First, scope: Cloudflare signing is opt-in
 | `format=avif`, `format=webp` | `filters:format(...)` | Direct, with one behavioral note: Cloudflare falls back to WebP or JPEG when an image is too large to encode to AVIF quickly; crabcrop encodes what was asked |
 | `format=jpeg` | `filters:format(jpeg)` | Approximate: Cloudflare's `jpeg` is progressive encoding |
 | `format=baseline-jpeg` | `filters:format(jpeg)` | Baseline is the standing behavior, and the distinction does exist: progressive output is the separate option `filters:format(jpeg,progressive)` |
-| `format=json` | Fetch the image URL with `Accept: application/json`, or `crabcrop meta` | Direct |
+| `format=json` | Fetch the image URL with `Accept: application/json`, or `crabcrop meta`, on a server with meta mode on (`CRABCROP_META_MODE=1`; it is off by default) | Direct |
 | `quality=80` | `filters:quality(80)` | Direct: the values copy. The defaults do not (Cloudflare 85, crabcrop 80) |
 | `quality=high`, `medium-high`, `medium-low`, `low` (perceptual levels) | `filters:quality(auto)`, or pick a number | Approximate: the names do not convert to numbers (Cloudflare publishes no equivalents). `quality(auto)` is the nearest behavior: a per-image choice made by content analysis |
 | `quality` set on PNG output (selects the PNG8 palette variant) | `filters:format(png):palette(256)` | Direct in effect: PNG8 is an indexed palette of up to 256 colors, which is what `palette(256)` writes; smaller budgets (`palette(64)`) also work. On crabcrop, `quality` itself stays a no-op on PNG, which is lossless within the palette |

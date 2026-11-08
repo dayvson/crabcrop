@@ -70,7 +70,14 @@ test("the MCP tools work end to end against a live server", { timeout: 90000 }, 
   assert.ok(existsSync(binary), "precondition: cargo build must have produced target/debug/crabcrop");
 
   const server = spawn(binary, [], {
-    env: { ...process.env, CRABCROP_SECRET: "mcp-test-secret-0123456", CRABCROP_ALLOWED_SOURCES: "127.0.0.1", PORT: "3323" },
+    // fetch_meta needs meta mode, which is off by default (issue #453).
+    env: {
+      ...process.env,
+      CRABCROP_SECRET: "mcp-test-secret-0123456",
+      CRABCROP_ALLOWED_SOURCES: "127.0.0.1",
+      CRABCROP_META_MODE: "1",
+      PORT: "3323",
+    },
     stdio: "ignore",
   });
   const fixtureServer = spawn("python3", ["-m", "http.server", "8912"], {

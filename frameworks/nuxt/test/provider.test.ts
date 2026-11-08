@@ -5,6 +5,7 @@ import { test } from "node:test";
 
 const provider = await import("../crabcrop.ts");
 const { getImage } = provider;
+const table = await import("../../dimension-table.mjs");
 
 // @nuxt/image passes the provider options merged with the
 // modifiers as the second argument, and its context, whose
@@ -103,4 +104,15 @@ test("both @nuxt/image provider shapes resolve to the same getImage", () => {
   // 2.x imports the default export and calls it; 1.x reads
   // the named export.
   assert.equal(provider.default().getImage, getImage);
+});
+
+test("dimensions and the base follow the rule all five integrations share (issue #460)", () => {
+  // No runtime config in the context: unsigned, like the other suites' rows.
+  const unsigned = (modifiers: Record<string, unknown>, base = table.BASE) =>
+    getImage(table.SRC, { modifiers, base }, {}).url;
+  table.checkDimensionTable({
+    width: (width: number) => unsigned({ width }),
+    height: (height: number) => unsigned({ height }),
+    emptyBase: () => unsigned({ width: 100 }, ""),
+  });
 });

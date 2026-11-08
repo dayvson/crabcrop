@@ -37,7 +37,9 @@ if (!class_exists('CrabcropUrl')) {
          * verify: a negative or non-integer expiry, a malformed key ID,
          * or operations or a source containing ?, #, whitespace,
          * control, or non-ASCII characters (the remainder travels as a
-         * raw path, so those bytes cannot be represented in it).
+         * raw path, so those bytes cannot be represented in it), or one
+         * of " < > \ ^ ` { | }, which a browser rewrites before the
+         * request leaves the page (a URL signed over them answers 403).
          */
         public static function build($base, $secret, $operations, $source, $expiry = null, $key_id = null)
         {
@@ -87,6 +89,19 @@ if (!class_exists('CrabcropUrl')) {
                 throw new InvalidArgumentException(
                     $what . ' contains a character that cannot appear in a signed URL'
                 );
+            }
+            // A browser turns \ into / and percent-encodes the rest of
+            // these in a path, so the server would verify different
+            // bytes than were signed (issue #472). Percent-encoded,
+            // they travel unchanged.
+            if (preg_match('/["<>\\\\^`{|}]/', $part, $match)) {
+                throw new InvalidArgumentException(sprintf(
+                    '%s contains a character that cannot appear in a signed URL: %s'
+                        . ' (browsers rewrite it; percent-encode it as %%%02X)',
+                    $what,
+                    $match[0],
+                    ord($match[0])
+                ));
             }
         }
     }

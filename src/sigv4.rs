@@ -19,11 +19,28 @@ pub const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// A static credential pair (plus the optional session token).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for Credentials {
+    /// The access key ID prints, since it names the identity
+    /// and travels in every signed request's `Authorization`
+    /// header anyway; the secret key and the session token
+    /// print as `[redacted]` (issue #455).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &crate::redact::Redacted)
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| crate::redact::Redacted),
+            )
+            .finish()
+    }
 }
 
 /// One request to sign. `path` is the percent-encoded path

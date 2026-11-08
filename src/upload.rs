@@ -178,6 +178,8 @@ impl UploadStore {
 
     /// An S3 destination, reusing the source S3
     /// configuration (endpoint, region, credentials).
+    /// Fails, like [`S3Store::new`], when the store's HTTP
+    /// client cannot be built.
     pub fn s3(
         bucket: String,
         prefix: String,
@@ -186,7 +188,7 @@ impl UploadStore {
         creds: Option<crate::sigv4::Credentials>,
         max_bytes: u64,
         allow_overwrite: bool,
-    ) -> Self {
+    ) -> Result<Self, reqwest::Error> {
         let trimmed = prefix.trim_matches('/');
         let prefix = if trimmed.is_empty() {
             String::new()
@@ -204,8 +206,8 @@ impl UploadStore {
             region,
             creds,
             Vec::new(),
-        );
-        Self {
+        )?;
+        Ok(Self {
             backend: Backend::S3 {
                 store: Arc::new(store),
                 bucket,
@@ -214,7 +216,7 @@ impl UploadStore {
             max_bytes,
             allow_overwrite,
             ref_prefix: String::new(),
-        }
+        })
     }
 
     /// The local destination directory, when the backend
@@ -327,12 +329,10 @@ impl UploadStore {
 /// to present the bytes as something they are not: a PNG
 /// cannot land as `promo.html`, and a JPEG cannot land as
 /// `photo.png`. A name with no extension has nothing to
-/// bind and is accepted; media kinds outside the binding
-/// table ([`UploadMedia::Other`](crate::engine::UploadMedia::Other)) are likewise unbound.
+/// bind and is accepted. Every media kind has a binding
+/// (issue #466): validation refuses a body it cannot name.
 pub fn check_upload_media(name: &str, media: crate::engine::UploadMedia) -> Result<(), String> {
-    let Some(allowed) = media.allowed_extensions() else {
-        return Ok(());
-    };
+    let allowed = media.allowed_extensions();
     let last = name.rsplit('/').next().unwrap_or(name);
     let Some((_, ext)) = last.rsplit_once('.') else {
         return Ok(());
@@ -583,11 +583,19 @@ mod tests {
         ] {
             assert!(check_upload_media(name, media).is_err(), "{name}");
         }
-        // No extension, nothing to bind; unlisted media
-        // kinds are unbound.
+        // No extension, nothing to bind.
         assert!(check_upload_media("cat", Png).is_ok());
         assert!(check_upload_media("cat.", Png).is_ok());
-        assert!(check_upload_media("odd.html", Other).is_ok());
+        // Every kind is bound (issue #466): none of them
+        // may land under an active-content name.
+        for media in [Svg, Heic, Jpeg, Png, Gif, WebP, Avif, Jxl, Bmp, Tiff, Ico] {
+            for name in ["promo.html", "page.svg", "x.js"] {
+                if media == Svg && name == "page.svg" {
+                    continue;
+                }
+                assert!(check_upload_media(name, media).is_err(), "{name} {media:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -601,7 +609,8 @@ mod tests {
             None,
             1024,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(
             store.source_ref("heroes/cat.jpg"),
             "s3://uploads/orig/heroes/cat.jpg"
@@ -629,7 +638,8 @@ mod tests {
             None,
             1024,
             false,
-        );
+        )
+        .unwrap();
         assert!(!store.exists("heroes/cat.jpg").await);
         store.put_new("heroes/cat.jpg", b"first").await.unwrap();
         assert!(store.exists("heroes/cat.jpg").await);

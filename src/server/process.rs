@@ -692,7 +692,9 @@ pub(in crate::server) async fn run_process(
 /// animated WebP outputs are served unsigned. A signing
 /// failure fails the request: serving unmarked output
 /// from a server configured to mark would be a silent
-/// policy break.
+/// policy break. A failed timestamp authority gets its own
+/// error, so the client hears an outage worth retrying
+/// rather than a broken encoder (issue #467).
 pub(in crate::server) fn apply_provenance(
     job: &ProcessJob,
     source_bytes: &[u8],
@@ -738,8 +740,11 @@ pub(in crate::server) fn apply_provenance(
                     processed.bytes = bytes;
                     signed = true;
                 }
-                Err(e) => {
-                    return Err(EngineError::Encode(format!("C2PA signing failed: {e}")));
+                Err(crate::provenance::SignError::Authority(cause)) => {
+                    return Err(EngineError::ProvenanceUnavailable(cause));
+                }
+                Err(crate::provenance::SignError::Failed(cause)) => {
+                    return Err(EngineError::Encode(format!("C2PA signing failed: {cause}")));
                 }
             }
         }

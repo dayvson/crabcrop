@@ -4488,6 +4488,18 @@
    "error": "invalid_crop"
   },
   {
+   "call": "ops.cropObjects",
+   "args": [
+    100,
+    100,
+    [
+     " person "
+    ]
+   ],
+   "segment": "crop:100x100:objects(person):1",
+   "canonical": "crop:100x100:objects(person):1"
+  },
+  {
    "call": "ops.cropRect",
    "args": [
     0,
@@ -4539,6 +4551,16 @@
    ],
    "segment": "focalpoint:0.75x0.4:2",
    "canonical": "focalpoint:0.75x0.4:2"
+  },
+  {
+   "call": "ops.focalPoint",
+   "args": [
+    0.30000000000000004,
+    0.4,
+    2
+   ],
+   "segment": "focalpoint:0.3x0.4:2",
+   "canonical": "focalpoint:0.3x0.4:2"
   },
   {
    "call": "ops.focalPoint",
@@ -4659,6 +4681,14 @@
    ],
    "segment": "blur(0.5)",
    "canonical": "blur(0.5)"
+  },
+  {
+   "call": "filter.blur",
+   "args": [
+    0.3333333333333333
+   ],
+   "segment": "blur(0.33333334)",
+   "canonical": "blur(0.33333334)"
   },
   {
    "call": "filter.blur",
@@ -4848,6 +4878,25 @@
    ],
    "segment": "convolution(0,-1,0,-1,5,-1,0,-1,0,0)",
    "canonical": "convolution(0,-1,0,-1,5,-1,0,-1,0,0)"
+  },
+  {
+   "call": "filter.convolution",
+   "args": [
+    [
+     0.30000000000000004,
+     0,
+     0,
+     0,
+     1,
+     0,
+     0,
+     0,
+     0
+    ],
+    0
+   ],
+   "segment": "convolution(0.30000000000000004,0,0,0,1,0,0,0,0,0)",
+   "canonical": "convolution(0.30000000000000004,0,0,0,1,0,0,0,0,0)"
   },
   {
    "call": "filter.noise",
@@ -5241,6 +5290,14 @@
    "call": "filter.blurClass",
    "args": [
     "person"
+   ],
+   "segment": "blurclass(person)",
+   "canonical": "blurclass(person)"
+  },
+  {
+   "call": "filter.blurClass",
+   "args": [
+    " person "
    ],
    "segment": "blurclass(person)",
    "canonical": "blurclass(person)"

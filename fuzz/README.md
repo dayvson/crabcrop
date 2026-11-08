@@ -211,7 +211,11 @@ non-sealed segments. `corpus/decode/` and
 `corpus/source_meta/` seed real bodies from the functional
 corpus and the fixtures (small images per format, an SVG,
 EXIF and ICC carriers, and truncated prefixes of the
-animated formats). `corpus/op_chain/` seeds filter-chain
+animated formats); `corpus/decode/` also seeds two shapes
+the server refuses (issue #466): an OpenEXR file, whose
+decoder is not compiled in, and an AV1 still under a
+generic HEIF brand, which the HEIC path refuses before
+decoding. `corpus/op_chain/` seeds filter-chain
 remainders: plain, face-shaped, quarter and arbitrary-angle
 rotations (`rotate(91)`, `rotate(45)`, negative and
 fractional angles), and trims that shrink the canvas. Add a

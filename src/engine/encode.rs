@@ -51,6 +51,7 @@ pub(in crate::engine) struct EncodeBuffers<'a> {
     img: &'a DynamicImage,
     rgb: std::cell::OnceCell<image::RgbImage>,
     rgba: std::cell::OnceCell<image::RgbaImage>,
+    sixteen: std::cell::OnceCell<DynamicImage>,
 }
 
 impl<'a> EncodeBuffers<'a> {
@@ -59,6 +60,7 @@ impl<'a> EncodeBuffers<'a> {
             img,
             rgb: std::cell::OnceCell::new(),
             rgba: std::cell::OnceCell::new(),
+            sixteen: std::cell::OnceCell::new(),
         }
     }
 
@@ -68,6 +70,25 @@ impl<'a> EncodeBuffers<'a> {
 
     fn rgba(&self) -> &image::RgbaImage {
         self.rgba.get_or_init(|| self.img.to_rgba8())
+    }
+
+    /// The image with integer samples, for the encoders that
+    /// write the native layout (PNG, plain and interlaced, and
+    /// AVIF), none of which takes 32-bit float (issue #464). A
+    /// float source (a float TIFF, a Radiance HDR file) converts
+    /// to 16 bits per channel, clamped to the 0 to 1 range as the
+    /// 8-bit layouts above clamp it; every other image is itself.
+    fn integer(&self) -> &DynamicImage {
+        let img = self.img;
+        match img {
+            DynamicImage::ImageRgb32F(_) => self
+                .sixteen
+                .get_or_init(|| DynamicImage::ImageRgb16(img.to_rgb16())),
+            DynamicImage::ImageRgba32F(_) => self
+                .sixteen
+                .get_or_init(|| DynamicImage::ImageRgba16(img.to_rgba16())),
+            _ => img,
+        }
     }
 }
 
@@ -197,7 +218,6 @@ pub(in crate::engine) fn encode(
         return encode_webp(src, quality, format_options);
     }
     let mut buf = Vec::new();
-    let (pixels, color) = (img.as_bytes(), ExtendedColorType::from(img.color()));
     match format {
         ImageFormat::Jpeg => {
             // JPEG has no alpha channel. A fill color composites
@@ -249,8 +269,9 @@ pub(in crate::engine) fn encode(
             if format_options.png_interlace {
                 return encode_png_interlaced(src);
             }
+            let img = src.integer();
             image::codecs::png::PngEncoder::new(&mut buf)
-                .write_image(pixels, w, h, color)
+                .write_image(img.as_bytes(), w, h, img.color().into())
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::WebP => unreachable!("WebP returns early in encode"),
@@ -259,12 +280,13 @@ pub(in crate::engine) fn encode(
             // speed tier is operator configuration; AVIF encoding
             // is the expensive step in the pipeline by a wide
             // margin, so the tier trades real latency for bytes.
+            let img = src.integer();
             image::codecs::avif::AvifEncoder::new_with_speed_quality(
                 &mut buf,
                 avif_speed,
                 quality.unwrap_or(80),
             )
-            .write_image(pixels, w, h, color)
+            .write_image(img.as_bytes(), w, h, img.color().into())
             .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
         ImageFormat::Gif => {
@@ -515,7 +537,7 @@ fn assemble_interlaced_png<'a>(
 /// lay out an interlaced data stream.
 fn encode_png_interlaced(src: &EncodeBuffers<'_>) -> Result<Vec<u8>, EngineError> {
     let encode_err = |msg: &str| EngineError::Encode(format!("png: {msg}"));
-    let img = src.img;
+    let img = src.integer();
     let (w, h) = (img.width(), img.height());
     let color = ExtendedColorType::from(img.color());
     let (png_color, depth, bytes_per_pixel) = match color {
@@ -533,7 +555,24 @@ fn encode_png_interlaced(src: &EncodeBuffers<'_>) -> Result<Vec<u8>, EngineError
             )));
         }
     };
-    let pixels = img.as_bytes();
+    // PNG stores 16-bit samples big-endian, and the image
+    // holds them in native order (issue #464: written as
+    // they lay, a little-endian host swapped every sample's
+    // bytes). The image crate's own PNG encoder reorders the
+    // same way.
+    let reordered: Vec<u8>;
+    let pixels = if depth == png::BitDepth::Sixteen {
+        reordered = img
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|sample| u16::from_ne_bytes(*sample).to_be_bytes())
+            .collect();
+        &reordered[..]
+    } else {
+        img.as_bytes()
+    };
     let row_len = w as usize * bytes_per_pixel;
     assemble_interlaced_png(w, h, png_color, depth, None, None, bytes_per_pixel, |y| {
         &pixels[y as usize * row_len..(y as usize + 1) * row_len]
@@ -589,14 +628,22 @@ fn encode_webp(
         return Ok(encoded.to_vec());
     }
     if q >= 100 {
+        // The image crate's lossless encoder takes 8-bit samples
+        // only: a 16-bit or float image encodes from the shared
+        // 8-bit layout the lossy path reads (issue #464).
+        let (pixels, color) = match img.color() {
+            image::ColorType::L8
+            | image::ColorType::La8
+            | image::ColorType::Rgb8
+            | image::ColorType::Rgba8 => (img.as_bytes(), ExtendedColorType::from(img.color())),
+            color if color.has_alpha() => {
+                (src.rgba().as_raw().as_slice(), ExtendedColorType::Rgba8)
+            }
+            _ => (src.rgb().as_raw().as_slice(), ExtendedColorType::Rgb8),
+        };
         let mut buf = Vec::new();
         image::codecs::webp::WebPEncoder::new_lossless(&mut buf)
-            .write_image(
-                img.as_bytes(),
-                img.width(),
-                img.height(),
-                ExtendedColorType::from(img.color()),
-            )
+            .write_image(pixels, img.width(), img.height(), color)
             .map_err(|e| EngineError::Encode(e.to_string()))?;
         return Ok(buf);
     }

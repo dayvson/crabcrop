@@ -171,10 +171,10 @@ fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
 /// The media kind an upload validated as (issue #192):
 /// what the endpoint binds the object name's extension
 /// against, so a validated image cannot be stored under
-/// a name that presents it as something else. `Other` is
-/// a format the generic decoder accepts but the binding
-/// table does not enumerate (the PNM/TGA/QOI long tail);
-/// those carry no extension binding.
+/// a name that presents it as something else. Every kind
+/// carries a binding (issue #466): a body the generic
+/// decoder accepts but this table does not name is
+/// refused, never stored unbound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadMedia {
     Svg,
@@ -188,27 +188,24 @@ pub enum UploadMedia {
     Bmp,
     Tiff,
     Ico,
-    Other,
 }
 
 impl UploadMedia {
     /// The name extensions this media kind may be stored
-    /// under (lowercase, no dot), or `None` when the kind
-    /// carries no binding.
-    pub(crate) fn allowed_extensions(self) -> Option<&'static [&'static str]> {
+    /// under (lowercase, no dot).
+    pub(crate) fn allowed_extensions(self) -> &'static [&'static str] {
         match self {
-            UploadMedia::Svg => Some(&["svg"]),
-            UploadMedia::Heic => Some(&["heic", "heif"]),
-            UploadMedia::Jpeg => Some(&["jpg", "jpeg"]),
-            UploadMedia::Png => Some(&["png"]),
-            UploadMedia::Gif => Some(&["gif"]),
-            UploadMedia::WebP => Some(&["webp"]),
-            UploadMedia::Avif => Some(&["avif"]),
-            UploadMedia::Jxl => Some(&["jxl"]),
-            UploadMedia::Bmp => Some(&["bmp"]),
-            UploadMedia::Tiff => Some(&["tif", "tiff"]),
-            UploadMedia::Ico => Some(&["ico"]),
-            UploadMedia::Other => None,
+            UploadMedia::Svg => &["svg"],
+            UploadMedia::Heic => &["heic", "heif"],
+            UploadMedia::Jpeg => &["jpg", "jpeg"],
+            UploadMedia::Png => &["png"],
+            UploadMedia::Gif => &["gif"],
+            UploadMedia::WebP => &["webp"],
+            UploadMedia::Avif => &["avif"],
+            UploadMedia::Jxl => &["jxl"],
+            UploadMedia::Bmp => &["bmp"],
+            UploadMedia::Tiff => &["tif", "tiff"],
+            UploadMedia::Ico => &["ico"],
         }
     }
 
@@ -226,7 +223,6 @@ impl UploadMedia {
             UploadMedia::Bmp => "bmp",
             UploadMedia::Tiff => "tiff",
             UploadMedia::Ico => "ico",
-            UploadMedia::Other => "image",
         }
     }
 }
@@ -270,10 +266,14 @@ pub fn validate_source_image(bytes: &[u8]) -> Result<(), EngineError> {
 pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError> {
     ensure_jxl_decoder();
     if crate::svg::is_svg(bytes) {
-        crate::svg::prepare(bytes).map_err(EngineError::Decode)?;
-        let stored = crate::svg::sanitized_bytes(bytes).map_err(EngineError::Decode)?;
+        // The parse runs in the SVG worker (issue #447); what
+        // is stored is the sanitized document it parsed.
+        let screened = crate::svg::screen(bytes).map_err(EngineError::Decode)?;
+        screened
+            .intrinsic_size(None)
+            .map_err(|e| EngineError::Decode(e.to_string()))?;
         return Ok(PreparedUpload {
-            stored,
+            stored: screened.into_bytes(),
             media: UploadMedia::Svg,
         });
     }
@@ -306,7 +306,11 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
     // The generic decode accepted the bytes; name what it
     // accepted. The guess mirrors the decoder's own, with
     // JPEG XL (which the image crate does not know) taken
-    // from the branch detection above.
+    // from the branch detection above. The image crate is
+    // built with these formats only (issue #466), so the
+    // last arm is unreachable today; it refuses rather
+    // than storing a kind no extension is bound to, should
+    // a feature change ever compile another decoder in.
     let media = if detected == ImageFormat::Jxl {
         UploadMedia::Jxl
     } else {
@@ -319,7 +323,12 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
             Ok(image::ImageFormat::Bmp) => UploadMedia::Bmp,
             Ok(image::ImageFormat::Tiff) => UploadMedia::Tiff,
             Ok(image::ImageFormat::Ico) => UploadMedia::Ico,
-            _ => UploadMedia::Other,
+            other => {
+                let format = other.map_or_else(|_| "unknown".to_string(), |f| format!("{f:?}"));
+                return Err(EngineError::Decode(format!(
+                    "the {format} format is not an upload format this server accepts"
+                )));
+            }
         }
     };
     Ok(PreparedUpload {
@@ -405,15 +414,26 @@ pub struct SourceProbe {
     pub dimensions: Option<(u32, u32)>,
 }
 
+/// How long the explain probe waits for an SVG's intrinsic
+/// size: a parse with no render, which takes milliseconds
+/// for any document within the bounds.
+const SVG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Probe source bytes for the explain report: kind and
 /// dimensions, headers only (see [`SourceProbe`]).
 pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
     if crate::svg::is_svg(bytes) {
-        let dimensions = crate::svg::prepare(bytes).ok().and_then(|prepared| {
-            let (w, h) = prepared.intrinsic();
-            let (w, h) = (w.round() as u32, h.round() as u32);
-            if w >= 1 && h >= 1 { Some((w, h)) } else { None }
-        });
+        // The intrinsic size takes a parse, which runs in the
+        // SVG worker (issue #447) under the probe's own short
+        // deadline: the explain handler waits on it.
+        let deadline = std::time::Instant::now() + SVG_PROBE_TIMEOUT;
+        let dimensions = crate::svg::screen(bytes)
+            .ok()
+            .and_then(|screened| screened.intrinsic_size(Some(deadline)).ok())
+            .and_then(|(w, h)| {
+                let (w, h) = (w.round() as u32, h.round() as u32);
+                if w >= 1 && h >= 1 { Some((w, h)) } else { None }
+            });
         return SourceProbe {
             kind: "svg",
             dimensions,
@@ -584,6 +604,12 @@ pub enum EngineError {
     /// between operations and frames and aborts instead
     /// of running unbounded. The server maps it to 504.
     Timeout,
+    /// Signing the output failed because the C2PA timestamp
+    /// authority did not answer in time, refused, or sent
+    /// something that is not a timestamp (issue #467). A
+    /// dependency outage a retry may clear, so the server
+    /// maps it to 503 with `Retry-After`. Carries the cause.
+    ProvenanceUnavailable(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -618,6 +644,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::Timeout => {
                 write!(f, "processing exceeded the time budget")
+            }
+            EngineError::ProvenanceUnavailable(cause) => {
+                write!(f, "C2PA timestamp authority failed: {cause}")
             }
         }
     }
@@ -696,12 +725,12 @@ fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), 
 /// frame or page selection) and what sniffing them settled:
 /// the format their content declares, and whether they take
 /// the HEIC or the SVG decode path (an SVG arrives sanitized
-/// and parsed).
+/// and screened; the worker parses it at decode).
 struct SniffedSource<'b> {
     bytes: &'b [u8],
     detected: ImageFormat,
     heic: bool,
-    svg: Option<crate::svg::Prepared>,
+    svg: Option<crate::svg::Screened>,
 }
 
 /// What the decode stage of [`Engine::process_preferred`]
@@ -1002,11 +1031,11 @@ impl Engine {
         // path instead of the generic one.
         let heic = is_heic(bytes);
         // SVG sources are sniffed by content (the declared type
-        // can lie), sanitized, and parsed up front: the raster
+        // can lie), sanitized, and screened up front: the raster
         // becomes the decoded image below, and the output
         // format defaults to PNG (SVG has no raster format).
         let svg = if crate::svg::is_svg(bytes) {
-            Some(crate::svg::prepare(bytes).map_err(EngineError::Decode)?)
+            Some(crate::svg::screen(bytes).map_err(EngineError::Decode)?)
         } else {
             None
         };
@@ -1266,14 +1295,24 @@ impl Engine {
                     .expect("decode_webp_frames returns at least one frame")
                     .into_buffer(),
             )
-        } else if let Some(prep) = &source.svg {
+        } else if let Some(screened) = &source.svg {
             // Rasterize at the size the request is heading for
             // (or the intrinsic size when it asks for none), so
             // vectors stay crisp; the normal pipeline runs on
-            // the raster from here.
-            let (tw, th) =
-                svg_raster_target(ops, prep.intrinsic(), dpr_factor(directives.dpr, ctx));
-            prep.render(tw, th).map_err(EngineError::Decode)?
+            // the raster from here. The parse and the render
+            // run in the SVG worker (issue #447), killed at the
+            // request's deadline.
+            let dpr = dpr_factor(directives.dpr, ctx);
+            screened
+                .rasterize(ctx.deadline, |intrinsic| {
+                    svg_raster_target(ops, intrinsic, dpr)
+                })
+                .map_err(|e| match e {
+                    crate::svg::RenderError::TimedOut(_) if ctx.deadline.is_some() => {
+                        EngineError::Timeout
+                    }
+                    e => EngineError::Decode(e.to_string()),
+                })?
         } else if source.heic {
             // HEIC/HEIF: the oxideav decode applies the EXIF
             // orientation from the decoder's own metadata (the
@@ -1283,7 +1322,9 @@ impl Engine {
             // then runs exactly as for the other formats.
             let (mut img, meta) = crate::heic::decode_heic(bytes)?;
             source_meta = meta;
-            if !keep_profile && let Some(icc) = &source_meta.icc {
+            if let Some(icc) = &source_meta.icc
+                && !(keep_profile && crate::color::icc_embeddable(icc))
+            {
                 img = crate::color::convert_to_srgb(img, icc);
             }
             img
@@ -1304,7 +1345,12 @@ impl Engine {
             // stage works in one known space, unless the
             // request asked to keep the profile (then the
             // profile is embedded at encode time instead).
-            if !keep_profile && let Some(icc) = &source_meta.icc {
+            // A profile the output will not carry (malformed,
+            // or past the embed cap, issue #445) converts
+            // anyway: untagged pixels would show wrong colors.
+            if let Some(icc) = &source_meta.icc
+                && !(keep_profile && crate::color::icc_embeddable(icc))
+            {
                 img = crate::color::convert_to_srgb(img, icc);
             }
             img
@@ -1566,21 +1612,20 @@ impl Engine {
         let mut encode_opts = EncodeOptions::default();
         // One smart crop window per crop for the whole
         // animation (issue #376): the first frame decides,
-        // the rest replay.
-        let mut smart_windows = SmartWindows::default();
+        // the rest replay. One trim window per trim (issue
+        // #465): the union over every frame, settled before
+        // any frame renders, so the frames share one canvas.
+        let mut share = FrameShare {
+            smart_windows: Some(SmartWindows::default()),
+            ..FrameShare::default()
+        };
+        survey_trims(&frames, ops, cap, dpr, ctx, &directives, &mut share)?;
         for frame in frames {
             ctx.check_deadline()?;
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, opts, _, _, _, _) = apply_operations(
-                img,
-                ops,
-                cap,
-                dpr,
-                ctx,
-                &directives,
-                Some(&mut smart_windows),
-            )?;
+            let (img, opts, _, _, _, _) =
+                apply_operations(img, ops, cap, dpr, ctx, &directives, Some(&mut share))?;
             if out_frames.is_empty() {
                 encode_opts = opts;
             }
@@ -1744,12 +1789,17 @@ impl Engine {
         let dpr = dpr_factor(directives.dpr, ctx);
         let mut budget = OutputBudget::new();
         let mut out_frames = Vec::with_capacity(frames.len());
+        // The frames share their trim windows (issue #465),
+        // as on the animated image paths: the encoder takes
+        // one frame size.
+        let mut share = FrameShare::default();
+        survey_trims(&frames, ops, cap, dpr, ctx, &directives, &mut share)?;
         for frame in frames {
             ctx.check_deadline()?;
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
             let (img, _, _, _, _, _) =
-                apply_operations(img, ops, cap, dpr, ctx, &directives, None)?;
+                apply_operations(img, ops, cap, dpr, ctx, &directives, Some(&mut share))?;
             budget.charge(img.width(), img.height())?;
             out_frames.push(crate::video::VideoFrame {
                 pixels: img.to_rgba8(),
@@ -2213,6 +2263,27 @@ fn filter_preserves_positions(filter: &Filter) -> bool {
     )
 }
 
+/// Whether a filter leaves every pixel where it was, so a
+/// pending focal form stays put (issue #465): the
+/// position-preserving filters of #373, plus the ones that
+/// paint over the frame in place (watermark, overlay, text,
+/// border, background removal). Those add content a detector
+/// could find, which is why #373 re-detects after them, but
+/// they move nothing. Anything else drops the form: a new
+/// filter errs toward the crop's own alignment, never toward
+/// a stale position.
+fn filter_keeps_focal(filter: &Filter) -> bool {
+    filter_preserves_positions(filter)
+        || matches!(
+            filter,
+            Filter::Watermark { .. }
+                | Filter::Overlay { .. }
+                | Filter::Text { .. }
+                | Filter::Border(..)
+                | Filter::RemoveBg
+        )
+}
+
 /// Drop every detection memo: the chain step that just
 /// ran moved the content the memos' boxes describe.
 fn invalidate_detection_memos(
@@ -2637,6 +2708,139 @@ impl SmartWindows {
     }
 }
 
+/// A rectangle of an image as (left, top, width, height).
+type Window = (u32, u32, u32, u32);
+
+/// One trim's shared window: the trim's position in the
+/// chain (operation and filter indexes), the frame
+/// dimensions it was surveyed at, and the union of the boxes
+/// the frames' own tolerance passes keep; `None` when every
+/// frame was uniform.
+#[derive(Debug)]
+struct TrimWindow {
+    key: (usize, usize),
+    dims: (u32, u32),
+    found: Option<Window>,
+}
+
+/// Trim windows shared across the frames of one animated
+/// render (issue #465). Trim cuts a box that depends on the
+/// content, so frames trimmed one at a time came out at
+/// different sizes: the GIF screen took the first frame's
+/// size and misplaced or clipped the rest, and the animated
+/// WebP and video encoders refused the frames. Each window
+/// is settled by [`survey_trims`] before any frame renders,
+/// as the union of every frame's own box, so one cut holds
+/// every frame's content and the frames stay registered on
+/// one canvas. Entries key on the trim's chain position and
+/// the frame dimensions, so a frame of a different size
+/// trims for itself.
+#[derive(Debug, Default)]
+struct TrimWindows {
+    entries: Vec<TrimWindow>,
+}
+
+impl TrimWindows {
+    /// The settled box for the trim at `key` on a frame of
+    /// `dims`, or `None` when no window is settled for it.
+    fn get(&self, key: (usize, usize), dims: (u32, u32)) -> Option<Option<Window>> {
+        self.entries
+            .iter()
+            .find(|e| e.key == key && e.dims == dims)
+            .map(|e| e.found)
+    }
+
+    fn settle(&mut self, key: (usize, usize), dims: (u32, u32), found: Option<Window>) {
+        self.entries.retain(|e| e.key != key);
+        self.entries.push(TrimWindow { key, dims, found });
+    }
+}
+
+/// The geometry the frames of one animated render share, so
+/// the frames come out on one canvas, cut from the same part
+/// of the scene.
+#[derive(Debug, Default)]
+struct FrameShare {
+    /// One smart crop window per crop (issue #376). `None`
+    /// on the video path, whose frames still decide their
+    /// smart crops one at a time.
+    smart_windows: Option<SmartWindows>,
+    /// One trim window per trim filter (issue #465).
+    trims: TrimWindows,
+}
+
+/// The smallest box holding both boxes; `None` stands for no
+/// box at all.
+fn union_box(a: Option<Window>, b: Option<Window>) -> Option<Window> {
+    match (a, b) {
+        (Some((ax, ay, aw, ah)), Some((bx, by, bw, bh))) => {
+            let (left, top) = (ax.min(bx), ay.min(by));
+            let right = (ax + aw).max(bx + bw);
+            let bottom = (ay + ah).max(by + bh);
+            Some((left, top, right - left, bottom - top))
+        }
+        (one, None) | (None, one) => one,
+    }
+}
+
+/// Settle the trim windows of an animated render (issue
+/// #465) before its frames render: for each trim filter in
+/// chain order, run every frame up to that filter (the trims
+/// before it replaying their settled windows, so the survey
+/// sees each frame as the render will) and record the union
+/// of the boxes the frames' own tolerance passes keep. The
+/// cost is one extra chain prefix per trim per frame, under
+/// the render's own deadline. A lone frame has nothing to
+/// share and trims for itself.
+fn survey_trims(
+    frames: &[image::Frame],
+    ops: &[Operation],
+    cap: Option<(u32, u32)>,
+    dpr: f32,
+    ctx: &ProcessContext<'_>,
+    directives: &crate::url::RequestDirectives,
+    share: &mut FrameShare,
+) -> Result<(), EngineError> {
+    if frames.len() < 2 {
+        return Ok(());
+    }
+    check_operation_count(ops)?;
+    for (op_index, op) in ops.iter().enumerate() {
+        let Operation::Filters(filters) = op else {
+            continue;
+        };
+        for (filter_index, filter) in filters.iter().enumerate() {
+            let tolerance = match filter {
+                Filter::Trim(tolerance) | Filter::TrimSides(tolerance, _) => *tolerance,
+                _ => continue,
+            };
+            let key = (op_index, filter_index);
+            // The first frame's dimensions and the union so far.
+            let mut surveyed: Option<((u32, u32), Option<Window>)> = None;
+            for frame in frames {
+                ctx.check_deadline()?;
+                let img = DynamicImage::ImageRgba8(frame.buffer().clone());
+                let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
+                let img = chain.run_to(img, ops, key)?;
+                let dims = (img.width(), img.height());
+                let found = crate::filters::trim_box(&img, tolerance);
+                match &mut surveyed {
+                    None => surveyed = Some((dims, found)),
+                    Some((first, union)) if *first == dims => *union = union_box(*union, found),
+                    // Dimensions at a trim follow from the
+                    // chain alone, so frames agree on them;
+                    // one that does not trims for itself.
+                    Some(_) => {}
+                }
+            }
+            if let Some((dims, found)) = surveyed {
+                share.trims.settle(key, dims, found);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply the operations to one image, collecting the encoding
 /// directives along the way. Shared by the still pipeline and
 /// the animated paths (GIF and WebP), which run it once per
@@ -2648,38 +2852,12 @@ fn apply_operations(
     dpr: f32,
     ctx: &ProcessContext<'_>,
     directives: &crate::url::RequestDirectives,
-    smart_windows: Option<&mut SmartWindows>,
+    share: Option<&mut FrameShare>,
 ) -> Result<ApplyOutcome, EngineError> {
     check_operation_count(ops)?;
-    let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, smart_windows);
+    let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, share);
     for (op_index, op) in ops.iter().enumerate() {
-        ctx.check_deadline()?;
-        img = chain.apply_op(img, op_index, op)?;
-        // Every operation other than the filters segment
-        // sizes, crops, or pads, so the detection memos never
-        // survive one (issue #373); the filters arm
-        // invalidates per filter instead, and the no-op
-        // arms (frame, page, debug) simply pay a fresh
-        // inference in a chain that mixes them with
-        // detection, which no real chain does.
-        if !matches!(op, Operation::Filters(_)) {
-            invalidate_detection_memos(
-                &mut chain.face_memo,
-                &mut chain.detection_memos,
-                &mut chain.segment_memo,
-            );
-        }
-        // The running image stays inside the output budget
-        // after every operation, not only after the ones
-        // that size it (issue #182, audit R2-12). While a
-        // fused window is pending (issue #287) the image in
-        // hand is still the pre-crop frame: the two-step
-        // path checks the window at this point, and the
-        // fused crop ran that same check on the window when
-        // it recorded it.
-        if chain.fused_window.is_none() {
-            check_output_pixels(img.width(), img.height())?;
-        }
+        img = chain.step(img, op_index, op)?;
     }
     chain.finish(img)
 }
@@ -2697,23 +2875,20 @@ struct ChainState<'r, 'a> {
     dpr: f32,
     ctx: &'r ProcessContext<'a>,
     directives: &'r crate::url::RequestDirectives,
-    /// The smart crop windows an animated render shares
-    /// across its frames (issue #376); `None` on a still.
-    smart_windows: Option<&'r mut SmartWindows>,
+    /// The geometry an animated render shares across its
+    /// frames (issues #376, #465); `None` on a still.
+    share: Option<&'r mut FrameShare>,
     encode_opts: EncodeOptions,
     face_memo: FaceMemo,
     /// The detection providers in resolution order, with
     /// one detection memo per provider (issue #166).
     detect_providers: Vec<&'a dyn crate::ai::DetectionProvider>,
     detection_memos: Vec<DetectionMemo>,
-    /// The pending focal rectangle from a `focal:` segment,
-    /// consumed by the next crop.
-    focal: Option<(u32, u32, u32, u32)>,
-    /// The pending focal point from a `focalpoint:` segment
-    /// (issue #313), consumed the same way. Setting either
-    /// focal form clears the other, so the last one in the
-    /// chain is the one the crop obeys.
-    focal_point: Option<(f32, f32, f32)>,
+    /// The pending focal form from a `focal:` or
+    /// `focalpoint:` segment (issue #313), consumed by the
+    /// next crop. One slot holds both forms, so the last one
+    /// in the chain is the one the crop obeys.
+    focal: Option<PendingFocal>,
     /// The `debug:focal` state: armed by the segment, captured
     /// by the first crop that follows it. The capture holds
     /// the values that crop actually used (threaded out of the
@@ -2747,6 +2922,146 @@ struct ChainState<'r, 'a> {
     fused_window: Option<(u32, u32, u32, u32)>,
 }
 
+/// A pending focal form (issues #313, #465): the rectangle
+/// a `focal:` segment named or the point a `focalpoint:`
+/// segment named, carried in the coordinates of the image in
+/// hand. The segment names it against the image at its own
+/// position in the chain; each later step that moves pixels
+/// maps it along (a resize or fit-in scales it, a resize flip
+/// mirrors it, a crop-rect or trim cuts it, a pad places
+/// it), and a filter that moves pixels any other way drops
+/// it, so the consuming crop never reads coordinates of an
+/// image that is gone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingFocal {
+    /// `None` for a rectangle, the zoom for a point.
+    zoom: Option<f32>,
+    /// (left, top, right, bottom) in the coordinates of a
+    /// `basis.0` x `basis.1` image. A point is a rectangle
+    /// of no size.
+    edges: [f64; 4],
+    basis: (u32, u32),
+}
+
+/// A pending focal form resolved against the image a crop
+/// cuts: a rectangle in its pixels, or a point as fractions
+/// of it with the zoom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Focal {
+    Rect((u32, u32, u32, u32)),
+    Point((f32, f32, f32)),
+}
+
+impl PendingFocal {
+    fn rect((left, top, right, bottom): (u32, u32, u32, u32), basis: (u32, u32)) -> Self {
+        PendingFocal {
+            zoom: None,
+            edges: [left as f64, top as f64, right as f64, bottom as f64],
+            basis,
+        }
+    }
+
+    fn point((x, y, zoom): (f32, f32, f32), basis: (u32, u32)) -> Self {
+        let (px, py) = (x as f64 * basis.0 as f64, y as f64 * basis.1 as f64);
+        PendingFocal {
+            zoom: Some(zoom),
+            edges: [px, py, px, py],
+            basis,
+        }
+    }
+
+    /// Through a resize of the whole image to `to`, mirrored
+    /// afterwards on the flipped axes.
+    fn scaled(self, to: (u32, u32), flip_h: bool, flip_v: bool) -> Self {
+        let ratio = |to: u32, from: u32| {
+            if from == 0 {
+                0.0
+            } else {
+                to as f64 / from as f64
+            }
+        };
+        let (sx, sy) = (ratio(to.0, self.basis.0), ratio(to.1, self.basis.1));
+        let [mut left, mut top, mut right, mut bottom] = self.edges;
+        (left, right) = (left * sx, right * sx);
+        (top, bottom) = (top * sy, bottom * sy);
+        if flip_h {
+            (left, right) = (to.0 as f64 - right, to.0 as f64 - left);
+        }
+        if flip_v {
+            (top, bottom) = (to.1 as f64 - bottom, to.1 as f64 - top);
+        }
+        PendingFocal {
+            zoom: self.zoom,
+            edges: [left, top, right, bottom],
+            basis: to,
+        }
+    }
+
+    /// Through a cut to `window`.
+    /// Whatever falls outside the window lands on its nearest
+    /// edge, so a rectangle the cut removed entirely still
+    /// pulls the crop toward the side it was on.
+    fn cropped(self, (x, y, w, h): Window) -> Self {
+        let [left, top, right, bottom] = self.edges;
+        let along =
+            |v: f64, origin: u32, extent: u32| (v - origin as f64).clamp(0.0, extent as f64);
+        PendingFocal {
+            zoom: self.zoom,
+            edges: [
+                along(left, x, w),
+                along(top, y, h),
+                along(right, x, w),
+                along(bottom, y, h),
+            ],
+            basis: (w, h),
+        }
+    }
+
+    /// Through a fit onto a larger canvas: the image scaled
+    /// to `placed`'s size and set at its offset on a
+    /// `canvas`-sized image.
+    fn placed(self, (x, y, w, h): Window, canvas: (u32, u32)) -> Self {
+        let fitted = self.scaled((w, h), false, false);
+        let [left, top, right, bottom] = fitted.edges;
+        let (dx, dy) = (x as f64, y as f64);
+        PendingFocal {
+            zoom: self.zoom,
+            edges: [left + dx, top + dy, right + dx, bottom + dy],
+            basis: canvas,
+        }
+    }
+
+    /// Resolve against the `dims` image the crop cuts. The
+    /// steps keep the basis in step with the image; a size
+    /// change no step mapped scales over.
+    fn resolve(self, dims: (u32, u32)) -> Focal {
+        let at = if self.basis == dims {
+            self
+        } else {
+            self.scaled(dims, false, false)
+        };
+        let [left, top, right, bottom] = at.edges;
+        match at.zoom {
+            None => {
+                let px = |v: f64, extent: u32| v.round().clamp(0.0, extent as f64) as u32;
+                let (left, top) = (px(left, dims.0), px(top, dims.1));
+                let (right, bottom) = (px(right, dims.0).max(left), px(bottom, dims.1).max(top));
+                Focal::Rect((left, top, right, bottom))
+            }
+            Some(zoom) => {
+                let frac = |v: f64, extent: u32| {
+                    if extent == 0 {
+                        0.5
+                    } else {
+                        (v / extent as f64).clamp(0.0, 1.0) as f32
+                    }
+                };
+                Focal::Point((frac(left, dims.0), frac(top, dims.1), zoom))
+            }
+        }
+    }
+}
+
 /// What a class filter paints (see
 /// [`ChainState::class_targets`]): the segmentation masks
 /// when a segment provider is configured, the detection
@@ -2763,7 +3078,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
         dpr: f32,
         ctx: &'r ProcessContext<'a>,
         directives: &'r crate::url::RequestDirectives,
-        smart_windows: Option<&'r mut SmartWindows>,
+        share: Option<&'r mut FrameShare>,
     ) -> Self {
         let detect_providers = detection_providers(ctx);
         let detection_memos = vec![None; detect_providers.len()];
@@ -2772,13 +3087,12 @@ impl<'r, 'a> ChainState<'r, 'a> {
             dpr,
             ctx,
             directives,
-            smart_windows,
+            share,
             encode_opts: EncodeOptions::default(),
             face_memo: None,
             detect_providers,
             detection_memos,
             focal: None,
-            focal_point: None,
             debug_armed: false,
             debug_capture: None,
             studio_record: None,
@@ -2789,6 +3103,66 @@ impl<'r, 'a> ChainState<'r, 'a> {
             fusion: fusion_plan(ops),
             fused_window: None,
         }
+    }
+
+    /// Run one operation of the chain, with what every
+    /// operation owes the chain around it: the deadline, the
+    /// detection memos, and the output budget.
+    fn step(
+        &mut self,
+        mut img: DynamicImage,
+        op_index: usize,
+        op: &Operation,
+    ) -> Result<DynamicImage, EngineError> {
+        self.ctx.check_deadline()?;
+        img = self.apply_op(img, op_index, op)?;
+        // Every operation other than the filters segment
+        // sizes, crops, or pads, so the detection memos never
+        // survive one (issue #373); the filters arm
+        // invalidates per filter instead, and the no-op
+        // arms (frame, page, debug) simply pay a fresh
+        // inference in a chain that mixes them with
+        // detection, which no real chain does.
+        if !matches!(op, Operation::Filters(_)) {
+            invalidate_detection_memos(
+                &mut self.face_memo,
+                &mut self.detection_memos,
+                &mut self.segment_memo,
+            );
+        }
+        // The running image stays inside the output budget
+        // after every operation, not only after the ones
+        // that size it (issue #182, audit R2-12). While a
+        // fused window is pending (issue #287) the image in
+        // hand is still the pre-crop frame: the two-step
+        // path checks the window at this point, and the
+        // fused crop ran that same check on the window when
+        // it recorded it.
+        if self.fused_window.is_none() {
+            check_output_pixels(img.width(), img.height())?;
+        }
+        Ok(img)
+    }
+
+    /// Run the chain on `img` up to the filter at `key` (the
+    /// operation and filter indexes) and return the image
+    /// that filter receives: the trim survey's view of a
+    /// frame (see [`survey_trims`]).
+    fn run_to(
+        &mut self,
+        mut img: DynamicImage,
+        ops: &[Operation],
+        (op_index, filter_index): (usize, usize),
+    ) -> Result<DynamicImage, EngineError> {
+        for (index, op) in ops.iter().enumerate().take(op_index) {
+            img = self.step(img, index, op)?;
+        }
+        if let Some(Operation::Filters(filters)) = ops.get(op_index) {
+            for (index, filter) in filters.iter().enumerate().take(filter_index) {
+                img = self.filter_step(img, (op_index, index), filter)?;
+            }
+        }
+        Ok(img)
     }
 
     /// Apply one operation of the chain to the image in hand.
@@ -2829,10 +3203,16 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         self.cap.map(|(cw, ch)| SizeCap::Axes(cw, ch)),
                         self.dpr,
                     )?
-                }
+                };
+                let dims = (img.width(), img.height());
+                self.focal = self
+                    .focal
+                    .map(|f| f.scaled(dims, size.flip_horizontal, size.flip_vertical));
             }
             Operation::FitIn { size, adaptive } => {
-                img = apply_fit_in(img, size, *adaptive, self.cap, self.dpr)?
+                img = apply_fit_in(img, size, *adaptive, self.cap, self.dpr)?;
+                let dims = (img.width(), img.height());
+                self.focal = self.focal.map(|f| f.scaled(dims, false, false));
             }
             Operation::Pad { size, fill } => {
                 let (tw, th) = match (size.width, size.height) {
@@ -2845,7 +3225,11 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         ));
                     }
                 };
-                img = apply_pad(img, tw, th, *fill, self.directives.fill, self.cap)?;
+                let (padded, placed) =
+                    apply_pad(img, tw, th, *fill, self.directives.fill, self.cap)?;
+                img = padded;
+                let dims = (img.width(), img.height());
+                self.focal = self.focal.map(|f| f.placed(placed, dims));
             }
             Operation::FocalRect {
                 left,
@@ -2863,15 +3247,19 @@ impl<'r, 'a> ChainState<'r, 'a> {
                         img.height()
                     )));
                 }
-                self.focal = Some((*left, *top, *right, *bottom));
-                self.focal_point = None;
+                self.focal = Some(PendingFocal::rect(
+                    (*left, *top, *right, *bottom),
+                    (img.width(), img.height()),
+                ));
             }
             Operation::FocalPoint { x, y, zoom } => {
                 // Fractions of the image in effect at this
                 // point, so there is no bounds failure to
                 // make: any image can carry the point.
-                self.focal_point = Some((*x, *y, *zoom));
-                self.focal = None;
+                self.focal = Some(PendingFocal::point(
+                    (*x, *y, *zoom),
+                    (img.width(), img.height()),
+                ));
             }
             Operation::CropRect {
                 left,
@@ -2901,42 +3289,95 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 } else {
                     img = img.crop_imm(*left, *top, right - left, bottom - top);
                 }
+                let window = (*left, *top, right - left, bottom - top);
+                self.focal = self.focal.map(|f| f.cropped(window));
             }
             Operation::Crop { size, align } => img = self.crop(img, op_index, size, align)?,
             Operation::Filters(filters) => {
-                // One filter at a time, in order: watermark
-                // filters resolve against the server-fetched
-                // images, everything else goes through
-                // `apply_filters_filled`. The deadline is
-                // checked between filters, not only between
-                // operations: a segment is one operation to
-                // the per-operation check, so without this a
-                // long segment (a hundred blurs in one
-                // `filters:`) runs far past the deadline the
-                // runner already reported to the client.
-                for filter in filters {
-                    self.ctx.check_deadline()?;
-                    img = self.apply_filter(img, filter)?;
-                    // A filter that moves content leaves the
-                    // detection memos describing a state the
-                    // pixels have left (issue #373): the next
-                    // detection consumer must re-detect.
-                    if !filter_preserves_positions(filter) {
-                        invalidate_detection_memos(
-                            &mut self.face_memo,
-                            &mut self.detection_memos,
-                            &mut self.segment_memo,
-                        );
-                    }
-                    // Every filter leaves the image inside
-                    // the output budget: growth is checked
-                    // before it compounds across a chain,
-                    // not just at the size operations.
-                    check_output_pixels(img.width(), img.height())?;
+                for (filter_index, filter) in filters.iter().enumerate() {
+                    img = self.filter_step(img, (op_index, filter_index), filter)?;
                 }
             }
         }
         Ok(img)
+    }
+
+    /// One filter of a `filters:` segment, at `key` (the
+    /// operation and filter indexes), with what every
+    /// filter owes the chain around it: the deadline, the
+    /// pending focal form, the detection memos, and the
+    /// output budget. Trims run here, since they need their
+    /// chain position to find the window an animated render
+    /// shares (issue #465); every other filter goes through
+    /// [`ChainState::apply_filter`].
+    fn filter_step(
+        &mut self,
+        img: DynamicImage,
+        key: (usize, usize),
+        filter: &Filter,
+    ) -> Result<DynamicImage, EngineError> {
+        // The deadline is checked between filters, not only
+        // between operations: a segment is one operation to
+        // the per-operation check, so without this a long
+        // segment (a hundred blurs in one `filters:`) runs
+        // far past the deadline the runner already reported
+        // to the client.
+        self.ctx.check_deadline()?;
+        let before = (img.width(), img.height());
+        let img = match filter {
+            Filter::Trim(tolerance) => self.trim(img, key, *tolerance, [0; 4]),
+            Filter::TrimSides(tolerance, sides) => self.trim(img, key, *tolerance, *sides),
+            _ => {
+                let img = self.apply_filter(img, filter)?;
+                // A filter that moves pixels in a way the
+                // chain does not track (a rotation, a flip,
+                // an upscale, studio) leaves the pending
+                // focal form pointing at content that is no
+                // longer there: drop it, and the crop falls
+                // back to its alignment (issue #465).
+                if !(filter_keeps_focal(filter) && (img.width(), img.height()) == before) {
+                    self.focal = None;
+                }
+                img
+            }
+        };
+        // A filter that moves content leaves the detection
+        // memos describing a state the pixels have left
+        // (issue #373): the next detection consumer must
+        // re-detect.
+        if !filter_preserves_positions(filter) {
+            invalidate_detection_memos(
+                &mut self.face_memo,
+                &mut self.detection_memos,
+                &mut self.segment_memo,
+            );
+        }
+        // Every filter leaves the image inside the output
+        // budget: growth is checked before it compounds
+        // across a chain, not just at the size operations.
+        check_output_pixels(img.width(), img.height())?;
+        Ok(img)
+    }
+
+    /// A `trim` filter: the window the frame's own tolerance
+    /// pass keeps, or on an animated render the window every
+    /// frame shares (issue #465), less the named sides. A
+    /// pending focal form moves with the cut.
+    fn trim(
+        &mut self,
+        img: DynamicImage,
+        key: (usize, usize),
+        tolerance: u8,
+        sides: [u32; 4],
+    ) -> DynamicImage {
+        let dims = (img.width(), img.height());
+        let found = match self.share.as_deref().and_then(|s| s.trims.get(key, dims)) {
+            Some(shared) => shared,
+            None => crate::filters::trim_box(&img, tolerance),
+        };
+        let window = crate::filters::trim_window(dims, found, sides);
+        self.focal = self.focal.map(|f| f.cropped(window));
+        crate::filters::trim_to(img, found, sides)
     }
 
     /// The `crop:` operation: crop to the target's aspect
@@ -2960,31 +3401,27 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 ));
             }
         };
-        // The crop consumes any pending focal rectangle.
-        // Center and smart crops position on it (smart
-        // skips face and saliency detection entirely);
-        // face and directional alignments were explicit
-        // caller instructions and ignore it.
-        let focal_rect = self
+        // The crop consumes any pending focal form, mapped
+        // onto the image in hand by the steps since its
+        // segment (issue #465). Center and smart crops
+        // position on it (smart skips face and saliency
+        // detection entirely); face and directional
+        // alignments were explicit caller instructions and
+        // ignore it.
+        let focal = self
             .focal
             .take()
-            .filter(|_| *align == Align::Center || *align == Align::Smart);
-        // A pending focal point behaves the same way
-        // (issue #313): center and smart crops center
-        // on it, explicit alignments ignore it.
-        let focal_pt = self
-            .focal_point
-            .take()
-            .filter(|_| *align == Align::Center || *align == Align::Smart);
+            .filter(|_| *align == Align::Center || *align == Align::Smart)
+            .map(|f| f.resolve((img.width(), img.height())));
         // With the debug view armed, this crop is the
         // one the view annotates: clone the canvas it
         // operates on and run the traced crop variants,
         // which report the decision they actually made.
         let want_trace = self.debug_armed && self.debug_capture.is_none();
         let canvas = want_trace.then(|| img.clone());
-        let img = if let Some(rect) = focal_rect {
+        let img = if let Some(Focal::Rect(rect)) = focal {
             self.focal_rect_crop(img, (tw, th), rect, canvas)
-        } else if let Some(pt) = focal_pt {
+        } else if let Some(Focal::Point(pt)) = focal {
             self.focal_point_crop(img, (tw, th), pt, canvas)
         } else if *align == Align::Face {
             self.face_crop(img, (tw, th), canvas)?
@@ -3003,7 +3440,12 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 self.debug_capture = Some(capture_from_trace(canvas, trace));
             }
             cropped
-        } else if *align == Align::Smart && self.smart_windows.is_some() {
+        } else if *align == Align::Smart
+            && self
+                .share
+                .as_ref()
+                .is_some_and(|s| s.smart_windows.is_some())
+        {
             self.shared_smart_crop(img, (tw, th), op_index, align)
         } else {
             crate::crop::crop_to_aspect_with(
@@ -3258,8 +3700,9 @@ impl<'r, 'a> ChainState<'r, 'a> {
         align: &Align,
     ) -> DynamicImage {
         let windows = self
-            .smart_windows
+            .share
             .as_deref_mut()
+            .and_then(|s| s.smart_windows.as_mut())
             .expect("the crop checked the option");
         let key = (op_index, img.width(), img.height());
         if let Some((x, y, cw, ch)) = windows.get(key) {
@@ -4051,6 +4494,31 @@ fn apply_size_cropped(
     apply_size_windowed(img, size, cap, dpr, Some(window))
 }
 
+/// Whether a resize or fit-in box asks for a zero pixel side
+/// (issue #464). A single `0` is proportional (or unbounded),
+/// but a zero written with more digits (`00x100`) parses as an
+/// exact zero: the spelling is shared grammar that the spec
+/// vectors pin, so the parser keeps it and the engine refuses
+/// it. Read on the size as requested, before DPR scaling
+/// rounds a zero up to one pixel. The `/explain` forecast asks
+/// the same question, so the two cannot disagree.
+pub(crate) fn has_zero_side(size: &ImageSize) -> bool {
+    size.width == Dimension::Pixels(0) || size.height == Dimension::Pixels(0)
+}
+
+/// Refuse a [`has_zero_side`] box with `unsupported_operation`,
+/// the answer an output past the pixel budget gets.
+fn check_nonzero_size(size: &ImageSize) -> Result<(), EngineError> {
+    if has_zero_side(size) {
+        return Err(EngineError::Unsupported(
+            "requested size has a zero pixel side; write 0 alone for a \
+             proportional or unbounded axis"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn apply_size_windowed(
     img: DynamicImage,
     size: &ImageSize,
@@ -4058,6 +4526,7 @@ fn apply_size_windowed(
     dpr: f32,
     window: Option<(u32, u32, u32, u32)>,
 ) -> Result<DynamicImage, EngineError> {
+    check_nonzero_size(size)?;
     let size = &ImageSize {
         width: scale_dimension(size.width, dpr),
         height: scale_dimension(size.height, dpr),
@@ -4209,7 +4678,9 @@ pub(crate) fn resize_lanczos3_cropped(
 /// center it, and fill the rest of the canvas: a solid color
 /// (the pad segment's own, or the request's `fill(...)`
 /// directive, or black), or a blurred cover-scaled copy of the
-/// image itself.
+/// image itself. Also returns where the fitted image sits on
+/// the canvas, which the pending focal form follows (issue
+/// #465).
 fn apply_pad(
     img: DynamicImage,
     target_w: u32,
@@ -4217,9 +4688,10 @@ fn apply_pad(
     fill: PadFill,
     directive_fill: Option<[u8; 3]>,
     cap: Option<(u32, u32)>,
-) -> Result<DynamicImage, EngineError> {
+) -> Result<(DynamicImage, Window), EngineError> {
     if target_w == 0 || target_h == 0 {
-        return Ok(img);
+        let whole = (0, 0, img.width(), img.height());
+        return Ok((img, whole));
     }
     check_output_pixels(target_w, target_h)?;
     let fitted = apply_fit_in(
@@ -4237,7 +4709,7 @@ fn apply_pad(
         1.0,
     )?;
     if fitted.width() == target_w && fitted.height() == target_h {
-        return Ok(fitted);
+        return Ok((fitted, (0, 0, target_w, target_h)));
     }
     let color = match fill {
         PadFill::Color(c) => Some(c),
@@ -4265,7 +4737,8 @@ fn apply_pad(
     let x = (target_w - fitted.width()) / 2;
     let y = (target_h - fitted.height()) / 2;
     image::imageops::overlay(&mut base, &fitted.to_rgba8(), x as i64, y as i64);
-    Ok(DynamicImage::ImageRgba8(base))
+    let placed = (x, y, fitted.width(), fitted.height());
+    Ok((DynamicImage::ImageRgba8(base), placed))
 }
 
 /// The box an adaptive fit-in actually fits into: the declared
@@ -4305,6 +4778,7 @@ fn apply_fit_in(
     cap: Option<(u32, u32)>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
+    check_nonzero_size(size)?;
     let scaled = ImageSize {
         width: scale_dimension(size.width, dpr),
         height: scale_dimension(size.height, dpr),
@@ -4343,3 +4817,6 @@ fn apply_fit_in(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_formats;

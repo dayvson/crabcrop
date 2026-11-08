@@ -72,7 +72,7 @@ Attaching the tags: purge by tag only works if responses were cached carrying a 
 - **A Cache Response Rule (no code):** one rule per preset. Match `http.request.uri.path contains "/preset:<name>/"` and set Cache-Tag to `<name>`. Preset URLs carry `preset:<name>` as a path segment, so the match is exact. Rule budgets are small on lower plans, so this suits a handful of presets.
 - **The Worker bridge (many or dynamic groups):** `cache-tag-worker.js` in this directory copies whatever `Cache-Group` values a response carries into `Cache-Tag`. Preset names must be valid tag characters (printable ASCII, no spaces), which crabcrop preset names are in practice. Cloudflare strips `Cache-Tag` before delivery, so visitors never see it. Step 4 of the checklist proves the tags landed on your zone.
 
-One membership subtlety, mirrored on both sides: crabcrop groups accumulate (an entry joins a group the first time any grouped spelling of its URL is served), and Cloudflare tags only attach to responses cached while the bridge was live. Right after enabling a bridge, purge the hostname once to re-seed the edge cache with tagged copies.
+One membership subtlety, mirrored on both sides: crabcrop groups accumulate (an entry joins a group the first time any grouped spelling of its URL is served), and Cloudflare tags only attach to responses cached while the bridge was live. Right after enabling a bridge, purge the hostname once to re-seed the edge cache with tagged copies. Neither bridge tags a sealed URL: its response carries no `Cache-Group` and its path hides the `preset:` segment, so purge sealed URLs by URL (see [Cache headers and groups](../../docs/endpoints.md#cache-headers-and-groups)).
 
 ## 6. Tiered Cache and Cache Reserve (optional)
 
@@ -84,7 +84,7 @@ One membership subtlety, mirrored on both sides: crabcrop groups accumulate (an 
 Run against your zone after setup:
 
 1. Request a signed image URL twice. The second response shows `cf-cache-status: HIT`, and the first carries crabcrop's own `cache-status` header naming the tier that served the origin fill.
-2. Request the same URL as meta (`Accept: application/json`). It is never a HIT on repeat: `private, no-store` is respected.
+2. Request the same URL as meta (`Accept: application/json`). It is never a HIT on repeat: `private, no-store` is respected. The meta check needs meta mode on (`CRABCROP_META_MODE=1`). With it off (the default), the answer is `403 meta_disabled`, an error status that the CDN's error-caching rules govern instead, so it shows nothing about how `private, no-store` is handled.
 3. Purge one URL in both layers, then request it: `cf-cache-status: MISS`, then HIT again on the next request.
 4. If you use the tag bridge: request a `preset:` URL, purge by its tag, and request it again. A MISS proves the tag landed.
 5. If you left formats unpinned, request one URL with an AVIF `Accept` header and then with a JPEG-only one. Identical bytes mean your variant split from step 3 is not in effect.

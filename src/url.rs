@@ -1010,9 +1010,11 @@ pub enum FrameSelection {
 
 /// The largest timestamp a `frame:` segment may name, in
 /// seconds: 24 hours. Real sources the loader will fetch
-/// (10 MiB, bounded decode) run far shorter; the cap keeps
-/// the grammar's numbers finite and small, and anything
-/// past a real duration clamps to the last frame anyway.
+/// (10 MiB by default, 1 GiB at most) almost always run
+/// shorter, and a percentage reaches any point of a longer
+/// one; the cap keeps the grammar's numbers finite and
+/// small, and anything past a real duration clamps to the
+/// last frame anyway.
 pub const MAX_FRAME_SECONDS: f64 = 86_400.0;
 
 /// The largest percentage a `frame:` segment may name.
@@ -3652,11 +3654,32 @@ pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
 /// caches like any other entry. An unknown key ID consults
 /// nothing and fails as a bad signature, indistinguishable
 /// from any other forgery attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` prints the key IDs and redacts the keys
+/// (issue #455). It is not `PartialEq`: nothing compares
+/// rings, and a derived comparison of key bytes would not be
+/// constant-time.
+#[derive(Clone)]
 pub struct Keyring {
     pub current_id: String,
     pub current: Vec<u8>,
     pub previous: Option<(String, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for Keyring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keyring")
+            .field("current_id", &self.current_id)
+            .field("current", &crate::redact::Redacted)
+            .field(
+                "previous",
+                &self
+                    .previous
+                    .as_ref()
+                    .map(|(id, _)| (id, crate::redact::Redacted)),
+            )
+            .finish()
+    }
 }
 
 impl Keyring {

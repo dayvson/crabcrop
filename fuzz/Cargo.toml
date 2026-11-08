@@ -21,7 +21,7 @@ crabcrop-url = { path = "../crates/crabcrop-url" }
 libfuzzer-sys = "0.4"
 # The harness builds images and probes dimensions itself;
 # same version requirement and features as the root crate.
-image = { version = "0.25", features = ["avif", "nasm", "tiff"] }
+image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "nasm", "png", "rayon", "tiff", "webp"] }
 
 [features]
 # The AVIF decoder the release binaries, the Docker image and

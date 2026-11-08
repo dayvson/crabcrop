@@ -28,7 +28,7 @@
  * context the secret is forced to null, so a factory created
  * with one still cannot sign (or leak it) client-side.
  */
-import { buildURL } from "@crabcrop/url";
+import { buildURL, MAX_DIMENSION } from "@crabcrop/url";
 
 export interface CrabcropLoaderConfig {
   base: string;
@@ -51,9 +51,6 @@ export interface CrabcropLoader {
   url(src: string, options?: CrabcropImageOptions): string;
   srcset(src: string, widths: number[], options?: CrabcropImageOptions): string;
 }
-
-/** The server's per-axis dimension cap (the URL grammar's MAX_DIMENSION). */
-const MAX_DIMENSION = 16383;
 
 const dim = (v: number | undefined, name: string): number | undefined => {
   if (v === undefined) return undefined;

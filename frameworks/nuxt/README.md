@@ -4,7 +4,7 @@ A provider module for `@nuxt/image` that routes images through your crabcrop dep
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (with `@nuxt/image` 1.8 or later, on Nuxt 3 or 4).
+1. Install the builder: `npm install @crabcrop/url` (0.9.12 or later, which exports the `MAX_DIMENSION` this file imports), with `@nuxt/image` 1.8 or later, on Nuxt 3 or 4.
 2. Copy [`crabcrop.ts`](crabcrop.ts) into your project, for example as `providers/crabcrop.ts`.
 3. Register it in `nuxt.config`:
 
@@ -62,6 +62,8 @@ The provider builds unsigned URLs whenever it runs in the browser; read [Signing
 
 With a preset configured, `preset:<name>` leads and the geometry and filters above append after it.
 
+Dimensions follow one rule: a fraction rounds to whole pixels, a value that is not a size (0, negative, or not a number) is left out so the URL serves the source's own size, and a value past the server's per-axis cap (`MAX_DIMENSION` in `@crabcrop/url`) throws, as does a missing `base` provider option, instead of minting a URL that cannot load. All five crabcrop integrations share this rule.
+
 About `outside`: in @nuxt/image semantics, `outside` means the result covers the box (at least the box on both axes, aspect preserved) without cropping. crabcrop has no uncropped cover resize, so the provider maps `outside` to a centered `crop:WxH`: both requested dimensions are honored exactly, but the overflow is cropped away instead of kept. (The earlier mapping to `fit-in:WxH` was the opposite geometry: its result could be smaller than the box on one axis.) If keeping the whole frame matters more than the exact size, use `fit: "inside"` and let your layout clip the overflow.
 
 ## Registry status
@@ -70,6 +72,6 @@ This provider is maintained in the crabcrop repository. Submission to the Nuxt I
 
 ## Tests
 
-`npm test` in this directory pins the modifier mapping to exact signed URLs (signatures cross-checked with `node:crypto` directly), the refusal of a `secret` provider option, and the browser-side guard. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
+`npm test` in this directory pins the modifier mapping to exact signed URLs (signatures cross-checked with `node:crypto` directly), the refusal of a `secret` provider option, and the browser-side guard. It also runs the dimension table all five integrations share ([`dimension-table.mjs`](../dimension-table.mjs)), so one mistake has one outcome in each. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
 
 [`tests/browser-bundles`](../../tests/browser-bundles) builds a real Nuxt app with `@nuxt/image` and this provider: it checks that the generated `image-options.mjs` and every file under `.output/public` are free of the secret, that the client build pulls in no Node built-in, and that server rendering signs with the secret from `NUXT_CRABCROP_SECRET`.

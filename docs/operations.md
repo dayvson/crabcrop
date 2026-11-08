@@ -14,6 +14,7 @@ Operations run in the order they appear in the path. Requested outputs are cappe
 | `300x0` or `300x` | Width 300 px, height scaled proportionally. |
 | `0x200` or `x200` | Height 200 px, width scaled proportionally. |
 | `0x0` | Original size. |
+| `00x100` | A zero written with more than one digit is not proportional: it asks for a zero-pixel side, and the request fails with `400` (`unsupported_operation`). |
 | `origx100` | Source width, height 100 px. `orig` works on either axis. |
 | `-300x200` | Resize to 300×200 and flip horizontally. |
 | `300x-200` | Resize to 300×200 and flip vertically. |
@@ -28,7 +29,7 @@ curl "http://localhost:3000/unsafe/300x0/https://example.com/photo.jpg"
 fit-in:<width>x<height>[:adaptive]
 ```
 
-Scales the image proportionally so it fits inside the box. A `0` axis is unbounded. Flips are not allowed here.
+Scales the image proportionally so it fits inside the box. A `0` axis is unbounded; a zero written with more digits (`fit-in:00x100`) is a zero-pixel side and fails with `400`, as it does for a resize. Flips are not allowed here.
 
 With `:adaptive`, the box axes swap when the source orientation disagrees with the box's: a portrait photo fitted into a landscape box fits inside the swapped (portrait) box instead, so it is not squeezed by the tighter axis. When the orientations agree, adaptive changes nothing. A square source, a square box, and a box with a `0` or `orig` axis have no orientation to disagree with and never swap.
 
@@ -95,7 +96,7 @@ curl "http://localhost:3000/unsafe/crop:800x800:objects(dog):1.5/https://example
 crop-rect:<left>x<top>:<right>x<bottom>
 ```
 
-Cuts the exact pixel rectangle between the two corners. `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside the source image fails with `400`.
+Cuts the exact pixel rectangle between the two corners, in the pixels of the image as it stands at the segment (the source, when nothing runs before it). `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside that image fails with `400`.
 
 ```bash
 curl "http://localhost:3000/unsafe/crop-rect:100x50:700x450/https://example.com/photo.jpg"
@@ -107,7 +108,7 @@ curl "http://localhost:3000/unsafe/crop-rect:100x50:700x450/https://example.com/
 focal:<left>x<top>:<right>x<bottom>
 ```
 
-Names the rectangle the next `crop:` in the URL must keep, in source pixels. The segment produces no output of its own; the crop consumes it. A `center` or `smart` crop positions its window on the rectangle: centered on the rectangle's center, and clamped so a rectangle that fits inside the window stays fully inside it. With a focal rectangle pending, `smart` skips face and detail detection entirely, because the caller has already said what matters. The directional alignments (`top`, `bottom`, `left`, `right`, and the four corners) and `face` are explicit instructions of their own and ignore the rectangle. `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside the source image fails with `400`. Coordinates address source pixels and are not scaled by `dpr`.
+Names the rectangle the next `crop:` in the URL must keep, in the pixels of the image as it stands at the segment (the source, when nothing runs before it). The segment produces no output of its own; the crop consumes it. The steps between the segment and the crop carry the rectangle with the image: a resize or `fit-in` scales it, a resize flip mirrors it, a `crop-rect` or `trim` moves it with the cut (any part the cut removes lands on the cut's nearest edge), and a `pad` moves it onto the canvas. A filter that moves pixels any other way (`rotate`, `flip`, `upscale`, `studio`) drops it, and the crop falls back to its own alignment. A `center` or `smart` crop positions its window on the rectangle: centered on the rectangle's center, and clamped so a rectangle that fits inside the window stays fully inside it. With a focal rectangle pending, `smart` skips face and detail detection entirely, because the caller has already said what matters. The directional alignments (`top`, `bottom`, `left`, `right`, and the four corners) and `face` are explicit instructions of their own and ignore the rectangle. `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside the image at its segment fails with `400`. The coordinates as written are not scaled by `dpr`.
 
 ```bash
 curl "http://localhost:3000/unsafe/focal:100x50:700x450/crop:800x600:smart/https://example.com/photo.jpg"
@@ -119,7 +120,7 @@ curl "http://localhost:3000/unsafe/focal:100x50:700x450/crop:800x600:smart/https
 focalpoint:<x>x<y>[:<zoom>]
 ```
 
-Names the point the next `crop:` in the URL centers on, as fractions of the image dimensions (`0.75x0.4` is three quarters across, two fifths down), with an optional zoom factor. Like the focal rectangle, the segment produces no output of its own; the crop consumes it, a `center` or `smart` crop positions on it, and the directional alignments and `face` ignore it. When a URL carries both focal forms, the last one before the crop wins. At zoom 1 the crop is the ordinary fill crop positioned on the point instead of the frame center. Above 1 the crop window tightens around the point (zoom 2 halves each axis, keeping the requested output size, so the crop renders from fewer source pixels); below 1 it loosens toward the fill window, which it can never exceed, so a small zoom converges on the zoom-1 crop. The zoom runs from above 0 to 100 and defaults to 1; the canonical form always spells it. Because the point is fractional, it addresses whatever image is in effect at that point in the chain and can never fall outside it, so there is no bounds failure. This is the form to migrate imgix focal-point crops (`fp-x`, `fp-y`, `fp-z`) to: the fractions and the zoom carry over as written.
+Names the point the next `crop:` in the URL centers on, as fractions of the image dimensions (`0.75x0.4` is three quarters across, two fifths down), with an optional zoom factor. Like the focal rectangle, the segment produces no output of its own; the crop consumes it, a `center` or `smart` crop positions on it, and the directional alignments and `face` ignore it. When a URL carries both focal forms, the last one before the crop wins. At zoom 1 the crop is the ordinary fill crop positioned on the point instead of the frame center. Above 1 the crop window tightens around the point (zoom 2 halves each axis, keeping the requested output size, so the crop renders from fewer source pixels); below 1 it loosens toward the fill window, which it can never exceed, so a small zoom converges on the zoom-1 crop. The zoom runs from above 0 to 100 and defaults to 1; the canonical form always spells it. Because the point is fractional, it addresses whatever image is in effect at that point in the chain and can never fall outside it, so there is no bounds failure. Later steps carry the point the way they carry the focal rectangle, so `focalpoint:0.6x0.5/crop-rect:1000x0:2000x500/crop:100x100` still centers on the spot the fractions named on the uncut image. This is the form to migrate imgix focal-point crops (`fp-x`, `fp-y`, `fp-z`) to: the fractions and the zoom carry over as written.
 
 ```bash
 curl "http://localhost:3000/unsafe/focalpoint:0.75x0.4:2/crop:800x600/https://example.com/photo.jpg"

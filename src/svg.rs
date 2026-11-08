@@ -13,9 +13,18 @@
 //! Rasterization is resvg/usvg (pure Rust), whose render model
 //! has no scripts or network access to begin with: defense in
 //! depth, with the sanitizer as the explicit, tested layer.
+//!
+//! The server never runs usvg in its own process (issue
+//! #447). [`screen`] sanitizes and runs the pre-parse bound
+//! here, the cheap first line, and [`Screened`] hands the
+//! sanitized document to a capped child process that parses
+//! and rasterizes it (the `worker` module), so a document
+//! that gets past the bound can abort or exhaust only that
+//! child.
 
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// Bounds on SVG document complexity (audit E-7). The raster
 /// target was already capped, but parse and `<use>` expansion
@@ -52,6 +61,11 @@ const MAX_CONVERSION_DEPTH: usize = 128;
 const NESTED_IMAGE_LEVELS: usize = 2;
 
 mod expansion;
+mod worker;
+
+pub use worker::{
+    RenderError, WORKER_ARG, WorkerCommand, is_worker_invocation, isolate_in_child, worker_main,
+};
 
 use image::DynamicImage;
 use resvg::usvg;
@@ -674,18 +688,126 @@ pub fn sanitized_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(sanitize(text)?.into_bytes())
 }
 
-/// Sanitize and parse `bytes`. Callers gate on [`is_svg`]
-/// first; other XML is rejected here as not-an-SVG.
+/// Sanitize and parse `bytes`, in this process. Callers gate
+/// on [`is_svg`] first; other XML is rejected here as
+/// not-an-SVG. The server goes through [`screen`] instead,
+/// which parses in the worker; this is the in-process form
+/// the worker itself and the fuzz harness use.
 pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| "SVG source is not valid UTF-8".to_string())?;
+    build(&sanitize(text)?)
+}
+
+/// A document that passed the sanitizer and the pre-parse
+/// bound in this process (issue #447): the checks that need
+/// no usvg, so a document they refuse costs no worker. The
+/// parse and the render happen in a worker when SVG work is
+/// isolated (the binary always isolates it), in this process
+/// otherwise.
+pub struct Screened {
+    clean: String,
+}
+
+/// Sanitize `bytes` and bound the sanitized document's
+/// expansion (issue #443), without parsing it into a usvg
+/// tree. Callers gate on [`is_svg`] first.
+pub fn screen(bytes: &[u8]) -> Result<Screened, String> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "SVG source is not valid UTF-8".to_string())?;
     let clean = sanitize(text)?;
+    let parsed =
+        roxmltree::Document::parse(&clean).map_err(|e| format!("cannot parse SVG: {e}"))?;
+    check_expansion(&parsed, MAX_CONVERSION_DEPTH)?;
+    drop(parsed);
+    Ok(Screened { clean })
+}
+
+impl Screened {
+    /// The sanitized document, exactly as [`sanitized_bytes`]
+    /// spells it.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.clean.into_bytes()
+    }
+
+    /// Parse the document, held to every bound [`prepare`]
+    /// enforces, and report its intrinsic size. An isolated
+    /// worker is killed at `deadline` (a default timeout when
+    /// `None`).
+    pub fn intrinsic_size(&self, deadline: Option<Instant>) -> Result<(f32, f32), RenderError> {
+        self.intrinsic_size_in(worker::configured(), deadline)
+    }
+
+    /// [`Screened::intrinsic_size`] in the given worker, or
+    /// in this process for `None`.
+    pub fn intrinsic_size_in(
+        &self,
+        worker: Option<&WorkerCommand>,
+        deadline: Option<Instant>,
+    ) -> Result<(f32, f32), RenderError> {
+        self.run(worker, deadline, |_| None).map(|(size, _)| size)
+    }
+
+    /// Parse the document and rasterize it at the size
+    /// `target` picks from its intrinsic size (see
+    /// [`Prepared::render`]).
+    pub fn rasterize(
+        &self,
+        deadline: Option<Instant>,
+        target: impl FnOnce((f32, f32)) -> (u32, u32),
+    ) -> Result<DynamicImage, RenderError> {
+        self.rasterize_in(worker::configured(), deadline, target)
+    }
+
+    /// [`Screened::rasterize`] in the given worker, or in
+    /// this process for `None`.
+    pub fn rasterize_in(
+        &self,
+        worker: Option<&WorkerCommand>,
+        deadline: Option<Instant>,
+        target: impl FnOnce((f32, f32)) -> (u32, u32),
+    ) -> Result<DynamicImage, RenderError> {
+        let (_, raster) = self.run(worker, deadline, |size| Some(target(size)))?;
+        raster
+            .map(DynamicImage::ImageRgba8)
+            .ok_or_else(|| RenderError::Refused("the SVG renderer returned no raster".to_string()))
+    }
+
+    fn run(
+        &self,
+        worker: Option<&WorkerCommand>,
+        deadline: Option<Instant>,
+        target: impl FnOnce((f32, f32)) -> Option<(u32, u32)>,
+    ) -> Result<worker::Output, RenderError> {
+        if let Some(command) = worker {
+            let deadline = deadline.unwrap_or_else(|| Instant::now() + worker::WORKER_TIMEOUT);
+            return worker::run(command, &self.clean, deadline, target);
+        }
+        let prepared = build(&self.clean).map_err(RenderError::Refused)?;
+        let size = prepared.intrinsic();
+        let raster = match target(size) {
+            Some((w, h)) => Some(
+                prepared
+                    .render(w, h)
+                    .map_err(RenderError::Refused)?
+                    .into_rgba8(),
+            ),
+            None => None,
+        };
+        Ok((size, raster))
+    }
+}
+
+/// Parse a sanitized document into a usvg tree, held to the
+/// expansion bound before usvg builds anything and to the
+/// node and decode budgets after. This is the work that runs
+/// in the worker.
+fn build(clean: &str) -> Result<Prepared, String> {
     // The bound runs on the sanitized text because that is what
     // usvg builds from (this very parse): the sanitizer removes
     // elements, which moves what `:first-child` and sibling
     // selectors match, and drops namespace prefixes.
-    let parsed =
-        roxmltree::Document::parse(&clean).map_err(|e| format!("cannot parse SVG: {e}"))?;
+    let parsed = roxmltree::Document::parse(clean).map_err(|e| format!("cannot parse SVG: {e}"))?;
     let cost = check_expansion(&parsed, MAX_CONVERSION_DEPTH)?;
     let budget = Arc::new(Mutex::new(NestedBudget {
         nodes: MAX_EXPANDED_NODES as u64 - cost.nodes,
@@ -694,7 +816,7 @@ pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
         refusal: None,
     }));
     let opt = usvg::Options {
-        fontdb: font_database(),
+        font_resolver: font_resolver(),
         image_href_resolver: usvg::ImageHrefResolver {
             resolve_data: nested_svg_resolver(budget.clone()),
             resolve_string: usvg::ImageHrefResolver::default_string_resolver(),
@@ -721,6 +843,36 @@ pub fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
     // walk visits at most MAX_EXPANDED_NODES nodes.
     check_raster_budget(embedded_raster_bytes(tree.root()))?;
     Ok(Prepared { tree })
+}
+
+/// usvg's own font lookups, with the system fonts loaded the
+/// first time a document asks for a font. A document without
+/// text never does, and each worker is a fresh process, so an
+/// icon does not pay for scanning the font directories.
+/// usvg hands each lookup the database it parses with, which
+/// starts empty (the `Options` default); the first lookup
+/// swaps in the system database, the one an eager load would
+/// have passed, so the fonts and their order are the same.
+fn font_resolver() -> usvg::FontResolver<'static> {
+    let select_font = usvg::FontResolver::default_font_selector();
+    let select_fallback = usvg::FontResolver::default_fallback_selector();
+    let with_system_fonts = |db: &mut Arc<usvg::fontdb::Database>| {
+        // Empty means nothing was selected from it yet, so
+        // no font ID can refer to the database replaced.
+        if db.is_empty() {
+            *db = font_database();
+        }
+    };
+    usvg::FontResolver {
+        select_font: Box::new(move |font, db| {
+            with_system_fonts(db);
+            select_font(font, db)
+        }),
+        select_fallback: Box::new(move |c, used, db| {
+            with_system_fonts(db);
+            select_fallback(c, used, db)
+        }),
+    }
 }
 
 /// System fonts, loaded once per process: SVG text elements
