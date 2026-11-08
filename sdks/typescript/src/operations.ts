@@ -11,6 +11,7 @@
  * `buildSrcSet` does for widths: a value the server would 400
  * never gets signed.
  */
+import { MAX_DIMENSION } from "./limits.ts";
 
 /** Output formats the `format(...)` filter accepts. */
 export type ImageFormat = "jpeg" | "jpg" | "png" | "webp" | "jxl" | "avif" | "gif" | "mp4" | "webm";
@@ -99,13 +100,11 @@ export interface StudioOptions {
 }
 
 /**
- * One side of a size: a pixel count (1..16383), 0 for
- * proportional, a negative count to flip that axis, or
+ * One side of a size: a pixel count (1..{@link MAX_DIMENSION}),
+ * 0 for proportional, a negative count to flip that axis, or
  * `"orig"` for the source's own dimension.
  */
 export type Dimension = number | "orig";
-
-const MAX_DIMENSION = 16383;
 
 function fail(what: string, value: unknown, rule: string): never {
   throw new Error(`${what} must be ${rule}, got ${JSON.stringify(value)}`);
@@ -126,20 +125,93 @@ function floatIn(what: string, value: number, min: number, max: number): number 
 }
 
 function positiveFloat(what: string, value: number): number {
-  if (!Number.isFinite(value) || value <= 0) {
+  // The server reads a 32-bit float: past its range the value
+  // is infinite there, and a positive value below it is zero.
+  const f32 = Math.fround(value);
+  if (!Number.isFinite(f32) || f32 <= 0) {
     fail(what, value, "a positive number");
   }
   return value;
 }
 
+/** Spell `digits * 10^exponent` in plain decimal, no exponent. */
+function plainDecimal(digits: bigint, exponent: number): string {
+  const text = digits.toString();
+  if (exponent >= 0) return text + "0".repeat(exponent);
+  const padded = text.padStart(1 - exponent, "0");
+  const whole = padded.slice(0, padded.length + exponent);
+  const fraction = padded.slice(padded.length + exponent).replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole;
+}
+
 /**
- * The canonical number spelling: integers without a fraction,
+ * The canonical spelling of a 32-bit float parameter (issue
+ * #472). The server parses these arguments as `f32` and
+ * prints them back as Rust's float `Display` does: the
+ * shortest decimal that reads back as the same f32 (the
+ * closer of two, a tie going up), never an exponent. So the
+ * double `0.1 + 0.2` spells `0.3`, the form the server keys
+ * its cache on, not its 17-digit double spelling. The search
+ * is exact, on the float's binary value in BigInt
+ * arithmetic, so no double rounding can pick a spelling Rust
+ * would not.
+ */
+function num(value: number): string {
+  const f = Math.fround(value);
+  if (!Number.isFinite(f)) {
+    throw new Error(`${value} is outside the 32-bit float range the server parses`);
+  }
+  if (f === 0) return "0";
+  const view = new DataView(new ArrayBuffer(4));
+  view.setFloat32(0, Math.abs(f));
+  const bits = view.getUint32(0);
+  const biased = bits >>> 23;
+  const fraction = bits & 0x7fffff;
+  const mantissa = BigInt(biased === 0 ? fraction : fraction | 0x800000);
+  // In units of a quarter ulp, 2^unit: the float sits at
+  // 4 * mantissa and reads back from any decimal strictly
+  // between the midpoints to its neighbors, which lie half as
+  // far below at a power of two (the binade below is finer).
+  // A decimal exactly on a midpoint rounds to the even
+  // mantissa, so the ends count only for an even one.
+  const unit = (biased === 0 ? 1 : biased) - 152;
+  const center = 4n * mantissa;
+  const low = fraction === 0 && biased > 1 ? center - 1n : center - 2n;
+  const high = center + 2n;
+  const inclusive = mantissa % 2n === 0n;
+  const sign = f < 0 ? "-" : "";
+  // From one decade above the value down, the first decimal
+  // exponent with a candidate in the interval gives the
+  // shortest spelling. Only the two neighbors of the value at
+  // that exponent can qualify, and an f32 needs at most nine
+  // significant digits, so the loop is short.
+  for (let k = Math.floor(Math.log10(Math.abs(f))) + 2; ; k--) {
+    // Compare digits * 10^k with units * 2^unit as integers.
+    const binary = (unit > 0 ? 2n ** BigInt(unit) : 1n) * (k < 0 ? 10n ** BigInt(-k) : 1n);
+    const step = (unit < 0 ? 2n ** BigInt(-unit) : 1n) * (k > 0 ? 10n ** BigInt(k) : 1n);
+    const at = center * binary;
+    const below = (at / step) * step;
+    const above = below + step;
+    const lowEnd = low * binary;
+    const highEnd = high * binary;
+    const downFits = inclusive ? below >= lowEnd : below > lowEnd;
+    const upFits = inclusive ? above <= highEnd : above < highEnd;
+    if (downFits || upFits) {
+      const down = downFits && (!upFits || 2n * (at - below) < step);
+      return sign + plainDecimal((down ? below : above) / step, k);
+    }
+  }
+}
+
+/**
+ * The canonical spelling of a 64-bit float parameter (the
+ * convolution kernel's values): integers without a fraction,
  * other values in plain decimal (the grammar takes no
  * exponent forms). JavaScript's shortest round-trip spelling
  * agrees with the server's for the magnitudes the grammar
  * allows; exponent spellings are expanded to plain decimal.
  */
-function num(value: number): string {
+function kernelNum(value: number): string {
   if (Number.isSafeInteger(value)) return String(value);
   const s = String(value);
   if (!s.includes("e")) return s;
@@ -200,7 +272,9 @@ function className(what: string, name: string): string {
   if (bytes < 1 || bytes > 64 || !/^[\p{L}\p{N} _.\-/]+$/u.test(trimmed)) {
     fail(what, name, "1 to 64 UTF-8 bytes of letters, digits, space, `_`, `.`, `-`, `/`");
   }
-  return encodeArg(name);
+  // The server trims the name before it validates and keys
+  // on it, so the trimmed name is the canonical one.
+  return encodeArg(trimmed);
 }
 
 const CROP_ALIGNS: readonly string[] = ["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"];
@@ -287,7 +361,10 @@ export const ops = {
         names.push(encoded);
       }
     }
-    if (!Number.isFinite(scale) || scale <= 0 || scale > 100) {
+    // Checked as the f32 the server reads (as are zoom, blur
+    // and gamma below): a positive double that rounds to f32
+    // zero would otherwise be spelled `0`, which it refuses.
+    if (!Number.isFinite(scale) || Math.fround(scale) <= 0 || scale > 100) {
       fail("crop objects scale", scale, "a number above 0 and at most 100");
     }
     const box = pixelBox("crop", width, height);
@@ -326,7 +403,7 @@ export const ops = {
       }
       return v;
     };
-    if (!Number.isFinite(zoom) || zoom <= 0 || zoom > 100) {
+    if (!Number.isFinite(zoom) || Math.fround(zoom) <= 0 || zoom > 100) {
       fail("focalpoint zoom", zoom, "a number above 0 and at most 100");
     }
     return `focalpoint:${num(frac("focalpoint x", x))}x${num(frac("focalpoint y", y))}:${num(zoom)}`;
@@ -424,7 +501,8 @@ export const filter = {
 
   /** Gaussian blur by sigma: positive, at most the server's 512 cap. */
   blur(sigma: number): string {
-    if (!Number.isFinite(sigma) || sigma <= 0 || sigma > 512) {
+    // The server also refuses a subnormal f32 sigma.
+    if (!Number.isFinite(sigma) || Math.fround(sigma) < 2 ** -126 || sigma > 512) {
       fail("blur sigma", sigma, "a positive number up to 512");
     }
     return `blur(${num(sigma)})`;
@@ -443,7 +521,7 @@ export const filter = {
   },
   /** Gamma correction divisor: 0 < g <= 10 (1 unchanged; above 1 brightens midtones). */
   gamma(value: number): string {
-    if (!Number.isFinite(value) || value <= 0 || value > 10) {
+    if (!Number.isFinite(value) || Math.fround(value) <= 0 || value > 10) {
       fail("gamma", value, "a number above 0 and at most 10");
     }
     return `gamma(${num(value)})`;
@@ -517,7 +595,7 @@ export const filter = {
     }
     for (const v of values) {
       floatIn("convolution kernel value", v, -1024, 1024);
-      if (!/^-?\d+(\.\d+)?$/.test(num(v))) {
+      if (!/^-?\d+(\.\d+)?$/.test(kernelNum(v))) {
         fail(
           "convolution kernel value",
           v,
@@ -534,7 +612,7 @@ export const filter = {
       fail("convolution normalize", normalize, "a boolean or 0/1");
     }
     const flag = normalize === true || normalize === 1 ? 1 : 0;
-    return `convolution(${values.map(num).join(",")},${flag})`;
+    return `convolution(${values.map(kernelNum).join(",")},${flag})`;
   },
   /**
    * Film grain: one noise value per pixel, added equally
@@ -751,7 +829,7 @@ export const filter = {
   monochrome(color: string): string {
     return `monochrome(${hex6("monochrome color", color)})`;
   },
-  /** Mosaic block size in pixels: 1..16383. */
+  /** Mosaic block size in pixels: 1..{@link MAX_DIMENSION}. */
   pixelate(blockSize: number): string {
     return `pixelate(${intIn("pixelate size", blockSize, 1, MAX_DIMENSION)})`;
   },

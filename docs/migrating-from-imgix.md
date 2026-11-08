@@ -61,7 +61,7 @@ Two operational differences matter. First, imgix signing is opt-in per Source (W
 | `auto=compress` | `filters:quality(45)` captures its pinned quality | Approximate: its metadata stripping is crabcrop's default, but its habit of overriding `fm` to JPEG for opaque images does not carry; an explicit `format(...)` in crabcrop stays |
 | `auto=format` | Nothing | Direct: negotiation is built in |
 | `cs=strip`, `cs=srgb` | Nothing (the default) | Direct: crabcrop converts to sRGB and drops profiles unless `filters:keep_profile` is set, which is the inverse of `cs` preservation values |
-| `fm=json` (metadata as JSON) | Fetch the image URL with `Accept: application/json`, or `crabcrop meta` | Direct |
+| `fm=json` (metadata as JSON) | Fetch the image URL with `Accept: application/json`, or `crabcrop meta`, on a server with meta mode on (`CRABCROP_META_MODE=1`; it is off by default) | Direct |
 | `dl=<filename>` (force download) | No equivalent | Unsupported: a `Content-Disposition` concern for your app or CDN layer |
 
 ## Adjustments: where numbers change meaning

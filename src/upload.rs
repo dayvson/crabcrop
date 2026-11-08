@@ -178,6 +178,8 @@ impl UploadStore {
 
     /// An S3 destination, reusing the source S3
     /// configuration (endpoint, region, credentials).
+    /// Fails, like [`S3Store::new`], when the store's HTTP
+    /// client cannot be built.
     pub fn s3(
         bucket: String,
         prefix: String,
@@ -186,7 +188,7 @@ impl UploadStore {
         creds: Option<crate::sigv4::Credentials>,
         max_bytes: u64,
         allow_overwrite: bool,
-    ) -> Self {
+    ) -> Result<Self, reqwest::Error> {
         let trimmed = prefix.trim_matches('/');
         let prefix = if trimmed.is_empty() {
             String::new()
@@ -204,8 +206,8 @@ impl UploadStore {
             region,
             creds,
             Vec::new(),
-        );
-        Self {
+        )?;
+        Ok(Self {
             backend: Backend::S3 {
                 store: Arc::new(store),
                 bucket,
@@ -214,7 +216,7 @@ impl UploadStore {
             max_bytes,
             allow_overwrite,
             ref_prefix: String::new(),
-        }
+        })
     }
 
     /// The local destination directory, when the backend
@@ -601,7 +603,8 @@ mod tests {
             None,
             1024,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(
             store.source_ref("heroes/cat.jpg"),
             "s3://uploads/orig/heroes/cat.jpg"
@@ -629,7 +632,8 @@ mod tests {
             None,
             1024,
             false,
-        );
+        )
+        .unwrap();
         assert!(!store.exists("heroes/cat.jpg").await);
         store.put_new("heroes/cat.jpg", b"first").await.unwrap();
         assert!(store.exists("heroes/cat.jpg").await);

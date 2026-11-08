@@ -165,6 +165,8 @@ A `None` secret produces the literal `unsafe` signature segment, for servers run
 
 Builders fail loudly at build time rather than minting a URL that would be refused at fetch time. Failures are typed: `BuildError` for signed URL construction (a character that cannot travel in a URL path, an out-of-range srcset width, an invalid key ID) and `SealError` for sealing and opening (remainder too long, invalid key ID, no secret, and the uniform `OpenFailed`).
 
+The refused characters are `?`, `#`, whitespace, control and non-ASCII characters, and `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, which a browser rewrites before an `<img src>` or `fetch()` request leaves the page (`\` becomes `/`, the rest are percent-encoded), so a URL signed over them answers 403 from a page. Percent-encode those in the source first (`x{y}.jpg` as `x%7By%7D.jpg`); the error message names the encoding. The full rules are in [`spec/url-signing.md`](../../spec/url-signing.md#building-urls).
+
 ## Links
 
 - The crabcrop server and full documentation: https://github.com/dayvson/crabcrop

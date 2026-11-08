@@ -133,7 +133,8 @@ pub const MAX_DIMENSION: u32 = 16383;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildError {
     /// The named input ("operations" or "source") contains
-    /// a character that cannot travel in a URL path.
+    /// a character that cannot travel unchanged in a URL
+    /// path (the set is at [`validate_url_text`]).
     InvalidCharacter { what: &'static str, character: char },
     /// A srcset width is not a positive dimension within
     /// the grammar's cap. Carries the width.
@@ -146,10 +147,9 @@ pub enum BuildError {
 impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuildError::InvalidCharacter { what, character } => write!(
-                f,
-                "{what} contains a character that cannot appear in a crabcrop URL: {character:?}"
-            ),
+            BuildError::InvalidCharacter { what, character } => {
+                write_invalid_character(f, what, *character)
+            }
             BuildError::InvalidWidth(w) => write!(
                 f,
                 "srcset width must be a positive integer no larger than {MAX_DIMENSION}, got {w}"
@@ -163,6 +163,37 @@ impl std::fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+/// Characters a browser rewrites in a URL path (issue #472):
+/// an `<img src>` or `fetch()` URL is parsed by WHATWG rules,
+/// which turn `\` into `/` and percent-encode the rest
+/// (Chrome encodes `^` and `|` too). The server verifies the
+/// raw path, so a URL signed over one of them answers 403
+/// from a page while the same bytes verify from curl.
+const BROWSER_REWRITTEN: [char; 9] = ['"', '<', '>', '\\', '^', '`', '{', '|', '}'];
+
+/// The one message for a refused character, shared by
+/// [`BuildError`] and [`SealError`]. A character a browser
+/// rewrites gets the fix in the message: percent-encoded,
+/// it travels unchanged and signs as written.
+fn write_invalid_character(
+    f: &mut std::fmt::Formatter<'_>,
+    what: &str,
+    character: char,
+) -> std::fmt::Result {
+    write!(
+        f,
+        "{what} contains a character that cannot appear in a crabcrop URL: {character:?}"
+    )?;
+    if BROWSER_REWRITTEN.contains(&character) {
+        write!(
+            f,
+            " (browsers rewrite it; percent-encode it as %{:02X})",
+            u32::from(character)
+        )?;
+    }
+    Ok(())
+}
 
 /// The purge subkey: the raw bytes of the HMAC-SHA256 of
 /// the domain label `crabcrop/purge-key` under the secret.
@@ -280,7 +311,8 @@ pub enum SealError {
     /// Carries the offending ID.
     InvalidKeyId(String),
     /// The named input ("operations" or "source") contains
-    /// a character that cannot travel in a URL path, so the
+    /// a character that cannot travel unchanged in a URL
+    /// path (the set is at [`validate_url_text`]), so the
     /// remainder it would seal could never be served.
     InvalidCharacter { what: &'static str, character: char },
     /// Sealing was asked for without a secret. There is no
@@ -308,10 +340,9 @@ impl std::fmt::Display for SealError {
                 f,
                 "invalid key ID {id:?}: 1 to 32 characters of [A-Za-z0-9_-]"
             ),
-            SealError::InvalidCharacter { what, character } => write!(
-                f,
-                "{what} contains a character that cannot appear in a crabcrop URL: {character:?}"
-            ),
+            SealError::InvalidCharacter { what, character } => {
+                write_invalid_character(f, what, *character)
+            }
             SealError::NoSecret => {
                 write!(f, "sealing requires a secret: there is no unsafe token")
             }
@@ -568,15 +599,20 @@ pub fn upload_signature_with_expiry(secret: &[u8], name: &str, expires: u64) -> 
 
 /// Why a builder input can never produce a verifiable URL:
 /// the remainder travels as a raw URL path, so `?` and `#`
-/// would truncate it at the HTTP layer, and whitespace,
-/// control, and non-ASCII characters cannot be sent as-is
-/// (audit P-4). Builders fail loudly at build time instead of
+/// would truncate it at the HTTP layer, whitespace, control,
+/// and non-ASCII characters cannot be sent as-is (audit
+/// P-4), and a browser rewrites `"` `<` `>` `\` `^` `` ` ``
+/// `{` `|` `}` before the request leaves the page (issue
+/// #472). Builders fail loudly at build time instead of
 /// minting a URL that 403s at fetch time.
 pub fn validate_url_text(text: &str, what: &'static str) -> Result<(), BuildError> {
-    if let Some(c) = text
-        .chars()
-        .find(|c| matches!(c, '?' | '#') || !c.is_ascii() || c.is_ascii_control() || *c == ' ')
-    {
+    if let Some(c) = text.chars().find(|c| {
+        matches!(c, '?' | '#')
+            || !c.is_ascii()
+            || c.is_ascii_control()
+            || *c == ' '
+            || BROWSER_REWRITTEN.contains(c)
+    }) {
         return Err(BuildError::InvalidCharacter { what, character: c });
     }
     Ok(())
@@ -725,6 +761,109 @@ mod tests {
             assert_eq!(unseal(secret, token).unwrap(), remainder);
             assert_eq!(unseal(b"wrong-secret", token), Err(SealError::OpenFailed));
         }
+    }
+
+    /// The refusal vectors from `spec/test-vectors.json`
+    /// (issue #472): every builder refuses each input with
+    /// the typed error naming the input and the character,
+    /// signed or not, plain or sealed, and a character a
+    /// browser rewrites carries its percent-encoding in the
+    /// message.
+    #[test]
+    fn refusal_test_vectors() {
+        let text = include_str!("../../../spec/test-vectors.json");
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        let refusals: Vec<&serde_json::Value> = vectors
+            .iter()
+            .filter(|v| v.get("refuses").is_some())
+            .collect();
+        assert!(refusals.len() >= 17, "the spec carries refusal vectors");
+        let base = "https://img.example.com";
+        for v in refusals {
+            let operations = v["operations"].as_str().unwrap();
+            let source = v["source"].as_str().unwrap();
+            let what = v["refuses"]["input"].as_str().unwrap();
+            let mut chars = v["refuses"]["character"].as_str().unwrap().chars();
+            let character = chars.next().unwrap();
+            assert!(chars.next().is_none());
+            let description = v["description"].as_str().unwrap();
+            for secret in [Some(&b"s3cr3t"[..]), None] {
+                let err = build_url(base, secret, operations, source, None).unwrap_err();
+                assert_eq!(
+                    err,
+                    BuildError::InvalidCharacter {
+                        what: if what == "source" {
+                            "source"
+                        } else {
+                            "operations"
+                        },
+                        character
+                    },
+                    "{description}"
+                );
+                let message = err.to_string();
+                assert!(
+                    message.starts_with(&format!("{what} contains")),
+                    "{message}"
+                );
+                if BROWSER_REWRITTEN.contains(&character) {
+                    let hint = format!("percent-encode it as %{:02X})", u32::from(character));
+                    assert!(message.ends_with(&hint), "{message}");
+                } else {
+                    assert!(!message.contains("percent-encode"), "{message}");
+                }
+            }
+            assert!(matches!(
+                build_url_with_key_id(base, Some((b"s3cr3t", "k2")), operations, source, None),
+                Err(BuildError::InvalidCharacter { character: c, .. }) if c == character
+            ));
+            assert!(
+                matches!(
+                    build_sealed_url(base, Some(b"s3cr3t"), operations, source, None, None, None),
+                    Err(SealError::InvalidCharacter { character: c, .. }) if c == character
+                ),
+                "{description}"
+            );
+            if what == "source" {
+                assert!(matches!(
+                    build_srcset(base, Some(b"s3cr3t"), source, &[320], None),
+                    Err(BuildError::InvalidCharacter { character: c, .. }) if c == character
+                ));
+            }
+        }
+    }
+
+    /// The fix the refusal message names works: the
+    /// percent-encoded spelling builds, signs as written (the
+    /// spec vector for this remainder), and contains nothing
+    /// a browser would rewrite.
+    #[test]
+    fn percent_encoded_sources_build_and_sign_as_written() {
+        let url = build_url(
+            "https://img.example.com",
+            Some(b"s3cr3t"),
+            "100x0",
+            "https://example.com/x%7By%7D.jpg",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://img.example.com/185ec1ffdc665285c43ca7af231f4bef87fe8c6f102709006e46e8ace401da57/100x0/https://example.com/x%7By%7D.jpg"
+        );
+        let err = build_url(
+            "https://img.example.com",
+            Some(b"s3cr3t"),
+            "100x0",
+            "https://example.com/x{y}.jpg",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "source contains a character that cannot appear in a crabcrop URL: '{' \
+             (browsers rewrite it; percent-encode it as %7B)"
+        );
     }
 
     /// A tiny deterministic PRNG for the property tests:

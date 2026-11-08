@@ -1,6 +1,6 @@
 # AI features
 
-The features that run ONNX models in-process: `removebg` (background removal), `studio` (product-shot composites and scene reframing on the same mask model, see [Studio mode](filters.md#studio-mode)), `upscale` (super-resolution), `remove_region` (region removal by inpainting), face detection for crops and redaction, and per-object segmentation that tightens the class filters to silhouettes. The models are files you supply, deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time.
+The features that run ONNX models in-process: `removebg` (background removal), `studio` (product-shot composites and scene reframing on the same mask model, see [Studio mode](filters.md#studio-mode)), `upscale` (super-resolution), `remove_region` (region removal by inpainting), face detection for crops and redaction, and per-object segmentation that tightens the class filters to silhouettes. The models are files you supply, deployment artifacts, like the `Dockerfile.ai` image variant in this repo. crabcrop never downloads a model, at startup or at request time. The annotation models (CLIP tags, moderation, embeddings, the aesthetic score, OCR, and detection boxes) answer through meta responses, so they also need meta mode on (`CRABCROP_META_MODE=1`, off by default; see [Meta responses](meta.md#meta-responses)).
 
 How configuration works:
 

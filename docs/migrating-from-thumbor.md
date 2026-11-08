@@ -26,7 +26,7 @@ crabcrop convert-thumbor "unsafe/filters:brightness(20):focal(10x10:50x50)/https
 | Signature: URL-safe base64 HMAC-SHA1 of the operations and source | Hex HMAC-SHA256, over the same kind of remainder |
 | `unsafe` URLs, gated by `ALLOW_UNSAFE` | `unsafe` URLs, gated by `CRABCROP_ALLOW_UNSAFE` |
 | Security key in the server config | `CRABCROP_SECRET` (one secret, minimum 16 bytes) |
-| `/meta/...` URL prefix | The same URL fetched with `Accept: application/json`, or `crabcrop meta` |
+| `/meta/...` URL prefix | The same URL fetched with `Accept: application/json`, or `crabcrop meta`, on a server with meta mode on (`CRABCROP_META_MODE=1`; it is off by default) |
 | Result caching is your CDN's job; Thumbor has no built-in result cache | Two built-in cache tiers (memory, then disk), `Cache-Status` on every image response |
 | No cache purge endpoint | `POST /purge/...` for one URL, `POST /purge-group/...` for a preset group, or the `purge` / `purge-group` verbs |
 | Presets: none; every URL spells its operations | Optional named presets (`preset:<name>`), expandable server-side and usable as cache groups |

@@ -83,7 +83,7 @@ https://img.example.com/<signature>/crop:1200x630:smart/filters:format(webp):qua
 
 Smart-crops the photo to the 1200x630 social card size, keeping the subject and any detected faces whole, then encodes it as WebP at quality 80. Sign it with the TypeScript or Python SDK, the crabcrop-url Rust crate, the CLI, or plain curl: same inputs, same URL.
 
-Send `Accept: application/json` with the same URL and the answer is the render's meta document instead of its bytes: dimensions, format, byte size, and provenance, with richer annotations as opt-ins.
+Send `Accept: application/json` with the same URL and the answer is the render's meta document instead of its bytes: dimensions, format, byte size, and provenance, with richer annotations as opt-ins. Meta mode is off by default, because every meta request renders afresh; the operator turns it on with `CRABCROP_META_MODE=1`.
 
 ## Features
 
@@ -95,7 +95,7 @@ Send `Accept: application/json` with the same URL and the answer is the render's
 - **Background removal.** Your ONNX model, in process. The subject stays, the background becomes real alpha.
 - **AI upscale.** Super-resolution from a model you supply rebuilds detail instead of stretching pixels, and it never falls back to a plain resize.
 - **Object removal.** Name a rectangle and an inpainting model fills it in from the surrounding pixels. Everything outside the rectangle comes back bit-identical.
-- **Face detection and redaction.** Blur or pixelate faces, or every detected object of a class, following the object's silhouette when a segmentation model is configured. Redaction never guesses: a detection failure fails the request.
+- **Face detection and redaction.** Blur or pixelate faces, or every detected object of a class, following the object's silhouette when a segmentation model is configured. Redaction never guesses: a detection failure fails the request. It replaces the pixels it covers, so no original color survives under transparency.
 - **Metadata that describes the picture.** JSON meta for every render: dimensions, format, byte size, provenance. Richer answers are opt-ins with their own model sets: CLIP tags and alt text, detections, moderation verdicts, embeddings, an aesthetic score.
 - **Reads the text in the picture.** Opt a meta request in and the answer reads the picture: the text lines in reading order, each with its box and a confidence score. The annotation never touches the image bytes.
 - **Provenance, checked and signed.** Meta reports the C2PA Content Credentials a source carries: manifest present, whether it validates, who signed it. With your own certificate, outputs are signed as served, the source recorded as an ingredient, so the chain survives the transform.

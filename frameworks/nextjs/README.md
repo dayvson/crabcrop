@@ -4,7 +4,7 @@ A custom loader for `next/image` that routes every image through your crabcrop d
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url`.
+1. Install the builder: `npm install @crabcrop/url` (0.9.12 or later, which exports the `MAX_DIMENSION` this file imports).
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project root.
 3. Point Next at it:
 
@@ -30,6 +30,10 @@ The loader builds unsigned URLs whenever it runs in the browser; read [Signing a
 
 Define the transform policy as a server-side [preset](../../docs/operations.md#presets) (crop, format, quality) and set `NEXT_PUBLIC_CRABCROP_PRESET` to its name. The loader then emits `preset:<name>` plus the `{width}x0` sizing `next/image` asks for per srcset entry, so widths still vary while the policy stays on the server. Without a preset, the loader emits `{width}x0` and maps the `quality` prop to `filters:quality(...)`.
 
+## Sizes
+
+Widths follow one rule: a fraction rounds to whole pixels, a value that is not a size (0, negative, or not a number) is left out so the URL serves the source's own size, and a value past the server's per-axis cap (`MAX_DIMENSION` in `@crabcrop/url`) throws, as does a call with `NEXT_PUBLIC_CRABCROP_BASE` unset, instead of minting a URL that cannot load. All five crabcrop integrations share this rule.
+
 ## Signing and server modes
 
 `next/image` calls the loader once per srcset width, during server rendering and again in the browser (client-side renders and navigations). A secret must never ship to the browser, so the loader signs only its server-rendering calls, with `CRABCROP_SECRET`; its browser calls produce unsigned URLs. That decides which server mode fits:
@@ -42,6 +46,6 @@ Define the transform policy as a server-side [preset](../../docs/operations.md#p
 
 ## Tests
 
-`npm test` in this directory runs the loader against exact expected URLs (signatures cross-checked with `node:crypto` directly). The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
+`npm test` in this directory runs the loader against exact expected URLs (signatures cross-checked with `node:crypto` directly). It also runs the dimension table all five integrations share ([`dimension-table.mjs`](../dimension-table.mjs)), so one mistake has one outcome in each. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
 
 [`tests/browser-bundles`](../../tests/browser-bundles) builds this loader into a browser bundle with Vite and runs it with a browser's globals and none of Node's.

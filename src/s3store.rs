@@ -42,7 +42,6 @@ pub enum RawPut {
     Failed,
 }
 
-#[derive(Debug)]
 pub struct S3Store {
     client: reqwest::Client,
     bucket: String,
@@ -72,7 +71,30 @@ pub struct S3Store {
     errors: std::sync::atomic::AtomicU64,
 }
 
+impl std::fmt::Debug for S3Store {
+    /// The entry MAC key prints as `[redacted]`, and the
+    /// credentials redact their own secret (issue #455).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Store")
+            .field("client", &self.client)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("creds", &self.creds)
+            .field("entry_key", &crate::redact::Redacted)
+            .field("max_entry_bytes", &self.max_entry_bytes)
+            .field("errors", &self.errors)
+            .finish()
+    }
+}
+
 impl S3Store {
+    /// Fails when the HTTP client cannot be built (no CA
+    /// roots on the host, say). Boot reports the error
+    /// instead of falling back to a default client, which
+    /// would panic on the same failure or else run with no
+    /// request timeout (issue #455).
     pub fn new(
         bucket: String,
         prefix: String,
@@ -80,18 +102,17 @@ impl S3Store {
         region: String,
         creds: Option<Credentials>,
         entry_key: Vec<u8>,
-    ) -> Self {
+    ) -> Result<Self, reqwest::Error> {
         let trimmed = prefix.trim_matches('/');
         let prefix = if trimmed.is_empty() {
             String::new()
         } else {
             format!("{trimmed}/")
         };
-        Self {
+        Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+                .build()?,
             bucket,
             prefix,
             endpoint,
@@ -100,7 +121,7 @@ impl S3Store {
             entry_key,
             max_entry_bytes: MAX_ENTRY_BYTES,
             errors: std::sync::atomic::AtomicU64::new(0),
-        }
+        })
     }
 
     /// Tier failures so far (issue #367), surfaced on
@@ -1048,6 +1069,7 @@ mod tests {
             None,
             test_entry_key(),
         )
+        .unwrap()
     }
 
     fn image(bytes: &[u8], groups: &[&str]) -> CachedImage {
@@ -1202,6 +1224,7 @@ mod tests {
             None,
             test_entry_key(),
         )
+        .unwrap()
     }
 
     #[tokio::test]

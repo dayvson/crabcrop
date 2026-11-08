@@ -235,6 +235,8 @@ const TOOLS = [
       "Fetch the crabcrop meta JSON for a URL (the processed result's width, " +
       "height, format, byte size, quality, and placeholder data on request). " +
       "The URL must already be signed if the server requires signatures. " +
+      "The server must have meta mode on (CRABCROP_META_MODE=1, off by default); " +
+      "without it the server answers 403 meta_disabled. " +
       "For safety the URL's origin must match CRABCROP_BASE: this tool will " +
       "not fetch arbitrary URLs.",
     inputSchema: {

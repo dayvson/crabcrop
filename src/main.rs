@@ -5,7 +5,9 @@
 //! from the library's modules, and serves signed image URLs
 //! of the form `/<signature>/<operations...>/<image-url>`.
 //! When the first argument names a CLI verb, that verb runs
-//! instead of the server (see [`cli`]).
+//! instead of the server (see [`cli`]). The server also
+//! starts this binary as its SVG worker, with
+//! `--svg-worker` (see `crabcrop::svg`).
 //!
 //! Every environment variable is documented in
 //! `docs/configuration.md`, the single reference for
@@ -31,8 +33,19 @@ use crate::loader::{Loader, SourceConfig, SourcePolicy};
 use crate::observe::Metrics;
 use crate::server::{AppState, app};
 
+fn main() {
+    // An SVG worker (issue #447) is this binary started by
+    // the server to parse and render one document: it caps
+    // itself and exits without a runtime or configuration,
+    // so it branches before either exists.
+    if crabcrop::svg::is_worker_invocation() {
+        std::process::exit(crabcrop::svg::worker_main());
+    }
+    start();
+}
+
 #[tokio::main]
-async fn main() {
+async fn start() {
     // CLI verbs run instead of the server when the first
     // argument names one. A first argument that is not a
     // flag and names nothing is an error, never a server
@@ -60,6 +73,15 @@ async fn main() {
             }
         }
         return;
+    }
+    // The server parses and renders every SVG in a worker
+    // started from its own binary (issue #447).
+    match crabcrop::svg::WorkerCommand::current_binary() {
+        Ok(worker) => crabcrop::svg::isolate_in_child(worker),
+        Err(e) => {
+            eprintln!("crabcrop: cannot locate this binary to start SVG workers: {e}");
+            std::process::exit(1);
+        }
     }
     if let Err(e) = run().await {
         eprintln!("crabcrop: {e}");
@@ -274,17 +296,40 @@ fn build_source_policy(get: impl Fn(&str) -> Option<String>) -> Result<SourcePol
     ))
 }
 
+/// A bucket store's base URL from the variable `name`: an
+/// http(s) URL, kept with any trailing slash trimmed. Every
+/// bucket fetch is an HTTP request to it, so any other
+/// scheme is a startup error, for the GCS endpoint as much
+/// as the S3 one (issue #455).
+fn store_endpoint(name: &str, endpoint: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(endpoint).map_err(|e| format!("invalid {name}: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!("{name} must be an http(s) URL"));
+    }
+    Ok(endpoint.trim_end_matches('/').to_string())
+}
+
+/// An error followed by its causes, `: `-separated. reqwest
+/// reports a client it cannot build only as "builder error";
+/// the reason (no CA roots on the host, say) is in the
+/// source chain, and a boot error should name it.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        message.push_str(": ");
+        message.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    message
+}
+
 fn build_source_config(get: impl Fn(&str) -> Option<String>) -> Result<SourceConfig, String> {
     let mut sources = SourceConfig::default();
     let nonempty = |name: &str| get(name).filter(|v| !v.is_empty());
 
     if let Some(endpoint) = nonempty("CRABCROP_S3_ENDPOINT") {
-        let parsed = reqwest::Url::parse(&endpoint)
-            .map_err(|e| format!("invalid CRABCROP_S3_ENDPOINT: {e}"))?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err("CRABCROP_S3_ENDPOINT must be an http(s) URL".to_string());
-        }
-        sources.s3_endpoint = Some(endpoint.trim_end_matches('/').to_string());
+        sources.s3_endpoint = Some(store_endpoint("CRABCROP_S3_ENDPOINT", &endpoint)?);
     }
     if let Some(region) = nonempty("CRABCROP_S3_REGION") {
         sources.s3_region = region;
@@ -306,9 +351,7 @@ fn build_source_config(get: impl Fn(&str) -> Option<String>) -> Result<SourceCon
         creds.session_token = nonempty("AWS_SESSION_TOKEN");
     }
     if let Some(endpoint) = nonempty("CRABCROP_GCS_ENDPOINT") {
-        reqwest::Url::parse(&endpoint)
-            .map_err(|e| format!("invalid CRABCROP_GCS_ENDPOINT: {e}"))?;
-        sources.gcs_endpoint = endpoint.trim_end_matches('/').to_string();
+        sources.gcs_endpoint = store_endpoint("CRABCROP_GCS_ENDPOINT", &endpoint)?;
     }
     if let Some(region) = nonempty("CRABCROP_GCS_REGION") {
         sources.gcs_region = region;
@@ -475,6 +518,97 @@ fn build_keyring(get: impl Fn(&str) -> Option<String>) -> Result<crate::url::Key
     Ok(keyring)
 }
 
+/// The upper bound on `CRABCROP_SOURCE_MAX_MB`, 1 GiB: a
+/// source is buffered whole before it renders, and one
+/// body's charge against the source buffer budget must
+/// stay a single semaphore grant. The video output cap
+/// stops at the same figure.
+const MAX_SOURCE_MAX_MB: u64 = 1024;
+
+/// The source fetch cap in megabytes (issue #471):
+/// `CRABCROP_SOURCE_MAX_MB`, 1 to 1024, defaulting to the
+/// loader's 10 MiB. The upload cap and the source buffer
+/// budget derive from it, so each reads it here, through
+/// the same `get`.
+fn source_max_mb(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String> {
+    let mb: u64 = parse_env_value(
+        "CRABCROP_SOURCE_MAX_MB",
+        get("CRABCROP_SOURCE_MAX_MB"),
+        crate::loader::DEFAULT_MAX_BYTES / (1024 * 1024),
+    )?;
+    if !(1..=MAX_SOURCE_MAX_MB).contains(&mb) {
+        return Err(format!(
+            "CRABCROP_SOURCE_MAX_MB must be between 1 and {MAX_SOURCE_MAX_MB}, got {mb}"
+        ));
+    }
+    Ok(mb)
+}
+
+/// The total time one source fetch may take, redirects
+/// and body included (issue #471):
+/// `CRABCROP_SOURCE_TIMEOUT_SECS`, 1 to 600 like the other
+/// wall-clock limits, defaulting to the loader's 10 s.
+fn source_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String> {
+    let secs: u64 = parse_env_value(
+        "CRABCROP_SOURCE_TIMEOUT_SECS",
+        get("CRABCROP_SOURCE_TIMEOUT_SECS"),
+        crate::loader::DEFAULT_TIMEOUT.as_secs(),
+    )?;
+    if !(1..=600).contains(&secs) {
+        return Err(format!(
+            "CRABCROP_SOURCE_TIMEOUT_SECS must be between 1 and 600, got {secs}"
+        ));
+    }
+    Ok(secs)
+}
+
+/// The proxy variables the HTTP client honours, as pairs
+/// it reads in order: the first of a pair that is set
+/// wins, even when it is empty.
+const PROXY_VARIABLES: [[&str; 2]; 3] = [
+    ["HTTPS_PROXY", "https_proxy"],
+    ["HTTP_PROXY", "http_proxy"],
+    ["ALL_PROXY", "all_proxy"],
+];
+
+/// The boot warning for a configured proxy that source
+/// fetches bypass (issue #471), or `None` when there is
+/// nothing to warn about. A pinned fetch connects to the
+/// address the private-address check validated and never
+/// goes through a proxy, which would resolve the host
+/// again on its own; under proxy-only egress those
+/// fetches fail with no other hint. Only the variable
+/// names are reported: a proxy URL can carry credentials.
+fn proxy_bypass_warning(
+    get: impl Fn(&str) -> Option<String>,
+    policy: &SourcePolicy,
+) -> Option<String> {
+    if !policy.pins_hostnames() {
+        return None;
+    }
+    let set: Vec<&str> = PROXY_VARIABLES
+        .iter()
+        .filter_map(|pair| {
+            let (name, value) = pair
+                .iter()
+                .find_map(|name| get(name).map(|value| (*name, value)))?;
+            (!value.trim().is_empty()).then_some(name)
+        })
+        .collect();
+    if set.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "a proxy is configured ({}), but source fetches bypass it: with private-address \
+         blocking on (CRABCROP_BLOCK_PRIVATE_SOURCES) and no CRABCROP_ALLOWED_SOURCES, \
+         each source host is pinned to the address the check validated and connected to \
+         directly, so under proxy-only egress those fetches fail. List the source hosts \
+         in CRABCROP_ALLOWED_SOURCES to fetch them through the proxy \
+         (see docs/configuration.md)",
+        set.join(", ")
+    ))
+}
+
 /// Fetch caps per processing lane permit in the default
 /// source buffer budget (issue #403): for each permit, room
 /// for one source rendering, one loaded and queued behind
@@ -491,14 +625,15 @@ const MAX_SOURCE_BUFFER_MB: u64 = 65_536;
 /// `CRABCROP_SOURCE_BUFFER_MAX_MB`, read through `get` so
 /// tests can drive it. The default scales with the
 /// processing lanes (`lane_permits`, the stills lane plus
-/// the slow lane): four fetch caps per permit. The floor is
-/// one fetch cap, below which no source could ever load.
+/// the slow lane): four fetch caps per permit, at the
+/// configured cap (issue #471). The floor is one fetch
+/// cap, below which no source at the cap could ever load.
 fn source_buffer_budget(
     get: impl Fn(&str) -> Option<String>,
     lane_permits: usize,
 ) -> Result<u64, String> {
     const MB: u64 = 1024 * 1024;
-    let cap_mb = crate::loader::DEFAULT_MAX_BYTES / MB;
+    let cap_mb = source_max_mb(&get)?;
     let default_mb = (cap_mb * SOURCE_BUFFER_CAPS_PER_PERMIT)
         .saturating_mul(lane_permits as u64)
         .clamp(cap_mb, MAX_SOURCE_BUFFER_MB);
@@ -515,11 +650,6 @@ fn source_buffer_budget(
     }
     Ok(mb * MB)
 }
-
-/// The default upload cap, in megabytes: the loader's
-/// source cap (issue #168 ties the two, so a stored
-/// original is always one the loader will fetch back).
-const DEFAULT_UPLOAD_MAX_MB: u64 = crate::loader::DEFAULT_MAX_BYTES / (1024 * 1024);
 
 /// Build the upload destination (issue #168) from the
 /// environment, read through `get` so tests can drive it.
@@ -548,15 +678,20 @@ fn build_upload_store(
     if dir.is_none() && bucket.is_none() {
         return Ok(None);
     }
+    // The upload cap defaults to the source fetch cap and
+    // may not pass it (issue #168 ties the two, so a stored
+    // original is always one the loader will fetch back).
+    let source_mb = source_max_mb(&get)?;
     let max_mb: u64 = parse_env_value(
         "CRABCROP_UPLOAD_MAX_MB",
         get("CRABCROP_UPLOAD_MAX_MB"),
-        DEFAULT_UPLOAD_MAX_MB,
+        source_mb,
     )?;
-    if max_mb == 0 || max_mb > DEFAULT_UPLOAD_MAX_MB {
+    if max_mb == 0 || max_mb > source_mb {
         return Err(format!(
-            "CRABCROP_UPLOAD_MAX_MB must be between 1 and {DEFAULT_UPLOAD_MAX_MB} \
-             (the source fetch cap an uploaded original must stay servable under), got {max_mb}"
+            "CRABCROP_UPLOAD_MAX_MB must be between 1 and {source_mb} \
+             (the source fetch cap, CRABCROP_SOURCE_MAX_MB, an uploaded original \
+             must stay servable under), got {max_mb}"
         ));
     }
     let max_bytes = max_mb * 1024 * 1024;
@@ -623,18 +758,20 @@ fn build_upload_store(
                 ));
             }
             let prefix = get("CRABCROP_UPLOAD_PREFIX").unwrap_or_default();
-            println!(
-                "uploads enabled: bucket {bucket} (cap {max_mb} MB, overwrite {allow_overwrite})"
-            );
-            Ok(Some(std::sync::Arc::new(crate::upload::UploadStore::s3(
-                bucket,
+            let store = crate::upload::UploadStore::s3(
+                bucket.clone(),
                 prefix,
                 sources.s3_endpoint.clone(),
                 sources.s3_region.clone(),
                 sources.aws_creds.clone(),
                 max_bytes,
                 allow_overwrite,
-            ))))
+            )
+            .map_err(|e| format!("cannot build the upload store client: {}", with_causes(&e)))?;
+            println!(
+                "uploads enabled: bucket {bucket} (cap {max_mb} MB, overwrite {allow_overwrite})"
+            );
+            Ok(Some(std::sync::Arc::new(store)))
         }
         _ => unreachable!("the both-set and neither-set cases returned above"),
     }
@@ -691,10 +828,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let process_permits = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
+    // The source fetch bounds (issue #471); the budget and
+    // the upload cap derive from the same cap.
+    let fetch_cap_mb = source_max_mb(&|name: &str| env::var(name).ok())?;
+    let fetch_timeout_secs = source_timeout_secs(&|name: &str| env::var(name).ok())?;
     let source_buffer_bytes = source_buffer_budget(
         |name| env::var(name).ok(),
         process_permits + slow_lane_permits,
     )?;
+    let fetch_cap = fetch_cap_mb * 1024 * 1024;
+    let fetch_timeout = std::time::Duration::from_secs(fetch_timeout_secs);
     let avif_speed: u8 = parse_env("CRABCROP_AVIF_SPEED", crate::engine::DEFAULT_AVIF_SPEED)?;
     if !(1..=10).contains(&avif_speed) {
         return Err(
@@ -716,6 +859,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .checked_mul(1024 * 1024)
         .ok_or("CRABCROP_CACHE_MAX_MB is too large")?;
     let policy = build_source_policy(|name| env::var(name).ok())?;
+    if let Some(warning) = proxy_bypass_warning(|name| env::var(name).ok(), &policy) {
+        eprintln!("warning: {warning}");
+    }
     let mut sources = build_source_config(|name| env::var(name).ok())?;
     // The upload destination (issue #168), built after the
     // source configuration it reuses. A local destination
@@ -822,7 +968,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sources.s3_region.clone(),
                 sources.aws_creds.clone(),
                 entry_key.clone(),
-            );
+            )
+            .map_err(|e| {
+                format!(
+                    "cannot build the shared result store client: {}",
+                    with_causes(&e)
+                )
+            })?;
             println!("shared result storage: bucket {bucket}");
             Some(Arc::new(store))
         }
@@ -856,20 +1008,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let frame_extractor = build_video_decoder(|name| env::var(name).ok())?;
     let pdf_renderer = build_pdf_renderer(|name| env::var(name).ok())?;
     let provenance_signer = build_provenance_signer(|name| env::var(name).ok())?;
-    // Meta mode stays on unless the operator switches it
-    // off (issue #390): it is the most expensive request
-    // shape a signed URL can trigger (an uncached render
-    // plus its annotation inferences, on every call).
-    let meta_enabled = parse_bool_value(
-        "CRABCROP_META_MODE",
-        env::var("CRABCROP_META_MODE").ok(),
-        true,
-    )?;
+    let meta_enabled = meta_mode_config(|name| env::var(name).ok())?;
+    if meta_enabled {
+        println!("meta mode: on");
+    }
 
     let state = AppState {
         keyring,
         allow_unsafe,
-        loader: Loader::with_defaults()
+        loader: Loader::new(fetch_cap, fetch_timeout)
             .map_err(|e| format!("cannot build the loader: {e}"))?
             .with_policy(policy)
             .with_sources(sources)
@@ -924,6 +1071,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
         config_fingerprint,
     };
+    println!(
+        "source fetch: cap {fetch_cap_mb} MB, timeout {fetch_timeout_secs}s, \
+         buffer budget {} MB",
+        source_buffer_bytes / (1024 * 1024)
+    );
     println!("configuration fingerprint: {}", state.config_fingerprint);
     println!("crabcrop listening on port {port}");
     axum::serve(listener, app(state))
@@ -972,7 +1124,12 @@ async fn shutdown_signal() {
 /// under format negotiation #370, one smart crop
 /// window per animated render #376, detection memos
 /// dropped after geometric steps #373).
-const RENDERING_VERSION: u32 = 2;
+///
+/// 3: the first release after 0.9.11, which changes output
+/// for existing URLs (interlaced PNG output from a 16-bit
+/// source writes its samples big-endian instead of
+/// byte-swapped #464).
+const RENDERING_VERSION: u32 = 3;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
@@ -1276,6 +1433,16 @@ fn metadata_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, String>
             "CRABCROP_METADATA must be \"strip\" or \"preserve\", got {v:?}"
         )),
     }
+}
+
+/// Meta mode from `CRABCROP_META_MODE`, off unless the
+/// operator turns it on (issue #453). Every meta request
+/// skips the cache tiers and runs a fresh fetch, render,
+/// and annotation inferences, and any viewer of a signed
+/// URL can ask for one with a header, so a deployment
+/// opts in to that cost rather than carrying it unasked.
+fn meta_mode_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, String> {
+    parse_bool_value("CRABCROP_META_MODE", get("CRABCROP_META_MODE"), false)
 }
 
 /// The AI provider set built at boot. Every provider is
@@ -2220,6 +2387,25 @@ mod tests {
     }
 
     #[test]
+    fn meta_mode_defaults_to_off_and_turns_on_by_the_boolean_spellings() {
+        // Issue #453: unset is off.
+        assert_eq!(meta_mode_config(env_of(&[])), Ok(false));
+        let set = |v: &str| meta_mode_config(env_of(&[("CRABCROP_META_MODE", v)]));
+        for v in ["1", "true", "YES", "on"] {
+            assert_eq!(set(v), Ok(true), "{v}");
+        }
+        for v in ["0", "false", "no", "OFF"] {
+            assert_eq!(set(v), Ok(false), "{v}");
+        }
+        // A typo, an empty value, or a stray space is a boot
+        // error naming the variable, never a silent default.
+        for bad in ["", " 1", "enabled", "2", "on\n"] {
+            let err = expect_err(set(bad));
+            assert!(err.contains("CRABCROP_META_MODE"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
     fn clip_config_needs_all_four_paths_or_none() {
         let get = |pairs: &[(&str, &str)]| {
             let map: std::collections::HashMap<String, String> = pairs
@@ -2303,6 +2489,77 @@ mod tests {
         let err =
             build_source_policy(get(&[("CRABCROP_BLOCK_PRIVATE_SOURCES", "ture")])).unwrap_err();
         assert!(err.contains("CRABCROP_BLOCK_PRIVATE_SOURCES"), "{err}");
+    }
+
+    #[test]
+    fn a_proxy_that_pinned_fetches_bypass_is_warned_about() {
+        let proxied = |name: &'static str| {
+            move |n: &str| (n == name).then(|| "http://proxy.internal:3128".to_string())
+        };
+        // The default policy pins every source hostname to
+        // its validated address (issue #471): a proxy set
+        // alongside it is named in a warning.
+        let default_policy = build_source_policy(env_of(&[])).unwrap();
+        let warning = proxy_bypass_warning(
+            env_of(&[("HTTPS_PROXY", "http://user:hunter2@proxy.internal:3128")]),
+            &default_policy,
+        )
+        .expect("a warning under the default policy");
+        assert!(warning.contains("(HTTPS_PROXY)"), "{warning}");
+        assert!(warning.contains("CRABCROP_ALLOWED_SOURCES"), "{warning}");
+        // The value is never echoed: a proxy URL can carry
+        // credentials.
+        assert!(!warning.contains("hunter2"), "{warning}");
+        assert!(!warning.contains("proxy.internal"), "{warning}");
+        // Every spelling the HTTP client reads counts.
+        for name in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            let warning = proxy_bypass_warning(proxied(name), &default_policy)
+                .unwrap_or_else(|| panic!("no warning for {name}"));
+            assert!(warning.contains(&format!("({name})")), "{warning}");
+        }
+        let warning = proxy_bypass_warning(
+            env_of(&[("HTTPS_PROXY", "http://p:1"), ("all_proxy", "http://p:1")]),
+            &default_policy,
+        )
+        .unwrap();
+        assert!(warning.contains("(HTTPS_PROXY, all_proxy)"), "{warning}");
+        // No proxy is nothing to warn about, and neither is
+        // an empty one: the client reads it as none, and an
+        // empty uppercase spelling hides the lowercase one.
+        for pairs in [
+            &[][..],
+            &[("HTTPS_PROXY", "")],
+            &[("HTTPS_PROXY", ""), ("https_proxy", "http://p:1")],
+            &[("NO_PROXY", "*")],
+        ] {
+            assert!(
+                proxy_bypass_warning(env_of(pairs), &default_policy).is_none(),
+                "{pairs:?}"
+            );
+        }
+        // Nothing is pinned with an allowlist (every host
+        // fetched is listed, and listed hosts are exempt),
+        // with blocking off, or with the any-source opt-out:
+        // every fetch then honours the proxy.
+        for pairs in [
+            &[("CRABCROP_ALLOWED_SOURCES", "images.example.com")][..],
+            &[("CRABCROP_BLOCK_PRIVATE_SOURCES", "0")],
+            &[("CRABCROP_ALLOW_ANY_SOURCE", "1")],
+        ] {
+            let policy = build_source_policy(env_of(pairs)).unwrap();
+            assert!(!policy.pins_hostnames(), "{pairs:?}");
+            assert!(
+                proxy_bypass_warning(proxied("HTTPS_PROXY"), &policy).is_none(),
+                "{pairs:?}"
+            );
+        }
     }
 
     #[test]
@@ -2795,23 +3052,49 @@ mod tests {
 
     #[test]
     fn source_config_construction_validates_endpoints_and_the_file_root() {
-        // A non-http(s) S3 endpoint is refused.
-        let err = expect_err(build_source_config(env_of(&[(
-            "CRABCROP_S3_ENDPOINT",
-            "ftp://example.com",
-        )])));
-        assert!(err.contains("must be an http(s) URL"), "{err}");
+        // Both store endpoints take the same check (issue
+        // #455: the GCS one used to boot with any scheme):
+        // a non-http(s) URL is refused, naming the variable,
+        // and so is a value that is not a URL at all.
+        for name in ["CRABCROP_S3_ENDPOINT", "CRABCROP_GCS_ENDPOINT"] {
+            for bad in [
+                "ftp://storage.example",
+                "file:///etc/passwd",
+                "gs://bucket",
+                "s3://bucket",
+                "data:text/plain,x",
+                "javascript:alert(1)",
+                "unix:/var/run/store.sock",
+            ] {
+                let err = expect_err(build_source_config(env_of(&[(name, bad)])));
+                assert_eq!(err, format!("{name} must be an http(s) URL"), "{bad}");
+            }
+            for bad in [
+                "storage.example",
+                "//storage.example",
+                "http://",
+                "http://[::1",
+                " ",
+            ] {
+                let err = expect_err(build_source_config(env_of(&[(name, bad)])));
+                assert!(
+                    err.starts_with(&format!("invalid {name}: ")),
+                    "{bad}: {err}"
+                );
+            }
+        }
         // A valid endpoint is stored with the trailing
         // slash trimmed.
-        let sources = build_source_config(env_of(&[(
-            "CRABCROP_S3_ENDPOINT",
-            "http://127.0.0.1:9000/",
-        )]))
+        let sources = build_source_config(env_of(&[
+            ("CRABCROP_S3_ENDPOINT", "http://127.0.0.1:9000/"),
+            ("CRABCROP_GCS_ENDPOINT", "https://gcs.example/"),
+        ]))
         .unwrap();
         assert_eq!(
             sources.s3_endpoint.as_deref(),
             Some("http://127.0.0.1:9000")
         );
+        assert_eq!(sources.gcs_endpoint, "https://gcs.example");
         // A file root that does not exist is refused...
         let missing = missing_path("root");
         let err = expect_err(build_source_config(env_of(&[(
@@ -2926,6 +3209,42 @@ mod tests {
             &plain,
         ));
         assert!(err.contains("CRABCROP_ALLOWED_BUCKETS"), "{err}");
+    }
+
+    #[test]
+    fn the_upload_cap_follows_the_source_fetch_cap() {
+        const MB: u64 = 1024 * 1024;
+        let plain = SourceConfig::default();
+        let upload = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("CRABCROP_UPLOAD_DIR", "/tmp")];
+            all.extend_from_slice(pairs);
+            build_upload_store(env_of(&all), &plain)
+        };
+        // A raised fetch cap (issue #471) raises the upload
+        // cap's default and its maximum with it.
+        let store = upload(&[("CRABCROP_SOURCE_MAX_MB", "64")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.max_bytes, 64 * MB);
+        let err = expect_err(upload(&[
+            ("CRABCROP_SOURCE_MAX_MB", "64"),
+            ("CRABCROP_UPLOAD_MAX_MB", "65"),
+        ]));
+        assert!(err.contains("between 1 and 64"), "{err}");
+        // A lowered one lowers both: an upload cap the
+        // default allowed is refused, so a stored original
+        // can never outgrow what the loader fetches back.
+        let store = upload(&[("CRABCROP_SOURCE_MAX_MB", "2")]).unwrap().unwrap();
+        assert_eq!(store.max_bytes, 2 * MB);
+        let err = expect_err(upload(&[
+            ("CRABCROP_SOURCE_MAX_MB", "2"),
+            ("CRABCROP_UPLOAD_MAX_MB", "10"),
+        ]));
+        assert!(err.contains("CRABCROP_UPLOAD_MAX_MB"), "{err}");
+        assert!(err.contains("CRABCROP_SOURCE_MAX_MB"), "{err}");
+        // A bad fetch cap fails the build, naming the cap.
+        let err = expect_err(upload(&[("CRABCROP_SOURCE_MAX_MB", "2048")]));
+        assert!(err.contains("CRABCROP_SOURCE_MAX_MB"), "{err}");
     }
 
     #[test]
@@ -3085,6 +3404,113 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn source_fetch_bounds_default_to_the_loader_and_check_their_ranges() {
+        // Unset: the loader's own defaults, 10 MiB and 10 s.
+        assert_eq!(source_max_mb(&env_of(&[])).unwrap(), 10);
+        assert_eq!(source_timeout_secs(&env_of(&[])).unwrap(), 10);
+        let cap = |v: &str| source_max_mb(&env_of(&[("CRABCROP_SOURCE_MAX_MB", v)]));
+        let timeout =
+            |v: &str| source_timeout_secs(&env_of(&[("CRABCROP_SOURCE_TIMEOUT_SECS", v)]));
+        // The range edges are accepted.
+        assert_eq!(cap("1").unwrap(), 1);
+        assert_eq!(cap("1024").unwrap(), 1024);
+        assert_eq!(timeout("1").unwrap(), 1);
+        assert_eq!(timeout("600").unwrap(), 600);
+        // Out of range, unparseable, and hostile spellings
+        // are boot errors naming the variable, never a
+        // silent default.
+        for bad in [
+            "0",
+            "1025",
+            "-1",
+            "10.5",
+            " 10",
+            "10MB",
+            "",
+            "lots",
+            "18446744073709551616",
+            "1\u{0}",
+        ] {
+            let err = expect_err(cap(bad));
+            assert!(err.contains("CRABCROP_SOURCE_MAX_MB"), "{bad:?}: {err}");
+        }
+        for bad in [
+            "0",
+            "601",
+            "-1",
+            "1.5",
+            "10s",
+            "",
+            "soon",
+            "18446744073709551616",
+        ] {
+            let err = expect_err(timeout(bad));
+            assert!(
+                err.contains("CRABCROP_SOURCE_TIMEOUT_SECS"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_source_buffer_budget_follows_the_configured_fetch_cap() {
+        const MB: u64 = 1024 * 1024;
+        let budget = |pairs: &[(&str, &str)], permits| source_buffer_budget(env_of(pairs), permits);
+        // Unset: four fetch caps per lane permit at the
+        // configured cap (issue #471), up or down.
+        assert_eq!(
+            budget(&[("CRABCROP_SOURCE_MAX_MB", "64")], 2).unwrap(),
+            512 * MB
+        );
+        assert_eq!(
+            budget(&[("CRABCROP_SOURCE_MAX_MB", "1")], 2).unwrap(),
+            8 * MB
+        );
+        // The largest cap on a large host stays inside the
+        // accepted range.
+        assert_eq!(
+            budget(&[("CRABCROP_SOURCE_MAX_MB", "1024")], 64).unwrap(),
+            MAX_SOURCE_BUFFER_MB * MB
+        );
+        // Set: the floor is one configured cap, so a budget
+        // that could never hold a source at the cap is
+        // refused, and a lower cap lowers the floor.
+        let err = expect_err(budget(
+            &[
+                ("CRABCROP_SOURCE_MAX_MB", "64"),
+                ("CRABCROP_SOURCE_BUFFER_MAX_MB", "63"),
+            ],
+            2,
+        ));
+        assert!(err.contains("between 64"), "{err}");
+        assert_eq!(
+            budget(
+                &[
+                    ("CRABCROP_SOURCE_MAX_MB", "64"),
+                    ("CRABCROP_SOURCE_BUFFER_MAX_MB", "64"),
+                ],
+                2
+            )
+            .unwrap(),
+            64 * MB
+        );
+        assert_eq!(
+            budget(
+                &[
+                    ("CRABCROP_SOURCE_MAX_MB", "1"),
+                    ("CRABCROP_SOURCE_BUFFER_MAX_MB", "1"),
+                ],
+                2
+            )
+            .unwrap(),
+            MB
+        );
+        // A bad cap fails the budget too, naming the cap.
+        let err = expect_err(budget(&[("CRABCROP_SOURCE_MAX_MB", "0")], 2));
+        assert!(err.contains("CRABCROP_SOURCE_MAX_MB"), "{err}");
     }
 
     #[test]

@@ -115,9 +115,39 @@ if ($GROUP === 'vectors') {
     $vectors = json_decode(file_get_contents($file), true);
     check(is_array($vectors) && count($vectors) > 0, 'spec vectors load');
     $signed = 0;
+    $refused = 0;
     foreach ($vectors as $vector) {
         if (!empty($vector['sealed'])) {
             continue; // Sealing is out of scope for a URL builder.
+        }
+        if (isset($vector['refuses'])) {
+            // Builder refusals (issue #472): signed and unsafe
+            // builds both refuse, naming the input, and a
+            // character a browser rewrites comes with its
+            // percent-encoding.
+            $character = $vector['refuses']['character'];
+            foreach (array('s3cr3t', null) as $secret) {
+                $message = null;
+                try {
+                    CrabcropUrl::build(
+                        'https://images.example.com',
+                        $secret,
+                        $vector['operations'],
+                        $vector['source']
+                    );
+                } catch (InvalidArgumentException $e) {
+                    $message = $e->getMessage();
+                }
+                $ok = $message !== null
+                    && strpos($message, $vector['refuses']['input'] . ' contains') === 0;
+                if ($ok && strpos('"<>\\^`{|}', $character) !== false) {
+                    $hint = sprintf('percent-encode it as %%%02X)', ord($character));
+                    $ok = substr($message, -strlen($hint)) === $hint;
+                }
+                check($ok, 'vector: ' . $vector['description'] . ($secret === null ? ' (unsafe)' : ''));
+            }
+            $refused++;
+            continue;
         }
         $signed++;
         eq(
@@ -127,6 +157,7 @@ if ($GROUP === 'vectors') {
         );
     }
     check($signed >= 20, "signature vectors covered ($signed)");
+    check($refused >= 17, "refusal vectors covered ($refused)");
 
     eq(
         'https://images.example.com/3c1f6c180116661877bd4c85fd201a178087d74c1cc188cc584e819d901308c6'
