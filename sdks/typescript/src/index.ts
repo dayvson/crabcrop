@@ -1,8 +1,18 @@
 /**
  * Build and sign crabcrop URLs, per `spec/url-signing.md` in
- * the crabcrop repository. Standard library only.
+ * the crabcrop repository. No dependencies: `#crypto` resolves
+ * to `node:crypto` on Node and to a plain TypeScript backend
+ * in browser bundles (see package.json `imports`), and this
+ * module uses no Node globals, so it bundles for either.
  */
-import { createCipheriv, createDecipheriv, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  aes256GcmOpen,
+  aes256GcmSeal,
+  hmacSha256,
+  randomBytes,
+  timingSafeEqual,
+} from "#crypto";
+import { fromBase64Url, toBase64Url, toHex, utf8, utf8Strict } from "./bytes.ts";
 
 /**
  * Compute the signature segment for a remainder: the lowercase
@@ -11,7 +21,16 @@ import { createCipheriv, createDecipheriv, createHmac, randomBytes, timingSafeEq
  * exactly as it will appear.
  */
 export function sign(secret: string, remainder: string): string {
-  return createHmac("sha256", secret).update(remainder, "utf8").digest("hex");
+  return toHex(hmacSha256(secret, remainder));
+}
+
+/**
+ * A subkey derived from the secret: the raw HMAC-SHA256 of
+ * `label` under it (the bytes whose hex is `sign(secret,
+ * label)`), one per signing domain.
+ */
+function subkey(secret: string, label: string): Uint8Array {
+  return hmacSha256(secret, label);
 }
 
 /**
@@ -24,8 +43,7 @@ export function sign(secret: string, remainder: string): string {
  * `POST /purge/<signature>/<path>`.
  */
 export function purgeSignature(secret: string, target: string): string {
-  const subkey = Buffer.from(sign(secret, "crabcrop/purge-key"), "hex");
-  return createHmac("sha256", subkey).update(target, "utf8").digest("hex");
+  return toHex(hmacSha256(subkey(secret, "crabcrop/purge-key"), target));
 }
 
 /**
@@ -40,8 +58,7 @@ export function purgeSignature(secret: string, target: string): string {
  * `POST /purge-group/<signature>/<group>`.
  */
 export function purgeGroupSignature(secret: string, group: string): string {
-  const subkey = Buffer.from(sign(secret, "crabcrop/purge-group-key"), "hex");
-  return createHmac("sha256", subkey).update(group, "utf8").digest("hex");
+  return toHex(hmacSha256(subkey(secret, "crabcrop/purge-group-key"), group));
 }
 
 /**
@@ -62,9 +79,8 @@ export function purgeGroupSignature(secret: string, group: string): string {
  * a token replays until the secret rotates.
  */
 export function uploadSignature(secret: string, name: string, expires?: number): string {
-  const subkey = Buffer.from(sign(secret, "crabcrop/upload-key"), "hex");
   const signed = expires === undefined ? name : `exp:${expires}/${name}`;
-  return createHmac("sha256", subkey).update(signed, "utf8").digest("hex");
+  return toHex(hmacSha256(subkey(secret, "crabcrop/upload-key"), signed));
 }
 
 export interface BuildOptions {
@@ -104,7 +120,7 @@ export function signWithKeyId(secret: string, keyId: string, remainder: string):
 export const MAX_SEALED_REMAINDER = 2048;
 
 /** The AAD every sealed token is bound to. */
-const SEAL_AAD = Buffer.from("crabcrop/sealed/1", "utf8");
+const SEAL_AAD = utf8("crabcrop/sealed/1");
 
 /**
  * The seal subkey: the raw bytes of the HMAC-SHA256 of the
@@ -114,8 +130,8 @@ const SEAL_AAD = Buffer.from("crabcrop/sealed/1", "utf8");
  * yields its own seal subkey, and the rotation window for
  * signatures is the rotation window for tokens.
  */
-function sealKey(secret: string): Buffer {
-  return Buffer.from(sign(secret, "crabcrop/seal-key"), "hex");
+function sealKey(secret: string): Uint8Array {
+  return subkey(secret, "crabcrop/seal-key");
 }
 
 /**
@@ -140,16 +156,17 @@ export function sealWithNonce(
   if (nonce.length !== 12) {
     throw new Error(`sealed token nonce must be 12 bytes, got ${nonce.length}`);
   }
-  if (Buffer.byteLength(remainder, "utf8") > MAX_SEALED_REMAINDER) {
+  const plaintext = utf8(remainder);
+  if (plaintext.length > MAX_SEALED_REMAINDER) {
     throw new Error(
       `remainder is over the ${MAX_SEALED_REMAINDER}-byte sealing cap: a recipe that long belongs in a preset`,
     );
   }
-  const cipher = createCipheriv("aes-256-gcm", sealKey(secret), Buffer.from(nonce));
-  cipher.setAAD(SEAL_AAD);
-  const ciphertext = Buffer.concat([cipher.update(remainder, "utf8"), cipher.final()]);
-  const body = Buffer.concat([Buffer.from(nonce), ciphertext, cipher.getAuthTag()]);
-  const token = `s1.${body.toString("base64url")}`;
+  const sealed = aes256GcmSeal(sealKey(secret), nonce, SEAL_AAD, plaintext);
+  const body = new Uint8Array(nonce.length + sealed.length);
+  body.set(nonce);
+  body.set(sealed, nonce.length);
+  const token = `s1.${toBase64Url(body)}`;
   if (keyId === undefined) {
     return token;
   }
@@ -194,28 +211,17 @@ export function unseal(secret: string, segment: string): string {
     throw openFailed();
   }
   const body = token.slice(3);
-  // Node's base64 decoder is lenient (it skips characters
-  // outside the alphabet), so canonicity is checked by
-  // re-encoding: anything but the exact minted spelling
-  // fails here.
-  const raw = Buffer.from(body, "base64url");
-  if (raw.length < 12 + 16 || raw.toString("base64url") !== body) {
+  // Canonicity is checked by re-encoding: anything but the
+  // exact minted spelling (padding, stray characters, nonzero
+  // trailing bits) fails here.
+  const raw = fromBase64Url(body);
+  if (raw === null || raw.length < 12 + 16 || toBase64Url(raw) !== body) {
     throw openFailed();
   }
-  const decipher = createDecipheriv("aes-256-gcm", sealKey(secret), raw.subarray(0, 12));
-  decipher.setAAD(SEAL_AAD);
-  decipher.setAuthTag(raw.subarray(raw.length - 16));
-  let plain: Buffer;
-  try {
-    plain = Buffer.concat([
-      decipher.update(raw.subarray(12, raw.length - 16)),
-      decipher.final(),
-    ]);
-  } catch {
-    throw openFailed();
-  }
-  const text = plain.toString("utf8");
-  if (!Buffer.from(text, "utf8").equals(plain)) {
+  const plain = aes256GcmOpen(sealKey(secret), raw.subarray(0, 12), SEAL_AAD, raw.subarray(12));
+  // The plaintext must be valid UTF-8: a remainder is text.
+  const text = plain === null ? null : utf8Strict(plain);
+  if (text === null) {
     throw openFailed();
   }
   return text;
@@ -417,11 +423,9 @@ export function verifyUrlSignature(
   }
   // Constant-time, like the Rust and Python verifiers: a
   // plain === leaks how much of the tag was right.
-  const given = Buffer.from(signature.value, "utf8");
-  const matches = (candidate: string): boolean => {
-    const expected = Buffer.from(sign(candidate, remainder), "utf8");
-    return expected.length === given.length && timingSafeEqual(expected, given);
-  };
+  const given = utf8(signature.value);
+  const matches = (candidate: string): boolean =>
+    timingSafeEqual(utf8(sign(candidate, remainder)), given);
   if (typeof secret === "string") {
     return matches(secret);
   }
