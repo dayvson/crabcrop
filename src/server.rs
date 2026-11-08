@@ -821,6 +821,13 @@ async fn explain_handle(
             Ok(v) => v,
             Err(e) => return parse_failure(&e, accept.as_deref()),
         };
+    // Server-wide defaults merge here, once, exactly as the
+    // image path merges them: the admission, the canonical
+    // form, and the forecast all follow the list the image
+    // request runs (issue #468). The report's operation
+    // list stays `ops`, the URL's own, so it never credits
+    // the URL with a default.
+    let merged = crate::url::merge_default_ops(&state.default_ops, ops.clone());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -847,10 +854,10 @@ async fn explain_handle(
     // either tool: the fetch is admitted, the probe stays
     // the raw-bytes probe.
     let admission = crate::loader::MediaAdmission {
-        video: ops
+        video: merged
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Frame(_))),
-        pdf: ops
+        pdf: merged
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Page(_))),
     };
@@ -884,18 +891,14 @@ async fn explain_handle(
         presets.push(crate::explain::preset_entry(name, &entry_ops));
     }
 
-    // The canonical form is the cache key's path form,
-    // defaults merged exactly as the image path merges
-    // them for its key. The key's config fingerprint
-    // suffix is operator state and stays unreported. For a
-    // root source the form is built from the source as
-    // written: the key itself is keyed on the expansion,
-    // but printing that here would publish the root's
-    // base URL into the report.
-    let canonical = crate::url::canonical_form(
-        &crate::url::merge_default_ops(&state.default_ops, ops.clone()),
-        source_url,
-    );
+    // The canonical form is the cache key's path form, of
+    // the merged list as the image path keys it. The key's
+    // config fingerprint suffix is operator state and stays
+    // unreported. For a root source the form is built from
+    // the source as written: the key itself is keyed on the
+    // expansion, but printing that here would publish the
+    // root's base URL into the report.
+    let canonical = crate::url::canonical_form(&merged, source_url);
     let report = crate::explain::Report::new(crate::explain::ReportInput {
         signed: !matches!(signature, crate::url::Signature::Unsafe),
         key_id,
@@ -906,6 +909,7 @@ async fn explain_handle(
         probe,
         source_bytes: fetched.total_bytes.map(|n| n as usize),
         ops,
+        merged_ops: merged,
         presets,
         canonical,
         cache_group: groups.into_iter().next(),

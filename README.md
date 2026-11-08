@@ -127,7 +127,7 @@ This README is the front door. The full reference lives on the website and in th
 
 Build and sign URLs from code: `@crabcrop/url` for TypeScript, `crabcrop_url` for Python, and the `crabcrop-url` Rust crate, all running the same spec test vectors, so client and server cannot drift. Loaders and integrations cover Next.js, Nuxt, Hydrogen, Astro, and SvelteKit, plus a WordPress plugin. For coding agents, a first-party MCP server exposes signing, explaining, meta, and purge over the same surface. Details in [Clients and SDKs](docs/clients.md).
 
-The server binary doubles as its own operator CLI: `crabcrop sign`, `explain`, `meta`, `purge`, `seal`, `upload`, and `convert-thumbor` run against a server (or offline, for the grammar-only verbs) with the same configuration conventions.
+The server binary doubles as its own operator CLI: `crabcrop sign`, `seal`, `unseal`, `explain`, `meta`, `purge`, `purge-group`, `upload`, and `convert-thumbor` run against a server (or offline, for the grammar-only verbs) with the same configuration conventions. Only a bare `crabcrop` starts the server; any argument runs the CLI, and one it does not know is an error. Every verb and flag is in [Command line](docs/endpoints.md#command-line).
 
 Migrating from another service: guides for [Thumbor](docs/migrating-from-thumbor.md), [imgproxy](docs/migrating-from-imgproxy.md), [Cloudinary](docs/migrating-from-cloudinary.md), [imgix](docs/migrating-from-imgix.md), [Cloudflare Images](docs/migrating-from-cloudflare-images.md), [ImageKit](docs/migrating-from-imagekit.md), and [Gumlet](docs/migrating-from-gumlet.md).
 

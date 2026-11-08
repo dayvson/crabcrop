@@ -8694,6 +8694,143 @@ async fn default_ops_apply_in_presets_only_mode() {
 }
 
 #[tokio::test]
+async fn explain_forecasts_the_merged_default_operations() {
+    // The image path runs the defaults merged ahead of the
+    // URL's own operations, so the forecast has to walk
+    // the same list (issue #468): a default format and a
+    // default DPR decide the output the image request
+    // answers with. The operation list stays the URL's own.
+    let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_defaults("filters:format(webp):dpr(2)", false).await;
+    let remainder = format!("50x0/{src}");
+    let sig = sign(&remainder);
+    let explain = client()
+        .get(format!("{base}/explain/{sig}/{remainder}"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(explain.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&explain.text().await.unwrap()).unwrap();
+    assert_eq!(json["forecast"]["format"], "webp");
+    assert_eq!(json["forecast"]["format_from"], "default");
+    assert_eq!(json["forecast"]["width"], 100);
+    assert_eq!(json["forecast"]["height"], 60);
+    let operations = json["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 1, "{operations:?}");
+    assert_eq!(operations[0]["segment"], "50x0");
+    let canonical = json["canonical"].as_str().unwrap();
+    assert!(
+        canonical.starts_with("filters:format(webp):dpr(2)/50x0/"),
+        "{canonical}"
+    );
+    // The image request agrees with the forecast.
+    let image = client()
+        .get(format!("{base}/{sig}/{remainder}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(image.status(), StatusCode::OK);
+    assert_eq!(image.headers().get("content-type").unwrap(), "image/webp");
+    let decoded = image::load_from_memory(&image.bytes().await.unwrap()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (100, 60));
+
+    // The HTML form says where the format came from, and
+    // never that the URL spelled it.
+    let html = client()
+        .get(format!("{base}/explain/{sig}/{remainder}"))
+        .header("Accept", "text/html")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains("<li>Format: webp (from the server's default operations)</li>"),
+        "{html}"
+    );
+    assert!(!html.contains("from the URL"), "{html}");
+
+    // A format the URL names wins over the default, and the
+    // report credits the URL.
+    let remainder = format!("50x0/filters:format(png)/{src}");
+    let sig = sign(&remainder);
+    let body = client()
+        .get(format!("{base}/explain/{sig}/{remainder}"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["forecast"]["format"], "png");
+    assert_eq!(json["forecast"]["format_from"], "operation");
+}
+
+#[tokio::test]
+async fn explain_survives_an_overflowing_forecast() {
+    // A crop-rect takes u32 corners and each upscale
+    // multiplies the running size: the forecast's pixel
+    // count overflowed u64 here and the handler panicked,
+    // dropping the connection (issue #468). It saturates
+    // now, and a saturated count is over the budget.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let sixteen = vec!["upscale(4)"; 16].join(":");
+    for chain in [
+        "crop-rect:0x0:4294967295x4294967295/filters:upscale(2)".to_string(),
+        format!("crop-rect:0x0:4294967295x4294967295/filters:{sixteen}"),
+    ] {
+        let remainder = format!("{chain}/{src}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/explain/{sig}/{remainder}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{chain}");
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["forecast"]["pixels"], u64::MAX, "{chain}");
+        assert_eq!(json["forecast"]["over_budget"], true, "{chain}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let health = client().get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn explain_admits_a_video_source_by_a_default_frame() {
+    // The image path admits a video source when its merged
+    // operations select a frame, a default `frame:`
+    // included. The explain probe admits by the same merged
+    // list (issue #468), so it reports the source the image
+    // request fetches instead of refusing it (on main it
+    // answered 502). The operation list stays the URL's own.
+    let (src, hits) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+    let base = spawn_app_with_defaults("frame:1.5", false).await;
+    let remainder = format!("100x0/{src}");
+    let resp = client()
+        .get(format!("{base}/explain/{}/{remainder}", sign(&remainder)))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["source"]["kind"], "video");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let operations = json["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 1, "{operations:?}");
+    assert_eq!(operations[0]["segment"], "100x0");
+    let canonical = json["canonical"].as_str().unwrap();
+    assert!(canonical.starts_with("frame:1.5/100x0/"), "{canonical}");
+}
+
+#[tokio::test]
 async fn rotation_window_verifies_both_keys_and_routes_by_key_id() {
     let (src_host, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let remainder = format!("25x25/{src_host}");

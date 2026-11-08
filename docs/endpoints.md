@@ -59,7 +59,9 @@ curl "http://localhost:3000/explain/<signature>/crop:1200x630:smart/filters:form
 
 Browsers get a readable HTML page; send `Accept: application/json` for the same report as JSON. The report carries the signature verdict (valid, which key, when the link expires), the source and its probed facts (media kind, pixel dimensions, and the encoded size when the fetch states it), every operation glossed in plain language in order, the referenced presets with their expansions, a forecast (output dimensions when the chain determines them, the output format, the output pixel count against the aggregate budget, and `zero_side`, true when a resize or fit-in asks for a zero-pixel side such as `00x100`, which the image request refuses with `400`; the dimensions and pixel count are then null), the canonical form that gets cached with its cache group, and links back to the image itself and to the debug focal remainder when the chain contains a crop. The CLI's `explain` verb does the offline half of this (grammar and signature against a secret you pass); the server route adds the live facts only a server can know.
 
-Explain is safe to expose to the same callers who hold signed URLs: the signature and expiry are verified exactly as the image path verifies them, before any source access, so a bad or expired URL is refused with the image path's own response and costs zero source fetches, and the one probe a valid URL pays for reads only the source's head through the loader, stopping as soon as the head identifies the source, with no decode, no detection, and nothing written to any cache tier. The encoded size is reported when the fetch itself states it (a declared length, or a body small enough to end inside the head); the probe never downloads a body just to count it, so a large source can report no size. The report contains only facts derivable from the URL and the source itself: no secrets or key material, no configuration values, paths, or fingerprints, no redirect or address details, and errors are the usual frozen codes and generic messages.
+The forecast walks the operations the image request runs, so with [server-wide default operations](configuration.md#server-wide-default-operations) configured it applies them, merged the same way: a default `filters:format(webp)` forecasts WebP for a URL that names no format. The JSON's `forecast.format_from` says where the format came from: `operation` when the URL names it, `default` when the server's defaults do, `source` when neither does. The operation list stays the URL's own; the defaults show in the canonical form. A chain whose pixel count is too large to represent reports the largest count instead, over the budget.
+
+Explain is safe to expose to the same callers who hold signed URLs: the signature and expiry are verified exactly as the image path verifies them, before any source access, so a bad or expired URL is refused with the image path's own response and costs zero source fetches, and the one probe a valid URL pays for reads only the source's head through the loader, stopping as soon as the head identifies the source, with no decode, no detection, and nothing written to any cache tier. The encoded size is reported when the fetch itself states it (a declared length, or a body small enough to end inside the head); the probe never downloads a body just to count it, so a large source can report no size. The report contains only facts derivable from the URL and the source itself: no secrets or key material, no configuration values (beyond the default operations, which shape the output and already show in the canonical form), paths, or fingerprints, no redirect or address details, and errors are the usual frozen codes and generic messages.
 
 ### Cache headers and groups
 
@@ -85,7 +87,9 @@ Every image request also writes one structured JSON log line to stdout, with the
 
 ## Command line
 
-The `crabcrop` binary doubles as its own operator CLI: when the first argument is a verb, it runs the verb and exits instead of starting the server. Configuration comes from flags over environment variables, the same convention as the MCP server: `--base` / `--secret` over `CRABCROP_BASE` / `CRABCROP_SECRET`, with the base defaulting to `http://localhost:3000`.
+The `crabcrop` binary doubles as its own operator CLI. With no arguments it starts the server, which reads its configuration from the environment and takes no arguments. With any argument it runs the CLI instead: the first argument must name a verb (or be `--help` or `--version`), which runs, and the process exits. Any other first argument, a flag included (`crabcrop --verison`, `crabcrop -x`), exits 1 with `unknown verb` and the usage on stderr; it never starts the server. `crabcrop --help` lists every verb and flag.
+
+Configuration comes from flags over environment variables, the same convention as the MCP server: `--base` / `--secret` / `--key-id` over `CRABCROP_BASE` / `CRABCROP_SECRET` / `CRABCROP_SECRET_KEY_ID`, with the base defaulting to `http://localhost:3000`. Flags go after the verb.
 
 ```bash
 export CRABCROP_BASE=http://localhost:3000
@@ -120,3 +124,16 @@ crabcrop upload ./photo.jpg heroes/photo.jpg
 # Convert a Thumbor URL (re-signed; losses are reported on stderr)
 crabcrop convert-thumbor "unsafe/300x200/smart/https://example.com/photo.jpg"
 ```
+
+Every flag the verbs take. A value flag is spelled `--flag <value>` or `--flag=<value>`, and an unknown flag after the verb (`--key-ids`) is an error too.
+
+| Flag | Environment | Verbs | Meaning |
+|---|---|---|---|
+| `--base <url>` | `CRABCROP_BASE` | all | The server's base URL. Default `http://localhost:3000`. |
+| `--secret <secret>` | `CRABCROP_SECRET` | all | The signing secret. |
+| `--key-id <id>` | `CRABCROP_SECRET_KEY_ID` | `sign`, `seal`, `purge`, `purge-group`, `upload` | The key ID stamped on the signature or token the verb mints (`<key-id>:<tag>`), for [rotating the secret](configuration.md#rotating-the-secret): 1 to 32 characters of `[A-Za-z0-9_-]`. Unset, the verbs mint with no key ID. |
+| `--placeholders` | | `meta` | Include the placeholder fields. |
+| `--detections` | | `meta` | Include the detection boxes. |
+| `--expires <unix-seconds>` | | `upload` | Mint an upload token that stops working at that second. |
+| `--help`, `-h` | | any position | Print the usage and exit 0. |
+| `--version`, `-V` | | first argument only | Print the version and exit 0. |
