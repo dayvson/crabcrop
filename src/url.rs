@@ -1148,6 +1148,12 @@ pub struct Request<'a> {
 /// pipeline (WebP's 16383).
 pub const MAX_DIMENSION: u32 = 16_383;
 
+/// The device pixel ratios a request may name, ascending:
+/// the values `dpr(...)` parses and the `DPR` client hint
+/// accepts. A hint that would push a size past the output
+/// limits steps down this list (issue #529).
+pub const DPR_FACTORS: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
+
 /// The largest cache lifetime a `maxage:` directive may name,
 /// in seconds: one year, the server's own default. A request
 /// may shorten its response's lifetime, never extend it past

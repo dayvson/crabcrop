@@ -1259,7 +1259,12 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// axis, such as a 16384 px source with no sizing step,
 /// refused instead of rendered, a 16383 px video side
 /// cropped to 16382 instead of padded to 16384, and PDF
-/// pages near the raster cap rendered one DPI lower #528).
+/// pages near the raster cap rendered one DPI lower #528; a
+/// `DPR` or `Sec-CH-DPR` client hint past 1 that took a
+/// 16384 px source side through unchanged steps down to a
+/// factor whose output fits 16383 px, so `8192x1` on a
+/// 16384x2 source with `DPR: 2` serves 12288x2 instead of
+/// 16384x2 #529).
 const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered

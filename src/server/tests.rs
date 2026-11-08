@@ -11378,6 +11378,265 @@ async fn dpr_header_scales_and_caches_separately() {
     assert_eq!(dims(&bogus), (20, 20));
 }
 
+/// The status and, on a 200, the decoded dimensions of `resp`.
+async fn status_and_dims(resp: reqwest::Response) -> (StatusCode, Option<(u32, u32)>) {
+    let status = resp.status();
+    let bytes = resp.bytes().await.unwrap();
+    let dims = (status == StatusCode::OK).then(|| {
+        let img = image::load_from_memory(&bytes).unwrap();
+        (img.width(), img.height())
+    });
+    (status, dims)
+}
+
+/// A DPR hint is advisory (issue #529): when the hint alone
+/// pushes a size past the per-axis limit or the pixel budget,
+/// the request answers 200 at the largest factor that fits,
+/// where it used to answer 400 on high-density screens only.
+#[tokio::test]
+async fn a_dpr_hint_past_the_limits_steps_down() {
+    let src = spawn_image_server().await;
+    let wide = spawn_bytes_server(png_of(16383, 1)).await;
+    let base = spawn_app(false).await;
+    for (ops, source, hint, dims) in [
+        // 18000x3 at 3 is past the per-axis limit; 2 fits.
+        ("6000x1", &src, ("DPR", "3"), (12000, 2)),
+        // 16384x2 at 2 is past it; 1.5 fits.
+        ("8192x1", &src, ("Sec-CH-DPR", "2"), (12288, 2)),
+        // 32766x2 at 2 and at 1.5; 1 keeps the source size.
+        ("0x1", &wide, ("DPR", "2"), (16383, 1)),
+        // The budget: a 12000x12000 canvas at 1.5 is 144
+        // million pixels, past the 100 million budget; at 1
+        // the 8000x8000 canvas fits, and the crop-rect after
+        // it keeps the response small.
+        (
+            "pad:8000x8000/crop-rect:0x0:8000x1/filters:no_upscale:format(png)",
+            &src,
+            ("DPR", "1.5"),
+            (8000, 1),
+        ),
+    ] {
+        let remainder = format!("{ops}/{source}");
+        let resp = get_with_headers(&base, &remainder, &[hint]).await;
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some(dims)),
+            "{ops} with {hint:?}"
+        );
+    }
+    // A stepped factor never serves a side past the limit. At
+    // 2, `8192x1` on a 16384x2 source asks for the source's own
+    // size, which no step refuses: served, it was one past the
+    // limit, and a WebP negotiated from Accept failed to encode
+    // it with a 500. The factor steps to 1.5 in every format.
+    let ceiling = spawn_bytes_server(png_of(16384, 2)).await;
+    let remainder = format!("8192x1/{ceiling}");
+    for (accept, format) in [("image/png", "image/png"), ("image/webp,*/*", "image/webp")] {
+        let resp = get_with_headers(&base, &remainder, &[("DPR", "3"), ("Accept", accept)]).await;
+        assert_eq!(header(&resp, "content-type"), format);
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some((12288, 2))),
+            "{accept}"
+        );
+    }
+}
+
+/// A stepped-down render keeps the cache entry of the hint
+/// that asked for it (issue #529): repeats of that hint hit
+/// it, and neither the hint-less URL nor another factor is
+/// ever answered from it. The response varies on both DPR
+/// headers.
+#[tokio::test]
+async fn a_stepped_down_hint_render_keys_under_its_hint() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("6000x1/{src}");
+    let resp = get_with_headers(&base, &remainder, &[("DPR", "3")]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    let vary = header(&resp, "vary");
+    assert!(
+        vary.split(", ").any(|h| h == "DPR") && vary.split(", ").any(|h| h == "Sec-CH-DPR"),
+        "{vary}"
+    );
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((12000, 2)))
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // The same factor from either header is the same entry.
+    for hints in [&[("DPR", "3")][..], &[("Sec-CH-DPR", "3")][..]] {
+        let resp = get_with_headers(&base, &remainder, hints).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit", "{hints:?}");
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some((12000, 2)))
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // The hint-less URL renders 6000x1 under its own key.
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((6000, 1)))
+    );
+    // A hint of 2 renders the same size, under its own key.
+    let resp = get_with_headers(&base, &remainder, &[("DPR", "2")]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((12000, 2)))
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    // And the hint-less entry still answers 6000x1.
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((6000, 1)))
+    );
+}
+
+/// Only the hint is advisory (issue #529): `dpr(...)` in the
+/// URL or in the operator's default operations is the
+/// request's own factor and keeps its 400, and a URL past the
+/// limit at factor 1 keeps its 400 under any hint.
+#[tokio::test]
+async fn an_explicit_dpr_past_the_limit_still_answers_400() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(false).await;
+    let refused =
+        |size: &str| format!("requested output {size} exceeds the 16383 pixel limit per axis");
+    let expect_400 = |resp: reqwest::Response, size: &'static str| {
+        let message = refused(size);
+        async move {
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(resp.text().await.unwrap(), message);
+        }
+    };
+    let remainder = format!("6000x1/filters:dpr(3)/{src}");
+    for hints in [&[][..], &[("DPR", "3")][..], &[("Sec-CH-DPR", "1")][..]] {
+        expect_400(get_with_headers(&base, &remainder, hints).await, "18000x3").await;
+    }
+    let remainder = format!("16383x1/0x2/{src}");
+    expect_400(
+        get_with_headers(&base, &remainder, &[("DPR", "3")]).await,
+        "32766x2",
+    )
+    .await;
+    // A default `dpr(3)` is the operator's explicit factor.
+    let base = spawn_app_with_defaults("filters:dpr(3)", false).await;
+    let remainder = format!("6000x1/{src}");
+    expect_400(
+        get_with_headers(&base, &remainder, &[("DPR", "2")]).await,
+        "18000x3",
+    )
+    .await;
+}
+
+/// Hostile DPR headers (issue #529): a value outside the
+/// factor set, or not a number at all, is no hint and the URL
+/// renders as written; a value in the set that the limits
+/// refuse steps down. Every one answers 200.
+#[tokio::test]
+async fn hostile_dpr_hints_render_or_step_down() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(false).await;
+    let remainder = format!("6000x1/{src}");
+    for (value, dims) in [
+        ("NaN", (6000, 1)),
+        ("inf", (6000, 1)),
+        ("-3", (6000, 1)),
+        ("0", (6000, 1)),
+        ("1e30", (6000, 1)),
+        ("2.5", (6000, 1)),
+        ("3,2", (6000, 1)),
+        ("", (6000, 1)),
+        ("3e0", (12000, 2)),
+        (" 3 ", (12000, 2)),
+    ] {
+        let resp = get_with_headers(&base, &remainder, &[("DPR", value)]).await;
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some(dims)),
+            "DPR: {value:?}"
+        );
+    }
+    let resp = client()
+        .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+        .header(
+            "Sec-CH-DPR",
+            reqwest::header::HeaderValue::from_bytes(b"3\xff").unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((6000, 1)))
+    );
+}
+
+/// `/explain` reads the DPR hint as the image path does and
+/// forecasts the factor the image request applies (issue
+/// #529), stepped down like the render.
+#[tokio::test]
+async fn explain_forecasts_the_stepped_down_hint() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(true).await;
+    let explain = |ops: &'static str, hint: Option<&'static str>| {
+        let (base, src) = (base.clone(), src.clone());
+        async move {
+            let mut req = client()
+                .get(format!("{base}/explain/unsafe/{ops}/{src}"))
+                .header("accept", "application/json");
+            if let Some(hint) = hint {
+                req = req.header("DPR", hint);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{ops}");
+            let report: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            report["forecast"].clone()
+        }
+    };
+    let forecast = explain("6000x1", Some("3")).await;
+    assert_eq!(forecast["width"], 12000);
+    assert_eq!(forecast["height"], 2);
+    assert_eq!(forecast["over_dimension"], false);
+    assert_eq!(forecast["dpr"], 2.0);
+    assert_eq!(forecast["dpr_from"], "hint");
+    assert_eq!(forecast["dpr_hint"], 3.0);
+    // The image request agrees.
+    let resp = client()
+        .get(format!("{base}/unsafe/6000x1/{src}"))
+        .header("DPR", "3")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((12000, 2)))
+    );
+    // Without the hint, factor 1.
+    let forecast = explain("6000x1", None).await;
+    assert_eq!(forecast["width"], 6000);
+    assert_eq!(forecast["height"], 1);
+    assert_eq!(forecast["dpr"], 1.0);
+    assert_eq!(forecast["dpr_from"], "none");
+    assert!(forecast["dpr_hint"].is_null());
+    // An explicit factor does not step: the forecast flags
+    // the refusal the image request answers.
+    let forecast = explain("6000x1/filters:dpr(3)", Some("2")).await;
+    assert_eq!(forecast["over_dimension"], true);
+    assert_eq!(forecast["width"], 18000);
+    assert_eq!(forecast["height"], 3);
+    assert_eq!(forecast["dpr"], 3.0);
+    assert_eq!(forecast["dpr_from"], "operation");
+    assert_eq!(forecast["dpr_hint"], 2.0);
+}
+
 #[tokio::test]
 async fn text_without_a_font_is_501() {
     let src = spawn_image_server().await;
