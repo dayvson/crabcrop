@@ -1600,10 +1600,18 @@ pub(in crate::server) fn meta_response(
     let body = serde_json::to_string(&meta).unwrap_or_default();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-    // Meta is a second representation of the same URL (audit
-    // PL-12): never publicly cacheable, so an intermediary can
-    // never pin it in place of the image, or the reverse.
+    meta_cache_headers((StatusCode::OK, headers, body).into_response())
+}
+
+/// The caching headers of an answer to a meta request.
+/// Meta is a second representation of the same URL (audit
+/// PL-12): never publicly cacheable, so an intermediary can
+/// never pin it in place of the image, or the reverse. The
+/// `meta_disabled` refusal (issue #453) answers that same
+/// representation and carries the same headers.
+pub(in crate::server) fn meta_cache_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
     headers.insert(header::VARY, "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data".parse().unwrap());
-    (StatusCode::OK, headers, body).into_response()
+    response
 }

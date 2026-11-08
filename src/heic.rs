@@ -340,7 +340,8 @@ pub(crate) fn decode_heic(bytes: &[u8]) -> Result<(DynamicImage, SourceMeta), En
     let mut meta = SourceMeta {
         icc: cap_metadata(img.metadata.icc.clone(), crate::color::MAX_ICC_BYTES),
         exif_tiff: cap_metadata(img.metadata.exif.clone(), crate::color::MAX_META_BYTES),
-        xmp: cap_metadata(img.metadata.xmp.clone(), crate::color::MAX_META_BYTES),
+        xmp: cap_metadata(img.metadata.xmp.clone(), crate::color::MAX_XMP_BYTES),
+        xmp_compressed: false,
         photoshop: None,
     };
     // The pixels are upright now; a preserved EXIF must say so,

@@ -4,6 +4,7 @@ import { createHmac } from "node:crypto";
 import { test } from "node:test";
 
 const { createCrabcropLoader } = await import("../crabcrop-loader.ts");
+const table = await import("../../dimension-table.mjs");
 
 const SRC = "https://cdn.example.com/a.jpg";
 const sig = (remainder: string) =>
@@ -52,4 +53,29 @@ test("in a browser context the secret is never used (audit PL-11)", () => {
   } finally {
     delete (globalThis as { window?: unknown }).window;
   }
+});
+
+test("dimensions and the base follow the rule all five integrations share (issue #460)", () => {
+  const loader = createCrabcropLoader({ base: table.BASE });
+  table.checkDimensionTable({
+    width: (width: number) => loader({ src: table.SRC, width }),
+    height: (height: number) => loader({ src: table.SRC, height }),
+    emptyBase: () => createCrabcropLoader({ base: "" }),
+  });
+});
+
+test("the shared rule applies after scale: the URL carries the scaled pixel count", () => {
+  const loader = createCrabcropLoader({ base: "https://images.example.com" });
+  assert.equal(
+    loader({ src: SRC, width: 0.75, height: 100.25, scale: 2 }),
+    `https://images.example.com/unsafe/2x201/${SRC}`,
+  );
+  // A scale that is not a positive number leaves the size out
+  // rather than emitting a flip or a 0x0.
+  assert.equal(loader({ src: SRC, width: 300, scale: -1 }), `https://images.example.com/unsafe/${SRC}`);
+  assert.equal(loader({ src: SRC, width: 300, scale: 0 }), `https://images.example.com/unsafe/${SRC}`);
+  assert.throws(
+    () => loader({ src: SRC, width: 10000, scale: 2 }),
+    /crabcrop loader: width 20000 exceeds the maximum dimension/,
+  );
 });

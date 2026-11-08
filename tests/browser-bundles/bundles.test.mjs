@@ -123,6 +123,7 @@ test("@crabcrop/url: a Vite client build signs and seals with no Node built-ins"
   const vectors = JSON.parse(readFileSync(join(repo, "spec/test-vectors.json"), "utf8"));
   let signed = 0;
   let sealed = 0;
+  let refused = 0;
   for (const v of vectors) {
     if (v.signature !== undefined) {
       assert.equal(sdk.sign(v.secret, v.remainder), v.signature, v.description);
@@ -134,8 +135,18 @@ test("@crabcrop/url: a Vite client build signs and seals with no Node built-ins"
       assert.equal(sdk.unseal(v.secret, v.token), v.remainder);
       sealed++;
     }
+    if (v.refuses !== undefined) {
+      // Issue #472: in the browser, where the rewriting
+      // happens, the builder refuses what every builder does.
+      assert.throws(
+        () => sdk.buildURL(BASE, "k", v.operations, v.source),
+        /cannot appear in a crabcrop URL/,
+        v.description,
+      );
+      refused++;
+    }
   }
-  assert.ok(signed > 0 && sealed > 0);
+  assert.ok(signed > 0 && sealed > 0 && refused > 0);
   const remainder = "300x200/https://example.com/photo.jpg";
   assert.equal(sdk.unseal("k", sdk.seal("k", remainder)), remainder);
   const url = sdk.buildURL(BASE, "k", "300x200", "https://example.com/photo.jpg");

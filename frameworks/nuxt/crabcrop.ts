@@ -48,7 +48,7 @@
  *   format (jpg -> jpeg)                -> filters:format(...)
  *   quality                             -> filters:quality(...)
  */
-import { buildURL } from "@crabcrop/url";
+import { buildURL, MAX_DIMENSION } from "@crabcrop/url";
 
 export interface CrabcropProviderOptions {
   base: string;
@@ -68,9 +68,6 @@ interface Modifiers {
   quality?: number | string;
   [key: string]: unknown;
 }
-
-/** The server's per-axis dimension cap (the URL grammar's MAX_DIMENSION). */
-const MAX_DIMENSION = 16383;
 
 const dim = (v: number | string | undefined, name: string): number | undefined => {
   const n = v === undefined ? NaN : Number(v);

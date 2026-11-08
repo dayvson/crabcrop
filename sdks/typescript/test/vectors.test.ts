@@ -29,6 +29,9 @@ const vectors = JSON.parse(
   key_id?: string;
   nonce?: string;
   token?: string;
+  operations?: string;
+  source?: string;
+  refuses?: { input: string; character: string };
 }[];
 
 for (const v of vectors) {
@@ -57,6 +60,69 @@ for (const v of vectors) {
     assert.throws(() => unseal("wrong-secret", token), /did not open/);
   });
 }
+
+// The refusal vectors (issue #472): every builder refuses each
+// input, signed or not, plain or sealed, naming the input and
+// the character; a character a browser rewrites comes with
+// its percent-encoding, the spelling that travels unchanged.
+const BROWSER_REWRITTEN = "\"<>\\^`{|}";
+let refusals = 0;
+for (const v of vectors) {
+  if (v.refuses === undefined) {
+    continue;
+  }
+  refusals++;
+  const { input, character } = v.refuses;
+  const operations = v.operations as string;
+  const source = v.source as string;
+  test(`refusal vector: ${v.description}`, () => {
+    let message = `${input} contains a character that cannot appear in a crabcrop URL: ${JSON.stringify(character)}`;
+    if (BROWSER_REWRITTEN.includes(character)) {
+      const hex = character.charCodeAt(0).toString(16).toUpperCase();
+      message += ` (browsers rewrite it; percent-encode it as %${hex})`;
+    }
+    const exact = { message };
+    const base = "https://img.example.com";
+    assert.throws(() => buildURL(base, "s3cr3t", operations, source), exact);
+    assert.throws(() => buildURL(base, null, operations, source), exact);
+    assert.throws(() => buildURL(base, "s3cr3t", operations, source, { keyId: "k2" }), exact);
+    assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source), exact);
+    if (input === "source") {
+      assert.throws(() => buildSrcSet(base, "s3cr3t", source, [320]), exact);
+    }
+  });
+}
+test("the spec carries the refusal vectors", () => {
+  assert.ok(refusals >= 17, `${refusals} refusal vectors`);
+});
+
+test("a percent-encoded source builds and signs as written (issue #472)", () => {
+  // The spelling the refusal message asks for: it holds
+  // nothing a browser rewrites, so the URL a page requests
+  // is the URL that was signed (the spec vector's signature).
+  const url = buildURL("https://img.example.com", "s3cr3t", "100x0", "https://example.com/x%7By%7D.jpg");
+  assert.equal(
+    url,
+    "https://img.example.com/185ec1ffdc665285c43ca7af231f4bef87fe8c6f102709006e46e8ace401da57/100x0/https://example.com/x%7By%7D.jpg",
+  );
+  assert.equal(new URL(url).href, url);
+});
+
+test("every character buildURL accepts survives URL parsing unchanged", () => {
+  // The WHATWG parser behind new URL() is what a page applies
+  // to an <img src> or fetch() URL; a character it would
+  // rewrite must be refused, never signed.
+  for (let code = 0; code < 0x80; code++) {
+    const c = String.fromCharCode(code);
+    let url: string;
+    try {
+      url = buildURL("https://img.example.com", "k", "300x200", `https://example.com/a${c}b.jpg`);
+    } catch {
+      continue;
+    }
+    assert.equal(new URL(url).href, url, JSON.stringify(c));
+  }
+});
 
 test("sealed round trip and builders", () => {
   const remainder = "300x200/https://example.com/photo.jpg";

@@ -52,7 +52,6 @@ struct Inner {
 /// behind it. The index mutations stay exactly as atomic as
 /// before; a race can at worst evict a fresh entry, which a
 /// cache heals on the next store.
-#[derive(Debug)]
 pub struct DiskStore {
     dir: PathBuf,
     max_bytes: usize,
@@ -73,6 +72,20 @@ pub struct DiskStore {
     /// one hold no thread, and a slow disk cannot crowd
     /// out the other work the pool carries.
     permits: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl std::fmt::Debug for DiskStore {
+    /// The entry MAC key prints as `[redacted]` (issue #455).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskStore")
+            .field("dir", &self.dir)
+            .field("max_bytes", &self.max_bytes)
+            .field("entry_key", &crate::redact::Redacted)
+            .field("inner", &self.inner)
+            .field("errors", &self.errors)
+            .field("permits", &self.permits)
+            .finish()
+    }
 }
 
 /// How many disk operations may run on the blocking pool

@@ -4,6 +4,7 @@ import { createHmac } from "node:crypto";
 import { test } from "node:test";
 
 const { default: service } = await import("../crabcrop-service.ts");
+const table = await import("../../dimension-table.mjs");
 
 const SRC = "https://cdn.example.com/a.jpg";
 const cfg = (config: Record<string, unknown>) => ({ service: { config } });
@@ -170,4 +171,13 @@ test("getSrcSet maps densities to transforms with x descriptors", () => {
     ],
   );
   assert.deepEqual(service.getSrcSet({ src: SRC, width: 400 }, unsigned), []);
+});
+
+test("dimensions and the base follow the rule all five integrations share (issue #460)", () => {
+  const config = cfg({ base: table.BASE });
+  table.checkDimensionTable({
+    width: (width: number) => service.getURL({ src: table.SRC, width }, config),
+    height: (height: number) => service.getURL({ src: table.SRC, height }, config),
+    emptyBase: () => service.getURL({ src: table.SRC, width: 100 }, cfg({ base: "" })),
+  });
 });

@@ -67,7 +67,7 @@ The bounds mirror the encoder's, because the work is the same class:
 - At most two extractions run at a time behind the video gate (shared with encodes), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
 - Each run (probe and extraction alike) is bounded by the same wall-clock timeout as encodes (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a frame whose PNG passes 256 MiB, the decode allocation budget, is refused).
 - Each run also gets the encoder's kernel limits (address space, and CPU time scaled by the cores the server may use; see [the encoder details](#the-encoder-contract)), so a multi-threaded decode that fits the wall clock, such as a far seek in a long 4K clip, is never cut short by the CPU limit.
-- The source itself flows through the ordinary loader first, with the same allowlist, size cap, and redirect rules as any source. Only a URL carrying a `frame:` segment may fetch a `video/*` Content-Type; every other request keeps the image-only rule.
+- The source itself flows through the ordinary loader first, with the same allowlist, size cap (`CRABCROP_SOURCE_MAX_MB`, 10 MiB by default: raise it for longer clips), fetch timeout, and redirect rules as any source. Only a URL carrying a `frame:` segment may fetch a `video/*` Content-Type; every other request keeps the image-only rule.
 
 ### Errors
 
@@ -92,7 +92,7 @@ Crabcrop ships no PDF renderer. Rendering runs in an external program you config
 - **Probe**: argv is `pdfinfo -f <page> -l <page> -`, with the PDF bytes on stdin. Crabcrop reads the page count, the encryption state, and the selected page's size in points from the report. When the probe refuses the range itself, which it does past the end of the document, a whole-document probe confirms the count for the refusal.
 - **Render**: argv is `pdftocairo -png -singlefile -f <page> -l <page> -r <dpi> - -`, again with the PDF bytes on stdin. One PNG page comes back on stdout and becomes the source image.
 
-Because the tools receive only bytes over stdin, nothing inside a document has anything to resolve: external references, embedded files, and document actions or scripts have no target and no effect. The source itself flows through the ordinary loader first, with the same allowlist and redirect rules as any source and the same 10 MiB fetch cap; only a URL carrying a `page:` segment may fetch an `application/pdf` Content-Type. Documents over 1000 pages are refused.
+Because the tools receive only bytes over stdin, nothing inside a document has anything to resolve: external references, embedded files, and document actions or scripts have no target and no effect. The source itself flows through the ordinary loader first, with the same allowlist and redirect rules as any source and the same fetch cap (`CRABCROP_SOURCE_MAX_MB`, 10 MiB by default: raise it for larger documents); only a URL carrying a `page:` segment may fetch an `application/pdf` Content-Type. Documents over 1000 pages are refused.
 
 The bounds mirror the frame extractor's, because the work is the same class:
 

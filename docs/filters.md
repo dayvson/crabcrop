@@ -93,7 +93,7 @@ filters:watermark(<url>,<x>,<y>,<alpha>)
 | `x`, `y` | Position of the watermark's top-left corner, in pixels. Negative values anchor from the right and bottom edges. |
 | `alpha` | Opacity, 0 (invisible) to 100 (opaque). The watermark's own alpha is honored. |
 
-The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`) instead of being skipped.
+The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`, or `400 invalid_source` when its URL is not one the server can fetch at all) instead of being skipped.
 
 ```bash
 # Overlay https://cdn.example.com/logo.png at the bottom right, 80% opaque
@@ -144,7 +144,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 | --- | --- | --- | --- |
 | `removebg` | none | Remove the background, keeping the subject over transparency. Output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:removebg:format(png)` |
 | `studio` | `studio(product,...)` or `studio(scene,...)` | Studio mode: `product` composites the subject onto a backdrop with a synthesized contact shadow, scaled and centered to a pad margin; `scene` keeps the photograph's scene, reframing it on the detected subject and correcting light and color. See [Studio mode](#studio-mode). Requires the removebg model. | `filters:studio(product,bg:white)` |
-| `keep_profile` | none | Keep the source ICC profile instead of converting to sRGB; the profile is embedded in JPEG and PNG outputs. Other output formats convert to sRGB (pixels labeled as nothing would be wrong colors). | `filters:keep_profile` |
+| `keep_profile` | none | Keep the source ICC profile instead of converting to sRGB; the profile is embedded in JPEG and PNG outputs. Other output formats convert to sRGB (pixels labeled as nothing would be wrong colors), and so does a profile that is malformed or larger than 256 KiB, which is never embedded. | `filters:keep_profile` |
 | `blurfaces` | none | Blur every detected face (privacy redaction). Requires a face model. | `filters:blurfaces` |
 | `pixelatefaces` | none | Pixelate every detected face (privacy redaction): each face becomes a mosaic of averaged cells, at most 8 across its longer side and never under 2 px, so even a face a few pixels wide is redacted. Requires a face model. | `filters:pixelatefaces` |
 | `blurclass` | `blurclass(person)` | Blur every detected object of the class (privacy redaction). Repeat for more classes. Requires a detection model. With a segmentation model, the blur follows the object's silhouette instead of its box. | `filters:blurclass(person)` |
@@ -156,6 +156,8 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 ```bash
 curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.com/product.jpg"
 ```
+
+Redaction replaces pixels. `blurfaces`, `pixelatefaces`, `blurclass`, `pixelateclass`, `blur_region`, and `pixelate_region` write the blurred or pixelated result, alpha included, in place of the pixels they cover; they never composite it over the original, so the source's alpha cannot let the original through. (With a segmentation model, a silhouette's antialiased edge mixes the redacted and the original pixels by the mask's strength, as it does for an opaque source.) This matters for sources with transparency: detection reads color only, so a face stored at alpha 0 is still found, and JPEG output, which has no alpha, writes the stored color. Under any alpha the stored color is the redacted one, the same an opaque source gets. An area of uniform alpha keeps that alpha exactly, so an opaque image stays opaque; where the alpha varies, as at a cut-out's edge, it is blurred or pixelated along with the color.
 
 ### Studio mode
 

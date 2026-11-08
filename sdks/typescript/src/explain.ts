@@ -5,6 +5,7 @@
  * copy for its no-build static page, and both are pinned to the
  * same verdict corpus (audit PL-10, P-3).
  */
+import { MAX_DIMENSION } from "./limits.ts";
 
 /** The segment kinds an explanation is made of. */
 export type SegmentKind = "expiry" | "maxage" | "debug" | "preset" | "operation";
@@ -92,8 +93,6 @@ export const FILTER_DESCRIPTIONS: Record<string, string> = {
   pixelate_region: "pixelate the rectangle (x,y,w,h) in pixels at this point in the chain (redaction)",
   remove_region: "erase the rectangle (x,y,w,h) in pixels at this point in the chain and inpaint it from the surrounding pixels (AI region removal)",
 };
-
-const MAX_DIMENSION = 16383;
 
 /**
  * The server's size grammar (url.rs parse_size/parse_dimension),
@@ -429,7 +428,7 @@ function validateFilter(name: string, args: string | null): string | null {
       if (args === null) return bad;
       const parts = args.split(",");
       return (parts.length === 1 || parts.length === 4) &&
-        parts.every((p) => isIntIn(p, 0, 16383))
+        parts.every((p) => isIntIn(p, 0, MAX_DIMENSION))
         ? null
         : bad;
     }
@@ -437,7 +436,7 @@ function validateFilter(name: string, args: string | null): string | null {
       if (args === null) return bad;
       const parts = args.split(",");
       return parts.length === 2 &&
-        isIntIn(parts[0], 0, 16383) &&
+        isIntIn(parts[0], 0, MAX_DIMENSION) &&
         /^[0-9a-fA-F]{6}$/.test(parts[1])
         ? null
         : bad;
@@ -452,7 +451,7 @@ function validateFilter(name: string, args: string | null): string | null {
     case "monochrome":
       return args !== null && /^[0-9a-fA-F]{6}$/.test(args) ? null : bad;
     case "pixelate":
-      return args !== null && isIntIn(args, 1, 16383) ? null : bad;
+      return args !== null && isIntIn(args, 1, MAX_DIMENSION) ? null : bad;
     case "flip":
       return args === "h" || args === "v" ? null : bad;
     case "overlay": {
@@ -508,7 +507,7 @@ function validateFilter(name: string, args: string | null): string | null {
       if (args === null) return bad;
       const parts = args.split(",");
       return parts.length === 4 &&
-        parts.every((p) => isIntIn(p, 0, 16383)) &&
+        parts.every((p) => isIntIn(p, 0, MAX_DIMENSION)) &&
         Number(parts[2]) >= 1 &&
         Number(parts[3]) >= 1
         ? null

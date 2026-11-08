@@ -28,6 +28,7 @@ CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_
   crabcrop explain <url-or-path>      Break a URL down segment by segment.
   crabcrop meta <url-or-remainder>    Fetch and print the meta JSON for an image.
                                       (--placeholders / --detections ask for those fields.)
+                                      Needs meta mode on the server (CRABCROP_META_MODE=1).
   crabcrop purge <url-or-remainder>   Purge one URL's cached variants.
   crabcrop purge-group <name>         Purge every cached entry in a preset group.
   crabcrop upload <file> [<name>]     Upload an original to the server's upload store
@@ -1234,7 +1235,8 @@ pub fn convert_thumbor(
     if segments.get(idx) == Some(&"meta") {
         warnings.push(
             "the meta segment has no URL form in crabcrop: fetch the converted URL with \
-             Accept: application/json, or run crabcrop meta on it"
+             Accept: application/json, or run crabcrop meta on it, on a server with meta \
+             mode on (CRABCROP_META_MODE=1)"
                 .to_string(),
         );
         idx += 1;

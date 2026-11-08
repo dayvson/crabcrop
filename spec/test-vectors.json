@@ -150,6 +150,12 @@
     "signature": "971306ae1da419c03dd8a49b1cb0523a5cb0e1b8d3ee074fedd0e50456aca1b9"
   },
   {
+    "description": "a percent-encoded source, the spelling builders ask for in place of a character a browser rewrites (issue #472): signed as written",
+    "secret": "s3cr3t",
+    "remainder": "100x0/https://example.com/x%7By%7D.jpg",
+    "signature": "185ec1ffdc665285c43ca7af231f4bef87fe8c6f102709006e46e8ace401da57"
+  },
+  {
     "description": "sealed: a plain remainder under an injected nonce (AES-256-GCM, key HMAC_SHA256(secret, \"crabcrop/seal-key\"), AAD crabcrop/sealed/1)",
     "sealed": true,
     "secret": "s3cr3t",
@@ -173,5 +179,158 @@
     "nonce": "0b0a09080706050403020100",
     "remainder": "exp:1893456000/300x200/root:photos/cat.jpg",
     "token": "s1.CwoJCAcGBQQDAgEAM3yLQzhWSh2-e40WBlrwPD1nZpOaMpA5jHnyRJUHyv0GtY-GFViYaBukUi3oSXcviK6xl8_VMYLStw"
+  },
+  {
+    "description": "refused: a backslash in the source: browsers turn it into a slash",
+    "operations": "300x200",
+    "source": "https://example.com/a\\b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "\\"
+    }
+  },
+  {
+    "description": "refused: a brace in the source: browsers percent-encode it",
+    "operations": "300x200",
+    "source": "https://example.com/x{y}.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "{"
+    }
+  },
+  {
+    "description": "refused: a closing brace in the source",
+    "operations": "300x200",
+    "source": "https://example.com/x}.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "}"
+    }
+  },
+  {
+    "description": "refused: a double quote in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a\"b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "\""
+    }
+  },
+  {
+    "description": "refused: a less-than sign in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a<b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "<"
+    }
+  },
+  {
+    "description": "refused: a greater-than sign in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a>b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": ">"
+    }
+  },
+  {
+    "description": "refused: a backtick in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a`b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "`"
+    }
+  },
+  {
+    "description": "refused: a caret in the source (Chrome percent-encodes it)",
+    "operations": "300x200",
+    "source": "https://example.com/a^b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "^"
+    }
+  },
+  {
+    "description": "refused: a pipe in the source (Chrome percent-encodes it)",
+    "operations": "300x200",
+    "source": "https://example.com/a|b.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "|"
+    }
+  },
+  {
+    "description": "refused: a raw brace in a text label: browsers percent-encode it",
+    "operations": "filters:text(x{y},12,ff8800ff,center)",
+    "source": "https://example.com/photo.jpg",
+    "refuses": {
+      "input": "operations",
+      "character": "{"
+    }
+  },
+  {
+    "description": "refused: a caret in a preset name",
+    "operations": "preset:card^2",
+    "source": "https://example.com/photo.jpg",
+    "refuses": {
+      "input": "operations",
+      "character": "^"
+    }
+  },
+  {
+    "description": "refused: a query string in the source: it would truncate the remainder",
+    "operations": "300x200",
+    "source": "https://example.com/a.jpg?w=1",
+    "refuses": {
+      "input": "source",
+      "character": "?"
+    }
+  },
+  {
+    "description": "refused: a fragment in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a.jpg#top",
+    "refuses": {
+      "input": "source",
+      "character": "#"
+    }
+  },
+  {
+    "description": "refused: a space in the source",
+    "operations": "300x200",
+    "source": "https://example.com/my photo.jpg",
+    "refuses": {
+      "input": "source",
+      "character": " "
+    }
+  },
+  {
+    "description": "refused: a control character in the operations",
+    "operations": "300x200\t",
+    "source": "https://example.com/photo.jpg",
+    "refuses": {
+      "input": "operations",
+      "character": "\t"
+    }
+  },
+  {
+    "description": "refused: a DEL in the source",
+    "operations": "300x200",
+    "source": "https://example.com/a\u007fb.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "\u007f"
+    }
+  },
+  {
+    "description": "refused: a non-ASCII character in the source",
+    "operations": "300x200",
+    "source": "https://example.com/caf\u00e9.jpg",
+    "refuses": {
+      "input": "source",
+      "character": "\u00e9"
+    }
   }
 ]

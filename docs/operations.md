@@ -14,6 +14,7 @@ Operations run in the order they appear in the path. Requested outputs are cappe
 | `300x0` or `300x` | Width 300 px, height scaled proportionally. |
 | `0x200` or `x200` | Height 200 px, width scaled proportionally. |
 | `0x0` | Original size. |
+| `00x100` | A zero written with more than one digit is not proportional: it asks for a zero-pixel side, and the request fails with `400` (`unsupported_operation`). |
 | `origx100` | Source width, height 100 px. `orig` works on either axis. |
 | `-300x200` | Resize to 300×200 and flip horizontally. |
 | `300x-200` | Resize to 300×200 and flip vertically. |
@@ -28,7 +29,7 @@ curl "http://localhost:3000/unsafe/300x0/https://example.com/photo.jpg"
 fit-in:<width>x<height>[:adaptive]
 ```
 
-Scales the image proportionally so it fits inside the box. A `0` axis is unbounded. Flips are not allowed here.
+Scales the image proportionally so it fits inside the box. A `0` axis is unbounded; a zero written with more digits (`fit-in:00x100`) is a zero-pixel side and fails with `400`, as it does for a resize. Flips are not allowed here.
 
 With `:adaptive`, the box axes swap when the source orientation disagrees with the box's: a portrait photo fitted into a landscape box fits inside the swapped (portrait) box instead, so it is not squeezed by the tighter axis. When the orientations agree, adaptive changes nothing. A square source, a square box, and a box with a `0` or `orig` axis have no orientation to disagree with and never swap.
 

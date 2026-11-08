@@ -68,7 +68,7 @@ pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 pub(in crate::server) use process::{SLOW_LANE_WAIT, apply_provenance};
 
 /// Shared state for the handlers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     /// The signing keyring (issue #143), from `CRABCROP_SECRET`:
     /// the current key plus, during a rotation window, the
@@ -191,11 +191,12 @@ pub struct AppState {
     /// never registered, so a PUT is a 404, not a refusal).
     pub upload: Option<Arc<crate::upload::UploadStore>>,
     /// Whether meta mode is enabled (issue #390):
-    /// `CRABCROP_META_MODE`, on by default. A meta request
-    /// bypasses every cache tier and runs a fresh render
-    /// plus its annotation inferences on every call, so a
-    /// deployment that does not use it can close the most
-    /// expensive request shape a signed URL can trigger.
+    /// `CRABCROP_META_MODE`, off by default (issue #453). A
+    /// meta request bypasses every cache tier and runs a
+    /// fresh render plus its annotation inferences on every
+    /// call, so the most expensive request shape a signed
+    /// URL can trigger is open only where the operator
+    /// turned it on.
     pub meta_enabled: bool,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
@@ -318,9 +319,88 @@ pub struct AppState {
     pub config_fingerprint: String,
 }
 
+impl std::fmt::Debug for AppState {
+    /// The fields a derive would print, except that the
+    /// `/metrics` token prints as `[redacted]`; the keyring,
+    /// the loader's credentials, and the stores redact their
+    /// own secrets (issue #455). A new field that holds a
+    /// secret must be redacted here too.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("AppState");
+        // Labels come from the field names themselves, so a
+        // label cannot drift from its field, and none is a
+        // snake_case string literal, which the error-code
+        // inventory (`every_error_code_is_documented`) would
+        // read as a response code.
+        macro_rules! fields {
+            ($($name:ident),* $(,)?) => {
+                $(out.field(stringify!($name), &self.$name);)*
+            };
+        }
+        fields!(
+            keyring,
+            allow_unsafe,
+            loader,
+            engine,
+            process_timeout,
+            metrics
+        );
+        out.field(
+            stringify!(metrics_token),
+            &self.metrics_token.as_ref().map(|_| crate::redact::Redacted),
+        );
+        fields!(
+            cache,
+            removebg,
+            upscale,
+            inpaint,
+            segment,
+            face,
+            tagger,
+            tag_threshold,
+            moderation,
+            embeddings,
+            aesthetic,
+            ocr,
+            detect,
+            detectors,
+            focal,
+            font,
+            fallback,
+            store,
+            shared_store,
+            upload,
+            meta_enabled,
+            ai_gate,
+            process_gate,
+            slow_gate,
+            ssim_target,
+            avif_speed,
+            jxl_speed,
+            width_step,
+            preserve_metadata,
+            brand_color,
+            presets,
+            only_presets,
+            source_roots,
+            default_ops,
+            video_encoder,
+            frame_extractor,
+            pdf_renderer,
+            provenance_signer,
+            video_gate,
+            anim_gate,
+            inflight,
+            purge_guard,
+            config_fingerprint
+        );
+        out.finish()
+    }
+}
+
 /// Build the router.
 pub fn app(state: AppState) -> Router {
-    let mut router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/explain/{*path}", get(explain_handle))
@@ -328,26 +408,25 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/purge-group/{*path}",
             axum::routing::post(purge_group_handle),
-        );
-    // The upload route exists only when a destination is
-    // configured (issue #168): an unconfigured server has
-    // no PUT surface at all, so the request is a plain 404.
-    if state.upload.is_some() {
-        router = router.route("/upload/{*path}", axum::routing::put(upload_handle));
-    }
-    router
+        )
+        // The upload route is registered whether or not a
+        // destination is configured (issue #467): without
+        // one, the handler answers `uploads_not_configured`,
+        // so a client can tell a server with uploads off
+        // from a mistyped path.
+        .route("/upload/{*path}", axum::routing::put(upload_handle))
         .route("/{*path}", get(handle))
         // A PUT that matched no upload route is a 404, not
         // the 405 the GET catch-all would otherwise produce
-        // for it: without an upload destination there is no
-        // PUT surface on this server at all (issue #168).
+        // for it: the upload route is this server's only
+        // PUT surface (issue #168).
         .route("/{*path}", axum::routing::put(put_not_found))
         .with_state(state)
         .layer(axum::middleware::from_fn(security_headers))
 }
 
-/// The PUT fallback: every PUT that is not an upload to a
-/// configured destination is simply not found.
+/// The PUT fallback: every PUT that is not to the upload
+/// route is simply not found.
 async fn put_not_found(headers: HeaderMap) -> Response {
     let accept = headers
         .get(header::ACCEPT)
@@ -386,12 +465,14 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Constant-time equality for a bearer token, so the
-/// comparison leaks nothing about it through timing.
+/// Equality for a bearer token that leaks nothing about it
+/// through timing, its length included (issue #454): both
+/// sides are hashed first, so the comparison always runs
+/// over two 32-byte digests, however long the presented
+/// token is.
 fn token_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    use sha2::Digest as _;
+    let (a, b) = (sha2::Sha256::digest(a), sha2::Sha256::digest(b));
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
@@ -416,10 +497,14 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
             accept.as_deref(),
         );
     };
+    // The auth scheme is case-insensitive (RFC 9110), so
+    // `bearer` and `BEARER` name it too.
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map(|(_, credentials)| credentials);
     if !presented.is_some_and(|p| token_eq(p.as_bytes(), token.as_bytes())) {
         return error_response(
             StatusCode::UNAUTHORIZED,
@@ -1312,10 +1397,10 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
 }
 
 /// `PUT /upload/<signature>/<name>`: store one original
-/// (issue #168). The route is registered only when a
-/// destination is configured, so `upload` here is always
-/// `Some`; the handler still answers 404 without one, so
-/// the rule holds however the state was built.
+/// (issue #168). The route is always registered; without
+/// a destination every request answers
+/// `404 uploads_not_configured` before anything else is
+/// checked (issue #467).
 ///
 /// The signature is an HMAC over the name under an upload
 /// subkey derived from the secret (see
@@ -1463,7 +1548,9 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // The read is bounded by the cap itself: it fails the
     // moment the body passes it, which is the oversize
     // answer (413) without ever holding more than the cap in
-    // memory; an unreadable body answers the same.
+    // memory. A body that cannot be read to its end (the
+    // client aborted it, or framed it badly) is the
+    // client's fault but not a size one: a 400 (issue #467).
     let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
     let cap = usize::try_from(upload.max_bytes).unwrap_or(usize::MAX);
     let bytes = match read_upload_body(body, cap, &charge).await {
@@ -1473,13 +1560,24 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             upload_log(name, "rejected:busy");
             return source_budget_busy(accept.as_deref());
         }
-        Err(_) => {
+        Err(LoadError::TooLarge { .. }) => {
             state.metrics.record_upload();
-            upload_log(name, "rejected:oversize-or-unreadable");
+            upload_log(name, "rejected:oversize");
             return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "upload_too_large",
                 format!("upload exceeds the {}-byte limit", upload.max_bytes),
+                accept.as_deref(),
+            );
+        }
+        Err(e) => {
+            eprintln!("upload body read failed: {e}");
+            state.metrics.record_upload();
+            upload_log(name, "rejected:unreadable");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "upload_unreadable",
+                "upload body could not be read".to_string(),
                 accept.as_deref(),
             );
         }
@@ -1659,12 +1757,23 @@ fn sf_quote(value: &str) -> String {
 
 /// Attach the cache observability headers (RFC 9211
 /// Cache-Status, RFC 9875 Cache-Group) to an image response.
-fn attach_cache_headers(response: &mut Response, cache_status: &str, groups: &[String]) {
+/// A sealed request gets no Cache-Group (issue #454): its
+/// groups are preset names read from inside the token, and
+/// listing them would show anyone who fetches the URL part
+/// of the recipe the token hides. Group purges still reach
+/// its entry, because the groups are recorded on the cache
+/// entry, never read back from this header.
+fn attach_cache_headers(
+    response: &mut Response,
+    cache_status: &str,
+    groups: &[String],
+    sealed: bool,
+) {
     response.headers_mut().insert(
         axum::http::HeaderName::from_static("cache-status"),
         axum::http::HeaderValue::from_str(cache_status).unwrap(),
     );
-    if !groups.is_empty() {
+    if !sealed && !groups.is_empty() {
         let list = groups
             .iter()
             .map(|g| sf_quote(g))
@@ -2000,21 +2109,28 @@ async fn serve(
     let meta = wants_meta(accept);
     if meta && !state.meta_enabled {
         // Meta mode is switched off on this deployment
-        // (issue #390): refuse specifically, like the
-        // metrics endpoint does, rather than serving a
-        // render the caller did not ask for.
-        if sealed {
-            return sealed_refusal(record);
-        }
-        return (
-            error_response(
-                StatusCode::FORBIDDEN,
-                "meta_disabled",
-                "meta mode is disabled on this server".to_string(),
-                accept,
-            ),
-            record,
-        );
+        // (issue #390), as it is by default (issue #453):
+        // refuse specifically, like the metrics endpoint
+        // does, rather than serving a render the caller did
+        // not ask for. The refusal answers the URL's JSON
+        // representation, so it carries the meta document's
+        // caching headers: a cache that stored it under the
+        // bare URL would serve it to every image viewer.
+        let (response, record) = if sealed {
+            sealed_refusal(record)
+        } else {
+            (
+                error_response(
+                    StatusCode::FORBIDDEN,
+                    "meta_disabled",
+                    "meta mode is disabled on this server: set CRABCROP_META_MODE=1 to enable it"
+                        .to_string(),
+                    accept,
+                ),
+                record,
+            )
+        };
+        return (meta_cache_headers(response), record);
     }
     let placeholders = meta && wants_placeholders(accept);
     let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
@@ -2187,7 +2303,7 @@ async fn serve(
             record.bytes_out = hit.bytes.len();
             let etag = hit.etag.clone();
             let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
-            attach_cache_headers(&mut response, cache_status, &groups);
+            attach_cache_headers(&mut response, cache_status, &groups, sealed);
             finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
         }
@@ -2700,10 +2816,12 @@ struct MissWork {
     max_age: Option<u32>,
     /// Whether the request arrived in the sealed spelling
     /// (issue #255). Meta for it redacts every operation and
-    /// source text. The flag describes this request, not the
-    /// render: meta bypasses the cache in both directions,
-    /// so a plain meta request on the same render still
-    /// reports in full.
+    /// source text, and its image responses carry no
+    /// Cache-Group (issue #454). The flag describes this
+    /// request, not the render: meta bypasses the cache in
+    /// both directions, so a plain meta request on the same
+    /// render still reports in full, and a plain hit on an
+    /// entry first served sealed still names its groups.
     sealed: bool,
 }
 
@@ -2801,10 +2919,15 @@ async fn serve_miss(
             // A policy refusal (Forbidden) is a decision, not a
             // failure: it never falls back. Neither does an
             // exhausted budget (issue #403): that is overload,
-            // and the fallback would need budget too. Any other
-            // load failure degrades to the configured fallback
-            // when there is one.
-            let fb = if matches!(e, LoadError::Forbidden(_) | LoadError::Busy) {
+            // and the fallback would need budget too. Nor does
+            // source text that does not parse (issue #467): a
+            // 400 stays honest, like a grammar failure. Any
+            // other load failure degrades to the configured
+            // fallback when there is one.
+            let fb = if matches!(
+                e,
+                LoadError::Forbidden(_) | LoadError::Busy | LoadError::InvalidSource(_)
+            ) {
                 None
             } else {
                 fallback_source_bytes(state, &charge).await
@@ -3356,7 +3479,7 @@ async fn serve_miss(
         )
     };
     if !meta {
-        attach_cache_headers(&mut response, cache_status, &groups);
+        attach_cache_headers(&mut response, cache_status, &groups, sealed);
     }
     if used_fallback {
         record.fallback = true;
@@ -3448,9 +3571,9 @@ pub(in crate::server) use meta::{
 };
 pub use meta::{EmbeddingMeta, ModerationMeta, OcrMeta};
 pub(in crate::server) use meta::{
-    annotate_meta, compose_aesthetic, detect_meta, embed_meta, meta_response, moderate_meta,
-    ocr_meta, wants_detections, wants_embeddings, wants_meta, wants_moderation, wants_ocr,
-    wants_placeholders,
+    annotate_meta, compose_aesthetic, detect_meta, embed_meta, meta_cache_headers, meta_response,
+    moderate_meta, ocr_meta, wants_detections, wants_embeddings, wants_meta, wants_moderation,
+    wants_ocr, wants_placeholders,
 };
 
 /// Build a successful image response: content type, cache
@@ -3621,6 +3744,14 @@ fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
             "source_fetch_failed",
             "source fetch failed".to_string(),
         ),
+        // The caller's own source text is at fault, not an
+        // origin (issue #467), so this is a 400 like a
+        // grammar failure, not a gateway error.
+        LoadError::InvalidSource(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_source",
+            "invalid source URL".to_string(),
+        ),
         LoadError::WrongContentType(_) => (
             StatusCode::BAD_GATEWAY,
             "source_not_an_image",
@@ -3775,13 +3906,37 @@ fn engine_error_parts(e: EngineError) -> (StatusCode, &'static str, String) {
             "pdf_render_failed",
             "PDF rendering failed".to_string(),
         ),
+        // A dependency outage, not a broken encoder (issue
+        // #467): the output was rendered, but the timestamp
+        // authority signing needs did not answer, and a
+        // retry may find it back.
+        EngineError::ProvenanceUnavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provenance_unavailable",
+            "provenance signing is unavailable".to_string(),
+        ),
     }
 }
 
+/// `Retry-After` on a `provenance_unavailable` answer, in
+/// seconds. Longer than a gate's: an authority outage
+/// outlasts a queue, and every retry that meets it holds a
+/// process permit for up to the authority's 15-second
+/// bound before it fails again.
+const PROVENANCE_RETRY_AFTER_SECS: u64 = 30;
+
 fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
     eprintln!("engine error: {e}");
+    let retry_after = matches!(e, EngineError::ProvenanceUnavailable(_));
     let (status, code, message) = engine_error_parts(e);
-    error_response(status, code, message, accept)
+    let mut response = error_response(status, code, message, accept);
+    if retry_after {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            PROVENANCE_RETRY_AFTER_SECS.to_string().parse().unwrap(),
+        );
+    }
+    response
 }
 
 #[cfg(test)]
