@@ -157,6 +157,8 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.com/product.jpg"
 ```
 
+Redaction replaces pixels. `blurfaces`, `pixelatefaces`, `blurclass`, `pixelateclass`, `blur_region`, and `pixelate_region` write the blurred or pixelated result, alpha included, over the area they cover; they never blend it over the original. This matters for sources with transparency: detection reads color only, so a face stored at alpha 0 is still found, and JPEG output, which has no alpha, writes the stored color. Under any alpha the stored color is the redacted one, the same an opaque source gets. An area of uniform alpha keeps that alpha exactly, so an opaque image stays opaque; where the alpha varies, as at a cut-out's edge, it is blurred or pixelated along with the color.
+
 ### Studio mode
 
 `studio(product,...)` names an outcome instead of a mechanism: a listing-ready product shot. One filter expands into a fixed pipeline, run at the filter's position in the chain:

@@ -1750,10 +1750,11 @@ fn average_blocks<P: image::Pixel>(
     }
 }
 
-/// Apply `f` to the rectangle (x, y, w, h) of `img` and
-/// composite the result back over an RGBA copy; pixels
-/// outside the rectangle are untouched, and alpha survives.
-/// The caller guarantees the rectangle is in bounds.
+/// Apply `f` to the rectangle (x, y, w, h) of `img` and write
+/// the result into an RGBA copy in place of the rectangle's
+/// pixels (see [`put_redacted`]); pixels outside the
+/// rectangle are untouched. The caller guarantees the
+/// rectangle is in bounds.
 fn apply_to_region(
     img: &DynamicImage,
     x: u32,
@@ -1764,9 +1765,39 @@ fn apply_to_region(
 ) -> DynamicImage {
     let mut base = img.to_rgba8();
     let region = img.crop_imm(x, y, w, h);
-    let done = f(&region).to_rgba8();
-    image::imageops::overlay(&mut base, &done, x as i64, y as i64);
+    put_redacted(&mut base, f(&region).to_rgba8(), x, y);
     DynamicImage::ImageRgba8(base)
+}
+
+/// Write the redacted pixels `done` over the rectangle of
+/// `base` at (x, y), replacing every channel (issue #444).
+/// Compositing them (`imageops::overlay`) let the original
+/// show through wherever the redacted alpha was below 255:
+/// all of it at alpha 0, a third at alpha 128. The face
+/// detector reads RGB only and a JPEG output writes the
+/// stored RGB, so a face stored at alpha 0 was detected and
+/// then served intact.
+///
+/// A rectangle of uniform alpha keeps that alpha exactly: it
+/// carries no detail to redact, and the blur's fixed-point
+/// kernel sums to slightly under one at large sigmas (from
+/// about 25), which would turn an opaque rectangle into
+/// alpha 253. Like `overlay`, it clips to `base`, so an
+/// empty or out-of-frame rectangle is a no-op.
+fn put_redacted(base: &mut image::RgbaImage, mut done: image::RgbaImage, x: u32, y: u32) {
+    let w = done.width().min(base.width().saturating_sub(x));
+    let h = done.height().min(base.height().saturating_sub(y));
+    if w == 0 || h == 0 {
+        return;
+    }
+    let alpha = base.get_pixel(x, y)[3];
+    let uniform = (y..y + h).all(|py| (x..x + w).all(|px| base.get_pixel(px, py)[3] == alpha));
+    if uniform {
+        for p in done.pixels_mut() {
+            p[3] = alpha;
+        }
+    }
+    image::imageops::replace(base, &done, x as i64, y as i64);
 }
 
 /// Gaussian-blur one rectangle of `img` (explicit region
@@ -2228,8 +2259,9 @@ fn paint_box(
     DynamicImage::ImageRgba8(out)
 }
 
-/// Apply `redact` to each face region of `img` and composite
-/// the results back. Face boxes are clamped to the image;
+/// Apply `redact` to each face region of `img` and write the
+/// results back in place of the face pixels (see
+/// [`put_redacted`]). Face boxes are clamped to the image;
 /// empty or fully out-of-frame boxes are skipped.
 fn redact_faces(
     img: &DynamicImage,
@@ -2249,8 +2281,7 @@ fn redact_faces(
             continue;
         }
         let region = img.crop_imm(x, y, w, h);
-        let done = redact(&region, face).to_rgba8();
-        image::imageops::overlay(&mut base, &done, x as i64, y as i64);
+        put_redacted(&mut base, redact(&region, face).to_rgba8(), x, y);
     }
     DynamicImage::ImageRgba8(base)
 }
@@ -3380,6 +3411,205 @@ mod tests {
         assert_eq!(out.dimensions(), (100_000, 1));
         assert_eq!(out.get_pixel(99_998, 0).0, [128, 128, 128, 128]);
         assert_eq!(out.get_pixel(99_997, 0).0, [0, 0, 0, 0]);
+    }
+
+    /// `checker_face_scene` stored as RGBA, the face box at
+    /// `alpha` and the rest opaque (issue #444): a face a PNG
+    /// viewer sees faintly or not at all, but that the face
+    /// detector (RGB only) finds and a JPEG output (alpha
+    /// dropped) shows.
+    fn checker_face_scene_at_alpha(bx: (u32, u32, u32, u32), alpha: u8) -> image::RgbaImage {
+        let (fx, fy, fw, fh) = bx;
+        let mut rgba = checker_face_scene(fx, fy, fw, fh).to_rgba8();
+        for (x, y, p) in rgba.enumerate_pixels_mut() {
+            if (fx..fx + fw).contains(&x) && (fy..fy + fh).contains(&y) {
+                p[3] = alpha;
+            }
+        }
+        rgba
+    }
+
+    /// The least-squares slope of the output's red channel
+    /// against the source's inside the box, the measure issue
+    /// #444 reported: 1 when the original passes through, 0
+    /// when none of it survives.
+    fn leak_slope(
+        src: &image::RgbaImage,
+        out: &image::RgbaImage,
+        (fx, fy, fw, fh): (u32, u32, u32, u32),
+    ) -> f64 {
+        let pairs: Vec<(f64, f64)> = (fy..fy + fh)
+            .flat_map(|y| (fx..fx + fw).map(move |x| (x, y)))
+            .map(|(x, y)| (src.get_pixel(x, y)[0] as f64, out.get_pixel(x, y)[0] as f64))
+            .collect();
+        let n = pairs.len() as f64;
+        let ms = pairs.iter().map(|p| p.0).sum::<f64>() / n;
+        let mo = pairs.iter().map(|p| p.1).sum::<f64>() / n;
+        let cov: f64 = pairs.iter().map(|(s, o)| (s - ms) * (o - mo)).sum();
+        let var: f64 = pairs.iter().map(|(s, _)| (s - ms).powi(2)).sum();
+        cov / var
+    }
+
+    /// Redact the checker face at alpha 0, 128, and 255, and
+    /// require that none of its original color survive under
+    /// any of them (issue #444). The stored RGB, all a JPEG
+    /// output writes, must be exactly what the opaque face
+    /// redacts to and must not keep the source's value; the
+    /// face keeps its own alpha, and nothing outside the box
+    /// changes.
+    fn assert_redacted_under_any_alpha(
+        name: &str,
+        bx: (u32, u32, u32, u32),
+        redact: impl Fn(&DynamicImage) -> DynamicImage,
+    ) {
+        let (fx, fy, fw, fh) = bx;
+        let inside = |x: u32, y: u32| (fx..fx + fw).contains(&x) && (fy..fy + fh).contains(&y);
+        let opaque = DynamicImage::ImageRgba8(checker_face_scene_at_alpha(bx, 255));
+        let opaque = redact(&opaque).to_rgba8();
+        for alpha in [0u8, 128, 255] {
+            let src = checker_face_scene_at_alpha(bx, alpha);
+            let out = redact(&DynamicImage::ImageRgba8(src.clone())).to_rgba8();
+            let slope = leak_slope(&src, &out, bx);
+            assert!(
+                slope.abs() < 0.05,
+                "{name} at alpha {alpha}: slope {slope:.3}"
+            );
+            for (x, y, p) in out.enumerate_pixels() {
+                let s = src.get_pixel(x, y);
+                if !inside(x, y) {
+                    assert_eq!(p, s, "{name} at alpha {alpha}: outside ({x}, {y}) changed");
+                    continue;
+                }
+                let at = format!("{name} at alpha {alpha}, ({x}, {y})");
+                assert_eq!(
+                    p.0[..3],
+                    opaque.get_pixel(x, y).0[..3],
+                    "{at}: not the opaque redaction"
+                );
+                assert_ne!(p.0[..3], s.0[..3], "{at}: kept its color");
+                assert_eq!(p[3], alpha, "{at}: alpha changed");
+            }
+        }
+    }
+
+    #[test]
+    fn face_redaction_replaces_the_face_under_any_alpha() {
+        // Issue #444: the redacted face was composited over the
+        // original, so at alpha 0 the original passed through
+        // whole and at alpha 128 a third of it did.
+        let bx = (8, 8, 40, 40);
+        let faces = [face_box(8, 8, 40, 40)];
+        assert_redacted_under_any_alpha("blur_faces", bx, |img| blur_faces(img, &faces));
+        assert_redacted_under_any_alpha("pixelate_faces", bx, |img| pixelate_faces(img, &faces));
+    }
+
+    #[test]
+    fn region_redaction_replaces_the_region_under_any_alpha() {
+        // The model-free forms share the leak and need no model
+        // to reach it. A 40 px region pixelates in 4 px blocks,
+        // so no 1 px strip is left at the edges.
+        let bx = (8, 8, 40, 40);
+        assert_redacted_under_any_alpha("blur_region", bx, |img| blur_region(img, 8, 8, 40, 40));
+        assert_redacted_under_any_alpha("pixelate_region", bx, |img| {
+            pixelate_region(img, 8, 8, 40, 40)
+        });
+    }
+
+    #[test]
+    fn class_redaction_replaces_the_object_under_any_alpha() {
+        // Rectangle and silhouette forms: the silhouette form
+        // takes the rectangle form's pixels inside the mask.
+        let bx = (8, 8, 40, 40);
+        let boxes = [detection(8, 8, 40, 40)];
+        let masked = || {
+            vec![MaskedDetection {
+                detection: detection(8, 8, 40, 40),
+                mask: image::GrayImage::from_pixel(40, 40, image::Luma([255])),
+            }]
+        };
+        assert_redacted_under_any_alpha("blur_detections", bx, |img| blur_detections(img, &boxes));
+        assert_redacted_under_any_alpha("pixelate_detections", bx, |img| {
+            pixelate_detections(img, &boxes)
+        });
+        assert_redacted_under_any_alpha("blur_detections_masked", bx, |img| {
+            blur_detections_masked(img, &masked())
+        });
+        assert_redacted_under_any_alpha("pixelate_detections_masked", bx, |img| {
+            pixelate_detections_masked(img, &masked())
+        });
+    }
+
+    #[test]
+    fn region_redaction_redacts_detail_carried_in_alpha() {
+        // Text or a logo is often drawn as alpha over one flat
+        // color, so its shape lives in the alpha channel alone.
+        // An alpha that varies is redacted like the color,
+        // never kept or composited back.
+        let src = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(64, 64, |x, y| {
+            image::Rgba([20, 20, 20, if (x + y) % 2 == 0 { 0 } else { 255 }])
+        }));
+        for (name, out) in [
+            ("blur_region", blur_region(&src, 8, 8, 40, 40)),
+            ("pixelate_region", pixelate_region(&src, 8, 8, 40, 40)),
+        ] {
+            let out = out.to_rgba8();
+            for (x, y, p) in out.enumerate_pixels() {
+                if (8..48).contains(&x) && (8..48).contains(&y) {
+                    assert!(
+                        p[3] > 60 && p[3] < 195,
+                        "{name}: alpha {} at ({x}, {y})",
+                        p[3]
+                    );
+                } else {
+                    assert_eq!(p, src.to_rgba8().get_pixel(x, y), "{name}: ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn redaction_keeps_an_opaque_rgba_image_opaque() {
+        // An opaque image stored with an alpha channel. A
+        // 240 px box blurs at sigma 30 as a region and 40 as a
+        // face, where the blur alone takes a constant 255 alpha
+        // below 255: the box's uniform alpha is kept, or the
+        // redacted box of an opaque image would come back
+        // translucent.
+        let src = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(260, 260, |x, y| {
+            let v = ((x * 7 + y * 13) % 256) as u8;
+            image::Rgba([v, 255 - v, v / 2, 255])
+        }));
+        let region = src.crop_imm(10, 10, 240, 240);
+        let blurred = blur_fast(&region, 30.0).to_rgba8();
+        assert!(blurred.get_pixel(120, 120)[3] < 255, "the premise moved");
+        let out = blur_region(&src, 10, 10, 240, 240).to_rgba8();
+        assert!(out.pixels().all(|p| p[3] == 255));
+        // Inside the box the color is the blur's, with nothing
+        // of the original blended in.
+        for (x, y, p) in blurred.enumerate_pixels() {
+            assert_eq!(out.get_pixel(x + 10, y + 10).0[..3], p.0[..3], "({x}, {y})");
+        }
+        let out = blur_faces(&src, &[face_box(10, 10, 240, 240)]).to_rgba8();
+        assert!(out.pixels().all(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn put_redacted_clips_to_the_image() {
+        // The composite it replaced clipped silently, so an
+        // empty or out-of-frame rectangle must stay a no-op
+        // rather than panic on the alpha scan.
+        let mut base = image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
+        let done = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 9]));
+        put_redacted(&mut base, done.clone(), 8, 0);
+        put_redacted(&mut base, done.clone(), 0, u32::MAX);
+        put_redacted(&mut base, image::RgbaImage::new(0, 0), 0, 0);
+        assert!(base.pixels().all(|p| p.0 == [1, 2, 3, 255]));
+        // Hanging over the corner: the 2x2 in frame is
+        // written, and its uniform alpha is kept.
+        put_redacted(&mut base, done, 6, 6);
+        assert_eq!(base.get_pixel(7, 7).0, [9, 9, 9, 255]);
+        assert_eq!(base.get_pixel(6, 6).0, [9, 9, 9, 255]);
+        assert_eq!(base.get_pixel(5, 7).0, [1, 2, 3, 255]);
     }
 
     fn striped() -> DynamicImage {
