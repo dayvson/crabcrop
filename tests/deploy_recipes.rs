@@ -151,3 +151,109 @@ fn the_helpers_read_what_they_claim() {
     assert_eq!(yaml_block(yaml, 0, "e").unwrap(), vec!["  f: 3"]);
     assert!(yaml_block(yaml, 2, "a").is_none());
 }
+
+/// The lines of a YAML text whose key is one of `keys`,
+/// list-item dashes included and comments skipped.
+fn yaml_keys<'a>(text: &'a str, keys: &[&str]) -> Vec<&'a str> {
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            let t = t.strip_prefix("- ").unwrap_or(t).trim_start();
+            keys.iter().any(|k| t.starts_with(&format!("{k}:")))
+        })
+        .collect()
+}
+
+/// Every YAML file under `dir`, recursively, sorted.
+fn yaml_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(yaml_files(&path));
+        } else if path.extension().is_some_and(|e| e == "yaml" || e == "yml") {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn recipes_start_the_server_with_no_arguments() {
+    // #470: any argument at all runs the CLI, and one it
+    // does not know exits 1, so a recipe that handed the
+    // server an argument would crash-loop instead of
+    // serving. The images run a bare `crabcrop` (the AI
+    // image inherits that entrypoint), and no recipe adds a
+    // command, an entrypoint, or arguments.
+    for rel in ["Dockerfile", "Dockerfile.release"] {
+        let stage = final_stage(&read(rel));
+        let entrypoints: Vec<&str> = stage
+            .iter()
+            .map(String::as_str)
+            .filter(|i| i.starts_with("ENTRYPOINT"))
+            .collect();
+        assert_eq!(entrypoints, [r#"ENTRYPOINT ["crabcrop"]"#], "{rel}");
+        assert!(
+            !stage.iter().any(|i| i.starts_with("CMD")),
+            "{rel}: a CMD would become the server's arguments"
+        );
+    }
+    let ai = final_stage(&read("Dockerfile.ai"));
+    assert_eq!(ai[0], "FROM ${BASE_IMAGE}");
+    assert!(
+        !ai.iter()
+            .any(|i| i.starts_with("ENTRYPOINT") || i.starts_with("CMD")),
+        "Dockerfile.ai: inherits the base image's bare entrypoint"
+    );
+
+    let unit = read("deploy/vm/crabcrop.service");
+    let exec: Vec<&str> = unit
+        .lines()
+        .filter(|l| l.starts_with("ExecStart="))
+        .collect();
+    assert_eq!(exec, ["ExecStart=/usr/local/bin/crabcrop"]);
+
+    // Compose spells a container's arguments `command:` and
+    // `entrypoint:` (its `args:` are build arguments);
+    // Kubernetes, Cloud Run and Container Apps spell them
+    // `command:` and `args:`.
+    let deploy = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy");
+    let files = yaml_files(&deploy);
+    assert!(files.len() >= 10, "found the YAML recipes: {files:?}");
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let compose = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("docker-compose"));
+        let keys: &[&str] = if compose {
+            &["command", "entrypoint"]
+        } else {
+            &["command", "args"]
+        };
+        let found = yaml_keys(&text, keys);
+        let rel = path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap();
+        assert!(found.is_empty(), "{}: {found:?}", rel.display());
+    }
+
+    let task: serde_json::Value =
+        serde_json::from_str(&read("deploy/ecs-fargate/task-definition.json")).unwrap();
+    let containers = task["containerDefinitions"].as_array().unwrap();
+    assert!(!containers.is_empty());
+    for container in containers {
+        for key in ["command", "entryPoint"] {
+            assert!(
+                container.get(key).is_none(),
+                "ecs-fargate: {key} in {container}"
+            );
+        }
+    }
+
+    // The YAML check is not vacuous.
+    let yaml = "containers:\n  - name: c\n    args: [\"--x\"]\n    # command: y\n  - command:\n";
+    assert_eq!(
+        yaml_keys(yaml, &["command", "args"]),
+        vec!["    args: [\"--x\"]", "  - command:"]
+    );
+}

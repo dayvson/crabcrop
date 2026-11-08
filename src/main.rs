@@ -34,15 +34,16 @@ use crate::server::{AppState, app};
 #[tokio::main]
 async fn main() {
     // CLI verbs run instead of the server when the first
-    // argument names one. A first argument that is not a
-    // flag and names nothing is an error, never a server
-    // start: `crabcrop sgin ...` must not silently bind
-    // the port and serve. No argument at all starts the
-    // server.
+    // argument names one, and only a bare `crabcrop` starts
+    // the server, which reads the environment and takes no
+    // arguments. Every argument goes to the CLI: past the
+    // help and version flags, a first argument that names
+    // no verb, a flag included, is an "unknown verb" error,
+    // never a server start. `crabcrop sgin ...` and
+    // `crabcrop --verison` must not silently bind the port
+    // and serve (#470).
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.first().is_some_and(|a| {
-        !a.starts_with('-') || a == "--help" || a == "-h" || a == "--version" || a == "-V"
-    }) {
+    if !argv.is_empty() {
         match cli::exec(&argv).await {
             Ok(out) => {
                 if !out.is_empty() {
