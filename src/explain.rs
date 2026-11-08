@@ -61,6 +61,13 @@ pub struct Forecast {
     /// walk stops there, so the dimensions and pixels are
     /// `None`: the image request has no output to forecast.
     pub zero_side: bool,
+    /// True when a resize, fit-in, crop, or pad resolves a
+    /// size past [`crate::url::MAX_DIMENSION`] on an axis
+    /// (`16383x1/0x2` asks for 32766x2), which the engine
+    /// refuses wherever the step sits in the chain (issue
+    /// #521). The walk stops there, so the dimensions are
+    /// the size the engine refuses.
+    pub over_dimension: bool,
 }
 
 /// Everything the handler verified and probed, ready to
@@ -168,6 +175,7 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
     let dpr = directives.dpr.unwrap_or(1.0);
     let mut cur: Option<(u64, u64)> = probe.dimensions.map(|(w, h)| (w as u64, h as u64));
     let mut zero_side = false;
+    let mut over_dimension = false;
     for op in ops {
         // The engine refuses the request here, whatever follows.
         if let Operation::Size(size) | Operation::FitIn { size, .. } = op
@@ -220,6 +228,20 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
                 cur
             }
         };
+        // The engine checks the size each of these steps
+        // resolves against the per-axis limit, and refuses the
+        // request there, whatever follows (issue #521). The
+        // walk leaves out the `no_upscale` cap a fit-in or a
+        // crop takes, which holds it inside the source.
+        let resolves = match op {
+            Operation::Size(_) | Operation::Pad { .. } => true,
+            Operation::FitIn { .. } | Operation::Crop { .. } => !directives.no_upscale,
+            _ => false,
+        };
+        if resolves && cur.is_some_and(|(w, h)| w.max(h) > u64::from(crate::url::MAX_DIMENSION)) {
+            over_dimension = true;
+            break;
+        }
     }
     let (width, height) = match cur {
         Some((w, h)) => (
@@ -239,6 +261,7 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
         format,
         format_from_operation,
         zero_side,
+        over_dimension,
         pixels,
         over_budget: pixels.is_some_and(|p| p > crate::engine::MAX_OUTPUT_PIXELS),
     }
@@ -410,6 +433,7 @@ impl Report {
                 "pixel_budget": crate::engine::MAX_OUTPUT_PIXELS,
                 "over_budget": self.forecast.over_budget,
                 "zero_side": self.forecast.zero_side,
+                "over_dimension": self.forecast.over_dimension,
             },
             "canonical": input.canonical,
             "cache_group": input.cache_group,
@@ -500,6 +524,12 @@ impl Report {
         match (self.forecast.width, self.forecast.height) {
             _ if self.forecast.zero_side => {
                 out.push_str("<li>Output: none; a size asks for a zero pixel side, so the image request itself would be refused</li>\n");
+            }
+            (Some(w), Some(h)) if self.forecast.over_dimension => {
+                out.push_str(&format!(
+                    "<li>Output: {w}x{h}, past the {} pixel limit per axis, so the image request itself would be refused</li>\n",
+                    crate::url::MAX_DIMENSION
+                ));
             }
             (Some(w), Some(h)) => {
                 out.push_str(&format!("<li>Output: {w}x{h}</li>\n"));
@@ -724,6 +754,70 @@ mod tests {
             (report.forecast.width, report.forecast.height),
             (Some(150), Some(100))
         );
+    }
+
+    #[test]
+    fn forecast_agrees_with_the_dimension_refusal() {
+        // A step that resolves a size past MAX_DIMENSION on an
+        // axis is refused by the engine wherever it sits in
+        // the chain (issue #521). The forecast used to report
+        // 32766x2 as a servable output; now it flags the step
+        // and stops there, on the size the engine refuses.
+        for (remainder, refused) in [
+            ("16383x1/0x2", (32766, 2)),
+            ("16383x1/0x2/100x100", (32766, 2)),
+            ("16383x1/fit-in:0x2", (32766, 2)),
+            ("crop:16383x1:smart/0x2", (32766, 2)),
+            ("4096x1/0x2/filters:dpr(2)", (16384, 4)),
+            ("12000x10/filters:dpr(2)", (24000, 20)),
+            ("pad:9000x100/filters:dpr(2)", (18000, 200)),
+        ] {
+            let report = report_for(
+                &format!("{remainder}/https://example.com/photo.jpg"),
+                png_probe(),
+            );
+            assert!(report.forecast.over_dimension, "{remainder}");
+            assert_eq!(
+                (report.forecast.width, report.forecast.height),
+                (Some(refused.0), Some(refused.1)),
+                "{remainder}"
+            );
+            assert_eq!(report.to_json()["forecast"]["over_dimension"], true);
+            let html = report.to_html();
+            assert!(
+                html.contains(&format!(
+                    "<li>Output: {}x{}, past the 16383 pixel limit per axis, so the image request itself would be refused</li>",
+                    refused.0, refused.1
+                )),
+                "{html}"
+            );
+        }
+        // Exactly the limit renders.
+        for (remainder, size) in [("5461x1/0x3", (16383, 3)), ("16383x1/0x1", (16383, 1))] {
+            let report = report_for(
+                &format!("{remainder}/https://example.com/photo.jpg"),
+                png_probe(),
+            );
+            assert!(!report.forecast.over_dimension, "{remainder}");
+            assert_eq!(
+                (report.forecast.width, report.forecast.height),
+                (Some(size.0), Some(size.1)),
+                "{remainder}"
+            );
+            assert_eq!(report.to_json()["forecast"]["over_dimension"], false);
+            let html = report.to_html();
+            assert!(
+                html.contains(&format!("<li>Output: {}x{}</li>", size.0, size.1)),
+                "{html}"
+            );
+        }
+        // `no_upscale` holds a crop's target inside the source
+        // before the engine checks it, so the request renders.
+        let report = report_for(
+            "crop:16383x10/filters:dpr(2):no_upscale/https://example.com/photo.jpg",
+            png_probe(),
+        );
+        assert!(!report.forecast.over_dimension);
     }
 
     #[test]

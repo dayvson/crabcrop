@@ -3432,6 +3432,125 @@ fn rotate_chains_inside_the_budget_still_work() {
     assert_eq!(decode_dims(&out.bytes), (201, 201));
 }
 
+/// Run `remainder` (operations only) through the engine on
+/// `src`, as the server would for that URL.
+fn process_remainder(src: &[u8], remainder: &str) -> Result<ProcessedImage, EngineError> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    Engine.process(src, &ops)
+}
+
+#[test]
+fn computed_sizes_past_max_dimension_are_refused() {
+    // Issue #521: the parser holds every size a URL spells
+    // to 16383 per axis, but a size the engine works out
+    // was unchecked, so `16383x1/0x2` rendered 32766x2
+    // (inside the pixel budget, past what WebP encodes).
+    // Each step that resolves its own size now refuses one
+    // past the limit, as a written size is.
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, refused) in [
+        // The issue's URL: the second step keeps the 16383:1
+        // aspect ratio at height 2.
+        ("16383x1/0x2", "32766x2"),
+        // A later step that would bring the size back
+        // never runs: the refusal is at the step.
+        ("16383x1/0x2/100x100", "32766x2"),
+        ("16383x1/fit-in:0x2", "32766x2"),
+        ("16383x1/fit-in:0x2:adaptive", "32766x2"),
+        // A smart crop sizes its window to the target, and
+        // the resize after it scales on from there.
+        ("crop:16383x1:smart/0x2", "32766x2"),
+        ("crop:16383x1/0x2", "32766x2"),
+        // DPR scales a proportional chain, a written size,
+        // a crop target, and a pad canvas past the limit.
+        ("4096x1/0x2/filters:dpr(2)", "16384x4"),
+        ("12000x10/filters:dpr(2)", "24000x20"),
+        ("crop:12000x10/filters:dpr(2)", "24000x20"),
+        ("pad:9000x100/filters:dpr(2)", "18000x200"),
+    ] {
+        let err = match process_remainder(&src, remainder) {
+            Err(err) => err,
+            Ok(out) => panic!("{remainder} rendered {:?}", decode_dims(&out.bytes)),
+        };
+        assert!(
+            matches!(err, EngineError::Unsupported(_)),
+            "{remainder}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported operation: requested output {refused} exceeds the 16383 pixel limit per axis"
+            ),
+            "{remainder}"
+        );
+    }
+}
+
+#[test]
+fn computed_sizes_at_max_dimension_still_render() {
+    // The limit is inclusive, and a chain that stays inside
+    // it renders as before (issue #521).
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, dims) in [
+        // 5461 * 3 = 16383: a proportional side that lands
+        // exactly on the limit.
+        ("5461x1/0x3", (16383, 3)),
+        ("5461x1/fit-in:0x3", (16383, 3)),
+        ("16383x1/0x1", (16383, 1)),
+        ("4096x1/0x2", (8192, 2)),
+    ] {
+        let out =
+            process_remainder(&src, remainder).unwrap_or_else(|err| panic!("{remainder}: {err}"));
+        assert_eq!(decode_dims(&out.bytes), dims, "{remainder}");
+    }
+    // `no_upscale` caps the step at the source before the
+    // check, so a DPR-scaled crop target past the limit
+    // renders inside the source.
+    let out = process_remainder(&src, "crop:16383x10/filters:dpr(2):no_upscale").unwrap();
+    let (w, h) = decode_dims(&out.bytes);
+    assert!(w <= 64 && h <= 48, "{w}x{h}");
+}
+
+#[test]
+fn check_output_size_bounds_each_axis_then_the_budget() {
+    let max = crate::url::MAX_DIMENSION;
+    assert!(check_output_size(max, 1).is_ok());
+    assert!(check_output_size(1, max).is_ok());
+    for (w, h) in [(max + 1, 1), (1, max + 1), (u32::MAX, u32::MAX)] {
+        let err = check_output_size(w, h).unwrap_err();
+        assert!(err.to_string().contains("pixel limit per axis"), "{err}");
+    }
+    // Inside the per-axis limit, the pixel budget still
+    // applies: 16383 x 6104 is just past 100 million.
+    let err = check_output_size(max, 6104).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 16383x6104 exceeds the 100000000 pixel limit"
+    );
+}
+
+#[test]
+fn rotate_canvas_is_checked_per_axis() {
+    // A 16383x1000 image rotated 3.5 degrees needs a canvas
+    // about 16413 px wide: about 33 million pixels, inside
+    // the budget, but past the per-axis limit (issue #521).
+    // The canvas check refuses it before the rotation
+    // allocates.
+    let img = DynamicImage::ImageLuma8(image::GrayImage::new(16_383, 1000));
+    let ops = [Operation::Filters(vec![Filter::Rotate(3.5)])];
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let ctx = ProcessContext::default();
+    let (cw, ch) = crate::filters::rotated_canvas(16_383, 1000, 3.5);
+    assert!(cw > crate::url::MAX_DIMENSION && (cw as u64 * ch as u64) < MAX_OUTPUT_PIXELS);
+    let err = apply_operations(img, &ops, None, 1.0, &ctx, &directives, None).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "unsupported operation: requested output {cw}x{ch} exceeds the 16383 pixel limit per axis"
+        )
+    );
+}
+
 #[test]
 fn operation_count_cap_rejects_overlong_chains() {
     let engine = Engine;

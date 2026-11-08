@@ -489,6 +489,29 @@ fn check_output_pixels(width: u32, height: u32) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Reject a size the engine works out for a step's output
+/// past the per-axis limit a size written in the URL is held
+/// to ([`crate::url::MAX_DIMENSION`]), then past the pixel
+/// budget (issue #521). Every step that resolves its own
+/// size checks it here before allocating it: a resize with a
+/// proportional or `orig` side, a fit-in scale, a crop or pad
+/// target, a DPR factor on any of them, a rotated canvas.
+/// The parser bounds only what the URL spells, and a chain
+/// can grow a proportional side past it inside the budget:
+/// `16383x1/0x2` keeps the aspect ratio at height 2 and asks
+/// for 32766x2, which WebP cannot encode. The step
+/// is refused, as a written side past the limit is, rather
+/// than clamped to a size nobody asked for.
+fn check_output_size(width: u32, height: u32) -> Result<(), EngineError> {
+    let max = crate::url::MAX_DIMENSION;
+    if width > max || height > max {
+        return Err(EngineError::Unsupported(format!(
+            "requested output {width}x{height} exceeds the {max} pixel limit per axis"
+        )));
+    }
+    check_output_pixels(width, height)
+}
+
 /// A running total of output pixels across the frames of one
 /// animated or video output, charged against the same budget
 /// a single still output gets (issue #182, audit R2-01). The
@@ -3940,10 +3963,11 @@ impl<'r, 'a> ChainState<'r, 'a> {
         // the one plain filter that grows
         // the canvas: check the canvas it
         // is about to allocate before it
-        // allocates (issue #182, R2-12).
+        // allocates (issue #182, R2-12),
+        // per axis too (issue #521).
         if let Filter::Rotate(degrees) = filter {
             let (cw, ch) = crate::filters::rotated_canvas(img.width(), img.height(), *degrees);
-            check_output_pixels(cw, ch)?;
+            check_output_size(cw, ch)?;
         }
         let (new_img, options) = crate::filters::apply_filters_filled(
             img,
@@ -4553,7 +4577,7 @@ fn apply_size_windowed(
         Some(SizeCap::Fit(cw, ch)) => cap_dimensions(w, h, (cw, ch)),
         None => (w, h),
     };
-    check_output_pixels(w, h)?;
+    check_output_size(w, h)?;
     let mut img = if w == sw && h == sh {
         match window {
             // No resample runs: the two-step path returns
@@ -4688,7 +4712,7 @@ fn apply_pad(
         let whole = (0, 0, img.width(), img.height());
         return Ok((img, whole));
     }
-    check_output_pixels(target_w, target_h)?;
+    check_output_size(target_w, target_h)?;
     let fitted = apply_fit_in(
         img.clone(),
         &ImageSize {
@@ -4802,7 +4826,7 @@ fn apply_fit_in(
         Some(c) => cap_dimensions(w, h, c),
         None => (w, h),
     };
-    check_output_pixels(w, h)?;
+    check_output_size(w, h)?;
     if w == sw && h == sh {
         Ok(img)
     } else {
