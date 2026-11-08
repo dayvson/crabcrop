@@ -10,6 +10,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - A step that works out an output size past 16383 px on an axis is refused with `400 unsupported_operation`, as a written size past the limit already is (issue #521). Before, `16383x1/0x2` rendered 32766x2, and so did a fit-in, a crop followed by a resize, `dpr()`, a pad canvas or a rotated canvas that grew a side past the limit; with WebP output these failed with `500` instead. Every URL that rendered within the limit renders the same bytes. `/explain` reports the refusal as `over_dimension`, and its forecast now follows the engine for SVG sources (their raster size), `no_upscale` caps, `rotate(...)` and trims.
 
+- The TypeScript SDK's `explainUrl` and `ops.cropObjects`, and the playground's explainer, fold repeated `objects(...)` class names ASCII-only, as the server does (issue #482). `É` and `é` (or `K` and the Kelvin sign) are two classes, so a list that reaches 33 distinct classes that way is now refused instead of passing the SDK and failing on the server with `400 invalid_crop`, and a shorter list keeps both spellings, as the server's canonical form does. The playground's explainer is now a generated build of the SDK's own, so its `studio(...)` description matches the SDK's.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added
