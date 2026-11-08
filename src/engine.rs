@@ -828,6 +828,13 @@ impl Engine {
     /// (`apply_operations`), the still encode, and metadata
     /// embedding. The functions after this one hold every
     /// stage but the chain.
+    ///
+    /// A DPR factor from the client hint (`ctx.dpr`) is
+    /// advisory (issue #529): when the render refuses its
+    /// output size at that factor, the stages after selection
+    /// run again at the next factor down (`step_down_hint`),
+    /// so the hint never turns a URL that renders without it
+    /// into an error.
     pub fn process_preferred(
         &self,
         bytes: &[u8],
@@ -845,6 +852,31 @@ impl Engine {
         let bytes = frame.as_ref().map_or(bytes, |(png, _)| png.as_slice());
         let page = Self::select_page(bytes, &directives, &ctx)?;
         let bytes = page.as_ref().map_or(bytes, |(png, _)| png.as_slice());
+        let video = frame.as_ref().map(|(_, meta)| *meta);
+        let pdf = page.as_ref().map(|(_, meta)| *meta);
+        // Selection runs once and only the stages after it run
+        // again at a lower factor, so an external tool never
+        // runs twice for one render.
+        step_down_hint(ops, &directives, ctx.dpr, |dpr| {
+            let ctx = ProcessContext { dpr, ..ctx.clone() };
+            self.process_selected(bytes, ops, ctx, directives.clone(), video, pdf)
+        })
+    }
+
+    /// The stages of [`Engine::process_preferred`] after frame
+    /// and page selection, at the DPR factor `ctx` carries:
+    /// sniffing, preflight, decode, the operation chain, the
+    /// still encode, and metadata embedding. `video` and `pdf`
+    /// are the selection's records, carried onto the result.
+    fn process_selected(
+        &self,
+        bytes: &[u8],
+        ops: &[Operation],
+        ctx: ProcessContext<'_>,
+        directives: crate::url::RequestDirectives,
+        video: Option<VideoSourceMeta>,
+        pdf: Option<PdfSourceMeta>,
+    ) -> Result<ProcessedImage, EngineError> {
         let source = Self::sniff_source(bytes)?;
         let detected = source.detected;
         // keep_profile is convert-or-tag (issue #374): the
@@ -943,8 +975,8 @@ impl Engine {
             segments,
             objects_crop,
             ssimulacra2: encoded.ssim,
-            video: frame.as_ref().map(|(_, meta)| *meta),
-            pdf: page.as_ref().map(|(_, meta)| *meta),
+            video,
+            pdf,
             provenance: None,
         })
     }
@@ -2232,6 +2264,100 @@ fn upscale_image(
 /// wins, then the client hint carried on the context, else 1.
 fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
     explicit.or(ctx.dpr).unwrap_or(1.0)
+}
+
+/// Run `render` at the hinted DPR factor `hint`, then at each
+/// lower factor [`hint_step_down`] names while the render
+/// refuses its output size (issue #529): the result at the
+/// largest factor that fits, or the refusal that stands. A
+/// refused try stops at the step that asks for the oversized
+/// image, before that step allocates it.
+fn step_down_hint<T>(
+    ops: &[Operation],
+    directives: &crate::url::RequestDirectives,
+    hint: Option<f32>,
+    mut render: impl FnMut(Option<f32>) -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    let mut hint = hint;
+    loop {
+        match render(hint) {
+            Err(err) => match hint_step_down(&err, ops, directives, hint) {
+                Some(lower) => hint = Some(lower),
+                None => return Err(err),
+            },
+            done => return done,
+        }
+    }
+}
+
+/// The factor a render refused at the hinted DPR factor
+/// `hint` tries next, or `None` when the refusal stands
+/// (issue #529). A client hint is advisory, so when it alone
+/// pushes a size past the per-axis limit or the pixel budget,
+/// the render steps down [`crate::url::DPR_FACTORS`] to the
+/// largest factor whose sizes fit both; at factor 1 the URL
+/// itself is over, and its refusal stands. Nothing else steps:
+/// a factor from `dpr(...)` (in the URL, a preset, or the
+/// operator's default operations) is the request's own and
+/// keeps its `400`, a refusal of any other kind is not the
+/// factor's doing, and a chain with no pixel size for the
+/// factor to scale renders the same at every factor.
+fn hint_step_down(
+    err: &EngineError,
+    ops: &[Operation],
+    directives: &crate::url::RequestDirectives,
+    hint: Option<f32>,
+) -> Option<f32> {
+    if directives.dpr.is_some() || !is_output_size_refusal(err) || !scales_with_dpr(ops) {
+        return None;
+    }
+    dpr_step_below(hint?)
+}
+
+/// The largest of [`crate::url::DPR_FACTORS`] below `factor`,
+/// the next one a hinted factor steps down to (issue #529);
+/// `None` at factor 1.
+pub(crate) fn dpr_step_below(factor: f32) -> Option<f32> {
+    crate::url::DPR_FACTORS
+        .iter()
+        .rev()
+        .copied()
+        .find(|&lower| lower < factor)
+}
+
+/// Whether `err` is a refusal of an output size: a step past
+/// the per-axis limit or the pixel budget
+/// ([`check_output_size`], [`check_output_pixels`]), a scaled
+/// overlay past the budget, or an animated output past the
+/// budget across its frames ([`OutputBudget`]). These are the
+/// refusals a DPR factor can cause, since it scales the sizes
+/// they measure.
+fn is_output_size_refusal(err: &EngineError) -> bool {
+    match err {
+        EngineError::Unsupported(what) => {
+            what.starts_with("requested output ")
+                || what.starts_with("scaled overlay ")
+                || what.starts_with("animated output exceeds ")
+        }
+        _ => false,
+    }
+}
+
+/// Whether any step of `ops` names a pixel size, the one
+/// thing a DPR factor scales: a resize, `fit-in`, `crop`, or
+/// `pad` with a pixel axis. An SVG source's raster size
+/// follows the first of these too.
+pub(crate) fn scales_with_dpr(ops: &[Operation]) -> bool {
+    ops.iter().any(|op| match op {
+        Operation::Size(size)
+        | Operation::Crop { size, .. }
+        | Operation::Pad { size, .. }
+        | Operation::FitIn { size, .. } => {
+            matches!(size.width, Dimension::Pixels(_))
+                || matches!(size.height, Dimension::Pixels(_))
+        }
+        _ => false,
+    })
 }
 
 /// Whether a filter leaves every existing pixel where it

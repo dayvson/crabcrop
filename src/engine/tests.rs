@@ -9281,6 +9281,237 @@ fn dpr_hint_applies_without_a_directive_and_loses_to_one() {
     assert_eq!((out.width, out.height), (60, 60));
 }
 
+/// Run `remainder` (operations only) through the engine on
+/// `src` with a DPR client hint of `hint`, as the server would
+/// for that URL and header.
+fn process_hinted(
+    src: &[u8],
+    remainder: &str,
+    hint: Option<f32>,
+) -> Result<ProcessedImage, EngineError> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    Engine.process_preferred(
+        src,
+        &ops,
+        ProcessContext {
+            dpr: hint,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn a_dpr_hint_past_the_per_axis_limit_steps_down() {
+    // Issue #529: a hint is advisory, so a factor that alone
+    // pushes a size past 16383 px per axis steps down to the
+    // largest factor that fits, instead of failing a URL that
+    // renders without the hint.
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, hint, dims) in [
+        // 18000x3 at 3 is refused; 2 fits.
+        ("6000x1", 3.0, (12000, 2)),
+        // 16384x2 at 2 is refused; 1.5 fits (one pixel
+        // rounds up to two).
+        ("8192x1", 2.0, (12288, 2)),
+        // A factor that fits is applied as hinted.
+        ("6000x1", 2.0, (12000, 2)),
+        ("5461x1", 3.0, (16383, 3)),
+    ] {
+        let out = process_hinted(&src, remainder, Some(hint))
+            .unwrap_or_else(|err| panic!("{remainder} at {hint}: {err}"));
+        assert_eq!(decode_dims(&out.bytes), dims, "{remainder} at {hint}");
+    }
+    // `0x1` on a 16383x1 source keeps the 16383:1 aspect: at
+    // 2 and at 1.5 the height rounds to 2 and the width to
+    // 32766, so the factor steps to 1, where the step keeps
+    // the size it started from.
+    let wide = solid_png(16383, 1, [30, 120, 200]);
+    let out = process_hinted(&wide, "0x1", Some(2.0)).unwrap();
+    assert_eq!(decode_dims(&out.bytes), (16383, 1));
+    // An animated source steps down the same way: every
+    // frame renders at the factor that fits.
+    let out = process_hinted(&animated_gif_bytes(), "6000x1", Some(3.0)).unwrap();
+    let frames = decoded_gif_frames(&out.bytes);
+    assert_eq!(frames.len(), 2);
+    for frame in &frames {
+        assert_eq!(frame.buffer().dimensions(), (12000, 2));
+    }
+}
+
+#[test]
+fn a_dpr_hint_past_the_pixel_budget_steps_down() {
+    // Issue #529: `8000x8000` at a hinted 1.5 asks for 144
+    // million pixels, past the 100 million budget; at 1 it
+    // fits. An 8000x8000 stand-in for the decoded source
+    // keeps the step at its own size at factor 1, so nothing
+    // resamples (or touches the zeroed pages). At a hinted 3
+    // the walk meets both bounds: 24000 px per axis, then
+    // 256 and 144 million pixels.
+    let (ops, _) = crate::url::parse_operations("8000x8000/example.com/a.png").unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    for hint in [1.5, 2.0, 3.0] {
+        let mut tried = Vec::new();
+        let (dims, factor) = step_down_hint(&ops, &directives, Some(hint), |dpr| {
+            tried.push(dpr);
+            let ctx = ProcessContext {
+                dpr,
+                ..Default::default()
+            };
+            let img = DynamicImage::new_rgb8(8000, 8000);
+            let factor = dpr_factor(directives.dpr, &ctx);
+            let (out, ..) = apply_operations(img, &ops, None, factor, &ctx, &directives, None)?;
+            Ok(((out.width(), out.height()), factor))
+        })
+        .unwrap();
+        assert_eq!((dims, factor), ((8000, 8000), 1.0), "hint {hint}");
+        let expected: Vec<Option<f32>> = crate::url::DPR_FACTORS
+            .iter()
+            .rev()
+            .filter(|&&f| f <= hint)
+            .map(|&f| Some(f))
+            .collect();
+        assert_eq!(tried, expected, "hint {hint}");
+    }
+}
+
+#[test]
+fn an_explicit_dpr_or_an_over_limit_url_keeps_its_refusal() {
+    // Issue #529: only the hint is advisory. `dpr(3)` in the
+    // URL (or a preset, or the operator's defaults, which
+    // reach the engine in the same merged list) is the
+    // request's own factor, and its refusal stands, hint or
+    // no hint.
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for hint in [None, Some(1.0), Some(2.0), Some(3.0)] {
+        let err = match process_hinted(&src, "6000x1/filters:dpr(3)", hint) {
+            Err(err) => err,
+            Ok(out) => panic!("rendered {:?} at {hint:?}", decode_dims(&out.bytes)),
+        };
+        assert_eq!(
+            err.to_string(),
+            "unsupported operation: requested output 18000x3 exceeds the 16383 pixel limit per axis",
+            "{hint:?}"
+        );
+    }
+    // A URL past the limit at factor 1 is over by itself: the
+    // hint steps all the way down and the refusal names the
+    // size the URL asks for at 1.
+    let err = match process_hinted(&src, "16383x1/0x2", Some(3.0)) {
+        Err(err) => err,
+        Ok(out) => panic!("rendered {:?}", decode_dims(&out.bytes)),
+    };
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 32766x2 exceeds the 16383 pixel limit per axis"
+    );
+}
+
+#[test]
+fn the_hint_steps_only_for_output_size_refusals() {
+    let ops_of = |remainder: &str| {
+        crate::url::parse_operations(&format!("{remainder}/example.com/a.png"))
+            .unwrap()
+            .0
+    };
+    // Hostile input (issue #529): a render that refuses its
+    // size at every factor is tried once per factor at or
+    // below the hint, never more, and its last refusal
+    // stands.
+    let ops = ops_of("6000x1");
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let mut tries = 0;
+    let err = step_down_hint(&ops, &directives, Some(3.0), |_| -> Result<(), _> {
+        tries += 1;
+        check_output_size(u32::MAX, u32::MAX, (1, 1))
+    })
+    .unwrap_err();
+    assert_eq!(tries, 4);
+    assert!(err.to_string().contains("pixel limit per axis"), "{err}");
+    // Each size check's refusal is one the hint steps for.
+    for err in [
+        check_output_size(crate::url::MAX_DIMENSION + 1, 1, (1, 1)).unwrap_err(),
+        check_output_size(10_000, 10_001, (1, 1)).unwrap_err(),
+        check_output_pixels(10_000, 10_001).unwrap_err(),
+        OutputBudget::with_limit(1).charge(2, 1).unwrap_err(),
+    ] {
+        assert_eq!(
+            hint_step_down(&err, &ops, &directives, Some(3.0)),
+            Some(2.0),
+            "{err}"
+        );
+    }
+    // Any other refusal is not the factor's doing: one try.
+    let mut tries = 0;
+    let err = step_down_hint(&ops, &directives, Some(3.0), |_| -> Result<(), _> {
+        tries += 1;
+        Err(EngineError::Unsupported(
+            "crop-rect 0x0:9x9 exceeds image bounds 4x4".to_string(),
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(tries, 1);
+    assert!(matches!(err, EngineError::Unsupported(_)));
+    let size = check_output_pixels(10_000, 10_001).unwrap_err();
+    assert_eq!(
+        hint_step_down(&EngineError::Timeout, &ops, &directives, Some(3.0)),
+        None
+    );
+    // No hint, a hint at 1, an explicit factor, or a chain
+    // with no pixel size for the factor to scale: no step.
+    assert_eq!(hint_step_down(&size, &ops, &directives, None), None);
+    assert_eq!(hint_step_down(&size, &ops, &directives, Some(1.0)), None);
+    let explicit = ops_of("6000x1/filters:dpr(3)");
+    let explicit_directives = crate::url::RequestDirectives::analyze(&explicit);
+    assert_eq!(
+        hint_step_down(&size, &explicit, &explicit_directives, Some(3.0)),
+        None
+    );
+    for remainder in ["filters:rotate(45)", "0x0", "origx0", "crop-rect:0x0:9x9"] {
+        let ops = ops_of(remainder);
+        let directives = crate::url::RequestDirectives::analyze(&ops);
+        assert_eq!(
+            hint_step_down(&size, &ops, &directives, Some(3.0)),
+            None,
+            "{remainder}"
+        );
+    }
+    for remainder in ["0x2", "fit-in:10x0", "crop:10x10", "pad:10x10", "origx2"] {
+        let ops = ops_of(remainder);
+        let directives = crate::url::RequestDirectives::analyze(&ops);
+        assert_eq!(
+            hint_step_down(&size, &ops, &directives, Some(3.0)),
+            Some(2.0),
+            "{remainder}"
+        );
+    }
+}
+
+#[test]
+fn dpr_steps_walk_the_factor_set_down() {
+    assert_eq!(dpr_step_below(3.0), Some(2.0));
+    assert_eq!(dpr_step_below(2.0), Some(1.5));
+    assert_eq!(dpr_step_below(1.5), Some(1.0));
+    assert_eq!(dpr_step_below(1.0), None);
+    // The grammar parses exactly the factor set the step walks
+    // (and the server's hint accepts).
+    for factor in crate::url::DPR_FACTORS {
+        let (ops, _) =
+            crate::url::parse_operations(&format!("filters:dpr({factor})/example.com/a.png"))
+                .unwrap();
+        assert_eq!(
+            crate::url::RequestDirectives::analyze(&ops).dpr,
+            Some(factor)
+        );
+    }
+    for factor in ["0.5", "1.25", "2.5", "4"] {
+        assert!(
+            crate::url::parse_operations(&format!("filters:dpr({factor})/example.com/a.png"))
+                .is_err(),
+            "{factor}"
+        );
+    }
+}
+
 #[test]
 fn text_routes_to_the_renderer_after_the_resize() {
     let engine = Engine;

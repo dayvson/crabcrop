@@ -12,6 +12,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The TypeScript SDK's `explainUrl` and `ops.cropObjects`, and the playground's explainer, fold repeated `objects(...)` class names ASCII-only, as the server does (issue #482). `É` and `é` (or `K` and the Kelvin sign) are two classes, so a list that reaches 33 distinct classes that way is now refused instead of passing the SDK and failing on the server with `400 invalid_crop`, and a shorter list keeps both spellings, as the server's canonical form does. The playground's explainer is now a generated build of the SDK's own, so its `studio(...)` description matches the SDK's.
 
+- A `DPR` or `Sec-CH-DPR` client hint no longer fails a request: when the hinted factor alone pushes a size past 16383 px on an axis or past the 100 million pixel budget, the image is served at the largest of 1, 1.5, 2 and 3 that fits, instead of answering `400` (issue #529). Before, `/unsafe/6000x1/<source>` with `DPR: 3` and `/unsafe/8000x8000/<source>` with `DPR: 1.5` failed on high-density screens only, while the same URL rendered on a desktop. A `dpr(...)` in the URL, a preset or `CRABCROP_DEFAULT_OPS` is never stepped down and keeps its `400`, and so does a URL past the limits at factor 1. A stepped-down render is cached under the hinted factor, so it never answers the URL without the hint. `/explain` now reads the DPR hint and forecasts the factor the image request applies, as `forecast.dpr`, `dpr_from` and `dpr_hint`.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added

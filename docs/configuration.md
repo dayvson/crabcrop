@@ -92,6 +92,7 @@ Pinned fetches connect directly and never go through a proxy: a proxy resolves t
 - **Presets-only mode is unaffected in what it rejects** (the URL's own operations), and the defaults still apply: they are not URL content.
 - Cache groups stay the URL's own presets; a preset referenced only by the defaults does not join entries to its group.
 - [`/explain`](endpoints.md#self-explaining-urls) forecasts from the merged operations, so its forecast matches what the image request serves; its operation list stays the URL's own, and the defaults appear in its canonical form.
+- **A default `dpr(...)` is an explicit factor, not a hint.** It beats the `DPR` client hint, as a URL's own `dpr(...)` does, and it is never stepped down: a size it pushes past the [output limits](url-grammar.md#output-size) answers `400`, where a factor from the hint alone steps down to the largest one that fits (see [Client hints](filters.md#client-hints)).
 
 ### Rotating the secret
 
