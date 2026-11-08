@@ -9346,12 +9346,15 @@ fn a_dpr_hint_past_the_pixel_budget_steps_down() {
     // keeps the step at its own size at factor 1, so nothing
     // resamples (or touches the zeroed pages). At a hinted 3
     // the walk meets both bounds: 24000 px per axis, then
-    // 256 and 144 million pixels.
+    // 256 and 144 million pixels. With no source header to
+    // walk, the render finds each refusal itself, one try per
+    // factor (`hint_start` settles them before any render
+    // when it can; see the test after this one).
     let (ops, _) = crate::url::parse_operations("8000x8000/example.com/a.png").unwrap();
     let directives = crate::url::RequestDirectives::analyze(&ops);
     for hint in [1.5, 2.0, 3.0] {
         let mut tried = Vec::new();
-        let (dims, factor) = step_down_hint(&ops, &directives, Some(hint), |dpr| {
+        let (dims, factor) = step_down_hint(&[], &ops, &directives, Some(hint), |dpr| {
             tried.push(dpr);
             let ctx = ProcessContext {
                 dpr,
@@ -9420,7 +9423,7 @@ fn the_hint_steps_only_for_output_size_refusals() {
     let ops = ops_of("6000x1");
     let directives = crate::url::RequestDirectives::analyze(&ops);
     let mut tries = 0;
-    let err = step_down_hint(&ops, &directives, Some(3.0), |_| -> Result<(), _> {
+    let err = step_down_hint(&[], &ops, &directives, Some(3.0), |_| -> Result<(), _> {
         tries += 1;
         check_output_size(u32::MAX, u32::MAX, (1, 1))
     })
@@ -9432,7 +9435,18 @@ fn the_hint_steps_only_for_output_size_refusals() {
         check_output_size(crate::url::MAX_DIMENSION + 1, 1, (1, 1)).unwrap_err(),
         check_output_size(10_000, 10_001, (1, 1)).unwrap_err(),
         check_output_pixels(10_000, 10_001).unwrap_err(),
+        check_hinted_output(crate::url::MAX_DIMENSION + 1, 4).unwrap_err(),
         OutputBudget::with_limit(1).charge(2, 1).unwrap_err(),
+        OutputBudget::with_limit(1)
+            .check_frames(1, 1, 2)
+            .unwrap_err(),
+        // A later check of the output's size words its
+        // refusal as the steps do, so the hint steps for it.
+        EngineError::Unsupported(
+            "requested output 16384x4 exceeds the 16383 pixel limit per axis; \
+             resize or crop it to fit"
+                .to_string(),
+        ),
     ] {
         assert_eq!(
             hint_step_down(&err, &ops, &directives, Some(3.0)),
@@ -9442,7 +9456,7 @@ fn the_hint_steps_only_for_output_size_refusals() {
     }
     // Any other refusal is not the factor's doing: one try.
     let mut tries = 0;
-    let err = step_down_hint(&ops, &directives, Some(3.0), |_| -> Result<(), _> {
+    let err = step_down_hint(&[], &ops, &directives, Some(3.0), |_| -> Result<(), _> {
         tries += 1;
         Err(EngineError::Unsupported(
             "crop-rect 0x0:9x9 exceeds image bounds 4x4".to_string(),
@@ -9510,6 +9524,166 @@ fn dpr_steps_walk_the_factor_set_down() {
             "{factor}"
         );
     }
+}
+
+/// The factors `step_down_hint` asks a stand-in render for,
+/// for `remainder` (operations only) over `src` with a DPR
+/// hint of `hint`, when the stand-in refuses its output size
+/// at every factor past `fits`.
+fn hint_tries(src: &[u8], remainder: &str, hint: f32, fits: f32) -> Vec<f32> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let mut tried = Vec::new();
+    let _ = step_down_hint(src, &ops, &directives, Some(hint), |dpr| {
+        let dpr = dpr.unwrap();
+        tried.push(dpr);
+        if dpr > fits {
+            check_output_size(u32::MAX, 1, (1, 1))
+        } else {
+            Ok(())
+        }
+    });
+    tried
+}
+
+#[test]
+fn the_header_walk_settles_the_hint_before_any_render() {
+    // Issue #529: each try decodes the source, so a factor
+    // the source's header already shows past the limits is
+    // never tried. A hint costs one render where the walk
+    // can size the chain, not one per factor.
+    let small = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, hint, start) in [
+        // 18000x3 at 3, past the per-axis limit.
+        ("6000x1", 3.0, 2.0),
+        // A factor that fits is the one tried.
+        ("6000x1", 2.0, 2.0),
+        // 144 million pixels at 1.5, past the budget.
+        ("8000x8000", 1.5, 1.0),
+        // A step past the budget anywhere in the chain.
+        ("8000x8000/100x100", 3.0, 1.0),
+        // Past the limit at every factor: one try, at 1,
+        // whose refusal stands.
+        ("16383x1/0x2", 3.0, 1.0),
+    ] {
+        assert_eq!(
+            hint_tries(&small, remainder, hint, 3.0),
+            [start],
+            "{remainder} at {hint}"
+        );
+    }
+    // A stepped factor never serves a side of 16384 px. At 2,
+    // these ask for a 16384 px source's own size, which no
+    // step refuses; 1.5 is the factor that fits.
+    let flat = solid_png(16_384, 2, [30, 120, 200]);
+    let wide = solid_png(16_384, 4, [30, 120, 200]);
+    assert_eq!(hint_tries(&flat, "8192x1", 3.0, 3.0), [1.5]);
+    assert_eq!(hint_tries(&wide, "0x2", 2.0, 3.0), [1.5]);
+    // The walk starts from the size the decode turns the
+    // source to: a 16383x1 JPEG stored on its side (EXIF
+    // orientation 6) decodes as 1x16383, where `0x2` at 2
+    // asks for 1x4. Upright, it asks for 32766x2 even at 1.
+    let line = DynamicImage::new_rgb8(16_383, 1);
+    assert_eq!(
+        hint_tries(&jpeg_with_orientation(&line, 6), "0x2", 2.0, 3.0),
+        [2.0]
+    );
+    assert_eq!(
+        hint_tries(&jpeg_with_orientation(&line, 1), "0x2", 2.0, 3.0),
+        [1.0]
+    );
+    // Where the walk cannot size the chain, the render's own
+    // refusals step the factor, one try each: the size after
+    // a `trim` hangs on the pixels, an SVG's intrinsic size
+    // takes a worker of its own, and bytes with no header
+    // state no size.
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="48"/>"#;
+    assert_eq!(
+        hint_tries(&small, "filters:trim/0x2", 3.0, 1.5),
+        [3.0, 2.0, 1.5]
+    );
+    assert_eq!(hint_tries(svg, "6000x1", 3.0, 2.0), [3.0, 2.0]);
+    assert_eq!(hint_tries(&[], "6000x1", 3.0, 1.0), [3.0, 2.0, 1.5, 1.0]);
+}
+
+#[test]
+fn a_stepped_hint_never_serves_a_side_past_the_limit() {
+    // Issue #529: at a hinted 2, `0x2` on a 16384x4 source
+    // asks for the source's own size, which the per-step
+    // check lets through as it lets any unchanged size
+    // through. Served, the output was one past the 16383 px
+    // limit, and as WebP it failed to encode with a `500`
+    // where main answered `400`. The factor steps to 1.5,
+    // the largest that fits, in every format, and so it does
+    // after a `trim`, where only the render finds the size.
+    let wide = solid_png(16_384, 4, [30, 120, 200]);
+    let flat = solid_png(16_384, 2, [30, 120, 200]);
+    for preferred in [None, Some(ImageFormat::WebP)] {
+        for (src, remainder, hint, dims) in [
+            (&wide, "0x2", 2.0, (12288, 3)),
+            (&flat, "8192x1", 3.0, (12288, 2)),
+            (&wide, "filters:trim/0x2", 2.0, (12288, 3)),
+        ] {
+            let (ops, _) =
+                crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+            let ctx = ProcessContext {
+                dpr: Some(hint),
+                preferred,
+                ..Default::default()
+            };
+            let out = Engine
+                .process_preferred(src, &ops, ctx)
+                .unwrap_or_else(|err| panic!("{remainder} at {hint} as {preferred:?}: {err}"));
+            assert_eq!(
+                decode_dims(&out.bytes),
+                dims,
+                "{remainder} at {hint} as {preferred:?}"
+            );
+        }
+    }
+    // The check behind the `trim` case: at a hinted factor
+    // past 1, the image the chain ends with is held to the
+    // limit even at the size a step started from, and the
+    // refusal is one the hint steps for.
+    let (ops, _) = crate::url::parse_operations("0x2/example.com/a.png").unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let ctx = ProcessContext {
+        dpr: Some(2.0),
+        ..Default::default()
+    };
+    let img = DynamicImage::new_rgb8(16_384, 4);
+    let err = match apply_operations(img, &ops, None, 2.0, &ctx, &directives, None) {
+        Err(err) => err,
+        Ok((img, ..)) => panic!("rendered {}x{}", img.width(), img.height()),
+    };
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 16384x4 exceeds the 16383 pixel limit per axis; \
+         resize or crop it to fit"
+    );
+    assert_eq!(
+        hint_step_down(&err, &ops, &directives, Some(2.0)),
+        Some(1.5)
+    );
+}
+
+#[test]
+fn output_budget_refuses_a_run_from_its_first_frame() {
+    // Issue #529: every frame of an animation renders at one
+    // size, so the first frame settles the run. A run past
+    // the budget is refused after one frame, with the
+    // refusal the running charge gives where it passes.
+    let budget = OutputBudget::with_limit(250);
+    assert!(budget.check_frames(10, 10, 2).is_ok());
+    let early = budget.check_frames(10, 10, 3).unwrap_err();
+    let mut running = OutputBudget::with_limit(250);
+    running.charge(10, 10).unwrap();
+    running.charge(10, 10).unwrap();
+    assert_eq!(early, running.charge(10, 10).unwrap_err());
+    // Hostile sizes and counts saturate past the budget
+    // instead of wrapping under it.
+    assert!(budget.check_frames(u32::MAX, u32::MAX, usize::MAX).is_err());
+    assert!(budget.check_frames(1, 1, usize::MAX).is_err());
 }
 
 #[test]

@@ -11424,6 +11424,22 @@ async fn a_dpr_hint_past_the_limits_steps_down() {
             "{ops} with {hint:?}"
         );
     }
+    // A stepped factor never serves a side past the limit. At
+    // 2, `8192x1` on a 16384x2 source asks for the source's own
+    // size, which no step refuses: served, it was one past the
+    // limit, and a WebP negotiated from Accept failed to encode
+    // it with a 500. The factor steps to 1.5 in every format.
+    let ceiling = spawn_bytes_server(png_of(16384, 2)).await;
+    let remainder = format!("8192x1/{ceiling}");
+    for (accept, format) in [("image/png", "image/png"), ("image/webp,*/*", "image/webp")] {
+        let resp = get_with_headers(&base, &remainder, &[("DPR", "3"), ("Accept", accept)]).await;
+        assert_eq!(header(&resp, "content-type"), format);
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some((12288, 2))),
+            "{accept}"
+        );
+    }
 }
 
 /// A stepped-down render keeps the cache entry of the hint

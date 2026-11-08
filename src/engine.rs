@@ -531,6 +531,27 @@ fn check_output_size(width: u32, height: u32, input: (u32, u32)) -> Result<(), E
     check_output_pixels(width, height)
 }
 
+/// Hold the image a render at a hinted DPR factor past 1
+/// ends with to [`crate::url::MAX_DIMENSION`] per axis, a
+/// size no step changed included (issue #529). The steps let
+/// a size they did not change pass ([`check_output_size`]),
+/// so a hinted factor could take a resize to a 16384 px
+/// source's own size and serve that side (or, as WebP, fail
+/// to encode it), past the limit a stepped factor promises to
+/// fit. The refusal is an output-size refusal, so the factor
+/// steps down. At factor 1 the render is the one the URL gets
+/// without the hint, under its own rules.
+fn check_hinted_output(width: u32, height: u32) -> Result<(), EngineError> {
+    let max = crate::url::MAX_DIMENSION;
+    if width > max || height > max {
+        return Err(EngineError::Unsupported(format!(
+            "requested output {width}x{height} exceeds the {max} pixel limit per axis; \
+             resize or crop it to fit"
+        )));
+    }
+    Ok(())
+}
+
 /// A running total of output pixels across the frames of one
 /// animated or video output, charged against the same budget
 /// a single still output gets (issue #182, audit R2-01). The
@@ -563,12 +584,34 @@ impl OutputBudget {
             .total
             .saturating_add(u64::from(width) * u64::from(height));
         if self.total > self.limit {
-            return Err(EngineError::Unsupported(format!(
-                "animated output exceeds the {} pixel budget across frames",
-                self.limit
-            )));
+            return Err(self.refusal());
         }
         Ok(())
+    }
+
+    /// Refuse up front when `frames` frames of `width` x
+    /// `height` would pass the budget. Every frame of one
+    /// animation renders at one size (each starts at the
+    /// canvas size, and the trim and smart-crop windows are
+    /// shared), so the first frame settles what the run will
+    /// charge: the refusal comes after one frame instead of a
+    /// budget's worth, with the message the charge gives. A
+    /// hinted DPR factor tried and refused for it costs one
+    /// frame this way (issue #529).
+    fn check_frames(&self, width: u32, height: u32, frames: usize) -> Result<(), EngineError> {
+        let run = (u64::from(width) * u64::from(height)).saturating_mul(frames as u64);
+        if self.total.saturating_add(run) > self.limit {
+            return Err(self.refusal());
+        }
+        Ok(())
+    }
+
+    /// The refusal of a run past the budget.
+    fn refusal(&self) -> EngineError {
+        EngineError::Unsupported(format!(
+            "animated output exceeds the {} pixel budget across frames",
+            self.limit
+        ))
     }
 }
 
@@ -830,11 +873,13 @@ impl Engine {
     /// stage but the chain.
     ///
     /// A DPR factor from the client hint (`ctx.dpr`) is
-    /// advisory (issue #529): when the render refuses its
-    /// output size at that factor, the stages after selection
-    /// run again at the next factor down (`step_down_hint`),
-    /// so the hint never turns a URL that renders without it
-    /// into an error.
+    /// advisory (issue #529): the render starts at the
+    /// largest factor up to the hint whose sizes the source's
+    /// header shows to fit the output limits, and when the
+    /// render still refuses its output size there, the stages
+    /// after selection run again at the next factor down
+    /// (`step_down_hint`), so the hint never turns a URL that
+    /// renders without it into an error.
     pub fn process_preferred(
         &self,
         bytes: &[u8],
@@ -854,10 +899,18 @@ impl Engine {
         let bytes = page.as_ref().map_or(bytes, |(png, _)| png.as_slice());
         let video = frame.as_ref().map(|(_, meta)| *meta);
         let pdf = page.as_ref().map(|(_, meta)| *meta);
-        // Selection runs once and only the stages after it run
-        // again at a lower factor, so an external tool never
-        // runs twice for one render.
-        step_down_hint(ops, &directives, ctx.dpr, |dpr| {
+        // Selection runs once, so a frame or page tool never
+        // runs again for a lower factor. A retry does run the
+        // stages after it again (the decode, and for an SVG
+        // the rasterizing worker), but only for a refusal the
+        // header walk could not foresee.
+        let mut retry = false;
+        step_down_hint(bytes, ops, &directives, ctx.dpr, |dpr| {
+            // A retry decodes again: none starts past the
+            // deadline.
+            if std::mem::replace(&mut retry, true) {
+                ctx.check_deadline()?;
+            }
             let ctx = ProcessContext { dpr, ..ctx.clone() };
             self.process_selected(bytes, ops, ctx, directives.clone(), video, pdf)
         })
@@ -1684,6 +1737,7 @@ impl Engine {
             ..FrameShare::default()
         };
         survey_trims(&frames, ops, cap, dpr, ctx, &directives, &mut share)?;
+        let frame_count = frames.len();
         for frame in frames {
             ctx.check_deadline()?;
             let delay = frame.delay();
@@ -1692,6 +1746,7 @@ impl Engine {
                 apply_operations(img, ops, cap, dpr, ctx, &directives, Some(&mut share))?;
             if out_frames.is_empty() {
                 encode_opts = opts;
+                budget.check_frames(img.width(), img.height(), frame_count)?;
             }
             budget.charge(img.width(), img.height())?;
             out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
@@ -1858,12 +1913,16 @@ impl Engine {
         // one frame size.
         let mut share = FrameShare::default();
         survey_trims(&frames, ops, cap, dpr, ctx, &directives, &mut share)?;
+        let frame_count = frames.len();
         for frame in frames {
             ctx.check_deadline()?;
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
             let (img, _, _, _, _, _) =
                 apply_operations(img, ops, cap, dpr, ctx, &directives, Some(&mut share))?;
+            if out_frames.is_empty() {
+                budget.check_frames(img.width(), img.height(), frame_count)?;
+            }
             budget.charge(img.width(), img.height())?;
             out_frames.push(crate::video::VideoFrame {
                 pixels: img.to_rgba8(),
@@ -2266,19 +2325,22 @@ fn dpr_factor(explicit: Option<f32>, ctx: &ProcessContext<'_>) -> f32 {
     explicit.or(ctx.dpr).unwrap_or(1.0)
 }
 
-/// Run `render` at the hinted DPR factor `hint`, then at each
-/// lower factor [`hint_step_down`] names while the render
-/// refuses its output size (issue #529): the result at the
-/// largest factor that fits, or the refusal that stands. A
-/// refused try stops at the step that asks for the oversized
-/// image, before that step allocates it.
+/// Run `render` for a request whose source is `bytes`, at
+/// the DPR factor its hint `hint` settles on (issue #529):
+/// first at the factor [`hint_start`] picks from the source's
+/// header, then at each lower factor [`hint_step_down`] names
+/// while the render still refuses its output size. The
+/// result at the largest factor that fits, or the refusal
+/// that stands. A refused try stops at the step that asks
+/// for the oversized image, before that step allocates it.
 fn step_down_hint<T>(
+    bytes: &[u8],
     ops: &[Operation],
     directives: &crate::url::RequestDirectives,
     hint: Option<f32>,
     mut render: impl FnMut(Option<f32>) -> Result<T, EngineError>,
 ) -> Result<T, EngineError> {
-    let mut hint = hint;
+    let mut hint = hint_start(bytes, ops, directives, hint);
     loop {
         match render(hint) {
             Err(err) => match hint_step_down(&err, ops, directives, hint) {
@@ -2288,6 +2350,56 @@ fn step_down_hint<T>(
             done => return done,
         }
     }
+}
+
+/// The factor a hinted render starts at (issue #529): the
+/// largest of [`crate::url::DPR_FACTORS`] up to `hint` whose
+/// sizes the walk of [`crate::explain::settle_hint`] (the
+/// `/explain` forecast's) finds within the output limits, so
+/// a factor the limits plainly refuse costs no decode. The
+/// walk starts from the size the decode hands the chain: the
+/// header's, turned by the EXIF orientation where the decode
+/// turns it. Where the header states no size, and for an SVG
+/// (whose intrinsic size takes a worker of its own) or a
+/// HEIC (whose decoder turns it by metadata of its own), the
+/// render starts at the hint and steps on its refusals alone.
+fn hint_start(
+    bytes: &[u8],
+    ops: &[Operation],
+    directives: &crate::url::RequestDirectives,
+    hint: Option<f32>,
+) -> Option<f32> {
+    let factor = hint?;
+    if directives.dpr.is_some()
+        || factor <= 1.0
+        || !scales_with_dpr(ops)
+        || crate::svg::is_svg(bytes)
+        || is_heic(bytes)
+    {
+        return hint;
+    }
+    let probe = probe_source(bytes);
+    let Some((width, height)) = probe.dimensions else {
+        return hint;
+    };
+    // `decode_source` turns a still by its EXIF orientation;
+    // GIF and animated WebP frames keep their stored size.
+    let turned = probe.kind != "gif"
+        && webp_animation_params(bytes).is_none()
+        && matches!(exif_orientation(bytes), Some(5..=8));
+    let dimensions = Some(if turned {
+        (height, width)
+    } else {
+        (width, height)
+    });
+    Some(crate::explain::settle_hint(
+        ops,
+        &SourceProbe {
+            dimensions,
+            ..probe
+        },
+        factor,
+    ))
 }
 
 /// The factor a render refused at the hinted DPR factor
@@ -2325,20 +2437,29 @@ pub(crate) fn dpr_step_below(factor: f32) -> Option<f32> {
         .find(|&lower| lower < factor)
 }
 
-/// Whether `err` is a refusal of an output size: a step past
+/// How every refusal of an output size opens: a step past
 /// the per-axis limit or the pixel budget
-/// ([`check_output_size`], [`check_output_pixels`]), a scaled
-/// overlay past the budget, or an animated output past the
-/// budget across its frames ([`OutputBudget`]). These are the
-/// refusals a DPR factor can cause, since it scales the sizes
-/// they measure.
+/// ([`check_output_size`], [`check_output_pixels`]), a hinted
+/// output past the per-axis limit ([`check_hinted_output`]),
+/// a scaled overlay past the budget, and an animated output
+/// past the budget across its frames ([`OutputBudget`]). A
+/// check that refuses an output size later in the pipeline
+/// words its refusal `requested output WxH exceeds ...` too,
+/// so the step-down counts it.
+const OUTPUT_SIZE_REFUSALS: [&str; 3] = [
+    "requested output ",
+    "scaled overlay ",
+    "animated output exceeds ",
+];
+
+/// Whether `err` is a refusal of an output size (see
+/// [`OUTPUT_SIZE_REFUSALS`]): the refusals a DPR factor can
+/// cause, since it scales the sizes they measure.
 fn is_output_size_refusal(err: &EngineError) -> bool {
     match err {
-        EngineError::Unsupported(what) => {
-            what.starts_with("requested output ")
-                || what.starts_with("scaled overlay ")
-                || what.starts_with("animated output exceeds ")
-        }
+        EngineError::Unsupported(what) => OUTPUT_SIZE_REFUSALS
+            .iter()
+            .any(|opening| what.starts_with(opening)),
         _ => false,
     }
 }
@@ -3017,7 +3138,11 @@ fn apply_operations(
     for (op_index, op) in ops.iter().enumerate() {
         img = chain.step(img, op_index, op)?;
     }
-    chain.finish(img)
+    let outcome = chain.finish(img)?;
+    if directives.dpr.is_none() && dpr > 1.0 && scales_with_dpr(ops) {
+        check_hinted_output(outcome.0.width(), outcome.0.height())?;
+    }
+    Ok(outcome)
 }
 
 /// The running state of one [`apply_operations`] pass: the

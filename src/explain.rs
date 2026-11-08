@@ -225,7 +225,10 @@ pub fn debug_focal_remainder(ops: &[Operation], source: &str) -> Option<String> 
 /// URL. The DPR factor is: a `dpr(...)` in the chain, else
 /// the `DPR` client hint, which steps down as the engine
 /// steps it, to the largest factor whose walk fits the
-/// per-axis limit and the pixel budget (issue #529).
+/// per-axis limit and the pixel budget ([`settle_hint`],
+/// issue #529). The walk does not count an animated
+/// source's frames, so it cannot see the budget they share,
+/// which the engine may step a hinted factor down for.
 fn forecast(
     ops: &[Operation],
     url_ops: &[Operation],
@@ -241,19 +244,65 @@ fn forecast(
         (None, Some(factor)) => (factor, "hint"),
         (None, None) => (1.0, "none"),
     };
-    let mut forecast = forecast_at(ops, url_ops, probe, factor);
     // The engine's step-down (`hint_step_down`): only a
-    // hinted factor steps, only past a size limit, and only
-    // when the chain has a pixel size for it to scale.
-    let steps = from == "hint" && crate::engine::scales_with_dpr(ops);
-    while steps
-        && (forecast.over_dimension || forecast.over_budget || forecast.step_past_budget)
+    // hinted factor steps, and only when the chain has a
+    // pixel size for it to scale.
+    let forecast = if from == "hint" && crate::engine::scales_with_dpr(ops) {
+        let (forecast, settled) = step_hint(ops, url_ops, probe, factor);
+        factor = settled;
+        forecast
+    } else {
+        forecast_at(ops, url_ops, probe, factor)
+    };
+    (forecast, DprForecast { factor, from })
+}
+
+/// The factor a hinted render starts at (issue #529): `hint`,
+/// or the largest of [`crate::url::DPR_FACTORS`] below it
+/// whose walk the engine would not refuse. The engine starts
+/// its render here before it decodes anything, so a factor
+/// this walk sees past the limits costs no decode; it steps
+/// further on a refusal the walk cannot see (a size that
+/// hangs on the pixels, an overlay, an animation's frames).
+pub(crate) fn settle_hint(ops: &[Operation], probe: &SourceProbe, hint: f32) -> f32 {
+    step_hint(ops, ops, probe, hint).1
+}
+
+/// The walk of [`settle_hint`], with the forecast at the
+/// factor it settles on. At factor 1 the walk is the one a
+/// request without the hint gets, refused or not.
+fn step_hint(
+    ops: &[Operation],
+    url_ops: &[Operation],
+    probe: &SourceProbe,
+    hint: f32,
+) -> (Forecast, f32) {
+    let mut factor = hint;
+    let mut forecast = forecast_at(ops, url_ops, probe, factor);
+    while refused_at(&forecast, factor)
         && let Some(lower) = crate::engine::dpr_step_below(factor)
     {
         factor = lower;
         forecast = forecast_at(ops, url_ops, probe, factor);
     }
-    (forecast, DprForecast { factor, from })
+    (forecast, factor)
+}
+
+/// Whether the engine refuses a hinted render whose walk at
+/// `factor` is `forecast`: a step past the per-axis limit, or
+/// any step or the output past the pixel budget, and at a
+/// factor past 1, an output past the per-axis limit even at
+/// the size a step started from (the engine's
+/// `check_hinted_output`), so a stepped factor never serves a
+/// side of 16384 px.
+fn refused_at(forecast: &Forecast, factor: f32) -> bool {
+    let max = crate::url::MAX_DIMENSION;
+    let past_limit =
+        forecast.width.is_some_and(|w| w > max) || forecast.height.is_some_and(|h| h > max);
+    forecast.over_dimension
+        || forecast.over_budget
+        || forecast.step_past_budget
+        || (factor > 1.0 && past_limit)
 }
 
 /// The forecast at one DPR factor. Sizes and the pixel count
@@ -567,6 +616,13 @@ impl Report {
         }
     }
 
+    /// Whether the forecast is still past the size limits at
+    /// the factor it settled on: a hint stepped all the way
+    /// down to 1 for a URL over the limits by itself.
+    fn past_limits(&self) -> bool {
+        refused_at(&self.forecast, self.dpr.factor)
+    }
+
     /// The JSON form: the same facts the HTML page shows,
     /// as data.
     pub fn to_json(&self) -> serde_json::Value {
@@ -750,6 +806,9 @@ impl Report {
             ("operation", _) => out.push_str(&format!("<li>DPR: {factor} (from the URL)</li>\n")),
             ("default", _) => out.push_str(&format!(
                 "<li>DPR: {factor} (from the server's default operations)</li>\n"
+            )),
+            ("hint", Some(hint)) if hint != factor && self.past_limits() => out.push_str(&format!(
+                "<li>DPR: {factor} (the DPR client hint asked for {hint}, stepped down to {factor}; the URL is past the size limits at any factor)</li>\n"
             )),
             ("hint", Some(hint)) if hint != factor => out.push_str(&format!(
                 "<li>DPR: {factor} (the DPR client hint asked for {hint}, stepped down so the output fits the size limits)</li>\n"
@@ -1283,6 +1342,22 @@ mod tests {
                 3.0,
                 (ok(32766, 2), true, (1.0, "hint")),
             ),
+            // A stepped factor never serves a side of 16384 px:
+            // at 2 these ask for the source's own size, which
+            // no step refuses, and the engine holds a hinted
+            // output to the limit at any size.
+            (
+                "8192x1",
+                png_of(16384, 2),
+                3.0,
+                (ok(12288, 2), false, (1.5, "hint")),
+            ),
+            (
+                "0x2",
+                png_of(16384, 4),
+                2.0,
+                (ok(12288, 3), false, (1.5, "hint")),
+            ),
             // Nothing for the factor to scale: no step.
             (
                 "filters:rotate(90)",
@@ -1316,9 +1391,9 @@ mod tests {
 
     #[test]
     fn the_report_names_the_factor_and_its_step() {
-        let report = |hint| {
-            let (ops, source, expiry, _) =
-                parse_operations_with_expiry("6000x1/https://example.com/a.png").unwrap();
+        let report_of = |remainder: &str, hint| {
+            let path = format!("{remainder}/https://example.com/a.png");
+            let (ops, source, expiry, _) = parse_operations_with_expiry(&path).unwrap();
             Report::new(ReportInput {
                 signed: true,
                 key_id: None,
@@ -1332,11 +1407,12 @@ mod tests {
                 presets: Vec::new(),
                 canonical: crate::url::canonical_form(&ops, source),
                 cache_group: None,
-                image_path: "/unsafe/6000x1/https://example.com/a.png".to_string(),
+                image_path: format!("/unsafe/{remainder}/https://example.com/a.png"),
                 merged_ops: ops.clone(),
                 ops,
             })
         };
+        let report = |hint| report_of("6000x1", hint);
         let stepped = report(Some(3.0));
         let json = stepped.to_json();
         assert_eq!(json["forecast"]["dpr"], 2.0);
@@ -1358,6 +1434,17 @@ mod tests {
         assert_eq!(plain.to_json()["forecast"]["dpr_from"], "none");
         assert!(plain.to_json()["forecast"]["dpr_hint"].is_null());
         assert!(!plain.to_html().contains("DPR:"));
+        // A URL past the limits at factor 1 steps all the way
+        // down, and the page does not claim it fits.
+        let over = report_of("16383x1/0x2", Some(3.0));
+        assert_eq!(over.to_json()["forecast"]["dpr"], 1.0);
+        assert_eq!(over.to_json()["forecast"]["over_dimension"], true);
+        let html = over.to_html();
+        assert!(
+            html.contains("<li>DPR: 1 (the DPR client hint asked for 3, stepped down to 1; the URL is past the size limits at any factor)</li>"),
+            "{html}"
+        );
+        assert!(!html.contains("so the output fits"), "{html}");
     }
 
     #[test]
