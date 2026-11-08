@@ -10,38 +10,16 @@
 //! `504`, and the server answers everything else throughout.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crabcrop::svg::{WORKER_ARG, WorkerCommand, prepare, screen};
 
-// The library's test helpers are not visible to an
-// integration test: its scratch directories come in by
-// path. Not every item is used here.
+// Not every shared item is used here.
 #[allow(dead_code)]
-#[path = "../src/test_support/scratch.rs"]
-mod test_support;
-
-/// Kill the server on drop, so a failed assert cannot leak
-/// a listening server into later runs.
-struct ServerGuard(Child);
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+mod common;
 
 /// One raw HTTP/1.0 GET: (status, body, time taken).
 fn get(port: u16, path: &str) -> (u16, Vec<u8>, Duration) {
@@ -78,8 +56,8 @@ fn get_with(port: u16, path: &str, headers: &str) -> (u16, Vec<u8>, Duration) {
 /// A directory of SVG sources the server reads through
 /// `file://` URLs. Bound before the server's guard, it is
 /// removed after the server exits (locals drop in reverse).
-fn source_dir(name: &str) -> test_support::ScratchDir {
-    let dir = test_support::scratch_dir(&format!("svg-isolation-{name}"));
+fn source_dir(name: &str) -> common::ScratchDir {
+    let dir = common::scratch_dir(&format!("svg-isolation-{name}"));
     std::fs::write(dir.join("ok.svg"), OK_SVG).unwrap();
     std::fs::write(dir.join("arc.svg"), ARC_SVG).unwrap();
     std::fs::write(dir.join("nested.svg"), nested_chain()).unwrap();
@@ -87,34 +65,20 @@ fn source_dir(name: &str) -> test_support::ScratchDir {
     dir
 }
 
-fn boot(root: &Path, extra_env: &[(&str, &str)]) -> (ServerGuard, u16) {
-    let port = free_port();
+fn boot(root: &Path, extra_env: &[(&str, &str)]) -> (common::ServerGuard, u16) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
     command
         .env_clear()
         .env("CRABCROP_SECRET", "svg-isolation-secret-0123456789")
-        .env("PORT", port.to_string())
         .env("CRABCROP_ALLOW_UNSAFE", "1")
         .env("CRABCROP_FILE_ROOT", root)
         .env("CRABCROP_CACHE_MAX_MB", "0")
-        .env("CRABCROP_METRICS_TOKEN", METRICS_TOKEN)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("CRABCROP_METRICS_TOKEN", METRICS_TOKEN);
     for (name, value) in extra_env {
         command.env(name, value);
     }
-    let mut server = ServerGuard(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = server.0.try_wait().unwrap() {
-            panic!("the binary exited before serving: {status}");
-        }
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() && get(port, "/health").0 == 200 {
-            return (server, port);
-        }
-        assert!(Instant::now() < deadline, "the server never answered");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let (server, port, _) = common::serve(&mut command);
+    (server, port)
 }
 
 const METRICS_TOKEN: &str = "svg-isolation-metrics-token";
