@@ -2891,7 +2891,7 @@ fn ai_filters_refuse_animated_sources() {
 #[test]
 fn debug_focal_with_a_video_format_is_a_specific_error() {
     let engine = Engine;
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let src = png_bytes(&DynamicImage::new_rgb8(20, 12));
     let err = engine
         .process_preferred(
@@ -3501,7 +3501,7 @@ fn video_output_budget_rejects_aggregate_overflow() {
     // The same aggregate budget guards the video path:
     // the request fails before the encoder ever runs.
     let engine = Engine;
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let mut ops = aggregate_overflow_ops();
     ops.push(Operation::Filters(vec![Filter::Format(FormatSpec::plain(
         ImageFormat::Mp4,
@@ -4632,7 +4632,7 @@ fn animated_trim_to_webp_and_video_shares_one_canvas() {
         // Lossy, so the squares are checked by band.
         assert!(luma_at(&frames[1], 20, 20) < 60);
         assert!(luma_at(&frames[1], 3, 3) > 200);
-        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
         let out = engine
             .process_preferred(
                 &src,
@@ -4982,17 +4982,17 @@ fn animated_gif_probe_survives_hostile_input() {
 
 /// A fake video encoder for the video tests: drains
 /// stdin and answers with the script's canned behavior.
-fn video_test_encoder(script: &str) -> crate::video::VideoEncoder {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-engine-video-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// The script lives in the returned directory.
+fn video_test_encoder(
+    script: &str,
+) -> (crate::test_support::ScratchDir, crate::video::VideoEncoder) {
+    let dir = crate::test_support::scratch_dir("engine-video");
     let path = dir.join("encoder.sh");
     crate::test_support::write_script(&path, script);
-    crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
-        .unwrap()
+    let encoder =
+        crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
+            .unwrap();
+    (dir, encoder)
 }
 
 const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDEO'\n";
@@ -5002,14 +5002,16 @@ const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDE
 /// `-dump_separator` after each stream's codec name as
 /// the reference tool prints it (issue #402), and its
 /// extraction prints a real 8x6 PNG. Returns the
-/// extractor (the script lives in a temp dir keyed by
-/// `name`).
-fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameExtractor {
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-engine-frame-{}-{name}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+/// extractor and the scratch directory its script
+/// lives in, keyed by `name`.
+fn frame_test_extractor(
+    name: &str,
+    report: &str,
+) -> (
+    crate::test_support::ScratchDir,
+    crate::frames::VideoFrameExtractor,
+) {
+    let dir = crate::test_support::scratch_dir(&format!("engine-frame-{name}"));
     std::fs::write(
         dir.join("frame.png"),
         png_bytes(&DynamicImage::new_rgb8(8, 6)),
@@ -5021,7 +5023,9 @@ fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameEx
     );
     let path = dir.join("decoder.sh");
     crate::test_support::write_script(&path, &script);
-    crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap()
+    let extractor =
+        crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap();
+    (dir, extractor)
 }
 
 /// Bytes that sniff as no image: an ISO-BMFF header
@@ -5049,7 +5053,7 @@ fn frame_segment_without_a_decoder_is_not_configured() {
 #[test]
 fn frame_segment_on_an_image_source_is_a_decode_failure() {
     let engine = Engine;
-    let extractor = frame_test_extractor("image-source", FAKE_PROBE_REPORT);
+    let (_scripts, extractor) = frame_test_extractor("image-source", FAKE_PROBE_REPORT);
     let ctx = ProcessContext {
         frame_extractor: Some(&extractor),
         ..Default::default()
@@ -5078,7 +5082,7 @@ fn frame_segment_on_an_image_source_is_a_decode_failure() {
 #[test]
 fn frame_segment_extracts_and_processes_the_frame() {
     let engine = Engine;
-    let extractor = frame_test_extractor("extract", FAKE_PROBE_REPORT);
+    let (_scripts, extractor) = frame_test_extractor("extract", FAKE_PROBE_REPORT);
     let out = engine
         .process_preferred(
             FAKE_VIDEO_BYTES,
@@ -5105,7 +5109,7 @@ fn frame_segment_extracts_and_processes_the_frame() {
 #[test]
 fn frame_segment_on_a_streamless_source_is_a_decode_failure() {
     let engine = Engine;
-    let extractor = frame_test_extractor("streamless", "'no streams in here at all'");
+    let (_scripts, extractor) = frame_test_extractor("streamless", "'no streams in here at all'");
     let err = engine
         .process_preferred(
             FAKE_VIDEO_BYTES,
@@ -5360,7 +5364,7 @@ fn tiff_hostile_inputs_fail_bounded_and_clean() {
 #[test]
 fn frame_percentage_without_a_duration_is_unsupported() {
     let engine = Engine;
-    let extractor = frame_test_extractor(
+    let (_scripts, extractor) = frame_test_extractor(
         "no-duration",
         "'  Duration: N/A, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 8x6, 10 fps'",
     );
@@ -5380,12 +5384,14 @@ fn frame_percentage_without_a_duration_is_unsupported() {
 
 /// A fake PDF renderer pair (issue #215): the probe
 /// prints a report naming `pages` pages, the renderer
-/// prints a real 8x6 PNG. Returns the renderer (the
-/// scripts live in a temp dir keyed by `name`).
-fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-engine-pdf-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// prints a real 8x6 PNG. Returns the renderer and the
+/// scratch directory its scripts live in, keyed by
+/// `name`.
+fn pdf_test_renderer(
+    name: &str,
+    pages: u32,
+) -> (crate::test_support::ScratchDir, crate::pdf::PdfRenderer) {
+    let dir = crate::test_support::scratch_dir(&format!("engine-pdf-{name}"));
     std::fs::write(
         dir.join("page.png"),
         png_bytes(&DynamicImage::new_rgb8(8, 6)),
@@ -5407,7 +5413,9 @@ fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
         "pdftocairo",
         format!("#!/bin/sh\ncat > /dev/null\ncat \"{page_path}\"\nexit 0\n"),
     );
-    crate::pdf::PdfRenderer::new(renderer, std::time::Duration::from_secs(30)).unwrap()
+    let renderer =
+        crate::pdf::PdfRenderer::new(renderer, std::time::Duration::from_secs(30)).unwrap();
+    (dir, renderer)
 }
 
 /// Bytes that carry the PDF header and sniff as no
@@ -5432,7 +5440,7 @@ fn page_segment_without_a_renderer_is_not_configured() {
 #[test]
 fn page_segment_on_a_non_pdf_source_is_a_decode_failure() {
     let engine = Engine;
-    let renderer = pdf_test_renderer("non-pdf", 3);
+    let (_scripts, renderer) = pdf_test_renderer("non-pdf", 3);
     let ctx = ProcessContext {
         pdf_renderer: Some(&renderer),
         ..Default::default()
@@ -5456,7 +5464,7 @@ fn page_segment_on_a_non_pdf_source_is_a_decode_failure() {
 #[test]
 fn page_segment_renders_and_processes_the_page() {
     let engine = Engine;
-    let renderer = pdf_test_renderer("render", 3);
+    let (_scripts, renderer) = pdf_test_renderer("render", 3);
     let out = engine
         .process_preferred(
             FAKE_PDF_BYTES,
@@ -5499,7 +5507,7 @@ fn probe_source_labels_pdfs() {
 #[test]
 fn page_segment_out_of_range_is_unsupported() {
     let engine = Engine;
-    let renderer = pdf_test_renderer("range", 3);
+    let (_scripts, renderer) = pdf_test_renderer("range", 3);
     let err = engine
         .process_preferred(
             FAKE_PDF_BYTES,
@@ -5521,7 +5529,7 @@ fn page_segment_out_of_range_is_unsupported() {
 fn animated_gif_to_mp4_uses_the_configured_encoder() {
     let engine = Engine;
     let src = animated_gif_bytes();
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let out = engine
         .process_preferred(
             &src,
@@ -5544,7 +5552,7 @@ fn animated_gif_to_mp4_uses_the_configured_encoder() {
 fn animated_webp_to_webm_uses_the_configured_encoder() {
     let engine = Engine;
     let src = animated_webp_bytes();
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let out = engine
         .process_preferred(
             &src,
@@ -5565,7 +5573,7 @@ fn animated_webp_to_webm_uses_the_configured_encoder() {
 fn video_output_runs_the_operations_per_frame() {
     let engine = Engine;
     let src = animated_gif_bytes();
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let out = engine
         .process_preferred(
             &src,
@@ -5587,7 +5595,7 @@ fn video_output_runs_the_operations_per_frame() {
 #[test]
 fn video_format_on_a_still_source_is_a_specific_error() {
     let engine = Engine;
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let ctx = ProcessContext {
         video_encoder: Some(&encoder),
         ..Default::default()
@@ -5646,7 +5654,8 @@ fn video_format_without_an_encoder_is_not_configured() {
 #[test]
 fn a_failing_encoder_is_a_video_error() {
     let engine = Engine;
-    let encoder = video_test_encoder("#!/bin/sh\ncat > /dev/null\necho 'no codec' >&2\nexit 3\n");
+    let (_scripts, encoder) =
+        video_test_encoder("#!/bin/sh\ncat > /dev/null\necho 'no codec' >&2\nexit 3\n");
     let err = engine
         .process_preferred(
             &animated_gif_bytes(),

@@ -16,6 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+// The library's test helpers are not visible to an
+// integration test: its scratch directories come in by
+// path. Not every item is used here.
+#[allow(dead_code)]
+#[path = "../src/test_support/scratch.rs"]
+mod test_support;
+
 /// Kill the child on drop, so a failed assert cannot
 /// leak a listening server into later runs.
 struct ServerGuard(Child);
@@ -115,15 +122,9 @@ fn boot(budget_mb: u32, upload_dir: &std::path::Path) -> (ServerGuard, u16) {
     panic!("no /health before the deadline");
 }
 
-/// A fresh per-test, per-process directory.
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-source-budget-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh per-test directory.
+fn scratch_dir(tag: &str) -> test_support::ScratchDir {
+    test_support::scratch_dir(&format!("source-budget-{tag}"))
 }
 
 fn tiny_png() -> Vec<u8> {

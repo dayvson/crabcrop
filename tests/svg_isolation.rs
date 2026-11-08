@@ -17,6 +17,13 @@ use std::time::{Duration, Instant};
 
 use crabcrop::svg::{WORKER_ARG, WorkerCommand, prepare, screen};
 
+// The library's test helpers are not visible to an
+// integration test: its scratch directories come in by
+// path. Not every item is used here.
+#[allow(dead_code)]
+#[path = "../src/test_support/scratch.rs"]
+mod test_support;
+
 /// Kill the server on drop, so a failed assert cannot leak
 /// a listening server into later runs.
 struct ServerGuard(Child);
@@ -70,12 +77,8 @@ fn get_with(port: u16, path: &str, headers: &str) -> (u16, Vec<u8>, Duration) {
 
 /// A directory of SVG sources the server reads through
 /// `file://` URLs.
-fn source_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-svg-isolation-{name}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+fn source_dir(name: &str) -> test_support::ScratchDir {
+    let dir = test_support::scratch_dir(&format!("svg-isolation-{name}"));
     std::fs::write(dir.join("ok.svg"), OK_SVG).unwrap();
     std::fs::write(dir.join("arc.svg"), ARC_SVG).unwrap();
     std::fs::write(dir.join("nested.svg"), nested_chain()).unwrap();
