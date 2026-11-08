@@ -402,18 +402,11 @@ impl VideoEncoder {
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     /// A fresh temp directory for one test's scripts and
     /// recordings.
-    fn test_dir(name: &str) -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("crabcrop-video-{name}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir(name: &str) -> crate::test_support::ScratchDir {
+        crate::test_support::scratch_dir(&format!("video-{name}"))
     }
 
     /// Write a fake encoder script and make it executable.
@@ -473,7 +466,7 @@ mod tests {
             let err = VideoEncoder::with_defaults(&plain).unwrap_err();
             assert!(err.contains("not executable"), "{err}");
         }
-        let err = VideoEncoder::with_defaults(&dir).unwrap_err();
+        let err = VideoEncoder::with_defaults(dir.path()).unwrap_err();
         assert!(err.contains("not a file"), "{err}");
     }
 

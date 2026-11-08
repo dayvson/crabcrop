@@ -1,13 +1,15 @@
 use super::*;
 use crate::ai::env_or_skip;
-use std::io::Write;
+use crate::test_support::{ScratchDir, scratch_dir};
 
-fn temp_file(tag: &str, contents: &[u8]) -> String {
-    let mut path = std::env::temp_dir();
-    path.push(format!("crabcrop-ocr-{tag}-{}", std::process::id()));
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(contents).unwrap();
-    path.to_string_lossy().into_owned()
+/// Write bytes to a fresh temp file and return the
+/// scratch directory it lives in and its path (issue
+/// #526).
+fn temp_file(tag: &str, contents: &[u8]) -> (ScratchDir, String) {
+    let dir = scratch_dir(&format!("ocr-{tag}"));
+    let path = dir.join(tag).to_string_lossy().into_owned();
+    std::fs::write(&path, contents).unwrap();
+    (dir, path)
 }
 
 fn expect_load<T>(result: Result<T, AiError>) -> String {
@@ -23,19 +25,16 @@ fn read_ocr_dict_keeps_every_line_verbatim() {
     // Only line terminators come off: a line that is
     // itself a space is a class, not padding, and a
     // trailing newline does not add a phantom class.
-    let path = temp_file("dict2", b"a\nb\n \nx\r\nlast\n");
+    let (_dict, path) = temp_file("dict2", b"a\nb\n \nx\r\nlast\n");
     let dict = read_ocr_dict(&path).unwrap();
     assert_eq!(dict, vec!["a", "b", " ", "x", "last"]);
-    let _ = std::fs::remove_file(&path);
     // No trailing newline: the last line still counts.
-    let path = temp_file("dict3", b"a\nb");
+    let (_dict, path) = temp_file("dict3", b"a\nb");
     assert_eq!(read_ocr_dict(&path).unwrap(), vec!["a", "b"]);
-    let _ = std::fs::remove_file(&path);
     // An empty dictionary is a load error.
-    let path = temp_file("dict4", b"");
+    let (_dict, path) = temp_file("dict4", b"");
     let message = expect_load(read_ocr_dict(&path));
     assert!(message.contains("contains no characters"), "{message}");
-    let _ = std::fs::remove_file(&path);
     // A missing dictionary is a load error naming it.
     let message = expect_load(read_ocr_dict("/nonexistent/ppocr-dict.txt"));
     assert!(
@@ -335,7 +334,7 @@ fn ocr_load_rejects_a_mismatched_dictionary() {
     let Some(recognize) = env_or_skip("CRABCROP_TEST_OCR_RECOGNIZE_MODEL") else {
         return;
     };
-    let tiny = temp_file("tiny-dict", b"a\nb\nc\n");
+    let (_tiny, tiny) = temp_file("tiny-dict", b"a\nb\nc\n");
     let message = expect_load(OnnxOcrProvider::load(
         Some(&dylib),
         &detect,
@@ -344,7 +343,6 @@ fn ocr_load_rejects_a_mismatched_dictionary() {
         "en",
     ));
     assert!(message.contains("failed their load probe"), "{message}");
-    let _ = std::fs::remove_file(&tiny);
 }
 
 /// A missing model file fails as Load, the same boot
@@ -354,7 +352,7 @@ fn ocr_load_rejects_a_mismatched_dictionary() {
 #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
 fn ocr_load_missing_model_file_is_a_load_error() {
     let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-    let dict = temp_file("some-dict", b"a\nb\n");
+    let (_dict, dict) = temp_file("some-dict", b"a\nb\n");
     let message = expect_load(OnnxOcrProvider::load(
         Some(&dylib),
         "/nonexistent/ocr-det.onnx",
@@ -363,5 +361,4 @@ fn ocr_load_missing_model_file_is_a_load_error() {
         "en",
     ));
     assert!(message.contains("cannot load the model"), "{message}");
-    let _ = std::fs::remove_file(&dict);
 }
