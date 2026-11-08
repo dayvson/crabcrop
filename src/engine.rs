@@ -171,10 +171,10 @@ fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
 /// The media kind an upload validated as (issue #192):
 /// what the endpoint binds the object name's extension
 /// against, so a validated image cannot be stored under
-/// a name that presents it as something else. `Other` is
-/// a format the generic decoder accepts but the binding
-/// table does not enumerate (the PNM/TGA/QOI long tail);
-/// those carry no extension binding.
+/// a name that presents it as something else. Every kind
+/// carries a binding (issue #466): a body the generic
+/// decoder accepts but this table does not name is
+/// refused, never stored unbound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadMedia {
     Svg,
@@ -188,27 +188,24 @@ pub enum UploadMedia {
     Bmp,
     Tiff,
     Ico,
-    Other,
 }
 
 impl UploadMedia {
     /// The name extensions this media kind may be stored
-    /// under (lowercase, no dot), or `None` when the kind
-    /// carries no binding.
-    pub(crate) fn allowed_extensions(self) -> Option<&'static [&'static str]> {
+    /// under (lowercase, no dot).
+    pub(crate) fn allowed_extensions(self) -> &'static [&'static str] {
         match self {
-            UploadMedia::Svg => Some(&["svg"]),
-            UploadMedia::Heic => Some(&["heic", "heif"]),
-            UploadMedia::Jpeg => Some(&["jpg", "jpeg"]),
-            UploadMedia::Png => Some(&["png"]),
-            UploadMedia::Gif => Some(&["gif"]),
-            UploadMedia::WebP => Some(&["webp"]),
-            UploadMedia::Avif => Some(&["avif"]),
-            UploadMedia::Jxl => Some(&["jxl"]),
-            UploadMedia::Bmp => Some(&["bmp"]),
-            UploadMedia::Tiff => Some(&["tif", "tiff"]),
-            UploadMedia::Ico => Some(&["ico"]),
-            UploadMedia::Other => None,
+            UploadMedia::Svg => &["svg"],
+            UploadMedia::Heic => &["heic", "heif"],
+            UploadMedia::Jpeg => &["jpg", "jpeg"],
+            UploadMedia::Png => &["png"],
+            UploadMedia::Gif => &["gif"],
+            UploadMedia::WebP => &["webp"],
+            UploadMedia::Avif => &["avif"],
+            UploadMedia::Jxl => &["jxl"],
+            UploadMedia::Bmp => &["bmp"],
+            UploadMedia::Tiff => &["tif", "tiff"],
+            UploadMedia::Ico => &["ico"],
         }
     }
 
@@ -226,7 +223,6 @@ impl UploadMedia {
             UploadMedia::Bmp => "bmp",
             UploadMedia::Tiff => "tiff",
             UploadMedia::Ico => "ico",
-            UploadMedia::Other => "image",
         }
     }
 }
@@ -310,7 +306,11 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
     // The generic decode accepted the bytes; name what it
     // accepted. The guess mirrors the decoder's own, with
     // JPEG XL (which the image crate does not know) taken
-    // from the branch detection above.
+    // from the branch detection above. The image crate is
+    // built with these formats only (issue #466), so the
+    // last arm is unreachable today; it refuses rather
+    // than storing a kind no extension is bound to, should
+    // a feature change ever compile another decoder in.
     let media = if detected == ImageFormat::Jxl {
         UploadMedia::Jxl
     } else {
@@ -323,7 +323,12 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
             Ok(image::ImageFormat::Bmp) => UploadMedia::Bmp,
             Ok(image::ImageFormat::Tiff) => UploadMedia::Tiff,
             Ok(image::ImageFormat::Ico) => UploadMedia::Ico,
-            _ => UploadMedia::Other,
+            other => {
+                let format = other.map_or_else(|_| "unknown".to_string(), |f| format!("{f:?}"));
+                return Err(EngineError::Decode(format!(
+                    "the {format} format is not an upload format this server accepts"
+                )));
+            }
         }
     };
     Ok(PreparedUpload {
@@ -715,12 +720,17 @@ impl Default for ProcessContext<'_> {
 /// sources (issue #261): the animated paths apply the
 /// chain per frame, so one request would run inference
 /// up to 200 times and hold an AI gate permit for
-/// minutes to hours. The set mirrors the AI gate's own
-/// (`RequestDirectives::uses_ai`) minus saliency smart
-/// crop, which is bounded pixel work, not inference,
-/// and stays available on animated sources under the
-/// processing deadline. A still spelling of the same
-/// source (a `frame:` selection renders one frame)
+/// minutes to hours. The set is the AI gate's own
+/// (`RequestDirectives::uses_ai_beyond_smart_crop`): a
+/// smart crop stays available on animated sources under
+/// the processing deadline. Its focal analysis is the
+/// built-in saliency statistic, or, with a face or focal
+/// provider configured, an inference that takes the AI
+/// gate like any other (issue #379). An animated image
+/// render runs that analysis once, on the first frame,
+/// and replays the window (issue #376); a video render
+/// still runs it on every frame. A still spelling of the
+/// same source (a `frame:` selection renders one frame)
 /// runs these operations normally.
 fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), EngineError> {
     let inference_bound = directives.removebg
@@ -4268,12 +4278,6 @@ pub(in crate::engine) use encode::{
     EncodeBuffers, encode, gif_frame_quantized, max_quality_attempts, next_quality,
 };
 
-/// Overlay `wm` onto `base` at (x, y) with `alpha` percent
-/// opacity, honoring the watermark's own alpha channel.
-/// Negative coordinates anchor from the right/bottom edges
-/// (x = -1 puts the watermark's right edge one pixel from the
-/// base's right edge). Parts falling outside the base are
-/// clipped, never a panic.
 /// One channel of a blend mode: the CSS formulas on the
 /// 0-255 scale (`b` is the base channel, `o` the overlay's).
 fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
@@ -4377,6 +4381,12 @@ fn blend_overlay(
     Ok(DynamicImage::ImageRgba8(out))
 }
 
+/// Overlay `wm` onto `base` at (x, y) with `alpha` percent
+/// opacity, honoring the watermark's own alpha channel.
+/// Negative coordinates anchor from the right/bottom edges
+/// (x = -1 puts the watermark's right edge one pixel from the
+/// base's right edge). Parts falling outside the base are
+/// clipped, never a panic.
 fn overlay_watermark(
     base: &DynamicImage,
     wm: &DynamicImage,
@@ -4689,9 +4699,6 @@ pub(crate) fn resize_lanczos3_cropped(
     }
 }
 
-/// Scale proportionally to fit inside the `fit-in` box, preserving
-/// aspect and never distorting. A 0 dimension bounds nothing;
-/// `orig` bounds at the source dimension (a scale of 1).
 /// Pad `img` to exactly `target_w` x `target_h`: fit the image
 /// inside the box (the fit-in rules, `no_upscale` cap included),
 /// center it, and fill the rest of the canvas: a solid color
@@ -4790,6 +4797,12 @@ fn fit_in_box(size: &ImageSize, sw: u32, sh: u32, adaptive: bool) -> ImageSize {
     }
 }
 
+/// Scale proportionally to fit inside the `fit-in` box, preserving
+/// aspect and never distorting. A 0 dimension bounds nothing;
+/// `orig` bounds at the source dimension (a scale of 1). The box
+/// scales by `dpr` first, and with `adaptive` its axes swap to
+/// match the source's orientation (see [`fit_in_box`]); `cap`
+/// then shrinks the result to fit inside it (`no_upscale`).
 fn apply_fit_in(
     img: DynamicImage,
     size: &ImageSize,
@@ -4836,3 +4849,6 @@ fn apply_fit_in(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_formats;

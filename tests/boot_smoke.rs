@@ -80,6 +80,97 @@ fn the_binary_boots_and_answers_health() {
 }
 
 #[test]
+fn an_unknown_dash_argument_exits_with_an_error_and_never_serves() {
+    // #470: main handed the CLI only bare words and the
+    // help and version flags, so any other dash argument
+    // fell through to the server start: with a secret set,
+    // `crabcrop --verison` bound the port and served. The
+    // server takes no arguments, so each of these must be
+    // the CLI's error exit, with nothing ever listening.
+    for arg in ["--verison", "-x", "--", "-", "--base", "--port=8080"] {
+        let port = free_port();
+        let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .arg(arg)
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .env("PORT", port.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut process = ServerGuard(child);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                TcpStream::connect(("127.0.0.1", port)).is_err(),
+                "`crabcrop {arg}` started a server on port {port}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "`crabcrop {arg}` neither exited nor served before the deadline"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "`crabcrop {arg}`: something is listening on port {port}"
+        );
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        process
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        process
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(1), "`crabcrop {arg}`: {stderr}");
+        assert!(stdout.is_empty(), "`crabcrop {arg}`: {stdout}");
+        assert!(
+            stderr.starts_with(&format!("crabcrop: unknown verb {arg:?}")),
+            "`crabcrop {arg}`: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn help_names_every_flag_the_cli_accepts() {
+    // #470: the parser took `--key-id` while the help never
+    // mentioned it. These are every flag parse_flags reads.
+    let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+        .arg("--help")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for flag in [
+        "--base",
+        "--secret",
+        "--key-id",
+        "--expires",
+        "--placeholders",
+        "--detections",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "--help does not name {flag}:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn boot_with_no_source_configuration_serves_health() {
     // No allowlist, no private-blocking setting, no
     // any-source opt-in: boot succeeds on the defaults

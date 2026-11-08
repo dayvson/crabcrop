@@ -87,7 +87,7 @@ Send `Accept: application/json` with the same URL and the answer is the render's
 
 ## Features
 
-- **All major formats, in and out.** JPEG, PNG, WebP, GIF, AVIF, and JPEG XL, in and out. HEIC and HEIF decode only; SVG decodes, sanitized and rasterized. Name no format and the Accept header decides: AVIF first, then JPEG XL, then WebP. An explicit `format(...)` always wins.
+- **All major formats, in and out.** JPEG, PNG, WebP, GIF, AVIF, and JPEG XL, in and out. HEIC, HEIF, TIFF, BMP, and ICO decode only; SVG decodes, sanitized and rasterized. Name no format and the Accept header decides: AVIF first, then JPEG XL, then WebP. An explicit `format(...)` always wins.
 - **More than photos.** The source can be one frame of a video, one page of a PDF, an object in S3 or GCS, a local file, or a short `root:` reference. Originals can also arrive through the signed upload endpoint, off by default.
 - **51 filters, one chain.** Resize, crop, fit-in, and pad are their own path segments. The 51 filters chain inside one `filters:` segment, everything running in the order written.
 - **Smart crop, face safe.** The crop window finds the subject, and keeps detected faces whole instead of clipping them at the edge.
@@ -127,7 +127,7 @@ This README is the front door. The full reference lives on the website and in th
 
 Build and sign URLs from code: `@crabcrop/url` for TypeScript, `crabcrop_url` for Python, and the `crabcrop-url` Rust crate, all running the same spec test vectors, so client and server cannot drift. Loaders and integrations cover Next.js, Nuxt, Hydrogen, Astro, and SvelteKit, plus a WordPress plugin. For coding agents, a first-party MCP server exposes signing, explaining, meta, and purge over the same surface. Details in [Clients and SDKs](docs/clients.md).
 
-The server binary doubles as its own operator CLI: `crabcrop sign`, `explain`, `meta`, `purge`, `seal`, `upload`, and `convert-thumbor` run against a server (or offline, for the grammar-only verbs) with the same configuration conventions.
+The server binary doubles as its own operator CLI: `crabcrop sign`, `seal`, `unseal`, `explain`, `meta`, `purge`, `purge-group`, `upload`, and `convert-thumbor` run against a server (or offline, for the grammar-only verbs) with the same configuration conventions. Only a bare `crabcrop` starts the server; any argument runs the CLI, and one it does not know is an error. Every verb and flag is in [Command line](docs/endpoints.md#command-line).
 
 Migrating from another service: guides for [Thumbor](docs/migrating-from-thumbor.md), [imgproxy](docs/migrating-from-imgproxy.md), [Cloudinary](docs/migrating-from-cloudinary.md), [imgix](docs/migrating-from-imgix.md), [Cloudflare Images](docs/migrating-from-cloudflare-images.md), [ImageKit](docs/migrating-from-imagekit.md), and [Gumlet](docs/migrating-from-gumlet.md).
 

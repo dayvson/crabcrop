@@ -14,6 +14,12 @@
 //! text is the forecast, a walk over the operation chain
 //! in the engine's own arithmetic; it is a forecast, and
 //! the response headers say `no-store` because it is one.
+//! The chain it walks is the one the image request runs,
+//! the server's default operations merged in, because the
+//! defaults decide the output too (issue #468). The
+//! canonical form already spells them; the operation list
+//! stays the URL's own, so the report never credits the
+//! URL with a default.
 
 use crate::engine::SourceProbe;
 use crate::url::{Dimension, Filter, Operation, RequestDirectives, canonical_form, format_text};
@@ -52,8 +58,13 @@ pub struct Forecast {
     /// detected source format (JPEG when the source kind is
     /// not one the server emits).
     pub format: String,
-    /// True when `format` came from the chain itself.
+    /// True when `format` came from the URL's own operations.
     pub format_from_operation: bool,
+    /// True when `format` came from the server's default
+    /// operations instead. The merge drops a default format
+    /// whenever the URL names one, so at most one of the
+    /// two is set; neither means the source format.
+    pub format_from_default: bool,
     pub pixels: Option<u64>,
     pub over_budget: bool,
     /// True when a resize or fit-in asks for a zero pixel side
@@ -98,8 +109,17 @@ pub struct ReportInput {
     /// count it, so a large source can honestly report no
     /// size; `None` is never a partial count.
     pub source_bytes: Option<usize>,
-    /// The request's own operations, presets expanded.
+    /// The request's own operations, presets expanded: the
+    /// operation list the report shows, since they are what
+    /// the URL spells.
     pub ops: Vec<Operation>,
+    /// The operations the image request runs: the server's
+    /// default operations merged ahead of `ops` exactly as
+    /// the image path merges them
+    /// ([`crate::url::merge_default_ops`]), or `ops` again
+    /// when none are configured. The forecast walks this
+    /// list.
+    pub merged_ops: Vec<Operation>,
     pub presets: Vec<PresetEntry>,
     /// The canonical remainder (the cache key's path form;
     /// the fingerprint suffix the key carries is operator
@@ -162,15 +182,21 @@ pub fn debug_focal_remainder(ops: &[Operation], source: &str) -> Option<String> 
 }
 
 /// Walk the chain over the probed source size and settle
-/// what the output will be. The arithmetic mirrors the
-/// engine's own size resolution (DPR scaling of pixel
-/// axes, the adaptive fit-in box swap, proportional axes
-/// resolved against the running size, `no_upscale` capping
-/// resizes at the source), simplified where the engine's
-/// answer depends on decoded pixels: a step it cannot
-/// settle makes the dimensions unknown from there on,
-/// never a guess.
-fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
+/// what the output will be. `ops` is the merged chain the
+/// image request runs and `url_ops` the URL's own part of
+/// it, which tells a URL's format from a default one. The
+/// arithmetic mirrors the engine's own size resolution
+/// (DPR scaling of pixel axes, the adaptive fit-in box
+/// swap, proportional axes resolved against the running
+/// size, `no_upscale` capping resizes at the source),
+/// simplified where the engine's answer depends on decoded
+/// pixels: a step it cannot settle makes the dimensions
+/// unknown from there on, never a guess. Sizes and the
+/// pixel count saturate rather than overflow: a crop-rect
+/// takes u32 corners and each upscale multiplies the
+/// running size, so a hostile chain can pass `u64::MAX`,
+/// and a saturated count is over the budget (issue #468).
+fn forecast(ops: &[Operation], url_ops: &[Operation], probe: &SourceProbe) -> Forecast {
     let directives = RequestDirectives::analyze(ops);
     let dpr = directives.dpr.unwrap_or(1.0);
     let mut cur: Option<(u64, u64)> = probe.dimensions.map(|(w, h)| (w as u64, h as u64));
@@ -222,7 +248,8 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
                 let mut cur = cur;
                 for filter in filters {
                     if let Filter::Upscale(n) = filter {
-                        cur = cur.map(|(w, h)| (w * *n as u64, h * *n as u64));
+                        let n = *n as u64;
+                        cur = cur.map(|(w, h)| (w.saturating_mul(n), h.saturating_mul(n)));
                     }
                 }
                 cur
@@ -250,15 +277,20 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
         ),
         None => (None, None),
     };
-    let pixels = cur.map(|(w, h)| w * h);
+    let pixels = cur.map(|(w, h)| w.saturating_mul(h));
+    let url_names_format = RequestDirectives::analyze(url_ops)
+        .explicit_format
+        .is_some();
     let (format, format_from_operation) = match directives.explicit_format {
-        Some(format) => (format_text(format).to_string(), true),
+        Some(format) => (format_text(format).to_string(), url_names_format),
         None => (default_format(probe.kind).to_string(), false),
     };
+    let format_from_default = directives.explicit_format.is_some() && !url_names_format;
     Forecast {
         width,
         height,
         format,
+        format_from_default,
         format_from_operation,
         zero_side,
         over_dimension,
@@ -316,10 +348,20 @@ fn resolve_size(
     };
     match (width, height) {
         (Some(w), Some(h)) => Some((w, h)),
-        (Some(w), None) => cur.map(|(cw, ch)| (w, (ch * w / cw.max(1)).max(1))),
-        (None, Some(h)) => cur.map(|(cw, ch)| ((cw * h / ch.max(1)).max(1), h)),
+        (Some(w), None) => cur.map(|(cw, ch)| (w, proportional(ch, w, cw))),
+        (None, Some(h)) => cur.map(|(cw, ch)| (proportional(cw, h, ch), h)),
         (None, None) => cur,
     }
+}
+
+/// `axis * to / from`, the proportional axis following the
+/// other axis from `from` to `to`, never below 1. The
+/// product runs in u128 because a saturated running size
+/// times a pixel axis overflows u64; the quotient
+/// saturates (issue #468).
+fn proportional(axis: u64, to: u64, from: u64) -> u64 {
+    let scaled = axis as u128 * to as u128 / from.max(1) as u128;
+    u64::try_from(scaled).unwrap_or(u64::MAX).max(1)
 }
 
 /// The fit-in forecast: swap the box when `adaptive` and
@@ -382,7 +424,7 @@ fn source_json(input: &ReportInput) -> serde_json::Value {
 
 impl Report {
     pub fn new(input: ReportInput) -> Self {
-        let forecast = forecast(&input.ops, &input.probe);
+        let forecast = forecast(&input.merged_ops, &input.ops, &input.probe);
         let debug_focal_remainder = debug_focal_remainder(&input.ops, &input.source_url);
         Self {
             input,
@@ -428,7 +470,13 @@ impl Report {
                 "width": self.forecast.width,
                 "height": self.forecast.height,
                 "format": self.forecast.format,
-                "format_from": if self.forecast.format_from_operation { "operation" } else { "source" },
+                "format_from": if self.forecast.format_from_operation {
+                    "operation"
+                } else if self.forecast.format_from_default {
+                    "default"
+                } else {
+                    "source"
+                },
                 "pixels": self.forecast.pixels,
                 "pixel_budget": crate::engine::MAX_OUTPUT_PIXELS,
                 "over_budget": self.forecast.over_budget,
@@ -543,6 +591,8 @@ impl Report {
             escape_html(&self.forecast.format),
             if self.forecast.format_from_operation {
                 "from the URL"
+            } else if self.forecast.format_from_default {
+                "from the server's default operations"
             } else {
                 "the source format by default; Accept negotiation may change it"
             }
@@ -646,7 +696,16 @@ mod tests {
     use crate::url::parse_operations_with_expiry;
 
     fn report_for(remainder: &str, probe: SourceProbe) -> Report {
+        report_with_defaults("", remainder, probe)
+    }
+
+    /// A report on a server whose `CRABCROP_DEFAULT_OPS` is
+    /// `defaults`, merged the way the handler merges them.
+    fn report_with_defaults(defaults: &str, remainder: &str, probe: SourceProbe) -> Report {
+        let defaults =
+            crate::url::parse_default_ops(defaults, &std::collections::HashMap::new()).unwrap();
         let (ops, source, expiry, _) = parse_operations_with_expiry(remainder).unwrap();
+        let merged_ops = crate::url::merge_default_ops(&defaults, ops.clone());
         Report::new(ReportInput {
             signed: true,
             key_id: None,
@@ -657,9 +716,10 @@ mod tests {
             probe,
             source_bytes: Some(412_000),
             presets: Vec::new(),
-            canonical: crate::url::canonical_form(&ops, source),
+            canonical: crate::url::canonical_form(&merged_ops, source),
             cache_group: None,
             image_path: format!("/sig/{remainder}"),
+            merged_ops,
             ops,
         })
     }
@@ -871,6 +931,7 @@ mod tests {
             canonical: crate::url::canonical_form(&ops, source),
             cache_group: None,
             image_path: "/sig/100x50/https://example.com/photo.jpg".to_string(),
+            merged_ops: ops.clone(),
             ops,
         });
         let json = report.to_json();
@@ -897,6 +958,7 @@ mod tests {
             canonical: crate::url::canonical_form(&ops, source),
             cache_group: None,
             image_path: "/sig/100x50/root:photos/cat.jpg".to_string(),
+            merged_ops: ops.clone(),
             ops,
         });
         let json = report.to_json();
@@ -930,6 +992,7 @@ mod tests {
             canonical: crate::url::canonical_form(&ops, source),
             cache_group: Some("\"><script>alert(2)</script>".to_string()),
             image_path: "/sig/100x50/https://example.com/a&lt;b.png".to_string(),
+            merged_ops: ops.clone(),
             ops,
         };
         input.source_url = "https://example.com/<script>alert(3)</script>.png".to_string();
@@ -966,6 +1029,128 @@ mod tests {
         assert_eq!(
             escape_html("<a href=\"x\">&'</a>"),
             "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;"
+        );
+    }
+
+    #[test]
+    fn hostile_chains_saturate_and_report_over_budget() {
+        // The walk multiplies u64 sizes, and crop-rect takes
+        // u32 corners (issue #468). The first chain overflows
+        // the pixel count; the second wraps it to exactly
+        // zero in a build without overflow checks, which read
+        // as under the budget. A saturated count is over the
+        // budget, so both report it, and neither panics.
+        let corner = "crop-rect:0x0:4294967295x4294967295";
+        let sixteen = vec!["upscale(4)"; 16].join(":");
+        for remainder in [
+            format!("{corner}/filters:upscale(2)"),
+            format!("{corner}/filters:{sixteen}"),
+            format!("filters:{sixteen}:{sixteen}:{sixteen}"),
+        ] {
+            let report = report_for(
+                &format!("{remainder}/https://example.com/photo.jpg"),
+                png_probe(),
+            );
+            assert_eq!(report.forecast.pixels, Some(u64::MAX), "{remainder}");
+            assert!(report.forecast.over_budget, "{remainder}");
+            assert_eq!(report.forecast.width, Some(u32::MAX), "{remainder}");
+            assert_eq!(report.forecast.height, Some(u32::MAX), "{remainder}");
+            assert_eq!(report.to_json()["forecast"]["over_budget"], true);
+            assert!(report.to_html().contains("over the budget"));
+        }
+        // A proportional resize after a saturated size
+        // scales in wide arithmetic rather than overflowing,
+        // and lands on the size it names.
+        for remainder in [
+            format!("filters:{sixteen}:{sixteen}:{sixteen}/100x0"),
+            format!("filters:{sixteen}:{sixteen}:{sixteen}/0x100"),
+            format!("{corner}/filters:{sixteen}/100x0"),
+        ] {
+            let report = report_for(
+                &format!("{remainder}/https://example.com/photo.jpg"),
+                png_probe(),
+            );
+            assert_eq!(
+                (report.forecast.width, report.forecast.height),
+                (Some(100), Some(100)),
+                "{remainder}"
+            );
+            assert!(!report.forecast.over_budget, "{remainder}");
+        }
+    }
+
+    #[test]
+    fn forecast_walks_the_default_operations() {
+        // A default format decides the output when the URL
+        // names none, and the report says so instead of
+        // crediting the URL or the source (issue #468). A
+        // default DPR scales the forecast like the engine.
+        let report = report_with_defaults(
+            "filters:format(webp):dpr(2)",
+            "100x0/https://example.com/photo.jpg",
+            png_probe(),
+        );
+        assert_eq!(report.forecast.format, "webp");
+        assert!(report.forecast.format_from_default);
+        assert!(!report.forecast.format_from_operation);
+        assert_eq!(
+            (report.forecast.width, report.forecast.height),
+            (Some(200), Some(133))
+        );
+        let json = report.to_json();
+        assert_eq!(json["forecast"]["format_from"], "default");
+        // The operation list is the URL's own; the defaults
+        // show in the canonical form only.
+        assert_eq!(json["operations"].as_array().unwrap().len(), 1);
+        assert_eq!(json["operations"][0]["segment"], "100x0");
+        assert_eq!(
+            json["canonical"],
+            "filters:format(webp):dpr(2)/100x0/https://example.com/photo.jpg"
+        );
+        let html = report.to_html();
+        assert!(
+            html.contains("<li>Format: webp (from the server's default operations)</li>"),
+            "{html}"
+        );
+
+        // The URL's own format wins, and the report credits it.
+        let report = report_with_defaults(
+            "filters:format(webp)",
+            "100x0/filters:format(avif)/https://example.com/photo.jpg",
+            png_probe(),
+        );
+        assert_eq!(report.forecast.format, "avif");
+        assert!(report.forecast.format_from_operation);
+        assert!(!report.forecast.format_from_default);
+        assert_eq!(report.to_json()["forecast"]["format_from"], "operation");
+
+        // Defaults that name no format leave it to the source.
+        let report = report_with_defaults(
+            "filters:quality(80)",
+            "100x0/https://example.com/photo.jpg",
+            png_probe(),
+        );
+        assert_eq!(report.forecast.format, "png");
+        assert!(!report.forecast.format_from_operation);
+        assert!(!report.forecast.format_from_default);
+        assert_eq!(report.to_json()["forecast"]["format_from"], "source");
+
+        // The debug view is a remainder to sign, and the
+        // image path merges the defaults into it again, so
+        // it keeps to the URL's own operations while the
+        // canonical form carries the defaults.
+        let report = report_with_defaults(
+            "filters:format(webp):dpr(2)",
+            "crop:100x100/https://example.com/photo.jpg",
+            png_probe(),
+        );
+        assert_eq!(
+            report.debug_focal_remainder.as_deref(),
+            Some("debug:focal/crop:100x100/https://example.com/photo.jpg")
+        );
+        assert_eq!(
+            report.to_json()["canonical"],
+            "filters:format(webp):dpr(2)/crop:100x100/https://example.com/photo.jpg"
         );
     }
 }

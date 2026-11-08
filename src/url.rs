@@ -3424,40 +3424,20 @@ pub fn canonical_form(ops: &[Operation], source: &str) -> String {
     }
 }
 
-/// The cache key for a remainder: its canonical form.
-/// Remainders that do not parse (purge targets naming
-/// presets are expanded by the purge handler's own path;
-/// opaque strings) fall back to the expiry-stripped
-/// textual form.
+/// The cache key for a remainder: its canonical form, which
+/// drops every `exp:` and `maxage:` segment (audit P-2). Both
+/// are per-request metadata enforced or applied outside the
+/// stored entry (expiry before lookup, the cache lifetime on
+/// the response), so neither may fragment the cache or
+/// shield entries from purges. A remainder that does not
+/// parse passes through unchanged: the parse is what finds
+/// where the source starts, so without it no segment can be
+/// told apart from source text, and no stored entry is keyed
+/// on an unparseable remainder for the text to reach.
 pub fn canonical_key_form(remainder: &str) -> String {
     match parse_operations_with_expiry(remainder) {
         Ok((ops, source, _, _)) => canonical_form(&ops, source),
-        Err(_) => cache_key_form(remainder),
-    }
-}
-
-/// The cache-key form of an expanded remainder: identical,
-/// except every `exp:` and `maxage:` segment is removed (audit
-/// P-2). Both are per-request metadata enforced or applied
-/// outside the stored entry (expiry before lookup, the cache
-/// lifetime on the response), so neither may fragment the
-/// cache or shield entries from purges. Unparseable remainders
-/// pass through unchanged.
-pub fn cache_key_form(remainder: &str) -> String {
-    let Ok((_, source)) = parse_operations(remainder) else {
-        return remainder.to_string();
-    };
-    let Some(ops_part) = remainder.strip_suffix(source) else {
-        return remainder.to_string();
-    };
-    let kept: Vec<&str> = ops_part
-        .split('/')
-        .filter(|seg| !seg.is_empty() && !seg.starts_with("exp:") && !seg.starts_with("maxage:"))
-        .collect();
-    if kept.is_empty() {
-        source.to_string()
-    } else {
-        format!("{}/{source}", kept.join("/"))
+        Err(_) => remainder.to_string(),
     }
 }
 
@@ -3926,37 +3906,71 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_form_strips_expiry_segments() {
+    fn canonical_key_form_strips_expiry_segments() {
         let src = "https://example.com/a.jpg";
         assert_eq!(
-            cache_key_form(&format!("exp:1893456000/300x200/{src}")),
+            canonical_key_form(&format!("exp:1893456000/300x200/{src}")),
             format!("300x200/{src}")
         );
         assert_eq!(
-            cache_key_form(&format!("300x200/exp:1893456000/{src}")),
+            canonical_key_form(&format!("300x200/exp:1893456000/{src}")),
             format!("300x200/{src}")
         );
-        assert_eq!(cache_key_form(&format!("exp:1893456000/{src}")), src);
+        assert_eq!(canonical_key_form(&format!("exp:1893456000/{src}")), src);
         assert_eq!(
-            cache_key_form(&format!("300x200/{src}")),
+            canonical_key_form(&format!("300x200/{src}")),
             format!("300x200/{src}")
         );
         // An exp: segment inside the source is URL text, kept.
         let tricky = "https://example.com/exp:123/a.jpg";
-        assert_eq!(cache_key_form(tricky), tricky);
+        assert_eq!(canonical_key_form(tricky), tricky);
         // maxage: is per-request metadata too: stripped wherever
         // it sits among the operations, kept inside the source.
         assert_eq!(
-            cache_key_form(&format!("maxage:60/300x200/{src}")),
+            canonical_key_form(&format!("maxage:60/300x200/{src}")),
             format!("300x200/{src}")
         );
         assert_eq!(
-            cache_key_form(&format!("300x200/maxage:60/{src}")),
+            canonical_key_form(&format!("300x200/maxage:60/{src}")),
             format!("300x200/{src}")
         );
-        assert_eq!(cache_key_form(&format!("maxage:60/{src}")), src);
+        assert_eq!(canonical_key_form(&format!("maxage:60/{src}")), src);
         let tricky = "https://example.com/maxage:60/a.jpg";
-        assert_eq!(cache_key_form(tricky), tricky);
+        assert_eq!(canonical_key_form(tricky), tricky);
+    }
+
+    #[test]
+    fn canonical_key_form_passes_unparseable_remainders_through() {
+        // A remainder that does not parse keys as itself,
+        // byte for byte, and stays a fixed point: no source
+        // boundary is known, so no segment is stripped, not
+        // even a well-formed `exp:` or `maxage:` ahead of the
+        // failing one. Purge targets are caller text, so the
+        // set is hostile: malformed metadata, a bad operation
+        // argument, a missing source, an empty remainder, a
+        // long run of segments.
+        let long = format!("{}filters:blur(x)/a.jpg", "exp:1/".repeat(10_000));
+        let cases = [
+            "".to_string(),
+            "/".to_string(),
+            "exp:/300x200/https://example.com/a.jpg".to_string(),
+            "exp:12x/300x200/https://example.com/a.jpg".to_string(),
+            "maxage:99999999999/https://example.com/a.jpg".to_string(),
+            "exp:1893456000/maxage:60/maxage:/https://example.com/a.jpg".to_string(),
+            "exp:1893456000/300x200/".to_string(),
+            "maxage:60/300x200/filters:blur(nope)/https://example.com/a.jpg".to_string(),
+            "exp:99999999999999999999999/https://example.com/a.jpg".to_string(),
+            long,
+        ];
+        for remainder in &cases {
+            assert!(
+                parse_operations_with_expiry(remainder).is_err(),
+                "the case must not parse: {remainder:.80}"
+            );
+            let key = canonical_key_form(remainder);
+            assert_eq!(&key, remainder, "an unparseable remainder keys as itself");
+            assert_eq!(canonical_key_form(&key), key, "the key is a fixed point");
+        }
     }
 
     #[test]

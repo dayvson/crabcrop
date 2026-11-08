@@ -821,6 +821,13 @@ async fn explain_handle(
             Ok(v) => v,
             Err(e) => return parse_failure(&e, accept.as_deref()),
         };
+    // Server-wide defaults merge here, once, exactly as the
+    // image path merges them: the admission, the canonical
+    // form, and the forecast all follow the list the image
+    // request runs (issue #468). The report's operation
+    // list stays `ops`, the URL's own, so it never credits
+    // the URL with a default.
+    let merged = crate::url::merge_default_ops(&state.default_ops, ops.clone());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -847,10 +854,10 @@ async fn explain_handle(
     // either tool: the fetch is admitted, the probe stays
     // the raw-bytes probe.
     let admission = crate::loader::MediaAdmission {
-        video: ops
+        video: merged
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Frame(_))),
-        pdf: ops
+        pdf: merged
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Page(_))),
     };
@@ -884,18 +891,14 @@ async fn explain_handle(
         presets.push(crate::explain::preset_entry(name, &entry_ops));
     }
 
-    // The canonical form is the cache key's path form,
-    // defaults merged exactly as the image path merges
-    // them for its key. The key's config fingerprint
-    // suffix is operator state and stays unreported. For a
-    // root source the form is built from the source as
-    // written: the key itself is keyed on the expansion,
-    // but printing that here would publish the root's
-    // base URL into the report.
-    let canonical = crate::url::canonical_form(
-        &crate::url::merge_default_ops(&state.default_ops, ops.clone()),
-        source_url,
-    );
+    // The canonical form is the cache key's path form, of
+    // the merged list as the image path keys it. The key's
+    // config fingerprint suffix is operator state and stays
+    // unreported. For a root source the form is built from
+    // the source as written: the key itself is keyed on the
+    // expansion, but printing that here would publish the
+    // root's base URL into the report.
+    let canonical = crate::url::canonical_form(&merged, source_url);
     let report = crate::explain::Report::new(crate::explain::ReportInput {
         signed: !matches!(signature, crate::url::Signature::Unsafe),
         key_id,
@@ -906,6 +909,7 @@ async fn explain_handle(
         probe,
         source_bytes: fetched.total_bytes.map(|n| n as usize),
         ops,
+        merged_ops: merged,
         presets,
         canonical,
         cache_group: groups.into_iter().next(),
@@ -950,32 +954,125 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
 /// grow with the whole bucket. A walk that outgrows the
 /// budget finishes in a background task and logs its own
 /// count on completion. Correctness does not wait for
-/// it: the tombstone keeps writes begun before the purge
-/// out (issue #350), and the purge stays active until
-/// the walk ends, so a lookup that overlaps the walk
-/// treats a copy the purge covers as a miss (issue #400).
+/// it: the generation tombstone keeps writes begun before
+/// the purge out (issue #350), and the purge's stamped
+/// tombstone, here and in the bucket, makes every copy
+/// written before the purge began a miss on every replica
+/// until the walk has removed it (issues #400, #461).
 const SHARED_PURGE_INLINE_SCAN: usize = 128;
 
-/// Queue the un-scanned remainder of a bounded shared
-/// purge, if any, on a background task (issue #368). The
-/// purge stays active until that task finishes; with
-/// nothing left to walk it ends here.
-fn spawn_shared_purge_rest(
+/// How often a replica re-reads the purge tombstones in the
+/// shared bucket (issue #461): the longest another replica's
+/// purge can take to reach this one's lookups.
+const TOMBSTONE_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Start a purge of `target`: record it in this process's
+/// guard and, with a shared tier, as a tombstone in the
+/// bucket (issue #461), before any tier is touched. The
+/// bucket record is what keeps the purge effective on
+/// other replicas, and on this one after a restart, while
+/// its walk runs. Returns the running purge and the
+/// tombstone's object name, `None` when there is no shared
+/// tier or the write failed (counted and logged by the
+/// store; the purge then holds on this process only).
+async fn begin_purge(
+    state: &AppState,
+    target: crate::cache::PurgeTarget,
+) -> (crate::cache::ActivePurge, Option<String>) {
+    let active = state.purge_guard.begin(target);
+    let tombstone = match &state.shared_store {
+        Some(shared) => {
+            shared
+                .put_tombstone(active.tombstone(), active.sequence())
+                .await
+        }
+        None => None,
+    };
+    (active, tombstone)
+}
+
+/// The shared tier's half of a purge (issues #368, #446):
+/// remove the covered copies written before the purge
+/// began, scanning at most [`SHARED_PURGE_INLINE_SCAN`]
+/// objects inline and queueing the remainder, if any, on a
+/// background task. The purge stays running until its walk
+/// ends, then its tombstone is marked ended (see
+/// [`end_purge`]). Returns what the inline part removed.
+async fn purge_shared_tier(
     shared: &Arc<crate::s3store::S3Store>,
-    pending: Option<crate::s3store::PendingPurge>,
     active: crate::cache::ActivePurge,
+    tombstone: Option<String>,
+    epoch_base: Option<String>,
     event: &'static str,
-    target: &str,
-) {
-    if let Some(pending) = pending {
-        let shared = shared.clone();
-        let target = target.to_string();
-        tokio::spawn(async move {
-            let removed = shared.finish_purge(pending).await;
-            drop(active);
-            purge_log(event, &target, Some(removed));
-        });
+    log_target: &str,
+) -> usize {
+    let target = active.tombstone().target.clone();
+    let cutoff = active.tombstone().cutoff;
+    let (removed, pending) = shared
+        .purge_bounded(
+            &target,
+            epoch_base.as_deref(),
+            cutoff,
+            SHARED_PURGE_INLINE_SCAN,
+        )
+        .await;
+    match pending {
+        Some(pending) => {
+            let shared = shared.clone();
+            let log_target = log_target.to_string();
+            tokio::spawn(async move {
+                let removed = shared.finish_purge(pending).await;
+                end_purge(&shared, active, tombstone).await;
+                purge_log(event, &log_target, Some(removed));
+            });
+        }
+        None => end_purge(shared, active, tombstone).await,
     }
+    removed
+}
+
+/// End a purge whose shared walk is done (issue #461):
+/// rewrite its bucket tombstone with the walk's end, from
+/// which every replica counts the grace period down and
+/// then collects it, and end the purge in this process,
+/// where its tombstone likewise outlives it for the grace.
+/// A tombstone that is never marked (the process stopped
+/// mid-walk) stays in force until a later purge of the same
+/// target finishes its walk.
+async fn end_purge(
+    shared: &crate::s3store::S3Store,
+    active: crate::cache::ActivePurge,
+    tombstone: Option<String>,
+) {
+    if let Some(object) = tombstone {
+        let mut ended = active.tombstone().clone();
+        ended.ended_ms = Some(crate::cache::now_ms());
+        shared.write_tombstone(&object, &ended).await;
+    }
+    drop(active);
+}
+
+/// Load the shared bucket's purge tombstones before serving
+/// (issue #461), then keep them fresh every
+/// `TOMBSTONE_REFRESH` on one background task. Without a
+/// shared tier there is nothing to read. A failed boot read
+/// is counted and logged, and the refresher retries: the
+/// tier stays best-effort, like every other shared read.
+pub async fn start_purge_tombstones(state: &AppState) {
+    let Some(shared) = state.shared_store.clone() else {
+        return;
+    };
+    shared.refresh_tombstones(&state.purge_guard).await;
+    let guard = state.purge_guard.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(TOMBSTONE_REFRESH);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            shared.refresh_tombstones(&guard).await;
+        }
+    });
 }
 
 /// One structured line per purge request (audit PL-8): the
@@ -1125,14 +1222,17 @@ async fn purge_handle(
     let task_state = state.clone();
     let task_target = target.to_string();
     let removed = tokio::spawn(async move {
-        // The tombstone lands before any tier is touched
-        // (issue #350): a write begun before this purge can
-        // then see it whenever it tries to land, including
-        // after this handler has finished. The purge stays
-        // active until the shared walk ends (issue #400).
-        let active = task_state
-            .purge_guard
-            .begin(crate::cache::PurgeTarget::Key(key_form.clone()));
+        // The tombstones land before any tier is touched
+        // (issues #350, #461): a write begun before this
+        // purge can then see it whenever it tries to land,
+        // including after this handler has finished, and
+        // every replica treats the copies it covers as
+        // purged until the shared walk ends (issue #400).
+        let (active, tombstone) = begin_purge(
+            &task_state,
+            crate::cache::PurgeTarget::Key(key_form.clone()),
+        )
+        .await;
         let mut removed = task_state.cache.purge_matching(&key_form);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1149,11 +1249,15 @@ async fn purge_handle(
             // its matching walk, which also reaches older
             // epochs and hint-variant spellings.
             let epoch_form = format!("{key_form}#cfg{}", task_state.config_fingerprint);
-            let (walked, pending) = shared
-                .purge_matching_bounded(&key_form, &epoch_form, SHARED_PURGE_INLINE_SCAN)
-                .await;
-            removed += walked;
-            spawn_shared_purge_rest(shared, pending, active, "purge", &task_target);
+            removed += purge_shared_tier(
+                shared,
+                active,
+                tombstone,
+                Some(epoch_form),
+                "purge",
+                &task_target,
+            )
+            .await;
         }
         task_state.metrics.record_purge();
         purge_log("purge", &task_target, Some(removed));
@@ -1233,11 +1337,10 @@ async fn purge_group_handle(
     let task_target = target.clone();
     let group = group.to_string();
     let removed = tokio::spawn(async move {
-        // Tombstone first, tiers second (issue #350), as in
-        // the per-URL purge.
-        let active = task_state
-            .purge_guard
-            .begin(crate::cache::PurgeTarget::Group(group.clone()));
+        // Tombstones first, tiers second (issues #350,
+        // #461), as in the per-URL purge.
+        let (active, tombstone) =
+            begin_purge(&task_state, crate::cache::PurgeTarget::Group(group.clone())).await;
         let mut removed = task_state.cache.purge_group(&group);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1248,11 +1351,9 @@ async fn purge_group_handle(
                 .unwrap_or(0);
         }
         if let Some(shared) = &task_state.shared_store {
-            let (walked, pending) = shared
-                .purge_group_bounded(&group, SHARED_PURGE_INLINE_SCAN)
-                .await;
-            removed += walked;
-            spawn_shared_purge_rest(shared, pending, active, "purge-group", &task_target);
+            removed +=
+                purge_shared_tier(shared, active, tombstone, None, "purge-group", &task_target)
+                    .await;
         }
         task_state.metrics.record_purge();
         purge_log("purge-group", &task_target, Some(removed));
@@ -1368,11 +1469,13 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
     let task_state = state.clone();
     let source = source.to_string();
     tokio::spawn(async move {
-        // Tombstone first, tiers second (issue #350), as in
-        // the per-URL purge.
-        let active = task_state
-            .purge_guard
-            .begin(crate::cache::PurgeTarget::Source(source.clone()));
+        // Tombstones first, tiers second (issues #350,
+        // #461), as in the per-URL purge.
+        let (active, tombstone) = begin_purge(
+            &task_state,
+            crate::cache::PurgeTarget::Source(source.clone()),
+        )
+        .await;
         let mut removed = task_state.cache.purge_source(&source);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1383,11 +1486,8 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
                 .unwrap_or(0);
         }
         if let Some(shared) = &task_state.shared_store {
-            let (walked, pending) = shared
-                .purge_source_bounded(&source, SHARED_PURGE_INLINE_SCAN)
-                .await;
-            removed += walked;
-            spawn_shared_purge_rest(shared, pending, active, "purge-source", &source);
+            removed +=
+                purge_shared_tier(shared, active, tombstone, None, "purge-source", &source).await;
         }
         purge_log("purge-source", &source, Some(removed));
         removed
@@ -2519,12 +2619,16 @@ async fn share_response(response: Response, cap: usize) -> (Response, Option<Sha
 /// answer.
 const MAX_FLIGHT_WAITS: u32 = 3;
 
-/// Whether a purge recorded after `snapshot` covers
-/// `entry` (issue #350): the write that carries this
-/// snapshot began before that purge, so its result must
-/// not stand in any tier.
+/// Whether `entry` must not stand in any tier: a purge
+/// recorded after `snapshot` covers it, so the write that
+/// carries the snapshot began before that purge (issue
+/// #350), or a live tombstone covers the copy by its stamp,
+/// as when it was rendered before another replica's purge
+/// began (issue #461).
 fn write_is_stale(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) -> bool {
-    state.purge_guard.purge_covers(snapshot, key, &entry.groups)
+    state
+        .purge_guard
+        .write_covered(snapshot, key, &entry.groups, entry.written)
 }
 
 /// Store `entry` in the memory tier under the purge
@@ -2533,8 +2637,9 @@ fn write_is_stale(state: &AppState, snapshot: u64, key: &str, entry: &CachedImag
 /// the write is in flight is reconciled right after: the
 /// entry just written is removed again, so the purge
 /// wins however the two interleave. The removal matches
-/// on the entry's ETag, so an entry a fresher write has
-/// already replaced under the same key is left alone.
+/// on the entry's ETag and stamp, so an entry a fresher
+/// write has already replaced under the same key is left
+/// alone.
 fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
     if write_is_stale(state, snapshot, key, entry) {
         return;
@@ -2544,7 +2649,7 @@ fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedIma
         && state
             .cache
             .get(key)
-            .is_some_and(|held| held.etag == entry.etag)
+            .is_some_and(|held| crate::cache::same_copy(&held, entry))
     {
         state.cache.remove(key);
     }
@@ -2555,9 +2660,9 @@ fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedIma
 /// recorded after `snapshot` covers the entry and the
 /// disk tier still holds this exact copy, remove it, so
 /// the copy the write or merge just made is not left
-/// behind for the purge to miss. The ETag match leaves
-/// alone an entry a fresher write has already replaced
-/// under the same key.
+/// behind for the purge to miss. The ETag and stamp match
+/// leaves alone an entry a fresher write has already
+/// replaced under the same key.
 fn reconcile_disk(
     store: &crate::storage::DiskStore,
     guard: &crate::cache::PurgeGuard,
@@ -2565,8 +2670,10 @@ fn reconcile_disk(
     key: &str,
     entry: &CachedImage,
 ) {
-    if guard.purge_covers(snapshot, key, &entry.groups)
-        && store.get(key).is_some_and(|held| held.etag == entry.etag)
+    if guard.write_covered(snapshot, key, &entry.groups, entry.written)
+        && store
+            .get(key)
+            .is_some_and(|held| crate::cache::same_copy(&held, entry))
     {
         store.remove(key);
     }
@@ -2588,7 +2695,7 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
     let entry = entry.clone();
     let _ = store
         .blocking(move |store| {
-            if guard.purge_covers(snapshot, &key, &entry.groups) {
+            if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
                 return;
             }
             store.put(&key, &entry);
@@ -2602,7 +2709,9 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
 /// same skip-and-reconcile discipline as the local
 /// tiers, applied inside the spawned task, because the
 /// purge it must lose to can land at any point during
-/// the network write.
+/// the network write. The reconcile deletes only the
+/// object it read back (issue #446), so a fresher render
+/// that replaced it meanwhile stays.
 fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedImage) {
     let Some(shared) = &state.shared_store else {
         return;
@@ -2611,17 +2720,15 @@ fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedIma
     let shared = shared.clone();
     let key = key.to_string();
     tokio::spawn(async move {
-        if guard.purge_covers(snapshot, &key, &entry.groups) {
+        if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
             return;
         }
         shared.put(&key, &entry).await;
-        if guard.purge_covers(snapshot, &key, &entry.groups)
-            && shared
-                .get(&key)
-                .await
-                .is_some_and(|held| held.etag == entry.etag)
+        if guard.write_covered(snapshot, &key, &entry.groups, entry.written)
+            && let Some((held, etag)) = shared.get_tagged(&key).await
+            && crate::cache::same_copy(&held, &entry)
         {
-            shared.remove(&key).await;
+            shared.remove_if_match(&key, etag.as_deref()).await;
         }
     });
 }
@@ -2641,12 +2748,15 @@ fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedIma
 /// purge. Every write this chain makes (promotions,
 /// merge write-backs) runs under the purge guard, under
 /// the generation the lookup started with. A disk or
-/// shared copy that a purge covers is a miss, and is
-/// deleted on sight, when that purge was running at any
-/// point since the lookup began (issue #400): the purge
-/// may not have reached the copy when it was read, and
-/// serving or promoting it would outlive the purge. The
-/// memory tier needs no such check: a purge empties it
+/// shared copy is a miss, and is deleted on sight, when a
+/// live tombstone covers it: a purge, begun here or read
+/// from the shared bucket, that is still running or within
+/// its grace, and that began after the copy was written
+/// (issues #400, #446, #461). The purge may not have
+/// reached such a copy yet, and serving or promoting it
+/// would outlive the purge; a copy rendered after the
+/// purge began serves normally. The memory tier needs no
+/// such check: a purge empties this process's memory
 /// before any slower tier, and every way back in is a
 /// promotion through this chain or a guarded write.
 /// Returns the image and the `Cache-Status` value for
@@ -2718,16 +2828,18 @@ async fn lookup_tiers(
         }
     }
     if let Some(shared) = &state.shared_store
-        && let Some(mut image) = shared.get(cache_key).await
+        && let Some((mut image, etag)) = shared.get_tagged(cache_key).await
     {
-        // Checked after the read, against purges running at
-        // any point since the snapshot: a walk can delete
-        // this object and end while its bytes are in flight.
+        // Checked after the read: a walk can delete this
+        // object and end while its bytes are in flight, and
+        // an ended purge's tombstone still covers the copy.
+        // The delete is conditional on the copy read, so a
+        // fresh render that replaced it meanwhile stays.
         if state
             .purge_guard
-            .running_covers(snapshot, cache_key, &image.groups)
+            .running_covers(cache_key, &image.groups, image.written)
         {
-            shared.remove(cache_key).await;
+            shared.remove_if_match(cache_key, etag.as_deref()).await;
             return None;
         }
         if !groups.is_empty() {
@@ -2770,10 +2882,10 @@ async fn lookup_disk_tier(
     let (image, grew) = store
         .blocking(move |store| {
             let mut image = store.get(&key)?;
-            if guard.running_covers(snapshot, &key, &image.groups) {
-                // A purge running since the lookup began
-                // covers this copy (issue #400): drop it
-                // rather than serve and promote it.
+            if guard.running_covers(&key, &image.groups, image.written) {
+                // A live tombstone covers this copy (issues
+                // #400, #461): drop it rather than serve and
+                // promote it.
                 store.remove(&key);
                 return None;
             }
@@ -2862,6 +2974,12 @@ async fn serve_miss(
     // lands while the render runs must not be undone by
     // the population writes at its end.
     let write_snapshot = state.purge_guard.snapshot();
+    // Its write stamp (issues #446, #461), taken after the
+    // snapshot: a purge that begins after this point covers
+    // the copies this render writes (it may read the old
+    // source), and one that began before it does not, so
+    // they outlive that purge's walk.
+    let write_stamp = state.purge_guard.stamp();
     let MissWork {
         ops,
         source_url,
@@ -3348,6 +3466,7 @@ async fn serve_miss(
             quality: processed.quality,
             groups: groups.clone(),
             etag: render_etag.clone(),
+            written: Some(write_stamp),
         };
         // Population runs under the purge guard (issue
         // #350): a purge that landed while this render was
@@ -3364,13 +3483,6 @@ async fn serve_miss(
         put_disk_tier(state, write_snapshot, &cache_key, &entry).await;
     }
     record.bytes_out = processed.bytes.len();
-    // The render's AI permit drained with its job:
-    // run_process holds it until the work finishes, which
-    // on this success path has already happened, so the
-    // gate is free and the annotation paths acquire it per
-    // section like any other request. (The request's own
-    // AI permit does not outlive the run, audit R2-29.)
-    let ai_gated = false;
     // The annotation sections share one deadline, the
     // same process budget the render ran under: a
     // section that has not answered when it passes is
@@ -3385,7 +3497,7 @@ async fn serve_miss(
     let annotation = if meta {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(annotation_deadline),
-            annotate_meta(state, &processed, ai_gated),
+            annotate_meta(state, &processed),
         )
         .await
         .ok()
@@ -3396,7 +3508,7 @@ async fn serve_miss(
     let detections = if meta && wants_detections(accept) {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(annotation_deadline),
-            detect_meta(state, &processed, ai_gated),
+            detect_meta(state, &processed),
         )
         .await
         .ok()
@@ -3408,7 +3520,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                moderate_meta(state, &processed, ai_gated),
+                moderate_meta(state, &processed),
             )
             .await
             {
@@ -3428,7 +3540,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                embed_meta(state, &processed, ai_gated),
+                embed_meta(state, &processed),
             )
             .await
             {
@@ -3444,7 +3556,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                ocr_meta(state, &processed, ai_gated, annotation_deadline),
+                ocr_meta(state, &processed, annotation_deadline),
             )
             .await
             {
