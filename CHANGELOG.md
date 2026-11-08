@@ -8,6 +8,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Release runs check the approval gate and CI before they build, and adopt a release that already exists (issue #457). A new preflight job stops a tag run unless the `release` environment has a Required reviewers rule and the tagged commit passed `rust.yml` on main. The host job updates an existing release for the tag instead of failing on it, which every tag run from v0.9.8 to v0.9.11 did on its first attempt. The one-off `mcp-publish-v010.yml` workflow is gone.
 
+- The TypeScript SDK's `explainUrl` and `ops.cropObjects`, and the playground's explainer, fold repeated `objects(...)` class names ASCII-only, as the server does (issue #482). `É` and `é` (or `K` and the Kelvin sign) are two classes, so a list that reaches 33 distinct classes that way is now refused instead of passing the SDK and failing on the server with `400 invalid_crop`, and a shorter list keeps both spellings, as the server's canonical form does. The playground's explainer is now a generated build of the SDK's own, so its `studio(...)` description matches the SDK's.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added
