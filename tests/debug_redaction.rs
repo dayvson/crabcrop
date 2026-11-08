@@ -46,29 +46,37 @@ fn secrets() -> Vec<Vec<u8>> {
     all
 }
 
-/// Fail if `rendered` carries any secret as text, as the
-/// decimal byte list a derived `Debug` prints for a
-/// `Vec<u8>`, or as hex; and require the redaction marker,
-/// so an empty rendering cannot pass.
-fn assert_redacted(what: &str, rendered: &str) {
+/// The first secret `rendered` carries, if any: as text, as
+/// the decimal byte list a derived `Debug` prints for a
+/// `Vec<u8>`, or as hex. The byte list is matched with
+/// whitespace ignored, because `{:#?}` (what `dbg!` prints)
+/// puts each byte on its own line.
+fn leak(rendered: &str) -> Option<String> {
+    let compact: String = rendered.split_whitespace().collect();
     for secret in secrets() {
-        if let Ok(text) = std::str::from_utf8(&secret) {
-            assert!(
-                !rendered.contains(text),
-                "{what} leaks {text:?}: {rendered}"
-            );
+        if let Ok(text) = std::str::from_utf8(&secret)
+            && rendered.contains(text)
+        {
+            return Some(format!("{text:?}"));
         }
-        let decimal = format!("{secret:?}");
+        let decimal: String = format!("{secret:?}").split_whitespace().collect();
         let decimal = decimal.trim_start_matches('[').trim_end_matches(']');
-        assert!(
-            !rendered.contains(decimal),
-            "{what} leaks the bytes {decimal}: {rendered}"
-        );
+        if compact.contains(decimal) {
+            return Some(format!("the bytes {decimal}"));
+        }
         let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
-        assert!(
-            !rendered.contains(&hex),
-            "{what} leaks the hex {hex}: {rendered}"
-        );
+        if rendered.contains(&hex) {
+            return Some(format!("the hex {hex}"));
+        }
+    }
+    None
+}
+
+/// Fail if `rendered` carries any secret, and require the
+/// redaction marker, so an empty rendering cannot pass.
+fn assert_redacted(what: &str, rendered: &str) {
+    if let Some(leak) = leak(rendered) {
+        panic!("{what} leaks {leak}: {rendered}");
     }
     assert!(
         rendered.contains("[redacted]"),
@@ -197,6 +205,16 @@ fn state(dir: &std::path::Path) -> AppState {
 fn debug_output_names_each_secret_holder_without_its_secrets() {
     let dir = std::env::temp_dir().join(format!("crabcrop-debug-redaction-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+
+    // The detector itself: what a derived `Debug` prints
+    // for each secret, compact or pretty, is caught.
+    for secret in secrets() {
+        assert!(leak(&format!("{secret:?}")).is_some());
+        assert!(leak(&format!("{secret:#?}")).is_some());
+        if let Ok(text) = String::from_utf8(secret) {
+            assert!(leak(&format!("{:#?}", Some(text))).is_some());
+        }
+    }
 
     let rendered = format!("{:?}", keyring());
     assert_redacted("Keyring", &rendered);

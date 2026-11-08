@@ -255,14 +255,16 @@ fn boot_without_ca_roots(vars: &[(&str, &str)]) -> std::process::Output {
     std::fs::create_dir_all(&dir).unwrap();
     let bundle = dir.join("empty-ca.pem");
     std::fs::write(&bundle, b"").unwrap();
-    Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+    let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
         .env("PORT", free_port().to_string())
         .env("SSL_CERT_FILE", &bundle)
         .envs(vars.iter().copied())
         .output()
-        .unwrap()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    out
 }
 
 #[test]
