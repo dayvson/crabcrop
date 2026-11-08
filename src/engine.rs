@@ -35,14 +35,10 @@ const MAX_ANIMATED_FRAMES: usize = 200;
 const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 
-/// The most operations one request may execute, after preset
-/// expansion (issue #182, audit R2-12): each operation counts
-/// once, and each filter inside a `filters:` segment counts
-/// once, because each is a pass over the pixels. Real chains
-/// (a size, a crop, a dozen filters) sit far below this; the
-/// cap exists so thousands of repeated cheap operations
-/// cannot burn a process-gate slot on CPU alone.
-const MAX_OPERATIONS: usize = 100;
+// The operation cap lives with the grammar (issue #469);
+// the engine's tests reach it from here through `super::*`.
+#[cfg(test)]
+use crate::url::MAX_OPERATIONS;
 
 /// The per-request encode budget (audit E-6): the
 /// quality(auto) verification loop and the max_bytes ladder
@@ -535,24 +531,14 @@ impl OutputBudget {
     }
 }
 
-/// Reject a request whose expanded operation list runs past
-/// [`MAX_OPERATIONS`]: the count the engine executes, not the
-/// count the URL spells, so preset expansion cannot multiply
-/// work past the cap (issue #182, audit R2-12).
+/// Reject an operation list past
+/// [`crate::url::MAX_OPERATIONS`] (issue #182, audit
+/// R2-12). The server refuses such a request at parse time,
+/// before any fetch (issue #469); this is the backstop for
+/// every other caller of the engine, with the same message
+/// and the same `unsupported_operation` class.
 fn check_operation_count(ops: &[Operation]) -> Result<(), EngineError> {
-    let count: usize = ops
-        .iter()
-        .map(|op| match op {
-            Operation::Filters(filters) => filters.len(),
-            _ => 1,
-        })
-        .sum();
-    if count > MAX_OPERATIONS {
-        return Err(EngineError::Unsupported(format!(
-            "request has {count} operations, over the {MAX_OPERATIONS} operation limit"
-        )));
-    }
-    Ok(())
+    crate::url::check_operation_count(ops).map_err(|e| EngineError::Unsupported(e.to_string()))
 }
 
 mod state;

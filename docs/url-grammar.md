@@ -18,6 +18,8 @@ GET /<signature>/<operations>/<source-url>
 /unsafe/crop:1200x630:smart/filters:grayscale:quality(80)/https://example.com/photo.jpg
 ```
 
+A request runs at most 100 operations. Each segment counts once, except `filters:`, where each filter counts once: the example above is three operations. The count is taken on what the server will run, after `preset:` references expand and with any server-wide default operations (`CRABCROP_DEFAULT_OPS`) merged in; `exp:` and `maxage:` are not operations and do not count. A request over the cap answers `400` with the code `unsupported_operation` and a body that names the count, such as `request has 101 operations, over the 100 operation limit`. The check runs right after parsing, on the image and `/explain` routes alike, so an over-cap URL never fetches its source. Real chains sit far below the cap; it exists so a URL that repeats cheap operations, or repeats a preset, cannot buy unbounded processing time.
+
 ### Sign a request
 
 Compute HMAC-SHA256 over the remainder of the path, the operations and the source URL exactly as they appear, with no leading slash, keyed with your `CRABCROP_SECRET`, and hex-encode the result:
