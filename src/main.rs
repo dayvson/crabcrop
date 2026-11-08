@@ -83,12 +83,7 @@ async fn start() -> Option<std::time::Instant> {
                 }
             }
             Err(e) => {
-                let sep = if e.starts_with("crabcrop:") {
-                    ""
-                } else {
-                    "crabcrop: "
-                };
-                eprintln!("{sep}{e}");
+                eprintln!("crabcrop: {e}");
                 std::process::exit(1);
             }
         }
