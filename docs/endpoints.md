@@ -97,7 +97,8 @@ crabcrop sign "300x200/filters:grayscale/https://example.com/photo.jpg"
 # Explain a URL segment by segment, verifying its signature
 crabcrop explain "http://localhost:3000/<signature>/300x200/filters:grayscale/https://example.com/photo.jpg"
 
-# Fetch the meta JSON for an image (a bare remainder is signed first)
+# Fetch the meta JSON for an image (a bare remainder is signed first).
+# The server needs meta mode on (CRABCROP_META_MODE=1); it is off by default.
 crabcrop meta "300x200/https://example.com/photo.jpg"
 
 # ... with placeholder fields and detection boxes included

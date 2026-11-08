@@ -83,7 +83,7 @@ https://img.example.com/<signature>/crop:1200x630:smart/filters:format(webp):qua
 
 Smart-crops the photo to the 1200x630 social card size, keeping the subject and any detected faces whole, then encodes it as WebP at quality 80. Sign it with the TypeScript or Python SDK, the crabcrop-url Rust crate, the CLI, or plain curl: same inputs, same URL.
 
-Send `Accept: application/json` with the same URL and the answer is the render's meta document instead of its bytes: dimensions, format, byte size, and provenance, with richer annotations as opt-ins.
+Send `Accept: application/json` with the same URL and the answer is the render's meta document instead of its bytes: dimensions, format, byte size, and provenance, with richer annotations as opt-ins. Meta mode is off by default, because every meta request renders afresh; the operator turns it on with `CRABCROP_META_MODE=1`.
 
 ## Features
 

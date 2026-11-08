@@ -92,8 +92,11 @@ def _wait_health(port, timeout_s, proc=None):
 def start_server(name, extra_env=None, health_timeout=60):
     """Boot one crabcrop instance profile. Returns True when healthy."""
     port = PORTS[name]
+    # Meta mode is off by default (issue #453); the suite
+    # exercises meta on every profile, so it turns it on.
     env = dict(os.environ, CRABCROP_SECRET=SECRET,
-               CRABCROP_PORT=str(port), NO_PROXY="127.0.0.1,localhost")
+               CRABCROP_PORT=str(port), NO_PROXY="127.0.0.1,localhost",
+               CRABCROP_META_MODE="1")
     env.update(extra_env or {})
     logf = open(LOGS[name], "w")
     p = subprocess.Popen([BIN], env=env, stdout=logf,

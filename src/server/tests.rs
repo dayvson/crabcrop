@@ -11801,6 +11801,54 @@ async fn meta_mode_disabled_refuses_meta_and_still_serves_the_render() {
 }
 
 #[tokio::test]
+async fn the_meta_disabled_refusal_is_never_publicly_cacheable() {
+    // Issue #453: with meta mode off by default, any viewer
+    // can make the server answer 403 for a URL by sending
+    // the meta Accept. Some CDNs cache a 403 that carries
+    // no caching headers (CloudFront's error caching keeps
+    // it 10 seconds), and the response would then be served
+    // to every image viewer. The refusal carries the meta
+    // document's headers, plain and sealed alike, and the
+    // sealed one keeps the uniform status and body.
+    let src = spawn_bytes_server(test_png()).await;
+    let base = spawn_app_with_meta_enabled(false).await;
+    let remainder = format!("100x0/{src}");
+    let plain = format!("{base}/{}/{remainder}", sign(&remainder));
+    let sealed_url = format!("{base}/{}", sealed_path(&remainder, Some("photo.png")));
+    for (url, sealed) in [(&plain, false), (&sealed_url, true)] {
+        let resp = client()
+            .get(url)
+            .header("Accept", "image/avif, application/json; placeholders=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{url}");
+        assert_eq!(
+            resp.headers()[header::CACHE_CONTROL],
+            "private, no-store",
+            "{url}"
+        );
+        let vary = resp.headers()[header::VARY].to_str().unwrap().to_string();
+        assert!(vary.starts_with("Accept,"), "{url}: {vary}");
+        let body = resp.text().await.unwrap();
+        if sealed {
+            assert_eq!(body, "bad signature");
+        } else {
+            assert!(body.contains(r#""code":"meta_disabled""#), "{body}");
+        }
+    }
+    // The plain refusal tells the caller how meta turns on.
+    let resp = client()
+        .get(&plain)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("CRABCROP_META_MODE=1"), "{body}");
+}
+
+#[tokio::test]
 async fn a_provider_free_smart_crop_never_touches_the_ai_gate() {
     // Issue #379 at the HTTP level: the app has no
     // face or focal provider and an AI gate with no

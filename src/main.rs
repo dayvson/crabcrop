@@ -957,15 +957,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let frame_extractor = build_video_decoder(|name| env::var(name).ok())?;
     let pdf_renderer = build_pdf_renderer(|name| env::var(name).ok())?;
     let provenance_signer = build_provenance_signer(|name| env::var(name).ok())?;
-    // Meta mode stays on unless the operator switches it
-    // off (issue #390): it is the most expensive request
-    // shape a signed URL can trigger (an uncached render
-    // plus its annotation inferences, on every call).
-    let meta_enabled = parse_bool_value(
-        "CRABCROP_META_MODE",
-        env::var("CRABCROP_META_MODE").ok(),
-        true,
-    )?;
+    let meta_enabled = meta_mode_config(|name| env::var(name).ok())?;
+    if meta_enabled {
+        println!("meta mode: on");
+    }
 
     let state = AppState {
         keyring,
@@ -1382,6 +1377,16 @@ fn metadata_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, String>
             "CRABCROP_METADATA must be \"strip\" or \"preserve\", got {v:?}"
         )),
     }
+}
+
+/// Meta mode from `CRABCROP_META_MODE`, off unless the
+/// operator turns it on (issue #453). Every meta request
+/// skips the cache tiers and runs a fresh fetch, render,
+/// and annotation inferences, and any viewer of a signed
+/// URL can ask for one with a header, so a deployment
+/// opts in to that cost rather than carrying it unasked.
+fn meta_mode_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, String> {
+    parse_bool_value("CRABCROP_META_MODE", get("CRABCROP_META_MODE"), false)
 }
 
 /// The AI provider set built at boot. Every provider is
@@ -2323,6 +2328,25 @@ mod tests {
         assert_eq!(metadata_config(strip), Ok(false));
         let bogus = |name: &str| (name == "CRABCROP_METADATA").then(|| "keep".to_string());
         assert!(metadata_config(bogus).is_err());
+    }
+
+    #[test]
+    fn meta_mode_defaults_to_off_and_turns_on_by_the_boolean_spellings() {
+        // Issue #453: unset is off.
+        assert_eq!(meta_mode_config(env_of(&[])), Ok(false));
+        let set = |v: &str| meta_mode_config(env_of(&[("CRABCROP_META_MODE", v)]));
+        for v in ["1", "true", "YES", "on"] {
+            assert_eq!(set(v), Ok(true), "{v}");
+        }
+        for v in ["0", "false", "no", "OFF"] {
+            assert_eq!(set(v), Ok(false), "{v}");
+        }
+        // A typo, an empty value, or a stray space is a boot
+        // error naming the variable, never a silent default.
+        for bad in ["", " 1", "enabled", "2", "on\n"] {
+            let err = expect_err(set(bad));
+            assert!(err.contains("CRABCROP_META_MODE"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

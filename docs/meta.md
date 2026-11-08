@@ -2,7 +2,11 @@
 
 ## Meta responses
 
-Send `Accept: application/json` with any image URL to get metadata about the processed image instead of the image bytes:
+Send `Accept: application/json` with any image URL to get metadata about the processed image instead of the image bytes.
+
+Meta mode is off by default: turn it on with `CRABCROP_META_MODE=1` (see [Configuration](configuration.md)). While it is off, a meta request answers `403 meta_disabled` before any fetch or render, and the same URL without the header serves the image as usual. Know the cost before you turn it on. Meta requests are never cached, so each one fetches the source, renders it, and runs the configured annotation models again: CLIP tags and the aesthetic score on every request, the others when the request opts in, and any caller can opt in to all of them. Concurrent identical meta requests share one run; one after another, each pays in full. Any viewer of a signed URL can send the header, so enable meta only where you use it.
+
+With meta mode on:
 
 ```bash
 curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
@@ -24,7 +28,7 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 | `pdf` | Present when the source was a PDF and a `page:` segment selected the page: the document's `pages` count, the `page` rendered, and the page size as `page_width` and `page_height` in points. See [PDF pages](media.md#pdf-pages). |
 | `provenance` | The C2PA facts for this render: whether output signing is configured on this server (`signing_configured`), and a summary of the manifest the source carried and the manifest the output carries (`source` and `output`, each `null` when the asset carries none, else `{state, signer, manifests, ingredients}` with `state` one of `valid`, `trusted`, `invalid`). See [Provenance (C2PA)](#provenance-c2pa). |
 
-Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other.
+Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other. The `403 meta_disabled` refusal carries the same headers, so a cache that honors them never serves it in place of the image.
 
 Add the `placeholders` parameter to the media type to also get placeholder data, computed from the final processed pixels. The parameter opts in when it is bare (`; placeholders`), set to `1`, or set to `true` (case-insensitive); any other value, including `0` and `false`, does not. The `detections` parameter below follows the same rule. On the CLI, `crabcrop meta --placeholders` and `crabcrop meta --detections` set them for you:
 

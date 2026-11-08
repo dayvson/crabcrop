@@ -191,11 +191,12 @@ pub struct AppState {
     /// never registered, so a PUT is a 404, not a refusal).
     pub upload: Option<Arc<crate::upload::UploadStore>>,
     /// Whether meta mode is enabled (issue #390):
-    /// `CRABCROP_META_MODE`, on by default. A meta request
-    /// bypasses every cache tier and runs a fresh render
-    /// plus its annotation inferences on every call, so a
-    /// deployment that does not use it can close the most
-    /// expensive request shape a signed URL can trigger.
+    /// `CRABCROP_META_MODE`, off by default (issue #453). A
+    /// meta request bypasses every cache tier and runs a
+    /// fresh render plus its annotation inferences on every
+    /// call, so the most expensive request shape a signed
+    /// URL can trigger is open only where the operator
+    /// turned it on.
     pub meta_enabled: bool,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
@@ -2029,21 +2030,28 @@ async fn serve(
     let meta = wants_meta(accept);
     if meta && !state.meta_enabled {
         // Meta mode is switched off on this deployment
-        // (issue #390): refuse specifically, like the
-        // metrics endpoint does, rather than serving a
-        // render the caller did not ask for.
-        if sealed {
-            return sealed_refusal(record);
-        }
-        return (
-            error_response(
-                StatusCode::FORBIDDEN,
-                "meta_disabled",
-                "meta mode is disabled on this server".to_string(),
-                accept,
-            ),
-            record,
-        );
+        // (issue #390), as it is by default (issue #453):
+        // refuse specifically, like the metrics endpoint
+        // does, rather than serving a render the caller did
+        // not ask for. The refusal answers the URL's JSON
+        // representation, so it carries the meta document's
+        // caching headers: a cache that stored it under the
+        // bare URL would serve it to every image viewer.
+        let (response, record) = if sealed {
+            sealed_refusal(record)
+        } else {
+            (
+                error_response(
+                    StatusCode::FORBIDDEN,
+                    "meta_disabled",
+                    "meta mode is disabled on this server: set CRABCROP_META_MODE=1 to enable it"
+                        .to_string(),
+                    accept,
+                ),
+                record,
+            )
+        };
+        return (meta_cache_headers(response), record);
     }
     let placeholders = meta && wants_placeholders(accept);
     let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
@@ -3484,9 +3492,9 @@ pub(in crate::server) use meta::{
 };
 pub use meta::{EmbeddingMeta, ModerationMeta, OcrMeta};
 pub(in crate::server) use meta::{
-    annotate_meta, compose_aesthetic, detect_meta, embed_meta, meta_response, moderate_meta,
-    ocr_meta, wants_detections, wants_embeddings, wants_meta, wants_moderation, wants_ocr,
-    wants_placeholders,
+    annotate_meta, compose_aesthetic, detect_meta, embed_meta, meta_cache_headers, meta_response,
+    moderate_meta, ocr_meta, wants_detections, wants_embeddings, wants_meta, wants_moderation,
+    wants_ocr, wants_placeholders,
 };
 
 /// Build a successful image response: content type, cache
