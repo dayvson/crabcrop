@@ -99,7 +99,7 @@ CI enforces formatting and lints. Run both before pushing:
 
 ```bash
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## The URL grammar is a shared contract

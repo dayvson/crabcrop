@@ -200,6 +200,7 @@ fn state(dir: &std::path::Path) -> AppState {
         slow_gate: Arc::new(Gate::new(1)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "debug-redaction".to_string(),
     }

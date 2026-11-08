@@ -23,6 +23,20 @@ libfuzzer-sys = "0.4"
 # same version requirement and features as the root crate.
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "nasm", "png", "rayon", "tiff", "webp"] }
 
+[features]
+# The AVIF decoder the release binaries, the Docker image and
+# the Homebrew install ship (issue #476): dav1d behind the
+# image crate's avif-native decoder. On by default, so every
+# fuzz run covers the decoder the server runs. dav1d is a C
+# library: pkg-config finds a system libdav1d, or
+# SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always builds it from
+# vendored sources (needs meson, ninja and nasm), as the
+# release does. The deterministic smoke in
+# scripts/test_all.sh builds with --no-default-features, so
+# it needs neither.
+default = ["avif-decode"]
+avif-decode = ["crabcrop/avif-decode"]
+
 [lib]
 path = "src/lib.rs"
 

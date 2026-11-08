@@ -98,9 +98,9 @@ class RenderingVersionCheck(unittest.TestCase):
         self.commit(f"Release {tag}")
         self.git("tag", tag)
 
-    def run_check(self, root=None, **env):
+    def run_check(self, root=None, *flags, **env):
         done = subprocess.run(
-            [sys.executable, "-I", str(SCRIPT), "--root", str(root or self.repo)],
+            [sys.executable, "-I", str(SCRIPT), "--root", str(root or self.repo), *flags],
             env={**GIT_ENV, **env},
             capture_output=True,
             text=True,
@@ -249,6 +249,49 @@ class RenderingVersionCheck(unittest.TestCase):
         code, out = self.run_check(plain, GIT_CEILING_DIRECTORIES=self.tmp.name)
         self.assertEqual(code, 0, out)
         self.assertIn("skipped: not a git checkout", out)
+
+    # --strict is how CI runs it: there a skip means the checkout lost the
+    # history or the tags, so every way of skipping fails instead.
+    def test_strict_fails_where_the_check_would_skip(self):
+        self.write([entry("a")], 1)
+        self.commit()
+        code, out = self.run_check(None, "--strict")
+        self.assertEqual(code, 1, out)
+        self.assertIn("could not run (--strict): no release tag", out)
+        self.assertNotIn("skipped", out)
+
+        plain = Path(self.tmp.name) / "plain"
+        plain.mkdir()
+        code, out = self.run_check(plain, "--strict", GIT_CEILING_DIRECTORIES=self.tmp.name)
+        self.assertEqual(code, 1, out)
+        self.assertIn("could not run (--strict): not a git checkout", out)
+
+    def test_strict_fails_in_a_shallow_clone_with_the_fix(self):
+        self.release([entry("a")], 1)
+        (self.repo / "README").write_text("later work\n")
+        self.commit()
+        clone = Path(self.tmp.name) / "clone"
+        self.git(
+            "clone", "-q", "--depth", "1", "--no-tags", self.repo.as_uri(), str(clone),
+            cwd=self.tmp.name,
+        )
+        code, out = self.run_check(clone, "--strict")
+        self.assertEqual(code, 1, out)
+        self.assertIn("shallow clone", out)
+        self.assertIn("git fetch --tags --unshallow", out)
+
+    def test_strict_judges_normally_once_a_tag_is_reachable(self):
+        self.release([entry("a"), entry("b")], 1)
+        self.write([entry("a"), entry("b", sha="bb")])
+        self.commit("Re-baseline after the tag")
+        code, out = self.run_check(None, "--strict")
+        self.assertEqual(code, 1, out)
+        self.assertIn("re-baselined since v1.0.0 (b)", out)
+        self.write(version=2)
+        self.commit("Bump")
+        code, out = self.run_check(None, "--strict")
+        self.assertEqual(code, 0, out)
+        self.assertIn("covered by RENDERING_VERSION 1 -> 2", out)
 
     def test_a_hook_environment_leaves_the_callers_repository_alone(self):
         # Run one case in a child that inherits GIT_DIR and GIT_WORK_TREE

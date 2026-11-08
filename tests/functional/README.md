@@ -105,11 +105,12 @@ files).
   fails if the tier's wall clock passes 240 s. An overrun is a bug
   in the suite: cut cells or shrink corpus images rather than
   letting it grow.
-- **Full on schedule (nightly) and on release tags.**
+- **Full on schedule (nightly), on pushes to main, and on release
+  tags.**
 - **Full instead of smoke on a pull request** whose diff touches
-  `Cargo.lock`, `Cargo.toml`, a crate manifest, the encode
-  pipeline modules under `src/` (engine, filters, quality, color,
-  crop, heic, svg, text, video, studio, ai), or this harness.
+  `Cargo.lock`, `Cargo.toml`, a crate manifest, any file under
+  `src/`, or this harness. `scripts/test_functional_tier.py` pins
+  the choice.
 
 ## Adding a case
 
