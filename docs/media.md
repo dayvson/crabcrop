@@ -34,7 +34,7 @@ Details an encoder setup has to match:
 
 - Frames are composited over black and padded up to even dimensions (H.264 and VP9 need them) by replicating the edge pixels. The response describes the padded dimensions.
 - Frame timing: the pipe contract carries one constant rate, so crabcrop picks it from the fastest frame, `ceil(1000 / shortest delay)` clamped to 1-100 fps (10 fps when no frame carries a delay), and repeats each frame `round(delay × fps / 1000)` times, at least once. Total duration is preserved to within one frame period per source frame. A source whose delays total more than 600 s is refused with a `400`.
-- At most two encodes run at a time, each under a hard wall-clock timeout (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s) after which the encoder is killed, and a hard output cap (`CRABCROP_VIDEO_MAX_MB`, default 64 MB) that aborts the encode the moment it is crossed. The encoder runs with an empty environment; nothing is inherited from the server's.
+- At most two encodes run at a time, each under a hard wall-clock timeout (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s) after which the encoder is killed, and a hard output cap (`CRABCROP_VIDEO_MAX_MB`, default 64 MB) that aborts the encode the moment it is crossed. The encoder runs with an empty environment (nothing is inherited from the server's) in the server's temporary directory (`TMPDIR`), or where the server runs when that directory does not exist.
 - The program must not daemonize or detach (no `setsid`, no double-fork). A timeout kills the program's whole process group; a descendant that detaches escapes that kill and is the operator's responsibility. The video decoder and the PDF renderer are held to the same rule.
 - On Linux the encoder also runs under kernel resource limits, a backstop behind the wall clock: 8 GiB of address space, and CPU time of the timeout times one more than the cores the server may use, plus 5 s (155 CPU seconds at the default 30 s on a 4-core host). The kernel counts CPU time across all of the program's threads, and FFmpeg works on several, so the limit scales with the cores: a run that fits the wall clock never reaches it.
 
@@ -45,7 +45,7 @@ Details an encoder setup has to match:
 | No encoder configured | `501`: `video output is not configured on this server` |
 | Still source (a still image, or a one-frame GIF or WebP) | `400`: the source is a still image, and video needs an animated source |
 | Animation over the 600 s cap | `400` |
-| Encoder exits nonzero, produces nothing, exceeds the cap, or times out | `502`: `video encoding failed` (the cause, including the encoder's stderr excerpt, is in the server log) |
+| Encoder exits nonzero, produces nothing, exceeds the cap, or times out | `502`: `video encoding failed` (the cause, with the last 500 characters of the encoder's stderr, is in the server log) |
 | Encode queue full (both slots busy past a 10 s wait) | `503` |
 
 Video results cache like any other response, under the video content type (`video/mp4` or `video/webm`), and every operation in the URL (resize, crop, filters) applies per frame before the encode. A meta request (`Accept: application/json`) on a video URL answers `400`: meta describes images, and a video result is not one.
@@ -65,7 +65,7 @@ The whitelists pin the program to the bytes the loader already validated: the pr
 The bounds mirror the encoder's, because the work is the same class:
 
 - At most two extractions run at a time behind the video gate (shared with encodes), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
-- Each run (probe and extraction alike) is bounded by the same wall-clock timeout as encodes (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a frame whose PNG passes 256 MiB, the decode allocation budget, is refused).
+- Each run (probe and extraction alike) is bounded by the same wall-clock timeout as encodes (`CRABCROP_VIDEO_TIMEOUT_SECS`, default 30 s), after which the program's whole process group is killed; the program runs with an empty environment in the temporary directory, as the encoder does, and its output is capped (a frame whose PNG passes 256 MiB, the decode allocation budget, is refused).
 - Each run also gets the encoder's kernel limits (address space, and CPU time scaled by the cores the server may use; see [the encoder details](#the-encoder-contract)), so a multi-threaded decode that fits the wall clock, such as a far seek in a long 4K clip, is never cut short by the CPU limit.
 - The source itself flows through the ordinary loader first, with the same allowlist, size cap, and redirect rules as any source. Only a URL carrying a `frame:` segment may fetch a `video/*` Content-Type; every other request keeps the image-only rule.
 
@@ -78,7 +78,7 @@ The bounds mirror the encoder's, because the work is the same class:
 | Source has no video stream, is not a readable video, or its metadata plants a second `Duration:` line in the probe report | `502`: the bad-source failure every undecodable source gets |
 | Percentage selection on a video that reports no duration | `400` |
 | Malformed `frame:` selector | `400` with the `invalid_frame` code, before any fetch |
-| Decoder exits nonzero, produces no frame, exceeds the cap, or times out; decoder older than FFmpeg 6.0 (no `fd` protocol); source cannot be staged in the temporary directory | `502`: `video frame extraction failed` (the cause, including the decoder's stderr excerpt, is in the server log) |
+| Decoder exits nonzero, produces no frame, exceeds the cap, or times out; decoder older than FFmpeg 6.0 (no `fd` protocol); source cannot be staged in the temporary directory | `502`: `video frame extraction failed` (the cause, with the last 500 characters of the decoder's stderr, is in the server log) |
 | Video queue full (both slots busy past a 10 s wait) | `503` |
 
 A frame render's [meta response](meta.md#meta-responses) carries a `video` object: the source's `width` and `height`, its `duration` in seconds when the container reports one, and the `frame_timestamp` the frame was selected at, after clamping. The explain endpoint labels a video source's kind as `video`; its dimensions stay unknown there, because explain never runs the decoder.
@@ -97,7 +97,7 @@ Because the tools receive only bytes over stdin, nothing inside a document has a
 The bounds mirror the frame extractor's, because the work is the same class:
 
 - Page work takes the video gate (at most two runs at a time, shared with encodes and frame extractions), on top of the slow lane; a request that waits more than 10 s for a slot sheds with `503`.
-- Each run is bounded by `CRABCROP_PDF_TIMEOUT_SECS` (default 30 s), after which the program's whole process group is killed; the program runs with an empty environment, and its output is capped (a page whose PNG passes 256 MiB, the decode allocation budget, is refused).
+- Each run is bounded by `CRABCROP_PDF_TIMEOUT_SECS` (default 30 s), after which the program's whole process group is killed; the program runs with an empty environment in the temporary directory, as the encoder does, and its output is capped (a page whose PNG passes 256 MiB, the decode allocation budget, is refused).
 - Each run also gets the same kernel limits as the video tools (address space, and CPU time scaled by the cores the server may use; see [the encoder details](#the-encoder-contract)), here against `CRABCROP_PDF_TIMEOUT_SECS`.
 
 ### Errors
@@ -111,7 +111,7 @@ The bounds mirror the frame extractor's, because the work is the same class:
 | Page past the end of the document | `400`, naming the page and the document's page count |
 | Document needs a password to open | `400`: the document is password-protected |
 | Malformed `page:` selector | `400` with the `invalid_page` code, before any fetch |
-| Renderer or probe exits nonzero, produces no page, exceeds the cap, or times out | `502`: `PDF rendering failed` (the cause, including the tool's stderr excerpt, is in the server log) |
+| Renderer or probe exits nonzero, produces no page, exceeds the cap, or times out | `502`: `PDF rendering failed` (the cause, with the last 500 characters of the tool's stderr, is in the server log) |
 | Video queue full (both slots busy past a 10 s wait) | `503` |
 
 A page render's [meta response](meta.md#meta-responses) carries a `pdf` object: the document's `pages` count, the `page` rendered, and the page's `page_width` and `page_height` in points. The explain endpoint labels a PDF source's kind as `pdf`; its dimensions stay unknown there, because explain never runs the renderer.
