@@ -77,7 +77,7 @@ Crops the image to the width:height aspect ratio, then resizes to exactly that w
 curl "http://localhost:3000/unsafe/crop:1200x630:top/https://example.com/photo.jpg"
 ```
 
-The objects form names one or more detection classes (the class filters' vocabulary, matched case-insensitively, duplicates folded), up to 32 distinct classes. A repeat counts once, and a list that names a 33rd distinct class is a `400 invalid_crop`, never a crop to the first 32:
+The objects form names one or more detection classes (the class filters' vocabulary, matched ASCII case-insensitively, duplicates folded: `Person` repeats `person`, but `É` and `é` are two classes), up to 32 distinct classes. A repeat counts once, and a list that names a 33rd distinct class is a `400 invalid_crop`, never a crop to the first 32:
 
 ```text
 crop:800x800:objects(dog)

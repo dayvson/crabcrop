@@ -88,7 +88,7 @@ fn mask_load_missing_model_file_is_a_load_error() {
 #[ignore = "needs the ONNX runtime and a model file (env-configured)"]
 fn mask_load_garbage_model_file_is_a_load_error() {
     let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
-    let garbage = temp_file("mask-garbage", b"this is not an onnx model at all");
+    let (_model, garbage) = temp_file("mask-garbage", b"this is not an onnx model at all");
     let message = expect_load(OnnxMaskProvider::load(Some(&dylib), &garbage));
     assert!(message.contains("cannot load the model"), "{message}");
 }

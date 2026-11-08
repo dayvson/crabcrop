@@ -70,16 +70,14 @@ fn crop224_preprocess_gives_clip_and_vit_the_same_crop() {
 
 #[test]
 fn read_labels_skips_comments_and_blanks() {
-    let path = std::env::temp_dir().join(format!("crabcrop-labels-{}.txt", std::process::id()));
+    let dir = crate::test_support::scratch_dir("clip-labels");
+    let path = dir.join("labels.txt");
     std::fs::write(&path, "# heading\n\nocean\n  sky  \n#kite\n").unwrap();
     let got = read_labels(path.to_str().unwrap()).unwrap();
     assert_eq!(got, ["ocean", "sky"]);
-    std::fs::remove_file(&path).ok();
-    let empty =
-        std::env::temp_dir().join(format!("crabcrop-labels-empty-{}.txt", std::process::id()));
+    let empty = dir.join("empty.txt");
     std::fs::write(&empty, "# only comments\n\n").unwrap();
     assert!(read_labels(empty.to_str().unwrap()).is_err());
-    std::fs::remove_file(&empty).ok();
 }
 
 #[test]
@@ -289,24 +287,26 @@ fn clip_live_tags_a_photo() {
     );
 }
 
-/// Write bytes to a fresh temp file and return its
-/// path: the load() failure tests need real files
-/// (a label list, a garbage tokenizer) without
-/// committing fixtures.
-fn temp_file(tag: &str, contents: &[u8]) -> String {
-    let path =
-        std::env::temp_dir().join(format!("crabcrop-ai-load-{tag}-{}.bin", std::process::id()));
+/// Write bytes to a fresh temp file and return the
+/// scratch directory it lives in and its path: the
+/// load() failure tests need real files (a label list,
+/// a garbage tokenizer) without committing fixtures
+/// (issue #526).
+fn temp_file(tag: &str, contents: &[u8]) -> (crate::test_support::ScratchDir, String) {
+    let dir = crate::test_support::scratch_dir(&format!("ai-load-{tag}"));
+    let path = dir
+        .join(format!("{tag}.bin"))
+        .to_string_lossy()
+        .into_owned();
     std::fs::write(&path, contents).unwrap();
-    path.to_string_lossy().into_owned()
+    (dir, path)
 }
 
-/// A path inside the temp dir that is never created.
+/// A path that does not exist: a name inside a scratch
+/// directory that is removed again before this returns.
 fn missing_path(tag: &str) -> String {
-    std::env::temp_dir()
-        .join(format!(
-            "crabcrop-ai-load-missing-{tag}-{}.onnx",
-            std::process::id()
-        ))
+    crate::test_support::scratch_dir(&format!("ai-load-missing-{tag}"))
+        .join(format!("{tag}.onnx"))
         .to_string_lossy()
         .into_owned()
 }
@@ -338,7 +338,7 @@ fn clip_load_missing_labels_file_is_a_load_error() {
 /// no labels: Load, still before the runtime is touched.
 #[test]
 fn clip_load_empty_labels_file_is_a_load_error() {
-    let labels = temp_file("clip-labels-empty", b"# only a comment\n\n");
+    let (_labels, labels) = temp_file("clip-labels-empty", b"# only a comment\n\n");
     let missing = missing_path("clip-empty");
     let message = expect_load(OnnxClipProvider::load(
         None, &missing, &missing, &missing, &labels,
@@ -350,7 +350,7 @@ fn clip_load_empty_labels_file_is_a_load_error() {
 /// next pre-runtime failure: Load.
 #[test]
 fn clip_load_missing_tokenizer_file_is_a_load_error() {
-    let labels = temp_file("clip-labels-ok", b"cat\ndog\n");
+    let (_labels, labels) = temp_file("clip-labels-ok", b"cat\ndog\n");
     let missing = missing_path("clip-tokenizer");
     let message = expect_load(OnnxClipProvider::load(
         None, &missing, &missing, &missing, &labels,
@@ -365,8 +365,8 @@ fn clip_load_missing_tokenizer_file_is_a_load_error() {
 /// same pre-runtime way.
 #[test]
 fn clip_load_garbage_tokenizer_file_is_a_load_error() {
-    let labels = temp_file("clip-labels-ok2", b"cat\ndog\n");
-    let tokenizer = temp_file("clip-tokenizer-garbage", b"{ this is not json");
+    let (_labels, labels) = temp_file("clip-labels-ok2", b"cat\ndog\n");
+    let (_tokenizer, tokenizer) = temp_file("clip-tokenizer-garbage", b"{ this is not json");
     let missing = missing_path("clip-garbage-tok");
     let message = expect_load(OnnxClipProvider::load(
         None, &missing, &missing, &tokenizer, &labels,
@@ -401,7 +401,7 @@ fn clip_load_missing_text_model_is_a_load_error() {
 #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
 fn clip_load_garbage_text_model_is_a_load_error() {
     let var = |name: &str| std::env::var(name).unwrap();
-    let garbage = temp_file("clip-text-garbage", b"this is not an onnx model at all");
+    let (_model, garbage) = temp_file("clip-text-garbage", b"this is not an onnx model at all");
     let message = expect_load(OnnxClipProvider::load(
         Some(&var("CRABCROP_TEST_ORT_DYLIB")),
         &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),

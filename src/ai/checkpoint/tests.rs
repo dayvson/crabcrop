@@ -1,20 +1,24 @@
 use crate::ai::{AestheticHead, AiError};
+use crate::test_support::{ScratchDir, scratch_dir};
 
-fn temp_file(tag: &str, contents: &[u8]) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "crabcrop-embedding-{tag}-{}.bin",
-        std::process::id()
-    ));
+/// Write bytes to a fresh temp file and return the
+/// scratch directory it lives in and its path (issue
+/// #526).
+fn temp_file(tag: &str, contents: &[u8]) -> (ScratchDir, String) {
+    let dir = scratch_dir(&format!("embedding-{tag}"));
+    let path = dir
+        .join(format!("{tag}.bin"))
+        .to_string_lossy()
+        .into_owned();
     std::fs::write(&path, contents).unwrap();
-    path.to_string_lossy().into_owned()
+    (dir, path)
 }
 
+/// A path that does not exist: a name inside a scratch
+/// directory that is removed again before this returns.
 fn missing_path(tag: &str) -> String {
-    std::env::temp_dir()
-        .join(format!(
-            "crabcrop-embedding-missing-{tag}-{}.pth",
-            std::process::id()
-        ))
+    scratch_dir(&format!("embedding-missing-{tag}"))
+        .join(format!("{tag}.pth"))
         .to_string_lossy()
         .into_owned()
 }
@@ -184,7 +188,7 @@ fn aesthetic_head_loads_a_synthetic_pth() {
             ("archive/data/1", &floats_bytes(&[0.75])),
         ],
     );
-    let path = temp_file("head-ok", &archive);
+    let (_head, path) = temp_file("head-ok", &archive);
     let head = AestheticHead::load(&path).unwrap();
     // The identity meta reports is the file name,
     // never the path it was loaded from.
@@ -203,7 +207,7 @@ fn aesthetic_head_loads_a_synthetic_pth() {
 
 #[test]
 fn aesthetic_head_load_rejects_garbage_and_missing_files() {
-    let path = temp_file("head-garbage", b"this is not a zip archive at all");
+    let (_head, path) = temp_file("head-garbage", b"this is not a zip archive at all");
     let err = expect_load(AestheticHead::load(&path));
     assert!(err.contains("not usable"), "{err}");
     let err = expect_load(AestheticHead::load(&missing_path("head")));
@@ -215,7 +219,7 @@ fn aesthetic_head_rejects_an_archive_without_a_pickle() {
     let archive = head_archive(b"", &[]);
     // An empty pickle payload is not a state dict;
     // the failure must be a load error either way.
-    let path = temp_file("head-empty-pkl", &archive);
+    let (_head, path) = temp_file("head-empty-pkl", &archive);
     let err = expect_load(AestheticHead::load(&path));
     assert!(err.contains("not usable"), "{err}");
 }
@@ -229,7 +233,7 @@ fn aesthetic_head_rejects_a_multi_value_bias() {
             ("archive/data/1", &floats_bytes(&[0.75, 0.5])),
         ],
     );
-    let path = temp_file("head-wide-bias", &archive);
+    let (_head, path) = temp_file("head-wide-bias", &archive);
     let err = expect_load(AestheticHead::load(&path));
     assert!(err.contains("bias is a single value"), "{err}");
 }
@@ -243,7 +247,7 @@ fn aesthetic_head_rejects_a_storage_shorter_than_the_tensor() {
             ("archive/data/1", &floats_bytes(&[0.75])),
         ],
     );
-    let path = temp_file("head-short-storage", &archive);
+    let (_head, path) = temp_file("head-short-storage", &archive);
     let err = expect_load(AestheticHead::load(&path));
     assert!(err.contains("overruns its storage"), "{err}");
 }
@@ -275,7 +279,7 @@ fn aesthetic_head_rejects_a_tensor_size_that_overflows() {
             ("archive/data/1", &floats_bytes(&[0.75])),
         ],
     );
-    let path = temp_file("head-size-overflow", &archive);
+    let (_head, path) = temp_file("head-size-overflow", &archive);
     let err = expect_load(AestheticHead::load(&path));
     assert!(err.contains("the tensor size overflows"), "{err}");
 }

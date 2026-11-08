@@ -17,6 +17,13 @@ use std::time::{Duration, Instant};
 
 use crabcrop::svg::{WORKER_ARG, WorkerCommand, prepare, screen};
 
+// The library's test helpers are not visible to an
+// integration test: its scratch directories come in by
+// path. Not every item is used here.
+#[allow(dead_code)]
+#[path = "../src/test_support/scratch.rs"]
+mod test_support;
+
 /// Kill the server on drop, so a failed assert cannot leak
 /// a listening server into later runs.
 struct ServerGuard(Child);
@@ -69,13 +76,10 @@ fn get_with(port: u16, path: &str, headers: &str) -> (u16, Vec<u8>, Duration) {
 }
 
 /// A directory of SVG sources the server reads through
-/// `file://` URLs.
-fn source_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-svg-isolation-{name}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+/// `file://` URLs. Bound before the server's guard, it is
+/// removed after the server exits (locals drop in reverse).
+fn source_dir(name: &str) -> test_support::ScratchDir {
+    let dir = test_support::scratch_dir(&format!("svg-isolation-{name}"));
     std::fs::write(dir.join("ok.svg"), OK_SVG).unwrap();
     std::fs::write(dir.join("arc.svg"), ARC_SVG).unwrap();
     std::fs::write(dir.join("nested.svg"), nested_chain()).unwrap();
@@ -248,7 +252,6 @@ fn hostile_svgs_fail_alone_while_the_server_keeps_serving() {
     );
     assert!(took < Duration::from_secs(30), "explain took {took:?}");
     assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The server's live child processes (Linux: the kernel
@@ -302,7 +305,6 @@ fn a_render_past_the_deadline_is_a_504_and_its_worker_dies() {
     }
     assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
     assert_eq!(get(port, "/unsafe/32x32/file:///ok.svg").0, 200);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A small PNG, embedded as a `data:` URI below.

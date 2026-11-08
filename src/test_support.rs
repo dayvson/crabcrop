@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+mod scratch;
+pub(crate) use scratch::{ScratchDir, scratch_dir};
+
 /// Write `body` to `path` as an executable script, for the
 /// tests that stand a fake tool in for FFmpeg, pdftocairo
 /// or pdfinfo.
@@ -47,23 +50,45 @@ pub(crate) fn write_script(path: &Path, body: &str) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "crabcrop-test-support-{}-{name}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    #[test]
+    fn scratch_dirs_are_distinct_and_removed_on_drop() {
+        let first = scratch_dir("test-support-drop");
+        let second = scratch_dir("test-support-drop");
+        assert_ne!(first.path(), second.path());
+        assert!(first.starts_with(std::env::temp_dir()));
+        assert!(first.is_dir() && second.is_dir());
+        std::fs::create_dir(first.join("nested")).unwrap();
+        std::fs::write(first.join("nested").join("file"), b"x").unwrap();
+        let path = first.to_path_buf();
+        drop(first);
+        assert!(!path.exists(), "{} survived its drop", path.display());
+        assert!(second.is_dir());
+    }
+
+    /// Issue #526: a name that comes round again still
+    /// yields an empty directory. The stale one here holds
+    /// what an earlier process left under a recycled ID in
+    /// the issue's failure, a `pdfinfo` next to where a test
+    /// puts its renderer.
+    #[test]
+    fn a_scratch_dir_starts_empty_over_a_stale_one() {
+        let parent = scratch_dir("test-support-stale");
+        let path = parent.join("crabcrop-boot-pdf-16683");
+        std::fs::create_dir_all(path.join("nested")).unwrap();
+        write_script(&path.join("pdfinfo"), "#!/bin/sh\n");
+        let dir = ScratchDir::fresh(path.clone());
+        assert_eq!(dir.path(), path);
+        assert!(!dir.join("pdfinfo").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[test]
     fn write_script_writes_the_exact_bytes_as_an_executable() {
-        let dir = temp_dir("exact");
+        let dir = scratch_dir("test-support-exact");
         let path = dir.join("tool");
         // Quotes, a printf format, backslashes, shell
         // expansions and trailing newlines all reach the
@@ -82,14 +107,13 @@ mod tests {
         write_script(&path, "#!/bin/sh\nprintf second\n");
         let out = Command::new(&path).output().unwrap();
         assert_eq!(out.stdout, b"second");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write and run `iterations` scripts with `write`
     /// while three threads spawn children in a tight
     /// loop, and count the runs that fail with ETXTBSY.
     fn busy_runs_under_forks(write: fn(&Path, &str), iterations: u32) -> u32 {
-        let dir = temp_dir("stress");
+        let dir = scratch_dir("test-support-stress");
         let stop = Arc::new(AtomicBool::new(false));
         let forks = Arc::new(AtomicU64::new(0));
         let forkers: Vec<_> = (0..3)
@@ -120,7 +144,6 @@ mod tests {
             forker.join().unwrap();
         }
         assert!(forks.load(Ordering::Relaxed) > 0);
-        let _ = std::fs::remove_dir_all(&dir);
         busy
     }
 

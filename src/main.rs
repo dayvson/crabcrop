@@ -2360,6 +2360,14 @@ fn build_ocr(
     Ok(Some(Arc::new(provider)))
 }
 
+// The library's test helpers are not visible to this
+// crate: its scratch directories come in by path, as in
+// the integration tests. Not every item is used here.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "test_support/scratch.rs"]
+mod test_support;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2637,25 +2645,64 @@ mod tests {
         }
     }
 
-    /// Write bytes to a fresh temp file and return its
-    /// path: construction tests need real files (a presets
-    /// file, a fallback image, an encoder program) without
-    /// committing fixtures. The tag keeps parallel tests
-    /// on distinct files.
-    fn temp_file(tag: &str, contents: &[u8]) -> String {
-        let path =
-            std::env::temp_dir().join(format!("crabcrop-boot-{tag}-{}.tmp", std::process::id()));
-        std::fs::write(&path, contents).unwrap();
-        path.to_string_lossy().into_owned()
+    /// A temp file with the bytes a construction test gave
+    /// it, in a scratch directory of its own that lives as
+    /// long as this does.
+    struct TempFile {
+        path: String,
+        _dir: crate::test_support::ScratchDir,
     }
 
-    /// A path inside the temp dir that is never created.
+    impl TempFile {
+        fn as_str(&self) -> &str {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempFile {
+        fn as_ref(&self) -> &std::path::Path {
+            self.path.as_ref()
+        }
+    }
+
+    /// Both formats print the path alone, as the `String`
+    /// this replaced did: the detector tests quote it into
+    /// JSON with `{file:?}` and splice it in with `{file}`.
+    impl std::fmt::Debug for TempFile {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(&self.path, f)
+        }
+    }
+
+    impl std::fmt::Display for TempFile {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.path)
+        }
+    }
+
+    /// Write bytes to a fresh temp file: construction tests
+    /// need real files (a presets file, a fallback image, an
+    /// encoder program) without committing fixtures. Each
+    /// starts in an empty directory, so no test sees a file
+    /// an earlier test process left (issue #526). The file
+    /// is named after its tag too, so two files that must
+    /// differ only in content (the fingerprint tests) differ
+    /// in more than their directory.
+    fn temp_file(tag: &str, contents: &[u8]) -> TempFile {
+        let dir = crate::test_support::scratch_dir(&format!("boot-{tag}"));
+        let path = dir
+            .join(format!("{tag}.tmp"))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&path, contents).unwrap();
+        TempFile { path, _dir: dir }
+    }
+
+    /// A path that does not exist: a name inside a scratch
+    /// directory that is removed again before this returns.
     fn missing_path(tag: &str) -> String {
-        std::env::temp_dir()
-            .join(format!(
-                "crabcrop-boot-missing-{tag}-{}.tmp",
-                std::process::id()
-            ))
+        crate::test_support::scratch_dir(&format!("boot-missing-{tag}"))
+            .join("missing.tmp")
             .to_string_lossy()
             .into_owned()
     }
@@ -3129,12 +3176,22 @@ mod tests {
     #[test]
     fn upload_store_construction_follows_the_destination_rules() {
         let plain = SourceConfig::default();
+        // Built where the temp dir is, never at a fixed
+        // /tmp: TMPDIR moves it (issue #526).
+        let scratch = crate::test_support::scratch_dir("boot-upload");
+        let root_dir = scratch.join("root");
+        std::fs::create_dir(&root_dir).unwrap();
+        let root = root_dir.to_string_lossy().into_owned();
+        let uploads = root_dir.join("uploads").to_string_lossy().into_owned();
+        // Its name starts with the root's, and it is not
+        // under the root.
+        let sibling = scratch.join("root-other").to_string_lossy().into_owned();
         // Neither destination: uploads are off, not an error.
         assert!(build_upload_store(env_of(&[]), &plain).unwrap().is_none());
         // Both destinations: a startup error.
         let err = expect_err(build_upload_store(
             env_of(&[
-                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_DIR", uploads.as_str()),
                 ("CRABCROP_UPLOAD_BUCKET", "uploads"),
             ]),
             &plain,
@@ -3142,16 +3199,17 @@ mod tests {
         assert!(err.contains("exactly one upload destination"), "{err}");
         // A local destination constructs with the defaults:
         // 10 MB cap (the source cap), overwrite off.
-        let store = build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", "/tmp")]), &plain)
-            .unwrap()
-            .unwrap();
+        let store =
+            build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", uploads.as_str())]), &plain)
+                .unwrap()
+                .unwrap();
         assert_eq!(store.max_bytes, 10 * 1024 * 1024);
         assert!(!store.allow_overwrite);
         assert!(store.local_dir().is_some());
         // The cap may only move down from the source cap.
         let err = expect_err(build_upload_store(
             env_of(&[
-                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_DIR", uploads.as_str()),
                 ("CRABCROP_UPLOAD_MAX_MB", "11"),
             ]),
             &plain,
@@ -3159,7 +3217,7 @@ mod tests {
         assert!(err.contains("CRABCROP_UPLOAD_MAX_MB"), "{err}");
         let store = build_upload_store(
             env_of(&[
-                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_DIR", uploads.as_str()),
                 ("CRABCROP_UPLOAD_MAX_MB", "2"),
                 ("CRABCROP_UPLOAD_ALLOW_OVERWRITE", "true"),
             ]),
@@ -3171,22 +3229,27 @@ mod tests {
         assert!(store.allow_overwrite);
         // A local destination outside a configured file
         // root is refused: its objects could never serve.
-        let rooted = build_source_config(env_of(&[(
-            "CRABCROP_FILE_ROOT",
-            std::env::temp_dir().to_string_lossy().as_ref(),
-        )]))
-        .unwrap();
-        // /tmp IS the temp dir here, so it is under the root.
-        assert!(
-            build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", "/tmp")]), &rooted)
+        let rooted = build_source_config(env_of(&[("CRABCROP_FILE_ROOT", root.as_str())])).unwrap();
+        // The root itself and a directory inside it are under
+        // it, and their objects are named from the root.
+        for (dir, object) in [
+            (root.as_str(), "file:///a.jpg"),
+            (uploads.as_str(), "file:///uploads/a.jpg"),
+        ] {
+            let store = build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", dir)]), &rooted)
                 .unwrap()
-                .is_some()
-        );
-        let err = expect_err(build_upload_store(
-            env_of(&[("CRABCROP_UPLOAD_DIR", "/")]),
-            &rooted,
-        ));
-        assert!(err.contains("CRABCROP_FILE_ROOT"), "{err}");
+                .unwrap();
+            assert_eq!(store.source_ref("a.jpg"), object, "{dir}");
+        }
+        // The check compares path components, not strings:
+        // the sibling is refused like `/`.
+        for outside in ["/", sibling.as_str()] {
+            let err = expect_err(build_upload_store(
+                env_of(&[("CRABCROP_UPLOAD_DIR", outside)]),
+                &rooted,
+            ));
+            assert!(err.contains("CRABCROP_FILE_ROOT"), "{outside}: {err}");
+        }
         // A bucket destination with credentials must be in
         // the readable allowlist, or its objects could
         // never serve back.
@@ -3226,8 +3289,10 @@ mod tests {
     fn the_upload_cap_follows_the_source_fetch_cap() {
         const MB: u64 = 1024 * 1024;
         let plain = SourceConfig::default();
+        let scratch = crate::test_support::scratch_dir("boot-upload-cap");
+        let dir = scratch.to_string_lossy().into_owned();
         let upload = |pairs: &[(&str, &str)]| {
-            let mut all = vec![("CRABCROP_UPLOAD_DIR", "/tmp")];
+            let mut all = vec![("CRABCROP_UPLOAD_DIR", dir.as_str())];
             all.extend_from_slice(pairs);
             build_upload_store(env_of(&all), &plain)
         };
@@ -3711,8 +3776,7 @@ mod tests {
         // An executable renderer whose pdfinfo sibling is
         // missing is refused at boot too: the pair is the
         // contract.
-        let dir = std::env::temp_dir().join(format!("crabcrop-boot-pdf-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("boot-pdf");
         let renderer_path = dir.join("pdftocairo");
         std::fs::write(&renderer_path, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&renderer_path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3733,6 +3797,74 @@ mod tests {
         ]))
         .unwrap();
         assert!(renderer.is_some());
+    }
+
+    /// Issue #526: these construction tests once named
+    /// their files after the process ID alone, and a later
+    /// test process that drew a recycled ID found what an
+    /// earlier one had left: a `pdfinfo` next to the
+    /// renderer, scripts already marked executable. Their
+    /// "missing" and "not executable" refusals then
+    /// constructed. Plant those leftovers under this
+    /// process's ID and run the three tests over them, each
+    /// twice: under a name built from the ID alone, however
+    /// spelled, the second run would meet what the first one
+    /// left.
+    #[cfg(unix)]
+    #[test]
+    fn construction_tests_ignore_files_left_under_a_reused_pid() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let pid = std::process::id();
+        let temp = std::env::temp_dir();
+        let pdf_dir = temp.join(format!("crabcrop-boot-pdf-{pid}"));
+        // Only what this test creates is removed afterwards:
+        // a file already under one of these names is the same
+        // kind of leftover, and not this test's to delete.
+        let made_pdf_dir = std::fs::create_dir(&pdf_dir).is_ok();
+        let mut planted = Vec::new();
+        for path in [
+            pdf_dir.join("pdfinfo"),
+            temp.join(format!("crabcrop-boot-encoder-plain-{pid}.tmp")),
+            temp.join(format!("crabcrop-boot-decoder-plain-{pid}.tmp")),
+        ] {
+            let Ok(mut file) = std::fs::File::create_new(&path) else {
+                continue;
+            };
+            file.write_all(b"#!/bin/sh\n").unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            planted.push(path);
+        }
+        let tests: [(&str, fn()); 3] = [
+            (
+                "pdf_renderer_construction_validates_both_programs",
+                pdf_renderer_construction_validates_both_programs,
+            ),
+            (
+                "video_construction_validates_the_encoder_program",
+                video_construction_validates_the_encoder_program,
+            ),
+            (
+                "video_decoder_construction_validates_the_program",
+                video_decoder_construction_validates_the_program,
+            ),
+        ];
+        let failed: Vec<&str> = tests
+            .into_iter()
+            .filter(|(_, test)| (0..2).any(|_| std::panic::catch_unwind(test).is_err()))
+            .map(|(name, _)| name)
+            .collect();
+        for path in &planted {
+            let _ = std::fs::remove_file(path);
+        }
+        if made_pdf_dir {
+            let _ = std::fs::remove_dir(&pdf_dir);
+        }
+        assert!(
+            failed.is_empty(),
+            "failed over the planted files: {failed:?}"
+        );
     }
 
     #[test]
