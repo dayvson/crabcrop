@@ -38,12 +38,21 @@ fn free_port() -> u16 {
 
 /// One raw HTTP/1.0 GET: (status, body, time taken).
 fn get(port: u16, path: &str) -> (u16, Vec<u8>, Duration) {
+    get_with(port, path, "")
+}
+
+/// [`get`] with extra header lines, each ending in CRLF.
+fn get_with(port: u16, path: &str, headers: &str) -> (u16, Vec<u8>, Duration) {
     let started = Instant::now();
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(90)))
         .unwrap();
-    write!(stream, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{headers}\r\n"
+    )
+    .unwrap();
     let mut raw = Vec::new();
     let _ = stream.read_to_end(&mut raw);
     let split = raw
@@ -84,6 +93,7 @@ fn boot(root: &Path, extra_env: &[(&str, &str)]) -> (ServerGuard, u16) {
         .env("CRABCROP_ALLOW_UNSAFE", "1")
         .env("CRABCROP_FILE_ROOT", root)
         .env("CRABCROP_CACHE_MAX_MB", "0")
+        .env("CRABCROP_METRICS_TOKEN", METRICS_TOKEN)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     for (name, value) in extra_env {
@@ -101,6 +111,23 @@ fn boot(root: &Path, extra_env: &[(&str, &str)]) -> (ServerGuard, u16) {
         assert!(Instant::now() < deadline, "the server never answered");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+const METRICS_TOKEN: &str = "svg-isolation-metrics-token";
+
+/// The process lane permits in use, from `/metrics`.
+fn process_lane_in_use(port: u16) -> u32 {
+    let (status, body, _) = get_with(
+        port,
+        "/metrics",
+        &format!("Authorization: Bearer {METRICS_TOKEN}\r\n"),
+    );
+    assert_eq!(status, 200);
+    String::from_utf8_lossy(&body)
+        .lines()
+        .find_map(|line| line.strip_prefix("crabcrop_lane_in_use{lane=\"process\"} "))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("a process lane gauge")
 }
 
 const OK_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#336699"/><circle cx="100" cy="50" r="30" fill="#ffcc00"/></svg>"##;
@@ -173,6 +200,10 @@ fn slow_svg() -> String {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "only Linux enforces the worker's address-space cap; elsewhere the arc allocates until the deadline"
+)]
 fn hostile_svgs_fail_alone_while_the_server_keeps_serving() {
     let dir = source_dir("hostile");
     let (mut server, port) = boot(&dir, &[]);
@@ -245,7 +276,18 @@ fn a_render_past_the_deadline_is_a_504_and_its_worker_dies() {
     // for a loaded test host.
     assert!(took < Duration::from_secs(15), "the 504 took {took:?}");
     // The worker was killed at the deadline, not left to
-    // render on behind the 504.
+    // render on behind the 504: the render gives its process
+    // lane permit back, where an in-process render detached
+    // at its 504 would hold it until it finished, minutes
+    // from now.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_lane_in_use(port) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the render still holds its lane after the 504"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     #[cfg(target_os = "linux")]
     {
         let deadline = Instant::now() + Duration::from_secs(5);

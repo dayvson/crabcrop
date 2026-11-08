@@ -13,11 +13,14 @@
 //! on stdin, and reads the intrinsic size and the RGBA
 //! raster back on stdout. The child caps its own address
 //! space and CPU time with `setrlimit` as it starts (on
-//! itself, so the caps hold on macOS too), parses and
-//! renders on a thread with a bounded stack, and is killed
-//! with its process group at the wall-clock deadline. An
-//! abort, a stack overflow, a spin, or an allocation storm
-//! ends the child alone; the request answers with the
+//! itself, so the CPU cap holds on macOS too; macOS accepts
+//! the address-space cap but does not enforce it), parses
+//! and renders on a thread with a bounded stack, and is
+//! killed with its process group at the wall-clock
+//! deadline. An abort, a stack overflow, a spin, or an
+//! allocation storm ends the child alone (where the cap is
+//! not enforced, an allocation storm runs until the
+//! deadline); the request answers with the
 //! documented refusal, and every other request carries on.
 //!
 //! One child serves one document. A pool of long-lived
@@ -376,8 +379,10 @@ pub(super) fn run(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_clear()
-        .current_dir(std::env::temp_dir());
+        // No `current_dir`: the worker reads no relative path,
+        // and a chdir into a missing directory (a TMPDIR that
+        // does not exist) would fail every SVG at spawn.
+        .env_clear();
     for name in FONT_ENV {
         if let Some(value) = std::env::var_os(name) {
             cmd.env(name, value);

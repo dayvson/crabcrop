@@ -113,7 +113,9 @@ pub(crate) fn limit_child(pid: u32, cpu_limit: Duration, max_address_space: u64)
 /// Apply the resource limits to the calling process
 /// itself (issue #447): the SVG worker caps itself as it
 /// starts. `setrlimit` on oneself works on every Unix,
-/// macOS included, unlike `prlimit` on another process.
+/// macOS included, unlike `prlimit` on another process
+/// (macOS accepts the address-space limit but does not
+/// enforce it; the CPU and core limits hold there).
 /// A limit is never raised past the hard limit the process
 /// inherited, and one the platform refuses is skipped (the
 /// parent's wall-clock kill stays the bound that always
