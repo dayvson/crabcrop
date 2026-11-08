@@ -1,14 +1,15 @@
 //! One runner for the external tools (issue #481): the
-//! frame extractor (frames.rs) and the PDF tools (pdf.rs)
-//! start their operator-configured programs through
-//! [`run_tool`], which holds the whole discipline in one
-//! place: no shell, an empty environment, the temporary
-//! directory as the working directory, the program's own
-//! process group (killed whole at the deadline or the
-//! output cap), a capped stdout, a drained stderr, and the
-//! kernel limits below. A tool module keeps only its argv,
-//! its input, its caps, and how a [`ToolError`] reads in
-//! its own error type.
+//! frame extractor (frames.rs), the PDF tools (pdf.rs), and
+//! the video encoder (video.rs) start their
+//! operator-configured programs through `run_tool`, which
+//! holds the whole discipline in one place: no shell, an
+//! empty environment, the temporary directory as the
+//! working directory, the program's own process group
+//! (killed whole at the deadline or the output cap), a
+//! capped stdout, a drained stderr, and the kernel limits
+//! below. A tool module keeps only its argv, its input, its
+//! caps, and how a `ToolError` reads in its own error
+//! type.
 //!
 //! The resource bounds (issue #362): the wall-clock
 //! timeouts kill the process group, but the children also
@@ -35,7 +36,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -50,7 +51,18 @@ pub(crate) enum ToolInput<'a> {
     /// tool that reads slowly, or not at all, never blocks
     /// the caller.
     Bytes(&'a [u8]),
+    /// A feeder that writes the input itself, on the writer
+    /// thread, for input too large to build up front (the
+    /// video encoder's frames, each repeated for its
+    /// scheduled count). Stdin closes when it returns. A
+    /// failed write means the tool stopped reading, and its
+    /// exit status and output say why, so the feeder's error
+    /// is dropped.
+    Writer(Feed),
 }
+
+/// The feeder behind [`ToolInput::Writer`].
+pub(crate) type Feed = Box<dyn FnOnce(&mut ChildStdin) -> std::io::Result<()> + Send>;
 
 /// One run of an external tool: the program, its argv, its
 /// input, and the bounds the run obeys.
@@ -176,9 +188,14 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
         deadline,
         cpu_limit,
     } = command;
-    let (stdin, feed) = match input {
+    let (stdin, feed): (Stdio, Option<Feed>) = match input {
         ToolInput::File(file) => (Stdio::from(file), None),
-        ToolInput::Bytes(bytes) => (Stdio::piped(), Some(bytes.to_vec())),
+        ToolInput::Bytes(bytes) => {
+            let bytes = bytes.to_vec();
+            let feed = move |stdin: &mut ChildStdin| stdin.write_all(&bytes);
+            (Stdio::piped(), Some(Box::new(feed)))
+        }
+        ToolInput::Writer(feed) => (Stdio::piped(), Some(feed)),
     };
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -204,10 +221,10 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     let mut child = cmd.spawn().map_err(ToolError::Spawn)?;
     limit_child(child.id(), cpu_limit, TOOL_MAX_ADDRESS_SPACE);
 
-    let writer = feed.map(|input| {
+    let writer = feed.map(|feed| {
         let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
         std::thread::spawn(move || {
-            let _ = stdin_pipe.write_all(&input);
+            let _ = feed(&mut stdin_pipe);
         })
     });
 
