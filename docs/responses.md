@@ -56,7 +56,7 @@ Operational failures carry these codes:
 | `invalid_path` | `400` | An explain, purge, purge-group, or upload path does not have the route's shape. |
 | `meta_not_available` | `400` | Meta was asked for a video or debug output, which serves no image to describe. |
 | `meta_disabled` | `403` | Meta mode is switched off on this server (`CRABCROP_META_MODE=0`). |
-| `not_found` | `404` | A `PUT` to a path that is not the upload route. |
+| `not_found` | `404` | A `PUT` to a path that is not the upload route. On a server without uploads configured, that includes a `PUT` to `/upload/...`. |
 | `metrics_disabled` | `403` | `GET /metrics` when no `CRABCROP_METRICS_TOKEN` is configured. |
 | `metrics_unauthorized` | `401` | `GET /metrics` with a missing or wrong bearer token. |
 | `source_forbidden` | `403` | The source policy refused the source URL. |
@@ -78,9 +78,9 @@ Operational failures carry these codes:
 | `pdf_render_failed` | `502` | The configured PDF renderer failed. |
 | `processing_timeout` | `504` | Processing ran past the process deadline. |
 | `processing_failed` | `500` | The processing job itself failed. |
-| `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate waited past its timeout; the response carries `Retry-After`. |
+| `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate, or the source buffer budget (`CRABCROP_SOURCE_BUFFER_MAX_MB`), waited past its timeout; the response carries `Retry-After`. |
 | `invalid_purge_group` | `400` | A purge-group name is empty or contains a slash. |
-| `uploads_not_configured` | `404` | A `PUT` to `/upload/...` when uploads are not configured. |
+| `uploads_not_configured` | `404` | Reserved for a `PUT` to `/upload/...` when uploads are not configured. Not sent today: without an upload destination the route is not registered, so that request answers `not_found`. |
 | `invalid_upload_name` | `400` | The upload name is not valid. |
 | `upload_too_large` | `413` | The upload body is larger than the cap. |
 | `upload_not_an_image` | `415` | The upload body is empty or does not decode as an image. |

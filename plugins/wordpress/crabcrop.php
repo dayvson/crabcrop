@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Crabcrop
  * Plugin URI:        https://crabcrop.org
- * Description:       Serve this site's media through a self-hosted crabcrop instance. Rewrites media URLs (featured images, post content, and srcset) to crabcrop URLs; the media library itself is untouched, and unmapped sizes and any misconfiguration fall back to the original URLs.
+ * Description:       Serve this site's media through a self-hosted crabcrop instance. Rewrites media URLs (featured images, post content, and srcset) to crabcrop URLs; the media library itself is untouched, and unmapped sizes and incomplete plugin settings fall back to the original URLs.
  * Version:           0.9.11
  * Author:            crabcrop contributors
  * License:           MIT
@@ -177,8 +177,10 @@ function crabcrop_wp_size_map_to_text($map)
  * The failure rule everywhere: if anything is off (no base URL, a
  * signed mode without a secret, an unmapped size, a URL that is not
  * this site's own media, or input the builder rejects), the original
- * URL is returned unchanged. A crabcrop outage or a configuration
- * mistake must never break an image on the site.
+ * URL is returned unchanged, so a plugin configuration mistake never
+ * breaks an image on the site. The plugin never contacts the
+ * instance, so a crabcrop outage or a server-side mismatch (a
+ * missing preset, a different secret) is not caught here.
  */
 
 /** True when $url lives under this site's uploads directory. */

@@ -288,8 +288,9 @@ pub(in crate::server) struct ProcessJob {
     pub(in crate::server) preferred: Option<ImageFormat>,
     /// Watermark images as (URL, fetched bytes) pairs: the
     /// decode happens inside the gated blocking job, not in
-    /// the async handler (audit R2-16).
-    pub(in crate::server) watermark_sources: Vec<(String, Vec<u8>)>,
+    /// the async handler (audit R2-16). Shared, so cloning
+    /// the job for a run never copies them (issue #403).
+    pub(in crate::server) watermark_sources: Arc<WatermarkSources>,
     pub(in crate::server) placeholders: bool,
     pub(in crate::server) mask_provider: Option<Arc<dyn crate::ai::MaskProvider>>,
     pub(in crate::server) upscale_provider: Option<Arc<dyn crate::ai::UpscaleProvider>>,
@@ -319,6 +320,20 @@ pub(in crate::server) struct ProcessJob {
     pub(in crate::server) brand_color: Option<[u8; 3]>,
     pub(in crate::server) avif_speed: u8,
     pub(in crate::server) jxl_speed: jixel::Speed,
+}
+
+/// A request's watermark images, with their share of the
+/// source buffer budget (issue #403). A run and its
+/// fallback retry share one copy; the share returns to the
+/// budget when the last holder drops it, after the images
+/// (fields drop in declaration order), so the budget never
+/// reports less than what is still buffered.
+#[derive(Default)]
+pub(in crate::server) struct WatermarkSources {
+    pub(in crate::server) images: Vec<(String, Vec<u8>)>,
+    /// Held only to be dropped after `images`.
+    #[allow(dead_code)]
+    pub(in crate::server) share: Option<crate::loader::SourceCharge>,
 }
 
 /// Why a gated engine run produced no image.
@@ -351,6 +366,13 @@ pub(in crate::server) enum ProcessFailure {
 /// before the server sheds it with a 503.
 pub(in crate::server) const PROCESS_GATE_WAIT: std::time::Duration =
     std::time::Duration::from_secs(5);
+
+/// How long a cache miss, or an upload, may wait in total
+/// for source buffer budget before the server sheds it with
+/// a 503 (issue #403): the stills gate's wait, since every
+/// miss, still or slow, charges its bytes before the gates,
+/// and a share frees as soon as a render ends.
+pub(in crate::server) const SOURCE_BUDGET_WAIT: std::time::Duration = PROCESS_GATE_WAIT;
 
 /// Which processing lane an engine run takes its permit
 /// from (issue #324). The lanes are fully separate: a run
@@ -488,19 +510,45 @@ pub(in crate::server) struct JobPermits {
     pub(in crate::server) anim: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+/// The source bytes a run takes over (issue #403), with
+/// their share of the source buffer budget: the blocking
+/// job owns both, so the bytes are never copied for it,
+/// and the share returns to the budget only after the job
+/// has released the bytes, even when the runner has
+/// already shed the request.
+pub(in crate::server) struct JobSource {
+    pub(in crate::server) bytes: Vec<u8>,
+    pub(in crate::server) share: Option<crate::loader::SourceCharge>,
+}
+
+/// Tests lend their fixture bytes by reference; the copy
+/// is theirs, and the run holds no budget share.
+#[cfg(test)]
+impl From<&Vec<u8>> for JobSource {
+    fn from(bytes: &Vec<u8>) -> Self {
+        JobSource {
+            bytes: bytes.clone(),
+            share: None,
+        }
+    }
+}
+
 /// Run the engine under its lane's gate (issue #324) on
 /// a blocking thread, so CPU-bound work neither stalls
 /// the async workers nor multiplies unboundedly under a
 /// burst of cache misses. Cache hits never reach this
-/// function.
+/// function. The run takes the source by value (issue
+/// #403): the blocking job owns the bytes, with their
+/// budget share, instead of copying them.
 pub(in crate::server) async fn run_process(
     state: &AppState,
     job: &ProcessJob,
-    bytes: &[u8],
+    source: impl Into<JobSource>,
     lane: Lane,
     deadline: std::time::Instant,
     permits: JobPermits,
 ) -> Result<crate::engine::ProcessedImage, ProcessFailure> {
+    let source: JobSource = source.into();
     // The run takes its permit from its lane's gate only
     // (issue #324): a slow-lane run never touches a
     // stills permit, and a still never waits behind the
@@ -515,7 +563,6 @@ pub(in crate::server) async fn run_process(
         _ => return Err(ProcessFailure::Busy),
     };
     let job = job.clone();
-    let bytes = bytes.to_vec();
     let engine = state.engine;
     // The processing deadline (issue #260) is the
     // caller's: serve_miss stamps it when the process
@@ -550,6 +597,7 @@ pub(in crate::server) async fn run_process(
         let _ai_permit = permits.ai;
         let _video_permit = permits.video;
         let _anim_permit = permits.anim;
+        let JobSource { bytes, share } = source;
         let declared_refs: Vec<&dyn crate::ai::DetectionProvider> = job
             .declared_detect_providers
             .iter()
@@ -562,9 +610,9 @@ pub(in crate::server) async fn run_process(
         // runtime workers, and a decoder panic on crafted
         // watermark bytes is contained by the same
         // catch_unwind as the engine run (audit R2-16).
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut watermarks = crate::filters::WatermarkImages::new();
-            for (url, wm_bytes) in &job.watermark_sources {
+            for (url, wm_bytes) in &job.watermark_sources.images {
                 let img = crate::engine::decode_image(wm_bytes)?;
                 watermarks.insert(url.clone(), img);
             }
@@ -600,7 +648,14 @@ pub(in crate::server) async fn run_process(
             Ok(Ok(processed)) => Ok(processed),
             Ok(Err(e)) => Err(ProcessFailure::Engine(e)),
             Err(_) => Err(ProcessFailure::Panicked),
-        }
+        };
+        // The source goes before its budget share does
+        // (issue #403), so the budget never reports less
+        // than what this job still holds; the watermarks
+        // carry their own share (see `WatermarkSources`).
+        drop(bytes);
+        drop(share);
+        result
     });
     // Past the deadline plus the grace bound the runner
     // stops waiting and sheds the request with a 504

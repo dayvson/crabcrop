@@ -4,13 +4,18 @@ A provider module for `@nuxt/image` that routes images through your crabcrop dep
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url`.
+1. Install the builder: `npm install @crabcrop/url` (with `@nuxt/image` 1.8 or later, on Nuxt 3 or 4).
 2. Copy [`crabcrop.ts`](crabcrop.ts) into your project, for example as `providers/crabcrop.ts`.
 3. Register it in `nuxt.config`:
 
 ```ts
 export default defineNuxtConfig({
   modules: ["@nuxt/image"],
+  runtimeConfig: {
+    // Server-only. Leave it empty here and set NUXT_CRABCROP_SECRET
+    // in the server's environment; omit it to build unsigned URLs.
+    crabcropSecret: "",
+  },
   image: {
     providers: {
       crabcrop: {
@@ -26,13 +31,17 @@ export default defineNuxtConfig({
 });
 ```
 
-Provider options: `base` (required), `preset` (recommended: the transform policy stays on the server), `secret` (optional, server-only contexts). The provider builds unsigned URLs whenever it runs in the browser; read [Signing and server modes](#signing-and-server-modes) before you deploy it.
+Provider options: `base` (required) and `preset` (recommended: the transform policy stays on the server).
+
+The secret is not a provider option. `@nuxt/image` writes provider options verbatim into the generated `#build/image-options.mjs`, which the client bundle imports, so anything placed there ships to every browser. The provider reads the secret from private runtime config instead (`runtimeConfig.crabcropSecret`, set at runtime with `NUXT_CRABCROP_SECRET`): Nuxt sends the browser only the `public` part of runtime config, and the provider signs only when it runs on the server. If it finds a `secret` provider option it throws. An earlier version of this file accepted one, so if you set it there, it has been in your client bundle: rotate it.
+
+The provider builds unsigned URLs whenever it runs in the browser; read [Signing and server modes](#signing-and-server-modes) before you deploy it.
 
 ## Signing and server modes
 
-`@nuxt/image` calls the provider during server rendering and again in the browser, and every sized image appends its geometry after the preset (one width per srcset entry with `sizes`). The browser calls cannot sign. That decides which server mode fits:
+`@nuxt/image` calls the provider during server rendering and again in the browser (client-side navigation and re-renders), and every sized image appends its geometry after the preset (one width per srcset entry with `sizes`). The browser calls cannot sign. That decides which server mode fits:
 
-- **Signed (production).** Run the server without `CRABCROP_ALLOW_UNSAFE`. Build the URLs in server-only code (a Nitro route under `server/`, reading the secret from private runtime config) with `buildURL` from `@crabcrop/url`, one call per srcset width with `preset:<name>/<width>x0` so the preset still applies (`buildSrcSet` emits bare `{width}x0` entries, without it), and render them with a plain `<img>`. The provider's browser calls produce unsigned URLs, which a signed server answers with `403`.
+- **Signed (production).** Run the server without `CRABCROP_ALLOW_UNSAFE`. With `crabcropSecret` set, the provider signs its server-rendering calls, and the server-side `useImage()` in Nitro routes signs too, but the browser calls produce unsigned URLs, which a signed server answers with `403`. So for pages the browser may re-render, build the URLs in server-only code (a Nitro route under `server/`, reading the secret from private runtime config) with `buildURL` from `@crabcrop/url`, one call per srcset width with `preset:<name>/<width>x0` so the preset still applies (`buildSrcSet` emits bare `{width}x0` entries, without it), and render them with a plain `<img>`.
 - **Presets-only (no secret anywhere).** `CRABCROP_ONLY_PRESETS=1` with `CRABCROP_ALLOW_UNSAFE=1` accepts URLs that carry a preset reference alone and rejects the geometry and filters the provider appends with `400`. It fits only images rendered without size, format, or quality modifiers, with the size inside the preset (`card-640 = 640x0/filters:format(webp)`).
 - **Unsafe alone (local development only).** With `CRABCROP_ALLOW_UNSAFE=1` and presets-only off, the provider works as is, but the server then honors any unsigned operation chain on any public source: the preset constrains nothing, because a client can drop it or append anything after it. That is an open image proxy and CPU sink. Use it to try the provider locally, never as the public deployment.
 
@@ -61,4 +70,6 @@ This provider is maintained in the crabcrop repository. Submission to the Nuxt I
 
 ## Tests
 
-`npm test` in this directory pins the modifier mapping to exact signed URLs (signatures cross-checked with `node:crypto` directly). The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs`; in a real project the installed package resolves it.
+`npm test` in this directory pins the modifier mapping to exact signed URLs (signatures cross-checked with `node:crypto` directly), the refusal of a `secret` provider option, and the browser-side guard. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
+
+[`tests/browser-bundles`](../../tests/browser-bundles) builds a real Nuxt app with `@nuxt/image` and this provider: it checks that the generated `image-options.mjs` and every file under `.output/public` are free of the secret, that the client build pulls in no Node built-in, and that server rendering signs with the secret from `NUXT_CRABCROP_SECRET`.
