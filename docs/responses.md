@@ -44,7 +44,7 @@ With `CRABCROP_FALLBACK_IMAGE` set (a URL, or a path to a local file read at sta
 
 ## Errors
 
-Error bodies are plain text with a short message. Send `Accept: application/json` and any failure instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`: the same status and the same message, plus a stable machine-readable `code` that clients can branch on. The codes are frozen as published: a failure class may be renamed in code, but its code never changes. One exception: a sealed request's failures stay the uniform `403` refusal, with no envelope and no code, so a lifted token reveals nothing about the payload it carries; an opened token whose payload has expired answers `signature_expired`, exactly as the plain form does.
+Error bodies are plain text with a short message. Send `Accept: application/json` and any failure instead answers with the v2 JSON envelope, `{"error":{"code":"invalid_filters","message":"invalid filters segment: filters:bogus(1)"}}`: the same status and the same message, plus a stable machine-readable `code` that clients can branch on. The codes are frozen as published: a failure class may be renamed in code, but its code never changes. One exception: a sealed request's failures stay the uniform `403` refusal, with no envelope and no code, so a lifted token reveals nothing about the payload it carries; an opened token whose payload has expired answers `signature_expired`, exactly as the plain form does. The same header also asks for meta, so with meta mode off (the default) a request that passes the signature and grammar checks answers `403 meta_disabled` there: a later failure (fetching or rendering the source) reports its own code in the envelope only on a server with meta mode on.
 
 Grammar failures (a `400` below) carry the parser's stable names: `empty_path`, `missing_signature`, `malformed_signature`, `invalid_size`, `invalid_crop`, `invalid_crop_rect`, `invalid_pad`, `invalid_expiry`, `unknown_preset`, `invalid_preset`, `unknown_root`, `invalid_root`, `presets_only`, `invalid_filters`, `missing_source_url`, `invalid_focal_rect`, `invalid_focal_point`, `invalid_maxage`, `invalid_debug`, `invalid_curve`, `invalid_convolution`, `invalid_noise`, `invalid_frame`, `invalid_page`. Signature-segment failures on the purge, purge-group, and upload routes carry these codes too.
 
@@ -57,7 +57,7 @@ Operational failures carry these codes:
 | `reserved_segment` | `400` | An image URL begins with a purge or upload segment. |
 | `invalid_path` | `400` | An explain, purge, purge-group, or upload path does not have the route's shape. |
 | `meta_not_available` | `400` | Meta was asked for a video or debug output, which serves no image to describe. |
-| `meta_disabled` | `403` | Meta mode is switched off on this server (`CRABCROP_META_MODE=0`). |
+| `meta_disabled` | `403` | Meta mode is off on this server, which is the default (`CRABCROP_META_MODE` unset or `0`). |
 | `not_found` | `404` | A `PUT` to a path that is not the upload route. |
 | `metrics_disabled` | `403` | `GET /metrics` when no `CRABCROP_METRICS_TOKEN` is configured. |
 | `metrics_unauthorized` | `401` | `GET /metrics` with a missing or wrong bearer token. |
