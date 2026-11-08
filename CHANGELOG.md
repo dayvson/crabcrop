@@ -10,6 +10,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - A step that works out an output size past 16383 px on an axis is refused with `400 unsupported_operation`, as a written size past the limit already is (issue #521). Before, `16383x1/0x2` rendered 32766x2, and so did a fit-in, a crop followed by a resize, `dpr()`, a pad canvas or a rotated canvas that grew a side past the limit; with WebP output these failed with `500` instead. Every URL that rendered within the limit renders the same bytes. `/explain` reports the refusal as `over_dimension`, and its forecast now follows the engine for SVG sources (their raster size), `no_upscale` caps, `rotate(...)` and trims.
 
+- Every output stays within 16383 px per axis (issue #528). A source with a 16384 px side, which decodes, kept that side through a chain with no sizing step: a WebP output failed with `500 image encoding failed`, whether `format(webp)` named it or `Accept` negotiated it, and every other format served 16384 px, past the documented limit. Such a request now answers `400 unsupported_operation` in every format, with a message that asks for a resize or crop, and `/explain` reports it as `over_dimension`; a chain that brings the side within the limit renders as before. Video output no longer pads a 16383 px side up to 16384 for H.264 and VP9: that side crops its last row or column to 16382 instead. A PDF page renders at most 16383 px per axis, one less than before, so a page at the old cap is served without a resize.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added

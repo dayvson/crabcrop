@@ -519,13 +519,35 @@ fn check_output_pixels(width: u32, height: u32) -> Result<(), EngineError> {
 /// `fit-in:0x0`, `rotate(180)`, a width hint or `no_upscale`
 /// held at the source), so it is held to the budget only: a
 /// source at the 16384 px decode ceiling passes through it
-/// as decoded, as it passes through a chain with no sizing
-/// step at all.
+/// as decoded, and a later step can still bring it within
+/// the limit. Whatever the chain leaves at the end is held
+/// to the limit by [`check_final_output`].
 fn check_output_size(width: u32, height: u32, input: (u32, u32)) -> Result<(), EngineError> {
     let max = crate::url::MAX_DIMENSION;
     if (width, height) != input && (width > max || height > max) {
         return Err(EngineError::Unsupported(format!(
             "requested output {width}x{height} exceeds the {max} pixel limit per axis"
+        )));
+    }
+    check_output_pixels(width, height)
+}
+
+/// The last word on size, for the image a chain hands its
+/// encoder: within [`crate::url::MAX_DIMENSION`] per axis,
+/// then within the pixel budget (issue #528). The steps
+/// let a size they did not change pass (see
+/// [`check_output_size`]), so a source at the 16384 px
+/// decode ceiling reached the encoder as decoded when no
+/// step resized it: WebP refused the side with a `500`, and
+/// every other format served an output past the documented
+/// limit. There is no later step to bring the size within
+/// the limit, so this check has no such exemption.
+fn check_final_output(width: u32, height: u32) -> Result<(), EngineError> {
+    let max = crate::url::MAX_DIMENSION;
+    if width > max || height > max {
+        return Err(EngineError::Unsupported(format!(
+            "output {width}x{height} exceeds the {max} pixel limit per axis; \
+             resize or crop it to fit"
         )));
     }
     check_output_pixels(width, height)
@@ -1791,8 +1813,9 @@ impl Engine {
     /// [`crate::video`]. Frame delays travel with the
     /// frames; the encoder side turns them into a constant
     /// frame rate (see `frame_schedule`). The reported
-    /// dimensions are the encoder's: odd dimensions pad up
-    /// to even for 4:2:0.
+    /// dimensions are the encoder's: an odd side pads up to
+    /// even for 4:2:0, or crops down at the per-axis limit
+    /// (see [`crate::video::even_dimension`]).
     fn process_video(
         &self,
         frames: Vec<image::Frame>,
@@ -1860,8 +1883,8 @@ impl Engine {
             bytes,
             format,
             quality: None,
-            width: crate::video::padded_dimension(width),
-            height: crate::video::padded_dimension(height),
+            width: crate::video::even_dimension(width),
+            height: crate::video::even_dimension(height),
             source_width,
             source_height,
             placeholder,
@@ -4005,8 +4028,9 @@ impl<'r, 'a> ChainState<'r, 'a> {
 
     /// Close the chain: render the debug view when
     /// `debug:focal` armed it, check the final image against
-    /// the output budget, and hand back the image with the
-    /// encode options and the records.
+    /// the per-axis limit and the output budget, and hand
+    /// back the image with the encode options and the
+    /// records.
     fn finish(self, mut img: DynamicImage) -> Result<ApplyOutcome, EngineError> {
         if self.debug_armed {
             // The debug view replaces the transform result. With
@@ -4040,8 +4064,10 @@ impl<'r, 'a> ChainState<'r, 'a> {
         }
         // The last word on size: whatever the chain did, the
         // image that goes to the encoder is inside the output
-        // budget (issue #182, audit R2-12).
-        check_output_pixels(img.width(), img.height())?;
+        // budget (issue #182, audit R2-12) and the per-axis
+        // limit (issue #528). The still, animated and video
+        // paths all end here, once per frame.
+        check_final_output(img.width(), img.height())?;
         let inpaint_record = if self.inpaint_regions.is_empty() {
             None
         } else {

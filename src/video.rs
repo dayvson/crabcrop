@@ -37,9 +37,11 @@
 //! Frames are composited over black before encoding: H.264
 //! carries no alpha in any browser-playable profile, and
 //! VP9 alpha is a Chrome-only behavior, so transparency
-//! cannot survive the trip. Odd dimensions are padded by one
-//! pixel (edge-replicated) because 4:2:0 chroma subsampling
-//! needs even width and height.
+//! cannot survive the trip. 4:2:0 chroma subsampling needs
+//! even width and height, so an odd side is padded by one
+//! pixel (edge-replicated), except at the per-axis output
+//! limit, where padding would pass it and the last row or
+//! column is cropped off instead (see [`even_dimension`]).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -138,13 +140,26 @@ pub fn frame_schedule(delays_ms: &[u64]) -> (u32, Vec<u32>) {
     (fps, counts)
 }
 
-/// Pad a dimension up to even, the 4:2:0 requirement.
-pub fn padded_dimension(dimension: u32) -> u32 {
-    dimension + (dimension % 2)
+/// The even side the encoder gets for a frame side, the
+/// 4:2:0 requirement. An odd side pads up by one pixel,
+/// unless that would pass [`crate::url::MAX_DIMENSION`],
+/// the limit every output is held to (issue #528): the
+/// limit is odd itself, so a 16383 px side pads to 16384,
+/// one past it. That side crops down to 16382 instead,
+/// losing its last row or column.
+pub fn even_dimension(dimension: u32) -> u32 {
+    if dimension.is_multiple_of(2) {
+        dimension
+    } else if dimension < crate::url::MAX_DIMENSION {
+        dimension + 1
+    } else {
+        dimension - 1
+    }
 }
 
-/// What one encode will run: padded output dimensions, the
-/// constant frame rate, and the per-frame sample counts.
+/// What one encode will run: the even output dimensions,
+/// the constant frame rate, and the per-frame sample
+/// counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Plan {
     width: u32,
@@ -166,6 +181,16 @@ fn plan(frames: &[VideoFrame]) -> Result<Plan, VideoError> {
             "video frames disagree on dimensions".to_string(),
         ));
     }
+    // The engine's chain already holds every frame to the
+    // limit (issue #528); the plan checks it again, because
+    // `even_dimension` keeps a side within the limit only
+    // when it starts there.
+    let max = crate::url::MAX_DIMENSION;
+    if width > max || height > max {
+        return Err(VideoError::Unsupported(format!(
+            "video frames of {width}x{height} exceed the {max} pixel limit per axis"
+        )));
+    }
     let delays: Vec<u64> = frames.iter().map(|f| f.delay_ms).collect();
     let total_ms: u64 = delays.iter().sum();
     if total_ms > MAX_DURATION_MS {
@@ -177,16 +202,17 @@ fn plan(frames: &[VideoFrame]) -> Result<Plan, VideoError> {
     }
     let (fps, counts) = frame_schedule(&delays);
     Ok(Plan {
-        width: padded_dimension(width),
-        height: padded_dimension(height),
+        width: even_dimension(width),
+        height: even_dimension(height),
         fps,
         counts,
     })
 }
 
-/// Composite one frame over black and pad it (edge
-/// replication) to the plan's dimensions: the exact bytes
-/// one sample sends the encoder.
+/// Composite one frame over black and fit it to the plan's
+/// dimensions, padding by edge replication or cropping the
+/// last row or column at the limit: the exact bytes one
+/// sample sends the encoder.
 fn sample_bytes(frame: &VideoFrame, plan: &Plan) -> Vec<u8> {
     let (sw, sh) = (frame.pixels.width(), frame.pixels.height());
     let mut out = vec![0u8; (plan.width * plan.height * 4) as usize];
@@ -544,6 +570,80 @@ mod tests {
         let sample2 = 6 * 4 * 4;
         assert_eq!(&stdin[sample2..sample2 + 4], &[0, 0, 255, 255]);
         assert_eq!(&stdin[stdin.len() - 4..], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn even_dimension_pads_up_and_crops_down_at_the_limit() {
+        // Issue #528: the limit is odd, so padding its side
+        // up passed it; that one side crops down instead.
+        let max = crate::url::MAX_DIMENSION;
+        assert_eq!(even_dimension(1), 2);
+        assert_eq!(even_dimension(2), 2);
+        assert_eq!(even_dimension(5), 6);
+        assert_eq!(even_dimension(max - 2), max - 1);
+        assert_eq!(even_dimension(max - 1), max - 1);
+        assert_eq!(even_dimension(max), max - 1);
+        for side in 1..=max {
+            let even = even_dimension(side);
+            assert!(
+                even.is_multiple_of(2) && even <= max && even.abs_diff(side) <= 1,
+                "{side} -> {even}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_holds_frames_to_the_output_limit() {
+        let plan_of = |width, height| plan(&[frame(width, height, [1, 2, 3, 255], 100)]);
+        let planned = plan_of(16_383, 3).unwrap();
+        assert_eq!((planned.width, planned.height), (16_382, 4));
+        let planned = plan_of(3, 16_383).unwrap();
+        assert_eq!((planned.width, planned.height), (4, 16_382));
+        // A frame past the limit never reaches the encoder.
+        for (width, height) in [(16_384, 2), (2, 16_384), (16_385, 1)] {
+            let err = plan_of(width, height).unwrap_err();
+            assert!(matches!(err, VideoError::Unsupported(_)), "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                format!("video frames of {width}x{height} exceed the 16383 pixel limit per axis")
+            );
+        }
+    }
+
+    #[test]
+    fn encode_crops_the_odd_edge_at_the_limit() {
+        // A 16383x3 frame goes to the encoder as 16382x4: the
+        // last column is cropped off, the odd row still pads
+        // by replicating the last one (issue #528).
+        let dir = test_dir("crop-at-limit");
+        let argv_file = dir.join("argv.txt");
+        let stdin_file = dir.join("stdin.bin");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf 'FAKE-MP4-BYTES'\n",
+            argv_file.display(),
+            stdin_file.display()
+        );
+        let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
+        let (kept, dropped) = ([0, 250, 0, 255], [250, 0, 0, 255]);
+        let mut wide = frame(16_383, 3, [10, 20, 30, 255], 100);
+        for y in 0..3 {
+            wide.pixels.put_pixel(16_381, y, image::Rgba(kept));
+            wide.pixels.put_pixel(16_382, y, image::Rgba(dropped));
+        }
+        encoder.encode(&[wide], ImageFormat::Mp4).unwrap();
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(argv.lines().any(|arg| arg == "16382x4"), "{argv}");
+        let stdin = std::fs::read(&stdin_file).unwrap();
+        assert_eq!(stdin.len(), 16_382 * 4 * 4);
+        let row = 16_382 * 4;
+        for y in 0..4 {
+            let last = y * row + row - 4;
+            assert_eq!(&stdin[last..last + 4], &kept, "row {y}");
+        }
+        assert!(
+            stdin.chunks(4).all(|px| px != dropped),
+            "the cropped column reached the encoder"
+        );
     }
 
     #[test]

@@ -94,9 +94,18 @@ A size written in the URL is at most 16383 px per axis, the strictest encoder li
 
 The refusal names the size it refused: `requested output 32766x2 exceeds the 16383 pixel limit per axis`.
 
-A source can decode at up to 16384 px per axis (see below), one past the limit. A step that ends at the size it started from works nothing out, so the per-axis limit never refuses it: a chain with no sizing step, `0x0`, `fit-in:0x0`, `rotate(180)`, and a resize that `no_upscale` or a width client hint holds at the source all pass such a source through as decoded. A step that changes the size is held to the limit, a quarter turn included: `origx1` on a 16384x2 source asks for 16384x1, and `rotate(90)` for 2x16384, so both are refused. An SVG source is rasterized before the chain runs, at the size its first resize, `fit-in`, or `crop` asks for and at most 4096 px per axis, and the chain's sizes resolve against that raster.
+A source can decode at up to 16384 px per axis (see below), one past the limit. A step that ends at the size it started from works nothing out, so the per-axis limit does not refuse the step itself: `0x0`, `fit-in:0x0`, `rotate(180)`, and a resize that `no_upscale` or a width client hint holds at the source pass such a source on as decoded, and a later step can still bring it within the limit. A step that changes the size is held to the limit at the step, a quarter turn included: `origx1` on a 16384x2 source asks for 16384x1, and `rotate(90)` for 2x16384, so both are refused. An SVG source is rasterized before the chain runs, at the size its first resize, `fit-in`, or `crop` asks for and at most 4096 px per axis, and the chain's sizes resolve against that raster. A PDF page renders at most 16383 px per axis (see [PDF pages](media.md#pdf-pages)).
 
-The [`/explain`](endpoints.md#self-explaining-urls) forecast applies the same rule to resize, `fit-in`, `crop`, `pad`, and `rotate(...)` steps, and reports `over_dimension: true` for such a chain. It works from the source's stored size and the URL alone, so it does not see an EXIF orientation turn the source, it reports no dimensions from a `trim` on (the trimmed size depends on the pixels), and it leaves out the client hints.
+The image the server encodes is held to the limit too, whatever the chain did. A chain that leaves a side past 16383 px, such as a 16384 px source with no sizing step or no operations at all, fails with `400` (`unsupported_operation`) in every output format, including a WebP negotiated from `Accept`:
+
+```text
+/unsafe/https://example.com/16384x1.png          400: output 16384x1 exceeds the 16383 pixel limit per axis; resize or crop it to fit
+/unsafe/8192x0/https://example.com/16384x1.png   200: 8192x1
+```
+
+Video output needs even sides (H.264 and VP9 subsample color in 2x2 blocks). An odd side pads up by one pixel, except a side at the limit: 16383 px crops its last row or column to 16382 instead of padding past the limit (see [Video output](media.md#video-output)).
+
+The [`/explain`](endpoints.md#self-explaining-urls) forecast applies the same rule to resize, `fit-in`, `crop`, `pad`, and `rotate(...)` steps and to the size the chain ends at, and reports `over_dimension: true` for such a chain. It works from the source's stored size and the URL alone, so it does not see an EXIF orientation turn the source, it reports no dimensions from a `trim` on (the trimmed size depends on the pixels), and it leaves out the client hints.
 
 ### Source images
 

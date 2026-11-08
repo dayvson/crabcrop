@@ -1,6 +1,6 @@
 # Operations
 
-Operations run in the order they appear in the path. Requested outputs are capped at 16383 px per axis and 100 megapixels in total, and so is every size a step works out along the way (a proportional side, a `fit-in` scale, a `dpr` factor): `16383x1/0x2` asks for 32766x2. A request past either bound fails with `400` before anything is allocated; see [Output size](url-grammar.md#output-size).
+Operations run in the order they appear in the path. Requested outputs are capped at 16383 px per axis and 100 megapixels in total, and so is every size a step works out along the way (a proportional side, a `fit-in` scale, a `dpr` factor): `16383x1/0x2` asks for 32766x2. A request past either bound fails with `400` before anything is allocated. The image the server encodes is held to the same cap, so a source with a 16384 px side needs a step that brings it within; see [Output size](url-grammar.md#output-size).
 
 ### Resize
 

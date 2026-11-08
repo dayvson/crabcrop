@@ -14032,7 +14032,10 @@ async fn computed_sizes_past_max_dimension_answer_400() {
 /// the hint's `Wx0` op is held at the source by its
 /// `no_upscale`, so it keeps the size it started from and
 /// works nothing out. The first cut of the per-axis check
-/// refused it, turning an advisory hint into a 400.
+/// refused it at the step, turning an advisory hint into a
+/// 400. Since issue #528 the output itself is held to the
+/// limit, so the URL answers 400 with and without a hint,
+/// for the same reason.
 #[tokio::test]
 async fn a_width_hint_passes_a_decode_ceiling_source_through() {
     let src = spawn_bytes_server(png_of(1, 16384)).await;
@@ -14044,9 +14047,92 @@ async fn a_width_hint_passes_a_decode_ceiling_source_through() {
         &[("Width", "3840"), ("Sec-CH-DPR", "2")][..],
     ] {
         let resp = get_with_headers(&base, &remainder, hints).await;
-        assert_eq!(resp.status(), StatusCode::OK, "{hints:?}");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{hints:?}");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "output 1x16384 exceeds the 16383 pixel limit per axis; resize or crop it to fit",
+            "{hints:?}"
+        );
+    }
+}
+
+/// A source at the 16384 px decode ceiling, one past the
+/// output limit, rendered through a chain that keeps that
+/// side (issue #528). WebP cannot encode it: a negotiated
+/// or named WebP answered `500 image encoding failed`,
+/// still or animated, and other formats served 16384 px.
+/// Every such request now answers the documented `400`,
+/// and a resize within the limit renders, as WebP too.
+#[tokio::test]
+async fn a_decode_ceiling_source_answers_400_never_500() {
+    let still = spawn_bytes_server(png_of(16384, 1)).await;
+    let delay = image::Delay::from_numer_denom_ms(100, 1);
+    let frames: Vec<image::Frame> = [[255, 0, 0, 255], [0, 0, 255, 255]]
+        .into_iter()
+        .map(|rgba| {
+            let pixels = image::RgbaImage::from_pixel(16384, 1, image::Rgba(rgba));
+            image::Frame::from_parts(pixels, 0, 0, delay)
+        })
+        .collect();
+    let mut gif = Vec::new();
+    image::codecs::gif::GifEncoder::new(&mut gif)
+        .encode_frames(frames)
+        .unwrap();
+    let animated = spawn_bytes_server(gif).await;
+    let base = spawn_app(true).await;
+    let browser = "image/avif;q=0,image/webp,image/apng,image/*,*/*;q=0.8";
+    let refused = "output 16384x1 exceeds the 16383 pixel limit per axis; resize or crop it to fit";
+    for src in [&still, &animated] {
+        for (ops, accept) in [
+            ("", browser),
+            ("filters:format(webp)/", "*/*"),
+            ("", "*/*"),
+            ("filters:grayscale()/", browser),
+        ] {
+            let url = format!("{base}/unsafe/{ops}{src}");
+            let plain = client()
+                .get(&url)
+                .header("accept", accept)
+                .send()
+                .await
+                .unwrap();
+            let json = client()
+                .get(&url)
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_error_modes(
+                plain,
+                json,
+                StatusCode::BAD_REQUEST,
+                "unsupported_operation",
+                refused,
+            )
+            .await;
+        }
+        // `/explain` forecasts the same refusal.
+        let resp = client()
+            .get(format!("{base}/explain/unsafe/{src}"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let report: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(report["forecast"]["over_dimension"], true, "{src}");
+        // A resize within the limit renders as the
+        // negotiated WebP.
+        let resp = client()
+            .get(format!("{base}/unsafe/8192x0/{src}"))
+            .header("accept", browser)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{src}");
+        assert_eq!(resp.headers()["content-type"], "image/webp", "{src}");
         let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
-        assert_eq!((img.width(), img.height()), (1, 16384), "{hints:?}");
+        assert_eq!((img.width(), img.height()), (8192, 1), "{src}");
     }
 }
 
