@@ -3483,13 +3483,6 @@ async fn serve_miss(
         put_disk_tier(state, write_snapshot, &cache_key, &entry).await;
     }
     record.bytes_out = processed.bytes.len();
-    // The render's AI permit drained with its job:
-    // run_process holds it until the work finishes, which
-    // on this success path has already happened, so the
-    // gate is free and the annotation paths acquire it per
-    // section like any other request. (The request's own
-    // AI permit does not outlive the run, audit R2-29.)
-    let ai_gated = false;
     // The annotation sections share one deadline, the
     // same process budget the render ran under: a
     // section that has not answered when it passes is
@@ -3504,7 +3497,7 @@ async fn serve_miss(
     let annotation = if meta {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(annotation_deadline),
-            annotate_meta(state, &processed, ai_gated),
+            annotate_meta(state, &processed),
         )
         .await
         .ok()
@@ -3515,7 +3508,7 @@ async fn serve_miss(
     let detections = if meta && wants_detections(accept) {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(annotation_deadline),
-            detect_meta(state, &processed, ai_gated),
+            detect_meta(state, &processed),
         )
         .await
         .ok()
@@ -3527,7 +3520,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                moderate_meta(state, &processed, ai_gated),
+                moderate_meta(state, &processed),
             )
             .await
             {
@@ -3547,7 +3540,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                embed_meta(state, &processed, ai_gated),
+                embed_meta(state, &processed),
             )
             .await
             {
@@ -3563,7 +3556,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                ocr_meta(state, &processed, ai_gated, annotation_deadline),
+                ocr_meta(state, &processed, annotation_deadline),
             )
             .await
             {

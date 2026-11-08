@@ -697,12 +697,17 @@ impl Default for ProcessContext<'_> {
 /// sources (issue #261): the animated paths apply the
 /// chain per frame, so one request would run inference
 /// up to 200 times and hold an AI gate permit for
-/// minutes to hours. The set mirrors the AI gate's own
-/// (`RequestDirectives::uses_ai`) minus saliency smart
-/// crop, which is bounded pixel work, not inference,
-/// and stays available on animated sources under the
-/// processing deadline. A still spelling of the same
-/// source (a `frame:` selection renders one frame)
+/// minutes to hours. The set is the AI gate's own
+/// (`RequestDirectives::uses_ai_beyond_smart_crop`): a
+/// smart crop stays available on animated sources under
+/// the processing deadline. Its focal analysis is the
+/// built-in saliency statistic, or, with a face or focal
+/// provider configured, an inference that takes the AI
+/// gate like any other (issue #379). An animated image
+/// render runs that analysis once, on the first frame,
+/// and replays the window (issue #376); a video render
+/// still runs it on every frame. A still spelling of the
+/// same source (a `frame:` selection renders one frame)
 /// runs these operations normally.
 fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), EngineError> {
     let inference_bound = directives.removebg
@@ -4249,12 +4254,6 @@ pub(in crate::engine) use encode::{
     EncodeBuffers, encode, gif_frame_quantized, max_quality_attempts, next_quality,
 };
 
-/// Overlay `wm` onto `base` at (x, y) with `alpha` percent
-/// opacity, honoring the watermark's own alpha channel.
-/// Negative coordinates anchor from the right/bottom edges
-/// (x = -1 puts the watermark's right edge one pixel from the
-/// base's right edge). Parts falling outside the base are
-/// clipped, never a panic.
 /// One channel of a blend mode: the CSS formulas on the
 /// 0-255 scale (`b` is the base channel, `o` the overlay's).
 fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
@@ -4358,6 +4357,12 @@ fn blend_overlay(
     Ok(DynamicImage::ImageRgba8(out))
 }
 
+/// Overlay `wm` onto `base` at (x, y) with `alpha` percent
+/// opacity, honoring the watermark's own alpha channel.
+/// Negative coordinates anchor from the right/bottom edges
+/// (x = -1 puts the watermark's right edge one pixel from the
+/// base's right edge). Parts falling outside the base are
+/// clipped, never a panic.
 fn overlay_watermark(
     base: &DynamicImage,
     wm: &DynamicImage,
@@ -4670,9 +4675,6 @@ pub(crate) fn resize_lanczos3_cropped(
     }
 }
 
-/// Scale proportionally to fit inside the `fit-in` box, preserving
-/// aspect and never distorting. A 0 dimension bounds nothing;
-/// `orig` bounds at the source dimension (a scale of 1).
 /// Pad `img` to exactly `target_w` x `target_h`: fit the image
 /// inside the box (the fit-in rules, `no_upscale` cap included),
 /// center it, and fill the rest of the canvas: a solid color
@@ -4771,6 +4773,12 @@ fn fit_in_box(size: &ImageSize, sw: u32, sh: u32, adaptive: bool) -> ImageSize {
     }
 }
 
+/// Scale proportionally to fit inside the `fit-in` box, preserving
+/// aspect and never distorting. A 0 dimension bounds nothing;
+/// `orig` bounds at the source dimension (a scale of 1). The box
+/// scales by `dpr` first, and with `adaptive` its axes swap to
+/// match the source's orientation (see [`fit_in_box`]); `cap`
+/// then shrinks the result to fit inside it (`no_upscale`).
 fn apply_fit_in(
     img: DynamicImage,
     size: &ImageSize,

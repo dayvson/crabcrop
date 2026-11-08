@@ -6532,15 +6532,14 @@ async fn meta_includes_the_inpaint_record() {
 }
 
 #[tokio::test]
-async fn meta_annotations_reuse_the_requests_ai_permit() {
+async fn ai_render_meta_sections_acquire_the_gate_after_the_render() {
     // A removebg request (AI use) answering meta on a
     // one-permit AI gate: the annotations must not wait
     // out the full gate timeout and silently drop both
-    // the tags and the detections (audit R2-29). They
-    // once ran under the permit the request held for
-    // its render; that permit now drains with the
-    // render job itself, so by annotation time the gate
-    // is free and the sections acquire it directly.
+    // the tags and the detections (audit R2-29). The
+    // render's permit drains with its job, so by
+    // annotation time the gate is free and each section
+    // acquires the one permit in turn.
     let src = spawn_image_server().await;
     let base = spawn_app_with_ai_and_meta().await;
     let remainder = format!("filters:removebg:format(png)/{src}");
@@ -10228,7 +10227,7 @@ async fn a_timed_out_annotation_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        annotate_meta(&state, &processed, false),
+        annotate_meta(&state, &processed),
     )
     .await
     .is_err();
@@ -10249,7 +10248,7 @@ async fn a_timed_out_moderation_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        moderate_meta(&state, &processed, false),
+        moderate_meta(&state, &processed),
     )
     .await
     .is_err();
@@ -10269,11 +10268,61 @@ async fn a_timed_out_detection_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        detect_meta(&state, &processed, false),
+        detect_meta(&state, &processed),
     )
     .await
     .is_err();
     assert_meta_slot_drains_with_inference(&state, &release, timed_out).await;
+}
+
+#[tokio::test]
+async fn meta_sections_never_run_inference_without_an_ai_permit() {
+    // Every meta section acquires its own AI permit; none
+    // runs under one the request claims to hold (issue
+    // #456). With the gate's only permit held elsewhere,
+    // each section degrades after the gate wait instead
+    // of reaching its provider: tags and detections are
+    // omitted, and the explicit-outcome sections report
+    // "busy". Once the permit returns, the same sections
+    // answer, so the degrade is the gate's doing.
+    let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
+    state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    state.tagger = Some(Arc::new(FakeTagger));
+    state.detect = Some(Arc::new(FakeDetector));
+    state.moderation = Some(Arc::new(FakeModeration));
+    state.embeddings = Some(Arc::new(FakeEmbedding));
+    state.ocr = Some(Arc::new(FakeOcr));
+    let processed = still_processed(test_png(), ImageFormat::Png);
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let held = state.ai_gate.clone().acquire_owned().await.unwrap();
+    let (tags, boxes, moderation, embedding, ocr) = tokio::join!(
+        annotate_meta(&state, &processed),
+        detect_meta(&state, &processed),
+        moderate_meta(&state, &processed),
+        embed_meta(&state, &processed),
+        ocr_meta(&state, &processed, deadline),
+    );
+    assert!(tags.is_none(), "tags ran without a permit");
+    assert!(boxes.is_none(), "detections ran without a permit");
+    assert_eq!(moderation, ModerationMeta::Unavailable("busy"));
+    assert_eq!(embedding, EmbeddingMeta::Unavailable("busy"));
+    assert_eq!(ocr, OcrMeta::Unavailable("busy"));
+    drop(held);
+    assert!(annotate_meta(&state, &processed).await.is_some());
+    assert!(detect_meta(&state, &processed).await.is_some());
+    assert!(matches!(
+        moderate_meta(&state, &processed).await,
+        ModerationMeta::Report(_)
+    ));
+    assert!(matches!(
+        embed_meta(&state, &processed).await,
+        EmbeddingMeta::Report(_)
+    ));
+    assert!(matches!(
+        ocr_meta(&state, &processed, deadline).await,
+        OcrMeta::Report(_)
+    ));
+    assert_eq!(state.ai_gate.available_permits(), 1);
 }
 
 /// A state for the slow-lane tests (issue #324): the
