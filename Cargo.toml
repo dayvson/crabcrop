@@ -30,6 +30,11 @@ bytes = "1"
 c2pa = { version = "=0.91.11", default-features = false, features = ["rust_native_crypto", "http_reqwest", "http_ureq"] }
 fast-ssim2 = "0.9"
 fast_image_resize = { version = "6.1", features = ["image"] }
+# The shared purge walk reads entry headers a bounded number
+# at a time (issue #462) with `buffer_unordered`. Already in
+# the tree through axum and hyper-util; `alloc` is the one
+# feature the combinator needs, and it adds no crate.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hex = "0.4"
 hmac = "0.13"
 jixel = "0.5"

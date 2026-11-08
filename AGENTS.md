@@ -36,8 +36,11 @@ both SDKs must all pass.
 - `sdks/`: TypeScript and Python SDKs, plus the MCP server (`sdks/mcp`).
 - `frameworks/`, `playground/`: integration starters and the live playground.
 - `fuzz/`: cargo-fuzz targets for the URL parser, the token
-  opener, image decode, metadata, and filter chains, built on the
-  server library and `crabcrop-url` (the opener's home).
+  opener, image decode (AVIF through dav1d included), metadata,
+  and operation chains through the engine, built on the server
+  library and `crabcrop-url` (the opener's home). The smoke runs
+  in `scripts/test_all.sh`; `.github/workflows/fuzz.yml` fuzzes
+  every target nightly.
 - `tests/functional/`: the HTTP functional suite, tiered; the local tier
   runs without network or model files.
 

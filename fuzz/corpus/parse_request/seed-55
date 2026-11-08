@@ -1,0 +1,1 @@
+/unsafe/filters:convolution(0,-1,0,-1,5,-1,0,-1,0,1):noise(10):enhance/example.com/img.jpg
