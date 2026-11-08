@@ -322,9 +322,9 @@ impl S3Store {
     /// Read the raw bytes stored under `name` (see
     /// [`S3Store::put_raw`]). Any failure (missing object,
     /// transport error) is `None`. The read half of the
-    /// raw pair; the upload existence check no longer uses
-    /// it (it goes through [`S3Store::exists_raw`], a
-    /// HEAD, since issue #192), serving reads of uploaded
+    /// raw pair, which no request path calls: the upload
+    /// existence check goes through [`S3Store::exists_raw`],
+    /// a HEAD (issue #192), and serving reads of uploaded
     /// objects go through the loader.
     #[allow(dead_code)]
     pub async fn get_raw(&self, name: &str) -> Option<Vec<u8>> {
@@ -424,9 +424,9 @@ impl S3Store {
     const HEADER_PROBE_BYTES: usize = 16 * 1024;
 
     /// Read one object's stored key and groups from its
-    /// header alone, via a ranged GET (audit R2-24: a purge
-    /// used to download every entry in the tier, image
-    /// bytes included). The header is a match hint, not a
+    /// header alone, via a ranged GET (audit R2-24: so a
+    /// purge does not download every entry in the tier,
+    /// image bytes included). The header is a match hint, not a
     /// serving read: it is parsed without MAC verification,
     /// because verification needs the whole object. A
     /// forged header can at worst steer a purge; entries

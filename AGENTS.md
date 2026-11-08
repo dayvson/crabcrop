@@ -49,9 +49,20 @@ both SDKs must all pass.
   `cargo clippy --locked --all-targets -- -D warnings`, which test_all.sh
   does not run. Run both locally before pushing or the first CI run fails
   on style alone.
-- AI functional groups need local model files and an ONNX Runtime library.
-  Models are deployment artifacts, never repo content; a group that cannot
-  run locally for lack of models is verified in CI instead.
+- The real-model AI tests are `#[ignore]`d in the normal gate: they need
+  model files and an ONNX Runtime library, which are deployment artifacts,
+  never repo content. `.github/workflows/ai-models.yml` downloads the
+  pinned artifacts and runs them (`cargo test -- --ignored`) on pull
+  requests and main pushes that touch `src/ai.rs`, `src/tokenizer.rs`,
+  `tests/fixtures/portrait.jpg` or the workflow itself, on every release
+  tag before anything publishes, weekly, and by hand. When you cannot run
+  them locally, that pull-request run is where an AI change is verified.
+  A change outside those paths can still break them (the real-model tests
+  in `src/main.rs` and `src/engine.rs`, an `ort` bump in `Cargo.lock`)
+  without starting it: run the workflow by hand on the branch
+  (`gh workflow run ai-models.yml --ref <branch>`).
+- The AI functional groups (`tests/functional`, tier `local`) run in no CI
+  workflow: only a local run with the models verifies them.
 
 ## Invariants
 
@@ -69,6 +80,11 @@ both SDKs must all pass.
 - One binary, configuration-gated: AI and provenance features are enabled
   by environment configuration in the same binary, not by separate builds
   or cargo features. Never commit model files, certificates, or keys.
+  The exception is throwaway C2PA test material: the test identity
+  (`tests/functional/c2pa_cert.pem` and `c2pa_key.pem`, the same pair
+  as `TEST_CHAIN` / `TEST_KEY` in `src/provenance.rs`) and the
+  negative-case key and certificate in that module's tests. None of
+  it chains to a trust list or is a deployment credential.
 - Source fetching stays inside the loader's policy (host allowlist,
   private-address protection, fetch and decode bounds). Do not widen what
   the server will fetch as a side effect of an unrelated change.
@@ -91,4 +107,7 @@ both SDKs must all pass.
 
 See RELEASING.md for the full choreography. The hard rule: never tag or
 publish a release unless main CI is fully green on the release head, the
-cargo audit job included.
+cargo audit job included. The release workflow's preflight job enforces
+the `rust.yml` part: a tag whose commit has no passing `rust.yml` push run
+on main stops before anything builds. It does not look at the other
+workflows that run on main, such as functional.yml; check those yourself.

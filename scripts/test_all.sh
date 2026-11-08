@@ -2,14 +2,15 @@
 # Run every test suite in the repository: Rust (binary and
 # crate), the TypeScript SDK, the Python SDK, the MCP server,
 # the framework modules (Nuxt, Next.js, Hydrogen, Astro,
-# SvelteKit), the WordPress plugin, and the playground (unit
-# and integration).
+# SvelteKit) and browser builds of their client code, the
+# WordPress plugin, and the playground (unit and integration).
 #
 # The integration suites need live servers; this script starts
 # and stops them:
 #   - a static server for test-fixtures/ on 127.0.0.1:8909
 #     (playground integration; the MCP suite starts its own on
-#     8912 against the same directory);
+#     8912 against the same directory, and the browser-bundles
+#     suite serves its Nuxt build on a free port);
 #   - crabcrop on 127.0.0.1:3321 with the playground's secret.
 #
 # Usage: scripts/test_all.sh [--skip-rust]
@@ -53,14 +54,16 @@ for bad in "v0.10.0" "crabcrop-url/0.10.0" "0.10" "0.10.0-"; do
     exit 1
   fi
 done
-# Every npm publish command in release.yml passes the tag, whatever
-# its other flags: the two known steps (@crabcrop/url and
-# @crabcrop/mcp) and any publish added later.
-publishes=$(grep -E 'npm publish( |$)' .github/workflows/release.yml \
-  | grep -vE '^[[:space:]]*(- name:|#)' || true)
+# Every npm publish command in any workflow passes the tag, whatever
+# its other flags: the two known steps in release.yml (@crabcrop/url
+# and @crabcrop/mcp) and any publish added later, one-off workflows
+# included (issue #457). A `name:` line, a workflow's, a job's or a
+# step's, is a label, not a command.
+publishes=$(grep -hE 'npm publish( |$)' .github/workflows/*.yml \
+  | grep -vE '^[[:space:]]*(-[[:space:]]+)?(name:|#)' || true)
 untagged=$(printf '%s\n' "$publishes" | grep -v -- '--tag "\$NPM_TAG"$' || true)
 if [ "$(printf '%s\n' "$publishes" | grep -c .)" -lt 2 ] || [ -n "$untagged" ]; then
-  echo "every npm publish in release.yml must pass --tag \"\$NPM_TAG\" from scripts/npm_dist_tag.sh:" >&2
+  echo "every npm publish in .github/workflows must pass --tag \"\$NPM_TAG\" from scripts/npm_dist_tag.sh:" >&2
   printf '%s\n' "${untagged:-(no npm publish commands found)}" >&2
   exit 1
 fi
@@ -74,6 +77,10 @@ python3 scripts/check_versions.py
 step "Rendering version (a corpus re-baseline since the last release tag raises it)"
 python3 scripts/check_rendering_version.py
 python3 scripts/test_check_rendering_version.py
+
+step "Release scripts (the preflight checks, and creating or updating the GitHub Release)"
+python3 scripts/test_release_preflight.py
+python3 scripts/test_publish_github_release.py
 
 step "Build (debug binary: the MCP suite spawns it)"
 cargo build --locked
@@ -111,6 +118,9 @@ step "Astro module"
 
 step "SvelteKit module"
 (cd frameworks/sveltekit && npm ci --no-audit --no-fund && npm test)
+
+step "Browser bundles (client builds of the integrations: Vite, and a full Nuxt build)"
+(cd tests/browser-bundles && npm ci --no-audit --no-fund && npm test)
 
 step "WordPress plugin"
 (cd plugins/wordpress && php tests/run.php)

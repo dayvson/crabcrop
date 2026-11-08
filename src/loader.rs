@@ -78,6 +78,11 @@ pub enum LoadError {
     Timeout,
     /// The source policy refused this URL. Carries the reason.
     Forbidden(String),
+    /// The source buffer budget (issue #403) stayed full for
+    /// the whole wait the request had for it: the load was
+    /// abandoned before it buffered the body, or the rest of
+    /// it.
+    Busy,
 }
 
 impl std::fmt::Display for LoadError {
@@ -96,6 +101,7 @@ impl std::fmt::Display for LoadError {
                 write!(f, "source content type is not readable")
             }
             LoadError::Timeout => write!(f, "source fetch timed out"),
+            LoadError::Busy => write!(f, "source buffer budget exhausted"),
             LoadError::Forbidden(reason) => {
                 write!(f, "source refused by policy: {reason}")
             }
@@ -132,6 +138,268 @@ impl MediaAdmission {
                     .split(';')
                     .next()
                     .is_some_and(|ct| ct.trim() == "application/pdf"))
+    }
+}
+
+/// The process-wide budget for source bytes held in memory
+/// (issue #403). Cache misses charge their source and
+/// watermark bodies against it as the bytes arrive (see
+/// [`SourceCharge`]) and keep the charge until the render
+/// job that uses the bytes finishes, so peak buffered
+/// source memory is bounded by the budget rather than by
+/// how many requests arrive at once. Clones share one
+/// budget.
+#[derive(Debug, Clone)]
+pub struct SourceBudget {
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    capacity: usize,
+}
+
+impl SourceBudget {
+    /// A budget of `capacity` bytes.
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.min(tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+
+    /// A budget nothing realistic exhausts, for loaders built
+    /// by tests and tools rather than the server.
+    pub fn unlimited() -> Self {
+        Self::new(tokio::sync::Semaphore::MAX_PERMITS)
+    }
+
+    /// The budget, in bytes.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes currently charged against the budget.
+    pub fn in_use(&self) -> usize {
+        self.capacity.saturating_sub(self.sem.available_permits())
+    }
+
+    /// Open an empty charge for one request, which may wait
+    /// at most `wait` in total for budget across all its
+    /// loads.
+    pub fn charge(&self, wait: Duration) -> SourceCharge {
+        SourceCharge {
+            budget: self.clone(),
+            state: std::sync::Mutex::new(ChargeState {
+                permit: None,
+                wait_left: wait,
+            }),
+        }
+    }
+}
+
+/// One request's charge against a [`SourceBudget`] (issue
+/// #403): the bytes its loads hold, and the wait it has
+/// left for more. A charged load reserves a body's declared
+/// length (the fetch cap when undeclared) only once the
+/// origin has answered, and holds that grant while the
+/// body keeps arriving. A body that goes [`BODY_GRANT`]
+/// without a byte drops to what it has actually received,
+/// growing again as more arrives, so a stalled origin
+/// holds only the bytes it has delivered, never budget it
+/// is not filling. Dropping the charge returns its bytes
+/// to the budget.
+#[derive(Debug)]
+pub struct SourceCharge {
+    budget: SourceBudget,
+    state: std::sync::Mutex<ChargeState>,
+}
+
+#[derive(Debug)]
+struct ChargeState {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    wait_left: Duration,
+}
+
+impl SourceCharge {
+    /// The bytes this charge holds.
+    pub fn bytes(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state.permit.as_ref().map_or(0, |p| p.num_permits())
+    }
+
+    /// Grow the charge to `total` bytes, waiting for the
+    /// difference at most the wait this request has left. A
+    /// total past the whole budget could never be granted
+    /// and fails at once. [`LoadError::Busy`] when the
+    /// budget stayed exhausted.
+    pub async fn grow_to(&self, total: usize) -> Result<(), LoadError> {
+        let (need, wait) = {
+            let state = self.state.lock().unwrap();
+            let held = state.permit.as_ref().map_or(0, |p| p.num_permits());
+            if total <= held {
+                return Ok(());
+            }
+            (total - held, state.wait_left)
+        };
+        if total > self.budget.capacity {
+            return Err(LoadError::Busy);
+        }
+        let permits = u32::try_from(need).map_err(|_| LoadError::Busy)?;
+        let start = tokio::time::Instant::now();
+        let acquired =
+            tokio::time::timeout(wait, self.budget.sem.clone().acquire_many_owned(permits)).await;
+        let mut state = self.state.lock().unwrap();
+        state.wait_left = state.wait_left.saturating_sub(start.elapsed());
+        match acquired {
+            Ok(Ok(permit)) => {
+                match &mut state.permit {
+                    Some(held) => held.merge(permit),
+                    None => state.permit = Some(permit),
+                }
+                Ok(())
+            }
+            _ => Err(LoadError::Busy),
+        }
+    }
+
+    /// Keep `total` bytes of the charge and return the rest
+    /// to the budget at once. Never grows the charge.
+    pub fn shrink_to(&self, total: usize) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(permit) = &mut state.permit {
+            let excess = permit.num_permits().saturating_sub(total);
+            if excess > 0 {
+                drop(permit.split(excess));
+            }
+        }
+    }
+
+    /// Move `bytes` of this charge (all of it, when it holds
+    /// fewer) into a new charge, so the two parts can be
+    /// released separately. The new charge has no wait.
+    pub fn split_off(&self, bytes: usize) -> SourceCharge {
+        let mut state = self.state.lock().unwrap();
+        let held = state.permit.as_ref().map_or(0, |p| p.num_permits());
+        let permit = if bytes >= held {
+            state.permit.take()
+        } else {
+            state.permit.as_mut().and_then(|p| p.split(bytes))
+        };
+        SourceCharge {
+            budget: self.budget.clone(),
+            state: std::sync::Mutex::new(ChargeState {
+                permit,
+                wait_left: Duration::ZERO,
+            }),
+        }
+    }
+}
+
+/// How long a charged body read may go without a byte
+/// before its grant for the declared length ends and it
+/// holds only what it has received (issue #403): far
+/// longer than a healthy origin pauses between packets,
+/// short enough that an origin that answers and then
+/// stalls cannot keep budget it is not filling. Each byte
+/// that arrives renews the grant. A body still arriving
+/// keeps it, however long the whole body takes: given
+/// back, the rest of the body would be charged behind
+/// every load still waiting for a grant of its own, and
+/// under a burst the load would be shed half-read.
+pub const BODY_GRANT: Duration = Duration::from_secs(1);
+
+/// The step a charged body grows by once its grant is over,
+/// so a trickling body does not touch the budget per chunk.
+const CHARGE_STEP: usize = 256 * 1024;
+
+/// One body read's part of a request's [`SourceCharge`].
+/// Dropped before [`BodyCharge::finish`] (an error, or the
+/// load's timeout cancelling the read), it returns the
+/// part to the budget, so a failed load leaves the request
+/// holding only the bodies it already kept.
+struct BodyCharge<'a> {
+    charge: &'a SourceCharge,
+    /// What the request held before this body.
+    base: usize,
+    /// The bytes granted up front, and when the grant ends
+    /// unless another byte arrives first.
+    grant: Option<(usize, tokio::time::Instant)>,
+    /// The most this body may hold: the fetch cap.
+    cap: usize,
+    finished: bool,
+}
+
+impl<'a> BodyCharge<'a> {
+    /// Reserve the body's declared length, or the cap when
+    /// it declares none, before reading any of it.
+    async fn begin(
+        charge: &'a SourceCharge,
+        declared: Option<u64>,
+        cap: u64,
+    ) -> Result<BodyCharge<'a>, LoadError> {
+        let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+        let ahead = declared
+            .and_then(|d| usize::try_from(d).ok())
+            .map_or(cap, |d| d.min(cap));
+        let base = charge.bytes();
+        let mut part = BodyCharge {
+            charge,
+            base,
+            grant: None,
+            cap,
+            finished: false,
+        };
+        charge.grow_to(base.saturating_add(ahead)).await?;
+        part.grant = Some((ahead, tokio::time::Instant::now() + BODY_GRANT));
+        Ok(part)
+    }
+
+    /// When the up-front grant ends, while it lasts.
+    fn grant_ends(&self) -> Option<tokio::time::Instant> {
+        self.grant.map(|(_, ends)| ends)
+    }
+
+    /// The body is still arriving: keep the grant for
+    /// another [`BODY_GRANT`].
+    fn renew_grant(&mut self) {
+        if let Some((_, ends)) = &mut self.grant {
+            *ends = tokio::time::Instant::now() + BODY_GRANT;
+        }
+    }
+
+    /// End the grant (the body went quiet): from here it
+    /// holds what it has received.
+    fn end_grant(&mut self, received: usize) {
+        if self.grant.take().is_some() {
+            self.charge.shrink_to(self.base + received);
+        }
+    }
+
+    /// Make sure `received` bytes are charged before the
+    /// body holds them: free under the grant, in steps past
+    /// it.
+    async fn cover(&mut self, received: usize) -> Result<(), LoadError> {
+        if let Some((ahead, _)) = self.grant
+            && received <= ahead
+        {
+            return Ok(());
+        }
+        let step = received.div_ceil(CHARGE_STEP).saturating_mul(CHARGE_STEP);
+        self.charge
+            .grow_to(self.base + step.min(self.cap).max(received))
+            .await
+    }
+
+    /// Keep exactly the `received` bytes of a complete body.
+    fn finish(mut self, received: usize) {
+        self.charge.shrink_to(self.base + received);
+        self.finished = true;
+    }
+}
+
+impl Drop for BodyCharge<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.charge.shrink_to(self.base);
+        }
     }
 }
 
@@ -187,6 +455,11 @@ pub struct Loader {
     pinned_clients: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<(String, std::net::SocketAddr), Client>>,
     >,
+    /// The source buffer budget (issue #403) the server's
+    /// misses charge their loads against: see
+    /// [`Loader::load_media_charged`]. Unlimited until the
+    /// server installs the configured budget.
+    source_budget: SourceBudget,
 }
 
 /// Cap on the pinned-client cache (issue #369).
@@ -274,7 +547,9 @@ pub struct ProbeLoad {
 /// probe that stops as soon as the caller's predicate
 /// settles on the head (or the head cap is reached).
 enum BodyMode<'a> {
-    Full,
+    /// The whole body, charged against the request's
+    /// source budget share when there is one (issue #403).
+    Full(Option<&'a SourceCharge>),
     Probe(&'a (dyn Fn(&[u8]) -> bool + Sync)),
 }
 
@@ -303,6 +578,7 @@ impl Loader {
             pinned_clients: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            source_budget: SourceBudget::unlimited(),
         })
     }
 
@@ -322,6 +598,18 @@ impl Loader {
     pub fn with_sources(mut self, sources: SourceConfig) -> Self {
         self.sources = sources;
         self
+    }
+
+    /// Set the source buffer budget (issue #403).
+    pub fn with_source_budget(mut self, budget: SourceBudget) -> Self {
+        self.source_budget = budget;
+        self
+    }
+
+    /// The source buffer budget this loader's callers
+    /// charge against.
+    pub fn source_budget(&self) -> &SourceBudget {
+        &self.source_budget
     }
 
     /// Fetch `url` and return the body bytes, dispatching on
@@ -346,7 +634,37 @@ impl Loader {
         url: &str,
         admission: MediaAdmission,
     ) -> Result<Vec<u8>, LoadError> {
-        match self.load_timed(url, admission, BodyMode::Full).await? {
+        self.load_full(url, admission, None).await
+    }
+
+    /// [`Loader::load_media`], charging the body against
+    /// `charge` as it arrives (issue #403): nothing before
+    /// the origin answers, then the body's declared length
+    /// while it keeps arriving, and only what has actually
+    /// been received once it goes [`BODY_GRANT`] without a
+    /// byte. The charge keeps the body's bytes
+    /// when the load succeeds and drops them when it fails.
+    /// [`LoadError::Busy`] when the request's wait for
+    /// budget ran out.
+    pub async fn load_media_charged(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+        charge: &SourceCharge,
+    ) -> Result<Vec<u8>, LoadError> {
+        self.load_full(url, admission, Some(charge)).await
+    }
+
+    async fn load_full(
+        &self,
+        url: &str,
+        admission: MediaAdmission,
+        charge: Option<&SourceCharge>,
+    ) -> Result<Vec<u8>, LoadError> {
+        match self
+            .load_timed(url, admission, BodyMode::Full(charge))
+            .await?
+        {
             LoadBody::Full(bytes) => Ok(bytes),
             LoadBody::Probe(_) => Err(LoadError::Network(
                 "internal: probe result for a full load".to_string(),
@@ -473,8 +791,8 @@ impl Loader {
         mode: &BodyMode<'_>,
     ) -> Result<LoadBody, LoadError> {
         match mode {
-            BodyMode::Full => Ok(LoadBody::Full(
-                self.read_checked_body(resp, admission).await?,
+            BodyMode::Full(charge) => Ok(LoadBody::Full(
+                self.read_checked_body(resp, admission, *charge).await?,
             )),
             BodyMode::Probe(settled) => Ok(LoadBody::Probe(
                 self.read_probe_body(resp, admission, settled).await?,
@@ -520,19 +838,59 @@ impl Loader {
         &self,
         mut resp: reqwest::Response,
         admission: MediaAdmission,
+        charge: Option<&SourceCharge>,
     ) -> Result<Vec<u8>, LoadError> {
-        Self::check_response_head(&resp, admission)?;
+        let declared = Self::check_response_head(&resp, admission)?;
+        let Some(charge) = charge else {
+            let mut body = Vec::new();
+            loop {
+                let chunk = resp.chunk().await.map_err(map_request_error)?;
+                let Some(bytes) = chunk else { break };
+                body.extend_from_slice(&bytes);
+                if body.len() as u64 > self.max_bytes {
+                    return Err(LoadError::TooLarge {
+                        limit: self.max_bytes,
+                    });
+                }
+            }
+            return Ok(body);
+        };
+        // A charged read (issue #403) refuses a declared
+        // length past the cap before it reserves anything,
+        // then charges the body as described on
+        // `BodyCharge`.
+        if declared.is_some_and(|total| total > self.max_bytes) {
+            return Err(LoadError::TooLarge {
+                limit: self.max_bytes,
+            });
+        }
+        let mut part = BodyCharge::begin(charge, declared, self.max_bytes).await?;
         let mut body = Vec::new();
         loop {
-            let chunk = resp.chunk().await.map_err(map_request_error)?;
-            let Some(bytes) = chunk else { break };
-            body.extend_from_slice(&bytes);
-            if body.len() as u64 > self.max_bytes {
+            let next = match part.grant_ends() {
+                Some(ends) => match tokio::time::timeout_at(ends, resp.chunk()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        part.end_grant(body.len());
+                        continue;
+                    }
+                },
+                None => resp.chunk().await,
+            };
+            let Some(bytes) = next.map_err(map_request_error)? else {
+                break;
+            };
+            let received = body.len() + bytes.len();
+            if received as u64 > self.max_bytes {
                 return Err(LoadError::TooLarge {
                     limit: self.max_bytes,
                 });
             }
+            part.cover(received).await?;
+            part.renew_grant();
+            body.extend_from_slice(&bytes);
         }
+        part.finish(body.len());
         Ok(body)
     }
 
@@ -749,6 +1107,22 @@ impl Loader {
                 total_bytes: Some(total),
             }));
         }
+        // A charged file read (issue #403) reserves the
+        // file's size before reading; a local read does not
+        // stall the way an origin can, and a file that grows
+        // under the read charges the rest as it arrives.
+        let mut part = match mode {
+            BodyMode::Full(Some(charge)) => {
+                let total = file.metadata().await.map_err(map_file_error)?.len();
+                if total > self.max_bytes {
+                    return Err(LoadError::TooLarge {
+                        limit: self.max_bytes,
+                    });
+                }
+                Some(BodyCharge::begin(charge, Some(total), self.max_bytes).await?)
+            }
+            _ => None,
+        };
         let mut body = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -756,12 +1130,18 @@ impl Loader {
             if n == 0 {
                 break;
             }
-            body.extend_from_slice(&buf[..n]);
-            if body.len() as u64 > self.max_bytes {
+            if (body.len() + n) as u64 > self.max_bytes {
                 return Err(LoadError::TooLarge {
                     limit: self.max_bytes,
                 });
             }
+            if let Some(part) = &mut part {
+                part.cover(body.len() + n).await?;
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+        if let Some(part) = part {
+            part.finish(body.len());
         }
         Ok(LoadBody::Full(body))
     }
@@ -966,8 +1346,6 @@ fn is_non_public_v6(ip: &Ipv6Addr) -> bool {
         || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64, discard-only
 }
 
-/// Split the `bucket/key` remainder of a bucket URL. Both parts
-/// are required; the key may itself contain slashes.
 /// Whether any `/`-separated component of `path` is a dot
 /// segment (exactly `.` or `..`). Dots inside a segment name
 /// (`a.b`, `c..d`, `...`) are ordinary key content, not
@@ -977,6 +1355,8 @@ fn has_dot_segment(path: &str) -> bool {
         .any(|segment| segment == "." || segment == "..")
 }
 
+/// Split the `bucket/key` remainder of a bucket URL. Both parts
+/// are required; the key may itself contain slashes.
 fn split_bucket_key<'a>(rest: &'a str, scheme: &str) -> Result<(&'a str, &'a str), LoadError> {
     let invalid = || {
         LoadError::Network(format!(
@@ -2213,5 +2593,370 @@ mod tests {
             assert!(matches!(err, LoadError::Forbidden(_)), "{url}: {err:?}");
         }
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_source_charge_grows_shrinks_splits_and_releases() {
+        let budget = SourceBudget::new(100);
+        let wait = Duration::from_millis(50);
+        let charge = budget.charge(wait);
+        charge.grow_to(60).await.unwrap();
+        assert_eq!((charge.bytes(), budget.in_use()), (60, 60));
+        // Growing to what is held is free; shrinking never
+        // grows.
+        charge.grow_to(40).await.unwrap();
+        charge.shrink_to(80);
+        assert_eq!(charge.bytes(), 60);
+        // More than is free: the wait runs out.
+        let other = budget.charge(wait);
+        assert_eq!(other.grow_to(41).await, Err(LoadError::Busy));
+        // More than the whole budget can never be granted:
+        // refused at once instead of waiting it out.
+        let start = std::time::Instant::now();
+        let big = budget.charge(Duration::from_secs(5));
+        assert_eq!(big.grow_to(101).await, Err(LoadError::Busy));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        // Splitting moves bytes into a part released on its
+        // own.
+        let part = charge.split_off(25);
+        assert_eq!((charge.bytes(), part.bytes()), (35, 25));
+        drop(part);
+        assert_eq!(budget.in_use(), 35);
+        charge.shrink_to(10);
+        assert_eq!(budget.in_use(), 10);
+        drop(charge);
+        assert_eq!(budget.in_use(), 0);
+        // A fresh loader's budget never sheds; the server
+        // installs the configured one.
+        assert_eq!(
+            Loader::with_defaults().unwrap().source_budget().capacity(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_waits_for_budget_once_in_total_not_per_load() {
+        // The wait bound is the request's, across all its
+        // loads: two waits that each run out take the one
+        // budget of wait between them, not one each.
+        let budget = SourceBudget::new(10);
+        let held = budget.charge(Duration::ZERO);
+        held.grow_to(10).await.unwrap();
+        let charge = budget.charge(Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        assert_eq!(charge.grow_to(5).await, Err(LoadError::Busy));
+        assert_eq!(charge.grow_to(5).await, Err(LoadError::Busy));
+        let waited = start.elapsed();
+        assert!(waited < Duration::from_millis(550), "{waited:?}");
+        // A waiter is granted as soon as bytes come free.
+        let waiter = budget.charge(Duration::from_secs(5));
+        let release = async {
+            sleep(Duration::from_millis(100)).await;
+            drop(held);
+        };
+        let (granted, ()) = tokio::join!(waiter.grow_to(8), release);
+        assert_eq!(granted, Ok(()));
+        assert_eq!(waiter.bytes(), 8);
+    }
+
+    #[tokio::test]
+    async fn a_charged_load_keeps_exactly_its_body_and_a_failed_one_keeps_nothing() {
+        let body = vec![7u8; 100_000];
+        let ok = response(
+            "200 OK",
+            &format!(
+                "Content-Type: image/png\r\nContent-Length: {}\r\n",
+                body.len()
+            ),
+            &body,
+        );
+        let budget = SourceBudget::new(1 << 20);
+        let loader = Loader::with_defaults()
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let charge = budget.charge(Duration::from_secs(1));
+        let base = spawn_server(Respond::Bytes(ok)).await;
+        let got = loader
+            .load_media_charged(&format!("{base}/a.png"), MediaAdmission::default(), &charge)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), body.len());
+        assert_eq!(charge.bytes(), body.len());
+        // A body past the cap fails and releases its part,
+        // keeping what the request already held.
+        let small = Loader::new(1000, Duration::from_secs(5))
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let undeclared = response("200 OK", "Content-Type: image/png\r\n", &body);
+        let base = spawn_server(Respond::Bytes(undeclared)).await;
+        let err = small
+            .load_media_charged(&format!("{base}/b.png"), MediaAdmission::default(), &charge)
+            .await
+            .unwrap_err();
+        assert_eq!(err, LoadError::TooLarge { limit: 1000 });
+        assert_eq!(charge.bytes(), body.len());
+        assert_eq!(budget.in_use(), body.len());
+        // So does a load the loader's timeout cancels while
+        // its body is held by a stalled origin.
+        let quick = Loader::new(1 << 20, Duration::from_millis(300))
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let base = spawn_stalling_server(1 << 19, 1000).await;
+        let err = quick
+            .load_media_charged(&format!("{base}/c.png"), MediaAdmission::default(), &charge)
+            .await
+            .unwrap_err();
+        assert_eq!(err, LoadError::Timeout);
+        assert_eq!(budget.in_use(), body.len());
+        drop(charge);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    /// An origin that answers with a declared length of
+    /// `declared` bytes, sends `sent` of them, then holds
+    /// the connection open without sending the rest.
+    async fn spawn_stalling_server(declared: usize, sent: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {declared}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&vec![0u8; sent]).await;
+                    sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_stalled_origin_holds_only_what_it_delivered() {
+        // An origin that declares the whole cap, sends 1000
+        // bytes, and stalls: the load holds its declared
+        // length only for the grant, then only what arrived,
+        // so a second request's load proceeds instead of
+        // waiting out the stall (the coordinator's design
+        // note on issue #403: up-front reservation would let
+        // a few stalled origins starve every other request).
+        const CAP: usize = 1 << 20;
+        let budget = SourceBudget::new(CAP);
+        let loader = Loader::new(CAP as u64, Duration::from_secs(20))
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let stalled = spawn_stalling_server(CAP, 1000).await;
+        let stalled_load = {
+            let loader = loader.clone();
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                let charge = budget.charge(Duration::from_secs(5));
+                let result = loader
+                    .load_media_charged(
+                        &format!("{stalled}/s.png"),
+                        MediaAdmission::default(),
+                        &charge,
+                    )
+                    .await;
+                (result.map(|b| b.len()), charge.bytes())
+            })
+        };
+        // While the grant lasts, the stall holds the cap.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while budget.in_use() < CAP {
+            assert!(std::time::Instant::now() < deadline, "no grant taken");
+            sleep(Duration::from_millis(10)).await;
+        }
+        // A healthy load arriving now waits at most for the
+        // grant to end, far short of the stall.
+        let body = vec![1u8; 4000];
+        let ok = response(
+            "200 OK",
+            "Content-Type: image/png\r\nContent-Length: 4000\r\n",
+            &body,
+        );
+        let healthy = spawn_server(Respond::Bytes(ok)).await;
+        let charge = budget.charge(Duration::from_secs(5));
+        let start = std::time::Instant::now();
+        let got = loader
+            .load_media_charged(
+                &format!("{healthy}/h.png"),
+                MediaAdmission::default(),
+                &charge,
+            )
+            .await
+            .unwrap();
+        let waited = start.elapsed();
+        assert_eq!(got.len(), 4000);
+        assert!(
+            waited < BODY_GRANT + Duration::from_millis(500),
+            "{waited:?}"
+        );
+        // The stall now holds exactly what it delivered.
+        assert_eq!(budget.in_use(), 1000 + 4000);
+        stalled_load.abort();
+    }
+
+    /// The burst the source budget exists for (issue #403):
+    /// `loads` concurrent distinct loads from an origin that
+    /// takes 100 ms to answer, each holding its body for 50
+    /// ms afterwards, as a render would. Returns the most
+    /// body bytes held at once.
+    async fn budgeted_burst(budget: SourceBudget, loads: usize) -> usize {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BODY: usize = 48 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    sleep(Duration::from_millis(100)).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {BODY}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&vec![0u8; BODY]).await;
+                });
+            }
+        });
+        let loader = Loader::new(64 * 1024, Duration::from_secs(10))
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let held = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for i in 0..loads {
+            let loader = loader.clone();
+            let budget = budget.clone();
+            let (held, peak) = (held.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                let charge = budget.charge(Duration::from_secs(5));
+                let body = loader
+                    .load_media_charged(
+                        &format!("http://{addr}/s{i}.png"),
+                        MediaAdmission::default(),
+                        &charge,
+                    )
+                    .await
+                    .expect("every load fits within the wait");
+                let now = held.fetch_add(body.len(), Ordering::SeqCst) + body.len();
+                peak.fetch_max(now, Ordering::SeqCst);
+                sleep(Duration::from_millis(50)).await;
+                held.fetch_sub(body.len(), Ordering::SeqCst);
+                drop(body);
+                drop(charge);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(budget.in_use(), 0, "every charge came back");
+        peak.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_loads_buffers_what_the_budget_holds_not_what_arrives() {
+        const BUDGET: usize = 3 * 48 * 1024;
+        // Unbudgeted, the bodies the burst holds at once grow
+        // with the request count: all twelve overlap.
+        let peak = budgeted_burst(SourceBudget::unlimited(), 12).await;
+        assert!(peak > BUDGET, "without a budget the burst overlaps: {peak}");
+        // Under a budget of three bodies, never more than
+        // three are held at once, however many are queued,
+        // and every load is still served.
+        let peak = budgeted_burst(SourceBudget::new(BUDGET), 12).await;
+        assert!(
+            peak <= BUDGET,
+            "{peak} bytes held under a {BUDGET} byte budget"
+        );
+    }
+
+    /// An origin that sends every body as `chunks` writes of
+    /// `chunk` bytes, `every` apart: healthy, but slower than
+    /// [`BODY_GRANT`] per body.
+    async fn spawn_paced_server(chunks: usize, chunk: usize, every: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        chunks * chunk
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    for i in 0..chunks {
+                        if i > 0 {
+                            sleep(every).await;
+                        }
+                        if socket.write_all(&vec![0u8; chunk]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_body_still_arriving_keeps_its_grant_under_a_burst() {
+        // Four loads of bodies that take 1.5 s to arrive but
+        // never pause for a whole BODY_GRANT, under a budget
+        // of two bodies: two at a time, all four served. A
+        // load that gave its grant back while its body was
+        // still arriving would have to charge the rest behind
+        // the loads still waiting for a whole grant, and,
+        // with nothing left to free, be shed half-read.
+        const CHUNK: usize = 32 * 1024;
+        const CHUNKS: usize = 6;
+        const BODY: usize = CHUNK * CHUNKS;
+        let every = Duration::from_millis(300);
+        assert!(every * (CHUNKS as u32 - 1) > BODY_GRANT);
+        let budget = SourceBudget::new(2 * BODY);
+        let loader = Loader::new(1 << 20, Duration::from_secs(20))
+            .unwrap()
+            .with_source_budget(budget.clone());
+        let base = spawn_paced_server(CHUNKS, CHUNK, every).await;
+        let loads: Vec<_> = (0..4)
+            .map(|i| {
+                let (loader, budget, base) = (loader.clone(), budget.clone(), base.clone());
+                tokio::spawn(async move {
+                    let charge = budget.charge(Duration::from_secs(5));
+                    let body = loader
+                        .load_media_charged(
+                            &format!("{base}/s{i}.png"),
+                            MediaAdmission::default(),
+                            &charge,
+                        )
+                        .await?;
+                    // Held a moment, as a render would.
+                    sleep(Duration::from_millis(50)).await;
+                    Ok::<usize, LoadError>(body.len())
+                })
+            })
+            .collect();
+        for load in loads {
+            assert_eq!(load.await.unwrap(), Ok(BODY));
+        }
+        assert_eq!(budget.in_use(), 0, "every charge came back");
     }
 }

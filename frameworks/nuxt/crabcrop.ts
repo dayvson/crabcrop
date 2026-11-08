@@ -1,10 +1,15 @@
 /**
- * A crabcrop provider for @nuxt/image.
+ * A crabcrop provider for @nuxt/image (1.8 or later, Nuxt 3
+ * or 4).
  *
  * Copy this file into your project (for example as
  * `providers/crabcrop.ts`) and register it in nuxt.config:
  *
  *   export default defineNuxtConfig({
+ *     runtimeConfig: {
+ *       // Server-only: set by NUXT_CRABCROP_SECRET at runtime.
+ *       crabcropSecret: "",
+ *     },
  *     image: {
  *       providers: {
  *         crabcrop: {
@@ -19,12 +24,15 @@
  *     },
  *   });
  *
- * Provider options: `base` (required), `preset` (recommended:
- * the transform policy stays server-side and the browser
- * never needs the secret), `secret` (optional; honored only
- * when this code runs server-side. Nuxt compiles provider
- * options into the app, so in the browser the secret is
- * forced to null and can never ship in the client bundle).
+ * Provider options: `base` (required) and `preset`
+ * (recommended: the transform policy stays server-side).
+ * @nuxt/image compiles provider options verbatim into
+ * `#build/image-options.mjs`, which the client bundle
+ * imports, so the secret is never a provider option: the
+ * provider throws if it finds one. It reads the secret from
+ * private runtime config (`crabcropSecret`), which Nuxt keeps
+ * out of the client payload, and signs only when it runs on
+ * the server; in the browser it builds unsigned URLs.
  * Unsigned URLs with appended geometry need the server's
  * unsafe mode without presets-only, an open image proxy fit
  * for local development only; production builds signed URLs
@@ -45,7 +53,11 @@ import { buildURL } from "@crabcrop/url";
 export interface CrabcropProviderOptions {
   base: string;
   preset?: string;
-  secret?: string | null;
+}
+
+/** The part of @nuxt/image's context this provider reads. */
+interface ImageContext {
+  options?: { runtimeConfig?: { crabcropSecret?: unknown } };
 }
 
 interface Modifiers {
@@ -96,13 +108,36 @@ const quality = (v: number | string): number => {
   return n;
 };
 
+/**
+ * The signing secret, on the server only. Private runtime
+ * config never reaches the browser (Nuxt sends the client
+ * only its `public` part), and the window check keeps a
+ * client call unsigned even if a secret were somehow there.
+ */
+const serverSecret = (ctx?: ImageContext): string | null => {
+  if (typeof window !== "undefined") return null;
+  const secret = ctx?.options?.runtimeConfig?.crabcropSecret;
+  return typeof secret === "string" && secret !== "" ? secret : null;
+};
+
+/**
+ * @nuxt/image calls this with the provider options merged
+ * into the second argument beside the modifiers, and its own
+ * context (global options and runtime config) as the third.
+ */
 export const getImage = (
   src: string,
-  { modifiers = {} }: { modifiers?: Modifiers },
-  input?: { options?: CrabcropProviderOptions },
+  { modifiers = {}, ...options }: { modifiers?: Modifiers } & Partial<CrabcropProviderOptions>,
+  ctx?: ImageContext,
 ) => {
-  const options = input?.options;
-  if (!options?.base) {
+  if ((options as { secret?: unknown }).secret != null) {
+    throw new Error(
+      "crabcrop provider: `secret` is not a provider option: @nuxt/image compiles provider " +
+        "options into the client bundle, so it has shipped to browsers. Rotate it, and set it " +
+        "in private runtime config instead (runtimeConfig.crabcropSecret, NUXT_CRABCROP_SECRET)",
+    );
+  }
+  if (!options.base) {
     throw new Error("crabcrop provider: the `base` option is required");
   }
   const width = dim(modifiers.width, "width");
@@ -154,9 +189,11 @@ export const getImage = (
   if (modifiers.quality !== undefined) {
     operations.push(`filters:quality(${quality(modifiers.quality)})`);
   }
-  // The provider also runs client-side, where options from
-  // nuxt.config are part of the bundle: never sign there
-  // (audit PL-11, the Next.js loader's guard).
-  const secret = typeof window === "undefined" ? (options.secret ?? null) : null;
-  return { url: buildURL(options.base, secret, operations.join("/"), src) };
+  return { url: buildURL(options.base, serverSecret(ctx), operations.join("/"), src) };
 };
+
+/**
+ * @nuxt/image 2 imports a provider's default export and calls
+ * it for the provider; 1.x reads the named `getImage` above.
+ */
+export default () => ({ getImage });

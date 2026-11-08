@@ -21,7 +21,9 @@ pub enum Signature {
     Unsafe,
 }
 
-/// What went wrong while splitting the signature off a request path.
+/// Why a request path failed to parse: its signature segment,
+/// an operation, a preset or source-root reference, or the
+/// source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// The path was empty or just `/`.
@@ -1222,10 +1224,6 @@ pub fn parse_size(segment: &str) -> Result<ImageSize, ParseError> {
     })
 }
 
-/// Split the signature off the front of a request path.
-///
-/// Returns the signature and the remainder of the path (operations and
-/// image URL, still slash-separated).
 /// Whether `id` is a well-formed key ID (issue #143): 1 to 32
 /// characters of `[A-Za-z0-9_-]`. Key IDs are routing metadata
 /// in the signature segment, never secret material.
@@ -1233,16 +1231,6 @@ pub fn is_valid_key_id(id: &str) -> bool {
     crabcrop_url::is_valid_key_id(id)
 }
 
-/// Split a sealed token off the front of a signature
-/// segment (issue #255): `Some((key_id, token))` when the
-/// segment is a sealed spelling, `[<key-id>:]s1.<body>`,
-/// `None` when it is a plain signature segment. Detection is
-/// a prefix test, complete by construction: a plain
-/// signature is 64 lowercase hex characters or `unsafe`, and
-/// a key ID is `[A-Za-z0-9_-]`, so no valid plain segment
-/// can start with `s1.`. The token keeps its `s1.` marker;
-/// the key ID routes the open (see [`Keyring::open_sealed`])
-/// and is not part of the ciphertext or the AAD.
 /// Whether a signature segment presents as a sealed
 /// spelling (issue #255): a real token (see
 /// [`split_sealed_segment`]), or a marker-shaped imitation,
@@ -1269,6 +1257,16 @@ pub fn looks_sealed(segment: &str) -> bool {
     digits > 0 && rest.as_bytes().get(digits) == Some(&b'.')
 }
 
+/// Split a sealed token off the front of a signature
+/// segment (issue #255): `Some((key_id, token))` when the
+/// segment is a sealed spelling, `[<key-id>:]s1.<body>`,
+/// `None` when it is a plain signature segment. Detection is
+/// a prefix test, complete by construction: a plain
+/// signature is 64 lowercase hex characters or `unsafe`, and
+/// a key ID is `[A-Za-z0-9_-]`, so no valid plain segment
+/// can start with `s1.`. The token keeps its `s1.` marker;
+/// the key ID routes the open (see [`Keyring::open_sealed`])
+/// and is not part of the ciphertext or the AAD.
 pub fn split_sealed_segment(segment: &str) -> Option<(Option<&str>, &str)> {
     if segment.starts_with(crabcrop_url::SEALED_PREFIX) {
         return Some((None, segment));
@@ -1593,7 +1591,7 @@ fn parse_align(s: &str) -> Option<Align> {
     }
 }
 
-/// The alignment after `crop:<WxH>:`. Every historical
+/// The alignment after `crop:<WxH>:`. Every other
 /// alignment is a bare keyword; the `objects` mode (issue
 /// #318) is the one parameterized form,
 /// `objects(<class>[,<class>...])[:<scale>]`: the classes
@@ -1829,7 +1827,6 @@ fn parse_format_spec(p: &str) -> Option<FormatSpec> {
     Some(spec)
 }
 
-/// Parse the filter list after `filters:`.
 /// A detection class name for the class filters
 /// (`blurclass` / `pixelateclass` / `recolorclass`):
 /// the vocabulary's own spellings (COCO names like `traffic
@@ -1954,6 +1951,7 @@ fn split_filter_chain(rest: &str) -> Vec<&str> {
     parts
 }
 
+/// Parse the filter list after `filters:`.
 fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidFilters(seg.to_string());
     if rest.is_empty() {
@@ -2803,13 +2801,12 @@ fn parse_text_color(s: &str) -> Option<[u8; 4]> {
 
 /// Everything the server and the engine need to know about a
 /// parsed request's directives, computed in ONE pass over the
-/// operations. This replaces the former family of per-question
-/// walks (each helper re-scanned the whole list, and the
-/// server's AI-gate predicate had drifted from the engine's
-/// preflight): there is now exactly one place that reads the
-/// ops list for directives, and both sides consume it.
+/// operations. This is the one place that reads the ops list
+/// for directives, and both the server and the engine consume
+/// it, so the server's AI-gate predicate cannot drift from the
+/// engine's preflight.
 ///
-/// Field semantics match the historical helpers: `format`,
+/// Field semantics: `format`,
 /// `fill`, `dpr`, and `facepad` are request-wide with the LAST
 /// segment winning; the shape filter is the FIRST one (it names
 /// error messages); class names keep request order; watermark
@@ -2988,16 +2985,14 @@ impl RequestDirectives {
         !self.classes.is_empty()
     }
 
-    /// Whether the request can run AI inference in the engine.
-    /// This is the ONE predicate behind both the server's AI
-    /// gate and the engine's expectations: background removal,
-    /// studio mode, region removal, upscale, face operations,
-    /// class redaction, and object crops always infer; smart
-    /// crops infer when a face provider is configured, so they
-    /// are gated too. The gate itself calls
-    /// `uses_ai_beyond_smart_crop` plus the provider check
-    /// (issue #379); this full form stays for the tests that
-    /// pin the directive classification.
+    /// Whether the request names any AI directive: background
+    /// removal, studio mode, region removal, upscale, face
+    /// operations, class redaction, object crops,
+    /// `debug:focal`, or a smart crop. A smart crop infers
+    /// only when a face or focal provider is configured, so
+    /// the server's AI gate uses `uses_ai_beyond_smart_crop`
+    /// plus that provider check (issue #379). Only the tests
+    /// call this, to pin the directive classification.
     #[allow(dead_code)]
     pub fn uses_ai(&self) -> bool {
         self.uses_ai_beyond_smart_crop() || self.smart_crop
@@ -3133,8 +3128,6 @@ pub(crate) fn format_text(format: ImageFormat) -> &'static str {
     }
 }
 
-/// The one canonical spelling of a filter: the grammar
-/// text the parser produces this exact value from.
 /// The canonical spelling of one quality value: `auto` or
 /// the number.
 fn quality_value_text(value: QualityValue) -> String {
@@ -3144,6 +3137,8 @@ fn quality_value_text(value: QualityValue) -> String {
     }
 }
 
+/// The one canonical spelling of a filter: the grammar
+/// text the parser produces this exact value from.
 fn filter_text(filter: &Filter) -> String {
     match filter {
         Filter::Grayscale => "grayscale".to_string(),
@@ -3506,10 +3501,9 @@ pub fn verify(secret: &[u8], signature: &Signature, remainder: &str, allow_unsaf
 /// P-1): they are HMACs under this derived key, never under the
 /// secret itself, so a signature minted for an image URL can
 /// never be replayed against the purge endpoint, even when the
-/// image remainder begins with `purge/`. Before this change the
-/// purge scheme signed the literal `purge/<target>` with the
-/// secret, which is exactly an image signature over a remainder
-/// of that shape.
+/// image remainder begins with `purge/`. Signing the literal
+/// `purge/<target>` with the secret itself would be exactly an
+/// image signature over a remainder of that shape.
 pub fn purge_key(secret: &[u8]) -> Vec<u8> {
     crabcrop_url::purge_key(secret)
 }

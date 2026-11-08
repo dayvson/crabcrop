@@ -59,6 +59,14 @@ updates:
         patterns: ["*"]
 
   - package-ecosystem: npm
+    directory: "/tests/browser-bundles"
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
     directory: "/playground"
     schedule:
       interval: weekly

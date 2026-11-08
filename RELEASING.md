@@ -4,11 +4,16 @@ One version number covers every artifact: the server binaries and container imag
 
 ## The pipeline
 
-Pushing a tag like `v0.2.0` runs `.github/workflows/release.yml`:
+Pushing a tag like `v0.2.0` runs `.github/workflows/release.yml`. Its first job, **preflight** (`scripts/release_preflight.py`), stops the run before anything is built unless both of these hold:
 
-1. **cargo-dist** builds the server for Linux and macOS on both architectures, plus the shell installer and SHA-256 checksums, and attaches them to a GitHub Release whose notes come from CHANGELOG.md.
+- The `release` environment has a **Required reviewers** rule (Settings, Environments, `release`, Deployment protection rules). That rule is what makes a human approve the registry jobs in step 3; without it they would publish unattended.
+- The tagged commit's latest push run of `rust.yml` on main passed. A run that is still going does not count.
+
+The job's error says which check failed. Nothing was built or published, so restore the rule, or wait for main CI to pass, and re-run the failed jobs. If main CI failed, fix main and tag a green commit instead. Once the preflight passes:
+
+1. **cargo-dist** builds the server for Linux and macOS on both architectures, plus the shell installer and SHA-256 checksums, and attaches them to a GitHub Release whose notes come from CHANGELOG.md. The `host` job creates the release with `scripts/publish_github_release.sh`. If a release for the tag already exists, such as a draft made by hand or one an earlier attempt created, the script uploads the assets to it (replacing any of the same name), sets the title, notes, and prerelease flag, and publishes it, so the job passes on its first attempt either way.
 2. **Container images**: the base image packages the step 1 binaries (`Dockerfile.release`, staged checksum-verified from the release tarballs by `scripts/stage_image_binaries.sh`, so an image ships the exact binary its release published), and the AI variant layers on it from `Dockerfile.ai`. Both are pushed to GHCR as `ghcr.io/dayvson/crabcrop` and `ghcr.io/dayvson/crabcrop-ai`, tagged with the version, and with `latest` only for a plain release: a prerelease such as `v0.10.0-rc.1` pushes its version tag alone. The repo `Dockerfile` remains the from-source build for operators building their own.
-3. **Registry publishing** (`cargo publish` for the crate, `npm publish` for the SDK, `twine upload` for the Python package) runs as separate jobs gated on the `release` GitHub Environment, so a human approves them in the Actions UI after inspecting the built artifacts. The jobs need the `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, and `PYPI_TOKEN` repository secrets. The two npm packages (`@crabcrop/url` and `@crabcrop/mcp`) publish with an explicit dist-tag from `scripts/npm_dist_tag.sh`: `latest` for a plain release, and `next` for a prerelease, so a release candidate never becomes what `npm install @crabcrop/url` or `npx -y @crabcrop/mcp` resolves (npm itself would put every publish on `latest`). Install a prerelease by its tag or version (`npm install @crabcrop/url@next`), and after publishing one, check that `npm dist-tag ls @crabcrop/url` and `npm dist-tag ls @crabcrop/mcp` show it under `next` with `latest` unchanged. crates.io and PyPI need no equivalent: their clients skip prereleases unless asked for one.
+3. **Registry publishing** (`cargo publish` for the crate, `npm publish` for the SDK, `twine upload` for the Python package) runs as separate jobs gated on the `release` GitHub Environment, whose Required reviewers rule makes a human approve them in the Actions UI after inspecting the built artifacts (the preflight fails the run when that rule is gone). The jobs need the `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, and `PYPI_TOKEN` repository secrets. The two npm packages (`@crabcrop/url` and `@crabcrop/mcp`) publish with an explicit dist-tag from `scripts/npm_dist_tag.sh`: `latest` for a plain release, and `next` for a prerelease, so a release candidate never becomes what `npm install @crabcrop/url` or `npx -y @crabcrop/mcp` resolves (npm itself would put every publish on `latest`). Install a prerelease by its tag or version (`npm install @crabcrop/url@next`), and after publishing one, check that `npm dist-tag ls @crabcrop/url` and `npm dist-tag ls @crabcrop/mcp` show it under `next` with `latest` unchanged. crates.io and PyPI need no equivalent: their clients skip prereleases unless asked for one.
 4. **The Homebrew formula** is generated from the release checksums and uploaded to the release as `crabcrop.rb`:
 
    ```bash
@@ -18,6 +23,8 @@ Pushing a tag like `v0.2.0` runs `.github/workflows/release.yml`:
    ```
 
    Moving it into a `homebrew-tap` repository is a separate, later step.
+
+**The release gate**: once the preflight passes, the same run calls `.github/workflows/ai-models.yml`, which downloads the pinned ONNX Runtime and models and runs the real-model AI tests (`cargo test -- --ignored`) alongside the builds. The `host` job, which creates the GitHub Release, waits for it, and the image and registry jobs wait for `host`, so a tag whose AI code fails against the real models publishes nothing. Nothing was published, so delete the tag (`git push origin :refs/tags/vX.Y.Z`), land the fix on main, and tag the fixed commit with the same version; for a transient download failure, re-run the failed jobs, which re-runs the gate and everything waiting on it.
 
 The workflow file is generated by cargo-dist (`cargo dist generate`) plus the image and publishing jobs maintained in this repo. Because the automation credential cannot push workflow files, the complete workflow lives at `docs/release-workflow.yml`; land it at `.github/workflows/release.yml` through the GitHub web UI (the same route as the rust.yml gates in #36) before the first tag.
 
@@ -52,7 +59,7 @@ The workflow file is generated by cargo-dist (`cargo dist generate`) plus the im
    The check compares the working tree with the last release tag, so run it from a full clone (`scripts/test_all.sh` runs it too; CI's shallow checkout has no tags and reports it skipped). Raise the version by one, note the reason next to the constant, and say in the release's CHANGELOG section that the release starts a new cache epoch. Raise it as well for a deliberate output change the corpus does not cover; the check only sees the corpus.
 
 5. Commit ("Release vX.Y.Z"), push, and tag: `git tag vX.Y.Z` on the release commit (the local master and the remote main carry the same tree, as usual).
-6. Land `docs/release-workflow.yml` at `.github/workflows/release.yml` if it is not already there, then push the tag and watch the run. Approve the `release` environment jobs when the artifacts look right.
+6. Land `docs/release-workflow.yml` at `.github/workflows/release.yml` if it is not already there. Once the release commit's `rust.yml` run on main has passed, push the tag and watch the run; a failed preflight names its reason (see the pipeline above). Approve the `release` environment jobs when the artifacts look right.
 7. Smoke test the published artifacts in a clean environment: `cargo add crabcrop-url`, `npm install @crabcrop/url`, `pip install crabcrop-url`, `docker pull ghcr.io/dayvson/crabcrop:X.Y.Z`, and the shell installer from the GitHub Release.
 
 ## Version policy

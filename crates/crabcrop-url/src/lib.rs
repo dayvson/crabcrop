@@ -1,7 +1,9 @@
 //! Build, sign, seal, and verify crabcrop URLs, per
 //! `spec/url-signing.md` in the crabcrop repository. This is
-//! the same code the server verifies with: one
-//! implementation, reused by every client.
+//! the same code the server verifies with, so a Rust client
+//! cannot drift from it. The TypeScript and Python SDKs are
+//! separate implementations of the same spec, held to it by
+//! the shared `spec/test-vectors.json`.
 //!
 //! A crabcrop URL names an image and the operations to
 //! apply to it. This crate mints and checks the four kinds
@@ -120,7 +122,9 @@ pub fn verify(secret: &[u8], signature_hex: &str, remainder: &str) -> bool {
 }
 
 /// The largest size dimension the server's grammar accepts,
-/// per `spec/url-signing.md`.
+/// as `docs/operations.md` in the crabcrop repository states.
+/// `spec/operation-vectors.json` pins it: `16383x16383`
+/// parses and `16384x10` is an `invalid_size`.
 pub const MAX_DIMENSION: u32 = 16383;
 
 /// Why a builder refused to produce a URL. Typed, with the

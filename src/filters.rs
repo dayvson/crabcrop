@@ -1,6 +1,6 @@
 //! Applying filter operations to decoded images.
 //!
-//! [`apply_filters`] runs pixel filters in URL order and collects
+//! [`apply_filters_filled`] runs pixel filters in URL order and collects
 //! encoding directives. `Format`, `Quality`, `Fill`, and
 //! `MaxBytes` do not touch pixels; they are recorded for the
 //! encoder.
@@ -93,7 +93,7 @@ pub fn apply_filters(img: DynamicImage, filters: &[Filter]) -> (DynamicImage, En
     apply_filters_filled(img, filters, None)
 }
 
-/// [`apply_filters`] with the request's resolved fill color,
+/// `apply_filters` (test builds only) with the request's resolved fill color,
 /// which arbitrary-angle rotation uses for the corners the
 /// turned image leaves uncovered (issue #144).
 pub fn apply_filters_filled(
@@ -338,7 +338,7 @@ fn rotate_arbitrary(img: DynamicImage, degrees: f32, fill: Option<[u8; 3]>) -> D
     let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba(background));
     // Every output pixel is a pure function of the source,
     // so the canvas splits into row bands across scoped
-    // threads without changing a byte (wave 3); small
+    // threads without changing a byte; small
     // canvases run sequentially on the calling thread.
     let row_len = (new_w * 4) as usize;
     let threads = band_threads();
@@ -477,11 +477,11 @@ fn map_rgb_image(
 }
 
 // ----------------------------------------------------------------
-// Wave-3 fast paths. Every function in this section is a
+// Fast paths. Every function in this section is a
 // byte-identical stand-in for the image-crate operation it
 // replaces: the identity is pinned by tests in this module
-// against the crate over fixture sweeps, and (for hue) an
-// exhaustive check over the RGB cube in the wave-3 spike.
+// against the crate over fixture sweeps, and hue was also
+// checked exhaustively over the RGB cube, outside the suite.
 // ----------------------------------------------------------------
 
 /// Below this frame size (in subpixels) the crate's
@@ -1466,11 +1466,11 @@ pub fn convolve(img: &DynamicImage, kernel: &[f64], normalize: bool) -> DynamicI
         1.0
     };
     let has_alpha = img.color().has_alpha();
-    // Fast path for opaque RGB sources: the RGBA detour this
-    // function used to take only ever read and wrote the three
-    // color channels (the synthesized alpha was dropped again
-    // on the way back), so working on the RGB buffer directly
-    // is byte-identical while skipping both conversions.
+    // Fast path for opaque RGB sources: the RGBA path below
+    // only ever reads and writes their three color channels
+    // (the synthesized alpha is dropped again on the way
+    // back), so working on the RGB buffer directly is
+    // byte-identical while skipping both conversions.
     if let DynamicImage::ImageRgb8(rgb) = img {
         let out = convolve_raw::<3>(
             rgb.as_raw(),
@@ -1964,10 +1964,6 @@ pub fn draw_border(img: &DynamicImage, width: u32, color: [u8; 3]) -> DynamicIma
     DynamicImage::ImageRgba8(rgba)
 }
 
-/// Crop away the uniform border: keep the bounding box of
-/// pixels that differ from the top-left corner color by more
-/// than `tolerance` in any channel (alpha included). A fully
-/// uniform image is returned unchanged, never emptied.
 /// Blur every detected face region in `img`. The blur sigma
 /// scales with each face's size, so the redaction holds up at
 /// any resolution. Pixels outside the face boxes are untouched.
@@ -1987,9 +1983,9 @@ const FACE_MOSAIC_CELLS: u32 = 8;
 /// box: its longer side spans at most `FACE_MOSAIC_CELLS`
 /// cells, and a cell is never under 2 px, so a face only a few
 /// pixels wide is averaged away rather than passed through
-/// (issue #401: a 1 px block made the old nearest-neighbor
-/// round trip an identity for faces under 20 px, and sampling
-/// kept a quarter of the pixels of slightly larger ones).
+/// (issue #401: with a 1 px block a nearest-neighbor round
+/// trip is an identity for faces under 20 px, and sampling
+/// keeps a quarter of the pixels of slightly larger ones).
 /// Pixels outside the face boxes are untouched.
 pub fn pixelate_faces(img: &DynamicImage, faces: &[crate::ai::FaceBox]) -> DynamicImage {
     redact_faces(img, faces, |region, face| {
@@ -2286,6 +2282,10 @@ fn redact_faces(
     DynamicImage::ImageRgba8(base)
 }
 
+/// Crop away the uniform border: keep the bounding box of
+/// pixels that differ from the top-left corner color by more
+/// than `tolerance` in any channel (alpha included). A fully
+/// uniform image is returned unchanged, never emptied.
 fn trim(img: DynamicImage, tolerance: u8) -> DynamicImage {
     let rgba = img.to_rgba8();
     let corner = *rgba.get_pixel(0, 0);
