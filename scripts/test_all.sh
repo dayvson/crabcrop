@@ -56,9 +56,10 @@ done
 # Every npm publish command in any workflow passes the tag, whatever
 # its other flags: the two known steps in release.yml (@crabcrop/url
 # and @crabcrop/mcp) and any publish added later, one-off workflows
-# included (issue #457).
+# included (issue #457). A `name:` line, a workflow's, a job's or a
+# step's, is a label, not a command.
 publishes=$(grep -hE 'npm publish( |$)' .github/workflows/*.yml \
-  | grep -vE '^[[:space:]]*(- name:|#)' || true)
+  | grep -vE '^[[:space:]]*(-[[:space:]]+)?(name:|#)' || true)
 untagged=$(printf '%s\n' "$publishes" | grep -v -- '--tag "\$NPM_TAG"$' || true)
 if [ "$(printf '%s\n' "$publishes" | grep -c .)" -lt 2 ] || [ -n "$untagged" ]; then
   echo "every npm publish in .github/workflows must pass --tag \"\$NPM_TAG\" from scripts/npm_dist_tag.sh:" >&2
