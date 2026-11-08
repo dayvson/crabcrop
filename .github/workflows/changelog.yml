@@ -1,0 +1,39 @@
+# CHANGELOG entry gate (issue #473). This file is the live
+# workflow; docs/changelog-workflow.yml is its mirror, kept
+# identical (scripts/test_all.sh compares them), the same
+# convention as docs/rust-workflow.yml and the other mirrors.
+#
+# A pull request that touches src/, sdks/, frameworks/ or
+# plugins/ must add a line under ## [Unreleased] in
+# CHANGELOG.md, or carry the no-changelog label when nothing
+# user-facing changed (a refactor, a test, a dependency bump).
+# The labeled and unlabeled events re-run the check when a
+# maintainer sets or removes the label. The rule lives in
+# scripts/check_docs.py (--changelog-entry), and
+# scripts/test_check_docs.py tests it.
+name: Changelog
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
+
+permissions:
+  contents: read
+
+jobs:
+  entry:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      # The pull request's merge commit and its first parent, the
+      # base branch tip it merges into: HEAD^1..HEAD is exactly the
+      # change the pull request makes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - name: Require a CHANGELOG entry or the no-changelog label
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: python3 scripts/check_docs.py --changelog-entry HEAD^1 --labels "$LABELS"
