@@ -40,7 +40,7 @@
 //! itself (a marker never draws inside its own content) and
 //! which therefore cost nothing here either.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roxmltree::Node;
 
@@ -197,9 +197,116 @@ enum Role {
     Pattern,
 }
 
+/// The kinds of element usvg resolves by walking a chain of
+/// `href` links of the same kind (`HrefIter`, and the
+/// `find_*`/`resolve_*_attr` helpers in usvg's parser).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HrefKind {
+    Gradient,
+    Pattern,
+    Filter,
+}
+
+fn href_kind(node: Node) -> Option<HrefKind> {
+    match node.tag_name().name() {
+        "linearGradient" | "radialGradient" => Some(HrefKind::Gradient),
+        "pattern" => Some(HrefKind::Pattern),
+        "filter" => Some(HrefKind::Filter),
+        _ => None,
+    }
+}
+
+/// Refuse a document in which usvg would follow an `href` chain
+/// for ever (issue #443). usvg inherits a gradient's stops and
+/// coordinates, a pattern's children and tiling, and a filter's
+/// region and primitives from the element its `href` names, of
+/// the same kind, and repeats that for the next `href`, and so
+/// on. Its only guard (`HrefIter`) stops the walk when a link
+/// points at the element being resolved or back at the one the
+/// walk began at; a cycle that the starting element is not part
+/// of, such as `#a`→`#b`→`#c`→`#b`, is followed with no end,
+/// and the blocking thread never returns.
+///
+/// This mirrors that walk exactly: from each gradient, pattern,
+/// or filter, it follows the same-kind `href` with usvg's stop
+/// rule and a per-origin visited set, and refuses the moment a
+/// link re-enters the chain anywhere but at its origin. A chain
+/// that ends, or self-links, or returns to its origin (all of
+/// which usvg terminates) is not refused, so no legitimate
+/// `href` inheritance chain is. Nodes whose chain ends without
+/// such a re-entry are memoized, keeping the pass linear.
+fn check_href_cycles<'a, 'input>(
+    doc: &'a roxmltree::Document<'input>,
+    facts: &Facts<'a, 'input>,
+) -> Result<(), Refusal> {
+    // The same-kind element `node`'s `href` names, the way
+    // usvg's walk continues (it stops at a kind change).
+    let successor = |node: Node<'a, 'input>| -> Option<Node<'a, 'input>> {
+        let kind = href_kind(node)?;
+        node.attributes()
+            .filter(|a| a.name().eq_ignore_ascii_case("href"))
+            .filter_map(|a| iri_id(a.value()))
+            .filter_map(|id| facts.ids.get(id))
+            .flatten()
+            .copied()
+            .find(|target| *target != node && href_kind(*target) == Some(kind))
+    };
+    // Nodes whose chain ends without re-entering it: they
+    // terminate from any origin and need not be walked again.
+    let mut safe: HashSet<usize> = HashSet::new();
+    for node in doc.descendants().filter(Node::is_element) {
+        if href_kind(node).is_none() {
+            continue;
+        }
+        let origin = node.id().get_usize();
+        if safe.contains(&origin) {
+            continue;
+        }
+        let mut path: Vec<usize> = Vec::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut curr = node;
+        loop {
+            let curr_id = curr.id().get_usize();
+            let Some(next) = successor(curr) else {
+                // No further same-kind link: the walk ends.
+                safe.insert(curr_id);
+                safe.extend(path.iter().copied());
+                break;
+            };
+            let next_id = next.id().get_usize();
+            if next_id == curr_id || next_id == origin {
+                // usvg stops on a self-link or a return to the
+                // element the walk began at (origin-dependent,
+                // so do not memoize the chain as safe).
+                break;
+            }
+            if safe.contains(&next_id) {
+                safe.insert(curr_id);
+                safe.extend(path.iter().copied());
+                break;
+            }
+            if seen.contains(&next_id) {
+                // A link back into the chain, not to its origin:
+                // usvg follows it with no end.
+                return Err(Refusal::Cycle);
+            }
+            seen.insert(curr_id);
+            path.push(curr_id);
+            curr = next;
+        }
+    }
+    Ok(())
+}
+
 /// Bound what usvg builds for `doc`, or say why it is refused.
 pub(super) fn bound(doc: &roxmltree::Document, limits: Limits) -> Result<Cost, Refusal> {
     let facts = Facts::gather(doc);
+    // usvg follows `href` on gradients, patterns, and filters
+    // with a guard that misses cycles not passing through the
+    // element it started from, so such a cycle hangs it before
+    // it builds anything the walk below would count. Refuse it
+    // first (issue #443).
+    check_href_cycles(doc, &facts)?;
     let fuel = limits
         .nodes
         .saturating_mul(4)
@@ -929,7 +1036,9 @@ mod tests {
     }
 
     fn svg(body: &str) -> String {
-        format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\">{body}</svg>")
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"10\" height=\"10\">{body}</svg>"
+        )
     }
 
     #[test]
@@ -1035,6 +1144,55 @@ mod tests {
         // of the chain.
         deep.push_str("<use href=\"#m0\"/><rect width=\"1\" height=\"1\" mask=\"url(#k59)\"/>");
         assert_eq!(bound_of(&svg(&deep)), Err(Refusal::Depth));
+    }
+
+    #[test]
+    fn href_chain_cycles_are_refused() {
+        // `#a` → `#b` → `#c` → `#b`: usvg's HrefIter guard
+        // (self-link or return to origin) misses this, so it
+        // loops with no end. Refused for each kind that walks
+        // an href chain, including gradients and elements that
+        // carry their own children (usvg still walks the chain
+        // to resolve absent attributes).
+        for body in [
+            // Gradient: the issue's named case.
+            "<defs><linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\" href=\"#c\"/>\
+             <linearGradient id=\"c\" href=\"#b\"/></defs>\
+             <rect width=\"1\" height=\"1\" fill=\"url(#a)\"/>",
+            // Radial gradient, xlink spelling.
+            "<defs><radialGradient id=\"a\" xlink:href=\"#b\"/><radialGradient id=\"b\" xlink:href=\"#c\"/>\
+             <radialGradient id=\"c\" xlink:href=\"#b\"/></defs>\
+             <rect width=\"1\" height=\"1\" fill=\"url(#a)\"/>",
+            // Pattern whose entry carries children: the walk
+            // still resolves tiling attributes down the chain.
+            "<defs><pattern id=\"a\" href=\"#b\" width=\"1\" height=\"1\"><rect width=\"1\" height=\"1\"/></pattern>\
+             <pattern id=\"b\" href=\"#c\"/><pattern id=\"c\" href=\"#b\"/></defs>\
+             <rect width=\"1\" height=\"1\" fill=\"url(#a)\"/>",
+            // Filter whose entry carries a primitive.
+            "<defs><filter id=\"a\" href=\"#b\"><feFlood/></filter>\
+             <filter id=\"b\" href=\"#c\"/><filter id=\"c\" href=\"#b\"/></defs>\
+             <rect width=\"1\" height=\"1\" filter=\"url(#a)\"/>",
+        ] {
+            assert_eq!(bound_of(&svg(body)), Err(Refusal::Cycle), "{body}");
+        }
+    }
+
+    #[test]
+    fn legitimate_href_chains_are_not_refused() {
+        // Chains usvg terminates must render: a plain
+        // inheritance chain, a two-link chain through the
+        // origin, and a self-link.
+        for body in [
+            "<defs><linearGradient id=\"base\"><stop offset=\"0\" stop-color=\"#f00\"/></linearGradient>\
+             <linearGradient id=\"mid\" href=\"#base\"/><linearGradient id=\"a\" href=\"#mid\"/></defs>\
+             <rect width=\"1\" height=\"1\" fill=\"url(#a)\"/>",
+            "<defs><linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\" href=\"#a\"/></defs>\
+             <rect width=\"1\" height=\"1\" fill=\"url(#a)\"/>",
+            "<defs><pattern id=\"p\" href=\"#p\" width=\"1\" height=\"1\"><rect width=\"1\" height=\"1\"/></pattern></defs>\
+             <rect width=\"1\" height=\"1\" fill=\"url(#p)\"/>",
+        ] {
+            assert!(bound_of(&svg(body)).is_ok(), "{body}");
+        }
     }
 
     #[test]

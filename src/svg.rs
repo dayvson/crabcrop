@@ -1368,6 +1368,34 @@ mod tests {
             assert!(bound_refusal(&svg).contains("cycle"), "{svg}");
             assert!(prepare(svg.as_bytes()).err().unwrap().contains("cycle"));
         }
+        // `href` chains that loop without passing through the
+        // element usvg started resolving (`#a`→`#b`→`#c`→`#b`).
+        // usvg's own guard misses these and follows them with
+        // no end, so before #443 each hung the blocking thread
+        // from a few hundred bytes: a gradient (the issue's
+        // named case), and a pattern and a filter whose entry
+        // carries children (usvg still walks the chain to
+        // resolve absent tiling and region attributes).
+        let href_cycles = [
+            "<defs><linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\" href=\"#c\"/>\
+             <linearGradient id=\"c\" href=\"#b\"/></defs><rect width=\"10\" height=\"10\" fill=\"url(#a)\"/>",
+            "<defs><pattern id=\"a\" href=\"#b\" width=\"1\" height=\"1\"><rect width=\"1\" height=\"1\"/></pattern>\
+             <pattern id=\"b\" href=\"#c\"/><pattern id=\"c\" href=\"#b\"/></defs>\
+             <rect width=\"10\" height=\"10\" fill=\"url(#a)\"/>",
+            "<defs><filter id=\"a\" href=\"#b\"><feFlood flood-color=\"#00ff00\"/></filter>\
+             <filter id=\"b\" href=\"#c\"/><filter id=\"c\" href=\"#b\"/></defs>\
+             <rect width=\"10\" height=\"10\" filter=\"url(#a)\"/>",
+        ];
+        for body in href_cycles {
+            let svg = svg_document(body);
+            assert!(bound_refusal(&svg).contains("cycle"), "{svg}");
+            let started = std::time::Instant::now();
+            assert!(
+                prepare(svg.as_bytes()).err().unwrap().contains("cycle"),
+                "{svg}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
         // A linear chain of 200 feImage references overflowed a
         // 2 MiB stack too; it is refused for depth.
         let svg = feimage_chain(1, 200, "href");
