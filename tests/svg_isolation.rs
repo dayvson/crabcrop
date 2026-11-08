@@ -76,7 +76,8 @@ fn get_with(port: u16, path: &str, headers: &str) -> (u16, Vec<u8>, Duration) {
 }
 
 /// A directory of SVG sources the server reads through
-/// `file://` URLs.
+/// `file://` URLs. Bound before the server's guard, it is
+/// removed after the server exits (locals drop in reverse).
 fn source_dir(name: &str) -> test_support::ScratchDir {
     let dir = test_support::scratch_dir(&format!("svg-isolation-{name}"));
     std::fs::write(dir.join("ok.svg"), OK_SVG).unwrap();
@@ -251,7 +252,6 @@ fn hostile_svgs_fail_alone_while_the_server_keeps_serving() {
     );
     assert!(took < Duration::from_secs(30), "explain took {took:?}");
     assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The server's live child processes (Linux: the kernel
@@ -305,7 +305,6 @@ fn a_render_past_the_deadline_is_a_504_and_its_worker_dies() {
     }
     assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
     assert_eq!(get(port, "/unsafe/32x32/file:///ok.svg").0, 200);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A small PNG, embedded as a `data:` URI below.

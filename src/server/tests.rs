@@ -13147,8 +13147,7 @@ async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
     // A replica that boots after the purge, with a disk of
     // its own that kept a pre-purge copy, misses on both.
     fx.restore_stale_bucket_copy().await;
-    let other_dir = fx.dir.with_extension("other");
-    let _ = std::fs::remove_dir_all(&other_dir);
+    let other_dir = crate::test_support::scratch_dir("srv-walk-other");
     let booted = fx.other_replica(Some(&other_dir));
     let booted_disk = booted.store.clone().unwrap();
     booted_disk.put(&fx.key, &fx.stale);
@@ -13156,7 +13155,6 @@ async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
     assert!(lookup_tiers(&booted, &fx.key, &[]).await.is_none());
     assert!(booted_disk.get(&fx.key).is_none(), "the disk copy survived");
     assert!(!fx.bucket_holds_stale(), "the bucket copy survived");
-    let _ = std::fs::remove_dir_all(&other_dir);
     // The restarted receiving server, over the same disk
     // and bucket with fresh memory, misses on the purged
     // URL and renders it again from the origin.

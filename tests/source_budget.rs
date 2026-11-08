@@ -122,7 +122,9 @@ fn boot(budget_mb: u32, upload_dir: &std::path::Path) -> (ServerGuard, u16) {
     panic!("no /health before the deadline");
 }
 
-/// A fresh per-test directory.
+/// A fresh per-test directory. Bound before the server's
+/// guard, it is removed after the server exits (locals drop
+/// in reverse).
 fn scratch_dir(tag: &str) -> test_support::ScratchDir {
     test_support::scratch_dir(&format!("source-budget-{tag}"))
 }
@@ -294,7 +296,6 @@ fn stalled_origins_do_not_block_a_normal_request() {
         "{body}"
     );
     assert!(!uploads.join("stall.png").exists());
-    let _ = std::fs::remove_dir_all(&uploads);
 }
 
 #[test]
@@ -366,5 +367,4 @@ fn a_budget_full_of_buffered_bytes_sheds_new_misses_with_server_busy() {
     origin.release.store(true, Ordering::SeqCst);
     assert_ne!(stalled.join().unwrap(), 200);
     assert_eq!(held_bytes(port), 0, "the stalled charge came back");
-    let _ = std::fs::remove_dir_all(&uploads);
 }

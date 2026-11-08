@@ -76,6 +76,15 @@ pdftocairo, pdfinfo) writes it with `crate::test_support::write_script`, not
 descriptor can fail to start with "Text file busy" when another test thread
 spawns a child at the same moment (issue #523).
 
+A test that writes files makes them in a directory of its own from
+`crate::test_support::scratch_dir(tag)`: it starts empty under
+`std::env::temp_dir()` and is removed when dropped. The binary's unit tests
+and `tests/*.rs` cannot see the library's test modules, so they include the
+same file, `src/test_support/scratch.rs`, with `#[path]`. Never build a temp
+name from the process ID alone: IDs repeat, and a later run inherits what an
+earlier one left (issue #526). Quote a path you splice into a fake tool's
+script (`>> '{}'`), so a temp dir with a space in it still works.
+
 ## Code style
 
 CI enforces formatting and lints. Run both before pushing:
