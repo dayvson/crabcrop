@@ -8515,6 +8515,135 @@ async fn default_ops_apply_in_presets_only_mode() {
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
 }
 
+/// GET a signed remainder on the image route (`""`) or
+/// the explain route (`"explain/"`), asking for the JSON
+/// envelope: the status and the parsed body.
+async fn get_signed_json(
+    base: &str,
+    route: &str,
+    remainder: &str,
+) -> (StatusCode, serde_json::Value) {
+    let resp = client()
+        .get(format!("{base}/{route}{}/{remainder}", sign(remainder)))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = serde_json::from_str(&resp.text().await.unwrap()).unwrap_or_default();
+    (status, body)
+}
+
+#[tokio::test]
+async fn over_cap_requests_answer_400_before_any_fetch() {
+    // Issue #469: the cap used to be checked by the engine
+    // alone, after the source was fetched and decoded, so an
+    // over-cap URL cost a fetch, and repeating a preset made
+    // one short to spell. It is checked on the expanded list
+    // at parse time now: every over-cap spelling below
+    // answers 400 on the image and explain routes, and the
+    // counting origin sees no request at all.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let over_cap = [
+        // One segment, one filter past the cap.
+        format!("filters:{}", vec!["invert"; 101].join(":")),
+        // 101 single-operation segments.
+        vec!["30x20"; 101].join("/"),
+        // The issue's evidence: 4,985 preset references, a
+        // path of about 64 KB that expands to 4,985 sizes.
+        vec!["preset:small"; 4_985].join("/"),
+        // Metadata does not count and does not hide the
+        // operations around it.
+        format!(
+            "exp:{}/{}/maxage:60",
+            now_unix() + 3600,
+            vec!["preset:gray"; 101].join("/")
+        ),
+        // The longest single filters segment a URL can carry.
+        format!("filters:{}", vec!["invert"; 9_000].join(":")),
+    ];
+    let counts = [101, 101, 4_985, 101, 9_000];
+    for (ops, count) in over_cap.iter().zip(counts) {
+        let remainder = format!("{ops}/{src}");
+        for route in ["", "explain/"] {
+            let (status, body) = get_signed_json(&base, route, &remainder).await;
+            let label = format!("{route}{}", &ops[..ops.len().min(40)]);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(body["error"]["code"], "unsupported_operation", "{label}");
+            assert_eq!(
+                body["error"]["message"],
+                format!("request has {count} operations, over the 100 operation limit"),
+                "{label}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "an over-cap request fetched its source"
+    );
+    // Without the JSON ask the body is the plain message.
+    let remainder = format!("{}/{src}", over_cap[0]);
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "request has 101 operations, over the 100 operation limit"
+    );
+    // A sealed spelling gets the uniform refusal, also
+    // without a fetch.
+    let resp = client()
+        .get(format!("{base}/{}", sealed_path(&remainder, Some("a.png"))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.text().await.unwrap(), "bad signature");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // Exactly at the cap still renders: the check refuses
+    // only past it, and the server survived the barrage.
+    let at_cap = format!("{}/{src}", vec!["30x20"; 100].join("/"));
+    let resp = get_signed(&base, &at_cap).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn over_cap_counts_the_default_operations_before_any_fetch() {
+    // Issue #469: the cap counts the merged list, defaults
+    // included, on both routes, and a default the URL
+    // overrides is dropped before counting.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_defaults("filters:format(webp)", false).await;
+    // 100 of the URL's own plus the default format: 101.
+    let over = format!("{}/{src}", vec!["filters:invert"; 100].join("/"));
+    for route in ["", "explain/"] {
+        let (status, body) = get_signed_json(&base, route, &over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 101 operations, over the 100 operation limit",
+            "{route}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // 99 plus the default fits.
+    let fits = format!("{}/{src}", vec!["filters:invert"; 99].join("/"));
+    let resp = get_signed(&base, &fits).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // The URL's own format drops the default one, so 99
+    // plus the URL's format is 100, not 101.
+    let own_format = format!(
+        "{}/filters:format(png)/{src}",
+        vec!["filters:invert"; 99].join("/")
+    );
+    let resp = get_signed(&base, &own_format).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+}
+
 #[tokio::test]
 async fn rotation_window_verifies_both_keys_and_routes_by_key_id() {
     let (src_host, _hits) = spawn_counting_server(200, "image/png", test_png()).await;

@@ -68,7 +68,7 @@ Operational failures carry these codes:
 | `source_timeout` | `504` | The source fetch timed out. |
 | `decode_failed` | `502` | The fetched bytes could not be decoded as an image. |
 | `encode_failed` | `500` | Encoding the output failed. |
-| `unsupported_operation` | `400` | The operation is not supported for this source or output. |
+| `unsupported_operation` | `400` | The operation is not supported for this source or output. Also a request over the 100-operation cap, counted after presets expand and with the default operations merged in (see [the URL grammar](url-grammar.md#how-requests-work)); that one answers before any source fetch, with the body `request has <n> operations, over the 100 operation limit`. |
 | `not_configured` | `501` | The operation needs a model or resource this server was not configured with. |
 | `inference_bad_output` | `502` | A model ran but produced output the server cannot use. |
 | `inference_failed` | `500` | An AI model failed at inference time. |

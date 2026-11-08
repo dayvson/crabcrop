@@ -193,6 +193,77 @@ fn boot_with_a_model_but_no_runtime_anywhere_fails_with_the_diagnostic() {
 }
 
 #[test]
+fn boot_refuses_default_operations_with_metadata_or_over_the_cap() {
+    // Issue #469: `exp:` and `maxage:` in CRABCROP_DEFAULT_OPS
+    // used to boot cleanly and be dropped, so a default
+    // lifetime never applied, and defaults alone over the
+    // operation cap booted a server that refused every
+    // request. Each is a boot error naming the variable now.
+    // The child runs under a deadline: a regression boots and
+    // serves, and must fail here instead of hanging the run.
+    let over_cap = format!("filters:{}", vec!["invert"; 101].join(":"));
+    let cases = [
+        (
+            "filters:format(webp)/maxage:60",
+            "invalid maxage segment: maxage:60",
+        ),
+        (
+            "exp:1893456000/filters:format(webp)",
+            "invalid expiry segment: exp:1893456000",
+        ),
+        (
+            over_cap.as_str(),
+            "request has 101 operations, over the 100 operation limit",
+        ),
+    ];
+    for (defaults, detail) in cases {
+        let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .env("PORT", free_port().to_string())
+            .env("CRABCROP_DEFAULT_OPS", defaults)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut server = ServerGuard(child);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = server.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "booted with CRABCROP_DEFAULT_OPS={defaults}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(status.code(), Some(1), "{defaults}");
+        let mut stderr = String::new();
+        server
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(
+            stderr.contains(&format!("crabcrop: invalid CRABCROP_DEFAULT_OPS: {detail}")),
+            "{defaults}: {stderr}"
+        );
+        let mut stdout = String::new();
+        server
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert!(!stdout.contains("default operations:"), "{stdout}");
+    }
+}
+
+#[test]
 fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
     // The in-process contract (cli::exec returning Err) is
     // covered by unit tests; this pins the process shell

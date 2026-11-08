@@ -82,6 +82,8 @@ With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves each host that is 
 
 - **The signature never covers the defaults.** They are operator configuration, applied after verification, like preset expansion.
 - **Defaults sit before the URL's own operations**, and for the singleton directives (format, quality, fill, dpr, max_bytes) the URL wins by the default being dropped from the merged list. A bare request under defaults and the same request spelled out in full therefore produce the same operations and share a cache entry. Everything else (sizes, filters, watermarks) applies from both, in order: a default blur and a URL blur stack.
+- **Defaults are operations only.** `exp:` and `maxage:` are per-request metadata, so a defaults string that carries either refuses the boot with `invalid CRABCROP_DEFAULT_OPS`, as a preset definition carrying them does. Set a shorter cache lifetime on the URLs that need it.
+- **Defaults count against the 100-operation cap** together with each URL's own operations, after the merge: a default the URL overrides is dropped and does not count (see [the URL grammar](url-grammar.md#how-requests-work)). A defaults string that alone runs past the cap refuses the boot, since every request under it would answer `400`.
 - **Cache entries key on the merged operations**, exactly like presets, so changing the defaults changes the keys and old entries age out unused. Purges account for the merge too: purging a URL removes its merged entry.
 - **Presets-only mode is unaffected in what it rejects** (the URL's own operations), and the defaults still apply: they are not URL content.
 - Cache groups stay the URL's own presets; a preset referenced only by the defaults does not join entries to its group.
