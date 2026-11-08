@@ -64,6 +64,33 @@ def third_party(rel, text, pos):
     return False
 
 
+# RENDERING_VERSION's doc comment in src/main.rs keeps one entry per
+# value, "N: the first release after X.Y.Z" (RELEASING.md, step 4).
+# That names the release before the change, so it is history a bump
+# keeps, and each raise adds one naming the version of its day. Only a
+# version that ends this phrase inside that comment is skipped.
+HISTORY_FILE = "src/main.rs"
+RENDERING_CONST = re.compile(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?const RENDERING_VERSION\b")
+_GAP = r"\s+(?:///\s*)?"  # a space, or a line break inside the comment
+HISTORY_ENTRY = re.compile(r"\bthe" + "".join(_GAP + word for word in ("first", "release", "after")) + _GAP + r"\Z")
+
+
+def rendering_history(rel, text, pos):
+    """Whether offset `pos` of a file is the release an entry of
+    RENDERING_VERSION's doc comment counts from."""
+    if rel != HISTORY_FILE:
+        return False
+    const = RENDERING_CONST.search(text)
+    if const is None or pos >= const.start():
+        return False
+    start = const.start()
+    for line in reversed(text[:start].splitlines(keepends=True)):
+        if not line.lstrip().startswith("///"):
+            break
+        start -= len(line)
+    return pos >= start and HISTORY_ENTRY.search(text[start:pos]) is not None
+
+
 def bumped(version, step):
     major, minor, patch = (int(part) for part in version.split("."))
     return f"{major}.{minor}.{patch + 1}" if step == "patch" else f"{major}.{minor + 1}.0"
@@ -102,9 +129,10 @@ class VersionToolsTest(unittest.TestCase):
 
     def leftovers(self, old):
         """`git grep -nwF old` over the copy: each line a bump left the
-        old version on. Third-party lockfile entries and EXAMPLES do
-        not count, nor does a prerelease or build of the old version
-        (0.10.0-rc.1 in an example), which is another version."""
+        old version on. Third-party lockfile entries, EXAMPLES and the
+        rendering version's history entries do not count, nor does a
+        prerelease or build of the old version (0.10.0-rc.1 in an
+        example), which is another version."""
         word = re.compile(rf"(?<![0-9A-Za-z_]){re.escape(old)}(?![0-9A-Za-z_])(?![-+][0-9A-Za-z])")
         hits = []
         for rel in self.files:
@@ -112,7 +140,7 @@ class VersionToolsTest(unittest.TestCase):
                 continue
             text = (self.tree / rel).read_text(encoding="utf-8", errors="replace")
             for match in word.finditer(text):
-                if third_party(rel, text, match.start()):
+                if third_party(rel, text, match.start()) or rendering_history(rel, text, match.start()):
                     continue
                 line = text.count("\n", 0, match.start())
                 hits.append(f"{rel}:{line + 1}: {text.splitlines()[line].strip()}")
@@ -144,7 +172,8 @@ class VersionToolsTest(unittest.TestCase):
             [],
             "the bump left the old version behind: add each site to scripts/version_sites.py; "
             "a mention that is not a pin of this release (a test input, another project's "
-            "version, generated text) is reworded, or its file joins EXAMPLES in this test",
+            "version, generated text) is reworded, or its file joins EXAMPLES in this test; "
+            "a RENDERING_VERSION entry reads 'N: the first release after X.Y.Z' (RELEASING.md, step 4)",
         )
 
     def requirement(self):
@@ -175,6 +204,35 @@ class VersionToolsTest(unittest.TestCase):
                 self.files.append(rel)
         found = [hit for hit in self.leftovers(old) if hit.startswith(("docs/example.md:", *EXAMPLES))]
         self.assertEqual(found, [f"docs/example.md:1: {lines[0]}", f"docs/example.md:2: {lines[1]}"])
+
+    def test_the_scan_skips_only_the_rendering_history(self):
+        old, rel = self.version, HISTORY_FILE
+        path = self.tree / rel
+        if rel not in self.files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((ROOT / rel).read_bytes())
+            self.files.append(rel)
+        text = path.read_text(encoding="utf-8")
+        const = RENDERING_CONST.search(text)
+        self.assertIsNotNone(const, f"RENDERING_VERSION left {rel}: move HISTORY_FILE with it")
+        entries = (
+            f"/// 8: the first release after {old}, which changes\n"
+            f"/// 9: the first release after\n/// {old}, wrapped.\n"
+            f"/// Built by crabcrop {old}.\n"
+        )
+        elsewhere = f'\n// the first release after {old}\nfn later() {{}}\n\npub const PINNED: &str = "{old}";\n'
+        path.write_text(text[: const.start()] + entries + text[const.start() :] + elsewhere, encoding="utf-8")
+        found = [hit.split(": ", 1)[1] for hit in self.leftovers(old) if hit.startswith(f"{rel}:")]
+        # Entries in the comment are skipped, the file's own history
+        # included; any other mention, in the comment or not, counts.
+        self.assertEqual(
+            found,
+            [
+                f"/// Built by crabcrop {old}.",
+                f"// the first release after {old}",
+                f'pub const PINNED: &str = "{old}";',
+            ],
+        )
 
     def test_a_minor_bump_moves_the_crabcrop_url_requirement(self):
         new = bumped(self.version, "minor")
