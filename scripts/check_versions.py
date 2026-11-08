@@ -2,137 +2,28 @@
 """Verify that every shipped artifact carries the same version.
 
 crabcrop releases one version number across all artifacts (RELEASING.md).
-This script reads each version site and fails if any disagrees. It is run
-by scripts/bump_version.py after an edit, and belongs in CI.
+This script reads each site listed in scripts/version_sites.py, the list
+scripts/bump_version.py writes, and fails if any disagrees with the
+server's own version or cannot be read as listed (a pin count that
+changed, a lockfile entry gone). It is run by scripts/bump_version.py
+after an edit, and belongs in CI.
 """
-import json
-import re
 import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-
-
-def read(rel):
-    return (ROOT / rel).read_text(encoding="utf-8")
-
-
-def cargo_package_version(rel):
-    text = read(rel)
-    match = re.search(r'\[package\][^\[]*?^version\s*=\s*"([^"]+)"', text, re.S | re.M)
-    return match.group(1) if match else None
-
-
-def json_version(rel):
-    return json.loads(read(rel)).get("version")
-
-
-def mcp_manifest_versions(rel):
-    data = json.loads(read(rel))
-    packages = data.get("packages") or [{}]
-    return data.get("version"), packages[0].get("version")
-
-
-def pyproject_version(rel):
-    match = re.search(r'\[project\][^\[]*?^version\s*=\s*"([^"]+)"', read(rel), re.S | re.M)
-    return match.group(1) if match else None
-
-
-def chart_versions(rel):
-    text = read(rel)
-    version = re.search(r"^version:\s*(\S+)", text, re.M)
-    app = re.search(r'^appVersion:\s*"([^"]+)"', text, re.M)
-    return (version.group(1) if version else None, app.group(1) if app else None)
-
-
-def mcp_server_info_version(rel):
-    match = re.search(r'const SERVER = \{ name: "crabcrop", version: "([^"]+)" \}', read(rel))
-    return match.group(1) if match else None
-
-
-def wp_plugin_version(rel):
-    match = re.search(r"^\s*\* Version:\s+(\S+)", read(rel), re.M)
-    return match.group(1) if match else None
-
-
-def helm_values_tags(rel):
-    """The image tags pinned in the Helm values: the
-    server image and the AI image. Returns both."""
-    tags = re.findall(r'^\s+tag: "([^"]+)"', read(rel), re.M)
-    return tags if len(tags) == 2 else [None]
-
-
-def kustomize_image_tags(rel, image):
-    tags = re.findall(rf"image: ghcr\.io/dayvson/{image}:(\S+)", read(rel))
-    return tags[0] if len(tags) == 1 else None
-
-
-def readme_image_tags(rel):
-    """The image references in a deploy guide. A guide
-    may show the pin several times; all of them must
-    agree, so the site value is the common tag, a MIXED
-    marker when they disagree, and None when the guide
-    carries no pin at all."""
-    tags = set(re.findall(r"crabcrop(?:-ai)?:(\d+\.\d+\.\d+)", read(rel)))
-    if len(tags) == 1:
-        return tags.pop()
-    return "MIXED:" + ",".join(sorted(tags)) if tags else None
-
-
-def sites():
-    found = {
-        "Cargo.toml (server)": cargo_package_version("Cargo.toml"),
-        "crates/crabcrop-url/Cargo.toml": cargo_package_version("crates/crabcrop-url/Cargo.toml"),
-        "sdks/typescript/package.json": json_version("sdks/typescript/package.json"),
-        "sdks/mcp/package.json": json_version("sdks/mcp/package.json"),
-        "frameworks/nextjs/package.json": json_version("frameworks/nextjs/package.json"),
-        "frameworks/nuxt/package.json": json_version("frameworks/nuxt/package.json"),
-        "frameworks/hydrogen/package.json": json_version("frameworks/hydrogen/package.json"),
-        "frameworks/astro/package.json": json_version("frameworks/astro/package.json"),
-        "frameworks/sveltekit/package.json": json_version("frameworks/sveltekit/package.json"),
-        "sdks/python/pyproject.toml": pyproject_version("sdks/python/pyproject.toml"),
-    }
-    found["sdks/mcp/src/index.ts SERVER.version"] = mcp_server_info_version("sdks/mcp/src/index.ts")
-    manifest, manifest_pkg = mcp_manifest_versions("sdks/mcp/server.json")
-    found["sdks/mcp/server.json version"] = manifest
-    found["sdks/mcp/server.json packages[0].version"] = manifest_pkg
-    found["plugins/wordpress/crabcrop.php"] = wp_plugin_version("plugins/wordpress/crabcrop.php")
-    chart, app = chart_versions("deploy/helm/crabcrop/Chart.yaml")
-    found["deploy/helm/crabcrop/Chart.yaml version"] = chart
-    found["deploy/helm/crabcrop/Chart.yaml appVersion"] = app
-    # The deploy pins (issue #383): the tags a reader
-    # copies out of the chart values, the kustomize base,
-    # and the platform guides. They are version sites
-    # like any other; a release that leaves one behind
-    # ships a guide pointing at an old image.
-    server_tag, ai_tag = helm_values_tags("deploy/helm/crabcrop/values.yaml")
-    found["deploy/helm/crabcrop/values.yaml image.tag"] = server_tag
-    found["deploy/helm/crabcrop/values.yaml ai.image.tag"] = ai_tag
-    found["deploy/kustomize/base/deployment.yaml image"] = kustomize_image_tags(
-        "deploy/kustomize/base/deployment.yaml", "crabcrop"
-    )
-    found["deploy/kustomize/components/ai image"] = kustomize_image_tags(
-        "deploy/kustomize/components/ai/deployment-patch.yaml", "crabcrop-ai"
-    )
-    for guide in (
-        "deploy/cloud-run/README.md",
-        "deploy/container-apps/README.md",
-        "deploy/ecs-fargate/README.md",
-        "deploy/helm/crabcrop/README.md",
-    ):
-        found[f"{guide} image pins"] = readme_image_tags(guide)
-    return found
+import version_sites
 
 
 def main():
-    found = sites()
-    values = set(found.values())
-    for name, value in found.items():
-        print(f"{value or 'MISSING':>10}  {name}")
-    if None in values or len(values) != 1:
-        print("\nversion mismatch across artifacts", file=sys.stderr)
+    version, rows, problems = version_sites.check()
+    for values, site in rows:
+        shown = ",".join(dict.fromkeys(values)) if values else "MISSING"
+        print(f"{shown:>10}  {site.path}: {site.what}")
+    if problems:
+        print("\nversion mismatch across artifacts:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
         return 1
-    print(f"\nall artifacts at {values.pop()}")
+    print(f"\nall artifacts at {version}")
     return 0
 
 
