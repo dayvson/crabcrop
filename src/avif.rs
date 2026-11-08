@@ -28,16 +28,27 @@
 //!   by bytes: every `iinf` entry is a box (8 bytes at least),
 //!   every version 2 `iloc` item 10 bytes at least.
 //!
-//! Every reservation the parser makes is then bounded by the size
-//! of the file. A refused source fails as any undecodable source
-//! does (`502 decode_failed`; `415` for an upload). The parser
-//! refuses a box that overruns its parent too, once it has made
-//! the reservation, so the walk changes when those files fail,
-//! not whether. The `iinf` count is the exception: mp4parse reads
-//! it as a capacity hint only, which is why a count is refused
-//! only above the 16-bit range (at most 65,535 small slots, which
-//! a version 0 box can ask for anyway) and only when the box
-//! could not hold that many entries.
+//! Every reservation the parser sizes from a declared box size or
+//! a 32-bit count is then bounded by the size of the file; the
+//! 16-bit counts stay as they are (about 5 MiB at most, for
+//! 65,535 `iloc` items). A refused source fails as any
+//! undecodable source does (`502 decode_failed`; `415` for an
+//! upload). The parser refuses a box that overruns its parent
+//! too, once it has made the reservation, so the walk mostly
+//! changes when those files fail, not whether. There are two
+//! exceptions. mp4parse never checks that `ipco` ends inside its
+//! `iprp`: an `ipco` that runs past it swallows the `ipma`, so
+//! the image loses the properties an AV1 item must have and fails
+//! later instead. And mp4parse reads the `iinf` count as a
+//! capacity hint only, which is why a count is refused only above
+//! the 16-bit range (at most 65,535 small slots, which a version
+//! 0 box can ask for anyway) and only when the box could not hold
+//! that many entries.
+//!
+//! The walk bounds reservations, not copies: an item whose
+//! `iloc` lists the same bytes as many extents is still copied
+//! once per extent. That is a separate hazard, outside this
+//! screen.
 //!
 //! The walk follows mp4parse's own rules where they are lenient,
 //! in the default strictness the image crate uses, so it refuses
@@ -462,7 +473,16 @@ mod tests {
         );
         let iref = bx(b"iref", &full(0, &past(b"auxl", b"")));
         let ipma = bx(b"iprp", &concat(&[bx(b"ipco", b""), past(b"ipma", b"")]));
-        for (child, kind) in [(iinf, b"infe"), (iref, b"auxl"), (ipma, b"ipma")] {
+        // mp4parse lets an ipco run past its iprp (the ipma
+        // behind it is lost, so the image fails later); the walk
+        // refuses it up front.
+        let ipco = bx(b"iprp", &past(b"ipco", &bx(b"ispe", &full(0, &[0; 8]))));
+        for (child, kind) in [
+            (iinf, b"infe"),
+            (iref, b"auxl"),
+            (ipma, b"ipma"),
+            (ipco, b"ipco"),
+        ] {
             let bytes = concat(&[ftyp(b""), meta(&[hdlr(), child])]);
             assert_eq!(overrun_of(&bytes), *kind);
         }
@@ -694,6 +714,27 @@ mod tests {
         for bytes in [heic, mp4, b"\x89PNG\r\n\x1a\n".to_vec(), Vec::new()] {
             assert!(matches!(screen(&bytes).unwrap(), Cow::Borrowed(b) if b == bytes.as_slice()));
         }
+        // The real HEIF files the HEIC tests decode, too.
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut heif = 0;
+        for entry in std::fs::read_dir(fixtures).unwrap() {
+            let path = entry.unwrap().path();
+            if !matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("heic" | "heif")
+            ) {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let screened = screen(&bytes).unwrap();
+            assert!(
+                matches!(screened, Cow::Borrowed(b) if b.as_ptr() == bytes.as_ptr()),
+                "{}",
+                path.display()
+            );
+            heif += 1;
+        }
+        assert!(heif >= 5, "the HEIF fixtures moved: found {heif}");
     }
 
     #[test]
