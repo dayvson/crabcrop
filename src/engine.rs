@@ -4067,6 +4067,31 @@ fn apply_size_cropped(
     apply_size_windowed(img, size, cap, dpr, Some(window))
 }
 
+/// Whether a resize or fit-in box asks for a zero pixel side
+/// (issue #464). A single `0` is proportional (or unbounded),
+/// but a zero written with more digits (`00x100`) parses as an
+/// exact zero: the spelling is shared grammar that the spec
+/// vectors pin, so the parser keeps it and the engine refuses
+/// it. Read on the size as requested, before DPR scaling
+/// rounds a zero up to one pixel. The `/explain` forecast asks
+/// the same question, so the two cannot disagree.
+pub(crate) fn has_zero_side(size: &ImageSize) -> bool {
+    size.width == Dimension::Pixels(0) || size.height == Dimension::Pixels(0)
+}
+
+/// Refuse a [`has_zero_side`] box with `unsupported_operation`,
+/// the answer an output past the pixel budget gets.
+fn check_nonzero_size(size: &ImageSize) -> Result<(), EngineError> {
+    if has_zero_side(size) {
+        return Err(EngineError::Unsupported(
+            "requested size has a zero pixel side; write 0 alone for a \
+             proportional or unbounded axis"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn apply_size_windowed(
     img: DynamicImage,
     size: &ImageSize,
@@ -4074,6 +4099,7 @@ fn apply_size_windowed(
     dpr: f32,
     window: Option<(u32, u32, u32, u32)>,
 ) -> Result<DynamicImage, EngineError> {
+    check_nonzero_size(size)?;
     let size = &ImageSize {
         width: scale_dimension(size.width, dpr),
         height: scale_dimension(size.height, dpr),
@@ -4321,6 +4347,7 @@ fn apply_fit_in(
     cap: Option<(u32, u32)>,
     dpr: f32,
 ) -> Result<DynamicImage, EngineError> {
+    check_nonzero_size(size)?;
     let scaled = ImageSize {
         width: scale_dimension(size.width, dpr),
         height: scale_dimension(size.height, dpr),

@@ -56,6 +56,11 @@ pub struct Forecast {
     pub format_from_operation: bool,
     pub pixels: Option<u64>,
     pub over_budget: bool,
+    /// True when a resize or fit-in asks for a zero pixel side
+    /// (`00x100`), which the engine refuses (issue #464). The
+    /// walk stops there, so the dimensions and pixels are
+    /// `None`: the image request has no output to forecast.
+    pub zero_side: bool,
 }
 
 /// Everything the handler verified and probed, ready to
@@ -162,7 +167,16 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
     let directives = RequestDirectives::analyze(ops);
     let dpr = directives.dpr.unwrap_or(1.0);
     let mut cur: Option<(u64, u64)> = probe.dimensions.map(|(w, h)| (w as u64, h as u64));
+    let mut zero_side = false;
     for op in ops {
+        // The engine refuses the request here, whatever follows.
+        if let Operation::Size(size) | Operation::FitIn { size, .. } = op
+            && crate::engine::has_zero_side(size)
+        {
+            zero_side = true;
+            cur = None;
+            break;
+        }
         cur = match op {
             Operation::Size(size) => {
                 let resolved = resolve_size(size, cur, dpr);
@@ -224,6 +238,7 @@ fn forecast(ops: &[Operation], probe: &SourceProbe) -> Forecast {
         height,
         format,
         format_from_operation,
+        zero_side,
         pixels,
         over_budget: pixels.is_some_and(|p| p > crate::engine::MAX_OUTPUT_PIXELS),
     }
@@ -394,6 +409,7 @@ impl Report {
                 "pixels": self.forecast.pixels,
                 "pixel_budget": crate::engine::MAX_OUTPUT_PIXELS,
                 "over_budget": self.forecast.over_budget,
+                "zero_side": self.forecast.zero_side,
             },
             "canonical": input.canonical,
             "cache_group": input.cache_group,
@@ -482,6 +498,9 @@ impl Report {
 
         out.push_str("<h2>Forecast</h2>\n<ul>\n");
         match (self.forecast.width, self.forecast.height) {
+            _ if self.forecast.zero_side => {
+                out.push_str("<li>Output: none; a size asks for a zero pixel side, so the image request itself would be refused</li>\n");
+            }
             (Some(w), Some(h)) => {
                 out.push_str(&format!("<li>Output: {w}x{h}</li>\n"));
             }
@@ -656,6 +675,55 @@ mod tests {
         );
         // No crop anywhere: no debug remainder.
         assert!(report.debug_focal_remainder.is_none());
+    }
+
+    #[test]
+    fn forecast_agrees_with_the_zero_side_refusal() {
+        // A multi-digit zero side parses as an exact zero,
+        // which the engine refuses (issue #464). The forecast
+        // used to read "Output: 0x100" (or the 1-pixel side
+        // DPR rounded it to); now it says the request has no
+        // output, whatever follows the step.
+        for remainder in [
+            "00x100",
+            "100x00",
+            "00xorig",
+            "00x100/filters:dpr(2)",
+            "fit-in:00x100",
+            "fit-in:100x00:adaptive",
+            "00x100/crop:50x50",
+            "crop-rect:0x0:200x200/00x10",
+        ] {
+            let report = report_for(
+                &format!("{remainder}/https://example.com/photo.jpg"),
+                png_probe(),
+            );
+            assert!(report.forecast.zero_side, "{remainder}");
+            assert_eq!(
+                (
+                    report.forecast.width,
+                    report.forecast.height,
+                    report.forecast.pixels
+                ),
+                (None, None, None),
+                "{remainder}"
+            );
+            assert_eq!(report.to_json()["forecast"]["zero_side"], true);
+            let html = report.to_html();
+            assert!(
+                html.contains("zero pixel side, so the image request itself would be refused"),
+                "{html}"
+            );
+            assert!(!html.contains("<li>Output: 0x"), "{html}");
+        }
+        // A lone 0 is proportional, not a zero side.
+        let report = report_for("0x100/https://example.com/photo.jpg", png_probe());
+        assert!(!report.forecast.zero_side);
+        assert_eq!(report.to_json()["forecast"]["zero_side"], false);
+        assert_eq!(
+            (report.forecast.width, report.forecast.height),
+            (Some(150), Some(100))
+        );
     }
 
     #[test]

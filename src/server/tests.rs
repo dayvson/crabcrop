@@ -13349,6 +13349,83 @@ async fn negotiates_avif_from_accept() {
     assert_eq!(&body[4..8], b"ftyp");
 }
 
+/// A float TIFF source (Rgb32F samples) renders to PNG, plain
+/// and interlaced, and to AVIF, named or negotiated from a
+/// browser's `Accept` (issue #464). Each of these was a 500
+/// `encode_failed`: the encoders take no float samples.
+#[tokio::test]
+async fn float_sources_render_to_png_and_avif() {
+    let float = DynamicImage::ImageRgb32F(image::Rgb32FImage::from_fn(64, 48, |x, y| {
+        image::Rgb([x as f32 / 63.0, y as f32 / 47.0, 0.5])
+    }));
+    let mut tiff = Vec::new();
+    float
+        .write_to(
+            &mut std::io::Cursor::new(&mut tiff),
+            image::ImageFormat::Tiff,
+        )
+        .unwrap();
+    let src = spawn_bytes_server(tiff).await;
+    let base = spawn_app(false).await;
+    for (ops, accept, content_type) in [
+        ("filters:format(png)", None, "image/png"),
+        ("filters:format(png,interlace)", None, "image/png"),
+        ("filters:format(avif)", None, "image/avif"),
+        ("32x0", Some("image/avif,image/webp,*/*"), "image/avif"),
+    ] {
+        let remainder = format!("{ops}/{src}");
+        let mut request = client().get(format!("{base}/{}/{remainder}", sign(&remainder)));
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{ops}");
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            content_type,
+            "{ops}"
+        );
+        let body = resp.bytes().await.unwrap();
+        if content_type == "image/png" {
+            let decoded = image::load_from_memory(&body).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (64, 48), "{ops}");
+            assert_eq!(decoded.to_rgb16(), float.to_rgb16(), "{ops}");
+        }
+    }
+}
+
+/// A multi-digit zero side (`00x100`) is valid grammar that
+/// asks for an empty image: a `400 unsupported_operation` in
+/// both error modes, where it was a 500 from the encoder
+/// (issue #464). DPR and fit-in used to round it up to a
+/// 1-pixel render instead.
+#[tokio::test]
+async fn zero_pixel_sides_answer_400() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(false).await;
+    let message =
+        "requested size has a zero pixel side; write 0 alone for a proportional or unbounded axis";
+    for ops in ["00x100", "100x00", "00x100/filters:dpr(2)", "fit-in:00x100"] {
+        let remainder = format!("{ops}/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let plain = client().get(&url).send().await.unwrap();
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::BAD_REQUEST,
+            "unsupported_operation",
+            message,
+        )
+        .await;
+    }
+}
+
 #[test]
 fn negotiation_honors_q_values() {
     use crate::url::ImageFormat::{Avif, Jxl, WebP};
