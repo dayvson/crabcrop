@@ -40,7 +40,11 @@ jpeg-encoder = { version = "0.7", features = ["simd"] }
 # a build dependency of ort-sys for a runtime this binary
 # never downloads. The library is loaded at run time
 # (load-dynamic), and api-31 matches the ONNX Runtime 1.31
-# that Dockerfile.ai pins.
+# that Dockerfile.ai pins. Dropping the default `tracing`
+# feature leaves ONNX Runtime on its own logger, which
+# writes errors to stderr (`ORT_LOG` sets the level); with
+# it, every message went to `tracing`, and this binary
+# installs no subscriber, so none was ever seen.
 ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }
 jxl-image-rs-integration = "0.8"
 jxl = "0.8"
