@@ -18,7 +18,9 @@
 //! process group, so a wrapper script's children die with
 //! it), and stdout is capped while it is read, so a runaway
 //! encoder cannot fill memory. The child runs with an empty
-//! environment and is always reaped.
+//! environment, in the temporary directory, and is always
+//! reaped: it goes through the runner the frame and PDF
+//! tools use ([`crate::toolrun`]).
 //!
 //! Timing: source frame delays are variable, encoders want a
 //! constant frame rate. The schedule picks the smallest rate
@@ -39,11 +41,12 @@
 //! pixel (edge-replicated) because 4:2:0 chroma subsampling
 //! needs even width and height.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::ChildStdin;
 use std::time::{Duration, Instant};
 
+use crate::toolrun::{ToolCommand, ToolError, ToolInput, run_tool, tool_cpu_limit};
 use crate::url::ImageFormat;
 
 /// Default encode wall-clock budget, in seconds
@@ -70,9 +73,6 @@ pub const MAX_FPS: u32 = 100;
 /// the GIF maximum delay run for hours, and no embedding
 /// page wants that video.
 pub const MAX_DURATION_MS: u64 = 600_000;
-
-/// How much of the encoder's stderr an error message keeps.
-const STDERR_EXCERPT_CHARS: usize = 500;
 
 /// One frame on its way to the encoder: composited RGBA
 /// pixels (post-operation, full canvas) and the delay the
@@ -333,223 +333,69 @@ impl VideoEncoder {
         self.run(&argv, frames, &plan)
     }
 
-    /// Run the encoder: feed it the scheduled samples on
-    /// stdin, read the video from stdout under the output
-    /// cap, and hold the whole run to the wall-clock
-    /// timeout. Stderr is captured for the error message
-    /// and never trusted beyond that.
+    /// Run the encoder through the shared runner
+    /// ([`crate::toolrun::run_tool`]): the scheduled samples
+    /// fed on stdin from a writer thread, the video read from
+    /// stdout under the output cap, and the whole run held to
+    /// the wall-clock timeout. Stderr is quoted in the error
+    /// message and never trusted beyond that.
     fn run(
         &self,
         argv: &[String],
         frames: &[VideoFrame],
         plan: &Plan,
     ) -> Result<Vec<u8>, VideoError> {
-        let mut command = Command::new(&self.program);
-        command
-            .args(argv)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // A minimal environment: the contract needs
-            // nothing from the server's, and inheriting it
-            // would hand the child the server's secrets.
-            .env_clear();
-        // The encoder runs in its own process group, so a
-        // timeout or abort can kill the whole tree: when the
-        // configured program is a wrapper script, killing
-        // only the direct child leaves its grandchildren
-        // running past the timeout (audit R2-31).
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let mut child = command.spawn().map_err(|e| {
-            VideoError::Failed(format!(
-                "could not be started ({}): {e}",
-                self.program.display()
-            ))
-        })?;
-        crate::toolrun::limit_child(
-            child.id(),
-            crate::toolrun::tool_cpu_limit(self.timeout),
-            crate::toolrun::TOOL_MAX_ADDRESS_SPACE,
-        );
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        let mut stdout = child.stdout.take().expect("stdout is piped");
-        let mut stderr = child.stderr.take().expect("stderr is piped");
-
         // One composited sample per frame, computed once;
         // the writer repeats each for its scheduled count.
         let samples: Vec<Vec<u8>> = frames.iter().map(|f| sample_bytes(f, plan)).collect();
         let counts = plan.counts.clone();
-        let writer = std::thread::spawn(move || {
+        let feed = move |stdin: &mut ChildStdin| {
             for (sample, &count) in samples.iter().zip(&counts) {
                 for _ in 0..count {
-                    if stdin.write_all(sample).is_err() {
-                        return; // The encoder is gone; the run side reports it.
-                    }
+                    stdin.write_all(sample)?;
                 }
             }
-            // Dropping stdin closes the pipe: end of input.
-        });
-        // Stderr is drained on its own thread (a full stderr
-        // pipe would stall the child) and reported back over
-        // a channel when the pipe closes; only the excerpt
-        // budget is kept. The thread is deliberately never
-        // joined: a child of the encoder (a shell's `sleep`,
-        // say) can inherit the pipe and hold it open past the
-        // encoder's own exit, and the run must not wait on
-        // grandchildren it did not spawn.
-        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                match stderr.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let room = 8192usize.saturating_sub(kept.len());
-                        kept.extend_from_slice(&chunk[..room.min(n)]);
-                    }
-                }
-            }
-            let _ = stderr_tx.send(kept);
-        });
-        // Stdout arrives over a channel so the read side can
-        // enforce the timeout and the cap while it reads,
-        // not after the bytes have already piled up. This
-        // thread is likewise detached: channel disconnect is
-        // the EOF signal, and it ends when the pipe closes.
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            let mut chunk = vec![0u8; 64 * 1024];
-            loop {
-                match stdout.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx.send(chunk[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        let timeout_error = || {
-            VideoError::Failed(format!(
-                "timed out after {}s and was killed",
-                self.timeout.as_secs()
-            ))
+            Ok(())
         };
-        let deadline = Instant::now() + self.timeout;
-        let mut output = Vec::new();
-        let mut failure: Option<VideoError> = None;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                failure = Some(timeout_error());
-                break;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(chunk) => {
-                    output.extend_from_slice(&chunk);
-                    if output.len() > self.max_output_bytes {
-                        failure = Some(VideoError::Failed(format!(
-                            "output exceeded the {} byte cap and the encode was aborted",
-                            self.max_output_bytes
-                        )));
-                        break;
-                    }
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let run = run_tool(ToolCommand {
+            program: &self.program,
+            args: &args,
+            input: ToolInput::Writer(Box::new(feed)),
+            max_stdout: self.max_output_bytes,
+            // Only the excerpt is read, and it comes from the
+            // end of the stream, whatever this keeps.
+            max_stderr: 8192,
+            deadline: Instant::now() + self.timeout,
+            cpu_limit: tool_cpu_limit(self.timeout),
+        })
+        .map_err(|e| {
+            VideoError::Failed(match e {
+                ToolError::Spawn(e) => {
+                    format!("could not be started ({}): {e}", self.program.display())
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    failure = Some(timeout_error());
-                    break;
+                ToolError::OutputCap(cap) => {
+                    format!("output exceeded the {cap} byte cap and the encode was aborted")
                 }
-            }
-        }
-        // Reap the child in every path: killed on failure,
-        // awaited (still under the deadline) on stdout EOF.
-        let status = if failure.is_some() {
-            kill_encoder(&mut child);
-            child.wait().ok()
-        } else {
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Some(status),
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Ok(None) => {
-                        failure = Some(timeout_error());
-                        kill_encoder(&mut child);
-                        break child.wait().ok();
-                    }
-                    Err(_) => break None,
+                ToolError::Read(e) => format!("reading its output failed: {e}"),
+                ToolError::TimedOut => {
+                    format!("timed out after {}s and was killed", self.timeout.as_secs())
                 }
-            }
-        };
-        // The writer is safe to join once the child is
-        // reaped: with no reader left, its writes fail fast
-        // instead of blocking.
-        let _ = writer.join();
-        if let Some(failure) = failure {
-            return Err(failure);
+                ToolError::Wait(_) => "could not be waited on after it finished".to_string(),
+            })
+        })?;
+        if !run.status.success() {
+            return Err(VideoError::Failed(format!(
+                "exited with status {}: {}",
+                run.status,
+                run.stderr_excerpt()
+            )));
         }
-        match status {
-            Some(status) if status.success() => {}
-            Some(status) => {
-                // The excerpt is worth a short grace, no
-                // more (see the stderr thread's comment): a
-                // grandchild holding the pipe open must not
-                // stall the error path.
-                let stderr_bytes = stderr_rx
-                    .recv_timeout(Duration::from_millis(200))
-                    .unwrap_or_default();
-                let excerpt = stderr_excerpt(&stderr_bytes);
-                return Err(VideoError::Failed(format!(
-                    "exited with status {status}: {excerpt}"
-                )));
-            }
-            None => {
-                return Err(VideoError::Failed(
-                    "could not be waited on after it finished".to_string(),
-                ));
-            }
-        }
-        if output.is_empty() {
+        if run.stdout.is_empty() {
             return Err(VideoError::Failed("produced no output".to_string()));
         }
-        Ok(output)
+        Ok(run.stdout)
     }
-}
-
-/// Kill the encoder on a timeout or abort. On Unix the
-/// child was spawned as the leader of its own process
-/// group, so the group takes the signal too: a wrapper
-/// script's grandchildren die with it instead of running
-/// on, unaccounted for by the video gate (audit R2-31).
-/// The direct kill stays as the fallback (and is the whole
-/// story on platforms without process groups).
-fn kill_encoder(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let pid = rustix::process::Pid::from_child(child);
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-    let _ = child.kill();
-}
-
-/// The encoder's stderr as an error message keeps it: lossy
-/// text, trimmed, capped at [`STDERR_EXCERPT_CHARS`].
-fn stderr_excerpt(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return "no error output".to_string();
-    }
-    trimmed.chars().take(STDERR_EXCERPT_CHARS).collect()
 }
 
 #[cfg(test)]
@@ -758,6 +604,41 @@ mod tests {
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
         let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
         assert!(err.to_string().contains("no output"), "{err}");
+    }
+
+    #[test]
+    fn encoder_runs_in_the_temp_directory() {
+        // Issue #481: the encoder's working directory is the
+        // temporary directory, as the frame and PDF tools'
+        // is, not the server's own.
+        let dir = test_dir("cwd");
+        let cwd_file = dir.join("cwd.txt");
+        let script = format!(
+            "#!/bin/sh\npwd -P > '{}'\ncat > /dev/null\nprintf 'FAKE-MP4'\n",
+            cwd_file.display()
+        );
+        let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
+        let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
+        let out = encoder.encode(&frames, ImageFormat::Mp4).unwrap();
+        assert_eq!(out, b"FAKE-MP4");
+        let cwd = std::fs::read_to_string(&cwd_file).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(cwd.trim()).unwrap(),
+            std::fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+    }
+
+    #[test]
+    fn encoder_errors_quote_the_end_of_stderr() {
+        // Issue #481: the error quotes the last 500 characters
+        // of stderr, where the encoder reports its failure,
+        // as the frame and PDF errors do.
+        let dir = test_dir("fail-tail");
+        let script = "#!/bin/sh\ncat > /dev/null\nhead -c 2000 /dev/zero | tr '\\000' x >&2\necho ' the real failure' >&2\nexit 1\n";
+        let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
+        let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
+        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        assert!(err.to_string().ends_with("x the real failure"), "{err}");
     }
 
     #[test]
