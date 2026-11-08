@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3444033ffa77c130db54dbed4cee434558c2396ca8a855f6c22428057c0a6b57 # shrinks to (w, h) = (40, 41), (tw, th) = (7393, 16383), union = (0, 0, 0, 4918054), scale = 0.0
+cc a937f6e1ffb164d9c8ba67ff4c38700c3e7348afaa7b1f37102bee123dd6b035 # shrinks to ((w, h), faces) = ((374, 339), [FaceBox { x: 0, y: 1, w: 37, h: 57, score: 0.417291 }]), (tw, th) = (4271, 12855), padding = 1.2602446
+cc 2e76b2deb263ae21effd6487cd3f34a41936cfb8f9c8b306089b8d92322137db # shrinks to (w, h) = (3, 1106), (tw, th) = (40, 16383), x = 0.0, y = 0.0, zoom = 1.347743

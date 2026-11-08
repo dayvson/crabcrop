@@ -97,6 +97,15 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
+[dev-dependencies]
+# Property tests (issue #478): tests/proptest_url.rs and
+# tests/proptest_crop.rs. Default features off: `fork` and
+# `timeout` pull in rusty-fork and tempfile, which the suites
+# never use; `std` keeps the regex string strategies and the
+# PROPTEST_* environment overrides. A test-only dependency:
+# it never enters a normal build.
+proptest = { version = "1.12", default-features = false, features = ["std"] }
+
 [features]
 # AVIF source decoding, through the image crate's avif-native
 # decoder (mp4parse + dav1d). Off by default (issue #141,
