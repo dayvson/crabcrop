@@ -77,9 +77,12 @@ pub struct Forecast {
     /// an axis (`16383x1/0x2` asks for 32766x2), which the
     /// engine refuses wherever the step sits in the chain
     /// (issue #521). A step that keeps the size it started
-    /// from is never flagged, as the engine never refuses
-    /// one. The walk stops there, so the dimensions are the
-    /// size the engine refuses.
+    /// from is not flagged, as the engine does not refuse
+    /// one, but the size the chain ends at is held to the
+    /// limit too (issue #528): a source at the 16384 px
+    /// decode ceiling that no step resizes is flagged. The
+    /// walk stops at a flagged step, so the dimensions are
+    /// the size the engine refuses.
     pub over_dimension: bool,
     /// True when any step's size passes the pixel budget,
     /// which the engine holds every step to, not only the
@@ -438,6 +441,11 @@ fn forecast_at(
         ),
         None => (None, None),
     };
+    // The engine holds the image it encodes to the limit
+    // as well, a size no step changed included (issue #528).
+    if cur.is_some_and(|(w, h)| w.max(h) > u64::from(crate::url::MAX_DIMENSION)) {
+        over_dimension = true;
+    }
     let pixels = cur.map(|(w, h)| w.saturating_mul(h));
     let url_names_format = RequestDirectives::analyze(url_ops)
         .explicit_format
@@ -1132,10 +1140,12 @@ mod tests {
             ((Some(16383), Some(1)), false)
         );
         // A step the cap holds at the source's own size keeps
-        // it, so a source at the 16384 px decode ceiling passes.
+        // it, so the step passes a source at the 16384 px
+        // decode ceiling, but the output is held to the limit
+        // too (issue #528).
         assert_eq!(
             forecast_of("fit-in:0x2/filters:no_upscale", png_of(16384, 1)),
-            ((Some(16384), Some(1)), false)
+            ((Some(16384), Some(1)), true)
         );
         // A step that grows a side to the ceiling is refused:
         // 8192x1 doubles to 16384x2, capped per axis to 16384x1.
@@ -1158,6 +1168,46 @@ mod tests {
         assert_eq!(
             forecast_of("pad:9000x100/filters:dpr(2):no_upscale", png_probe()),
             ((Some(18000), Some(200)), true)
+        );
+    }
+
+    #[test]
+    fn forecast_holds_the_output_to_the_limit() {
+        // The engine refuses an output past 16383 px on an
+        // axis, even when no step changed the size (issue
+        // #528): a source at the 16384 px decode ceiling
+        // needs a step that brings it within the limit.
+        for (remainder, probe, size) in [
+            ("filters:grayscale", png_of(16384, 1), (16384, 1)),
+            ("0x0", png_of(1, 16384), (1, 16384)),
+            (
+                "fit-in:0x0/filters:format(webp)",
+                png_of(16384, 2),
+                (16384, 2),
+            ),
+        ] {
+            let report = report_for(&format!("{remainder}/https://example.com/a.png"), probe);
+            assert!(report.forecast.over_dimension, "{remainder}");
+            assert_eq!(
+                (report.forecast.width, report.forecast.height),
+                (Some(size.0), Some(size.1)),
+                "{remainder}"
+            );
+            assert!(
+                report.to_html().contains(&format!(
+                    "<li>Output: {}x{}, past the 16383 pixel limit per axis, so the image request itself would be refused</li>",
+                    size.0, size.1
+                )),
+                "{remainder}"
+            );
+        }
+        assert_eq!(
+            forecast_of("8192x0", png_of(16384, 1)),
+            ((Some(8192), Some(1)), false)
+        );
+        assert_eq!(
+            forecast_of("filters:grayscale", png_of(16383, 1)),
+            ((Some(16383), Some(1)), false)
         );
     }
 
@@ -1207,14 +1257,19 @@ mod tests {
         );
         // A quarter turn swaps the sides, and the resize after
         // it scales the long side on from there; a half turn
-        // keeps the size.
+        // keeps the size, which the step lets through and the
+        // output check does not (issue #528).
         assert_eq!(
             forecast_of("filters:rotate(90)/2x0", png_of(16383, 1)),
             ((Some(2), Some(32766)), true)
         );
         assert_eq!(
             forecast_of("filters:rotate(180)", png_of(16384, 2)),
-            ((Some(16384), Some(2)), false)
+            ((Some(16384), Some(2)), true)
+        );
+        assert_eq!(
+            forecast_of("filters:rotate(180)/8192x0", png_of(16384, 2)),
+            ((Some(8192), Some(1)), false)
         );
         assert_eq!(
             forecast_of("filters:rotate(90)", png_of(16384, 2)),
@@ -1232,8 +1287,10 @@ mod tests {
     fn forecast_passes_steps_that_keep_a_decode_ceiling_size() {
         // A source can decode at 16384 px per axis. A step
         // that keeps that size works nothing out, and the
-        // engine passes it; one that changes the size is held
-        // to the limit (issue #521).
+        // engine passes it, so a later step can bring the
+        // size within the limit; one that changes the size is
+        // held to the limit (issue #521). A chain that ends
+        // at the ceiling is refused (issue #528).
         for remainder in [
             "0x0",
             "fit-in:0x0",
@@ -1241,8 +1298,13 @@ mod tests {
             "filters:grayscale",
         ] {
             assert_eq!(
+                forecast_of(&format!("{remainder}/8192x0"), png_of(16384, 2)),
+                ((Some(8192), Some(1)), false),
+                "{remainder}"
+            );
+            assert_eq!(
                 forecast_of(remainder, png_of(16384, 2)),
-                ((Some(16384), Some(2)), false),
+                ((Some(16384), Some(2)), true),
                 "{remainder}"
             );
         }
@@ -1255,8 +1317,12 @@ mod tests {
             ((Some(16384), Some(2)), true)
         );
         assert_eq!(
+            forecast_of("crop:8192x1/4096x0/filters:dpr(2)", png_of(16384, 2)),
+            ((Some(8192), Some(1)), false)
+        );
+        assert_eq!(
             forecast_of("crop:8192x1/filters:dpr(2)", png_of(16384, 2)),
-            ((Some(16384), Some(2)), false)
+            ((Some(16384), Some(2)), true)
         );
     }
 
