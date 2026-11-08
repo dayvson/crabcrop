@@ -69,6 +69,7 @@ fn boot(env: &[(&str, &str)]) -> (ServerGuard, u16) {
         .env("CRABCROP_SECRET", "source-limits-secret-0123456789")
         .env("PORT", port.to_string())
         .env("CRABCROP_ALLOW_UNSAFE", "1")
+        .env("CRABCROP_META_MODE", "1")
         .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
