@@ -1,6 +1,6 @@
 [package]
 name = "crabcrop"
-version = "0.9.11"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.96"
 description = "On-demand image optimization service in Rust"
@@ -12,7 +12,7 @@ include = ["/src/**/*", "/tests/fixtures/**/*", "/README.md", "/LICENSE", "/CHAN
 members = ["crates/crabcrop-url"]
 
 [dependencies]
-crabcrop-url = { path = "crates/crabcrop-url", version = "0.9" }
+crabcrop-url = { path = "crates/crabcrop-url", version = "0.10" }
 ab_glyph = "0.2"
 axum = "0.8"
 bytes = "1"

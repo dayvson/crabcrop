@@ -4,6 +4,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-08
+
 ### Added
 
 - `CRABCROP_SOURCE_MAX_MB` and `CRABCROP_SOURCE_TIMEOUT_SECS` set the source fetch cap and timeout (issue #471). Both were fixed at 10 MB and 10 seconds, and they bound video and PDF sources too, so a deployment could not serve `frame:` from longer clips or `page:` from larger PDFs. The defaults are unchanged. The cap takes 1 to 1024 and the timeout 1 to 600; any other value, an empty one included, stops boot with an error naming the variable. The upload cap (`CRABCROP_UPLOAD_MAX_MB`) defaults to the fetch cap and may not pass it. The default source buffer budget is four fetch caps per processing lane permit, so raising the cap raises the budget too: set `CRABCROP_SOURCE_BUFFER_MAX_MB` yourself to keep memory where it was. Boot prints a `source fetch:` line with the cap, the timeout, and the budget. It also warns on stderr when `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` (either case) is set while hostname sources are pinned, which is the default (private-address blocking on, no `CRABCROP_ALLOWED_SOURCES`): pinned fetches connect directly, so they fail where egress goes only through a proxy. The warning names the variables, never their values. To fetch through the proxy, list the source hosts in `CRABCROP_ALLOWED_SOURCES`.
