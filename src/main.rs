@@ -1248,12 +1248,15 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// trim window for every frame of an animation #465; a
 /// step that works out a size past 16383 px on an axis,
 /// such as `16383x1/0x2`, refused instead of rendered
-/// #521; an output left past 16383 px on an axis, such as
-/// a 16384 px source with no sizing step, refused instead
-/// of rendered, a 16383 px video side cropped to 16382
-/// instead of padded to 16384, and PDF pages near the
-/// raster cap rendered one DPI lower #528).
-const RENDERING_VERSION: u32 = 3;
+/// #521).
+///
+/// 4: the first release after 0.10.0, which changes output
+/// for existing URLs (an output left past 16383 px on an
+/// axis, such as a 16384 px source with no sizing step,
+/// refused instead of rendered, a 16383 px video side
+/// cropped to 16382 instead of padded to 16384, and PDF
+/// pages near the raster cap rendered one DPI lower #528).
+const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
