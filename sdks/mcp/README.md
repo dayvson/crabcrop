@@ -30,7 +30,14 @@ The server runs over stdio with Node >= 22. Once published, point your MCP clien
 }
 ```
 
-From a checkout, it also runs directly from source (Node type-strips the TypeScript):
+From a checkout, it also runs directly from source on Node 22.18 or newer, which type-strips the TypeScript. Build the SDK and install the package's link to it once first:
+
+```bash
+cd /path/to/crabcrop/sdks/typescript && npm ci && npm run build
+cd ../mcp && npm ci
+```
+
+Then point the client at the source:
 
 ```json
 {

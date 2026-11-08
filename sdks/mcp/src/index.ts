@@ -16,7 +16,7 @@
  * agentic clients persist tool arguments in transcripts, so
  * the environment is the right home for the secret.
  *
- * Run: node src/index.ts   (Node >= 22, for type stripping)
+ * Run: node src/index.ts   (Node >= 22.18, for type stripping)
  */
 import { buildURL, explainUrl, purgeSignature, sign } from "@crabcrop/url";
 

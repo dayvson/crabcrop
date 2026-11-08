@@ -21,7 +21,9 @@ pub enum Signature {
     Unsafe,
 }
 
-/// What went wrong while splitting the signature off a request path.
+/// Why a request path failed to parse: its signature segment,
+/// an operation, a preset or source-root reference, or the
+/// source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// The path was empty or just `/`.
@@ -1825,7 +1827,6 @@ fn parse_format_spec(p: &str) -> Option<FormatSpec> {
     Some(spec)
 }
 
-/// Parse the filter list after `filters:`.
 /// A detection class name for the class filters
 /// (`blurclass` / `pixelateclass` / `recolorclass`):
 /// the vocabulary's own spellings (COCO names like `traffic
@@ -1950,6 +1951,7 @@ fn split_filter_chain(rest: &str) -> Vec<&str> {
     parts
 }
 
+/// Parse the filter list after `filters:`.
 fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
     let invalid = || ParseError::InvalidFilters(seg.to_string());
     if rest.is_empty() {
@@ -2983,16 +2985,14 @@ impl RequestDirectives {
         !self.classes.is_empty()
     }
 
-    /// Whether the request can run AI inference in the engine.
-    /// This is the ONE predicate behind both the server's AI
-    /// gate and the engine's expectations: background removal,
-    /// studio mode, region removal, upscale, face operations,
-    /// class redaction, and object crops always infer; smart
-    /// crops infer when a face provider is configured, so they
-    /// are gated too. The gate itself calls
-    /// `uses_ai_beyond_smart_crop` plus the provider check
-    /// (issue #379); this full form stays for the tests that
-    /// pin the directive classification.
+    /// Whether the request names any AI directive: background
+    /// removal, studio mode, region removal, upscale, face
+    /// operations, class redaction, object crops,
+    /// `debug:focal`, or a smart crop. A smart crop infers
+    /// only when a face or focal provider is configured, so
+    /// the server's AI gate uses `uses_ai_beyond_smart_crop`
+    /// plus that provider check (issue #379). Only the tests
+    /// call this, to pin the directive classification.
     #[allow(dead_code)]
     pub fn uses_ai(&self) -> bool {
         self.uses_ai_beyond_smart_crop() || self.smart_crop
