@@ -16,6 +16,7 @@ from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/functional.yml"
 
+
 def tier_step_script(text):
     """The `run: |` block of the step with `id: tier`, dedented."""
     lines = text.splitlines()
