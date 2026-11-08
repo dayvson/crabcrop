@@ -84,7 +84,8 @@ pub struct WriteStamp {
 /// this long after the purge began; NTP-synced hosts agree
 /// to within milliseconds. The cost of the margin is that a
 /// copy another process renders in the first seconds after
-/// a purge is treated as purged once and re-rendered.
+/// a purge counts as purged: it is not cached, and the next
+/// request for it renders again.
 pub const CLOCK_SKEW_MARGIN_MS: u64 = 5_000;
 
 /// How long a purge's tombstone outlives the end of its
