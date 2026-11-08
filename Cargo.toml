@@ -27,7 +27,7 @@ bytes = "1"
 # set (minus the wasm backends) so a configured timestamp
 # authority can be reached. All c2pa contact lives in
 # src/provenance.rs.
-c2pa = { version = "=0.91.7", default-features = false, features = ["rust_native_crypto", "http_reqwest", "http_ureq"] }
+c2pa = { version = "=0.91.11", default-features = false, features = ["rust_native_crypto", "http_reqwest", "http_ureq"] }
 fast-ssim2 = "0.9"
 fast_image_resize = { version = "6.1", features = ["image"] }
 hex = "0.4"
