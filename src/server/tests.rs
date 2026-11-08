@@ -466,7 +466,6 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
 /// canned behavior, so the whole video path runs without
 /// a real encoder.
 async fn spawn_app_with_video(script: &str) -> String {
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -474,14 +473,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         std::env::temp_dir().join(format!("crabcrop-server-video-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(&path, script);
     let encoder =
         crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
             .unwrap();
@@ -553,7 +545,6 @@ async fn spawn_app_with_video(script: &str) -> String {
 /// and its extraction answers with the test PNG, so the
 /// whole frame path runs without a real decoder.
 async fn spawn_app_with_frame_decoder(report: &str) -> String {
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -566,14 +557,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         "#!/bin/sh\ncat > /dev/null\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' {report} | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n"
     );
     let path = dir.join("decoder.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(&path, &script);
     let extractor =
         crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap();
     let state = AppState {
@@ -836,7 +820,6 @@ async fn explain_labels_a_video_source() {
 /// the bytes is a password refusal, CORRUPT is
 /// unreadable.
 async fn spawn_app_with_pdf_renderer() -> String {
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -847,14 +830,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
     let page_path = dir.join("page.png").display().to_string();
     let write_tool = |name: &str, script: String| {
         let path = dir.join(name);
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, &script);
         path
     };
     write_tool(
@@ -9159,22 +9135,16 @@ async fn timed_out_encode_releases_the_process_gate() {
     // get a genuine encode attempt on the freed gate
     // instead of the gate-held 503 (Busy) the soak's
     // follow-up requests got.
-    use std::io::Write as _;
     let dir = std::env::temp_dir().join(format!(
         "crabcrop-server-stuck-encode-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let script_path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&script_path).unwrap();
-    file.write_all(b"#!/bin/sh\ncat > /dev/null\nsleep 9\nprintf 'x'\n")
-        .unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(
+        &script_path,
+        "#!/bin/sh\ncat > /dev/null\nsleep 9\nprintf 'x'\n",
+    );
     let encoder = crate::video::VideoEncoder::new(
         script_path,
         std::time::Duration::from_secs(30),
@@ -9562,28 +9532,19 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
     // budget, still has budget left when the lane
     // drains at 6 s, so it enters its own encode
     // instead of aborting at its first checkpoint.
-    use std::io::Write as _;
     let dir =
         std::env::temp_dir().join(format!("crabcrop-server-lane-bound-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let log_path = dir.join("runs.log");
     let script_path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&script_path).unwrap();
-    file.write_all(
-        format!(
+    crate::test_support::write_script(
+        &script_path,
+        &format!(
             "#!/bin/sh\ncat > /dev/null\necho S >> {}\nsleep 6\necho E >> {}\nprintf 'x'\n",
             log_path.display(),
             log_path.display()
-        )
-        .as_bytes(),
-    )
-    .unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+        ),
+    );
     let encoder = crate::video::VideoEncoder::new(
         script_path,
         std::time::Duration::from_secs(30),
@@ -9960,20 +9921,12 @@ fn lane_test_job(
 /// deterministic long encode inside a single opaque
 /// stage.
 fn fake_long_encoder(dir: &std::path::Path, sleep_secs: u32) -> crate::video::VideoEncoder {
-    use std::io::Write as _;
     std::fs::create_dir_all(dir).unwrap();
     let script_path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&script_path).unwrap();
-    file.write_all(
-        format!("#!/bin/sh\ncat > /dev/null\nsleep {sleep_secs}\nprintf 'x'\n").as_bytes(),
-    )
-    .unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(
+        &script_path,
+        &format!("#!/bin/sh\ncat > /dev/null\nsleep {sleep_secs}\nprintf 'x'\n"),
+    );
     crate::video::VideoEncoder::new(
         script_path,
         std::time::Duration::from_secs(30),

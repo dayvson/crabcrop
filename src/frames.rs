@@ -1339,13 +1339,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
     fn fake_tool(name: &str, script: &str) -> PathBuf {
         let dir = temp_dir(name);
         let path = dir.join("fake-decoder");
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, script);
         path
     }
 
