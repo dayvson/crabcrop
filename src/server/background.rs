@@ -20,13 +20,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
 
-/// How many shared-tier write-throughs a process keeps in
-/// flight (issue #463). Each one holds a whole rendered
-/// entry until the bucket answers, so a slow or stalled
-/// bucket would otherwise let them pile up with every
-/// miss. A write that finds them all taken is skipped:
-/// the local tiers already hold the entry, and the next
-/// replica to miss renders it again and writes it then.
+/// How many shared-tier writes a process keeps in flight
+/// (issue #463). Each one holds a whole rendered entry
+/// until the bucket answers, so a slow or stalled bucket
+/// would otherwise let them pile up with every miss. A
+/// fresh render's write-through that finds them all taken
+/// is skipped: the local tiers already hold the entry, and
+/// the next replica to miss renders it again and writes it
+/// then. A tier hit's group write-back is never skipped: it
+/// waits for a slot in its own task.
 pub const SHARED_PUTS_AT_ONCE: usize = 64;
 
 /// How long a stopping server drains, from the signal on,
@@ -54,12 +56,13 @@ pub struct Background {
     /// finishes its walk (issue #461). They are tracked so
     /// that a shutdown can say how many it stopped.
     walks: TaskTracker,
-    /// Write-through slots, [`SHARED_PUTS_AT_ONCE`] by
+    /// Shared-tier write slots, [`SHARED_PUTS_AT_ONCE`] by
     /// default; a write holds one until the bucket has
     /// answered it and its reconcile is done.
     put_slots: Arc<Semaphore>,
     put_capacity: usize,
-    /// Write-throughs skipped because every slot was taken.
+    /// Render write-throughs skipped because every slot was
+    /// taken.
     puts_skipped: Arc<AtomicU64>,
 }
 
@@ -69,7 +72,8 @@ impl Default for Background {
     }
 }
 
-/// What a drain left running at its deadline.
+/// What a drain left running at its deadline, or what is
+/// running when a second signal ends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Drained {
     /// Tracked writes that had not finished: abandoned.
@@ -111,10 +115,11 @@ impl Background {
         drop(self.walks.spawn(task));
     }
 
-    /// A write-through slot, or `None` with the skip
-    /// counted when every slot is taken. Never waits: the
-    /// write it guards is best-effort, and a request must
-    /// not queue behind a stalled bucket.
+    /// A slot for a fresh render's write-through, or `None`
+    /// with the skip counted when every slot is taken. Never
+    /// waits: the write it guards is best-effort, and a
+    /// request must not queue behind a stalled bucket. Group
+    /// write-backs waiting for a slot are served first.
     pub(crate) fn put_slot(&self) -> Option<OwnedSemaphorePermit> {
         let slot = self.put_slots.clone().try_acquire_owned().ok();
         if slot.is_none() {
@@ -123,7 +128,22 @@ impl Background {
         slot
     }
 
-    /// Write-throughs holding a slot right now.
+    /// A slot for a tier hit's group write-back, waited for
+    /// inside the write's own tracked task, so no request
+    /// waits for it. Such a write cannot be skipped: the
+    /// local merge has already recorded the group, so no
+    /// later hit sends it again, and a bucket copy that never
+    /// learns the group outlives a purge of that group on
+    /// every replica. These writes come one per entry and
+    /// newly learned group, not one per miss, so the queue
+    /// stays small; they share the entry's bytes, and the
+    /// bound on writes in flight still holds.
+    pub(crate) async fn wait_put_slot(&self) -> Option<OwnedSemaphorePermit> {
+        // The semaphore is never closed; `None` cannot happen.
+        self.put_slots.clone().acquire_owned().await.ok()
+    }
+
+    /// Shared-tier writes holding a slot right now.
     pub fn puts_in_flight(&self) -> usize {
         self.put_capacity - self.put_slots.available_permits()
     }
@@ -133,7 +153,8 @@ impl Background {
         self.put_capacity
     }
 
-    /// Write-throughs skipped so far for want of a slot.
+    /// Render write-throughs skipped so far for want of a
+    /// slot.
     pub fn puts_skipped(&self) -> u64 {
         self.puts_skipped.load(Ordering::Relaxed)
     }
@@ -148,6 +169,12 @@ impl Background {
     pub async fn drain(&self, deadline: tokio::time::Instant) -> Drained {
         self.writes.close();
         let _ = tokio::time::timeout_at(deadline, self.writes.wait()).await;
+        self.running()
+    }
+
+    /// The tracked writes and background purge walks
+    /// running right now.
+    pub fn running(&self) -> Drained {
         Drained {
             writes: self.writes.len(),
             walks: self.walks.len(),

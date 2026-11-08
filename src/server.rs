@@ -605,18 +605,18 @@ fn tier_metrics(state: &AppState) -> String {
             "crabcrop_cache_tier_errors_total{{tier=\"shared\"}} {}\n",
             store.errors()
         ));
-        // The write-through bound (issue #463): in flight
-        // against its slots, and the writes skipped because
-        // every slot was taken.
+        // The write bound (issue #463): in flight against
+        // its slots, and the render write-throughs skipped
+        // because every slot was taken.
         let background = &state.background;
         out.push_str(&format!(
-            "# HELP crabcrop_cache_shared_puts_in_flight Shared tier write-throughs in flight.\n\
+            "# HELP crabcrop_cache_shared_puts_in_flight Shared tier writes in flight.\n\
              # TYPE crabcrop_cache_shared_puts_in_flight gauge\n\
              crabcrop_cache_shared_puts_in_flight {}\n\
-             # HELP crabcrop_cache_shared_puts_capacity Shared tier write-throughs allowed in flight.\n\
+             # HELP crabcrop_cache_shared_puts_capacity Shared tier writes allowed in flight.\n\
              # TYPE crabcrop_cache_shared_puts_capacity gauge\n\
              crabcrop_cache_shared_puts_capacity {}\n\
-             # HELP crabcrop_cache_shared_puts_skipped_total Shared tier write-throughs skipped with every slot in flight.\n\
+             # HELP crabcrop_cache_shared_puts_skipped_total Shared tier render write-throughs skipped with every slot in flight.\n\
              # TYPE crabcrop_cache_shared_puts_skipped_total counter\n\
              crabcrop_cache_shared_puts_skipped_total {}\n",
             background.puts_in_flight(),
@@ -2849,6 +2849,23 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
         .await;
 }
 
+/// Why a shared-tier write is made, which decides what it
+/// does when every write slot is taken (issue #463).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedWrite {
+    /// A fresh render's write-through, on a miss. Skipped
+    /// when every slot is taken: the bucket only misses a
+    /// copy that the next replica to miss renders again.
+    Render,
+    /// A tier hit's write-back of the request's cache groups
+    /// onto the stored copy (issue #350). Never skipped: the
+    /// local merge has already recorded the groups, so no
+    /// later hit sends them again, and a bucket copy that
+    /// never learns a group outlives a purge of it on every
+    /// replica. It waits for a slot in its own task instead.
+    Groups,
+}
+
 /// Write `entry` through to the shared tier in the
 /// background under the purge guard (issue #350): the
 /// same skip-and-reconcile discipline as the local
@@ -2861,23 +2878,50 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
 /// At most [`SHARED_PUTS_AT_ONCE`] writes are in flight
 /// (issue #463), each holding its entry until the bucket
 /// answers. With every slot taken, a stalled bucket's
-/// backlog, the write is skipped and counted on /metrics:
-/// the local tiers hold the entry, so the cost is a
-/// render on the next replica that misses.
-fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedImage) {
+/// backlog, a [`SharedWrite::Render`] is skipped and counted
+/// on /metrics: the local tiers hold the entry, so the cost
+/// is a render on the next replica that misses. A
+/// [`SharedWrite::Groups`] write-back is never skipped: it
+/// waits for a slot in its own task.
+fn spawn_shared_put(
+    state: &AppState,
+    snapshot: u64,
+    key: &str,
+    entry: CachedImage,
+    write: SharedWrite,
+) {
     let Some(shared) = &state.shared_store else {
         return;
     };
-    let Some(slot) = state.background.put_slot() else {
-        return;
-    };
     let guard = state.purge_guard.clone();
+    // A write a purge already covers would be dropped in the
+    // task anyway: checked before it takes a slot, so it is
+    // not counted as a skip.
+    if guard.write_covered(snapshot, key, &entry.groups, entry.written) {
+        return;
+    }
+    let slot = match write {
+        SharedWrite::Render => match state.background.put_slot() {
+            Some(slot) => Some(slot),
+            None => return,
+        },
+        SharedWrite::Groups => None,
+    };
+    let background = state.background.clone();
     let shared = shared.clone();
     let key = key.to_string();
     // The handle is dropped: the write is detached, and
     // tracked for the shutdown drain.
     let _detached = state.background.spawn(async move {
-        let _slot = slot;
+        let _slot = match slot {
+            Some(slot) => slot,
+            None => match background.wait_put_slot().await {
+                Some(slot) => slot,
+                None => return,
+            },
+        };
+        // Checked again with the slot held: a purge can begin
+        // while the write waits for one.
         if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
             return;
         }
@@ -2941,7 +2985,7 @@ async fn lookup_tiers(
                 // able to strand it.
                 let mut entry = hit.clone();
                 entry.groups = merged.clone();
-                spawn_shared_put(state, snapshot, cache_key, entry);
+                spawn_shared_put(state, snapshot, cache_key, entry, SharedWrite::Groups);
             }
             if let Some(store) = &state.store {
                 // The merge and its reconcile run as one
@@ -3005,9 +3049,15 @@ async fn lookup_tiers(
             let merged = crate::cache::union_groups(&image.groups, groups);
             if merged != image.groups {
                 image.groups = merged;
-                // Best-effort, off the response path, like
-                // the write-through put.
-                spawn_shared_put(state, snapshot, cache_key, image.clone());
+                // Off the response path, like the
+                // write-through put, but never skipped.
+                spawn_shared_put(
+                    state,
+                    snapshot,
+                    cache_key,
+                    image.clone(),
+                    SharedWrite::Groups,
+                );
             }
         }
         put_memory_tier(state, snapshot, cache_key, &image);
@@ -3061,7 +3111,13 @@ async fn lookup_disk_tier(
     if grew {
         // The merge grew the disk entry's set; the
         // shared tier's copy learns it too (issue #350).
-        spawn_shared_put(state, snapshot, cache_key, image.clone());
+        spawn_shared_put(
+            state,
+            snapshot,
+            cache_key,
+            image.clone(),
+            SharedWrite::Groups,
+        );
     }
     put_memory_tier(state, snapshot, cache_key, &image);
     Some(image)
@@ -3638,7 +3694,13 @@ async fn serve_miss(
         // write waits (issue #347): it is already off the
         // response path, and the order means a request
         // dropped during the disk write cannot strand it.
-        spawn_shared_put(state, write_snapshot, &cache_key, entry.clone());
+        spawn_shared_put(
+            state,
+            write_snapshot,
+            &cache_key,
+            entry.clone(),
+            SharedWrite::Render,
+        );
         put_disk_tier(state, write_snapshot, &cache_key, &entry).await;
     }
     record.bytes_out = processed.bytes.len();
