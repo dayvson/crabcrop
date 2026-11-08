@@ -36,8 +36,11 @@ both SDKs must all pass.
 - `sdks/`: TypeScript and Python SDKs, plus the MCP server (`sdks/mcp`).
 - `frameworks/`, `playground/`: integration starters and the live playground.
 - `fuzz/`: cargo-fuzz targets for the URL parser, the token
-  opener, image decode, metadata, and filter chains, built on the
-  server library and `crabcrop-url` (the opener's home).
+  opener, image decode (AVIF through dav1d included), metadata,
+  and operation chains through the engine, built on the server
+  library and `crabcrop-url` (the opener's home). The smoke runs
+  in `scripts/test_all.sh`; `.github/workflows/fuzz.yml` fuzzes
+  every target nightly.
 - `tests/functional/`: the HTTP functional suite, tiered; the local tier
   runs without network or model files.
 
@@ -48,9 +51,9 @@ both SDKs must all pass.
   MCP, frameworks, playground, fuzz). Everything must pass before a change
   lands.
 - CI also enforces `cargo fmt --check` and
-  `cargo clippy --locked --all-targets -- -D warnings`, which test_all.sh
-  does not run. Run both locally before pushing or the first CI run fails
-  on style alone.
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`,
+  which test_all.sh does not run. Run both locally before pushing or
+  the first CI run fails on style alone.
 - The real-model AI tests are `#[ignore]`d in the normal gate: they need
   model files and an ONNX Runtime library, which are deployment artifacts,
   never repo content. `.github/workflows/ai-models.yml` downloads the

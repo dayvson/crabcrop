@@ -30,8 +30,17 @@ bytes = "1"
 c2pa = { version = "=0.91.11", default-features = false, features = ["rust_native_crypto", "http_reqwest", "http_ureq"] }
 fast-ssim2 = "0.9"
 fast_image_resize = { version = "6.1", features = ["image"] }
+# The shared purge walk reads entry headers a bounded number
+# at a time (issue #462) with `buffer_unordered`. Already in
+# the tree through axum and hyper-util; `alloc` is the one
+# feature the combinator needs, and it adds no crate.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hex = "0.4"
 hmac = "0.13"
+# Platform-independent cosine for thumbhash, so a placeholder is
+# the same bytes on every OS (the system libm differs in the last
+# bit between glibc and Apple). Already in the tree via image deps.
+libm = "0.2"
 jixel = "0.5"
 jpeg-encoder = { version = "0.7", features = ["simd"] }
 # Default features off (issue #466): the defaults compile
@@ -113,6 +122,13 @@ gif = "0.14"
 quantizr = "1.4"
 png = "0.18"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "fs", "io-util", "signal"] }
+# The work handlers leave running (issue #463) is spawned on a
+# TaskTracker, so a shutdown can wait for it up to a deadline.
+# Already in the tree through h2 (hyper, reqwest). `rt` is the
+# feature that carries the tracker; it turns on futures-util's
+# default features for tokio-util, which add one build-time
+# crate, futures-macro, from the same futures release.
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 
 # Safe process-group signalling for the video encoder's
 # timeout kill (issue #194, audit R2-31): the crate forbids

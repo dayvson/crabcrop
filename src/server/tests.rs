@@ -39,9 +39,31 @@ async fn spawn_watermark_server() -> String {
     spawn_bytes_server(png).await.replace("src.png", "wm.png")
 }
 
+/// Answer one HTTP/1.1 request the way a real origin does:
+/// read the request head, write the response, then close the
+/// write side. Writing and dropping the socket with the
+/// request still unread makes the kernel answer with a reset
+/// instead of a clean close, and on macOS that reset can reach
+/// the client before it has read the whole response ("error
+/// decoding response body", "error sending request").
+async fn reply_and_close(socket: &mut tokio::net::TcpStream, head: &[u8], body: &[u8]) {
+    let mut buf = [0u8; 1024];
+    let mut seen = Vec::new();
+    while !seen.windows(4).any(|w| w == b"\r\n\r\n") && seen.len() < 64 * 1024 {
+        match socket.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+    }
+    let _ = socket.write_all(head).await;
+    let _ = socket.write_all(body).await;
+    let _ = socket.shutdown().await;
+}
+
 async fn spawn_bytes_server(png: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let png = Arc::new(png);
     tokio::spawn(async move {
         // Serves every connection: cache-bypassing requests
         // (meta mode) fetch the source more than once.
@@ -49,12 +71,14 @@ async fn spawn_bytes_server(png: Vec<u8>) -> String {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                png.len()
-            );
-            let _ = socket.write_all(head.as_bytes()).await;
-            let _ = socket.write_all(&png).await;
+            let png = png.clone();
+            tokio::spawn(async move {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                );
+                reply_and_close(&mut socket, head.as_bytes(), &png).await;
+            });
         }
     });
     format!("http://{addr}/src.png")
@@ -186,6 +210,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -328,6 +353,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -389,6 +415,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -450,6 +477,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -521,6 +549,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -602,6 +631,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -884,6 +914,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -1242,6 +1273,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -1309,6 +1341,7 @@ async fn spawn_app_rotating() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -1380,6 +1413,7 @@ async fn spawn_app_with_fallback() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -3059,6 +3093,7 @@ async fn spawn_app_with_presets_and_roots(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -3923,7 +3958,6 @@ async fn explain_reports_the_root_name_and_never_the_base() {
 /// how cache behavior becomes observable from outside.
 async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncWriteExt;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
@@ -3941,8 +3975,7 @@ async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::Atomic
                     "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(&body).await;
+                reply_and_close(&mut socket, head.as_bytes(), &body).await;
             });
         }
     });
@@ -4296,6 +4329,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -4476,6 +4510,7 @@ async fn spawn_app_with_moderation(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -4808,6 +4843,7 @@ async fn spawn_app_with_ocr_timeout(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -5229,6 +5265,7 @@ async fn spawn_app_with_embeddings(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -5973,6 +6010,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6036,6 +6074,7 @@ async fn spawn_app_with_studio() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6099,6 +6138,7 @@ async fn spawn_app_with_inpaint() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6194,6 +6234,7 @@ async fn spawn_app_with_segment() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6685,6 +6726,7 @@ async fn spawn_app_with_providers(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6762,6 +6804,7 @@ async fn spawn_app_full(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -8254,6 +8297,7 @@ async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -8339,6 +8383,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     }
@@ -9457,6 +9502,7 @@ async fn spawn_app_with_provenance_signer(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: Some(signer),
         config_fingerprint: "test".to_string(),
     };
@@ -9586,6 +9632,7 @@ async fn processing_gate_bounds_concurrency() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -9714,6 +9761,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -10449,6 +10497,7 @@ fn lane_test_state(
         slow_gate: Arc::new(Gate::new(slow_permits)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     }
@@ -10733,6 +10782,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         slow_gate,
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -10888,6 +10938,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -11819,6 +11870,7 @@ async fn spawn_app_with_upload_gate(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -13454,6 +13506,533 @@ async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
     drop(active);
 }
 
+/// A served app over a shared tier alone for the purge
+/// walk pacing tests (issue #462), its bucket filled to
+/// `objects` objects that are not cache entries: the first
+/// [`SHARED_PURGE_INLINE_SCAN`], named `0-head-NNNN`, list
+/// ahead of every entry object, so a purge's inline scan
+/// reads exactly those; the rest, named `z-tail-NNNN`, list
+/// after every entry object and are left to the background
+/// walk, which a test parks on them with the fake's
+/// `hold_prefix`.
+async fn spawn_walk_app(
+    fake: &crate::s3store::test_support::FakeS3,
+    objects: usize,
+) -> (String, AppState) {
+    let state = tier_test_state(None, &fake.endpoint);
+    let probe = state.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app(state)).await.unwrap();
+    });
+    let mut bucket = fake.objects.lock().unwrap();
+    let before = bucket.len();
+    for i in 0..objects {
+        let name = if i < SHARED_PURGE_INLINE_SCAN {
+            format!("0-head-{i:04}")
+        } else {
+            format!("z-tail-{i:04}")
+        };
+        bucket.insert(name, b"not a cache entry".to_vec());
+    }
+    assert_eq!(bucket.len(), before + objects);
+    drop(bucket);
+    (base, probe)
+}
+
+/// Send a signed group purge and return its body.
+async fn purge_group_call(base: &str, group: &str) -> String {
+    let sig = crate::url::purge_group_signature(SECRET, group);
+    let resp = client()
+        .post(format!("{base}/purge-group/{sig}/{group}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.text().await.unwrap()
+}
+
+/// Wait until every purge `state` started has ended, its
+/// walks and re-lists included, or fail. Walks over a few
+/// thousand objects can take seconds on a loaded machine,
+/// so the limit is generous.
+async fn wait_for_purges_to_end(state: &AppState) {
+    for _ in 0..3000 {
+        if state.purge_guard.active_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the purges never ended");
+}
+
+/// The purge tombstones in the fake bucket, parsed.
+fn bucket_tombstones(fake: &crate::s3store::test_support::FakeS3) -> Vec<crate::cache::Tombstone> {
+    let mut tombstones: Vec<crate::cache::Tombstone> = fake
+        .objects
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name.starts_with("purges/"))
+        .map(|(_, data)| {
+            crate::storage::parse_tombstone(data, &crate::url::entry_key(b"disk-key-test")).unwrap()
+        })
+        .collect();
+    tombstones.sort_by_key(|tombstone| tombstone.cutoff.start_ms);
+    tombstones
+}
+
+#[tokio::test]
+async fn identical_group_purges_share_one_walk_and_one_relist() {
+    // Issue #462: five purge-group calls in a row on a
+    // 1,000-object bucket each listed the bucket and walked
+    // it, all five walks at once. Now the four that arrive
+    // while the first one's walk runs join it, and one
+    // re-list after it serves all four. That re-list is
+    // still needed with tombstones (#461): a copy rendered
+    // between the first and the last call is newer than the
+    // first purge, so the first walk spares it, and the
+    // later purges' tombstones hide it only until they
+    // expire; it has to leave the bucket.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    const OBJECTS: usize = 1000;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, OBJECTS - 1).await;
+    let shared = probe.shared_store.clone().unwrap();
+    // One member of `small` from before every purge.
+    let stale_key = "40x24/example.com/stale.png#cfgtest";
+    let groups = vec!["small".to_string()];
+    let member = CachedImage {
+        groups: groups.clone(),
+        ..tier_test_entry()
+    };
+    shared.put(stale_key, &member).await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    wait_until("the first walk parks", || {
+        fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    assert_eq!(fake.walk.lists_of(""), 1);
+    // Another replica writes back a render that began after
+    // the first purge: the first walk has already listed the
+    // bucket, and would spare the copy anyway.
+    let fresh_key = "40x24/example.com/fresh.png#cfgtest";
+    let fresh = CachedImage {
+        written: Some(probe.purge_guard.stamp()),
+        ..member.clone()
+    };
+    shared.put(fresh_key, &fresh).await;
+    // Four more identical purges join the parked walk: none
+    // of them lists the bucket or reads a header.
+    let reads = fake.ranged_gets.load(Ordering::SeqCst);
+    for _ in 0..4 {
+        assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    }
+    assert_eq!(fake.walk.lists_of(""), 1);
+    assert_eq!(fake.ranged_gets.load(Ordering::SeqCst), reads);
+    assert_eq!(probe.purge_guard.active_count(), 5);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    // One walk and one re-list: each object's header read
+    // once per pass, where five walks read it five times.
+    assert_eq!(fake.walk.lists_of(""), 2);
+    assert_eq!(fake.ranged_gets.load(Ordering::SeqCst), 2 * OBJECTS);
+    assert!(shared.get(stale_key).await.is_none());
+    // The copy written between the first and the last call
+    // is gone from the bucket, where nothing else would have
+    // removed it: once the grace has passed, no tombstone
+    // covers it any more.
+    assert!(shared.get(fresh_key).await.is_none());
+    let past_grace = crate::cache::now_ms() + crate::cache::TOMBSTONE_GRACE_MS + 1;
+    assert!(
+        !probe
+            .purge_guard
+            .running_covers_at(past_grace, fresh_key, &groups, fresh.written)
+    );
+    // Every purge's bucket tombstone was marked ended.
+    let tombstones = bucket_tombstones(&fake);
+    assert_eq!(tombstones.len(), 5);
+    assert!(tombstones.iter().all(|t| t.ended_ms.is_some()));
+}
+
+#[tokio::test]
+async fn background_purge_walks_take_turns_two_at_a_time() {
+    // Issue #462: every purge that outgrew its inline scan
+    // walked the rest of the bucket on its own unbounded
+    // task, so N different purges ran N walks at once. Now
+    // background walks wait for one of PURGE_WALKS_AT_ONCE
+    // turns: with every walk's reads parked, exactly two
+    // walks' worth arrive, and the other three walks wait.
+    use crate::s3store::{PURGE_READS_AT_ONCE, PURGE_WALKS_AT_ONCE};
+    const OBJECTS: usize = SHARED_PURGE_INLINE_SCAN + 100;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, OBJECTS).await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    let calls: Vec<_> = (0..5)
+        .map(|i| {
+            let base = base.clone();
+            tokio::spawn(async move { purge_group_call(&base, &format!("g{i}")).await })
+        })
+        .collect();
+    for call in calls {
+        assert_eq!(call.await.unwrap(), "purged 0\n");
+    }
+    let parked = PURGE_WALKS_AT_ONCE * PURGE_READS_AT_ONCE;
+    wait_until("two walks park", || {
+        fake.walk.held.load(Ordering::SeqCst) >= parked
+    })
+    .await;
+    // The other walks wait for a turn: no read of theirs
+    // arrives while the first two are parked.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(fake.walk.held.load(Ordering::SeqCst), parked);
+    assert_eq!(probe.purge_guard.active_count(), 5);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    assert_eq!(fake.walk.held_peak.load(Ordering::SeqCst), parked);
+    // Each purge still listed and walked the whole bucket.
+    assert_eq!(fake.walk.lists_of(""), 5);
+    assert_eq!(fake.ranged_gets.load(Ordering::SeqCst), 5 * OBJECTS);
+}
+
+#[tokio::test]
+async fn an_identical_url_purge_joins_the_walk_and_purges_its_variants_inline() {
+    // Issue #462: a per-URL purge whose target is already
+    // being walked joins that walk, but the current epoch's
+    // variants are reached by name, five reads, so it still
+    // deletes them itself: a copy re-rendered after the
+    // first purge is gone from the bucket when the second
+    // purge answers, while the first walk is still parked.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    let fx = WalkFixture::new("walk-join-url").await;
+    {
+        let mut objects = fx.fake.objects.lock().unwrap();
+        for i in 0..64 {
+            objects.insert(format!("z-tail-{i:04}"), b"not a cache entry".to_vec());
+        }
+    }
+    *fx.fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    let path = fx.url.strip_prefix(&fx.base).unwrap();
+    let (_, remainder) = path[1..].split_once('/').unwrap();
+    let purge_url = format!(
+        "{}/purge/{}/{remainder}",
+        fx.base,
+        crate::url::purge_signature(SECRET, remainder)
+    );
+    let resp = client().post(&purge_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    wait_until("the first walk parks", || {
+        fx.fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    assert!(!fx.bucket_holds_stale());
+    // A render after the first purge began writes its copy
+    // through to the bucket.
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    wait_until("the re-render lands in the bucket", || {
+        fx.fake.objects.lock().unwrap().contains_key(&fx.object)
+    })
+    .await;
+    let lists = fx.fake.walk.lists_of("");
+    let resp = client().post(&purge_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Memory, disk, and the bucket copy, by name...
+    assert_eq!(resp.text().await.unwrap(), "purged 3\n");
+    assert!(!fx.fake.objects.lock().unwrap().contains_key(&fx.object));
+    // ...with no walk of its own: it joined the parked one.
+    assert_eq!(fx.fake.walk.lists_of(""), lists);
+    assert_eq!(
+        fx.fake.walk.held.load(Ordering::SeqCst),
+        PURGE_READS_AT_ONCE
+    );
+    assert_eq!(fx.probe.purge_guard.active_count(), 2);
+    *fx.fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&fx.probe).await;
+    // One re-list served the joined purge.
+    assert_eq!(fx.fake.walk.lists_of(""), lists + 1);
+    fx.assert_no_tier_serves_the_stale_copy().await;
+}
+
+#[tokio::test]
+async fn a_purge_joining_an_inline_walk_still_gets_its_relist() {
+    // Issue #462 review: the leader's walk ends inline, with
+    // no background remainder, and an identical purge joins
+    // while that inline scan runs. The joined purge must
+    // still get its re-list, or a copy rendered between the
+    // two purges stays in the bucket and serves again once
+    // the joined purge's tombstone expires.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, 40).await;
+    let shared = probe.shared_store.clone().unwrap();
+    let groups = vec!["small".to_string()];
+    let member = CachedImage {
+        groups: groups.clone(),
+        ..tier_test_entry()
+    };
+    shared
+        .put("40x24/example.com/stale.png#cfgtest", &member)
+        .await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("0-head-".into());
+    let leader_base = base.clone();
+    let leader = tokio::spawn(async move { purge_group_call(&leader_base, "small").await });
+    wait_until("the leader's inline scan parks", || {
+        fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    let fresh_key = "40x24/example.com/fresh.png#cfgtest";
+    let fresh = CachedImage {
+        written: Some(probe.purge_guard.stamp()),
+        ..member.clone()
+    };
+    shared.put(fresh_key, &fresh).await;
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    assert_eq!(fake.walk.lists_of(""), 1);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    assert_eq!(leader.await.unwrap(), "purged 1\n");
+    wait_for_purges_to_end(&probe).await;
+    assert_eq!(fake.walk.lists_of(""), 2);
+    assert!(shared.get(fresh_key).await.is_none());
+}
+
+#[tokio::test]
+async fn the_relist_judges_copies_by_the_latest_joined_purge() {
+    // Issue #462 review: two purges join a parked walk, one
+    // before and one after a copy is rendered. The shared
+    // re-list must judge copies by the later purge's start,
+    // or that copy stays in the bucket and serves again once
+    // the later purge's tombstone expires.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN + 50).await;
+    let shared = probe.shared_store.clone().unwrap();
+    let member = CachedImage {
+        groups: vec!["small".to_string()],
+        ..tier_test_entry()
+    };
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    wait_until("the leader's walk parks", || {
+        fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    let fresh_key = "40x24/example.com/fresh.png#cfgtest";
+    let fresh = CachedImage {
+        written: Some(probe.purge_guard.stamp()),
+        ..member.clone()
+    };
+    shared.put(fresh_key, &fresh).await;
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    assert_eq!(fake.walk.lists_of(""), 2);
+    assert!(shared.get(fresh_key).await.is_none());
+}
+
+#[tokio::test]
+async fn inline_scans_of_different_purges_share_one_read_budget() {
+    // Issue #462 review: walk turns bound the background
+    // walks only, and each purge's inline scan read 16
+    // headers at a time on its own, so six concurrent purges
+    // of different groups put 96 reads on the store at once.
+    // Every inline read now holds one of the process's
+    // PURGE_INLINE_READS_AT_ONCE: with every inline read
+    // parked, exactly that many arrive, and the rest wait.
+    use crate::s3store::PURGE_INLINE_READS_AT_ONCE;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN).await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("0-head-".into());
+    let calls: Vec<_> = (0..6)
+        .map(|i| {
+            let base = base.clone();
+            tokio::spawn(async move { purge_group_call(&base, &format!("g{i}")).await })
+        })
+        .collect();
+    wait_until("the inline scans park their reads", || {
+        fake.walk.held.load(Ordering::SeqCst) >= PURGE_INLINE_READS_AT_ONCE
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        fake.walk.held.load(Ordering::SeqCst),
+        PURGE_INLINE_READS_AT_ONCE
+    );
+    assert_eq!(fake.walk.lists_of(""), 6);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    for call in calls {
+        assert_eq!(call.await.unwrap(), "purged 0\n");
+    }
+    assert_eq!(
+        fake.walk.held_peak.load(Ordering::SeqCst),
+        PURGE_INLINE_READS_AT_ONCE
+    );
+    assert_eq!(
+        fake.ranged_gets.load(Ordering::SeqCst),
+        6 * SHARED_PURGE_INLINE_SCAN
+    );
+    wait_for_purges_to_end(&probe).await;
+}
+
+#[tokio::test]
+async fn a_purge_request_scan_does_not_wait_behind_background_walks() {
+    // Issue #462 review: the inline read budget is the
+    // requests' own. With both background turns taken by
+    // walks whose reads are parked, a purge of another group
+    // still scans its inline part and answers; only its own
+    // background walk waits for a turn.
+    use crate::s3store::{PURGE_READS_AT_ONCE, PURGE_WALKS_AT_ONCE};
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN + 20).await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    for i in 0..PURGE_WALKS_AT_ONCE {
+        assert_eq!(
+            purge_group_call(&base, &format!("g{i}")).await,
+            "purged 0\n"
+        );
+    }
+    let parked = PURGE_WALKS_AT_ONCE * PURGE_READS_AT_ONCE;
+    wait_until("the background walks park", || {
+        fake.walk.held.load(Ordering::SeqCst) == parked
+    })
+    .await;
+    let reads = fake.ranged_gets.load(Ordering::SeqCst);
+    // Well inside the store client's 10 s request timeout,
+    // which would otherwise free a stuck budget by failing
+    // the parked reads.
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        purge_group_call(&base, "other"),
+    )
+    .await
+    .expect("the purge request waited behind the parked walks");
+    assert_eq!(answer, "purged 0\n");
+    assert_eq!(
+        fake.ranged_gets.load(Ordering::SeqCst),
+        reads + SHARED_PURGE_INLINE_SCAN
+    );
+    assert_eq!(fake.walk.held.load(Ordering::SeqCst), parked);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    assert_eq!(fake.walk.lists_of(""), PURGE_WALKS_AT_ONCE + 1);
+}
+
+/// Issue #462 review: purge a group while `fail` makes the
+/// store fail part of the walk, and check that the purge
+/// stays in force. The walk could not reach the group's
+/// copy, so marking the purge ended would let that copy
+/// serve again once the tombstone expires; it is left
+/// running in the bucket instead, as when the process stops
+/// mid-walk, until a later purge of the group completes.
+async fn assert_a_failed_walk_leaves_its_purge_in_force(
+    fail: fn(&mut crate::s3store::test_support::FailFlags, bool),
+) {
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, 0).await;
+    let shared = probe.shared_store.clone().unwrap();
+    let stale_key = "40x24/example.com/stale.png#cfgtest";
+    let groups = vec!["small".to_string()];
+    let member = CachedImage {
+        groups: groups.clone(),
+        ..tier_test_entry()
+    };
+    shared.put(stale_key, &member).await;
+    let errors = shared.errors();
+    fail(&mut fake.fail.lock().unwrap(), true);
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    wait_for_purges_to_end(&probe).await;
+    fail(&mut fake.fail.lock().unwrap(), false);
+    // Counted for /metrics, and the copy is still there.
+    assert!(shared.errors() > errors);
+    assert!(shared.get(stale_key).await.is_some());
+    let tombstones = bucket_tombstones(&fake);
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].ended_ms, None);
+    // A replica that reads the tombstone keeps the copy a
+    // miss past any grace period.
+    assert!(shared.refresh_tombstones(&probe.purge_guard).await);
+    let past_grace = crate::cache::now_ms() + crate::cache::TOMBSTONE_GRACE_MS + 1;
+    assert!(
+        probe
+            .purge_guard
+            .running_covers_at(past_grace, stale_key, &groups, None)
+    );
+    // A later purge whose walk completes removes the copy,
+    // and its ended tombstone supersedes the one left open.
+    assert_eq!(purge_group_call(&base, "small").await, "purged 1\n");
+    wait_for_purges_to_end(&probe).await;
+    assert!(shared.get(stale_key).await.is_none());
+    assert!(shared.refresh_tombstones(&probe.purge_guard).await);
+    let tombstones = bucket_tombstones(&fake);
+    assert_eq!(tombstones.len(), 1);
+    assert!(tombstones[0].ended_ms.is_some());
+}
+
+#[tokio::test]
+async fn a_purge_whose_walk_cannot_list_the_bucket_stays_in_force() {
+    assert_a_failed_walk_leaves_its_purge_in_force(|fail, on| fail.list = on).await;
+}
+
+#[tokio::test]
+async fn a_purge_whose_header_reads_fail_stays_in_force() {
+    assert_a_failed_walk_leaves_its_purge_in_force(|fail, on| fail.get_object = on).await;
+}
+
+#[tokio::test]
+async fn a_purge_whose_deletes_fail_stays_in_force() {
+    assert_a_failed_walk_leaves_its_purge_in_force(|fail, on| fail.delete = on).await;
+}
+
+#[tokio::test]
+async fn a_failed_relist_leaves_the_joined_purges_in_force() {
+    // Issue #462 review: one re-list serves every purge that
+    // joined a walk. When the store cannot list the bucket
+    // for it, none of those purges may be marked ended: the
+    // copy rendered between the purges is still there.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN + 50).await;
+    let shared = probe.shared_store.clone().unwrap();
+    let groups = vec!["small".to_string()];
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    wait_until("the first walk parks", || {
+        fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    let fresh_key = "40x24/example.com/fresh.png#cfgtest";
+    let fresh = CachedImage {
+        groups: groups.clone(),
+        written: Some(probe.purge_guard.stamp()),
+        ..tier_test_entry()
+    };
+    shared.put(fresh_key, &fresh).await;
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    assert_eq!(probe.purge_guard.active_count(), 2);
+    fake.fail.lock().unwrap().list = true;
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    fake.fail.lock().unwrap().list = false;
+    assert!(shared.get(fresh_key).await.is_some());
+    // The first purge's own walk completed, so it ended; the
+    // joined one did not.
+    let tombstones = bucket_tombstones(&fake);
+    assert_eq!(tombstones.len(), 2);
+    assert!(tombstones[0].ended_ms.is_some());
+    assert_eq!(tombstones[1].ended_ms, None);
+    assert!(shared.refresh_tombstones(&probe.purge_guard).await);
+    let past_grace = crate::cache::now_ms() + crate::cache::TOMBSTONE_GRACE_MS + 1;
+    assert!(
+        probe
+            .purge_guard
+            .running_covers_at(past_grace, fresh_key, &groups, fresh.written)
+    );
+}
+
 /// An app over a disk tier under a chosen
 /// configuration fingerprint (the epoch tests).
 async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &str) -> String {
@@ -13509,6 +14088,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: fingerprint.to_string(),
     };
@@ -13722,7 +14302,10 @@ async fn upload_rejects_names_that_misstate_the_media() {
         ("photo.jpg", StatusCode::UNSUPPORTED_MEDIA_TYPE),
         ("promo.html", StatusCode::UNSUPPORTED_MEDIA_TYPE),
         ("photo.png", StatusCode::CREATED),
-        ("photo.PNG", StatusCode::CREATED),
+        // Its own stem: on a case-insensitive file system
+        // (the macOS default) photo.PNG is the same file as
+        // photo.png and would be refused as existing.
+        ("upper.PNG", StatusCode::CREATED),
         ("photo", StatusCode::CREATED),
     ] {
         let sig = crate::url::upload_signature(SECRET, name);
@@ -14762,6 +15345,7 @@ async fn spawn_explain_app_with_roots(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -15055,4 +15639,370 @@ async fn explain_escapes_markup_bearing_strings() {
     let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(json["source"]["url"], src);
     assert_eq!(json["presets"][0]["name"], "a&b");
+}
+
+/// Serve `state` on an ephemeral port: the tests that read
+/// `/metrics` while they drive the state directly.
+async fn serve_state(state: &AppState) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = state.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state)).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The `/metrics` exposition, read with `token`.
+async fn scrape(base: &str, token: &str) -> String {
+    let resp = client()
+        .get(format!("{base}/metrics"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
+    // Issue #463: every shared write-through was a bare
+    // spawn, so a stalled bucket let them pile up, one per
+    // miss, each holding a whole entry. Now at most
+    // SHARED_PUTS_AT_ONCE are in flight, and one that finds
+    // every slot taken is skipped and counted, not queued.
+    let fake = crate::s3store::test_support::start_fake().await;
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let mut state = tier_test_state(None, &fake.endpoint);
+    state.metrics_token = Some("metrics-token".to_string());
+    let shared = state.shared_store.clone().unwrap();
+    let base = serve_state(&state).await;
+    let snapshot = state.purge_guard.snapshot();
+    let key = |i: usize| format!("{i}/example.com/a.png");
+    for i in 0..SHARED_PUTS_AT_ONCE {
+        spawn_shared_put(
+            &state,
+            snapshot,
+            &key(i),
+            tier_test_entry(),
+            SharedWrite::Render,
+        );
+    }
+    wait_until("every slot's write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == SHARED_PUTS_AT_ONCE
+    })
+    .await;
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains(&format!(
+            "crabcrop_cache_shared_puts_in_flight {SHARED_PUTS_AT_ONCE}\n"
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(&format!(
+            "crabcrop_cache_shared_puts_capacity {SHARED_PUTS_AT_ONCE}\n"
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_skipped_total 0\n"),
+        "{metrics}"
+    );
+
+    // Every slot is taken: the next write is skipped on the
+    // spot and counted, and nothing more reaches the bucket.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        &key(1000),
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 1);
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_skipped_total 1\n"),
+        "{metrics}"
+    );
+    assert_eq!(fake.held_puts.load(Ordering::SeqCst), SHARED_PUTS_AT_ONCE);
+
+    // The bucket answers: the held writes land, tracked to
+    // the end, and give their slots back.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let left = state.background.drain(deadline).await;
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 0
+        }
+    );
+    assert_eq!(state.background.puts_in_flight(), 0);
+    assert_eq!(entry_objects(&fake), SHARED_PUTS_AT_ONCE);
+    assert!(shared.get(&key(0)).await.is_some());
+    assert!(shared.get(&key(1000)).await.is_none());
+
+    // With a slot free again, a write goes through.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        &key(1001),
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    state.background.drain(deadline).await;
+    assert!(shared.get(&key(1001)).await.is_some());
+    assert_eq!(state.background.puts_skipped(), 1);
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_in_flight 0\n"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_waits_for_a_write_through_until_its_deadline() {
+    // Issue #463: at shutdown the detached writes died with
+    // the runtime once the connections drained. The drain
+    // now waits for them, and stops waiting at its deadline.
+    let fake = crate::s3store::test_support::start_fake().await;
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let state = tier_test_state(None, &fake.endpoint);
+    let shared = state.shared_store.clone().unwrap();
+    let key = "40x24/example.com/i.png";
+    spawn_shared_put(
+        &state,
+        state.purge_guard.snapshot(),
+        key,
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    wait_until("the write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // The bucket holds the write past the deadline: the
+    // drain gives up at it and reports the write.
+    let grace = std::time::Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let left = state.background.drain(started + grace).await;
+    assert!(started.elapsed() >= grace);
+    assert_eq!(
+        left,
+        Drained {
+            writes: 1,
+            walks: 0
+        }
+    );
+    assert_eq!(entry_objects(&fake), 0);
+    // Answered in time, the write lands before the drain
+    // returns.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let left = state.background.drain(deadline).await;
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 0
+        }
+    );
+    assert!(shared.get(key).await.is_some());
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_counts_purge_walks_but_never_waits_for_them() {
+    // Issue #463: a purge's background walk is tracked, but
+    // a shutdown does not wait for it. Cut short, it leaves
+    // the purge's tombstone unended, which keeps the purge
+    // in force (issue #461).
+    let fake = crate::s3store::test_support::start_fake().await;
+    {
+        let mut objects = fake.objects.lock().unwrap();
+        for i in 0..SHARED_PURGE_INLINE_SCAN + 8 {
+            objects.insert(format!("0-filler-{i:04}"), b"not a cache entry".to_vec());
+        }
+    }
+    // The request scans the inline budget itself; the
+    // background walk parks on its first read past it.
+    *fake.hold_ranged_after.lock().unwrap() = Some(SHARED_PURGE_INLINE_SCAN);
+    let state = tier_test_state(None, &fake.endpoint);
+    purge_source_everywhere(&state, "example.com/i.png").await;
+    wait_until("the background walk parks", || {
+        fake.ranged_gets.load(Ordering::SeqCst) > SHARED_PURGE_INLINE_SCAN
+    })
+    .await;
+    assert_eq!(state.purge_guard.active_count(), 1);
+    // A deadline far off: the drain returns as soon as the
+    // writes are done, with the parked walk still running.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let left = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        state.background.drain(deadline),
+    )
+    .await
+    .expect("the drain must not wait for the walk");
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 1
+        }
+    );
+    assert_eq!(state.purge_guard.active_count(), 1);
+    // Released, the walk ends the purge as before.
+    *fake.hold_ranged_after.lock().unwrap() = None;
+    wait_until("the purge walk ends", || {
+        state.purge_guard.active_count() == 0
+    })
+    .await;
+}
+
+/// Fill every shared write slot against a stalled bucket:
+/// `SHARED_PUTS_AT_ONCE` render write-throughs, each held.
+async fn hold_every_shared_write_slot(
+    state: &AppState,
+    fake: &crate::s3store::test_support::FakeS3,
+) {
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let snapshot = state.purge_guard.snapshot();
+    for i in 0..SHARED_PUTS_AT_ONCE {
+        spawn_shared_put(
+            state,
+            snapshot,
+            &format!("{i}/example.com/filler.png"),
+            tier_test_entry(),
+            SharedWrite::Render,
+        );
+    }
+    wait_until("every slot's write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == SHARED_PUTS_AT_ONCE
+    })
+    .await;
+}
+
+/// A group-free copy is served to a grouped request while
+/// every shared write slot is taken, from memory or from the
+/// bucket; then the bucket recovers and the group is purged.
+/// The purge must reach the bucket copy, on this replica and
+/// on any other.
+async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool) {
+    // Issue #463 review: the bound skipped a tier hit's
+    // group write-back like a render write-through. The
+    // local merge had already recorded the group, so nothing
+    // sent it again; the bucket copy never learned it, the
+    // group purge left it, and every replica served it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let state = tier_test_state(None, &fake.endpoint);
+    let shared = state.shared_store.clone().unwrap();
+    let key = "40x24/example.com/hero.png";
+    let entry = tier_test_entry();
+    shared.put(key, &entry).await;
+    if from_memory {
+        put_memory_tier(&state, state.purge_guard.snapshot(), key, &entry);
+    }
+    hold_every_shared_write_slot(&state, &fake).await;
+
+    let groups = vec!["hero".to_string()];
+    let (_, status) = lookup_tiers(&state, key, &groups).await.unwrap();
+    let expected = if from_memory {
+        "crabcrop; hit"
+    } else {
+        "crabcrop; hit; detail=\"shared\""
+    };
+    assert_eq!(status, expected);
+    // The write-back waits for a slot rather than take a
+    // sixty-fifth: the bound on writes in flight holds.
+    assert_eq!(state.background.puts_in_flight(), SHARED_PUTS_AT_ONCE);
+    assert_eq!(fake.held_puts.load(Ordering::SeqCst), SHARED_PUTS_AT_ONCE);
+    // The next hit is a memory hit that already carries the
+    // group: it sends nothing.
+    let (_, status) = lookup_tiers(&state, key, &groups).await.unwrap();
+    assert_eq!(status, "crabcrop; hit");
+
+    // The bucket recovers: the held writes land, then the
+    // write-back takes a freed slot and lands too.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(state.background.drain(far).await.writes, 0);
+    assert_eq!(
+        shared.get(key).await.unwrap().groups,
+        groups,
+        "the bucket copy never learned the group"
+    );
+    assert_eq!(state.background.puts_skipped(), 0);
+
+    let base = serve_state(&state).await;
+    let sig = crate::url::purge_group_signature(SECRET, "hero");
+    let resp = client()
+        .post(format!("{base}/purge-group/{sig}/hero"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    wait_until("the group purge ends", || {
+        state.purge_guard.active_count() == 0
+    })
+    .await;
+    assert!(
+        shared.get(key).await.is_none(),
+        "the purge answered {body:?}, yet the bucket copy survived it"
+    );
+    assert!(lookup_tiers(&state, key, &groups).await.is_none());
+    // Another replica, with the bucket's tombstones read,
+    // misses as well.
+    let other = tier_test_state(None, &fake.endpoint);
+    shared.refresh_tombstones(&other.purge_guard).await;
+    assert!(lookup_tiers(&other, key, &groups).await.is_none());
+}
+
+#[tokio::test]
+async fn a_memory_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
+    group_purge_after_a_hit_with_every_write_slot_taken(true).await;
+}
+
+#[tokio::test]
+async fn a_shared_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
+    group_purge_after_a_hit_with_every_write_slot_taken(false).await;
+}
+
+#[tokio::test]
+async fn a_render_write_a_purge_covers_is_dropped_but_not_counted_as_skipped() {
+    // Issue #463 review: the skip counter is for renders the
+    // bucket missed because every slot was taken. A write a
+    // running purge already covers would never land, so it
+    // is not one of them.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let state = tier_test_state(None, &fake.endpoint);
+    let snapshot = state.purge_guard.snapshot();
+    hold_every_shared_write_slot(&state, &fake).await;
+    let covered = "40x24/example.com/covered.png";
+    let _purge = state
+        .purge_guard
+        .begin(crate::cache::PurgeTarget::Key(covered.to_string()));
+    spawn_shared_put(
+        &state,
+        snapshot,
+        covered,
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 0);
+    // One the purge does not cover is skipped and counted.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        "40x24/example.com/other.png",
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 1);
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(state.background.drain(far).await.writes, 0);
+    assert_eq!(entry_objects(&fake), SHARED_PUTS_AT_ONCE);
 }
