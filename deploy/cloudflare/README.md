@@ -72,7 +72,7 @@ Attaching the tags: purge by tag only works if responses were cached carrying a 
 - **A Cache Response Rule (no code):** one rule per preset. Match `http.request.uri.path contains "/preset:<name>/"` and set Cache-Tag to `<name>`. Preset URLs carry `preset:<name>` as a path segment, so the match is exact. Rule budgets are small on lower plans, so this suits a handful of presets.
 - **The Worker bridge (many or dynamic groups):** `cache-tag-worker.js` in this directory copies whatever `Cache-Group` values a response carries into `Cache-Tag`. Preset names must be valid tag characters (printable ASCII, no spaces), which crabcrop preset names are in practice. Cloudflare strips `Cache-Tag` before delivery, so visitors never see it. Step 4 of the checklist proves the tags landed on your zone.
 
-One membership subtlety, mirrored on both sides: crabcrop groups accumulate (an entry joins a group the first time any grouped spelling of its URL is served), and Cloudflare tags only attach to responses cached while the bridge was live. Right after enabling a bridge, purge the hostname once to re-seed the edge cache with tagged copies.
+One membership subtlety, mirrored on both sides: crabcrop groups accumulate (an entry joins a group the first time any grouped spelling of its URL is served), and Cloudflare tags only attach to responses cached while the bridge was live. Right after enabling a bridge, purge the hostname once to re-seed the edge cache with tagged copies. Neither bridge tags a sealed URL: its response carries no `Cache-Group` and its path hides the `preset:` segment, so purge sealed URLs by URL (see [Cache headers and groups](../../docs/endpoints.md#cache-headers-and-groups)).
 
 ## 6. Tiered Cache and Cache Reserve (optional)
 

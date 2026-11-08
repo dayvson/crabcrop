@@ -7827,6 +7827,53 @@ async fn preset_responses_carry_the_group_and_group_purge_evicts() {
 }
 
 #[tokio::test]
+async fn sealed_preset_responses_carry_no_cache_group() {
+    // Issue #454: a sealed URL hides its recipe, preset
+    // names included, so neither its miss nor its hit
+    // lists them in Cache-Group. The entry still joins the
+    // group (groups live on the cache entry, not in the
+    // header), so purge-group reaches it, and the plain
+    // spelling of the same render keeps the header.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let remainder = format!("preset:small/{src}");
+    let sealed_url = format!("{base}/{}", sealed_path(&remainder, Some("photo.png")));
+    let resp = client().get(&sealed_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert!(resp.headers().get("cache-group").is_none());
+    let resp = client().get(&sealed_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert!(resp.headers().get("cache-group").is_none());
+    // An entry only ever served sealed is in the group.
+    let sig = crate::url::purge_group_signature(SECRET, "small");
+    let resp = client()
+        .post(format!("{base}/purge-group/{sig}/small"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.text().await.unwrap().contains("purged 1"));
+    let resp = client().get(&sealed_url).send().await.unwrap();
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert!(resp.headers().get("cache-group").is_none());
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // The plain spelling hits the same entry and names
+    // its group.
+    let plain_url = format!("{base}/{}/{remainder}", sign(&remainder));
+    let resp = client().get(&plain_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(header(&resp, "cache-group"), "\"small\"");
+    // And a sealed hit after the plain one still names none.
+    let resp = client().get(&sealed_url).send().await.unwrap();
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert!(resp.headers().get("cache-group").is_none());
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn purge_group_refuses_transplanted_purge_signatures() {
     // Audit R2-14: purge-group verifies under its own
     // subkey, so a per-target purge signature, even one
@@ -13498,6 +13545,101 @@ async fn metrics_require_the_configured_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let resp = metrics_response(&base).await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn metrics_bearer_scheme_is_case_insensitive() {
+    // Issue #454: the auth scheme is case-insensitive
+    // (RFC 9110), so every casing of `Bearer` reaches the
+    // token check. The token itself stays case-sensitive.
+    let base = spawn_app(false).await;
+    for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+        let resp = client()
+            .get(format!("{base}/metrics"))
+            .header("authorization", format!("{scheme} {TEST_METRICS_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{scheme}");
+    }
+    let resp = client()
+        .get(format!("{base}/metrics"))
+        .header(
+            "authorization",
+            format!("bearer {}", TEST_METRICS_TOKEN.to_ascii_uppercase()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn metrics_refuse_wrong_and_hostile_authorization() {
+    // Issue #454: a wrong token answers the same 401
+    // whether or not its length matches the configured
+    // token's, malformed headers answer it too, and the
+    // server keeps serving the real token afterwards.
+    let base = spawn_app(false).await;
+    let same_length = {
+        let mut t = TEST_METRICS_TOKEN.as_bytes().to_vec();
+        let last = t.len() - 1;
+        t[last] ^= 1;
+        String::from_utf8(t).unwrap()
+    };
+    assert_eq!(same_length.len(), TEST_METRICS_TOKEN.len());
+    assert_ne!(same_length, TEST_METRICS_TOKEN);
+    let shorter = &TEST_METRICS_TOKEN[..TEST_METRICS_TOKEN.len() - 1];
+    let longer = format!("{TEST_METRICS_TOKEN}x");
+    let huge = "a".repeat(8 * 1024);
+    let mut values: Vec<axum::http::HeaderValue> = [
+        format!("Bearer {same_length}"),
+        format!("Bearer {shorter}"),
+        format!("Bearer {longer}"),
+        format!("Bearer {huge}"),
+        "Bearer x".to_string(),
+        "Bearer".to_string(),
+        format!("Bearer{TEST_METRICS_TOKEN}"),
+        format!("Bearer\t{TEST_METRICS_TOKEN}"),
+        format!("Bearerx {TEST_METRICS_TOKEN}"),
+        format!("Basic {TEST_METRICS_TOKEN}"),
+        format!("{TEST_METRICS_TOKEN} Bearer"),
+        TEST_METRICS_TOKEN.to_string(),
+    ]
+    .iter()
+    .map(|v| axum::http::HeaderValue::from_str(v).unwrap())
+    .collect();
+    // Not UTF-8: the header cannot be read as text at all.
+    let mut raw = b"Bearer \xff".to_vec();
+    raw.extend_from_slice(TEST_METRICS_TOKEN.as_bytes());
+    values.push(axum::http::HeaderValue::from_bytes(&raw).unwrap());
+    for value in values {
+        let resp = client()
+            .get(format!("{base}/metrics"))
+            .header("accept", "application/json")
+            .header("authorization", value.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{value:?}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "metrics_unauthorized", "{value:?}");
+    }
+    let resp = metrics_response(&base).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[test]
+fn token_eq_matches_only_the_exact_token_at_any_length() {
+    // Issue #454: equality is unchanged by comparing
+    // digests; only the timing stopped depending on the
+    // presented length.
+    assert!(token_eq(b"secret-token", b"secret-token"));
+    assert!(!token_eq(b"secret-token", b"secret-tokem"));
+    assert!(!token_eq(b"secret-token", b"secret-toke"));
+    assert!(!token_eq(b"secret-toke", b"secret-token"));
+    assert!(!token_eq(b"", b"secret-token"));
+    assert!(!token_eq(&[0u8; 4096], b"secret-token"));
 }
 
 #[tokio::test]
