@@ -8,6 +8,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Release runs check the approval gate and CI before they build, and adopt a release that already exists (issue #457). A new preflight job stops a tag run unless the `release` environment has a Required reviewers rule and the tagged commit passed `rust.yml` on main. The host job updates an existing release for the tag instead of failing on it, which every tag run from v0.9.8 to v0.9.11 did on its first attempt. The one-off `mcp-publish-v010.yml` workflow is gone.
 
+- Shared-tier purges are paced and coalesced (issue #462). A purge reads entry headers 16 at a time instead of one by one, purge requests share a budget of 32 reads in flight, and at most two background walks run at once. A purge whose target is already being walked joins that walk instead of listing the bucket again, and one re-list afterwards removes copies rendered in between. A walk that the bucket fails part way (a listing, read or delete with no answer) no longer ends its purge: the tombstone stays in force until a later purge of the same target completes a walk, and each failure counts in `crabcrop_cache_tier_errors_total`.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added
