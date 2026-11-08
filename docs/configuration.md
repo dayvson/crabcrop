@@ -85,6 +85,7 @@ With `CRABCROP_BLOCK_PRIVATE_SOURCES` on, the loader resolves each host that is 
 - **Cache entries key on the merged operations**, exactly like presets, so changing the defaults changes the keys and old entries age out unused. Purges account for the merge too: purging a URL removes its merged entry.
 - **Presets-only mode is unaffected in what it rejects** (the URL's own operations), and the defaults still apply: they are not URL content.
 - Cache groups stay the URL's own presets; a preset referenced only by the defaults does not join entries to its group.
+- [`/explain`](endpoints.md#self-explaining-urls) forecasts from the merged operations, so its forecast matches what the image request serves; its operation list stays the URL's own, and the defaults appear in its canonical form.
 
 ### Rotating the secret
 
