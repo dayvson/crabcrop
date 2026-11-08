@@ -1,5 +1,7 @@
 //! A minimal in-memory zip reader, sized for head saves.
 
+use super::HEAD_BUDGET;
+
 /// One entry of a zip archive, extracted.
 pub(super) struct ZipEntry {
     pub(super) name: String,
@@ -11,9 +13,12 @@ pub(super) struct ZipEntry {
 /// saves `torch.save` writes for a linear head:
 /// stored and deflated entries, no encryption, no
 /// zip64, no multi-disk archives; anything else is
-/// an error naming the limitation. Entry payloads are
-/// capped as they inflate, so a hostile archive
-/// cannot expand without bound.
+/// an error naming the limitation. The entries share
+/// the head budget: each declared size is charged
+/// against it before the entry inflates, and an entry
+/// inflates no further than its declared size, so a
+/// hostile archive expands no further than the file
+/// itself may weigh.
 pub(super) fn read_zip_entries(bytes: &[u8]) -> Result<Vec<ZipEntry>, String> {
     let u16_at = |at: usize| -> Result<u16, String> {
         bytes
@@ -52,6 +57,7 @@ pub(super) fn read_zip_entries(bytes: &[u8]) -> Result<Vec<ZipEntry>, String> {
     }
     let mut dir = u32_at(eocd + 16)? as usize;
     let mut entries = Vec::new();
+    let mut budget = HEAD_BUDGET;
     for _ in 0..count {
         if !bytes
             .get(dir..)
@@ -73,6 +79,11 @@ pub(super) fn read_zip_entries(bytes: &[u8]) -> Result<Vec<ZipEntry>, String> {
             .get(dir + 46..dir + 46 + name_len)
             .ok_or("the central directory is truncated")?;
         let name = String::from_utf8_lossy(name_bytes).into_owned();
+        budget = budget.checked_sub(plain_len).ok_or_else(|| {
+            format!(
+                "the entry {name} declares {plain_len} bytes: past the {HEAD_BUDGET}-byte budget a head save's entries share"
+            )
+        })?;
         if !bytes
             .get(local_at..)
             .is_some_and(|b| b.starts_with(b"PK\x03\x04"))
@@ -112,3 +123,6 @@ pub(super) fn read_zip_entries(bytes: &[u8]) -> Result<Vec<ZipEntry>, String> {
     }
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests;

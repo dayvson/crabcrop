@@ -8,6 +8,13 @@ mod zip;
 use pickle::{PickleTensor, PickleValue, unpickle};
 use zip::read_zip_entries;
 
+/// The most a head save may hold: the file itself, and
+/// everything its zip entries inflate to. A linear head
+/// is a few kilobytes; the budget keeps a wrong file (a
+/// full model save, say) from being buffered and parsed
+/// as one.
+pub(super) const HEAD_BUDGET: usize = 16 * 1024 * 1024;
+
 /// Extract the (weights, bias) pair from a head
 /// file's bytes: the zip entries, the pickle's state
 /// dict, and the float storages it names. Every

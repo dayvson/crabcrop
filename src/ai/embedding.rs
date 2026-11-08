@@ -3,7 +3,7 @@
 
 use image::DynamicImage;
 
-use super::checkpoint::parse_aesthetic_head;
+use super::checkpoint::{HEAD_BUDGET, parse_aesthetic_head};
 use super::session::model_display_name;
 use super::{AiError, EmbeddingProvider, ImageEmbedding, TagProvider};
 
@@ -81,10 +81,7 @@ impl AestheticHead {
     pub fn load(path: &str) -> Result<Self, AiError> {
         let bytes = std::fs::read(path)
             .map_err(|e| AiError::Load(format!("cannot read the aesthetic head {path}: {e}")))?;
-        // A linear head is a few kilobytes; the cap
-        // keeps a wrong file (a full model save, say)
-        // from being buffered and parsed as one.
-        if bytes.len() > 16 * 1024 * 1024 {
+        if bytes.len() > HEAD_BUDGET {
             return Err(AiError::Load(format!(
                 "the aesthetic head {path} is {} bytes: a linear head is a few kilobytes, not a model file",
                 bytes.len()
