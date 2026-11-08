@@ -100,6 +100,25 @@ Give user-facing changes an entry under `## [Unreleased]` in
 [CHANGELOG.md](CHANGELOG.md). The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+The changelog workflow enforces this: a pull request that touches `src/`,
+`sdks/`, `frameworks/`, or `plugins/` fails until it adds a line under
+`## [Unreleased]`. When nothing user-facing changed (a refactor, a test, a
+dependency bump), a maintainer adds the `no-changelog` label instead, and the
+check passes. To run the same check locally, against the branch point with
+`main`:
+
+```bash
+python3 scripts/check_docs.py --changelog-entry origin/main
+```
+
+## Reference docs
+
+The reference pages in `docs/` move with the code. `scripts/check_docs.py`,
+which `scripts/test_all.sh` runs, fails when an environment variable, a
+default, an error code or status, or a filter is in the code but not the docs
+(or the other way round), and when a documented error code is named in no test.
+Its output names the file and the entry to fix.
+
 ## Security
 
 Please do not report security vulnerabilities as public issues. See
