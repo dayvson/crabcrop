@@ -5,10 +5,7 @@
 //! the hand-rolled PNG paths (indexed and Adam7
 //! interlaced assembly).
 //!
-//! Extracted from engine.rs as a pure code move: every
-//! item keeps its name and behavior, and engine.rs
-//! re-exports the entry point the pipeline uses, so
-//! existing paths do not change.
+//! engine.rs re-exports the entry point the pipeline uses.
 
 use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 
@@ -21,8 +18,8 @@ use crate::url::{FormatOptions, ImageFormat, Subsampling};
 /// descent from the current quality to the floor is geometric,
 /// spaced so the final allowed step lands exactly on quality
 /// 1, the grammar's floor. A fixed-ratio walk cannot promise
-/// that (from 95 it spent the whole pool reaching 15, and
-/// budgets below that encode were never chased; issue #229).
+/// that (from 95 it spends the whole pool reaching 15, and
+/// budgets below that encode go unchased; issue #229).
 /// The attempt caps still bound the cost per format, AVIF's
 /// most tightly, since its encodes are the expensive ones.
 pub(in crate::engine) fn next_quality(current: u8, steps_remaining: u32) -> u8 {
@@ -544,10 +541,10 @@ fn encode_png_interlaced(src: &EncodeBuffers<'_>) -> Result<Vec<u8>, EngineError
 }
 
 /// Encode WebP. Quality below 100 is a lossy VP8 encode via
-/// libwebp (the `webp` crate, method 4) since issue #292:
-/// measured about 2.7x faster than the oxideav-webp encode it
-/// replaced, at slightly higher PSNR; the output bytes
-/// differ, which is the accepted cost.
+/// libwebp (the `webp` crate, method 4; issue #292):
+/// measured about 2.7x faster than the oxideav-webp encode,
+/// at slightly higher PSNR; the output bytes differ, which
+/// is the accepted cost.
 /// The swap is a temporary measure: the daily oxideav watch
 /// re-benches this path, and the lossy encode returns to
 /// oxideav-webp once a release closes the gap to roughly 1.3x

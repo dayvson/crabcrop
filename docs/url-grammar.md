@@ -114,7 +114,7 @@ A source that cannot be fetched or decoded can degrade to a configured fallback 
 
 ## Source roots
 
-A source root names an origin on the server, so a URL can carry a short source instead of spelling out the full source URL: the origin layout stays off the URL, and URLs get shorter. Define roots in a file, one per line:
+A source root names an origin on the server, so a URL can carry a short source instead of spelling out the full source URL: the origin layout stays off the URL, and URLs get shorter. Define roots in a file, one per line (blank lines and lines starting with `#` are skipped):
 
 ```text
 # /etc/crabcrop/roots.txt

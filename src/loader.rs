@@ -966,8 +966,6 @@ fn is_non_public_v6(ip: &Ipv6Addr) -> bool {
         || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64, discard-only
 }
 
-/// Split the `bucket/key` remainder of a bucket URL. Both parts
-/// are required; the key may itself contain slashes.
 /// Whether any `/`-separated component of `path` is a dot
 /// segment (exactly `.` or `..`). Dots inside a segment name
 /// (`a.b`, `c..d`, `...`) are ordinary key content, not
@@ -977,6 +975,8 @@ fn has_dot_segment(path: &str) -> bool {
         .any(|segment| segment == "." || segment == "..")
 }
 
+/// Split the `bucket/key` remainder of a bucket URL. Both parts
+/// are required; the key may itself contain slashes.
 fn split_bucket_key<'a>(rest: &'a str, scheme: &str) -> Result<(&'a str, &'a str), LoadError> {
     let invalid = || {
         LoadError::Network(format!(

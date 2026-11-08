@@ -325,7 +325,7 @@ impl UploadStore {
 /// cannot land as `promo.html`, and a JPEG cannot land as
 /// `photo.png`. A name with no extension has nothing to
 /// bind and is accepted; media kinds outside the binding
-/// table ([`UploadMedia::Other`]) are likewise unbound.
+/// table ([`UploadMedia::Other`](crate::engine::UploadMedia::Other)) are likewise unbound.
 pub fn check_upload_media(name: &str, media: crate::engine::UploadMedia) -> Result<(), String> {
     let Some(allowed) = media.allowed_extensions() else {
         return Ok(());

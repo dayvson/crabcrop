@@ -1276,7 +1276,7 @@ pub fn convert_thumbor(
         } else if matches!(seg, "fit-in" | "adaptive-fit-in" | "full-fit-in") {
             fit_in = true;
             if seg == "adaptive-fit-in" {
-                // An exact conversion since #167: crabcrop's
+                // An exact conversion (#167): crabcrop's
                 // fit-in has the same adaptive mode, so no
                 // warning is owed.
                 fit_in_adaptive = true;

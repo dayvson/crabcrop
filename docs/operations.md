@@ -184,7 +184,7 @@ curl "http://localhost:3000/unsafe/page:2/800x1000/filters:format(webp)/https://
 
 ## Presets
 
-A preset names an operation string on the server, so URLs stay short and the transformation menu stays operator-controlled. Define presets in a file, one per line:
+A preset names an operation string on the server, so URLs stay short and the transformation menu stays operator-controlled. Define presets in a file, one per line (blank lines and lines starting with `#` are skipped):
 
 ```text
 # /etc/crabcrop/presets.txt
