@@ -79,6 +79,8 @@ curl -X POST "http://localhost:3000/purge-group/<signature>/small"
 
 The response is `200` with a body like `purged 3`: every entry recorded in the group, across this server's cache tiers, with the same reach as a per-URL purge (this server's tiers and the shared bucket, not other replicas' memory) and the same bounded shared-bucket scan: on a very large bucket the count reports what the request itself removed and the remainder finishes in the background, logged on completion, while the receiving server treats any disk or bucket copy of a group member as a miss until the scan ends. A bad signature is a `403` and removes nothing; an unknown group answers `purged 0`.
 
+A [sealed URL](url-grammar.md#sealed-urls)'s responses carry no `Cache-Group`: its preset names are inside the token, and the header would show them to anyone who fetches the URL. Its cache entry still joins those groups, so `purge-group` reaches sealed renders exactly as it reaches plain ones. A CDN group purge does not. The group purge bridges in the [CDN recipes](deployment.md#put-a-cdn-in-front) for Cloudflare (the Worker), Fastly, BunnyCDN, and CloudFront build the edge's tags from this header, and the path-rule bridges (Cloudflare's Cache Response Rule, Akamai) match the `preset:` segment the token hides, so the edge copy of a sealed response carries no tag. Purge sealed URLs at the CDN by URL.
+
 Every image request also writes one structured JSON log line to stdout, with the operation summary, status, per-stage timings, and cache result (never the full source URL).
 
 ## Command line

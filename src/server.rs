@@ -385,12 +385,14 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Constant-time equality for a bearer token, so the
-/// comparison leaks nothing about it through timing.
+/// Equality for a bearer token that leaks nothing about it
+/// through timing, its length included (issue #454): both
+/// sides are hashed first, so the comparison always runs
+/// over two 32-byte digests, however long the presented
+/// token is.
 fn token_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    use sha2::Digest as _;
+    let (a, b) = (sha2::Sha256::digest(a), sha2::Sha256::digest(b));
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
@@ -415,10 +417,14 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
             accept.as_deref(),
         );
     };
+    // The auth scheme is case-insensitive (RFC 9110), so
+    // `bearer` and `BEARER` name it too.
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map(|(_, credentials)| credentials);
     if !presented.is_some_and(|p| token_eq(p.as_bytes(), token.as_bytes())) {
         return error_response(
             StatusCode::UNAUTHORIZED,
@@ -1577,12 +1583,23 @@ fn sf_quote(value: &str) -> String {
 
 /// Attach the cache observability headers (RFC 9211
 /// Cache-Status, RFC 9875 Cache-Group) to an image response.
-fn attach_cache_headers(response: &mut Response, cache_status: &str, groups: &[String]) {
+/// A sealed request gets no Cache-Group (issue #454): its
+/// groups are preset names read from inside the token, and
+/// listing them would show anyone who fetches the URL part
+/// of the recipe the token hides. Group purges still reach
+/// its entry, because the groups are recorded on the cache
+/// entry, never read back from this header.
+fn attach_cache_headers(
+    response: &mut Response,
+    cache_status: &str,
+    groups: &[String],
+    sealed: bool,
+) {
     response.headers_mut().insert(
         axum::http::HeaderName::from_static("cache-status"),
         axum::http::HeaderValue::from_str(cache_status).unwrap(),
     );
-    if !groups.is_empty() {
+    if !sealed && !groups.is_empty() {
         let list = groups
             .iter()
             .map(|g| sf_quote(g))
@@ -2105,7 +2122,7 @@ async fn serve(
             record.bytes_out = hit.bytes.len();
             let etag = hit.etag.clone();
             let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
-            attach_cache_headers(&mut response, cache_status, &groups);
+            attach_cache_headers(&mut response, cache_status, &groups, sealed);
             finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
         }
@@ -2618,10 +2635,12 @@ struct MissWork {
     max_age: Option<u32>,
     /// Whether the request arrived in the sealed spelling
     /// (issue #255). Meta for it redacts every operation and
-    /// source text. The flag describes this request, not the
-    /// render: meta bypasses the cache in both directions,
-    /// so a plain meta request on the same render still
-    /// reports in full.
+    /// source text, and its image responses carry no
+    /// Cache-Group (issue #454). The flag describes this
+    /// request, not the render: meta bypasses the cache in
+    /// both directions, so a plain meta request on the same
+    /// render still reports in full, and a plain hit on an
+    /// entry first served sealed still names its groups.
     sealed: bool,
 }
 
@@ -3219,7 +3238,7 @@ async fn serve_miss(
         )
     };
     if !meta {
-        attach_cache_headers(&mut response, cache_status, &groups);
+        attach_cache_headers(&mut response, cache_status, &groups, sealed);
     }
     if used_fallback {
         record.fallback = true;

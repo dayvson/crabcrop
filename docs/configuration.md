@@ -8,7 +8,7 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_SECRET_KEY_ID` | `current` | The current secret's key ID, named by keyed signature segments (`<key-id>:<tag>`). |
 | `CRABCROP_SECRET_PREVIOUS` | unset | The outgoing secret during a rotation window; the server verifies it alongside the current one. Same minimum length. |
 | `CRABCROP_SECRET_PREVIOUS_KEY_ID` | `previous` | The previous secret's key ID. Must differ from the current one. |
-| `CRABCROP_METRICS_TOKEN` | unset | Bearer token for `GET /metrics`. Unset, `/metrics` answers `403` to everyone; set, the request must carry `Authorization: Bearer <token>`, and a missing or wrong token answers `401`. |
+| `CRABCROP_METRICS_TOKEN` | unset | Bearer token for `GET /metrics`. Unset, `/metrics` answers `403` to everyone; set, the request must carry `Authorization: Bearer <token>` (the scheme name in any letter case, as HTTP allows), and a missing or wrong token answers `401`. |
 | `CRABCROP_DEFAULT_OPS` | unset | Operations prepended to every request (a house format, quality, or watermark), validated at boot. See [Server-wide default operations](#server-wide-default-operations). |
 | `PORT` | `3000` | Listen port. `CRABCROP_PORT` is the namespaced alias and wins when both are set. |
 | `CRABCROP_ALLOW_UNSAFE` | off | Honors `unsafe` URLs (for the boolean spellings, see above). |
