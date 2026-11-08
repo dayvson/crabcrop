@@ -978,6 +978,7 @@ dependencies = [
  "jxl",
  "jxl-image-rs-integration",
  "kamadak-exif",
+ "libm",
  "moxcms",
  "ort",
  "oxideav-h265",
