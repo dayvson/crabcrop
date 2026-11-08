@@ -491,10 +491,12 @@ fn op_chain_drives_resize_and_crop_through_the_engine() {
 
 #[test]
 fn op_chain_skips_the_engine_past_the_budget() {
-    // A request whose canvas could pass the harness budget
-    // never reaches the engine: the harness, not the
-    // engine's 100-megapixel budget, bounds a fuzz run's
-    // allocations.
+    // A request whose canvas could pass the harness budget,
+    // or whose blurs could pass the blur work budget, never
+    // reaches the engine: the harness, not the engine's
+    // 100-megapixel budget, bounds a fuzz run's allocations,
+    // and a sanitizer build's blur time stays far below the
+    // fuzzer's hang timeout.
     for input in [
         "/unsafe/16383x16383/example.com/a.png",
         "/unsafe/600x600/example.com/a.png",
@@ -509,10 +511,32 @@ fn op_chain_skips_the_engine_past_the_budget() {
         "/unsafe/400x1/0x2000/example.com/a.png",
         // After a trim the canvas could be 1 pixel tall.
         "/unsafe/filters:trim(5)/400x0/example.com/a.png",
+        // Inside the pixel budget, past the blur work budget:
+        // a large-sigma blur, the ambient bars of a large
+        // pad, and a large blurred region.
+        "/unsafe/500x500/filters:blur(100)/example.com/a.png",
+        "/unsafe/pad:400x400:blur/example.com/a.png",
+        "/unsafe/400x400/filters:blur_region(0,0,400,400)/example.com/a.png",
     ] {
         assert_eq!(
             crabcrop_fuzz::check_chain(input),
             ChainOutcome::OverBudget,
+            "{input}"
+        );
+    }
+    // The blur budget leaves small blurs to the engine: the
+    // largest sigma on the source, and blurred pad bars on a
+    // small box.
+    for (input, size) in [
+        ("/unsafe/filters:blur(512)/example.com/a.png", (24, 18)),
+        ("/unsafe/pad:100x100:blur/example.com/a.png", (100, 100)),
+    ] {
+        assert_eq!(
+            crabcrop_fuzz::check_chain(input),
+            ChainOutcome::Rendered {
+                width: size.0,
+                height: size.1
+            },
             "{input}"
         );
     }

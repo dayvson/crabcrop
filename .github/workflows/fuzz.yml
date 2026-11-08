@@ -40,7 +40,8 @@ jobs:
   fuzz:
 
     runs-on: ubuntu-latest
-    # 15 minutes of fuzzing after a cold sanitizer build.
+    # 15 minutes of fuzzing after a cold sanitizer build,
+    # plus up to 10 for an input that hangs at the end.
     timeout-minutes: 75
 
     strategy:
@@ -94,12 +95,19 @@ jobs:
           # capacity doubling of a buffer near it stays within
           # design, but an allocation past 512 MiB escaped the
           # budget. -timeout turns a hang into a reported input
-          # instead of a job timeout with nothing to show.
+          # instead of a job timeout with nothing to show. It
+          # is generous because the fuzzing build runs tight
+          # pixel loops over a hundred times slower than a debug
+          # build: the harness budgets keep a legitimate
+          # op_chain input near a minute at worst (an AVIF
+          # max_bytes ladder at 500x500 took 29 s), and 600 s
+          # leaves room for slower runners without reporting
+          # slow-but-bounded work as a hang.
           cargo +nightly fuzz run "$TARGET" "$corpus" "fuzz/corpus/$TARGET" -- \
             -max_total_time=900 \
             -rss_limit_mb=2048 \
             -malloc_limit_mb=512 \
-            -timeout=120 \
+            -timeout=600 \
             -print_final_stats=1
       - name: Save the corpus
         if: always()

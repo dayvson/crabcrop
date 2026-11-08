@@ -274,6 +274,37 @@ pub fn check_meta(data: &[u8]) {
 /// could exceed it at any step never reaches the engine.
 pub const CHAIN_MAX_PIXELS: u64 = 1 << 18;
 
+/// The most blur work, in canvas pixels times kernel taps
+/// summed over the chain, that either leg of `check_chain`
+/// may do. A blur's cost grows with its sigma (up to
+/// `url::MAX_BLUR_SIGMA`, a kernel of thousands of taps) as
+/// well as with its canvas, and the fuzzing build (address
+/// sanitizer plus the fuzzer's comparison tracing) runs its
+/// inner loop over a hundred times slower than a debug
+/// build: `blur(100)` on a 500x500 canvas took three
+/// minutes there and about a second in the smoke, so
+/// libFuzzer would report a request the server renders in
+/// a second as a hang. A blur that would pass
+/// this budget ends the filter leg, and a request whose
+/// blurs could pass it never reaches the engine, as with
+/// [`CHAIN_MAX_PIXELS`]; smaller sigmas and canvases still
+/// reach every blur path.
+pub const CHAIN_MAX_BLUR_WORK: u64 = 1 << 24;
+
+/// The work of one blur at `sigma` over `pixels`: the
+/// canvas times an upper bound on the kernel length the
+/// filters size for that sigma (`blur_kernel_size`, after
+/// the `url::MAX_BLUR_SIGMA` clamp).
+fn blur_work(pixels: u64, sigma: f32) -> u64 {
+    let sigma = if sigma.is_normal() && sigma > 0.0 {
+        sigma.min(url::MAX_BLUR_SIGMA)
+    } else {
+        0.8
+    };
+    let taps = ((((sigma - 0.8) / 0.3) + 1.0) * 2.0 + 2.0).max(3.0) as u64;
+    pixels.saturating_mul(taps)
+}
+
 /// The size of the harness's stand-in source.
 const SOURCE_WIDTH: u32 = 24;
 const SOURCE_HEIGHT: u32 = 18;
@@ -308,7 +339,8 @@ pub enum ChainOutcome {
     /// The input does not parse: nothing ran.
     Unparsed,
     /// The filter leg ran; the request could outgrow
-    /// [`CHAIN_MAX_PIXELS`] somewhere in its chain, so the
+    /// [`CHAIN_MAX_PIXELS`] somewhere in its chain, or its
+    /// blurs could pass [`CHAIN_MAX_BLUR_WORK`], so the
     /// engine leg was skipped.
     OverBudget,
     /// The engine refused the request.
@@ -334,6 +366,10 @@ pub enum ChainOutcome {
 /// - every other filter keeps the dimensions;
 /// - no filter leaves a zero dimension.
 ///
+/// A rotation whose canvas would exceed
+/// [`CHAIN_MAX_PIXELS`], or a blur that would take the
+/// leg past [`CHAIN_MAX_BLUR_WORK`], ends this leg.
+///
 /// The engine leg runs the whole operation list (resize,
 /// crop, fit-in, pad, crop-rect, focal, debug view, filters
 /// and the encode) through `engine::Engine::process` on the
@@ -341,7 +377,8 @@ pub enum ChainOutcome {
 /// AI providers, watermarks, text renderer, frame extractor
 /// or PDF renderer, so those operations refuse. A request
 /// whose canvas could exceed [`CHAIN_MAX_PIXELS`] at any
-/// step (see [`canvas_bound`]) skips this leg. Otherwise
+/// step, or whose blurs could pass [`CHAIN_MAX_BLUR_WORK`]
+/// (see [`canvas_bound`]), skips this leg. Otherwise
 /// the engine either refuses with an `EngineError` or
 /// renders an image inside [`check_render_size`]'s bounds;
 /// a panic in either leg is the failure.
@@ -349,7 +386,7 @@ pub fn check_chain(input: &str) -> ChainOutcome {
     let Ok((_, _, request)) = url::parse_request(input) else {
         return ChainOutcome::Unparsed;
     };
-    check_filter_leg(&request.operations);
+    let _ = check_filter_leg(&request.operations);
     let Some(bound) = canvas_bound(&request.operations) else {
         return ChainOutcome::OverBudget;
     };
@@ -366,8 +403,10 @@ pub fn check_chain(input: &str) -> ChainOutcome {
     }
 }
 
-/// The filter leg of [`check_chain`].
-fn check_filter_leg(ops: &[Operation]) {
+/// The filter leg of [`check_chain`]. Returns how many
+/// filters it applied before the chain ended or a budget
+/// stopped it.
+fn check_filter_leg(ops: &[Operation]) -> usize {
     let chain: Vec<&Filter> = ops
         .iter()
         .filter_map(|op| match op {
@@ -378,17 +417,27 @@ fn check_filter_leg(ops: &[Operation]) {
         .collect();
     let fill = url::RequestDirectives::analyze(ops).fill;
     let mut img = synthetic_image();
+    let mut blur_spent: u64 = 0;
+    let mut applied = 0;
     for filter in chain {
         let (w, h) = (img.width(), img.height());
         let predicted = match filter {
             Filter::Rotate(degrees) => {
                 let (rw, rh) = filters::rotated_canvas(w, h, *degrees);
                 if rw as u64 * rh as u64 > CHAIN_MAX_PIXELS {
-                    return;
+                    return applied;
                 }
                 Some((rw, rh))
             }
             Filter::Trim(_) | Filter::TrimSides(..) => None,
+            Filter::Blur(sigma) => {
+                blur_spent =
+                    blur_spent.saturating_add(blur_work(u64::from(w) * u64::from(h), *sigma));
+                if blur_spent > CHAIN_MAX_BLUR_WORK {
+                    return applied;
+                }
+                Some((w, h))
+            }
             _ => Some((w, h)),
         };
         let (out, _) = filters::apply_filters_filled(img, std::slice::from_ref(filter), fill);
@@ -411,7 +460,9 @@ fn check_filter_leg(ops: &[Operation]) {
             ),
         }
         img = out;
+        applied += 1;
     }
+    applied
 }
 
 /// The size invariant on an engine render: both axes are
@@ -493,7 +544,9 @@ fn proportional(axis: Axis, other: Axis, target: Axis) -> Axis {
 
 /// Conservative per-axis bounds on every canvas the engine
 /// builds for `ops` from the synthetic source: `None` when
-/// some step's canvas could exceed [`CHAIN_MAX_PIXELS`],
+/// some step's canvas could exceed [`CHAIN_MAX_PIXELS`] or
+/// the chain's blurs (blur filters, blurred regions, and
+/// `pad:...:blur` bars) could pass [`CHAIN_MAX_BLUR_WORK`],
 /// else the largest upper bound each axis reaches anywhere
 /// in the chain (the output, and the `debug:focal` view,
 /// which draws on a canvas the chain passed through, both
@@ -516,6 +569,11 @@ pub fn canvas_bound(ops: &[Operation]) -> Option<(u64, u64)> {
         Axis::exact(u64::from(SOURCE_HEIGHT)),
     );
     let mut peak = (cur.0.hi, cur.1.hi);
+    let mut blur_spent: u64 = 0;
+    let mut spend = |pixels: u64, sigma: f32| -> Option<()> {
+        blur_spent = blur_spent.saturating_add(blur_work(pixels, sigma));
+        (blur_spent <= CHAIN_MAX_BLUR_WORK).then_some(())
+    };
     let mut step = |cur: (Axis, Axis)| -> Option<(Axis, Axis)> {
         if cur.0.hi.saturating_mul(cur.1.hi) > CHAIN_MAX_PIXELS {
             return None;
@@ -546,10 +604,19 @@ pub fn canvas_bound(ops: &[Operation]) -> Option<(u64, u64)> {
             // refuses any other spelling.
             Operation::Crop { size, .. } | Operation::Pad { size, .. } => {
                 if let (Dimension::Pixels(w), Dimension::Pixels(h)) = (size.width, size.height) {
-                    cur = step((
-                        Axis::pixels(w, dpr).capped(cap),
-                        Axis::pixels(h, dpr).capped(cap),
-                    ))?;
+                    let (bw, bh) = (Axis::pixels(w, dpr), Axis::pixels(h, dpr));
+                    if let Operation::Pad {
+                        fill: url::PadFill::Blur,
+                        ..
+                    } = op
+                    {
+                        // The ambient bars blur the whole box
+                        // at a sigma that grows with its longer
+                        // side (the engine's `apply_pad`).
+                        let sigma = (bw.hi.max(bh.hi) as f32 / 16.0).clamp(2.0, 80.0);
+                        spend(bw.hi.saturating_mul(bh.hi), sigma)?;
+                    }
+                    cur = step((bw.capped(cap), bh.capped(cap)))?;
                 }
             }
             Operation::FitIn { size, adaptive } => {
@@ -595,6 +662,20 @@ pub fn canvas_bound(ops: &[Operation]) -> Option<(u64, u64)> {
                                 hi: cur.1.hi,
                             },
                         ),
+                        Filter::Blur(sigma) => {
+                            spend(cur.0.hi.saturating_mul(cur.1.hi), *sigma)?;
+                            cur
+                        }
+                        // The region blurs at a sigma set by its
+                        // shorter side (`filters::blur_region`);
+                        // the engine refuses a region outside
+                        // the canvas before it blurs.
+                        Filter::BlurRegion { w, h, .. } => {
+                            let sigma = ((*w).min(*h) as f32 / 8.0).clamp(1.0, 30.0);
+                            let area = u64::from(*w).saturating_mul(u64::from(*h));
+                            spend(area.min(cur.0.hi.saturating_mul(cur.1.hi)), sigma)?;
+                            cur
+                        }
                         Filter::Upscale(factor) => {
                             let f = u64::from(*factor);
                             step((
@@ -673,4 +754,34 @@ fn fit_in_bound(
         Axis::around(cur.0.lo as f64 * lo, cur.0.hi as f64 * hi).capped(cap),
         Axis::around(cur.1.lo as f64 * lo, cur.1.hi as f64 * hi).capped(cap),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operations(path: &str) -> Vec<Operation> {
+        url::parse_request(path)
+            .expect("the test request parses")
+            .2
+            .operations
+    }
+
+    #[test]
+    fn the_filter_leg_stops_before_a_blur_past_the_work_budget() {
+        // Four 45-degree turns grow the 24x18 source to about
+        // 87x87; blur(512) there would cost about 26 million
+        // pixel-taps, past CHAIN_MAX_BLUR_WORK, so the leg
+        // ends before it. A small blur on the same canvas,
+        // and blur(512) after three turns, still run.
+        let turns = "rotate(45):rotate(45):rotate(45):rotate(45)";
+        let leg = |filters: &str| {
+            check_filter_leg(&operations(&format!(
+                "/unsafe/filters:{filters}/example.com/a.png"
+            )))
+        };
+        assert_eq!(leg(&format!("{turns}:blur(512)")), 4);
+        assert_eq!(leg(&format!("{turns}:blur(5)")), 5);
+        assert_eq!(leg("rotate(45):rotate(45):rotate(45):blur(512)"), 4);
+    }
 }

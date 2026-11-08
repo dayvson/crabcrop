@@ -67,7 +67,8 @@ request that parses:
   box), a trim never grows either axis, every other
   filter keeps the dimensions, and no dimension is ever
   zero. A rotation whose canvas would exceed the
-  harness's pixel budget ends the leg.
+  harness's pixel budget, or a blur past its blur
+  budget (below), ends the leg.
 - The engine leg runs the whole operation list through
   `engine::Engine::process` on the source encoded as a
   PNG: resize, crop (`src/crop.rs`: center, directional,
@@ -86,6 +87,19 @@ request that parses:
   100-megapixel output budget, bounds a run's
   allocations. The render must also stay inside that
   bound, which checks the guard itself.
+
+Blurs get a budget of their own, `CHAIN_MAX_BLUR_WORK`
+(2^24 pixels times kernel taps, summed over the chain).
+A blur's cost grows with its sigma as well as its canvas,
+and the fuzzing build (address sanitizer plus comparison
+tracing) runs its inner loop over a hundred times slower
+than a debug build: `blur(100)` on a 500x500 canvas took
+three minutes there and about a second in the smoke,
+which the fuzzer would report as a hang. A blur past the budget ends the filter
+leg, and a request whose blurs (blur filters, blurred
+regions, `pad:...:blur` bars) could pass it skips the
+engine leg. Small sigmas and canvases still reach every
+blur path.
 
 The harness depends on the server's library target
 (`crabcrop`, issue #417), so each target runs the
@@ -167,7 +181,7 @@ cargo-fuzz, and dav1d (see above):
 ```sh
 rustup toolchain install nightly --profile minimal
 cargo +nightly install cargo-fuzz --locked
-cargo +nightly fuzz run op_chain -- -max_total_time=300 -rss_limit_mb=2048 -malloc_limit_mb=512
+cargo +nightly fuzz run op_chain -- -max_total_time=300 -rss_limit_mb=2048 -malloc_limit_mb=512 -timeout=600
 ```
 
 The same for `parse_request`, `unseal`, `decode`, and
@@ -176,7 +190,9 @@ the process, and 512 MiB for any one allocation, twice the
 engine's 256 MiB decode budget (one decoded buffer may
 reach the budget, and a same-size copy or one capacity
 doubling of it stays within design; anything larger
-escaped the budget).
+escaped the budget). The 600-second hang timeout is
+generous on purpose: the sanitizer build is slow enough
+that a tight one reports bounded work as a hang.
 
 Crashes land in `fuzz/artifacts/`. A crash becomes its own
 fix issue with the minimized input
