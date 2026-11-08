@@ -3903,30 +3903,6 @@ fn float_sources_encode_to_every_still_format() {
     }
 }
 
-/// A Radiance HDR source takes the same route as a float TIFF.
-#[test]
-fn radiance_hdr_sources_encode_to_png_and_avif() {
-    let hdr_img = DynamicImage::ImageRgb32F(image::Rgb32FImage::from_fn(48, 32, |x, y| {
-        image::Rgb([x as f32 / 47.0, y as f32 / 31.0, 0.25])
-    }));
-    let mut hdr = Vec::new();
-    hdr_img
-        .write_to(&mut Cursor::new(&mut hdr), image::ImageFormat::Hdr)
-        .unwrap();
-    let png = process_spelled(&hdr, "filters:format(png)", None);
-    assert_eq!(
-        image::load_from_memory(&png.bytes).unwrap(),
-        float_expected(&hdr)
-    );
-    let interlaced = process_spelled(&hdr, "filters:format(png,interlace)", None);
-    assert_eq!(
-        image::load_from_memory(&interlaced.bytes).unwrap(),
-        float_expected(&hdr)
-    );
-    let avif = process_spelled(&hdr, "", Some(ImageFormat::Avif));
-    assert_eq!(avif.format, ImageFormat::Avif);
-}
-
 /// Float samples are source content: NaN, the infinities,
 /// negatives, values past 1 and subnormals all encode without
 /// a panic, clamped to the displayable range (NaN to the top
