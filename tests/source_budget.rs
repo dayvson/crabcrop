@@ -82,8 +82,9 @@ fn exchange(
 }
 
 /// Boot the binary with a source budget of `budget_mb`, an
-/// allowlist that admits the local origin, and uploads to
-/// `upload_dir`.
+/// allowlist that admits the local origin, uploads to
+/// `upload_dir`, and meta mode on (off by default, issue
+/// #453), so a meta request reaches the budget.
 fn boot(budget_mb: u32, upload_dir: &std::path::Path) -> (ServerGuard, u16) {
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
@@ -95,6 +96,7 @@ fn boot(budget_mb: u32, upload_dir: &std::path::Path) -> (ServerGuard, u16) {
         .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
         .env("CRABCROP_METRICS_TOKEN", "budget-token")
         .env("CRABCROP_SOURCE_BUFFER_MAX_MB", budget_mb.to_string())
+        .env("CRABCROP_META_MODE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

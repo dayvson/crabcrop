@@ -752,7 +752,12 @@ def builder(call, args, segment, canonical=None, throws=False, code=None,
     parser counterpart (a preset reference is not a parseable
     segment; a non-integer size has no URL spelling): the Rust
     differential skips those and only the SDK suite checks
-    them."""
+    them. A builder emits the canonical spelling (issue #472),
+    so `canonical` may differ from `segment` only by dropping
+    it (maxage is not part of the canonical form)."""
+    if canonical not in (None, "", segment):
+        raise SystemExit(f"{call}{args}: segment {segment} is not its canonical "
+                         f"form {canonical}; builders emit canonical spellings")
     entry = {"call": call, "args": args}
     if throws:
         entry["throws"] = True
@@ -789,12 +794,20 @@ builder("ops.cropObjects", [100, 100, OBJ32.split(",") + ["C0"]],
         f"crop:100x100:objects({OBJ32}):1")
 builder("ops.cropObjects", [100, 100, OBJ33.split(",")],
         f"crop:100x100:objects({OBJ33}):1", throws=True, code="invalid_crop")
+# Issue #472: the server trims a class name before it keys on
+# it, so the builder encodes the trimmed name.
+builder("ops.cropObjects", [100, 100, [" person "]],
+        "crop:100x100:objects(person):1")
 builder("ops.cropRect", [0, 0, 50, 50], "crop-rect:0x0:50x50")
 builder("ops.cropRect", [50, 50, 0, 0], "crop-rect:50x50:0x0",
         throws=True, code="invalid_crop_rect")
 builder("ops.focal", [0, 0, 50, 50], "focal:0x0:50x50")
 builder("ops.focalPoint", [0.75, 0.4], "focalpoint:0.75x0.4:1")
 builder("ops.focalPoint", [0.75, 0.4, 2], "focalpoint:0.75x0.4:2")
+# Issue #472: f32 parameters spell the shortest decimal that
+# reads back as the same f32, as the server prints them, not
+# the double's 17-digit spelling (0.1 + 0.2 here).
+builder("ops.focalPoint", [0.1 + 0.2, 0.4, 2], "focalpoint:0.3x0.4:2")
 builder("ops.focalPoint", [1.5, 0.4], "focalpoint:1.5x0.4:1",
         throws=True, code="invalid_focal_point")
 builder("ops.pad", [100, 100], "pad:100x100")
@@ -814,6 +827,7 @@ builder("ops.filters",
 builder("filter.grayscale", [], "grayscale")
 builder("filter.blur", [2], "blur(2)")
 builder("filter.blur", [0.5], "blur(0.5)")
+builder("filter.blur", [1 / 3], "blur(0.33333334)")
 builder("filter.blur", [0], "blur(0)", throws=True, code="invalid_filters")
 builder("filter.blur", [-1], "blur(-1)", throws=True, code="invalid_filters")
 builder("filter.blur", [600], "blur(600)", throws=True, code="invalid_filters")
@@ -835,6 +849,10 @@ builder("filter.curve", ["rgb", [[0, 0]]], "curve(rgb,0,0)",
         throws=True, code="invalid_curve")
 builder("filter.convolution", [[0, -1, 0, -1, 5, -1, 0, -1, 0], 0],
         "convolution(0,-1,0,-1,5,-1,0,-1,0,0)")
+# Kernel values are f64 on the server: the double's spelling
+# is the canonical one there.
+builder("filter.convolution", [[0.1 + 0.2, 0, 0, 0, 1, 0, 0, 0, 0], 0],
+        "convolution(0.30000000000000004,0,0,0,1,0,0,0,0,0)")
 builder("filter.noise", [100], "noise(100)")
 builder("filter.noise", [101], "noise(101)", throws=True, code="invalid_noise")
 builder("filter.rotate", [45], "rotate(45)")
@@ -883,6 +901,7 @@ builder("filter.overlay", ["https://x/ov.png", 0, 0, 80, "multiply"],
         "overlay(https%3A%2F%2Fx%2Fov.png,0,0,80,multiply)")
 builder("filter.text", ["Hello", 12, "ff8800", "center"], "text(Hello,12,ff8800ff,center)")
 builder("filter.blurClass", ["person"], "blurclass(person)")
+builder("filter.blurClass", [" person "], "blurclass(person)")
 builder("filter.pixelateClass", ["traffic light"], "pixelateclass(traffic%20light)")
 builder("filter.recolorClass", ["person", "FF0000"], "recolorclass(person,ff0000)")
 builder("filter.blurRegion", [1, 2, 30, 40], "blur_region(1,2,30,40)")

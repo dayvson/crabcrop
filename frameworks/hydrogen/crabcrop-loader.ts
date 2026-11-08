@@ -26,8 +26,14 @@
  * boundary: in a browser context the secret is forced to
  * null, so a factory created with one still cannot sign (or
  * leak it) client-side.
+ *
+ * Dimensions follow the rule every crabcrop integration
+ * shares: after `scale`, a fraction rounds to whole pixels, a
+ * value that is not a size (0, negative, NaN) is left out,
+ * and a value past the server's cap throws, as does a
+ * missing `base`, instead of minting a dead URL.
  */
-import { buildURL } from "@crabcrop/url";
+import { buildURL, MAX_DIMENSION } from "@crabcrop/url";
 
 export interface CrabcropLoaderConfig {
   base: string;
@@ -45,11 +51,29 @@ export interface CrabcropImageParams {
   scale?: number;
 }
 
+const dim = (v: number | undefined, name: string): number | undefined => {
+  if (v === undefined) return undefined;
+  if (!Number.isFinite(v) || v <= 0) return undefined;
+  const rounded = Math.round(v);
+  // An over-cap dimension is a certain dead URL (the
+  // server rejects the size at parse): throw here, where
+  // the mistake is visible, instead of signing it.
+  if (rounded > MAX_DIMENSION) {
+    throw new Error(
+      `crabcrop loader: ${name} ${rounded} exceeds the maximum dimension ${MAX_DIMENSION}`,
+    );
+  }
+  return rounded;
+};
+
 export function createCrabcropLoader(config: CrabcropLoaderConfig) {
+  if (!config?.base) {
+    throw new Error("crabcrop loader: the `base` config is required");
+  }
   return ({ src, width, height, scale }: CrabcropImageParams): string => {
     const factor = scale ?? 1;
-    const w = width ? Math.round(width * factor) : undefined;
-    const h = height ? Math.round(height * factor) : undefined;
+    const w = width === undefined ? undefined : dim(width * factor, "width");
+    const h = height === undefined ? undefined : dim(height * factor, "height");
     const operations: string[] = [];
     if (config.preset) {
       operations.push(`preset:${config.preset}`);

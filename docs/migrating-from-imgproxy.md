@@ -14,7 +14,7 @@ imgproxy and crabcrop sign and shape their URLs differently enough that there is
 | No built-in result cache; caching is the CDN's job | Two built-in cache tiers (memory, then disk), `Cache-Status` on every image response, `Cache-Group` for presets |
 | No purge endpoint | `POST /purge/...` per URL, `POST /purge-group/...` per preset, or the CLI verbs |
 | Watermark image configured on the server | Per-URL `filters:watermark(...)`, or the `overlay` filter with blend modes |
-| Info processing options | The image URL fetched with `Accept: application/json`, or `crabcrop meta` |
+| Info processing options | The image URL fetched with `Accept: application/json`, or `crabcrop meta`, on a server with meta mode on (`CRABCROP_META_MODE=1`; it is off by default) |
 
 ## Resizing
 

@@ -2,7 +2,11 @@
 
 ## Meta responses
 
-Send `Accept: application/json` with any image URL to get metadata about the processed image instead of the image bytes:
+Send `Accept: application/json` with any image URL to get metadata about the processed image instead of the image bytes.
+
+Meta mode is off by default: turn it on with `CRABCROP_META_MODE=1` (see [Configuration](configuration.md)). While it is off, a meta request answers `403 meta_disabled` before any fetch or render, and the same URL without the header serves the image as usual. Know the cost before you turn it on. Meta requests are never cached, so each one fetches the source, renders it, and runs the configured annotation models again: CLIP tags and the aesthetic score on every request, the others when the request opts in, and any caller can opt in to all of them. Concurrent identical meta requests share one run; one after another, each pays in full. Any viewer of a signed URL can send the header, so enable meta only where you use it.
+
+With meta mode on:
 
 ```bash
 curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https://example.com/photo.jpg"
@@ -24,7 +28,7 @@ curl -H "Accept: application/json" "http://localhost:3000/unsafe/300x200/https:/
 | `pdf` | Present when the source was a PDF and a `page:` segment selected the page: the document's `pages` count, the `page` rendered, and the page size as `page_width` and `page_height` in points. See [PDF pages](media.md#pdf-pages). |
 | `provenance` | The C2PA facts for this render: whether output signing is configured on this server (`signing_configured`), and a summary of the manifest the source carried and the manifest the output carries (`source` and `output`, each `null` when the asset carries none, else `{state, signer, manifests, ingredients}` with `state` one of `valid`, `trusted`, `invalid`). See [Provenance (C2PA)](#provenance-c2pa). |
 
-Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other.
+Meta responses are served with `Cache-Control: private, no-store`: a URL has two representations (image and JSON), and intermediaries must never pin one in place of the other. The `403 meta_disabled` refusal carries the same headers, so a cache that honors them never serves it in place of the image.
 
 Add the `placeholders` parameter to the media type to also get placeholder data, computed from the final processed pixels. The parameter opts in when it is bare (`; placeholders`), set to `1`, or set to `true` (case-insensitive); any other value, including `0` and `false`, does not. The `detections` parameter below follows the same rule. On the CLI, `crabcrop meta --placeholders` and `crabcrop meta --detections` set them for you:
 
@@ -42,7 +46,7 @@ Crabcrop reads and writes [C2PA](https://c2pa.org/) Content Credentials. Two hal
 
 **Sign, when you configure an identity.** Set `CRABCROP_C2PA_CERT` and `CRABCROP_C2PA_KEY` to a PEM certificate chain and its private key, and still JPEG, PNG, WebP, and AVIF outputs are signed as they are produced. A manifest cannot survive a transform byte for byte (decoding and re-encoding drop the segments it lives in), so the source itself is recorded in the output's manifest as a parent ingredient: its hash, and its own manifest store whenever it carries one, so the chain stays walkable end to end. Video and PDF sources are the exception: a frame or page render starts a fresh chain, and no source ingredient is recorded for them. Outputs of the AI edits (background removal, studio mode, region removal, upscale, class and face edits) record the edit with the IPTC `compositeWithTrainedAlgorithmicMedia` source type. GIF, JPEG XL, video, and animated WebP outputs are served unsigned in this version.
 
-The identity is yours, like the models and the secret: the server holds no certificate of its own. It is proven at boot with a sign-and-verify round trip, so a broken identity (a bare self-signed certificate, a key that does not match, a chain outside the C2PA certificate profile) is a startup error with the reason named, never a first-request surprise. `CRABCROP_C2PA_TSA_URL` optionally adds a timestamp authority. Boot asks it once, after the identity's own round trip has passed, and every call to it is bounded (5 seconds to connect, 15 seconds overall), so a stalled authority fails boot or the signed request within that bound instead of hanging either. The call follows no redirect: give the authority's final URL, since one that answers with a redirect fails boot with the status named.
+The identity is yours, like the models and the secret: the server holds no certificate of its own. It is proven at boot with a sign-and-verify round trip, so a broken identity (a bare self-signed certificate, a key that does not match, a chain outside the C2PA certificate profile) is a startup error with the reason named, never a first-request surprise. `CRABCROP_C2PA_TSA_URL` optionally adds a timestamp authority. Boot asks it once, after the identity's own round trip has passed, and every call to it is bounded (5 seconds to connect, 15 seconds overall), so a stalled authority fails boot or the signed request within that bound instead of hanging either. A request whose signing the authority fails (it stalls, refuses, or answers with something that is not a timestamp) answers `503` with the code `provenance_unavailable` and `Retry-After: 30`: the output was rendered but cannot be served unsigned, and a retry may find the authority back. The call follows no redirect: give the authority's final URL, since one that answers with a redirect fails boot with the status named.
 
 Two honesty rules, stated plainly:
 

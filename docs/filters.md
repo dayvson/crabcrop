@@ -29,7 +29,7 @@ Filters chain inside one `filters:` segment, separated by `:`, and run in the or
 | `equalize` | none | Histogram equalization, per channel. | `filters:equalize` |
 | `enhance` | none | Gentle per-channel auto-levels: each channel's 0.5th percentile maps to 0 and its 99.5th to 255, stretching a compressed range toward the ends; a channel whose percentile span is under 16 levels is left alone. Deliberately weaker than `equalize`, which redistributes the whole histogram. | `filters:enhance` |
 | `rotate` | `rotate(45)`, angle in degrees, from -36000 to 36000, decimals allowed | Rotate the image. Multiples of 90 are exact quarter turns; other angles expand the canvas to fit, filling the uncovered corners with the `fill` color (white by default) or transparency when the image carries alpha. | `filters:rotate(-90)` |
-| `trim` | `trim`, `trim(20)`, or `trim(20,5,0,5,0)`: tolerance 0–255, default 10; the five-argument form adds pixels to remove from the left, top, right, and bottom | Crop away the border that matches the top-left corner color within the tolerance. With five arguments, the named pixels come off each side of what the tolerance pass leaves, clamped so at least one pixel survives on each axis. | `filters:trim(20)` |
+| `trim` | `trim`, `trim(20)`, or `trim(20,5,0,5,0)`: tolerance 0–255, default 10; the five-argument form adds pixels to remove from the left, top, right, and bottom | Crop away the border that matches the top-left corner color within the tolerance. With five arguments, the named pixels come off each side of what the tolerance pass leaves, clamped so at least one pixel survives on each axis. On an animated source every frame takes the same cut: the smallest box holding what each frame's own pass would keep, so the frames share one canvas and stay in register. | `filters:trim(20)` |
 | `sepia` | none | The classic warm sepia tone. | `filters:sepia` |
 | `duotone` | `duotone(1a1a40,ffd9a0)`, two colors, six hex digits each | Map shadows to the first color and highlights to the second, by luminance. | `filters:duotone(1a1a40,ffd9a0)` |
 | `monochrome` | `monochrome(ff8000)`, six hex digits | Single-hue rendering: each pixel's luminance scaled by the color, so full luminance renders exactly that color. | `filters:monochrome(ff8000)` |
@@ -69,7 +69,7 @@ Notes on the directives:
 - WebP encodes lossy at the requested quality (default 80); `quality(100)` selects the lossless encode. `quality` has no effect on PNG or GIF output.
 - JPEG has no alpha channel. With `fill`, transparent pixels are composited over the fill color; without it, the stored RGB values are used as-is.
 - `no_upscale` applies to the whole request wherever it appears. A plain resize clamps each axis at the source dimension: a `300x200` resize of a 200×150 source returns 200×150, and a `300x100` resize returns 200×100 (the axis that shrinks is honored as written). Fit-in and crop targets shrink proportionally instead, since their dimensions already carry the image's proportions.
-- `dpr` also applies request-wide, and it scales targets *before* the `no_upscale` cap sees them, so `dpr` never invents pixels past the source when both are set. Targets round to whole pixels. `crop-rect` and `focal` coordinates address source pixels and are not scaled. When the URL carries no `dpr`, the server honors the `DPR` client hint header (same set of values; an invalid hint is ignored). An explicit `dpr` in the URL always beats the header.
+- `dpr` also applies request-wide, and it scales targets *before* the `no_upscale` cap sees them, so `dpr` never invents pixels past the source when both are set. Targets round to whole pixels. `crop-rect` and `focal` coordinates address the image as it stands at their segment (source pixels when nothing runs before them) and are not scaled. When the URL carries no `dpr`, the server honors the `DPR` client hint header (same set of values; an invalid hint is ignored). An explicit `dpr` in the URL always beats the header.
 
 ### Client hints
 
@@ -93,7 +93,7 @@ filters:watermark(<url>,<x>,<y>,<alpha>)
 | `x`, `y` | Position of the watermark's top-left corner, in pixels. Negative values anchor from the right and bottom edges. |
 | `alpha` | Opacity, 0 (invisible) to 100 (opaque). The watermark's own alpha is honored. |
 
-The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`) instead of being skipped.
+The server fetches each watermark through the same loader, limits, and source policy as source images. A watermark that fails to load or decode fails the request (`502`, or `400 invalid_source` when its URL is not one the server can fetch at all) instead of being skipped.
 
 ```bash
 # Overlay https://cdn.example.com/logo.png at the bottom right, 80% opaque
@@ -144,7 +144,7 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 | --- | --- | --- | --- |
 | `removebg` | none | Remove the background, keeping the subject over transparency. Output format must carry alpha: `png`, `webp`, `jxl`, or `avif`. | `filters:removebg:format(png)` |
 | `studio` | `studio(product,...)` or `studio(scene,...)` | Studio mode: `product` composites the subject onto a backdrop with a synthesized contact shadow, scaled and centered to a pad margin; `scene` keeps the photograph's scene, reframing it on the detected subject and correcting light and color. See [Studio mode](#studio-mode). Requires the removebg model. | `filters:studio(product,bg:white)` |
-| `keep_profile` | none | Keep the source ICC profile instead of converting to sRGB; the profile is embedded in JPEG and PNG outputs. Other output formats convert to sRGB (pixels labeled as nothing would be wrong colors). | `filters:keep_profile` |
+| `keep_profile` | none | Keep the source ICC profile instead of converting to sRGB; the profile is embedded in JPEG and PNG outputs. Other output formats convert to sRGB (pixels labeled as nothing would be wrong colors), and so does a profile that is malformed or larger than 256 KiB, which is never embedded. | `filters:keep_profile` |
 | `blurfaces` | none | Blur every detected face (privacy redaction). Requires a face model. | `filters:blurfaces` |
 | `pixelatefaces` | none | Pixelate every detected face (privacy redaction): each face becomes a mosaic of averaged cells, at most 8 across its longer side and never under 2 px, so even a face a few pixels wide is redacted. Requires a face model. | `filters:pixelatefaces` |
 | `blurclass` | `blurclass(person)` | Blur every detected object of the class (privacy redaction). Repeat for more classes. Requires a detection model. With a segmentation model, the blur follows the object's silhouette instead of its box. | `filters:blurclass(person)` |
@@ -156,6 +156,8 @@ curl "http://localhost:3000/unsafe/800x600/filters:text(Sale%20ends%20soon,32,ff
 ```bash
 curl "http://localhost:3000/unsafe/filters:removebg:format(png)/https://example.com/product.jpg"
 ```
+
+Redaction replaces pixels. `blurfaces`, `pixelatefaces`, `blurclass`, `pixelateclass`, `blur_region`, and `pixelate_region` write the blurred or pixelated result, alpha included, in place of the pixels they cover; they never composite it over the original, so the source's alpha cannot let the original through. (With a segmentation model, a silhouette's antialiased edge mixes the redacted and the original pixels by the mask's strength, as it does for an opaque source.) This matters for sources with transparency: detection reads color only, so a face stored at alpha 0 is still found, and JPEG output, which has no alpha, writes the stored color. Under any alpha the stored color is the redacted one, the same an opaque source gets. An area of uniform alpha keeps that alpha exactly, so an opaque image stays opaque; where the alpha varies, as at a cut-out's edge, it is blurred or pixelated along with the color.
 
 ### Studio mode
 

@@ -371,13 +371,16 @@ pub fn crop_to_aspect_point_traced(
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
     (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
 }
-/// the smallest region with that aspect which contains the face
-/// expanded by `padding` (a fraction of the face's size, added
-/// on every side), centered on the face's center and clamped
-/// into the image. When the padded region cannot fit (the
-/// image is too small on one axis) it shrinks to fit and the
-/// face fills more of the frame. The engine resizes the result
-/// to the exact target, like every other crop.
+
+/// Crop `img` to the `target_w:target_h` aspect ratio, framing
+/// a detected face: the smallest region with that aspect which
+/// contains the face expanded by `padding` (a fraction of the
+/// face's size, added on every side), centered on the face's
+/// center and clamped into the image. When the padded region
+/// cannot fit (the image is too small on one axis) it shrinks
+/// to fit and the face fills more of the frame. The engine
+/// resizes the result to the exact target, like every other
+/// crop.
 pub fn crop_around_face(
     img: DynamicImage,
     target_w: u32,
@@ -528,13 +531,13 @@ fn crop_region_traced(
 /// the window stays fully inside it, and so the window stays
 /// inside the image either way.
 fn focal_start(rect_start: u32, rect_end: u32, window: u32, extent: u32) -> u32 {
-    // The rectangle was validated against the image as it
-    // stood when its segment ran; a resize between that
-    // segment and the crop leaves it in stale coordinates,
-    // possibly past the current frame (issue #371). Re-clamp
-    // it into the consuming space first: with both ends
-    // inside the frame, the fits branch below can no longer
-    // produce inverted clamp bounds.
+    // The engine maps the rectangle onto the frame it cuts
+    // (issue #465), but a rectangle that reaches this
+    // function past the frame (issue #371, a hand-built
+    // call) must not panic it. Re-clamp it into the
+    // consuming space first: with both ends inside the
+    // frame, the fits branch below can no longer produce
+    // inverted clamp bounds.
     let rect_start = rect_start.min(extent);
     let rect_end = rect_end.min(extent).max(rect_start);
     let max_start = extent.saturating_sub(window) as i64;

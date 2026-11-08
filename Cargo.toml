@@ -38,7 +38,18 @@ hmac = "0.13"
 libm = "0.2"
 jixel = "0.5"
 jpeg-encoder = { version = "0.7", features = ["simd"] }
-ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
+# Default features off (issue #466): the defaults compile
+# ndarray (unused: tensors go in as shape-and-slice pairs)
+# and download-binaries with tls-native, which made OpenSSL
+# a build dependency of ort-sys for a runtime this binary
+# never downloads. The library is loaded at run time
+# (load-dynamic), and api-31 matches the ONNX Runtime 1.31
+# that Dockerfile.ai pins. Dropping the default `tracing`
+# feature leaves ONNX Runtime on its own logger, which
+# writes errors to stderr (`ORT_LOG` sets the level); with
+# it, every message went to `tracing`, and this binary
+# installs no subscriber, so none was ever seen.
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }
 jxl-image-rs-integration = "0.8"
 jxl = "0.8"
 flate2 = "1"
@@ -48,6 +59,10 @@ moxcms = "0.8"
 # Default features off: the crate's `deflate` feature would let a
 # crafted HEIC inflate embedded metadata toward a 1 GiB cap on
 # every decode (issue #184); `registry` is the decode path itself.
+# `registry` also compiles the crate's AV1, H.264, and H.266
+# codecs; src/heic.rs refuses any coded item that is not HEVC
+# before the decoder runs (issue #466), so only oxideav-h265
+# ever sees source bytes.
 oxideav-heif = { version = "=0.0.13", default-features = false, features = ["registry"] }
 oxideav-h265 = "=0.0.15"
 oxideav-webp = { version = "0.3.1", default-features = false }
@@ -68,7 +83,16 @@ simplecss = "0.2"
 sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-image = { version = "0.25", features = ["avif", "nasm", "tiff"] }
+# Default features off (issue #466): the defaults compile
+# decoders for formats crabcrop does not promise (OpenEXR,
+# Radiance HDR, QOI, PNM, DDS, TGA, farbfeld), and the generic
+# decode picks its decoder from the source bytes alone, so any
+# source or upload reached each one a magic number selects
+# (all but TGA, which has none). The list is
+# the documented source set (JPEG, PNG, GIF, WebP, TIFF, BMP,
+# ICO; AVIF through the avif-decode feature) plus the AVIF
+# encoder (avif, nasm) and its threading (rayon).
+image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "nasm", "png", "rayon", "tiff", "webp"] }
 # Direct decoder bindings for the two hottest source formats
 # (perf wave 3): zune-jpeg is the same decoder the image crate
 # wraps for JPEG (already in the tree transitively); calling it

@@ -350,15 +350,16 @@ pub(in crate::server) enum ProcessFailure {
     /// The job ran past its processing deadline plus the
     /// grace bound (issue #322): the runner stopped
     /// waiting and the request is shed with a 504. The
-    /// blocking job itself is detached, but it holds no
-    /// gate permit: the process permit stays on the async
-    /// side and drops with this answer, and the handler's
-    /// AI, video, and animation permits drop with it, so
-    /// a follow-up request gets a genuine attempt instead
-    /// of shedding on a dead request's gates. The detached
-    /// job aborts at the engine's next deadline check; a
-    /// job stuck inside one opaque encoder call runs only
-    /// until that call returns.
+    /// blocking job itself is detached and keeps every
+    /// permit `run_process` moved into it, the lane
+    /// permit and the request's AI, video, and animation
+    /// permits, until it finishes (issue #357): the gates
+    /// count the work still draining, so a follow-up
+    /// request waits or sheds at the gate instead of
+    /// stacking onto busy capacity. The detached job
+    /// aborts at the engine's next deadline check; a job
+    /// stuck inside one opaque call runs only until that
+    /// call returns.
     TimedOut,
 }
 
@@ -692,7 +693,9 @@ pub(in crate::server) async fn run_process(
 /// animated WebP outputs are served unsigned. A signing
 /// failure fails the request: serving unmarked output
 /// from a server configured to mark would be a silent
-/// policy break.
+/// policy break. A failed timestamp authority gets its own
+/// error, so the client hears an outage worth retrying
+/// rather than a broken encoder (issue #467).
 pub(in crate::server) fn apply_provenance(
     job: &ProcessJob,
     source_bytes: &[u8],
@@ -738,8 +741,11 @@ pub(in crate::server) fn apply_provenance(
                     processed.bytes = bytes;
                     signed = true;
                 }
-                Err(e) => {
-                    return Err(EngineError::Encode(format!("C2PA signing failed: {e}")));
+                Err(crate::provenance::SignError::Authority(cause)) => {
+                    return Err(EngineError::ProvenanceUnavailable(cause));
+                }
+                Err(crate::provenance::SignError::Failed(cause)) => {
+                    return Err(EngineError::Encode(format!("C2PA signing failed: {cause}")));
                 }
             }
         }

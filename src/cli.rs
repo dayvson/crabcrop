@@ -1,8 +1,10 @@
-//! Operator CLI verbs, dispatched from `main` before the
-//! server starts: `sign`, `explain`, `meta`, `purge`,
-//! `purge-group`, `upload`, and `convert-thumbor`.
-//! Configuration comes from `--base` / `--secret` flags
-//! over `CRABCROP_BASE` / `CRABCROP_SECRET`, the same
+//! Operator CLI verbs, dispatched from `main` whenever the
+//! binary gets any argument (only a bare `crabcrop` starts
+//! the server): `sign`, `seal`, `unseal`, `explain`,
+//! `meta`, `purge`, `purge-group`, `upload`, and
+//! `convert-thumbor`. Configuration comes from `--base` /
+//! `--secret` / `--key-id` flags over `CRABCROP_BASE` /
+//! `CRABCROP_SECRET` / `CRABCROP_SECRET_KEY_ID`, the same
 //! convention as the MCP server. The verbs use the
 //! server's own URL grammar, so what the CLI validates
 //! is what the server will do.
@@ -15,10 +17,12 @@ const USAGE: &str = "\
 crabcrop: on-demand image optimization service
 
 Server:
-  crabcrop                      Start the server (configuration via environment).
-  crabcrop --version            Print the version and exit.
+  crabcrop                      Start the server (configuration via environment). The server
+                                takes no arguments: any argument runs the CLI below.
+  crabcrop --version, -V        Print the version and exit.
+  crabcrop --help, -h           Print this help and exit.
 
-CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_SECRET):
+CLI verbs (flags go after the verb; see Flags below):
   crabcrop sign <remainder>           Print the signed URL for an operations + source remainder.
   crabcrop seal <remainder> [<name>]  Print the sealed URL for a remainder: the whole remainder
                                       rides in an opaque token in the signature slot, optionally
@@ -28,6 +32,7 @@ CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_
   crabcrop explain <url-or-path>      Break a URL down segment by segment.
   crabcrop meta <url-or-remainder>    Fetch and print the meta JSON for an image.
                                       (--placeholders / --detections ask for those fields.)
+                                      Needs meta mode on the server (CRABCROP_META_MODE=1).
   crabcrop purge <url-or-remainder>   Purge one URL's cached variants.
   crabcrop purge-group <name>         Purge every cached entry in a preset group.
   crabcrop upload <file> [<name>]     Upload an original to the server's upload store
@@ -35,7 +40,41 @@ CLI verbs (flags: --base <url>, --secret <secret>; env: CRABCROP_BASE, CRABCROP_
                                       source reference to use in transform URLs.
                                       (--expires <unix-seconds> mints an upload token
                                       that stops working at that second.)
-  crabcrop convert-thumbor <url>      Convert a Thumbor URL to a crabcrop URL.";
+  crabcrop convert-thumbor <url>      Convert a Thumbor URL to a crabcrop URL.
+
+Flags (each value flag also takes the --flag=<value> spelling):
+  --base <url>                        Server base URL. Env CRABCROP_BASE; default
+                                      http://localhost:3000.
+  --secret <secret>                   Signing secret. Env CRABCROP_SECRET.
+  --key-id <id>                       Key ID stamped on the signatures and tokens that sign,
+                                      seal, purge, purge-group and upload mint.
+                                      Env CRABCROP_SECRET_KEY_ID.
+  --placeholders                      meta only: include the placeholder fields.
+  --detections                        meta only: include the detection boxes.
+  --expires <unix-seconds>            upload only: the minted upload token stops working
+                                      at that second.
+  --help, -h                          Print this help and exit, in any position.";
+
+/// Every flag `parse_flags` accepts: the ones that take a
+/// value (`--flag <value>` or `--flag=<value>`), then the
+/// switches. USAGE lists each, and a test holds the two
+/// together: `--key-id` was once accepted but never listed
+/// (#470).
+const VALUE_FLAGS: [&str; 4] = ["--base", "--secret", "--key-id", "--expires"];
+const SWITCH_FLAGS: [&str; 2] = ["--placeholders", "--detections"];
+
+/// Every verb `exec` runs, each listed in USAGE.
+const VERBS: [&str; 9] = [
+    "sign",
+    "seal",
+    "unseal",
+    "explain",
+    "meta",
+    "purge",
+    "purge-group",
+    "upload",
+    "convert-thumbor",
+];
 
 struct Config {
     base: String,
@@ -70,7 +109,7 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
             _ => (arg.as_str(), None),
         };
         match flag {
-            "--base" | "--secret" | "--key-id" | "--expires" => {
+            _ if VALUE_FLAGS.contains(&flag) => {
                 let value = match inline_value {
                     Some(v) => v,
                     None => {
@@ -80,26 +119,26 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
                             .ok_or_else(|| format!("{flag} needs a value"))?
                     }
                 };
-                if flag == "--base" {
-                    base = Some(value);
-                } else if flag == "--key-id" {
-                    key_id = Some(value);
-                } else if flag == "--expires" {
-                    expires = Some(value.parse().map_err(|_| {
-                        format!("--expires needs a unix-seconds timestamp, got {value:?}")
-                    })?);
-                } else {
-                    secret = Some(value);
+                match flag {
+                    "--base" => base = Some(value),
+                    "--secret" => secret = Some(value),
+                    "--key-id" => key_id = Some(value),
+                    "--expires" => {
+                        expires = Some(value.parse().map_err(|_| {
+                            format!("--expires needs a unix-seconds timestamp, got {value:?}")
+                        })?);
+                    }
+                    _ => unreachable!("{flag} is in VALUE_FLAGS without a handler"),
                 }
             }
-            "--placeholders" | "--detections" => {
+            _ if SWITCH_FLAGS.contains(&flag) => {
                 if inline_value.is_some() {
                     return Err(format!("{flag} takes no value\n\n{USAGE}"));
                 }
-                if flag == "--placeholders" {
-                    placeholders = true;
-                } else {
-                    detections = true;
+                match flag {
+                    "--placeholders" => placeholders = true,
+                    "--detections" => detections = true,
+                    _ => unreachable!("{flag} is in SWITCH_FLAGS without a handler"),
                 }
             }
             _ if arg.starts_with("--") => return Err(format!("unknown flag {arg:?}\n\n{USAGE}")),
@@ -226,6 +265,13 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
     if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
         return Ok(USAGE.to_string());
     }
+    // The verb is checked before its flags, so a mistyped
+    // one (`crabcrop --verison`, `crabcrop sgin --expires 5`)
+    // is reported as what it is rather than as a complaint
+    // about the flags that follow it.
+    if !VERBS.contains(&verb) {
+        return Err(format!("unknown verb {verb:?}\n\n{USAGE}"));
+    }
     let (config, positional) = parse_flags(&args[1..])?;
     if verb != "meta" && (config.placeholders || config.detections) {
         return Err(format!(
@@ -247,7 +293,7 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
         "purge-group" => purge_group(&config, &positional).await,
         "upload" => upload(&config, &positional).await,
         "convert-thumbor" => convert_thumbor_cmd(&config, &positional),
-        _ => Err(format!("unknown verb {verb:?}\n\n{USAGE}")),
+        _ => unreachable!("{verb} is in VERBS without a handler"),
     }
 }
 
@@ -1234,7 +1280,8 @@ pub fn convert_thumbor(
     if segments.get(idx) == Some(&"meta") {
         warnings.push(
             "the meta segment has no URL form in crabcrop: fetch the converted URL with \
-             Accept: application/json, or run crabcrop meta on it"
+             Accept: application/json, or run crabcrop meta on it, on a server with meta \
+             mode on (CRABCROP_META_MODE=1)"
                 .to_string(),
         );
         idx += 1;
@@ -1589,6 +1636,76 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("unknown verb \"sgin\""), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_first_argument_that_names_no_verb_is_an_unknown_verb() {
+        // #470: main now hands every argument to exec, dash
+        // spellings included, so whatever leads must name a
+        // verb or fail as one, before any flag after it is
+        // read: a flag error here would hide the typo.
+        let cases: [&[&str]; 11] = [
+            &["--verison"],
+            &["-x"],
+            &["-"],
+            &["--"],
+            &[""],
+            &[
+                "--base",
+                "http://img.test",
+                "sign",
+                "300x200/https://e.com/a.jpg",
+            ],
+            &["--secret=s", "sign", "300x200/https://e.com/a.jpg"],
+            &["--placeholders", "meta", "300x200/https://e.com/a.jpg"],
+            &["--verison", "--bogus"],
+            &["--verison", "--expires", "not-a-number"],
+            &["sgin", "--detections", "--expires", "5"],
+        ];
+        for case in cases {
+            let err = exec(&args(case)).await.unwrap_err();
+            let expected = format!("unknown verb {:?}\n\n", case[0]);
+            assert!(err.starts_with(&expected), "{case:?}: {err}");
+        }
+        // No arguments at all never reaches exec from main;
+        // called directly, it is still an error, not a panic.
+        let err = exec(&[]).await.unwrap_err();
+        assert!(err.starts_with("unknown verb \"\""), "{err}");
+    }
+
+    #[tokio::test]
+    async fn usage_lists_every_flag_and_verb_the_cli_accepts() {
+        // #470: `--key-id` parsed but was missing from the
+        // help. The tables are what parse_flags and exec
+        // dispatch on, so a flag or verb added to either
+        // shows up here until USAGE names it.
+        for flag in VALUE_FLAGS.iter().chain(&SWITCH_FLAGS) {
+            assert!(USAGE.contains(flag), "USAGE does not list {flag}");
+        }
+        for verb in VERBS {
+            assert!(
+                USAGE.contains(&format!("crabcrop {verb} ")),
+                "USAGE does not list the {verb} verb"
+            );
+        }
+        // And the tables are live: each flag parses, in both
+        // spellings for the value flags ("1" suits them all),
+        // and each verb reaches its handler, which refuses
+        // the missing argument instead of the dispatch
+        // calling it unknown.
+        for flag in VALUE_FLAGS {
+            parse_flags(&args(&[flag, "1"])).unwrap_or_else(|e| panic!("{flag}: {e}"));
+            parse_flags(&args(&[&format!("{flag}=1")])).unwrap_or_else(|e| panic!("{flag}: {e}"));
+        }
+        for flag in SWITCH_FLAGS {
+            parse_flags(&args(&[flag])).unwrap_or_else(|e| panic!("{flag}: {e}"));
+        }
+        for verb in VERBS {
+            let err = exec(&args(&[verb])).await.unwrap_err();
+            assert!(!err.contains("unknown verb"), "{verb}: {err}");
+        }
+        let err = parse_flags(&args(&["--key-ids", "k2"])).err().unwrap();
+        assert!(err.starts_with("unknown flag \"--key-ids\""), "{err}");
     }
 
     #[tokio::test]

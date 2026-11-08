@@ -57,11 +57,15 @@ pub enum ParseError {
     /// Carries the offending segment.
     InvalidPad(String),
     /// An `exp:...` segment did not carry a valid unix
-    /// timestamp. Carries the offending segment.
+    /// timestamp, or sat in a server-wide default operations
+    /// string, where per-request metadata is refused (issue
+    /// #469). Carries the offending segment.
     InvalidExpiry(String),
     /// A `maxage:...` segment did not carry a valid cache
     /// lifetime: whole seconds from 0 to [`MAX_CACHE_AGE`].
-    /// Carries the offending segment.
+    /// Also refused in a server-wide default operations
+    /// string, like `exp:` (issue #469). Carries the
+    /// offending segment.
     InvalidMaxAge(String),
     /// A `debug:...` segment named a debug view the grammar
     /// does not have: the only one is `debug:focal`. Carries
@@ -116,6 +120,11 @@ pub enum ParseError {
     InvalidNoise(String),
     /// No source URL followed the operations.
     MissingSourceUrl,
+    /// The operation list a request would execute, after
+    /// preset expansion and with the server-wide defaults
+    /// merged in, runs past [`MAX_OPERATIONS`] (see
+    /// [`check_operation_count`]). Carries the count.
+    TooManyOperations(usize),
 }
 
 impl ParseError {
@@ -149,6 +158,11 @@ impl ParseError {
             ParseError::InvalidConvolution(_) => "invalid_convolution",
             ParseError::InvalidNoise(_) => "invalid_noise",
             ParseError::MissingSourceUrl => "missing_source_url",
+            // The engine's code for the same refusal, which it
+            // answered alone until the check moved to parse
+            // time (issue #469): moving it earlier changed
+            // when the 400 answers, not what it says.
+            ParseError::TooManyOperations(_) => "unsupported_operation",
         }
     }
 }
@@ -198,6 +212,10 @@ impl std::fmt::Display for ParseError {
                 write!(f, "invalid noise filter in segment: {seg}")
             }
             ParseError::MissingSourceUrl => write!(f, "missing source URL"),
+            ParseError::TooManyOperations(count) => write!(
+                f,
+                "request has {count} operations, over the {MAX_OPERATIONS} operation limit"
+            ),
         }
     }
 }
@@ -1010,9 +1028,11 @@ pub enum FrameSelection {
 
 /// The largest timestamp a `frame:` segment may name, in
 /// seconds: 24 hours. Real sources the loader will fetch
-/// (10 MiB, bounded decode) run far shorter; the cap keeps
-/// the grammar's numbers finite and small, and anything
-/// past a real duration clamps to the last frame anyway.
+/// (10 MiB by default, 1 GiB at most) almost always run
+/// shorter, and a percentage reaches any point of a longer
+/// one; the cap keeps the grammar's numbers finite and
+/// small, and anything past a real duration clamps to the
+/// last frame anyway.
 pub const MAX_FRAME_SECONDS: f64 = 86_400.0;
 
 /// The largest percentage a `frame:` segment may name.
@@ -2536,6 +2556,43 @@ pub fn preset_names(rest: &str) -> Vec<String> {
     out
 }
 
+/// The most operations one request may execute (issue #182,
+/// audit R2-12), counted by [`operation_count`] on the list
+/// the engine runs: after preset expansion and with the
+/// server-wide defaults merged in, so neither a short URL
+/// that repeats a preset nor the defaults can multiply work
+/// past it. Real chains (a size, a crop, a dozen filters)
+/// sit far below it; the cap exists so thousands of
+/// repeated cheap operations cannot burn a process-gate
+/// slot on CPU alone.
+pub const MAX_OPERATIONS: usize = 100;
+
+/// How many operations a list executes: each operation
+/// once, and each filter inside a `filters:` segment once,
+/// because each is a pass over the pixels.
+pub fn operation_count(ops: &[Operation]) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            Operation::Filters(filters) => filters.len(),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Refuse an operation list over [`MAX_OPERATIONS`] (issue
+/// #469). The server runs it on the merged list right after
+/// parsing, on the image and explain routes alike, so an
+/// over-cap request answers its `400` before the cache, the
+/// gates, or any source fetch; the engine keeps the same
+/// check as a backstop.
+pub fn check_operation_count(ops: &[Operation]) -> Result<(), ParseError> {
+    let count = operation_count(ops);
+    if count > MAX_OPERATIONS {
+        return Err(ParseError::TooManyOperations(count));
+    }
+    Ok(())
+}
+
 /// Merge server-wide defaults under a request's operations
 /// (issue #145): the defaults come first, the request's own
 /// operations follow, and for the singleton directives
@@ -2593,6 +2650,14 @@ pub fn merge_default_ops(defaults: &[Operation], url_ops: Vec<Operation>) -> Vec
 /// table, and the rest must be operations only, with no
 /// source. The operations are returned ready to prepend to a
 /// request's own. An empty string yields no operations.
+///
+/// `exp:` and `maxage:` are refused, as preset definitions
+/// refuse them (issue #469): both are per-request metadata,
+/// which the operations parse returns apart from the
+/// operations, so a default lifetime used to boot cleanly
+/// and never apply. A string that alone runs past
+/// [`MAX_OPERATIONS`] is refused too: every request under it
+/// would answer `400`.
 pub fn parse_default_ops(
     text: &str,
     presets: &std::collections::HashMap<String, String>,
@@ -2612,6 +2677,20 @@ pub fn parse_default_ops(
     if source != "example.com/defaults" {
         return Err(ParseError::InvalidPreset(text.to_string()));
     }
+    // The parse succeeded up to the synthetic source, so every
+    // segment of `expanded` is an operation or metadata, and a
+    // metadata prefix is always read as metadata.
+    if let Some(seg) = expanded
+        .split('/')
+        .find(|seg| seg.starts_with("exp:") || seg.starts_with("maxage:"))
+    {
+        return Err(if seg.starts_with("exp:") {
+            ParseError::InvalidExpiry(seg.to_string())
+        } else {
+            ParseError::InvalidMaxAge(seg.to_string())
+        });
+    }
+    check_operation_count(&ops)?;
     Ok(ops)
 }
 
@@ -3422,40 +3501,20 @@ pub fn canonical_form(ops: &[Operation], source: &str) -> String {
     }
 }
 
-/// The cache key for a remainder: its canonical form.
-/// Remainders that do not parse (purge targets naming
-/// presets are expanded by the purge handler's own path;
-/// opaque strings) fall back to the expiry-stripped
-/// textual form.
+/// The cache key for a remainder: its canonical form, which
+/// drops every `exp:` and `maxage:` segment (audit P-2). Both
+/// are per-request metadata enforced or applied outside the
+/// stored entry (expiry before lookup, the cache lifetime on
+/// the response), so neither may fragment the cache or
+/// shield entries from purges. A remainder that does not
+/// parse passes through unchanged: the parse is what finds
+/// where the source starts, so without it no segment can be
+/// told apart from source text, and no stored entry is keyed
+/// on an unparseable remainder for the text to reach.
 pub fn canonical_key_form(remainder: &str) -> String {
     match parse_operations_with_expiry(remainder) {
         Ok((ops, source, _, _)) => canonical_form(&ops, source),
-        Err(_) => cache_key_form(remainder),
-    }
-}
-
-/// The cache-key form of an expanded remainder: identical,
-/// except every `exp:` and `maxage:` segment is removed (audit
-/// P-2). Both are per-request metadata enforced or applied
-/// outside the stored entry (expiry before lookup, the cache
-/// lifetime on the response), so neither may fragment the
-/// cache or shield entries from purges. Unparseable remainders
-/// pass through unchanged.
-pub fn cache_key_form(remainder: &str) -> String {
-    let Ok((_, source)) = parse_operations(remainder) else {
-        return remainder.to_string();
-    };
-    let Some(ops_part) = remainder.strip_suffix(source) else {
-        return remainder.to_string();
-    };
-    let kept: Vec<&str> = ops_part
-        .split('/')
-        .filter(|seg| !seg.is_empty() && !seg.starts_with("exp:") && !seg.starts_with("maxage:"))
-        .collect();
-    if kept.is_empty() {
-        source.to_string()
-    } else {
-        format!("{}/{source}", kept.join("/"))
+        Err(_) => remainder.to_string(),
     }
 }
 
@@ -3652,11 +3711,32 @@ pub fn verify_upload(secret: &[u8], signature: &Signature, name: &str) -> bool {
 /// caches like any other entry. An unknown key ID consults
 /// nothing and fails as a bad signature, indistinguishable
 /// from any other forgery attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` prints the key IDs and redacts the keys
+/// (issue #455). It is not `PartialEq`: nothing compares
+/// rings, and a derived comparison of key bytes would not be
+/// constant-time.
+#[derive(Clone)]
 pub struct Keyring {
     pub current_id: String,
     pub current: Vec<u8>,
     pub previous: Option<(String, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for Keyring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keyring")
+            .field("current_id", &self.current_id)
+            .field("current", &crate::redact::Redacted)
+            .field(
+                "previous",
+                &self
+                    .previous
+                    .as_ref()
+                    .map(|(id, _)| (id, crate::redact::Redacted)),
+            )
+            .finish()
+    }
 }
 
 impl Keyring {
@@ -3903,37 +3983,71 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_form_strips_expiry_segments() {
+    fn canonical_key_form_strips_expiry_segments() {
         let src = "https://example.com/a.jpg";
         assert_eq!(
-            cache_key_form(&format!("exp:1893456000/300x200/{src}")),
+            canonical_key_form(&format!("exp:1893456000/300x200/{src}")),
             format!("300x200/{src}")
         );
         assert_eq!(
-            cache_key_form(&format!("300x200/exp:1893456000/{src}")),
+            canonical_key_form(&format!("300x200/exp:1893456000/{src}")),
             format!("300x200/{src}")
         );
-        assert_eq!(cache_key_form(&format!("exp:1893456000/{src}")), src);
+        assert_eq!(canonical_key_form(&format!("exp:1893456000/{src}")), src);
         assert_eq!(
-            cache_key_form(&format!("300x200/{src}")),
+            canonical_key_form(&format!("300x200/{src}")),
             format!("300x200/{src}")
         );
         // An exp: segment inside the source is URL text, kept.
         let tricky = "https://example.com/exp:123/a.jpg";
-        assert_eq!(cache_key_form(tricky), tricky);
+        assert_eq!(canonical_key_form(tricky), tricky);
         // maxage: is per-request metadata too: stripped wherever
         // it sits among the operations, kept inside the source.
         assert_eq!(
-            cache_key_form(&format!("maxage:60/300x200/{src}")),
+            canonical_key_form(&format!("maxage:60/300x200/{src}")),
             format!("300x200/{src}")
         );
         assert_eq!(
-            cache_key_form(&format!("300x200/maxage:60/{src}")),
+            canonical_key_form(&format!("300x200/maxage:60/{src}")),
             format!("300x200/{src}")
         );
-        assert_eq!(cache_key_form(&format!("maxage:60/{src}")), src);
+        assert_eq!(canonical_key_form(&format!("maxage:60/{src}")), src);
         let tricky = "https://example.com/maxage:60/a.jpg";
-        assert_eq!(cache_key_form(tricky), tricky);
+        assert_eq!(canonical_key_form(tricky), tricky);
+    }
+
+    #[test]
+    fn canonical_key_form_passes_unparseable_remainders_through() {
+        // A remainder that does not parse keys as itself,
+        // byte for byte, and stays a fixed point: no source
+        // boundary is known, so no segment is stripped, not
+        // even a well-formed `exp:` or `maxage:` ahead of the
+        // failing one. Purge targets are caller text, so the
+        // set is hostile: malformed metadata, a bad operation
+        // argument, a missing source, an empty remainder, a
+        // long run of segments.
+        let long = format!("{}filters:blur(x)/a.jpg", "exp:1/".repeat(10_000));
+        let cases = [
+            "".to_string(),
+            "/".to_string(),
+            "exp:/300x200/https://example.com/a.jpg".to_string(),
+            "exp:12x/300x200/https://example.com/a.jpg".to_string(),
+            "maxage:99999999999/https://example.com/a.jpg".to_string(),
+            "exp:1893456000/maxage:60/maxage:/https://example.com/a.jpg".to_string(),
+            "exp:1893456000/300x200/".to_string(),
+            "maxage:60/300x200/filters:blur(nope)/https://example.com/a.jpg".to_string(),
+            "exp:99999999999999999999999/https://example.com/a.jpg".to_string(),
+            long,
+        ];
+        for remainder in &cases {
+            assert!(
+                parse_operations_with_expiry(remainder).is_err(),
+                "the case must not parse: {remainder:.80}"
+            );
+            let key = canonical_key_form(remainder);
+            assert_eq!(&key, remainder, "an unparseable remainder keys as itself");
+            assert_eq!(canonical_key_form(&key), key, "the key is a fixed point");
+        }
     }
 
     #[test]
@@ -3970,6 +4084,9 @@ mod tests {
             (ParseError::InvalidFrame("x".into()), "invalid_frame"),
             (ParseError::InvalidPage("x".into()), "invalid_page"),
             (ParseError::MissingSourceUrl, "missing_source_url"),
+            // The engine's code, kept when the cap check moved
+            // to parse time (issue #469).
+            (ParseError::TooManyOperations(101), "unsupported_operation"),
         ];
         let mut seen = std::collections::HashSet::new();
         for (err, expected) in &cases {
@@ -7340,6 +7457,151 @@ mod tests {
             canonical_form(&merged, "example.com/i.jpg"),
             "filters:format(webp):quality(80):blur(2):blur(3)/example.com/i.jpg"
         );
+    }
+
+    #[test]
+    fn default_ops_refuse_request_metadata() {
+        // Issue #469: the parse used to accept `exp:` and
+        // `maxage:` and drop them, so a default lifetime
+        // booted cleanly and never applied. Both are refused
+        // now, naming the segment, wherever they sit.
+        let mut presets = std::collections::HashMap::new();
+        presets.insert("thumb".to_string(), "100x0".to_string());
+        for (text, want) in [
+            (
+                "filters:format(webp)/maxage:60",
+                ParseError::InvalidMaxAge("maxage:60".to_string()),
+            ),
+            (
+                "maxage:0",
+                ParseError::InvalidMaxAge("maxage:0".to_string()),
+            ),
+            (
+                "exp:1893456000/filters:format(webp)",
+                ParseError::InvalidExpiry("exp:1893456000".to_string()),
+            ),
+            (
+                "preset:thumb/exp:1/maxage:5",
+                ParseError::InvalidExpiry("exp:1".to_string()),
+            ),
+            (
+                "maxage:60/preset:thumb",
+                ParseError::InvalidMaxAge("maxage:60".to_string()),
+            ),
+        ] {
+            assert_eq!(parse_default_ops(text, &presets), Err(want), "{text}");
+        }
+        // Malformed metadata still fails as the parser's own
+        // error, and metadata-free strings still parse.
+        assert_eq!(
+            parse_default_ops("maxage:soon", &presets),
+            Err(ParseError::InvalidMaxAge("maxage:soon".to_string()))
+        );
+        assert_eq!(
+            parse_default_ops("preset:thumb/filters:format(webp)", &presets)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn operation_count_counts_each_filter_and_every_other_operation_once() {
+        let (ops, _) = parse_operations(
+            "crop:1200x630:smart/filters:grayscale:quality(80)/exp:9/maxage:5/300x200/example.com/i.jpg",
+        )
+        .unwrap();
+        // crop (1) + two filters (2) + size (1); exp and
+        // maxage are not operations.
+        assert_eq!(operation_count(&ops), 4);
+        assert_eq!(operation_count(&[]), 0);
+        assert!(check_operation_count(&[]).is_ok());
+        // Exactly at the cap passes, either way it is spelled.
+        let one_segment = vec![Operation::Filters(vec![Filter::Invert; MAX_OPERATIONS])];
+        assert!(check_operation_count(&one_segment).is_ok());
+        let segments = vec![Operation::Filters(vec![Filter::Invert]); MAX_OPERATIONS];
+        assert!(check_operation_count(&segments).is_ok());
+        // One more fails with the count in the message and the
+        // engine's code, so the HTTP answer did not change when
+        // the check moved to parse time.
+        let mut over = segments.clone();
+        over.push(Operation::Filters(vec![Filter::Invert]));
+        let err = check_operation_count(&over).unwrap_err();
+        assert_eq!(err, ParseError::TooManyOperations(MAX_OPERATIONS + 1));
+        assert_eq!(err.code(), "unsupported_operation");
+        assert_eq!(
+            err.to_string(),
+            "request has 101 operations, over the 100 operation limit"
+        );
+        // An empty filters list contributes nothing, and a
+        // chain about as long as a 64 KiB URL can spell in one
+        // segment is refused with its full count.
+        assert_eq!(operation_count(&[Operation::Filters(Vec::new())]), 0);
+        let (hostile, _) = parse_operations(&format!(
+            "filters:{}/example.com/i.jpg",
+            vec!["invert"; 9_000].join(":")
+        ))
+        .unwrap();
+        assert_eq!(
+            check_operation_count(&hostile),
+            Err(ParseError::TooManyOperations(9_000))
+        );
+    }
+
+    #[test]
+    fn default_ops_over_the_cap_alone_are_refused() {
+        // Issue #469: defaults that alone exceed the cap would
+        // make every request answer 400, so the boot refuses
+        // them. The count is the expanded one: a preset counts
+        // as the operations it expands to.
+        let mut presets = std::collections::HashMap::new();
+        presets.insert(
+            "ten".to_string(),
+            format!("filters:{}", ["invert"; 10].join(":")),
+        );
+        let at_cap = format!("filters:{}", vec!["invert"; MAX_OPERATIONS].join(":"));
+        assert_eq!(
+            operation_count(&parse_default_ops(&at_cap, &presets).unwrap()),
+            MAX_OPERATIONS
+        );
+        let over = format!("{at_cap}:invert");
+        assert_eq!(
+            parse_default_ops(&over, &presets),
+            Err(ParseError::TooManyOperations(MAX_OPERATIONS + 1))
+        );
+        let tens = ["preset:ten"; 10].join("/");
+        assert!(parse_default_ops(&tens, &presets).is_ok());
+        assert_eq!(
+            parse_default_ops(&format!("{tens}/300x200"), &presets),
+            Err(ParseError::TooManyOperations(MAX_OPERATIONS + 1))
+        );
+    }
+
+    #[test]
+    fn merged_count_drops_overridden_default_singletons() {
+        // The cap counts the merged list: a default singleton
+        // the URL overrides is dropped before counting, the
+        // rest add to the URL's own operations.
+        let presets = std::collections::HashMap::new();
+        let defaults = parse_default_ops("filters:format(webp):blur(2)", &presets).unwrap();
+        let ninety_eight = vec!["filters:invert"; MAX_OPERATIONS - 2].join("/");
+        let (ops, _) = parse_operations(&format!("{ninety_eight}/example.com/i.jpg")).unwrap();
+        assert!(check_operation_count(&merge_default_ops(&defaults, ops)).is_ok());
+        let (ops, _) =
+            parse_operations(&format!("{ninety_eight}/filters:invert/example.com/i.jpg")).unwrap();
+        assert_eq!(
+            check_operation_count(&merge_default_ops(&defaults, ops)),
+            Err(ParseError::TooManyOperations(MAX_OPERATIONS + 1))
+        );
+        // The URL's own format drops the default one, so 98
+        // inverts plus a URL format still fit: the surviving
+        // default blur, 98 inverts, and the format make 100,
+        // where counting the unmerged lists would make 101.
+        let (ops, _) = parse_operations(&format!(
+            "{ninety_eight}/filters:format(png)/example.com/i.jpg"
+        ))
+        .unwrap();
+        assert!(check_operation_count(&merge_default_ops(&defaults, ops)).is_ok());
     }
 
     #[test]

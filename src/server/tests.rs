@@ -2331,6 +2331,12 @@ fn load_error_cases() -> Vec<(LoadError, StatusCode, &'static str, String)> {
             "source fetch failed".to_string(),
         ),
         (
+            LoadError::InvalidSource("a cause".to_string()),
+            StatusCode::BAD_REQUEST,
+            "invalid_source",
+            "invalid source URL".to_string(),
+        ),
+        (
             LoadError::WrongContentType(Some("text/html".to_string())),
             StatusCode::BAD_GATEWAY,
             "source_not_an_image",
@@ -2431,6 +2437,12 @@ fn engine_error_cases() -> Vec<(EngineError, StatusCode, &'static str, String)> 
             "pdf_render_failed",
             "PDF rendering failed".to_string(),
         ),
+        (
+            EngineError::ProvenanceUnavailable("a cause".to_string()),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provenance_unavailable",
+            "provenance signing is unavailable".to_string(),
+        ),
     ]
 }
 
@@ -2470,6 +2482,21 @@ async fn operational_error_classes_carry_stable_codes() {
         let body: serde_json::Value = serde_json::from_str(&error_body_text(resp).await).unwrap();
         assert_eq!(body["error"]["code"], code);
         assert_eq!(body["error"]["message"], message);
+    }
+    // The provenance outage class carries Retry-After in
+    // both modes, and only it among the engine classes
+    // (issue #467).
+    for accept in [None, Some("application/json")] {
+        for (e, ..) in engine_error_cases() {
+            let outage = matches!(e, EngineError::ProvenanceUnavailable(_));
+            let resp = engine_error_response(e, accept);
+            let retry = resp.headers().get(header::RETRY_AFTER);
+            if outage {
+                assert_eq!(retry.unwrap(), "30");
+            } else {
+                assert!(retry.is_none(), "{:?}", resp.status());
+            }
+        }
     }
     // The shed class keeps its Retry-After in both
     // modes.
@@ -2604,7 +2631,7 @@ fn every_error_code_is_documented() {
     // The derivation must find the set it derived
     // today in bulk; a broken extraction fails loudly
     // here instead of vacuously passing. The floor is
-    // on the deduplicated set (63 codes today), so a
+    // on the deduplicated set (66 codes today), so a
     // file dropping out of the scan shows up as codes
     // going missing, not as duplicate slack.
     assert!(
@@ -2625,7 +2652,7 @@ fn every_error_code_is_documented() {
     // documented code the server no longer emits, or
     // one a split moved out of the scan, fails here
     // too. At the time of writing the two sets agree:
-    // 39 documented operational codes, all derived.
+    // 42 documented operational codes, all derived.
     let mut documented: Vec<&str> = Vec::new();
     for line in docs.lines() {
         let Some(rest) = line.trim().strip_prefix("| `") else {
@@ -2770,6 +2797,107 @@ async fn operational_failures_speak_json_when_asked() {
     assert_eq!(json.status(), StatusCode::NOT_IMPLEMENTED);
     let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "not_configured");
+}
+
+#[tokio::test]
+async fn source_text_the_server_cannot_fetch_answers_400_invalid_source() {
+    // Issue #467: a source URL that does not parse, names
+    // a scheme the loader does not fetch, or is a
+    // malformed bucket locator is the caller's fault, so
+    // it answers 400, not the 502 a failing origin gets.
+    // Signed, so the signature is not what fails. The
+    // last two are a segment kind this server does not
+    // know, a prefix and a bare form: they read as source
+    // text and answer the same (spec/url-signing.md,
+    // Versioning).
+    let base = spawn_app(false).await;
+    for source in [
+        "ftp://8.8.8.8/a.jpg",
+        "notaurl",
+        "s3://",
+        "gs://x",
+        "newop:7/https://example.com/a.jpg",
+        "newop/https://example.com/a.jpg",
+    ] {
+        let remainder = format!("100x50/{source}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let plain = client().get(&url).send().await.unwrap();
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::BAD_REQUEST,
+            "invalid_source",
+            "invalid source URL",
+        )
+        .await;
+        // The explain probe goes through the same loader
+        // and answers the same.
+        let url = format!("{base}/explain/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{source}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_source", "{source}");
+    }
+    // Only the first hop is the caller's text: an origin
+    // that redirects to ftp:// is a failing origin, 502.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: ftp://8.8.8.8/a.jpg\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    });
+    let remainder = format!("100x50/http://{addr}/src.png");
+    let url = format!("{base}/{}/{remainder}", sign(&remainder));
+    let json = client()
+        .get(&url)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json.status(), StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "source_fetch_failed");
+}
+
+#[tokio::test]
+async fn an_invalid_source_does_not_fall_back() {
+    // Issue #467: an invalid source is a 400, and a 400
+    // stays honest (docs/responses.md, Fallback image):
+    // the fallback stands in for a source that could not
+    // be fetched or decoded, not for a URL that names
+    // nothing fetchable.
+    let base = spawn_app_with_fallback().await;
+    let remainder = "100x50/notaurl";
+    let url = format!("{base}/{}/{remainder}", sign(remainder));
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(resp.headers().get("x-crabcrop-fallback").is_none());
+    // A source that fails at the origin still falls back.
+    let (src404, _hits) = spawn_counting_server(404, "image/png", test_png()).await;
+    let remainder = format!("100x50/{src404}");
+    let url = format!("{base}/{}/{remainder}", sign(&remainder));
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-crabcrop-fallback").unwrap(), "1");
 }
 
 #[tokio::test]
@@ -6426,15 +6554,14 @@ async fn meta_includes_the_inpaint_record() {
 }
 
 #[tokio::test]
-async fn meta_annotations_reuse_the_requests_ai_permit() {
+async fn ai_render_meta_sections_acquire_the_gate_after_the_render() {
     // A removebg request (AI use) answering meta on a
     // one-permit AI gate: the annotations must not wait
     // out the full gate timeout and silently drop both
-    // the tags and the detections (audit R2-29). They
-    // once ran under the permit the request held for
-    // its render; that permit now drains with the
-    // render job itself, so by annotation time the gate
-    // is free and the sections acquire it directly.
+    // the tags and the detections (audit R2-29). The
+    // render's permit drains with its job, so by
+    // annotation time the gate is free and each section
+    // acquires the one permit in turn.
     let src = spawn_image_server().await;
     let base = spawn_app_with_ai_and_meta().await;
     let remainder = format!("filters:removebg:format(png)/{src}");
@@ -7721,6 +7848,53 @@ async fn preset_responses_carry_the_group_and_group_purge_evicts() {
 }
 
 #[tokio::test]
+async fn sealed_preset_responses_carry_no_cache_group() {
+    // Issue #454: a sealed URL hides its recipe, preset
+    // names included, so neither its miss nor its hit
+    // lists them in Cache-Group. The entry still joins the
+    // group (groups live on the cache entry, not in the
+    // header), so purge-group reaches it, and the plain
+    // spelling of the same render keeps the header.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let remainder = format!("preset:small/{src}");
+    let sealed_url = format!("{base}/{}", sealed_path(&remainder, Some("photo.png")));
+    let resp = client().get(&sealed_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert!(resp.headers().get("cache-group").is_none());
+    let resp = client().get(&sealed_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert!(resp.headers().get("cache-group").is_none());
+    // An entry only ever served sealed is in the group.
+    let sig = crate::url::purge_group_signature(SECRET, "small");
+    let resp = client()
+        .post(format!("{base}/purge-group/{sig}/small"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.text().await.unwrap().contains("purged 1"));
+    let resp = client().get(&sealed_url).send().await.unwrap();
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert!(resp.headers().get("cache-group").is_none());
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // The plain spelling hits the same entry and names
+    // its group.
+    let plain_url = format!("{base}/{}/{remainder}", sign(&remainder));
+    let resp = client().get(&plain_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(header(&resp, "cache-group"), "\"small\"");
+    // And a sealed hit after the plain one still names none.
+    let resp = client().get(&sealed_url).send().await.unwrap();
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert!(resp.headers().get("cache-group").is_none());
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn purge_group_refuses_transplanted_purge_signatures() {
     // Audit R2-14: purge-group verifies under its own
     // subkey, so a per-target purge signature, even one
@@ -8185,14 +8359,17 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
                 .unwrap(),
             )
         }),
-        shared_store: Some(Arc::new(crate::s3store::S3Store::new(
-            "results".into(),
-            String::new(),
-            Some(endpoint.into()),
-            "us-east-1".into(),
-            None,
-            crate::url::entry_key(b"disk-key-test"),
-        ))),
+        shared_store: Some(Arc::new(
+            crate::s3store::S3Store::new(
+                "results".into(),
+                String::new(),
+                Some(endpoint.into()),
+                "us-east-1".into(),
+                None,
+                crate::url::entry_key(b"disk-key-test"),
+            )
+            .unwrap(),
+        )),
         upload: None,
         meta_enabled: true,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -8238,7 +8415,19 @@ fn tier_test_entry() -> CachedImage {
         quality: Some(80),
         groups: Vec::new(),
         etag: crate::cache::etag_for_bytes(b"tier-test-pixels"),
+        written: None,
     }
+}
+
+/// How many cache entry objects the fake bucket holds,
+/// leaving out purge tombstones (issue #461).
+fn entry_objects(fake: &crate::s3store::test_support::FakeS3) -> usize {
+    fake.objects
+        .lock()
+        .unwrap()
+        .keys()
+        .filter(|k| k.ends_with(".bin"))
+        .count()
 }
 
 /// Poll a lookup future exactly once, then drop it:
@@ -8535,6 +8724,272 @@ async fn default_ops_apply_in_presets_only_mode() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
+}
+
+/// GET a signed remainder on the image route (`""`) or
+/// the explain route (`"explain/"`), asking for the JSON
+/// envelope: the status and the parsed body.
+async fn get_signed_json(
+    base: &str,
+    route: &str,
+    remainder: &str,
+) -> (StatusCode, serde_json::Value) {
+    let resp = client()
+        .get(format!("{base}/{route}{}/{remainder}", sign(remainder)))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = serde_json::from_str(&resp.text().await.unwrap()).unwrap_or_default();
+    (status, body)
+}
+
+#[tokio::test]
+async fn over_cap_requests_answer_400_before_any_fetch() {
+    // Issue #469: the cap used to be checked by the engine
+    // alone, after the source was fetched and decoded, so an
+    // over-cap URL cost a fetch, and repeating a preset made
+    // one short to spell. It is checked on the expanded list
+    // at parse time now: every over-cap spelling below
+    // answers 400 on the image and explain routes, and the
+    // counting origin sees no request at all.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let over_cap = [
+        // One segment, one filter past the cap.
+        format!("filters:{}", vec!["invert"; 101].join(":")),
+        // 101 single-operation segments.
+        vec!["30x20"; 101].join("/"),
+        // The issue's evidence: 4,985 preset references, a
+        // path of about 64 KB that expands to 4,985 sizes.
+        vec!["preset:small"; 4_985].join("/"),
+        // Metadata does not count and does not hide the
+        // operations around it.
+        format!(
+            "exp:{}/{}/maxage:60",
+            now_unix() + 3600,
+            vec!["preset:gray"; 101].join("/")
+        ),
+        // The longest single filters segment a URL can carry.
+        format!("filters:{}", vec!["invert"; 9_000].join(":")),
+    ];
+    let counts = [101, 101, 4_985, 101, 9_000];
+    for (ops, count) in over_cap.iter().zip(counts) {
+        let remainder = format!("{ops}/{src}");
+        for route in ["", "explain/"] {
+            let (status, body) = get_signed_json(&base, route, &remainder).await;
+            let label = format!("{route}{}", &ops[..ops.len().min(40)]);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(body["error"]["code"], "unsupported_operation", "{label}");
+            assert_eq!(
+                body["error"]["message"],
+                format!("request has {count} operations, over the 100 operation limit"),
+                "{label}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "an over-cap request fetched its source"
+    );
+    // Without the JSON ask the body is the plain message.
+    let remainder = format!("{}/{src}", over_cap[0]);
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "request has 101 operations, over the 100 operation limit"
+    );
+    // A sealed spelling gets the uniform refusal, also
+    // without a fetch.
+    let resp = client()
+        .get(format!("{base}/{}", sealed_path(&remainder, Some("a.png"))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.text().await.unwrap(), "bad signature");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // Exactly at the cap still renders: the check refuses
+    // only past it, and the server survived the barrage.
+    let at_cap = format!("{}/{src}", vec!["30x20"; 100].join("/"));
+    let resp = get_signed(&base, &at_cap).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn over_cap_counts_the_default_operations_before_any_fetch() {
+    // Issue #469: the cap counts the merged list, defaults
+    // included, on both routes, and a default the URL
+    // overrides is dropped before counting.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_defaults("filters:format(webp)", false).await;
+    // 100 of the URL's own plus the default format: 101.
+    let over = format!("{}/{src}", vec!["filters:invert"; 100].join("/"));
+    for route in ["", "explain/"] {
+        let (status, body) = get_signed_json(&base, route, &over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 101 operations, over the 100 operation limit",
+            "{route}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // 99 plus the default fits.
+    let fits = format!("{}/{src}", vec!["filters:invert"; 99].join("/"));
+    let resp = get_signed(&base, &fits).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // The URL's own format drops the default one, so 99
+    // plus the URL's format is 100, not 101.
+    let own_format = format!(
+        "{}/filters:format(png)/{src}",
+        vec!["filters:invert"; 99].join("/")
+    );
+    let resp = get_signed(&base, &own_format).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+}
+
+#[tokio::test]
+async fn explain_forecasts_the_merged_default_operations() {
+    // The image path runs the defaults merged ahead of the
+    // URL's own operations, so the forecast has to walk
+    // the same list (issue #468): a default format and a
+    // default DPR decide the output the image request
+    // answers with. The operation list stays the URL's own.
+    let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_defaults("filters:format(webp):dpr(2)", false).await;
+    let remainder = format!("50x0/{src}");
+    let sig = sign(&remainder);
+    let explain = client()
+        .get(format!("{base}/explain/{sig}/{remainder}"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(explain.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&explain.text().await.unwrap()).unwrap();
+    assert_eq!(json["forecast"]["format"], "webp");
+    assert_eq!(json["forecast"]["format_from"], "default");
+    assert_eq!(json["forecast"]["width"], 100);
+    assert_eq!(json["forecast"]["height"], 60);
+    let operations = json["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 1, "{operations:?}");
+    assert_eq!(operations[0]["segment"], "50x0");
+    let canonical = json["canonical"].as_str().unwrap();
+    assert!(
+        canonical.starts_with("filters:format(webp):dpr(2)/50x0/"),
+        "{canonical}"
+    );
+    // The image request agrees with the forecast.
+    let image = client()
+        .get(format!("{base}/{sig}/{remainder}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(image.status(), StatusCode::OK);
+    assert_eq!(image.headers().get("content-type").unwrap(), "image/webp");
+    let decoded = image::load_from_memory(&image.bytes().await.unwrap()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (100, 60));
+
+    // The HTML form says where the format came from, and
+    // never that the URL spelled it.
+    let html = client()
+        .get(format!("{base}/explain/{sig}/{remainder}"))
+        .header("Accept", "text/html")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains("<li>Format: webp (from the server's default operations)</li>"),
+        "{html}"
+    );
+    assert!(!html.contains("from the URL"), "{html}");
+
+    // A format the URL names wins over the default, and the
+    // report credits the URL.
+    let remainder = format!("50x0/filters:format(png)/{src}");
+    let sig = sign(&remainder);
+    let body = client()
+        .get(format!("{base}/explain/{sig}/{remainder}"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["forecast"]["format"], "png");
+    assert_eq!(json["forecast"]["format_from"], "operation");
+}
+
+#[tokio::test]
+async fn explain_survives_an_overflowing_forecast() {
+    // A crop-rect takes u32 corners and each upscale
+    // multiplies the running size: the forecast's pixel
+    // count overflowed u64 here and the handler panicked,
+    // dropping the connection (issue #468). It saturates
+    // now, and a saturated count is over the budget.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let sixteen = vec!["upscale(4)"; 16].join(":");
+    for chain in [
+        "crop-rect:0x0:4294967295x4294967295/filters:upscale(2)".to_string(),
+        format!("crop-rect:0x0:4294967295x4294967295/filters:{sixteen}"),
+    ] {
+        let remainder = format!("{chain}/{src}");
+        let sig = sign(&remainder);
+        let resp = client()
+            .get(format!("{base}/explain/{sig}/{remainder}"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{chain}");
+        let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(json["forecast"]["pixels"], u64::MAX, "{chain}");
+        assert_eq!(json["forecast"]["over_budget"], true, "{chain}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let health = client().get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn explain_admits_a_video_source_by_a_default_frame() {
+    // The image path admits a video source when its merged
+    // operations select a frame, a default `frame:`
+    // included. The explain probe admits by the same merged
+    // list (issue #468), so it reports the source the image
+    // request fetches instead of refusing it (on main it
+    // answered 502). The operation list stays the URL's own.
+    let (src, hits) = spawn_counting_server(200, "video/mp4", FAKE_VIDEO_SOURCE.to_vec()).await;
+    let base = spawn_app_with_defaults("frame:1.5", false).await;
+    let remainder = format!("100x0/{src}");
+    let resp = client()
+        .get(format!("{base}/explain/{}/{remainder}", sign(&remainder)))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(json["source"]["kind"], "video");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let operations = json["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 1, "{operations:?}");
+    assert_eq!(operations[0]["segment"], "100x0");
+    let canonical = json["canonical"].as_str().unwrap();
+    assert!(canonical.starts_with("frame:1.5/100x0/"), "{canonical}");
 }
 
 #[tokio::test]
@@ -8835,6 +9290,76 @@ fn still_processed(bytes: Vec<u8>, format: ImageFormat) -> crate::engine::Proces
 }
 
 #[test]
+fn provenance_step_tells_an_authority_outage_from_a_signing_failure() {
+    // Issue #467: a stalled timestamp authority is its
+    // own engine error (a 503 a retry may clear), and a
+    // failure that is not the authority's stays an
+    // encode failure. The bytes here are not the PNG they
+    // claim to be, so that signing fails before the
+    // authority is asked.
+    let (signer, release, staller) = crate::provenance::test_signer_with_a_stalled_authority();
+    let job = provenance_job(Some(signer), false);
+    let source = test_png();
+    let mut processed = still_processed(source.clone(), ImageFormat::Png);
+    let outage = apply_provenance(&job, &source, &mut processed).unwrap_err();
+    let mut garbage = still_processed(b"not a png".to_vec(), ImageFormat::Png);
+    let broken = apply_provenance(&job, &source, &mut garbage).unwrap_err();
+    drop(release);
+    assert_eq!(staller.join().unwrap(), 1, "only the real output asked");
+    assert!(
+        matches!(outage, EngineError::ProvenanceUnavailable(_)),
+        "{outage:?}"
+    );
+    assert!(matches!(broken, EngineError::Encode(_)), "{broken:?}");
+}
+
+#[tokio::test]
+async fn a_stalled_timestamp_authority_answers_503_provenance_unavailable() {
+    // Issue #467: the output rendered, but the authority
+    // signing depends on stopped answering after boot.
+    // That is a dependency outage, not a broken encoder:
+    // 503 provenance_unavailable with Retry-After, not
+    // 500 encode_failed, and within the authority's
+    // bound.
+    let (signer, release, staller) = crate::provenance::test_signer_with_a_stalled_authority();
+    let base = spawn_app_with_provenance_signer(signer).await;
+    let src = spawn_bytes_server(test_png()).await;
+    let remainder = format!("40x24/{src}");
+    let url = format!("{base}/{}/{remainder}", sign(&remainder));
+    let started = std::time::Instant::now();
+    let json = client()
+        .get(&url)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(json.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json.headers().get(header::RETRY_AFTER).unwrap(), "30");
+    let body: serde_json::Value = serde_json::from_str(&json.text().await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "provenance_unavailable");
+    assert_eq!(
+        body["error"]["message"],
+        "provenance signing is unavailable"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "answered at the authority's bound, took {elapsed:?}"
+    );
+    // Errors are never cached: the plain request asks
+    // the authority again and gets the same answer.
+    let plain = client().get(&url).send().await.unwrap();
+    assert_eq!(plain.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(plain.headers().get(header::RETRY_AFTER).unwrap(), "30");
+    assert_eq!(
+        plain.text().await.unwrap(),
+        "provenance signing is unavailable"
+    );
+    drop(release);
+    assert_eq!(staller.join().unwrap(), 2);
+}
+
+#[test]
 fn provenance_step_signs_a_still_and_records_the_facts() {
     let job = provenance_job(Some(crate::provenance::test_signer()), false);
     let source = test_png();
@@ -8936,6 +9461,13 @@ fn provenance_step_without_a_signer_only_verifies() {
 /// An app whose state carries the C2PA test signing
 /// identity (issue #173).
 async fn spawn_app_with_signer() -> String {
+    spawn_app_with_provenance_signer(crate::provenance::test_signer()).await
+}
+
+/// An app that signs its outputs with `signer`.
+async fn spawn_app_with_provenance_signer(
+    signer: Arc<crate::provenance::ProvenanceSigner>,
+) -> String {
     let state = AppState {
         keyring: crate::url::Keyring::single(SECRET.to_vec()),
         allow_unsafe: false,
@@ -8985,7 +9517,7 @@ async fn spawn_app_with_signer() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
-        provenance_signer: Some(crate::provenance::test_signer()),
+        provenance_signer: Some(signer),
         config_fingerprint: "test".to_string(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9681,7 +10213,23 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
         worst, 1,
         "live jobs must never exceed the lane permit count; log: {log}"
     );
-    assert_eq!(state.slow_gate.available_permits(), 1);
+    // The encoder logs its end marker before it exits,
+    // and the detached job drops its permit only after
+    // the encode returns, so the permit can still be
+    // out for a moment after the second "E" lands. Wait
+    // for it the way the drain test above does.
+    let mut back = false;
+    for _ in 0..200 {
+        if state.slow_gate.available_permits() == 1 {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        back,
+        "the slow-lane permit must return when the second job drains"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -9830,7 +10378,7 @@ async fn a_timed_out_annotation_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        annotate_meta(&state, &processed, false),
+        annotate_meta(&state, &processed),
     )
     .await
     .is_err();
@@ -9851,7 +10399,7 @@ async fn a_timed_out_moderation_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        moderate_meta(&state, &processed, false),
+        moderate_meta(&state, &processed),
     )
     .await
     .is_err();
@@ -9871,11 +10419,61 @@ async fn a_timed_out_detection_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        detect_meta(&state, &processed, false),
+        detect_meta(&state, &processed),
     )
     .await
     .is_err();
     assert_meta_slot_drains_with_inference(&state, &release, timed_out).await;
+}
+
+#[tokio::test]
+async fn meta_sections_never_run_inference_without_an_ai_permit() {
+    // Every meta section acquires its own AI permit; none
+    // runs under one the request claims to hold (issue
+    // #456). With the gate's only permit held elsewhere,
+    // each section degrades after the gate wait instead
+    // of reaching its provider: tags and detections are
+    // omitted, and the explicit-outcome sections report
+    // "busy". Once the permit returns, the same sections
+    // answer, so the degrade is the gate's doing.
+    let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
+    state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    state.tagger = Some(Arc::new(FakeTagger));
+    state.detect = Some(Arc::new(FakeDetector));
+    state.moderation = Some(Arc::new(FakeModeration));
+    state.embeddings = Some(Arc::new(FakeEmbedding));
+    state.ocr = Some(Arc::new(FakeOcr));
+    let processed = still_processed(test_png(), ImageFormat::Png);
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let held = state.ai_gate.clone().acquire_owned().await.unwrap();
+    let (tags, boxes, moderation, embedding, ocr) = tokio::join!(
+        annotate_meta(&state, &processed),
+        detect_meta(&state, &processed),
+        moderate_meta(&state, &processed),
+        embed_meta(&state, &processed),
+        ocr_meta(&state, &processed, deadline),
+    );
+    assert!(tags.is_none(), "tags ran without a permit");
+    assert!(boxes.is_none(), "detections ran without a permit");
+    assert_eq!(moderation, ModerationMeta::Unavailable("busy"));
+    assert_eq!(embedding, EmbeddingMeta::Unavailable("busy"));
+    assert_eq!(ocr, OcrMeta::Unavailable("busy"));
+    drop(held);
+    assert!(annotate_meta(&state, &processed).await.is_some());
+    assert!(detect_meta(&state, &processed).await.is_some());
+    assert!(matches!(
+        moderate_meta(&state, &processed).await,
+        ModerationMeta::Report(_)
+    ));
+    assert!(matches!(
+        embed_meta(&state, &processed).await,
+        EmbeddingMeta::Report(_)
+    ));
+    assert!(matches!(
+        ocr_meta(&state, &processed, deadline).await,
+        OcrMeta::Report(_)
+    ));
+    assert_eq!(state.ai_gate.available_permits(), 1);
 }
 
 /// A state for the slow-lane tests (issue #324): the
@@ -11571,6 +12169,54 @@ async fn meta_mode_disabled_refuses_meta_and_still_serves_the_render() {
 }
 
 #[tokio::test]
+async fn the_meta_disabled_refusal_is_never_publicly_cacheable() {
+    // Issue #453: with meta mode off by default, any viewer
+    // can make the server answer 403 for a URL by sending
+    // the meta Accept. Some CDNs cache a 403 that carries
+    // no caching headers (CloudFront's error caching keeps
+    // it 10 seconds), and the response would then be served
+    // to every image viewer. The refusal carries the meta
+    // document's headers, plain and sealed alike, and the
+    // sealed one keeps the uniform status and body.
+    let src = spawn_bytes_server(test_png()).await;
+    let base = spawn_app_with_meta_enabled(false).await;
+    let remainder = format!("100x0/{src}");
+    let plain = format!("{base}/{}/{remainder}", sign(&remainder));
+    let sealed_url = format!("{base}/{}", sealed_path(&remainder, Some("photo.png")));
+    for (url, sealed) in [(&plain, false), (&sealed_url, true)] {
+        let resp = client()
+            .get(url)
+            .header("Accept", "image/avif, application/json; placeholders=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{url}");
+        assert_eq!(
+            resp.headers()[header::CACHE_CONTROL],
+            "private, no-store",
+            "{url}"
+        );
+        let vary = resp.headers()[header::VARY].to_str().unwrap().to_string();
+        assert!(vary.starts_with("Accept,"), "{url}: {vary}");
+        let body = resp.text().await.unwrap();
+        if sealed {
+            assert_eq!(body, "bad signature");
+        } else {
+            assert!(body.contains(r#""code":"meta_disabled""#), "{body}");
+        }
+    }
+    // The plain refusal tells the caller how meta turns on.
+    let resp = client()
+        .get(&plain)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("CRABCROP_META_MODE=1"), "{body}");
+}
+
+#[tokio::test]
 async fn a_provider_free_smart_crop_never_touches_the_ai_gate() {
     // Issue #379 at the HTTP level: the app has no
     // face or focal provider and an AI gate with no
@@ -12102,8 +12748,9 @@ async fn purge_during_a_render_keeps_the_entry_out_of_every_tier() {
     // Give the background shared-tier write every
     // chance to land: it must never appear.
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    assert!(
-        fake.objects.lock().unwrap().is_empty(),
+    assert_eq!(
+        entry_objects(&fake),
+        0,
         "the shared tier holds the purged render"
     );
     let on_disk = std::fs::read_dir(&dir)
@@ -12192,6 +12839,7 @@ struct WalkFixture {
     dir: std::path::PathBuf,
     hits: Arc<AtomicUsize>,
     probe: AppState,
+    server: tokio::task::JoinHandle<()>,
     base: String,
     url: String,
     object: String,
@@ -12210,7 +12858,7 @@ impl WalkFixture {
         let probe = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             axum::serve(listener, app(state)).await.unwrap();
         });
         let preset = format!("preset:small/{src}");
@@ -12254,12 +12902,43 @@ impl WalkFixture {
             dir,
             hits,
             probe,
+            server,
             base,
             url,
             object,
             key,
             stale,
         }
+    }
+
+    /// Whether the bucket copy is the stale one.
+    fn bucket_holds_stale(&self) -> bool {
+        self.fake
+            .objects
+            .lock()
+            .unwrap()
+            .get(&self.object)
+            .and_then(|data| {
+                crate::storage::parse_entry(data, &crate::url::entry_key(b"disk-key-test"))
+            })
+            .is_some_and(|(_, image)| image.etag == self.stale.etag)
+    }
+
+    /// Put the stale copy back in the bucket, as the walk
+    /// left it: unreached.
+    async fn restore_stale_bucket_copy(&self) {
+        let shared = self.probe.shared_store.clone().unwrap();
+        shared.put(&self.key, &self.stale).await;
+        assert!(self.bucket_holds_stale());
+    }
+
+    /// A replica over the fixture's bucket that did not
+    /// receive the purge, with its own disk tier at `dir`
+    /// when given.
+    fn other_replica(&self, dir: Option<&std::path::Path>) -> AppState {
+        let mut state = tier_test_state(dir, &self.fake.endpoint);
+        state.presets = preset_test_map();
+        state
     }
 
     /// Purge group `small` and wait until its background
@@ -12352,7 +13031,7 @@ async fn lookups_during_a_background_purge_walk_do_not_resurrect_the_entry() {
             .lock()
             .unwrap()
             .iter()
-            .any(|r| r == &format!("DELETE {}", fx.object)),
+            .any(|r| r == &format!("DELETE {} if-match", fx.object)),
         "the lookup did not delete the purged bucket copy"
     );
     fx.finish_walk().await;
@@ -12425,11 +13104,220 @@ async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
     shared.put(key, &tier_test_entry()).await;
     assert!(lookup_tiers(&state, key, &[]).await.is_none());
     assert!(shared.get(key).await.is_none());
+    // A copy rendered after the purge began is not
+    // covered (issue #446): it serves while the purge runs.
+    let fresh = CachedImage {
+        written: Some(state.purge_guard.stamp()),
+        ..tier_test_entry()
+    };
+    shared.put(key, &fresh).await;
+    let (_, status) = lookup_tiers(&state, key, &[]).await.unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
     drop(active);
+    // Once the purge has ended, its tombstone still covers
+    // copies older than it for the grace period (issue
+    // #461), but not fresh ones.
+    state.cache.remove(key);
+    store.remove(key);
     shared.put(key, &tier_test_entry()).await;
+    assert!(lookup_tiers(&state, key, &[]).await.is_none());
+    shared.put(key, &fresh).await;
     let (_, status) = lookup_tiers(&state, key, &[]).await.unwrap();
     assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_render_after_a_purge_began_keeps_caching_during_the_walk() {
+    // Issue #446: while a purge's background walk runs,
+    // the receiving server treated every disk or bucket
+    // copy the purge covers as purged, including copies
+    // rendered after the purge began: each lookup deleted
+    // the fresh render and rendered again, and the walk
+    // deleted (and counted) the render too. A copy written
+    // after the purge began now keeps serving from every
+    // persistent tier, and the walk leaves it in place.
+    let fx = WalkFixture::new("walk-fresh").await;
+    fx.purge_and_park_walk().await;
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    let fresh = header(&resp, "etag");
+    assert_ne!(fresh, fx.stale.etag);
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+    let shared = fx.probe.shared_store.clone().unwrap();
+    let store = fx.probe.store.clone().unwrap();
+    // The render's write-through lands in the bucket.
+    for _ in 0..250 {
+        if shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh));
+    let deletes = || {
+        fx.fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with(&format!("DELETE {}", fx.object)))
+            .count()
+    };
+    let deletes_after_render = deletes();
+    // With memory cleared, the next lookup hits the disk
+    // tier, while the walk is still parked...
+    fx.probe.cache.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"disk\""
+    );
+    assert_eq!(header(&resp, "etag"), fresh);
+    // ...and with the disk copy gone too, the bucket.
+    fx.probe.cache.remove(&fx.key);
+    store.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"shared\""
+    );
+    assert_eq!(header(&resp, "etag"), fresh);
+    assert_eq!(
+        fx.hits.load(Ordering::SeqCst),
+        2,
+        "a fresh copy re-rendered"
+    );
+    assert_eq!(
+        fx.probe.purge_guard.active_count(),
+        1,
+        "the walk ended early"
+    );
+    // The walk then reaches the object, reads a copy
+    // written after the purge began, and leaves it: no
+    // delete, so nothing counted.
+    fx.finish_walk().await;
+    assert_eq!(deletes(), deletes_after_render);
+    assert!(shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh));
+    fx.probe.cache.remove(&fx.key);
+    store.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"shared\""
+    );
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
+    // Issue #461: the guard that kept a purge effective
+    // during its walk lived only in memory, and so did the
+    // walk's remainder. A restart mid-walk lost both: the
+    // unreached bucket copy then served again on every
+    // replica, the receiving one included. The purge's
+    // tombstone in the bucket now keeps it effective.
+    let fx = WalkFixture::new("walk-restart").await;
+    // A replica already running, which never receives the
+    // purge: it read the bucket's tombstones at boot.
+    let running = fx.other_replica(None);
+    start_purge_tombstones(&running).await;
+    fx.purge_and_park_walk().await;
+    // The receiving server stops mid-walk: its memory, its
+    // guard, and the walk's remainder are gone. The bucket
+    // still holds the unreached copy and the tombstone, not
+    // marked ended.
+    fx.server.abort();
+    assert!(fx.bucket_holds_stale());
+    let tombstone = {
+        let objects = fx.fake.objects.lock().unwrap();
+        let (_, data) = objects
+            .iter()
+            .find(|(name, _)| name.starts_with("purges/"))
+            .expect("the purge left a tombstone in the bucket");
+        crate::storage::parse_tombstone(data, &crate::url::entry_key(b"disk-key-test")).unwrap()
+    };
+    assert_eq!(
+        tombstone.target,
+        crate::cache::PurgeTarget::Group("small".into())
+    );
+    assert_eq!(tombstone.ended_ms, None);
+    // The running replica learns the purge at its next
+    // refresh and misses on the unreached copy.
+    let shared = running.shared_store.clone().unwrap();
+    assert!(shared.refresh_tombstones(&running.purge_guard).await);
+    assert!(lookup_tiers(&running, &fx.key, &[]).await.is_none());
+    assert!(
+        !fx.bucket_holds_stale(),
+        "the copy was not removed on sight"
+    );
+    // A replica that boots after the purge, with a disk of
+    // its own that kept a pre-purge copy, misses on both.
+    fx.restore_stale_bucket_copy().await;
+    let other_dir = fx.dir.with_extension("other");
+    let _ = std::fs::remove_dir_all(&other_dir);
+    let booted = fx.other_replica(Some(&other_dir));
+    let booted_disk = booted.store.clone().unwrap();
+    booted_disk.put(&fx.key, &fx.stale);
+    start_purge_tombstones(&booted).await;
+    assert!(lookup_tiers(&booted, &fx.key, &[]).await.is_none());
+    assert!(booted_disk.get(&fx.key).is_none(), "the disk copy survived");
+    assert!(!fx.bucket_holds_stale(), "the bucket copy survived");
+    let _ = std::fs::remove_dir_all(&other_dir);
+    // The restarted receiving server, over the same disk
+    // and bucket with fresh memory, misses on the purged
+    // URL and renders it again from the origin.
+    fx.restore_stale_bucket_copy().await;
+    let restarted = fx.other_replica(Some(&fx.dir));
+    start_purge_tombstones(&restarted).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app(restarted)).await.unwrap();
+    });
+    let url = fx.url.replace(&fx.base, &base);
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_ne!(header(&resp, "etag"), fx.stale.etag);
+    assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+    assert!(!fx.bucket_holds_stale());
+}
+
+#[tokio::test]
+async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
+    // Issue #461: a replica that held a copy from before
+    // another replica's purge must not write it back to
+    // the shared tier once it knows the purge, or the copy
+    // would outlive the walk that removed it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let holder = tier_test_state(None, &fake.endpoint);
+    let purger = tier_test_state(None, &fake.endpoint);
+    let key = "40x24/example.com/i.png#cfgtest";
+    holder.cache.put(key.to_string(), tier_test_entry());
+    let (active, tombstone) = begin_purge(
+        &purger,
+        crate::cache::PurgeTarget::Key("40x24/example.com/i.png".into()),
+    )
+    .await;
+    assert!(tombstone.is_some());
+    let shared = holder.shared_store.clone().unwrap();
+    assert!(shared.refresh_tombstones(&holder.purge_guard).await);
+    // The memory hit still serves (another process's
+    // memory is out of a purge's reach), but the group it
+    // learns does not carry the copy back to the bucket.
+    let (_, status) = lookup_tiers(&holder, key, &["thumb".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(status, "crabcrop; hit");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        entry_objects(&fake),
+        0,
+        "the pre-purge copy was written back"
+    );
+    drop(active);
 }
 
 /// An app over a disk tier under a chosen
@@ -12724,6 +13612,58 @@ async fn upload_rejects_names_that_misstate_the_media() {
 }
 
 #[tokio::test]
+async fn undocumented_formats_fail_as_sources_and_uploads() {
+    // Issue #466: the image crate's long-tail decoders are
+    // not compiled in, and a HEIF file coded with anything
+    // but HEVC is refused before decoding. As a source each
+    // sample is a 502 decode_failed; as an upload it is a
+    // 415 whatever name it claims, and nothing is stored.
+    let mut samples = crate::engine::test_formats::undocumented_samples();
+    samples.push(("av1-in-mif1", crate::engine::test_formats::av1_in_mif1()));
+    let base = spawn_app(false).await;
+    for (kind, bytes) in &samples {
+        let src = spawn_bytes_server(bytes.clone()).await;
+        let remainder = format!("100x50/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let resp = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{kind}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "decode_failed", "{kind}");
+    }
+    let dir = upload_dir("long-tail");
+    let base = spawn_app_with_upload(&dir, 10 * 1024 * 1024, false).await;
+    for (kind, bytes) in &samples {
+        for name in [
+            format!("{kind}/promo.html"),
+            format!("{kind}/page.svg"),
+            format!("{kind}/x.png"),
+            format!("{kind}/plain"),
+        ] {
+            let sig = crate::url::upload_signature(SECRET, &name);
+            let resp = client()
+                .put(format!("{base}/upload/{sig}/{name}"))
+                .body(bytes.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{name}");
+            let text = resp.text().await.unwrap();
+            assert!(
+                text.contains("not an image this server can decode"),
+                "{name}: {text}"
+            );
+            assert!(!dir.join(&name).exists(), "{name}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn concurrent_uploads_to_one_new_name_create_exactly_once() {
     // Two signed PUTs racing for one new name with
     // overwriting off: exactly one creates, the other
@@ -12814,20 +13754,121 @@ async fn upload_validation_is_shed_when_the_gate_stays_saturated() {
 }
 
 #[tokio::test]
-async fn upload_route_is_absent_when_not_configured() {
-    // The plain test app has no upload destination:
-    // the PUT route was never registered, so this is
-    // a 404 (no upload surface at all), not a 403.
+async fn uploads_answer_uploads_not_configured_without_a_destination() {
+    // Issue #467: the plain test app has no upload
+    // destination. The route still exists and says why
+    // it refuses, 404 uploads_not_configured, before it
+    // looks at the signature, so a bad one gets the same
+    // answer. A PUT anywhere else stays a plain
+    // not_found.
     let base = spawn_app(false).await;
     let name = "cat.png";
     let sig = crate::url::upload_signature(SECRET, name);
+    for sig in [sig.as_str(), "0000", "deadbeef"] {
+        let url = format!("{base}/upload/{sig}/{name}");
+        let plain = client().put(&url).body(test_png()).send().await.unwrap();
+        let json = client()
+            .put(&url)
+            .header("accept", "application/json")
+            .body(test_png())
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::NOT_FOUND,
+            "uploads_not_configured",
+            "uploads are not configured",
+        )
+        .await;
+    }
+    let resp = client()
+        .put(format!("{base}/elsewhere/{name}"))
+        .header("accept", "application/json")
+        .body(test_png())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn an_upload_body_read_error_is_a_400_not_a_413() {
+    // Issue #467: only the cap is a size answer. These
+    // are signed, valid-name uploads well under the cap
+    // whose bodies cannot be read to their end: hostile
+    // chunked framings (a chunk size that is not hex, one
+    // that overflows, a chunk longer than it declared) and
+    // an aborted body. Each answered 413 upload_too_large
+    // before; each answers 400 upload_unreadable, stores
+    // nothing, and leaves the server serving.
+    let dir = upload_dir("unreadable");
+    let base = spawn_app_with_upload(&dir, 1024 * 1024, false).await;
+    let addr = base.trim_start_matches("http://").to_string();
+    let name = "torn.png";
+    let sig = crate::url::upload_signature(SECRET, name);
+    let framings: [&[u8]; 3] = [
+        b"zz\r\nabc\r\n0\r\n\r\n",
+        b"ffffffffffffffffffffffff\r\nabc\r\n0\r\n\r\n",
+        b"3\r\nabcdef\r\n0\r\n\r\n",
+    ];
+    for framing in framings {
+        let mut socket = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "PUT /upload/{sig}/{name} HTTP/1.1\r\nHost: {addr}\r\n\
+             Accept: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(framing).await.unwrap();
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            socket.read_to_end(&mut reply),
+        )
+        .await;
+        let reply = String::from_utf8_lossy(&reply);
+        let shown = String::from_utf8_lossy(framing);
+        assert!(reply.starts_with("HTTP/1.1 400 "), "{shown:?}: {reply}");
+        assert!(
+            reply.contains("\"upload_unreadable\""),
+            "{shown:?}: {reply}"
+        );
+        assert!(!dir.join(name).exists(), "{shown:?}");
+    }
+    // An aborted body: a client that declares a length,
+    // sends part of it, and shuts its half of the
+    // connection. Same answer, nothing stored.
+    let mut socket = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!(
+        "PUT /upload/{sig}/{name} HTTP/1.1\r\nHost: {addr}\r\n\
+         Accept: application/json\r\nContent-Length: 4096\r\n\r\n"
+    );
+    socket.write_all(head.as_bytes()).await.unwrap();
+    socket.write_all(&test_png()[..32]).await.unwrap();
+    socket.shutdown().await.unwrap();
+    let mut reply = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.read_to_end(&mut reply),
+    )
+    .await;
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.starts_with("HTTP/1.1 400 "), "{reply}");
+    assert!(reply.contains("\"upload_unreadable\""), "{reply}");
+    assert!(!dir.join(name).exists());
+    // The server is still serving, and the same name
+    // uploads cleanly once.
     let resp = client()
         .put(format!("{base}/upload/{sig}/{name}"))
         .body(test_png())
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -12968,6 +14009,83 @@ async fn negotiates_avif_from_accept() {
     );
     let body = resp.bytes().await.unwrap();
     assert_eq!(&body[4..8], b"ftyp");
+}
+
+/// A float TIFF source (Rgb32F samples) renders to PNG, plain
+/// and interlaced, and to AVIF, named or negotiated from a
+/// browser's `Accept` (issue #464). Each of these was a 500
+/// `encode_failed`: the encoders take no float samples.
+#[tokio::test]
+async fn float_sources_render_to_png_and_avif() {
+    let float = DynamicImage::ImageRgb32F(image::Rgb32FImage::from_fn(64, 48, |x, y| {
+        image::Rgb([x as f32 / 63.0, y as f32 / 47.0, 0.5])
+    }));
+    let mut tiff = Vec::new();
+    float
+        .write_to(
+            &mut std::io::Cursor::new(&mut tiff),
+            image::ImageFormat::Tiff,
+        )
+        .unwrap();
+    let src = spawn_bytes_server(tiff).await;
+    let base = spawn_app(false).await;
+    for (ops, accept, content_type) in [
+        ("filters:format(png)", None, "image/png"),
+        ("filters:format(png,interlace)", None, "image/png"),
+        ("filters:format(avif)", None, "image/avif"),
+        ("32x0", Some("image/avif,image/webp,*/*"), "image/avif"),
+    ] {
+        let remainder = format!("{ops}/{src}");
+        let mut request = client().get(format!("{base}/{}/{remainder}", sign(&remainder)));
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{ops}");
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            content_type,
+            "{ops}"
+        );
+        let body = resp.bytes().await.unwrap();
+        if content_type == "image/png" {
+            let decoded = image::load_from_memory(&body).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (64, 48), "{ops}");
+            assert_eq!(decoded.to_rgb16(), float.to_rgb16(), "{ops}");
+        }
+    }
+}
+
+/// A multi-digit zero side (`00x100`) is valid grammar that
+/// asks for an empty image: a `400 unsupported_operation` in
+/// both error modes, where it was a 500 from the encoder
+/// (issue #464). DPR and fit-in used to round it up to a
+/// 1-pixel render instead.
+#[tokio::test]
+async fn zero_pixel_sides_answer_400() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(false).await;
+    let message =
+        "requested size has a zero pixel side; write 0 alone for a proportional or unbounded axis";
+    for ops in ["00x100", "100x00", "00x100/filters:dpr(2)", "fit-in:00x100"] {
+        let remainder = format!("{ops}/{src}");
+        let url = format!("{base}/{}/{remainder}", sign(&remainder));
+        let plain = client().get(&url).send().await.unwrap();
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::BAD_REQUEST,
+            "unsupported_operation",
+            message,
+        )
+        .await;
+    }
 }
 
 #[test]
@@ -13217,6 +14335,101 @@ async fn metrics_require_the_configured_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let resp = metrics_response(&base).await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn metrics_bearer_scheme_is_case_insensitive() {
+    // Issue #454: the auth scheme is case-insensitive
+    // (RFC 9110), so every casing of `Bearer` reaches the
+    // token check. The token itself stays case-sensitive.
+    let base = spawn_app(false).await;
+    for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+        let resp = client()
+            .get(format!("{base}/metrics"))
+            .header("authorization", format!("{scheme} {TEST_METRICS_TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{scheme}");
+    }
+    let resp = client()
+        .get(format!("{base}/metrics"))
+        .header(
+            "authorization",
+            format!("bearer {}", TEST_METRICS_TOKEN.to_ascii_uppercase()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn metrics_refuse_wrong_and_hostile_authorization() {
+    // Issue #454: a wrong token answers the same 401
+    // whether or not its length matches the configured
+    // token's, malformed headers answer it too, and the
+    // server keeps serving the real token afterwards.
+    let base = spawn_app(false).await;
+    let same_length = {
+        let mut t = TEST_METRICS_TOKEN.as_bytes().to_vec();
+        let last = t.len() - 1;
+        t[last] ^= 1;
+        String::from_utf8(t).unwrap()
+    };
+    assert_eq!(same_length.len(), TEST_METRICS_TOKEN.len());
+    assert_ne!(same_length, TEST_METRICS_TOKEN);
+    let shorter = &TEST_METRICS_TOKEN[..TEST_METRICS_TOKEN.len() - 1];
+    let longer = format!("{TEST_METRICS_TOKEN}x");
+    let huge = "a".repeat(8 * 1024);
+    let mut values: Vec<axum::http::HeaderValue> = [
+        format!("Bearer {same_length}"),
+        format!("Bearer {shorter}"),
+        format!("Bearer {longer}"),
+        format!("Bearer {huge}"),
+        "Bearer x".to_string(),
+        "Bearer".to_string(),
+        format!("Bearer{TEST_METRICS_TOKEN}"),
+        format!("Bearer\t{TEST_METRICS_TOKEN}"),
+        format!("Bearerx {TEST_METRICS_TOKEN}"),
+        format!("Basic {TEST_METRICS_TOKEN}"),
+        format!("{TEST_METRICS_TOKEN} Bearer"),
+        TEST_METRICS_TOKEN.to_string(),
+    ]
+    .iter()
+    .map(|v| axum::http::HeaderValue::from_str(v).unwrap())
+    .collect();
+    // Not UTF-8: the header cannot be read as text at all.
+    let mut raw = b"Bearer \xff".to_vec();
+    raw.extend_from_slice(TEST_METRICS_TOKEN.as_bytes());
+    values.push(axum::http::HeaderValue::from_bytes(&raw).unwrap());
+    for value in values {
+        let resp = client()
+            .get(format!("{base}/metrics"))
+            .header("accept", "application/json")
+            .header("authorization", value.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{value:?}");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "metrics_unauthorized", "{value:?}");
+    }
+    let resp = metrics_response(&base).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[test]
+fn token_eq_matches_only_the_exact_token_at_any_length() {
+    // Issue #454: equality is unchanged by comparing
+    // digests; only the timing stopped depending on the
+    // presented length.
+    assert!(token_eq(b"secret-token", b"secret-token"));
+    assert!(!token_eq(b"secret-token", b"secret-tokem"));
+    assert!(!token_eq(b"secret-token", b"secret-toke"));
+    assert!(!token_eq(b"secret-toke", b"secret-token"));
+    assert!(!token_eq(b"", b"secret-token"));
+    assert!(!token_eq(&[0u8; 4096], b"secret-token"));
 }
 
 #[tokio::test]

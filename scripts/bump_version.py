@@ -3,122 +3,20 @@
 
 Usage: python3 scripts/bump_version.py 0.2.0 [--dry-run]
 
-Edits each version site in place (the same sites check_versions.py reads),
-then runs the check. Cargo.lock files are refreshed by the next cargo
-command; the release workflow builds with --locked after the tag's own
-lockfile update commit (see RELEASING.md).
+Edits each site listed in scripts/version_sites.py in place, the list
+check_versions.py reads, then runs the check. The sites include the
+lockfiles' own entries (the crabcrop and crabcrop-url packages in
+Cargo.lock and fuzz/Cargo.lock, the version and linked @crabcrop/url
+fields of every package-lock.json), so no lockfile refresh follows, and
+on a minor bump the server's crabcrop-url requirement. A site that is
+not where the list says (a pin count that changed, a field gone) stops
+the bump before anything is written.
 """
 import re
 import subprocess
 import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-
-CARGO_FILES = ["Cargo.toml", "crates/crabcrop-url/Cargo.toml"]
-JSON_FILES = [
-    "sdks/typescript/package.json",
-    "sdks/mcp/package.json",
-    "frameworks/nextjs/package.json",
-    "frameworks/nuxt/package.json",
-    "frameworks/hydrogen/package.json",
-    "frameworks/astro/package.json",
-    "frameworks/sveltekit/package.json",
-]
-
-
-def sub_once(rel, pattern, repl, flags=0):
-    path = ROOT / rel
-    text = path.read_text(encoding="utf-8")
-    new, count = re.subn(pattern, repl, text, count=1, flags=flags)
-    if count != 1:
-        raise SystemExit(f"{rel}: version pattern matched {count} times, expected 1")
-    return new
-
-
-def read_text(rel):
-    return (ROOT / rel).read_text(encoding="utf-8")
-
-
-def edits(version):
-    out = {}
-    for rel in CARGO_FILES:
-        out[rel] = sub_once(
-            rel,
-            r'(\[package\][^\[]*?^version\s*=\s*")[^"]+(")',
-            rf"\g<1>{version}\g<2>",
-            re.S | re.M,
-        )
-    for rel in JSON_FILES:
-        out[rel] = sub_once(rel, r'("version":\s*")[^"]+(")', rf"\g<1>{version}\g<2>")
-    out["sdks/python/pyproject.toml"] = sub_once(
-        "sdks/python/pyproject.toml",
-        r'(\[project\][^\[]*?^version\s*=\s*")[^"]+(")',
-        rf"\g<1>{version}\g<2>",
-        re.S | re.M,
-    )
-    out["sdks/mcp/src/index.ts"] = sub_once(
-        "sdks/mcp/src/index.ts",
-        r'(const SERVER = \{ name: "crabcrop", version: ")[^"]+(")',
-        rf"\g<1>{version}\g<2>",
-    )
-    # server.json carries the version twice: the manifest
-    # itself and its npm package entry. Both must move.
-    manifest = read_text("sdks/mcp/server.json")
-    manifest, count = re.subn(
-        r'("version":\s*")[^"]+(")', rf"\g<1>{version}\g<2>", manifest
-    )
-    if count != 2:
-        raise SystemExit(f"sdks/mcp/server.json: version matched {count} times, expected 2")
-    out["sdks/mcp/server.json"] = manifest
-    out["plugins/wordpress/crabcrop.php"] = sub_once(
-        "plugins/wordpress/crabcrop.php",
-        r"(\* Version:\s+)[0-9]+\.[0-9]+\.[0-9]+",
-        rf"\g<1>{version}",
-    )
-    chart = sub_once(
-        "deploy/helm/crabcrop/Chart.yaml", r"^version:\s*\S+", f"version: {version}", re.M
-    )
-    path = ROOT / "deploy/helm/crabcrop/Chart.yaml"
-    chart, count = re.subn(
-        r'^appVersion:\s*"[^"]+"', f'appVersion: "{version}"', chart, count=1, flags=re.M
-    )
-    if count != 1:
-        raise SystemExit("Chart.yaml: appVersion matched 0 times")
-    out["deploy/helm/crabcrop/Chart.yaml"] = chart
-    # The deploy pins (issue #383): the image tags in the
-    # chart values, the kustomize base and AI component,
-    # and the platform guides. Every occurrence moves;
-    # check_versions.py reads the same sites and would
-    # fail the bump otherwise.
-    values = read_text("deploy/helm/crabcrop/values.yaml")
-    values, count = re.subn(r'(?m)^(\s+tag: ")[^"]+(")', rf"\g<1>{version}\g<2>", values)
-    if count != 2:
-        raise SystemExit(f"values.yaml: tag matched {count} times, expected 2")
-    out["deploy/helm/crabcrop/values.yaml"] = values
-    for rel, image in (
-        ("deploy/kustomize/base/deployment.yaml", "crabcrop"),
-        ("deploy/kustomize/components/ai/deployment-patch.yaml", "crabcrop-ai"),
-    ):
-        out[rel] = sub_once(
-            rel,
-            rf"(image: ghcr\.io/dayvson/{image}:)\S+",
-            rf"\g<1>{version}",
-        )
-    for rel in (
-        "deploy/cloud-run/README.md",
-        "deploy/container-apps/README.md",
-        "deploy/ecs-fargate/README.md",
-        "deploy/helm/crabcrop/README.md",
-    ):
-        text = read_text(rel)
-        text, count = re.subn(
-            r"(crabcrop(?:-ai)?:)\d+\.\d+\.\d+", rf"\g<1>{version}", text
-        )
-        if count < 1:
-            raise SystemExit(f"{rel}: no image pin found to bump")
-        out[rel] = text
-    return out
+import version_sites
 
 
 def main():
@@ -127,15 +25,21 @@ def main():
     if len(args) != 1 or not re.fullmatch(r"\d+\.\d+\.\d+", args[0]):
         raise SystemExit("usage: bump_version.py X.Y.Z [--dry-run]")
     version = args[0]
-    for rel, new in edits(version).items():
+    changed, problems = version_sites.bump(version)
+    if problems:
+        print("cannot bump; nothing was written:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+    for rel, text in changed.items():
         if dry:
             print(f"would update {rel}")
         else:
-            (ROOT / rel).write_text(new, encoding="utf-8")
+            (version_sites.ROOT / rel).write_text(text, encoding="utf-8")
             print(f"updated {rel}")
     if dry:
         return 0
-    return subprocess.call([sys.executable, str(ROOT / "scripts/check_versions.py")])
+    return subprocess.call([sys.executable, str(version_sites.ROOT / "scripts/check_versions.py")])
 
 
 if __name__ == "__main__":

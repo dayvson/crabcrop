@@ -32,6 +32,7 @@
 //! Context API from the start because the convenience
 //! constructors are removed in 0.92.
 
+use std::cell::Cell;
 use std::io::Cursor;
 use std::time::Duration;
 
@@ -93,15 +94,16 @@ fn tsa_agent(connect: Duration, total: Duration) -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-/// The SDK signer with its timestamp request sent through
-/// the timed agent (issue #397). `create_signer::from_keys`
-/// returns a signer that leaves `send_timestamp_request`
-/// to the trait default, and that default builds a fresh
-/// `Context::new()`, whose resolver has no timeout at all,
-/// whatever context the builder signs under. So the
-/// builder's context never reached the one call that
-/// talks to the authority. This wrapper overrides that
-/// call and delegates everything else unchanged.
+/// The SDK signer and the timed agent its timestamp
+/// requests go through (issue #397).
+/// `create_signer::from_keys` returns a signer that leaves
+/// `send_timestamp_request` to the trait default, and that
+/// default builds a fresh `Context::new()`, whose resolver
+/// has no timeout at all, whatever context the builder
+/// signs under. So the builder's context never reached the
+/// one call that talks to the authority. Each signing pass
+/// signs through a [`SignPass`], which overrides that call
+/// and delegates everything else unchanged.
 struct TimedSigner {
     inner: c2pa::BoxedSigner,
     agent: ureq::Agent,
@@ -112,35 +114,56 @@ impl TimedSigner {
     fn context(&self) -> Context {
         Context::new().with_resolver(self.agent.clone())
     }
+
+    /// A fresh signing pass over this signer.
+    fn pass(&self) -> SignPass<'_> {
+        SignPass {
+            signer: self,
+            authority_failed: Cell::new(false),
+        }
+    }
 }
 
-impl Signer for TimedSigner {
+/// One signing pass: the [`TimedSigner`] as the SDK sees
+/// it, plus a record of whether the timestamp authority
+/// failed during the pass (issue #467). The record lives
+/// here rather than on the shared signer, so concurrent
+/// passes never see each other's failures, and it lets
+/// [`ProvenanceSigner::sign`] tell an authority outage
+/// apart from every other signing failure without reading
+/// the SDK's error text.
+struct SignPass<'a> {
+    signer: &'a TimedSigner,
+    authority_failed: Cell<bool>,
+}
+
+impl Signer for SignPass<'_> {
     fn sign(&self, data: &[u8]) -> c2pa::Result<Vec<u8>> {
-        self.inner.sign(data)
+        self.signer.inner.sign(data)
     }
 
     fn alg(&self) -> SigningAlg {
-        self.inner.alg()
+        self.signer.inner.alg()
     }
 
     fn certs(&self) -> c2pa::Result<Vec<Vec<u8>>> {
-        self.inner.certs()
+        self.signer.inner.certs()
     }
 
     fn reserve_size(&self) -> usize {
-        self.inner.reserve_size()
+        self.signer.inner.reserve_size()
     }
 
     fn time_authority_url(&self) -> Option<String> {
-        self.inner.time_authority_url()
+        self.signer.inner.time_authority_url()
     }
 
     fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
-        self.inner.timestamp_request_headers()
+        self.signer.inner.timestamp_request_headers()
     }
 
     fn timestamp_request_body(&self, message: &[u8]) -> c2pa::Result<Vec<u8>> {
-        self.inner.timestamp_request_body(message)
+        self.signer.inner.timestamp_request_body(message)
     }
 
     fn send_timestamp_request(&self, message: &[u8]) -> Option<c2pa::Result<Vec<u8>>> {
@@ -149,34 +172,63 @@ impl Signer for TimedSigner {
         // when the request body cannot be built; an
         // operator who configured an authority gets the
         // error instead of an untimestamped signature.
+        // Building the body is local work, so its failure
+        // is not the authority's.
         let body = match self.timestamp_request_body(message) {
             Ok(body) => body,
             Err(e) => return Some(Err(e)),
         };
-        Some(
-            c2pa::crypto::time_stamp::default_rfc3161_request(
-                &url,
-                self.timestamp_request_headers(),
-                &body,
-                message,
-                &self.context(),
-            )
-            .map_err(Into::into),
-        )
+        let reply = c2pa::crypto::time_stamp::default_rfc3161_request(
+            &url,
+            self.timestamp_request_headers(),
+            &body,
+            message,
+            &self.signer.context(),
+        );
+        if reply.is_err() {
+            self.authority_failed.set(true);
+        }
+        Some(reply.map_err(Into::into))
     }
 
     fn ocsp_val(&self) -> Option<Vec<u8>> {
-        self.inner.ocsp_val()
+        self.signer.inner.ocsp_val()
     }
 
     fn direct_cose_handling(&self) -> bool {
-        self.inner.direct_cose_handling()
+        self.signer.inner.direct_cose_handling()
     }
 
     fn dynamic_assertions(&self) -> Vec<Box<dyn c2pa::dynamic_assertion::DynamicAssertion>> {
-        self.inner.dynamic_assertions()
+        self.signer.inner.dynamic_assertions()
     }
 }
+
+/// Why signing one output failed (issue #467).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignError {
+    /// The timestamp authority failed this pass: it did
+    /// not answer within its bounds, refused the
+    /// connection, or answered with something that is not
+    /// a timestamp. A dependency outage, so a retry may
+    /// clear it. Carries the cause.
+    Authority(String),
+    /// Any other failure: the manifest, the ingredient,
+    /// or the output bytes. Carries the cause.
+    Failed(String),
+}
+
+/// The cause alone, either way: callers say which kind of
+/// failure it was where it matters to them.
+impl std::fmt::Display for SignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignError::Authority(cause) | SignError::Failed(cause) => f.write_str(cause),
+        }
+    }
+}
+
+impl std::error::Error for SignError {}
 
 /// A 1x1 PNG, the boot self-test's signing target.
 const SELF_TEST_PNG: &[u8] = &[
@@ -472,14 +524,16 @@ impl ProvenanceSigner {
     /// identity and read the manifest back. Ok carries the
     /// signer name the readback reports.
     fn probe(&self) -> Result<String, String> {
-        let signed = self.sign(
-            SELF_TEST_PNG,
-            "image/png",
-            &SignRequest {
-                ingredient: None,
-                ai_edited: false,
-            },
-        )?;
+        let signed = self
+            .sign(
+                SELF_TEST_PNG,
+                "image/png",
+                &SignRequest {
+                    ingredient: None,
+                    ai_edited: false,
+                },
+            )
+            .map_err(|e| e.to_string())?;
         let summary = read_manifest(&signed, "image/png")
             .ok_or_else(|| "self-test output carried no readable manifest".to_string())?;
         if summary.state == "invalid" {
@@ -492,13 +546,16 @@ impl ProvenanceSigner {
 
     /// Sign one output. The returned bytes are the output
     /// with its manifest store embedded; the input bytes
-    /// are never modified.
+    /// are never modified. A failure of the timestamp
+    /// authority is [`SignError::Authority`], anything else
+    /// [`SignError::Failed`].
     pub fn sign(
         &self,
         output: &[u8],
         mime: &str,
         request: &SignRequest<'_>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, SignError> {
+        let failed = |e: c2pa::Error| SignError::Failed(e.to_string());
         let definition = serde_json::json!({
             "title": "crabcrop output",
             "format": mime,
@@ -510,7 +567,7 @@ impl ProvenanceSigner {
         .to_string();
         let mut builder = Builder::from_context(self.signer.context())
             .with_definition(definition)
-            .map_err(|e| e.to_string())?;
+            .map_err(failed)?;
         // The actions assertion must open with a created
         // or opened action (the SDK's own post-sign
         // validation enforces it): opened when a parent
@@ -526,13 +583,13 @@ impl ProvenanceSigner {
             let mut cursor = Cursor::new(source_bytes);
             builder
                 .add_ingredient_from_stream(ingredient, source_format, &mut cursor)
-                .map_err(|e| e.to_string())?;
+                .map_err(failed)?;
             builder
                 .add_action(serde_json::json!({
                     "action": "c2pa.opened",
                     "parameters": { "ingredientIds": ["source"] },
                 }))
-                .map_err(|e| e.to_string())?;
+                .map_err(failed)?;
         } else {
             // No ingredient to open (the source was a
             // video or a PDF, whose still this output was
@@ -545,7 +602,7 @@ impl ProvenanceSigner {
                     "action": "c2pa.created",
                     "digitalSourceType": "http://cv.iptc.org/newscodes/digitalsourcetype/softwareImage",
                 }))
-                .map_err(|e| e.to_string())?;
+                .map_err(failed)?;
         }
         if request.ai_edited {
             builder
@@ -553,13 +610,20 @@ impl ProvenanceSigner {
                     "action": "c2pa.edited",
                     "digitalSourceType": AI_EDITED_SOURCE_TYPE,
                 }))
-                .map_err(|e| e.to_string())?;
+                .map_err(failed)?;
         }
         let mut source = Cursor::new(output);
         let mut dest = Cursor::new(Vec::new());
+        let pass = self.signer.pass();
         builder
-            .sign(&self.signer, mime, &mut source, &mut dest)
-            .map_err(|e| e.to_string())?;
+            .sign(&pass, mime, &mut source, &mut dest)
+            .map_err(|e| {
+                if pass.authority_failed.get() {
+                    SignError::Authority(e.to_string())
+                } else {
+                    failed(e)
+                }
+            })?;
         Ok(dest.into_inner())
     }
 }
@@ -585,6 +649,30 @@ pub const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgE
 #[cfg(test)]
 pub(crate) fn test_signer() -> std::sync::Arc<ProvenanceSigner> {
     std::sync::Arc::new(tests::test_signer())
+}
+
+/// A test-identity signer whose timestamp authority is a
+/// stalled one with short bounds, for other modules'
+/// suites (issue #467). Built without the boot probe,
+/// which the stalled authority would fail: this is the
+/// signer whose authority stopped answering after boot.
+/// Drop the sender to release the authority; the join
+/// handle yields how many connections it accepted.
+#[cfg(test)]
+pub(crate) fn test_signer_with_a_stalled_authority() -> (
+    std::sync::Arc<ProvenanceSigner>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<usize>,
+) {
+    let (url, release, staller) = tests::stalled_authority();
+    let signer = ProvenanceSigner::build(
+        TEST_CHAIN.as_bytes(),
+        TEST_KEY.as_bytes(),
+        SigningAlg::Es256,
+        Some(tests::short_bounds(url)),
+    )
+    .expect("the test identity loads");
+    (std::sync::Arc::new(signer), release, staller)
 }
 
 /// The manifest store JSON of an asset, for other
@@ -748,7 +836,7 @@ mod tests {
     /// seconds at most, so a regression fails its test
     /// instead of hanging the suite. The join handle
     /// yields how many connections it accepted.
-    fn stalled_authority() -> (
+    pub(crate) fn stalled_authority() -> (
         String,
         std::sync::mpsc::Sender<()>,
         std::thread::JoinHandle<usize>,
@@ -782,7 +870,7 @@ mod tests {
     }
 
     /// Short bounds for the stalled-authority tests.
-    fn short_bounds(url: String) -> TimestampAuthority {
+    pub(crate) fn short_bounds(url: String) -> TimestampAuthority {
         TimestampAuthority {
             url,
             connect_timeout: Duration::from_millis(300),
@@ -847,13 +935,61 @@ mod tests {
         let elapsed = started.elapsed();
         drop(release);
         let contacts = staller.join().unwrap();
-        assert!(result.is_err(), "a stalled authority is an error");
+        // Issue #467: the failure says it was the
+        // authority, so the server can answer an outage
+        // worth retrying instead of a broken encoder.
+        assert!(
+            matches!(result, Err(SignError::Authority(_))),
+            "a stalled authority is an authority failure: {result:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(5),
             "signing gave up at the bound, took {elapsed:?}"
         );
         assert!(elapsed >= bound, "{elapsed:?}");
         assert_eq!(contacts, 1);
+    }
+
+    #[test]
+    fn an_authority_that_refuses_the_connection_is_an_authority_failure() {
+        // An authority that is down outright (nothing
+        // listens on its port) fails at once, and is the
+        // same kind of failure as a stalled one.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let signer = ProvenanceSigner::build(
+            TEST_CHAIN.as_bytes(),
+            TEST_KEY.as_bytes(),
+            SigningAlg::Es256,
+            Some(short_bounds(url)),
+        )
+        .expect("the test identity loads");
+        let result = signer.sign(SELF_TEST_PNG, "image/png", &plain());
+        assert!(matches!(result, Err(SignError::Authority(_))), "{result:?}");
+    }
+
+    #[test]
+    fn a_failure_before_the_timestamp_is_not_the_authoritys() {
+        // Issue #467: an authority being configured does
+        // not make every failure its fault. Bytes that are
+        // not the PNG they claim to be fail before the
+        // claim is signed, so the authority is never asked
+        // and the failure stays an ordinary one. Asserted
+        // through the stalled authority's contact count.
+        let (url, release, staller) = stalled_authority();
+        let signer = ProvenanceSigner::build(
+            TEST_CHAIN.as_bytes(),
+            TEST_KEY.as_bytes(),
+            SigningAlg::Es256,
+            Some(short_bounds(url)),
+        )
+        .expect("the test identity loads");
+        let result = signer.sign(b"not a png at all", "image/png", &plain());
+        drop(release);
+        let contacts = staller.join().unwrap();
+        assert!(matches!(result, Err(SignError::Failed(_))), "{result:?}");
+        assert_eq!(contacts, 0, "the authority was never asked");
     }
 
     /// A timestamp authority that answers its first

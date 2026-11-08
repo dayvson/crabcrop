@@ -78,6 +78,130 @@ fn prepare_upload_reports_media_and_stores_the_sanitized_svg() {
     );
 }
 
+/// A named source sample, the upload media kind it binds
+/// to, and the source dimensions the pipeline must report.
+type FormatSample = (&'static str, Vec<u8>, UploadMedia, (u32, u32));
+
+/// One sample per documented source format (issue #466).
+fn documented_format_samples() -> Vec<FormatSample> {
+    use image::ImageFormat as Raster;
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 16, |x, y| {
+        image::Rgb([(x * 10) as u8, (y * 15) as u8, 128])
+    }));
+    let raster = |name, format, media| -> FormatSample {
+        // The ICO decoder reads embedded PNGs as RGBA only,
+        // as real icons carry them.
+        let img = if format == Raster::Ico {
+            DynamicImage::ImageRgba8(img.to_rgba8())
+        } else {
+            img.clone()
+        };
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, format).unwrap();
+        (name, buf.into_inner(), media, (24, 16))
+    };
+    let png = raster("png", Raster::Png, UploadMedia::Png);
+    let jxl = Engine
+        .process(
+            &png.1,
+            &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                ImageFormat::Jxl,
+            ))])],
+        )
+        .unwrap()
+        .bytes;
+    let heic = include_bytes!("../../tests/fixtures/orient6.heic").to_vec();
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="16"><rect width="24" height="16" fill="red"/></svg>"#;
+    vec![
+        raster("jpeg", Raster::Jpeg, UploadMedia::Jpeg),
+        png,
+        raster("gif", Raster::Gif, UploadMedia::Gif),
+        raster("webp", Raster::WebP, UploadMedia::WebP),
+        raster("tiff", Raster::Tiff, UploadMedia::Tiff),
+        raster("bmp", Raster::Bmp, UploadMedia::Bmp),
+        raster("ico", Raster::Ico, UploadMedia::Ico),
+        ("jxl", jxl, UploadMedia::Jxl, (24, 16)),
+        // Stored 64x48 under EXIF orientation 6.
+        ("heic", heic, UploadMedia::Heic, (48, 64)),
+        ("svg", svg.to_vec(), UploadMedia::Svg, (24, 16)),
+    ]
+}
+
+#[test]
+fn every_documented_source_format_decodes_and_binds() {
+    // The format matrix (issue #466): every format the docs
+    // promise as a source decodes through the pipeline, and
+    // validates as an upload bound to its own media kind.
+    for (name, bytes, media, dims) in documented_format_samples() {
+        let out = Engine
+            .process(&bytes, &[])
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!((out.source_width, out.source_height), dims, "{name}");
+        let prepared = prepare_upload(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(prepared.media, media, "{name}");
+    }
+    // AVIF decodes in builds with the avif-decode feature,
+    // and fails naming the feature without it.
+    let mut avif = Vec::new();
+    image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut avif, 10, 80)
+        .write_image(&[90u8; 24 * 16 * 3], 24, 16, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    #[cfg(feature = "avif-decode")]
+    {
+        let out = Engine.process(&avif, &[]).unwrap();
+        assert_eq!((out.source_width, out.source_height), (24, 16));
+        assert_eq!(prepare_upload(&avif).unwrap().media, UploadMedia::Avif);
+    }
+    #[cfg(not(feature = "avif-decode"))]
+    match Engine.process(&avif, &[]) {
+        Err(EngineError::Decode(msg)) => assert!(msg.contains("avif-decode"), "{msg}"),
+        other => panic!("expected the feature error, got {other:?}"),
+    }
+}
+
+#[test]
+fn undocumented_formats_are_refused_as_sources_and_uploads() {
+    // The image crate sniffs these by magic bytes alone, so
+    // with their decoders compiled in, any source or upload
+    // reached them (issue #466). Each sample is a valid file
+    // in its format: the refusal is the missing decoder.
+    for (name, bytes) in crate::engine::test_formats::undocumented_samples() {
+        assert!(
+            image::guess_format(&bytes).is_ok(),
+            "{name}: the sample must still be sniffed as its format"
+        );
+        match decode_image(&bytes) {
+            Err(EngineError::Decode(_)) => {}
+            other => panic!("{name}: expected a decode error, got {other:?}"),
+        }
+        match Engine.process(&bytes, &[]) {
+            Err(EngineError::Decode(_)) => {}
+            other => panic!("{name}: expected a decode error, got {other:?}"),
+        }
+        match prepare_upload(&bytes) {
+            Err(EngineError::Decode(_)) => {}
+            other => panic!("{name}: expected the upload refused, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_non_hevc_heif_is_refused_as_source_and_upload() {
+    // An AV1 still under a generic HEIF brand takes the HEIC
+    // branch; the AV1 item is refused before any decoder runs
+    // (issue #466), as a source and as an upload alike.
+    let bytes = crate::engine::test_formats::av1_in_mif1();
+    for result in [
+        Engine.process(&bytes, &[]).map(|_| ()),
+        prepare_upload(&bytes).map(|_| ()),
+    ] {
+        match result {
+            Err(EngineError::Decode(msg)) => assert!(msg.contains("not HEVC"), "{msg}"),
+            other => panic!("expected the non-HEVC refusal, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn round_trips_png() {
     let engine = Engine;
@@ -773,6 +897,7 @@ fn meta_jpeg() -> Vec<u8> {
         icc: None,
         exif_tiff: Some(tiff),
         xmp: Some(b"<x:xmpmeta>fixture</x:xmpmeta>".to_vec()),
+        xmp_compressed: false,
         photoshop: None,
     };
     crate::color::inject_jpeg(&base, None, &meta, true)
@@ -849,7 +974,7 @@ fn png_metadata_bombs_render_like_the_plain_png() {
     let mut iccp = b"ICC Profile\0\0".to_vec();
     iccp.extend_from_slice(&zlib_bomb(crate::color::MAX_ICC_BYTES + 1));
     let mut itxt = b"XML:com.adobe.xmp\0\x01\0\0\0".to_vec();
-    itxt.extend_from_slice(&zlib_bomb(crate::color::MAX_META_BYTES + 1));
+    itxt.extend_from_slice(&zlib_bomb(crate::color::MAX_XMP_BYTES + 1));
     let mut chunks: Vec<(&[u8; 4], &[u8])> = Vec::new();
     for _ in 0..40 {
         chunks.push((b"iCCP", &iccp));
@@ -868,6 +993,202 @@ fn png_metadata_bombs_render_like_the_plain_png() {
         let want = engine.process_preferred(&plain, &[], ctx()).unwrap();
         let got = engine.process_preferred(&bombed, &[], ctx()).unwrap();
         assert_eq!(got.bytes, want.bytes, "preserve {preserve_metadata}");
+    }
+}
+
+/// An `iCCP` chunk payload carrying `profile`, compressed.
+fn iccp_chunk(profile: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(profile).unwrap();
+    let mut data = b"ICC Profile\0\0".to_vec();
+    data.extend_from_slice(&encoder.finish().unwrap());
+    data
+}
+
+/// `len` zero bytes behind an ICC header that describes
+/// them: the size field and the `acsp` signature in place,
+/// no tags. Passes the embed check up to the embed cap.
+fn padded_profile(len: usize) -> Vec<u8> {
+    let mut icc = vec![0u8; len];
+    icc[0..4].copy_from_slice(&(len as u32).to_be_bytes());
+    icc[36..40].copy_from_slice(b"acsp");
+    icc
+}
+
+/// `32x32/filters:[keep_profile:]format(<format>)`.
+fn small_render(format: ImageFormat, keep_profile: bool) -> Vec<Operation> {
+    let mut filters = vec![Filter::Format(FormatSpec::plain(format))];
+    if keep_profile {
+        filters.insert(0, Filter::KeepProfile);
+    }
+    vec![
+        size_op(Dimension::Pixels(32), Dimension::Pixels(32)),
+        Operation::Filters(filters),
+    ]
+}
+
+#[test]
+fn compressed_png_metadata_does_not_inflate_the_output() {
+    // Issue #445: metadata inflated from compressed PNG
+    // chunks was written back raw. Under preserve, a
+    // 64x64 PNG carrying a 16 MiB XMP packet in a 16 KB
+    // stream rendered to a 16 MiB PNG at 32x32; under the
+    // default policy, keep_profile with JPEG output turned
+    // a 4 MiB iCCP of zeros into a 4 MiB JPEG. Past their
+    // caps, neither is copied now, into either format: the
+    // render is the one the source without the chunk gets.
+    let plain = gradient_png();
+    let xmp_chunk = |len: usize| {
+        let mut data = b"XML:com.adobe.xmp\0\x01\0\0\0".to_vec();
+        data.extend_from_slice(&zlib_bomb(len));
+        data
+    };
+    let xmp_issue = xmp_chunk(crate::color::MAX_META_BYTES);
+    let iccp_zeros = iccp_chunk(&vec![0u8; crate::color::MAX_ICC_BYTES]);
+    let iccp_headed = iccp_chunk(&padded_profile(crate::color::MAX_ICC_BYTES));
+    let with = |kind: &[u8; 4], chunk: &[u8]| with_chunks_after_ihdr(&plain, &[(kind, chunk)]);
+    let engine = Engine;
+    let render = |src: &[u8], format, preserve_metadata, keep_profile| {
+        let ctx = ProcessContext {
+            preserve_metadata,
+            ..Default::default()
+        };
+        let out = engine
+            .process_preferred(src, &small_render(format, keep_profile), ctx)
+            .unwrap();
+        assert_eq!(out.format, format);
+        out.bytes
+    };
+    let cases = [
+        ("16 MiB XMP", with(b"iTXt", &xmp_issue), true, false),
+        (
+            "16 MiB XMP, keep_profile",
+            with(b"iTXt", &xmp_issue),
+            true,
+            true,
+        ),
+        (
+            "4 MiB iCCP of zeros",
+            with(b"iCCP", &iccp_zeros),
+            false,
+            true,
+        ),
+        (
+            "4 MiB iCCP, preserve",
+            with(b"iCCP", &iccp_zeros),
+            true,
+            true,
+        ),
+        (
+            "4 MiB iCCP behind a header",
+            with(b"iCCP", &iccp_headed),
+            false,
+            true,
+        ),
+    ];
+    for (name, bombed, preserve, keep) in cases {
+        assert!(bombed.len() < 32 * 1024, "{name}: {} bytes", bombed.len());
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            let want = render(&plain, format, preserve, keep);
+            let got = render(&bombed, format, preserve, keep);
+            assert!(
+                got == want,
+                "{name} as {format:?}: {} bytes against {} without the chunk",
+                got.len(),
+                want.len()
+            );
+        }
+    }
+    // A packet at its cap is copied into PNG, compressed as
+    // the source stored it (a JPEG segment holds 64 KiB, so
+    // not into JPEG): the render grows by no more than the
+    // chunk weighed in the source.
+    let bombed = with(b"iTXt", &xmp_chunk(crate::color::MAX_XMP_BYTES));
+    let carried = bombed.len() - plain.len();
+    let want = render(&plain, ImageFormat::Png, true, false);
+    let got = render(&bombed, ImageFormat::Png, true, false);
+    assert!(
+        got.len() <= want.len() + carried,
+        "{} bytes against {} plus the {carried}-byte chunk",
+        got.len(),
+        want.len()
+    );
+    let xmp = crate::color::extract_source_meta(&got, true).xmp;
+    assert_eq!(xmp.map(|xmp| xmp.len()), Some(crate::color::MAX_XMP_BYTES));
+    let want = render(&plain, ImageFormat::Jpeg, true, false);
+    assert!(render(&bombed, ImageFormat::Jpeg, true, false) == want);
+    // The ceiling on what a profile can still add: one at
+    // the embed cap is kept and goes into a JPEG raw, in
+    // APP2 segments of at most 65519 bytes plus 18 bytes
+    // of marker, length, and chunk header.
+    let at_cap = padded_profile(crate::color::MAX_EMBED_ICC_BYTES);
+    let bombed = with(b"iCCP", &iccp_chunk(&at_cap));
+    let want = render(&plain, ImageFormat::Jpeg, false, true);
+    let got = render(&bombed, ImageFormat::Jpeg, false, true);
+    let segments = crate::color::MAX_EMBED_ICC_BYTES.div_ceil(65519);
+    assert_eq!(
+        got.len(),
+        want.len() + crate::color::MAX_EMBED_ICC_BYTES + 18 * segments
+    );
+    assert_eq!(
+        crate::color::extract_source_meta(&got, false).icc,
+        Some(at_cap)
+    );
+}
+
+#[test]
+fn keep_profile_converts_a_profile_it_cannot_embed() {
+    // Issue #445: keep_profile is convert-or-tag (issue
+    // #374), and a profile that fails the embed check is
+    // not tagged, so its pixels must be converted like
+    // the default's. Two Display P3 profiles that still
+    // parse: one with a byte past its declared size, one
+    // grown past the embed cap with its size field
+    // rewritten to match.
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(3, 1, |x, _| {
+        [
+            image::Rgb([200, 80, 40]),
+            image::Rgb([40, 120, 200]),
+            image::Rgb([90, 160, 90]),
+        ][x as usize]
+    }));
+    let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let mut trailing = p3.clone();
+    trailing.push(0);
+    let mut oversized = p3.clone();
+    oversized.resize(crate::color::MAX_EMBED_ICC_BYTES + 4, 0);
+    let len = oversized.len() as u32;
+    oversized[0..4].copy_from_slice(&len.to_be_bytes());
+    let engine = Engine;
+    for (name, icc) in [("trailing byte", trailing), ("past the cap", oversized)] {
+        assert!(!crate::color::icc_embeddable(&icc), "{name}");
+        assert!(moxcms::ColorProfile::new_from_slice(&icc).is_ok(), "{name}");
+        let src = with_chunks_after_ihdr(&png_bytes(&img), &[(b"iCCP", &iccp_chunk(&icc))]);
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            let ops = |keep: bool| {
+                let mut filters = vec![Filter::Format(FormatSpec::plain(format))];
+                if keep {
+                    filters.insert(0, Filter::KeepProfile);
+                }
+                [Operation::Filters(filters)]
+            };
+            let kept = engine.process(&src, &ops(true)).unwrap();
+            let converted = engine.process(&src, &ops(false)).unwrap();
+            assert_eq!(kept.bytes, converted.bytes, "{name} as {format:?}");
+            assert!(
+                crate::color::extract_source_meta(&kept.bytes, false)
+                    .icc
+                    .is_none(),
+                "{name} as {format:?}"
+            );
+            // And the conversion really ran: the lossless
+            // pixel is not the raw P3 value.
+            if format == ImageFormat::Png {
+                let px = image::load_from_memory(&kept.bytes).unwrap().to_rgb8();
+                assert_ne!(px.get_pixel(0, 0).0, [200, 80, 40], "{name}");
+            }
+        }
     }
 }
 
@@ -1488,6 +1809,79 @@ fn fit_in_box_swap_decision() {
     assert_eq!(fit_in_box(&orig, 200, 400, true), orig);
 }
 
+/// A size side written as a multi-digit zero (`00x100`) parses
+/// as an exact zero: the spec vectors pin the spelling, so the
+/// parser keeps it. The engine refuses it with
+/// `unsupported_operation` (issue #464) on every route a size
+/// reaches it by: before, the resize handed the encoder a
+/// 0-wide image (a 500), and DPR scaling or fit-in rounded the
+/// zero up to a 1-pixel render nobody asked for.
+#[test]
+fn a_zero_pixel_side_is_refused_on_every_route() {
+    let engine = Engine;
+    let still = png_bytes(&gradient_image());
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="48" height="32"><rect width="48" height="32" fill="red"/></svg>"#;
+    let sources: [(&str, &[u8]); 3] = [
+        ("png", &still),
+        ("animated gif", &animated_gif_bytes()),
+        ("svg", svg),
+    ];
+    let refused = [
+        "00x100",
+        "100x00",
+        "00x00",
+        "00xorig",
+        "origx00",
+        "-00x-100",
+        "000000x100",
+        "00x100/filters:dpr(2)",
+        "100x00/filters:dpr(3)",
+        "fit-in:00x100",
+        "fit-in:100x00",
+        "fit-in:00x00",
+        "fit-in:00x100:adaptive",
+        "fit-in:00x100/filters:dpr(2)",
+        // A later valid size does not rescue the request.
+        "00x100/50x50",
+    ];
+    for (kind, src) in sources {
+        // The crop+resize fusion resolves the size against
+        // the window, through the same check. (An SVG source
+        // rasterizes at the first size's target, too small
+        // for the rectangle, which is its own refusal.)
+        let fused = (kind != "svg").then_some("crop-rect:0x0:24x16/00x10");
+        for remainder in refused.into_iter().chain(fused) {
+            let (ops, _) =
+                crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+            let err = engine
+                .process(src, &ops)
+                .expect_err(&format!("{kind} {remainder}"));
+            assert!(
+                matches!(err, EngineError::Unsupported(_)),
+                "{kind} {remainder}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("zero pixel side"),
+                "{kind} {remainder}: {err}"
+            );
+        }
+    }
+    // A lone 0 keeps its meaning: proportional for a resize,
+    // unbounded for fit-in.
+    for (remainder, dims) in [
+        ("0x16", (24, 16)),
+        ("24x0", (24, 16)),
+        ("0x0", (48, 32)),
+        ("fit-in:0x16", (24, 16)),
+        ("fit-in:24x0", (24, 16)),
+    ] {
+        let (ops, _) =
+            crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+        let out = engine.process(&still, &ops).unwrap();
+        assert_eq!(decode_dims(&out.bytes), dims, "{remainder}");
+    }
+}
+
 #[test]
 fn crop_rect_extracts_the_exact_region() {
     let engine = Engine;
@@ -2066,6 +2460,258 @@ fn focal_point_without_a_crop_is_a_no_op() {
     let plain = engine.process(&src, &[]).unwrap();
     let with_point = engine.process(&src, &[point_op(0.25, 0.75, 3.0)]).unwrap();
     assert_eq!(with_point.bytes, plain.bytes);
+}
+
+/// `w` x `h` with `n` equal vertical stripes, stripe `i` the
+/// gray `20 + 10 * i`: no stripe is black (the pad fill) or
+/// white (a trim border), and every stripe tells itself
+/// apart from its neighbors.
+fn stripes(w: u32, h: u32, n: u32) -> DynamicImage {
+    DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, _| {
+        let v = (20 + 10 * (x * n / w)) as u8;
+        image::Rgb([v, v, v])
+    }))
+}
+
+/// Which stripe of [`stripes`] the output pixel shows.
+fn stripe_at(img: &DynamicImage, x: u32, y: u32) -> i32 {
+    let v = img.to_rgb8().get_pixel(x, y)[0] as i32;
+    ((v - 20) as f32 / 10.0).round() as i32
+}
+
+#[test]
+fn focal_rect_follows_a_resize_to_its_crop() {
+    // Issue #465: the rectangle names stripe 6 of a
+    // 2000x1000 source of 100 px stripes. A resize between
+    // the segment and the crop left it in source
+    // coordinates, which the crop re-clamped onto the
+    // 500 px frame's right edge: the window centered on the
+    // stripe 14/15 boundary. The rectangle now scales with
+    // the image, so all three spellings agree on stripe 6.
+    let src = stripes(2000, 1000, 20);
+    let width_500 = size_op(Dimension::Pixels(500), Dimension::Proportional);
+    let spellings: [Vec<Operation>; 3] = [
+        vec![
+            focal_op(600, 0, 700, 100),
+            width_500.clone(),
+            crop_op(100, 100, Align::Center),
+        ],
+        vec![focal_op(600, 0, 700, 100), crop_op(100, 100, Align::Center)],
+        vec![
+            width_500,
+            focal_op(150, 0, 175, 25),
+            crop_op(100, 100, Align::Center),
+        ],
+    ];
+    for ops in &spellings {
+        let out = run_chain(&src, ops);
+        assert_eq!((out.width(), out.height()), (100, 100));
+        assert_eq!(stripe_at(&out, 50, 50), 6, "{ops:?}");
+    }
+}
+
+#[test]
+fn focal_point_follows_a_crop_rect_to_its_crop() {
+    // Issue #465: the point names stripe 12 (x 1200 of
+    // 2000). The crop-rect keeps x 1000..2000, where the
+    // stale fraction 0.6 lands on x 1600 instead, so the
+    // window centered near stripe 16. The point now moves
+    // with the cut: x 200 of the 1000 px frame, a window
+    // clamped to the frame's left edge, and stripe 12 at the
+    // output's center.
+    let src = stripes(2000, 1000, 20);
+    let ops = [
+        point_op(0.6, 0.5, 1.0),
+        rect_op(1000, 0, 2000, 500),
+        crop_op(100, 100, Align::Center),
+    ];
+    let out = run_chain(&src, &ops);
+    assert_eq!(stripe_at(&out, 50, 50), 12);
+    // The window starts at the cut's left edge (stripe 10),
+    // where the stale fraction's window started at stripe 13.
+    assert_eq!(stripe_at(&out, 5, 50), 10);
+}
+
+#[test]
+fn focal_forms_follow_a_flip_a_pad_and_a_trim() {
+    // 200x100, 10 px stripes: the rectangle names stripe 6.
+    let src = stripes(200, 100, 20);
+    let rect = || focal_op(60, 0, 70, 10);
+    let crop = || crop_op(100, 100, Align::Center);
+    // A resize flip mirrors the frame: stripe 6 now sits at
+    // x 130..140, and the rectangle goes with it.
+    let flipped = Operation::Size(ImageSize {
+        width: Dimension::Pixels(200),
+        height: Dimension::Pixels(100),
+        flip_horizontal: true,
+        flip_vertical: false,
+    });
+    let out = run_chain(&src, &[rect(), flipped, crop()]);
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+    // A pad sets the frame 100 px into a 400 px canvas; the
+    // stale rectangle centered the window on black fill, the
+    // stale point on stripe 3.
+    let out = run_chain(
+        &src,
+        &[rect(), pad_op(400, 100, PadFill::Directive), crop()],
+    );
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+    let out = run_chain(
+        &src,
+        &[
+            point_op(0.325, 0.5, 1.0),
+            pad_op(400, 100, PadFill::Directive),
+            crop(),
+        ],
+    );
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+    // A trim cuts a 10 px white border away: the rectangle,
+    // named on the bordered frame, moves with the cut (the
+    // stale one landed on stripe 7).
+    let mut bordered = image::RgbImage::from_pixel(220, 120, image::Rgb([255, 255, 255]));
+    image::imageops::overlay(&mut bordered, &src.to_rgb8(), 10, 10);
+    let bordered = DynamicImage::ImageRgb8(bordered);
+    let out = run_chain(
+        &bordered,
+        &[
+            focal_op(70, 10, 80, 20),
+            Operation::Filters(vec![Filter::Trim(10)]),
+            crop(),
+        ],
+    );
+    assert_eq!((out.width(), out.height()), (100, 100));
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+}
+
+#[test]
+fn focal_forms_survive_filters_that_paint_in_place_and_drop_on_ones_that_move() {
+    let src = stripes(200, 100, 20);
+    let crop = || crop_op(100, 100, Align::Center);
+    // A border paints over the frame without moving it: the
+    // rectangle still steers the crop.
+    let out = run_chain(
+        &src,
+        &[
+            focal_op(60, 0, 70, 10),
+            Operation::Filters(vec![Filter::Border(2, [255, 0, 0])]),
+            crop(),
+        ],
+    );
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+    // A rotation moves every pixel in a way the chain does
+    // not track: the form drops, and the crop is the plain
+    // center crop of the rotated frame.
+    let rotate = || Operation::Filters(vec![Filter::Rotate(180.0)]);
+    let plain = run_chain(&src, &[rotate(), crop()]);
+    for focal in [focal_op(60, 0, 70, 10), point_op(0.3, 0.5, 1.0)] {
+        let out = run_chain(&src, &[focal, rotate(), crop()]);
+        assert_eq!(out.to_rgb8().as_raw(), plain.to_rgb8().as_raw());
+    }
+}
+
+#[test]
+fn focal_forms_survive_hostile_geometry() {
+    // Rectangles and points cut away by a crop-rect, pushed
+    // through one-pixel frames, flips and pads, never panic
+    // and never leave the frame: the crop always cuts a
+    // window of the requested size.
+    let src = stripes(200, 100, 20);
+    let focals = [
+        focal_op(0, 0, 1, 1),
+        focal_op(190, 90, 200, 100),
+        focal_op(0, 0, 200, 100),
+        point_op(0.0, 0.0, 1.0),
+        point_op(1.0, 1.0, 100.0),
+        point_op(0.5, 0.5, 0.01),
+    ];
+    let steps = [
+        rect_op(100, 50, 101, 51),
+        rect_op(0, 0, 50, 100),
+        rect_op(150, 0, 200, 100),
+        size_op(Dimension::Pixels(1), Dimension::Pixels(1)),
+        size_op(Dimension::Pixels(3), Dimension::Pixels(700)),
+        Operation::Size(ImageSize {
+            width: Dimension::Pixels(17),
+            height: Dimension::Pixels(5),
+            flip_horizontal: true,
+            flip_vertical: true,
+        }),
+        Operation::FitIn {
+            size: ImageSize {
+                width: Dimension::Pixels(1),
+                height: Dimension::Proportional,
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            adaptive: false,
+        },
+        pad_op(1, 900, PadFill::Directive),
+        Operation::Filters(vec![Filter::TrimSides(0, [u32::MAX; 4])]),
+    ];
+    let ctx = ProcessContext::default();
+    for focal in &focals {
+        for step in &steps {
+            for second in &steps {
+                let ops = [
+                    focal.clone(),
+                    step.clone(),
+                    second.clone(),
+                    crop_op(7, 3, Align::Smart),
+                ];
+                let directives = crate::url::RequestDirectives::analyze(&ops);
+                // A crop-rect past a frame an earlier step
+                // shrank is the usual 400, never a panic.
+                match apply_operations(src.clone(), &ops, None, 1.0, &ctx, &directives, None) {
+                    Ok((out, ..)) => assert_eq!((out.width(), out.height()), (7, 3), "{ops:?}"),
+                    Err(err) => assert!(
+                        matches!(&err, EngineError::Unsupported(msg) if msg.contains("crop-rect")),
+                        "{ops:?}: {err:?}"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pending_focal_maps_through_each_step() {
+    // The geometry behind the crop tests, exactly.
+    let rect = PendingFocal::rect((60, 10, 70, 30), (200, 100));
+    assert_eq!(
+        rect.scaled((100, 50), false, false).resolve((100, 50)),
+        Focal::Rect((30, 5, 35, 15))
+    );
+    assert_eq!(
+        rect.scaled((200, 100), true, true).resolve((200, 100)),
+        Focal::Rect((130, 70, 140, 90))
+    );
+    // A cut keeps the part inside; a rectangle cut away
+    // entirely lands on the nearest edge.
+    assert_eq!(
+        rect.cropped((65, 0, 100, 100)).resolve((100, 100)),
+        Focal::Rect((0, 10, 5, 30))
+    );
+    assert_eq!(
+        rect.cropped((100, 0, 100, 100)).resolve((100, 100)),
+        Focal::Rect((0, 10, 0, 30))
+    );
+    assert_eq!(
+        rect.placed((100, 0, 200, 100), (400, 100))
+            .resolve((400, 100)),
+        Focal::Rect((160, 10, 170, 30))
+    );
+    // A point comes back as fractions of the frame in hand,
+    // exactly as named when nothing moved it.
+    let point = PendingFocal::point((0.6, 0.5, 2.0), (2000, 1000));
+    assert_eq!(point.resolve((2000, 1000)), Focal::Point((0.6, 0.5, 2.0)));
+    // 0.6 is not exact in f32, so the moved point is
+    // checked to within a rounding step.
+    let Focal::Point((x, y, zoom)) = point.cropped((1000, 0, 1000, 500)).resolve((1000, 500))
+    else {
+        panic!("a point resolves to a point");
+    };
+    assert!((x - 0.2).abs() < 1e-6, "{x}");
+    assert_eq!((y, zoom), (1.0, 2.0));
 }
 
 fn crop_op(w: u32, h: u32, align: Align) -> Operation {
@@ -3113,6 +3759,197 @@ fn png_interlace_marks_the_file_and_round_trips() {
     assert_eq!((decoded.width(), decoded.height()), (48, 32));
 }
 
+/// 16-bit samples in an interlaced PNG are written big-endian,
+/// as the format requires (issue #464): the hand-assembled
+/// Adam7 stream used to copy the image's native-order bytes,
+/// so a little-endian host swapped every sample of a 16-bit
+/// source's interlaced render.
+#[test]
+fn png_interlace_writes_16_bit_samples_big_endian() {
+    let deep = DynamicImage::ImageRgba16(
+        DynamicImage::ImageRgba32F(image::Rgba32FImage::from_fn(48, 32, |x, y| {
+            image::Rgba([x as f32 / 47.0, y as f32 / 31.0, 0.3, 0.6])
+        }))
+        .to_rgba16(),
+    );
+    let src = EncodeBuffers::new(&deep);
+    let interlaced = encode(
+        &src,
+        ImageFormat::Png,
+        None,
+        None,
+        None,
+        FormatOptions {
+            png_interlace: true,
+            ..FormatOptions::default()
+        },
+        DEFAULT_AVIF_SPEED,
+        DEFAULT_JXL_SPEED,
+    )
+    .unwrap();
+    assert_eq!(interlaced[28], 1, "IHDR interlace byte must be Adam7");
+    let decoded = image::load_from_memory(&interlaced).unwrap();
+    assert_eq!(decoded.color(), image::ColorType::Rgba16);
+    assert_eq!(decoded.to_rgba16(), deep.to_rgba16());
+}
+
+/// A float TIFF built in memory, which decodes to 32-bit
+/// float samples (Rgb32F, or Rgba32F with `alpha`).
+fn float_tiff(alpha: bool, sample: impl Fn(u32, u32) -> [f32; 4]) -> Vec<u8> {
+    let rgba = image::Rgba32FImage::from_fn(48, 32, |x, y| image::Rgba(sample(x, y)));
+    let img = if alpha {
+        DynamicImage::ImageRgba32F(rgba)
+    } else {
+        DynamicImage::ImageRgb32F(DynamicImage::ImageRgba32F(rgba).to_rgb32f())
+    };
+    let mut out = Vec::new();
+    img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Tiff)
+        .unwrap();
+    out
+}
+
+fn float_gradient(x: u32, y: u32) -> [f32; 4] {
+    [x as f32 / 47.0, y as f32 / 31.0, 0.25, 0.5]
+}
+
+/// The integer render a float source should get: its samples
+/// clamped to 0..1 at 16 bits.
+fn float_expected(bytes: &[u8]) -> DynamicImage {
+    let decoded = image::load_from_memory(bytes).unwrap();
+    if decoded.color().has_alpha() {
+        DynamicImage::ImageRgba16(decoded.to_rgba16())
+    } else {
+        DynamicImage::ImageRgb16(decoded.to_rgb16())
+    }
+}
+
+fn process_spelled(src: &[u8], remainder: &str, preferred: Option<ImageFormat>) -> ProcessedImage {
+    let path = if remainder.is_empty() {
+        "example.com/a.tif".to_string()
+    } else {
+        format!("{remainder}/example.com/a.tif")
+    };
+    let (ops, _) = crate::url::parse_operations(&path).unwrap();
+    Engine
+        .process_preferred(
+            src,
+            &ops,
+            ProcessContext {
+                preferred,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{remainder} ({preferred:?}): {e:?}"))
+}
+
+/// Float (HDR) sources decode to 32-bit float samples, which
+/// the PNG and AVIF encoders do not take: every PNG and AVIF
+/// render of one failed with a 500, including the request
+/// that names no format and negotiates AVIF from `Accept`
+/// (issue #464). They now encode from a 16-bit conversion; the
+/// lossless WebP encode, which takes only 8-bit samples, from
+/// the 8-bit layout the lossy encode already used.
+#[test]
+fn float_sources_encode_to_every_still_format() {
+    for alpha in [false, true] {
+        let tiff = float_tiff(alpha, float_gradient);
+        let source = image::load_from_memory(&tiff).unwrap();
+        assert_eq!(
+            source.color(),
+            if alpha {
+                image::ColorType::Rgba32F
+            } else {
+                image::ColorType::Rgb32F
+            }
+        );
+        let expected = float_expected(&tiff);
+        let png = process_spelled(&tiff, "filters:format(png)", None);
+        assert_eq!(png.format, ImageFormat::Png);
+        let decoded = image::load_from_memory(&png.bytes).unwrap();
+        assert_eq!(decoded.color(), expected.color(), "alpha {alpha}");
+        assert_eq!(decoded, expected, "alpha {alpha}");
+        // Interlaced: the same samples, Adam7-ordered.
+        let interlaced = process_spelled(&tiff, "filters:format(png,interlace)", None);
+        assert_eq!(interlaced.bytes[28], 1);
+        assert_eq!(
+            image::load_from_memory(&interlaced.bytes).unwrap(),
+            expected
+        );
+        // Indexed PNG already read the 8-bit layout.
+        let indexed = process_spelled(&tiff, "filters:format(png):palette(64)", None);
+        assert_eq!(decode_dims(&indexed.bytes), (48, 32));
+        // A resize keeps float samples, and still encodes.
+        let resized = process_spelled(&tiff, "24x0/filters:format(png)", None);
+        assert_eq!(decode_dims(&resized.bytes), (24, 16));
+        // AVIF, named and negotiated.
+        for (remainder, preferred) in [
+            ("filters:format(avif)", None),
+            ("filters:format(avif):quality(50)", None),
+            ("24x0", Some(ImageFormat::Avif)),
+        ] {
+            let avif = process_spelled(&tiff, remainder, preferred);
+            assert_eq!(avif.format, ImageFormat::Avif, "{remainder}");
+            assert_eq!(&avif.bytes[4..8], b"ftyp", "{remainder}");
+        }
+        // Lossless WebP keeps the 8-bit pixels exactly.
+        let webp = process_spelled(&tiff, "filters:format(webp):quality(100)", None);
+        let decoded = image::load_from_memory(&webp.bytes).unwrap();
+        assert_eq!(decoded.to_rgba8(), source.to_rgba8(), "alpha {alpha}");
+        // The formats that already worked still do.
+        for format in ["jpeg", "webp", "gif", "jxl"] {
+            let out = process_spelled(&tiff, &format!("filters:format({format})"), None);
+            assert!(!out.bytes.is_empty(), "{format}");
+        }
+    }
+}
+
+/// Float samples are source content: NaN, the infinities,
+/// negatives, values past 1 and subnormals all encode without
+/// a panic, clamped to the displayable range (NaN to the top
+/// of it, the image crate's rule for every integer layout).
+#[test]
+fn hostile_float_samples_clamp_instead_of_failing() {
+    let hostile = [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        -1.0,
+        2.0,
+        f32::MAX,
+        f32::MIN_POSITIVE / 2.0,
+        -0.0,
+    ];
+    for alpha in [false, true] {
+        let tiff = float_tiff(alpha, |x, y| {
+            let at = |i: u32| hostile[(i as usize) % hostile.len()];
+            [at(x), at(y), at(x + y), at(x * 3 + y)]
+        });
+        let expected = float_expected(&tiff);
+        for remainder in [
+            "filters:format(png)",
+            "filters:format(png,interlace)",
+            "filters:format(avif)",
+            "filters:format(webp):quality(100)",
+            "filters:format(webp)",
+            "filters:format(jpeg)",
+            "24x0/filters:format(png)",
+            "fit-in:20x20/filters:format(png,interlace)",
+        ] {
+            let out = process_spelled(&tiff, remainder, None);
+            assert!(!out.bytes.is_empty(), "{remainder}");
+        }
+        let png = process_spelled(&tiff, "filters:format(png)", None);
+        let decoded = image::load_from_memory(&png.bytes).unwrap();
+        assert_eq!(decoded, expected, "alpha {alpha}");
+        // Red reads the hostile list along x: NaN, then
+        // infinity, then negative infinity.
+        let red = |x: u32| decoded.to_rgba16().get_pixel(x, 0).0[0];
+        assert_eq!(red(0), u16::MAX, "NaN");
+        assert_eq!(red(1), u16::MAX, "infinity");
+        assert_eq!(red(2), 0, "negative infinity");
+    }
+}
+
 #[test]
 fn webp_options_change_the_encode() {
     let img = gradient_image();
@@ -3657,6 +4494,218 @@ fn animated_smart_crop_uses_one_window_for_every_frame() {
     assert!(center(&frames[0]) > 200, "frame one keeps its bright half");
     assert!(center(&frames[1]) < 55, "frame two replays the same window");
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// 64x64 white frames, each holding one black square given
+/// as (left, top, side); a side of 0 leaves the frame white.
+fn square_frames(squares: &[(u32, u32, u32)]) -> Vec<image::Frame> {
+    squares
+        .iter()
+        .map(|&(x, y, side)| {
+            let img = image::RgbaImage::from_fn(64, 64, |px, py| {
+                if (x..x + side).contains(&px) && (y..y + side).contains(&py) {
+                    image::Rgba([0, 0, 0, 255])
+                } else {
+                    image::Rgba([255, 255, 255, 255])
+                }
+            });
+            image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(100, 1))
+        })
+        .collect()
+}
+
+fn square_gif(squares: &[(u32, u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::codecs::gif::GifEncoder::new(&mut out)
+        .encode_frames(square_frames(squares))
+        .unwrap();
+    out
+}
+
+fn square_webp(squares: &[(u32, u32, u32)]) -> Vec<u8> {
+    let frames: Vec<_> = square_frames(squares)
+        .into_iter()
+        .map(|f| {
+            let buffer = f.into_buffer();
+            let image = oxideav_webp::WebpImage::from_rgba8(64, 64, buffer.into_raw()).unwrap();
+            oxideav_webp::Frame::new(image, Some(std::time::Duration::from_millis(100)))
+        })
+        .collect();
+    let opts = oxideav_webp::EncodeOptions::default()
+        .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
+    oxideav_webp::encode_animation(&frames, &opts).unwrap()
+}
+
+/// A GIF frame's rectangle as (left, top, width, height).
+type GifRect = (u16, u16, u16, u16);
+
+/// A GIF's logical screen and each frame's rectangle, read
+/// from the file itself: the image crate's decoder
+/// composites every frame onto the screen and hides both.
+fn gif_layout(bytes: &[u8]) -> ((u16, u16), Vec<GifRect>) {
+    let mut options = gif::DecodeOptions::new();
+    options.skip_frame_decoding(true);
+    let mut decoder = options.read_info(bytes).unwrap();
+    let screen = (decoder.width(), decoder.height());
+    let mut frames = Vec::new();
+    while let Some(frame) = decoder.next_frame_info().unwrap() {
+        frames.push((frame.left, frame.top, frame.width, frame.height));
+    }
+    (screen, frames)
+}
+
+fn trim_to(format: ImageFormat, mut filters: Vec<Filter>) -> Vec<Operation> {
+    filters.push(Filter::Format(FormatSpec::plain(format)));
+    vec![Operation::Filters(filters)]
+}
+
+fn luma_at(frame: &image::Frame, x: u32, y: u32) -> u8 {
+    frame.buffer().get_pixel(x, y).0[0]
+}
+
+#[test]
+fn animated_trim_cuts_one_window_for_every_frame() {
+    // Issue #465: trim decided per frame, so frames whose
+    // content shrank came out at 60, 44, and 24 px, all
+    // pushed at 0,0 on a 60x60 screen taken from the first.
+    // The frames now share one cut, the union of their
+    // boxes: every frame fills the screen, and each square
+    // stays where it was relative to the others.
+    let engine = Engine;
+    let shrinking = [(2, 2, 60), (10, 10, 44), (20, 20, 24)];
+    let out = engine
+        .process(
+            &square_gif(&shrinking),
+            &trim_to(ImageFormat::Gif, vec![Filter::Trim(10)]),
+        )
+        .unwrap();
+    assert_eq!((out.width, out.height), (60, 60));
+    let (screen, rects) = gif_layout(&out.bytes);
+    assert_eq!(screen, (60, 60));
+    assert_eq!(rects, vec![(0, 0, 60, 60); 3]);
+    let frames = decoded_gif_frames(&out.bytes);
+    assert_eq!(luma_at(&frames[0], 0, 0), 0);
+    // The 44 px square sat at 10 of 64; the cut starts at 2.
+    assert_eq!(luma_at(&frames[1], 8, 8), 0);
+    assert_eq!(luma_at(&frames[1], 7, 7), 255);
+    assert_eq!(luma_at(&frames[1], 51, 51), 0);
+    assert_eq!(luma_at(&frames[1], 52, 52), 255);
+    assert_eq!(luma_at(&frames[2], 18, 18), 0);
+    assert_eq!(luma_at(&frames[2], 17, 17), 255);
+    // Later frames that trim larger set the canvas too: the
+    // screen once came from the first frame's 40 px, and
+    // the 60 and 63 px frames spilled past it.
+    let growing = [(12, 12, 40), (2, 2, 60), (1, 1, 63)];
+    let out = engine
+        .process(
+            &square_gif(&growing),
+            &trim_to(ImageFormat::Gif, vec![Filter::Trim(10)]),
+        )
+        .unwrap();
+    let (screen, rects) = gif_layout(&out.bytes);
+    assert_eq!(screen, (63, 63));
+    assert_eq!(rects, vec![(0, 0, 63, 63); 3]);
+    let frames = decoded_gif_frames(&out.bytes);
+    assert_eq!(luma_at(&frames[0], 11, 11), 0);
+    assert_eq!(luma_at(&frames[0], 10, 10), 255);
+}
+
+#[test]
+fn animated_trim_to_webp_and_video_shares_one_canvas() {
+    // Issue #465: the animated WebP encoder refused frames
+    // of different sizes, a 500 for any trimmed animation
+    // whose content moved; the video plan refused them with
+    // a 400. One cut gives every frame the same canvas.
+    let engine = Engine;
+    let shrinking = [(2, 2, 60), (10, 10, 44), (20, 20, 24)];
+    for src in [square_gif(&shrinking), square_webp(&shrinking)] {
+        let out = engine
+            .process(&src, &trim_to(ImageFormat::WebP, vec![Filter::Trim(10)]))
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        assert_eq!((out.width, out.height), (60, 60));
+        let frames = decoded_webp_frames(&out.bytes);
+        assert_eq!(frames.len(), 3);
+        for frame in &frames {
+            assert_eq!(frame.buffer().dimensions(), (60, 60));
+        }
+        // Lossy, so the squares are checked by band.
+        assert!(luma_at(&frames[1], 20, 20) < 60);
+        assert!(luma_at(&frames[1], 3, 3) > 200);
+        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let out = engine
+            .process_preferred(
+                &src,
+                &trim_to(ImageFormat::Mp4, vec![Filter::Trim(10)]),
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.bytes, b"ENGINE-VIDEO");
+        assert_eq!((out.width, out.height), (60, 60));
+    }
+}
+
+#[test]
+fn animated_trim_survives_hostile_frames() {
+    // Whatever the frames hold and however the chain trims
+    // them, every frame lands on the one screen.
+    let engine = Engine;
+    let one_canvas = |squares: &[(u32, u32, u32)], ops: &[Operation]| {
+        let out = engine.process(&square_gif(squares), ops).unwrap();
+        let (screen, rects) = gif_layout(&out.bytes);
+        assert_eq!(rects.len(), squares.len(), "{ops:?}");
+        for rect in &rects {
+            assert_eq!(*rect, (0, 0, screen.0, screen.1), "{ops:?}");
+        }
+        (screen.0 as u32, screen.1 as u32)
+    };
+    let trim = |filters: Vec<Filter>| trim_to(ImageFormat::Gif, filters);
+    // A blank frame has no box of its own: it takes the
+    // others' cut instead of keeping its whole 64x64.
+    let with_blank = [(2, 2, 60), (0, 0, 0), (20, 20, 24)];
+    assert_eq!(
+        one_canvas(&with_blank, &trim(vec![Filter::Trim(10)])),
+        (60, 60)
+    );
+    // Nothing to cut in any frame: nothing is cut.
+    let blank = [(0, 0, 0), (0, 0, 0)];
+    assert_eq!(one_canvas(&blank, &trim(vec![Filter::Trim(10)])), (64, 64));
+    // Sides past the box clamp to one pixel, in every frame.
+    let shrinking = [(2, 2, 60), (10, 10, 44), (20, 20, 24)];
+    assert_eq!(
+        one_canvas(
+            &shrinking,
+            &trim(vec![Filter::TrimSides(10, [u32::MAX; 4])])
+        ),
+        (1, 1)
+    );
+    // Trims chained around other geometry, a later trim
+    // surveyed on frames the earlier one already cut, and a
+    // shared smart crop after them.
+    let chained = [
+        rect_op(0, 0, 64, 40),
+        Operation::Filters(vec![Filter::Trim(10), Filter::Rotate(90.0)]),
+        size_op(Dimension::Pixels(30), Dimension::Proportional),
+        Operation::Filters(vec![Filter::TrimSides(0, [1, 0, 0, 2]), Filter::Trim(250)]),
+        crop_op(9, 7, Align::Smart),
+        Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::Gif))]),
+    ];
+    assert_eq!(one_canvas(&shrinking, &chained), (9, 7));
+    // The render's deadline bounds the survey too.
+    let err = engine
+        .process_preferred(
+            &square_gif(&shrinking),
+            &trim(vec![Filter::Trim(10)]),
+            ProcessContext {
+                deadline: Some(std::time::Instant::now()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Timeout), "{err:?}");
 }
 
 #[test]
@@ -7538,6 +8587,145 @@ fn blurfaces_without_a_model_is_a_clean_error() {
     match &err {
         EngineError::NotConfigured(msg) => assert!(msg.contains("face"), "{msg}"),
         other => panic!("expected NotConfigured, got {other:?}"),
+    }
+}
+
+/// The boxes `alpha_redaction_scene` hides: the known face,
+/// the known person, and a free region.
+const ALPHA_HIDDEN_BOXES: [(u32, u32, u32, u32); 3] =
+    [(140, 30, 40, 40), (10, 10, 60, 80), (80, 100, 40, 40)];
+
+/// Issue #444: a black and white checkerboard stored as RGBA,
+/// opaque except for `ALPHA_HIDDEN_BOXES`, which are at
+/// `alpha`. The fake detectors report the boxes whatever the
+/// alpha, as YuNet does (it reads RGB only).
+fn alpha_redaction_scene(alpha: u8) -> Vec<u8> {
+    let img = image::RgbaImage::from_fn(200, 160, |x, y| {
+        let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+        let hidden = ALPHA_HIDDEN_BOXES
+            .iter()
+            .any(|&(bx, by, bw, bh)| (bx..bx + bw).contains(&x) && (by..by + bh).contains(&y));
+        image::Rgba([v, v, v, if hidden { alpha } else { 255 }])
+    });
+    png_bytes(&DynamicImage::ImageRgba8(img))
+}
+
+#[test]
+fn redaction_leaves_no_original_color_under_alpha() {
+    // Issue #444, end to end: a face, an object, or a region
+    // stored at alpha 0 or 128 came back with all or a third
+    // of its original color, and JPEG output (which drops
+    // alpha) served it. The measure is the issue's: the slope
+    // of the output's red against the source's inside the
+    // redacted area, about 1 for a pass-through and 0 for
+    // none.
+    let engine = Engine;
+    let segment = LeftHalfSegment::default();
+    let ctx = |models: &str| match models {
+        "face" => ProcessContext {
+            face_provider: Some(&KnownFace),
+            ..Default::default()
+        },
+        "objects" => detect_ctx(&KnownObjects),
+        "masks" => segment_ctx(&KnownObjects, &segment),
+        _ => ProcessContext::default(),
+    };
+    let person = || "person".to_string();
+    let face = (140, 30, 40, 40);
+    let (rx, ry, rw, rh) = (80, 100, 40, 40);
+    let cases = [
+        ("blurfaces", Filter::BlurFaces, "face", face),
+        ("pixelatefaces", Filter::PixelateFaces, "face", face),
+        (
+            "blurclass",
+            Filter::BlurClass(person()),
+            "objects",
+            (10, 10, 60, 80),
+        ),
+        (
+            "pixelateclass",
+            Filter::PixelateClass(person()),
+            "objects",
+            (10, 10, 60, 80),
+        ),
+        // The silhouette is the box's left half.
+        (
+            "blurclass masked",
+            Filter::BlurClass(person()),
+            "masks",
+            (10, 10, 30, 80),
+        ),
+        (
+            "pixelateclass masked",
+            Filter::PixelateClass(person()),
+            "masks",
+            (10, 10, 30, 80),
+        ),
+        (
+            "blur_region",
+            Filter::BlurRegion {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            },
+            "none",
+            (rx, ry, rw, rh),
+        ),
+        (
+            "pixelate_region",
+            Filter::PixelateRegion {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            },
+            "none",
+            (rx, ry, rw, rh),
+        ),
+    ];
+    for alpha in [0u8, 128] {
+        let source = alpha_redaction_scene(alpha);
+        let src = image::load_from_memory(&source).unwrap().to_rgba8();
+        for (name, filter, models, (bx, by, bw, bh)) in &cases {
+            for format in [ImageFormat::Jpeg, ImageFormat::Png] {
+                let out = engine
+                    .process_preferred(
+                        &source,
+                        &[Operation::Filters(vec![
+                            filter.clone(),
+                            Filter::Format(FormatSpec::plain(format)),
+                            Filter::Quality(Quality::Value(100)),
+                        ])],
+                        ctx(models),
+                    )
+                    .unwrap();
+                let result = image::load_from_memory(&out.bytes).unwrap().to_rgba8();
+                let pairs: Vec<(f64, f64)> = (*by..by + bh)
+                    .flat_map(|y| (*bx..bx + bw).map(move |x| (x, y)))
+                    .map(|(x, y)| {
+                        (
+                            src.get_pixel(x, y)[0] as f64,
+                            result.get_pixel(x, y)[0] as f64,
+                        )
+                    })
+                    .collect();
+                let n = pairs.len() as f64;
+                let ms = pairs.iter().map(|p| p.0).sum::<f64>() / n;
+                let mo = pairs.iter().map(|p| p.1).sum::<f64>() / n;
+                let cov: f64 = pairs.iter().map(|(s, o)| (s - ms) * (o - mo)).sum();
+                let var: f64 = pairs.iter().map(|(s, _)| (s - ms).powi(2)).sum();
+                let slope = cov / var;
+                assert!(
+                    slope.abs() < 0.1,
+                    "{name} at alpha {alpha} to {format:?}: slope {slope:.3}"
+                );
+                if format == ImageFormat::Png {
+                    // The redacted area keeps the source's alpha.
+                    assert_eq!(result.get_pixel(*bx + 1, *by + 1)[3], alpha, "{name}");
+                }
+            }
+        }
     }
 }
 

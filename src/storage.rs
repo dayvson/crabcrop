@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::cache::CachedImage;
+use crate::cache::{CachedImage, PurgeCutoff, PurgeTarget, Tombstone, WriteStamp};
 use crate::url::ImageFormat;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -52,7 +52,6 @@ struct Inner {
 /// behind it. The index mutations stay exactly as atomic as
 /// before; a race can at worst evict a fresh entry, which a
 /// cache heals on the next store.
-#[derive(Debug)]
 pub struct DiskStore {
     dir: PathBuf,
     max_bytes: usize,
@@ -75,6 +74,20 @@ pub struct DiskStore {
     permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
+impl std::fmt::Debug for DiskStore {
+    /// The entry MAC key prints as `[redacted]` (issue #455).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskStore")
+            .field("dir", &self.dir)
+            .field("max_bytes", &self.max_bytes)
+            .field("entry_key", &crate::redact::Redacted)
+            .field("inner", &self.inner)
+            .field("errors", &self.errors)
+            .field("permits", &self.permits)
+            .finish()
+    }
+}
+
 /// How many disk operations may run on the blocking pool
 /// at once (issue #347). Fixed, not configured: the disk
 /// acceptance for this boundary is that waiting work
@@ -91,16 +104,25 @@ const DISK_OP_PERMITS: usize = 32;
 /// self-consistent. CRABDISK5 adds the entry's ETag (a
 /// digest of its payload bytes) to the header, so a hit
 /// answers conditional requests without rehashing the
-/// body. CRABDISK4 files still parse: the payload is in
-/// hand, so their ETag is derived from it on read, and
-/// entries written by the previous build keep serving
-/// instead of being dropped. Anything older does not
-/// parse and is deleted on sight at scan, the store's
-/// standing upgrade behavior for a cache.
-const MAGIC: &str = "CRABDISK5";
+/// body. CRABDISK6 adds the entry's write stamp (issues
+/// #446, #461: when the render behind it began, and on
+/// which process), so a purge removes only the copies
+/// written before it began. CRABDISK5 and CRABDISK4 files
+/// still parse, as unstamped entries that count as older
+/// than every purge, and a CRABDISK4 entry's ETag is
+/// derived from its payload on read: entries written by
+/// earlier builds keep serving instead of being dropped.
+/// Anything older does not parse and is deleted on sight
+/// at scan, the store's standing upgrade behavior for a
+/// cache.
+const MAGIC: &str = "CRABDISK6";
 
-/// The previous entry format: identical but for the
-/// missing ETag line. Readable, never written.
+/// The entry format before write stamps: identical but
+/// for the missing stamp line. Readable, never written.
+const MAGIC_V5: &str = "CRABDISK5";
+
+/// The entry format before stored ETags: CRABDISK5 without
+/// the ETag line. Readable, never written.
 const MAGIC_V4: &str = "CRABDISK4";
 
 /// The largest serialized entry the shared (S3) tier will
@@ -612,12 +634,13 @@ pub(crate) fn serialize_entry(key: &str, image: &CachedImage, entry_key: &[u8]) 
     // The MAC covers everything after its own line, so the
     // body is assembled first and the MAC computed over it.
     let head = format!(
-        "{}\n{quality}\n{}\n{}\n{}\n{}\n",
+        "{}\n{quality}\n{}\n{}\n{}\n{}\n{}\n",
         format_name(image.format),
         image.groups.len(),
         key.len(),
         image.bytes.len(),
-        image.etag
+        image.etag,
+        stamp_line(image.written)
     );
     let mut body =
         Vec::with_capacity(head.len() + key.len() + 1 + groups_block.len() + image.bytes.len());
@@ -635,6 +658,37 @@ pub(crate) fn serialize_entry(key: &str, image: &CachedImage, entry_key: &[u8]) 
     out.push(b'\n');
     out.extend_from_slice(&body);
     out
+}
+
+/// The CRABDISK6 stamp line: `<unix-ms> <writer-hex>`, or
+/// `-` for a copy promoted or merged from an unstamped
+/// entry, which stays unstamped wherever it goes.
+fn stamp_line(written: Option<WriteStamp>) -> String {
+    match written {
+        Some(stamp) => format!("{} {:016x}", stamp.at_ms, stamp.writer),
+        None => "-".to_string(),
+    }
+}
+
+/// Parse a stamp line. The field is authenticated by the
+/// entry MAC like every other, so the checks here are
+/// framing: an exact shape, nothing that could overflow.
+fn parse_stamp_line(line: &[u8]) -> Option<Option<WriteStamp>> {
+    if line == b"-" {
+        return Some(None);
+    }
+    let text = std::str::from_utf8(line).ok()?;
+    let (at, writer) = text.split_once(' ')?;
+    if at.is_empty() || at.len() > 20 || !at.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if writer.len() != 16 || !writer.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(Some(WriteStamp {
+        at_ms: at.parse().ok()?,
+        writer: u64::from_str_radix(writer, 16).ok()?,
+    }))
 }
 
 /// Take the next `\n`-terminated line starting at `pos`,
@@ -659,10 +713,22 @@ struct EntryHeader {
     /// (everything after the MAC line) begins.
     mac: [u8; 32],
     covered_start: usize,
-    /// The entry's stored ETag (CRABDISK5). CRABDISK4
+    /// The entry's stored ETag (CRABDISK5 on). CRABDISK4
     /// entries carry none: `None`, and the reader derives
     /// the value from the payload instead.
     etag: Option<String>,
+    /// The entry's write stamp (CRABDISK6); `None` for an
+    /// unstamped entry, of any version.
+    written: Option<WriteStamp>,
+}
+
+/// What the shared tier's purge walk reads from an entry
+/// header: its claimed key, groups, and write stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeaderProbe {
+    pub key: String,
+    pub groups: Vec<String>,
+    pub written: Option<WriteStamp>,
 }
 
 /// Split a stored file into (key, format, quality, groups,
@@ -678,9 +744,11 @@ struct EntryHeader {
 /// [`parse_entry`] and [`read_header`], the serving paths.
 fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
     let mut pos = 0;
-    let version5 = match take_line(data, &mut pos)? {
-        line if line == MAGIC.as_bytes() => true,
-        line if line == MAGIC_V4.as_bytes() => false,
+    // (carries an ETag line, carries a stamp line)
+    let (has_etag, has_stamp) = match take_line(data, &mut pos)? {
+        line if line == MAGIC.as_bytes() => (true, true),
+        line if line == MAGIC_V5.as_bytes() => (true, false),
+        line if line == MAGIC_V4.as_bytes() => (false, false),
         _ => return None,
     };
     let mac_line = take_line(data, &mut pos)?;
@@ -711,10 +779,10 @@ fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
         .ok()?
         .parse()
         .ok()?;
-    // The CRABDISK5 ETag line: a quoted 32-digit hex digest.
-    // The MAC authenticates it like every other field, so
-    // the shape check here is framing, not trust.
-    let etag = if version5 {
+    // The ETag line: a quoted 32-digit hex digest. The MAC
+    // authenticates it like every other field, so the shape
+    // check here is framing, not trust.
+    let etag = if has_etag {
         let line = take_line(data, &mut pos)?;
         if line.len() != 34
             || line.first() != Some(&b'"')
@@ -724,6 +792,11 @@ fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
             return None;
         }
         Some(String::from_utf8(line.to_vec()).ok()?)
+    } else {
+        None
+    };
+    let written = if has_stamp {
+        parse_stamp_line(take_line(data, &mut pos)?)?
     } else {
         None
     };
@@ -771,6 +844,7 @@ fn parse_header_bytes(data: &[u8], total_len: usize) -> Option<EntryHeader> {
         mac,
         covered_start,
         etag,
+        written,
     })
 }
 
@@ -814,22 +888,29 @@ pub(crate) fn parse_entry(data: &[u8], entry_key: &[u8]) -> Option<(String, Cach
             quality: header.quality,
             groups: header.groups,
             etag,
+            written: header.written,
         },
     ))
 }
 
-/// Just the key and groups of a stored entry, WITHOUT MAC
-/// verification, for the shared tier's purge walk: matching
-/// a purge target needs the entry's claimed key and
-/// groups, and verification needs the whole object, which
-/// is exactly the full read the walk exists to avoid. A
-/// forged header can at worst steer a purge; it can never
-/// be served, because every serving read goes through
-/// [`parse_entry`] and verifies. `total_len` is the
-/// object's real length; `data` holds at least its header.
-pub(crate) fn parse_entry_header(data: &[u8], total_len: usize) -> Option<(String, Vec<String>)> {
+/// Just the key, groups, and stamp of a stored entry,
+/// WITHOUT MAC verification, for the shared tier's purge
+/// walk: matching a purge target needs the entry's claimed
+/// key, groups, and write stamp, and verification needs
+/// the whole object, which is exactly the full read the
+/// walk exists to avoid. A forged header can at worst steer
+/// a purge (delete a copy, or leave one for the tombstone
+/// to keep missing); it can never be served, because every
+/// serving read goes through [`parse_entry`] and verifies.
+/// `total_len` is the object's real length; `data` holds at
+/// least its header.
+pub(crate) fn parse_entry_header(data: &[u8], total_len: usize) -> Option<HeaderProbe> {
     let header = parse_header_bytes(data, total_len)?;
-    Some((header.key, header.groups))
+    Some(HeaderProbe {
+        key: header.key,
+        groups: header.groups,
+        written: header.written,
+    })
 }
 
 /// Just the header of a stored file, for the boot scan.
@@ -845,6 +926,127 @@ fn read_header(path: &Path, cap: usize, entry_key: &[u8]) -> Option<(String, Vec
         return None;
     }
     Some((header.key, header.groups))
+}
+
+/// The purge tombstone format (issue #461): what a purge
+/// writes to the shared bucket so every replica, and the
+/// same one after a restart, keeps treating the copies it
+/// covers as purged until its walk has removed them. A
+/// small text record, authenticated like an entry:
+///
+/// ```text
+/// CRABPURGE1
+/// <HMAC-SHA256 hex over everything below>
+/// <key|group|source>
+/// <purge start, unix ms> <writer, 16 hex digits>
+/// <walk end, unix ms, or ->
+/// <target length>
+/// <target bytes>
+/// ```
+///
+/// The MAC key is derived from the entry key under its own
+/// label, so neither record can stand in for the other,
+/// and a tombstone planted by anyone without the secret is
+/// ignored.
+const TOMBSTONE_MAGIC: &str = "CRABPURGE1";
+
+/// The largest tombstone object a refresh reads. Targets
+/// are cache keys, group names, and source locators, far
+/// smaller than this.
+pub(crate) const MAX_TOMBSTONE_BYTES: usize = 64 * 1024;
+
+/// The tombstone MAC key: the entry key under a label of
+/// its own.
+fn tombstone_mac_key(entry_key: &[u8]) -> [u8; 32] {
+    entry_mac(entry_key, b"crabcrop purge tombstone v1")
+}
+
+fn target_parts(target: &PurgeTarget) -> (&'static str, &str) {
+    match target {
+        PurgeTarget::Key(base) => ("key", base),
+        PurgeTarget::Group(group) => ("group", group),
+        PurgeTarget::Source(source) => ("source", source),
+    }
+}
+
+pub(crate) fn serialize_tombstone(tombstone: &Tombstone, entry_key: &[u8]) -> Vec<u8> {
+    let (kind, name) = target_parts(&tombstone.target);
+    let ended = tombstone
+        .ended_ms
+        .map(|ms| ms.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let start = stamp_line(Some(WriteStamp {
+        at_ms: tombstone.cutoff.start_ms,
+        writer: tombstone.cutoff.writer,
+    }));
+    let mut body = format!("{kind}\n{start}\n{ended}\n{}\n", name.len()).into_bytes();
+    body.extend_from_slice(name.as_bytes());
+    let mac = entry_mac(&tombstone_mac_key(entry_key), &body);
+    let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+    let mut out = format!("{TOMBSTONE_MAGIC}\n{mac_hex}\n").into_bytes();
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Parse and authenticate a tombstone object. `None` for
+/// anything that is not a whole, verified record: the
+/// object's bytes come from the bucket, which is
+/// operator-adjacent data, not trusted input.
+pub(crate) fn parse_tombstone(data: &[u8], entry_key: &[u8]) -> Option<Tombstone> {
+    if data.len() > MAX_TOMBSTONE_BYTES {
+        return None;
+    }
+    let mut pos = 0;
+    if take_line(data, &mut pos)? != TOMBSTONE_MAGIC.as_bytes() {
+        return None;
+    }
+    let mac_line = take_line(data, &mut pos)?;
+    if mac_line.len() != 64 || !mac_line.iter().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mac_vec = hex_decode(mac_line)?;
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(&mac_vec);
+    if !verify_entry_mac(&tombstone_mac_key(entry_key), &data[pos..], &mac) {
+        return None;
+    }
+    let kind = take_line(data, &mut pos)?;
+    let start = parse_stamp_line(take_line(data, &mut pos)?)??;
+    let ended_line = take_line(data, &mut pos)?;
+    let ended_ms = if ended_line == b"-" {
+        None
+    } else {
+        if ended_line.is_empty()
+            || ended_line.len() > 20
+            || !ended_line.iter().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(std::str::from_utf8(ended_line).ok()?.parse().ok()?)
+    };
+    let len_line = take_line(data, &mut pos)?;
+    if len_line.is_empty() || len_line.len() > 20 || !len_line.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let len: usize = std::str::from_utf8(len_line).ok()?.parse().ok()?;
+    if pos.checked_add(len)? != data.len() {
+        return None;
+    }
+    let name = String::from_utf8(data[pos..].to_vec()).ok()?;
+    let target = match kind {
+        b"key" => PurgeTarget::Key(name),
+        b"group" => PurgeTarget::Group(name),
+        b"source" => PurgeTarget::Source(name),
+        _ => return None,
+    };
+    Some(Tombstone {
+        target,
+        cutoff: PurgeCutoff {
+            start_ms: start.at_ms,
+            writer: start.writer,
+        },
+        ended_ms,
+    })
 }
 
 #[cfg(test)]
@@ -895,6 +1097,7 @@ mod tests {
             quality: Some(80),
             groups: Vec::new(),
             etag: crate::cache::etag_for_bytes(bytes),
+            written: None,
         }
     }
 
@@ -945,13 +1148,29 @@ mod tests {
     /// line, MAC'd the same way. Only group-free entries:
     /// that is all the compatibility test stores.
     fn serialize_entry_v4(key: &str, image: &CachedImage, entry_key: &[u8]) -> Vec<u8> {
+        serialize_legacy_entry(MAGIC_V4, key, image, entry_key)
+    }
+
+    /// An entry in a pre-stamp layout: CRABDISK4 (no ETag
+    /// line) or CRABDISK5 (an ETag line, no stamp line).
+    fn serialize_legacy_entry(
+        magic: &str,
+        key: &str,
+        image: &CachedImage,
+        entry_key: &[u8],
+    ) -> Vec<u8> {
         assert!(image.groups.is_empty());
         let quality = image
             .quality
             .map(|q| q.to_string())
             .unwrap_or_else(|| "-".to_string());
+        let etag_line = if magic == MAGIC_V5 {
+            format!("{}\n", image.etag)
+        } else {
+            String::new()
+        };
         let head = format!(
-            "{}\n{quality}\n{}\n{}\n{}\n",
+            "{}\n{quality}\n{}\n{}\n{}\n{etag_line}",
             format_name(image.format),
             image.groups.len(),
             key.len(),
@@ -965,7 +1184,7 @@ mod tests {
         let mac = entry_mac(entry_key, &body);
         let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
         let mut out = Vec::new();
-        out.extend_from_slice(MAGIC_V4.as_bytes());
+        out.extend_from_slice(magic.as_bytes());
         out.push(b'\n');
         out.extend_from_slice(mac_hex.as_bytes());
         out.push(b'\n');
@@ -993,6 +1212,178 @@ mod tests {
         assert_eq!(store.stats().0, 1);
         assert_eq!(store.get("k"), Some(img));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamped_entries_round_trip_and_older_formats_read_unstamped() {
+        // Issues #446, #461: the write stamp is persisted
+        // and survives a reopen; an entry written before
+        // stamps existed still serves, unstamped, which a
+        // purge treats as older than itself.
+        let key = test_entry_key();
+        let stamp = WriteStamp {
+            at_ms: 1_762_000_000_123,
+            writer: 0x0123_4567_89ab_cdef,
+        };
+        let stamped = CachedImage {
+            written: Some(stamp),
+            ..image(b"stamped")
+        };
+        let data = serialize_entry("s", &stamped, &key);
+        assert!(data.starts_with(b"CRABDISK6\n"));
+        assert_eq!(parse_entry(&data, &key).unwrap().1, stamped);
+        let probe = parse_entry_header(&data, data.len()).unwrap();
+        assert_eq!(probe.key, "s");
+        assert_eq!(probe.written, Some(stamp));
+        // An unstamped copy stays unstamped when rewritten.
+        let unstamped = serialize_entry("u", &image(b"plain"), &key);
+        assert_eq!(parse_entry(&unstamped, &key).unwrap().1.written, None);
+        let dir = temp_dir("stamps");
+        {
+            let store = DiskStore::open(&dir, 1_000_000, key.clone()).unwrap();
+            store.put("s", &stamped);
+        }
+        for (name, magic) in [("v5", MAGIC_V5), ("v4", MAGIC_V4)] {
+            let legacy = serialize_legacy_entry(magic, name, &image(b"legacy"), &key);
+            let (_, parsed) = parse_entry(&legacy, &key).unwrap();
+            assert_eq!(parsed, image(b"legacy"), "{name}");
+            assert_eq!(
+                parse_entry_header(&legacy, legacy.len()).unwrap().written,
+                None
+            );
+            std::fs::write(dir.join(format!("{}.bin", key_stem(name))), &legacy).unwrap();
+        }
+        let store = DiskStore::open(&dir, 1_000_000, key).unwrap();
+        assert_eq!(store.stats().0, 3);
+        assert_eq!(store.get("s").unwrap().written, Some(stamp));
+        assert_eq!(store.get("v5").unwrap().written, None);
+        assert_eq!(store.get("v4").unwrap().written, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_lines_it_cannot_trust_fail_the_parse() {
+        // The stamp line is MACed, but framing is checked
+        // before anything is trusted: every malformed shape
+        // is a miss, never a panic or a wrapped number.
+        let key = test_entry_key();
+        let with_stamp = |line: &str| {
+            let mut body =
+                format!("png\n-\n0\n1\n1\n\"00000000000000000000000000000000\"\n{line}\nk\nx")
+                    .into_bytes();
+            let mac = entry_mac(&key, &body);
+            let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+            let mut v = format!("{MAGIC}\n{mac_hex}\n").into_bytes();
+            v.append(&mut body);
+            v
+        };
+        let good = parse_entry(&with_stamp("5 00000000000000ff"), &key).unwrap();
+        assert_eq!(
+            good.1.written,
+            Some(WriteStamp {
+                at_ms: 5,
+                writer: 0xff
+            })
+        );
+        for bad in [
+            "",
+            "x",
+            "5",
+            "5 ",
+            " 00000000000000ff",
+            "5 00000000000000f",
+            "5 00000000000000fff",
+            "5 00000000000000fg",
+            "-5 00000000000000ff",
+            "+5 00000000000000ff",
+            "18446744073709551616 00000000000000ff",
+            "999999999999999999999 00000000000000ff",
+            "5  00000000000000ff",
+            "5 00000000000000ff ",
+            "--",
+        ] {
+            assert_eq!(parse_entry(&with_stamp(bad), &key), None, "{bad:?}");
+        }
+    }
+
+    fn tombstone(target: PurgeTarget, ended_ms: Option<u64>) -> Tombstone {
+        Tombstone {
+            target,
+            cutoff: PurgeCutoff {
+                start_ms: 1_762_000_000_000,
+                writer: 0xfeed,
+            },
+            ended_ms,
+        }
+    }
+
+    #[test]
+    fn tombstones_round_trip_and_authenticate() {
+        let key = test_entry_key();
+        for t in [
+            tombstone(PurgeTarget::Key("300x200/http://x/a.jpg".into()), None),
+            tombstone(PurgeTarget::Group("hero".into()), Some(1_762_000_001_000)),
+            tombstone(PurgeTarget::Source("file:///a b\n.jpg".into()), None),
+            tombstone(PurgeTarget::Group(String::new()), Some(0)),
+        ] {
+            let data = serialize_tombstone(&t, &key);
+            assert_eq!(parse_tombstone(&data, &key), Some(t.clone()));
+            // Under another secret it is a stranger's record.
+            assert_eq!(
+                parse_tombstone(&data, &crate::url::entry_key(b"other")),
+                None
+            );
+            // Any changed byte fails the MAC or the framing.
+            for i in 0..data.len() {
+                let mut tampered = data.clone();
+                tampered[i] ^= 0x01;
+                assert_eq!(parse_tombstone(&tampered, &key), None, "byte {i}");
+            }
+            // Truncated or extended, it is not a record.
+            assert_eq!(parse_tombstone(&data[..data.len() - 1], &key), None);
+            let mut longer = data.clone();
+            longer.push(b'x');
+            assert_eq!(parse_tombstone(&longer, &key), None);
+        }
+    }
+
+    #[test]
+    fn entries_and_tombstones_never_stand_in_for_each_other() {
+        // Hostile input: the bucket holds both kinds of
+        // record under one secret, and a planted or moved
+        // object must not parse as the other kind.
+        let key = test_entry_key();
+        let entry = serialize_entry("k", &image(b"x"), &key);
+        assert_eq!(parse_tombstone(&entry, &key), None);
+        let record = serialize_tombstone(&tombstone(PurgeTarget::Group("g".into()), None), &key);
+        assert_eq!(parse_entry(&record, &key), None);
+        assert_eq!(parse_entry_header(&record, record.len()), None);
+        // Well-MACed but malformed bodies: an unknown kind,
+        // an unstamped start, a bad end, a lying length.
+        let signed = |body: &str| {
+            let mac = entry_mac(&tombstone_mac_key(&key), body.as_bytes());
+            let mac_hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+            format!("{TOMBSTONE_MAGIC}\n{mac_hex}\n{body}").into_bytes()
+        };
+        assert!(parse_tombstone(&signed("group\n5 000000000000feed\n-\n1\ng"), &key).is_some());
+        for body in [
+            "everything\n5 000000000000feed\n-\n1\ng",
+            "group\n-\n-\n1\ng",
+            "group\n5 000000000000feed\nsoon\n1\ng",
+            "group\n5 000000000000feed\n-5\n1\ng",
+            "group\n5 000000000000feed\n-\n2\ng",
+            "group\n5 000000000000feed\n-\n0\ng",
+            "group\n5 000000000000feed\n-\n18446744073709551615\ng",
+            "group\n5 000000000000feed\n-\n99999999999999999999999\ng",
+            "group\n5 000000000000feed\n-\n\ng",
+            "group\n5 000000000000feed\n-",
+        ] {
+            assert_eq!(parse_tombstone(&signed(body), &key), None, "{body:?}");
+        }
+        // Oversized objects are refused before parsing.
+        let huge = PurgeTarget::Group("g".repeat(MAX_TOMBSTONE_BYTES));
+        let big = serialize_tombstone(&tombstone(huge, None), &key);
+        assert_eq!(parse_tombstone(&big, &key), None);
     }
 
     #[test]
@@ -1061,7 +1452,7 @@ mod tests {
     /// field checks are what reject these, never the MAC.
     fn crafted_entry(group_count: &str, key_len: &str, payload_len: &str, tail: &[u8]) -> Vec<u8> {
         let mut body = format!(
-            "png\n-\n{group_count}\n{key_len}\n{payload_len}\n\"00000000000000000000000000000000\"\n"
+            "png\n-\n{group_count}\n{key_len}\n{payload_len}\n\"00000000000000000000000000000000\"\n-\n"
         )
         .into_bytes();
         body.extend_from_slice(tail);

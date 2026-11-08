@@ -225,15 +225,15 @@ pub(in crate::server) fn compose_annotation(
 /// tag provider is configured. Bounded by the AI gate like
 /// every other inference; any failure (gate busy, decode,
 /// inference) omits the annotation rather than failing a
-/// response whose image processed fine. When `ai_gated` is
-/// set the request already holds an AI permit (an AI
-/// transform answering meta), and the annotation runs
-/// under it rather than acquiring a second permit (audit
-/// R2-29).
+/// response whose image processed fine. Every meta
+/// section acquires its own AI permit, an AI transform's
+/// meta response included: the render's permit drained
+/// with its job (`run_process` holds it until the work
+/// finishes), so the request no longer holds one when the
+/// sections run.
 pub(in crate::server) async fn annotate_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
-    ai_gated: bool,
 ) -> Option<Annotation> {
     let tagger = state.tagger.as_ref()?;
     // The permit moves into the blocking task below and
@@ -244,16 +244,10 @@ pub(in crate::server) async fn annotate_meta(
     // that moment while the detached inference runs on
     // unaccounted. Every meta helper holds its permit
     // this way.
-    let permit = if ai_gated {
-        None
-    } else {
-        Some(
-            tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
-                .await
-                .ok()?
-                .ok()?,
-        )
-    };
+    let permit = tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()?;
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
     let tagger = tagger.clone();
     match tokio::task::spawn_blocking(move || {
@@ -293,7 +287,6 @@ pub(in crate::server) async fn annotate_meta(
 pub(in crate::server) async fn detect_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
-    ai_gated: bool,
 ) -> Option<Vec<(String, crate::ai::Detection)>> {
     let mut providers: Vec<(String, Arc<dyn crate::ai::DetectionProvider>)> = Vec::new();
     if let Some(detector) = &state.detect {
@@ -305,25 +298,18 @@ pub(in crate::server) async fn detect_meta(
     if providers.is_empty() {
         return None;
     }
-    // Same permit rule as `annotate_meta`: a request that
-    // already holds an AI permit runs its detections under
-    // it instead of queueing for a second one (audit R2-29).
-    // The permit itself is shared with each provider's
-    // blocking task (issue #357), so the slot stays
-    // accounted until the inference that is actually
-    // running returns, even if the caller has already
-    // timed the section out.
-    let permit = if ai_gated {
-        None
-    } else {
-        Some(
-            tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
-                .await
-                .ok()?
-                .ok()?,
-        )
-    };
-    let permit = Arc::new(permit);
+    // Same permit rule as `annotate_meta`: the section
+    // acquires its own AI permit. The permit is shared
+    // with each provider's blocking task (issue #357), so
+    // the slot stays accounted until the inference that is
+    // actually running returns, even if the caller has
+    // already timed the section out.
+    let permit = Arc::new(
+        tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()?,
+    );
     let img = crate::engine::decode_image(&processed.bytes).ok()?;
     let mut aggregated: Vec<(String, crate::ai::Detection)> = Vec::new();
     let mut any_answered = false;
@@ -411,17 +397,15 @@ pub(in crate::server) fn compose_moderation(
 }
 
 /// Run moderation for a meta response that asked for it.
-/// Same permit rule as `annotate_meta` (a request already
-/// holding an AI permit runs under it, audit R2-29),
-/// but the outcome is explicit rather than an omitted
-/// field: an unconfigured provider, a busy gate, and a
-/// failed inference each report unavailable, with a
-/// reason, because the client asked for the field by
-/// name.
+/// Same permit rule as `annotate_meta` (the section
+/// acquires its own AI permit), but the outcome is
+/// explicit rather than an omitted field: an
+/// unconfigured provider, a busy gate, and a failed
+/// inference each report unavailable, with a reason,
+/// because the client asked for the field by name.
 pub(in crate::server) async fn moderate_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
-    ai_gated: bool,
 ) -> ModerationMeta {
     let Some(provider) = state.moderation.as_ref() else {
         return ModerationMeta::Unavailable("not_configured");
@@ -429,14 +413,11 @@ pub(in crate::server) async fn moderate_meta(
     // The permit moves into the blocking task and drops
     // when the inference returns, as in `annotate_meta`
     // (issue #357).
-    let permit = if ai_gated {
-        None
-    } else {
+    let permit =
         match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Some(permit),
+            Ok(Ok(permit)) => permit,
             _ => return ModerationMeta::Unavailable("busy"),
-        }
-    };
+        };
     let img = match crate::engine::decode_image(&processed.bytes) {
         Ok(img) => img,
         Err(_) => return ModerationMeta::Unavailable("inference_failed"),
@@ -596,18 +577,17 @@ pub enum EmbeddingMeta {
 }
 
 /// Run the embedding provider for a meta response.
-/// Same permit rule as `moderate_meta` (a request
-/// already holding an AI permit runs under it, audit
-/// R2-29), and the outcome is explicit rather than an
-/// omitted field: an unconfigured provider, a busy
-/// gate, and a failed inference each report
-/// unavailable, with a reason, because the client
-/// asked for the field by name (directly, or through
-/// the aesthetic head that scores the vector).
+/// Same permit rule as `moderate_meta` (the section
+/// acquires its own AI permit), and the outcome is
+/// explicit rather than an omitted field: an
+/// unconfigured provider, a busy gate, and a failed
+/// inference each report unavailable, with a reason,
+/// because the client asked for the field by name
+/// (directly, or through the aesthetic head that scores
+/// the vector).
 pub(in crate::server) async fn embed_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
-    ai_gated: bool,
 ) -> EmbeddingMeta {
     let Some(provider) = state.embeddings.as_ref() else {
         return EmbeddingMeta::Unavailable("not_configured");
@@ -615,14 +595,11 @@ pub(in crate::server) async fn embed_meta(
     // The permit moves into the blocking task and drops
     // when the inference returns, as in `annotate_meta`
     // (issue #357).
-    let permit = if ai_gated {
-        None
-    } else {
+    let permit =
         match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Some(permit),
+            Ok(Ok(permit)) => permit,
             _ => return EmbeddingMeta::Unavailable("busy"),
-        }
-    };
+        };
     let img = match crate::engine::decode_image(&processed.bytes) {
         Ok(img) => img,
         Err(_) => return EmbeddingMeta::Unavailable("inference_failed"),
@@ -697,7 +674,6 @@ fn compose_ocr(report: &crate::ai::OcrReport) -> crate::ai::OcrReport {
 pub(in crate::server) async fn ocr_meta(
     state: &AppState,
     processed: &crate::engine::ProcessedImage,
-    ai_gated: bool,
     deadline: Instant,
 ) -> OcrMeta {
     let Some(provider) = state.ocr.as_ref() else {
@@ -706,14 +682,11 @@ pub(in crate::server) async fn ocr_meta(
     // The permit moves into the blocking task and drops
     // when the inference returns, as in `annotate_meta`
     // (issue #357).
-    let permit = if ai_gated {
-        None
-    } else {
+    let permit =
         match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Some(permit),
+            Ok(Ok(permit)) => permit,
             _ => return OcrMeta::Unavailable("busy"),
-        }
-    };
+        };
     let img = match crate::engine::decode_image(&processed.bytes) {
         Ok(img) => img,
         Err(_) => return OcrMeta::Unavailable("inference_failed"),
@@ -1600,10 +1573,18 @@ pub(in crate::server) fn meta_response(
     let body = serde_json::to_string(&meta).unwrap_or_default();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-    // Meta is a second representation of the same URL (audit
-    // PL-12): never publicly cacheable, so an intermediary can
-    // never pin it in place of the image, or the reverse.
+    meta_cache_headers((StatusCode::OK, headers, body).into_response())
+}
+
+/// The caching headers of an answer to a meta request.
+/// Meta is a second representation of the same URL (audit
+/// PL-12): never publicly cacheable, so an intermediary can
+/// never pin it in place of the image, or the reverse. The
+/// `meta_disabled` refusal (issue #453) answers that same
+/// representation and carries the same headers.
+pub(in crate::server) fn meta_cache_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
     headers.insert(header::VARY, "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data".parse().unwrap());
-    (StatusCode::OK, headers, body).into_response()
+    response
 }

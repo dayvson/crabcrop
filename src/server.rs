@@ -68,7 +68,7 @@ pub use process::{DEFAULT_SLOW_LANE_PERMITS, Gate, Inflight};
 pub(in crate::server) use process::{SLOW_LANE_WAIT, apply_provenance};
 
 /// Shared state for the handlers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     /// The signing keyring (issue #143), from `CRABCROP_SECRET`:
     /// the current key plus, during a rotation window, the
@@ -191,11 +191,12 @@ pub struct AppState {
     /// never registered, so a PUT is a 404, not a refusal).
     pub upload: Option<Arc<crate::upload::UploadStore>>,
     /// Whether meta mode is enabled (issue #390):
-    /// `CRABCROP_META_MODE`, on by default. A meta request
-    /// bypasses every cache tier and runs a fresh render
-    /// plus its annotation inferences on every call, so a
-    /// deployment that does not use it can close the most
-    /// expensive request shape a signed URL can trigger.
+    /// `CRABCROP_META_MODE`, off by default (issue #453). A
+    /// meta request bypasses every cache tier and runs a
+    /// fresh render plus its annotation inferences on every
+    /// call, so the most expensive request shape a signed
+    /// URL can trigger is open only where the operator
+    /// turned it on.
     pub meta_enabled: bool,
     /// Bounds concurrent AI inference so it cannot starve the
     /// transform pipeline.
@@ -318,9 +319,88 @@ pub struct AppState {
     pub config_fingerprint: String,
 }
 
+impl std::fmt::Debug for AppState {
+    /// The fields a derive would print, except that the
+    /// `/metrics` token prints as `[redacted]`; the keyring,
+    /// the loader's credentials, and the stores redact their
+    /// own secrets (issue #455). A new field that holds a
+    /// secret must be redacted here too.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("AppState");
+        // Labels come from the field names themselves, so a
+        // label cannot drift from its field, and none is a
+        // snake_case string literal, which the error-code
+        // inventory (`every_error_code_is_documented`) would
+        // read as a response code.
+        macro_rules! fields {
+            ($($name:ident),* $(,)?) => {
+                $(out.field(stringify!($name), &self.$name);)*
+            };
+        }
+        fields!(
+            keyring,
+            allow_unsafe,
+            loader,
+            engine,
+            process_timeout,
+            metrics
+        );
+        out.field(
+            stringify!(metrics_token),
+            &self.metrics_token.as_ref().map(|_| crate::redact::Redacted),
+        );
+        fields!(
+            cache,
+            removebg,
+            upscale,
+            inpaint,
+            segment,
+            face,
+            tagger,
+            tag_threshold,
+            moderation,
+            embeddings,
+            aesthetic,
+            ocr,
+            detect,
+            detectors,
+            focal,
+            font,
+            fallback,
+            store,
+            shared_store,
+            upload,
+            meta_enabled,
+            ai_gate,
+            process_gate,
+            slow_gate,
+            ssim_target,
+            avif_speed,
+            jxl_speed,
+            width_step,
+            preserve_metadata,
+            brand_color,
+            presets,
+            only_presets,
+            source_roots,
+            default_ops,
+            video_encoder,
+            frame_extractor,
+            pdf_renderer,
+            provenance_signer,
+            video_gate,
+            anim_gate,
+            inflight,
+            purge_guard,
+            config_fingerprint
+        );
+        out.finish()
+    }
+}
+
 /// Build the router.
 pub fn app(state: AppState) -> Router {
-    let mut router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/explain/{*path}", get(explain_handle))
@@ -328,26 +408,25 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/purge-group/{*path}",
             axum::routing::post(purge_group_handle),
-        );
-    // The upload route exists only when a destination is
-    // configured (issue #168): an unconfigured server has
-    // no PUT surface at all, so the request is a plain 404.
-    if state.upload.is_some() {
-        router = router.route("/upload/{*path}", axum::routing::put(upload_handle));
-    }
-    router
+        )
+        // The upload route is registered whether or not a
+        // destination is configured (issue #467): without
+        // one, the handler answers `uploads_not_configured`,
+        // so a client can tell a server with uploads off
+        // from a mistyped path.
+        .route("/upload/{*path}", axum::routing::put(upload_handle))
         .route("/{*path}", get(handle))
         // A PUT that matched no upload route is a 404, not
         // the 405 the GET catch-all would otherwise produce
-        // for it: without an upload destination there is no
-        // PUT surface on this server at all (issue #168).
+        // for it: the upload route is this server's only
+        // PUT surface (issue #168).
         .route("/{*path}", axum::routing::put(put_not_found))
         .with_state(state)
         .layer(axum::middleware::from_fn(security_headers))
 }
 
-/// The PUT fallback: every PUT that is not an upload to a
-/// configured destination is simply not found.
+/// The PUT fallback: every PUT that is not to the upload
+/// route is simply not found.
 async fn put_not_found(headers: HeaderMap) -> Response {
     let accept = headers
         .get(header::ACCEPT)
@@ -386,12 +465,14 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Constant-time equality for a bearer token, so the
-/// comparison leaks nothing about it through timing.
+/// Equality for a bearer token that leaks nothing about it
+/// through timing, its length included (issue #454): both
+/// sides are hashed first, so the comparison always runs
+/// over two 32-byte digests, however long the presented
+/// token is.
 fn token_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    use sha2::Digest as _;
+    let (a, b) = (sha2::Sha256::digest(a), sha2::Sha256::digest(b));
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
@@ -416,10 +497,14 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
             accept.as_deref(),
         );
     };
+    // The auth scheme is case-insensitive (RFC 9110), so
+    // `bearer` and `BEARER` name it too.
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map(|(_, credentials)| credentials);
     if !presented.is_some_and(|p| token_eq(p.as_bytes(), token.as_bytes())) {
         return error_response(
             StatusCode::UNAUTHORIZED,
@@ -640,14 +725,15 @@ fn probe_settled(head: &[u8]) -> bool {
 /// The checks mirror the image path exactly and run in its
 /// order: signature grammar, signature verification, the
 /// reserved-segment guard, preset expansion, operation
-/// parsing, expiry. Only then is the source touched, once,
-/// through the loader with all of its guards, and the
-/// facts come from header probing (`crate::engine::
-/// probe_source`): no decode, no detection, no process,
-/// AI, or video gate, and nothing written to any cache
-/// tier. A bad signature or an expired URL therefore costs
-/// zero source fetches, and answers with the image path's
-/// own status and body.
+/// parsing, the operation cap, expiry. Only then is the
+/// source touched, once, through the loader with all of
+/// its guards, and the facts come from header probing
+/// (`crate::engine::probe_source`): no decode, no
+/// detection, no process, AI, or video gate, and nothing
+/// written to any cache tier. A bad signature, an over-cap
+/// operation list, or an expired URL therefore costs zero
+/// source fetches, and answers with the image path's own
+/// status and body.
 async fn explain_handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -727,6 +813,16 @@ async fn explain_handle(
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
     };
+    // The operation cap (issue #469), on the list the image
+    // path counts (the defaults merged in) and at the same
+    // point: an over-cap URL answers its 400 here, before the
+    // probe fetch.
+    if let Err(e) = crate::url::check_operation_count(&crate::url::merge_default_ops(
+        &state.default_ops,
+        ops.clone(),
+    )) {
+        return parse_failure(&e, accept.as_deref());
+    }
     // A root source expands for the probe fetch only: the
     // report below carries the source exactly as written
     // and the root's name, never the base URL the reference
@@ -736,6 +832,13 @@ async fn explain_handle(
             Ok(v) => v,
             Err(e) => return parse_failure(&e, accept.as_deref()),
         };
+    // Server-wide defaults merge here, once, exactly as the
+    // image path merges them: the admission, the canonical
+    // form, and the forecast all follow the list the image
+    // request runs (issue #468). The report's operation
+    // list stays `ops`, the URL's own, so it never credits
+    // the URL with a default.
+    let merged = crate::url::merge_default_ops(&state.default_ops, ops.clone());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -762,10 +865,10 @@ async fn explain_handle(
     // either tool: the fetch is admitted, the probe stays
     // the raw-bytes probe.
     let admission = crate::loader::MediaAdmission {
-        video: ops
+        video: merged
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Frame(_))),
-        pdf: ops
+        pdf: merged
             .iter()
             .any(|op| matches!(op, crate::url::Operation::Page(_))),
     };
@@ -799,18 +902,14 @@ async fn explain_handle(
         presets.push(crate::explain::preset_entry(name, &entry_ops));
     }
 
-    // The canonical form is the cache key's path form,
-    // defaults merged exactly as the image path merges
-    // them for its key. The key's config fingerprint
-    // suffix is operator state and stays unreported. For a
-    // root source the form is built from the source as
-    // written: the key itself is keyed on the expansion,
-    // but printing that here would publish the root's
-    // base URL into the report.
-    let canonical = crate::url::canonical_form(
-        &crate::url::merge_default_ops(&state.default_ops, ops.clone()),
-        source_url,
-    );
+    // The canonical form is the cache key's path form, of
+    // the merged list as the image path keys it. The key's
+    // config fingerprint suffix is operator state and stays
+    // unreported. For a root source the form is built from
+    // the source as written: the key itself is keyed on the
+    // expansion, but printing that here would publish the
+    // root's base URL into the report.
+    let canonical = crate::url::canonical_form(&merged, source_url);
     let report = crate::explain::Report::new(crate::explain::ReportInput {
         signed: !matches!(signature, crate::url::Signature::Unsafe),
         key_id,
@@ -821,6 +920,7 @@ async fn explain_handle(
         probe,
         source_bytes: fetched.total_bytes.map(|n| n as usize),
         ops,
+        merged_ops: merged,
         presets,
         canonical,
         cache_group: groups.into_iter().next(),
@@ -865,32 +965,125 @@ fn explain_load_error(e: LoadError, accept: Option<&str>) -> Response {
 /// grow with the whole bucket. A walk that outgrows the
 /// budget finishes in a background task and logs its own
 /// count on completion. Correctness does not wait for
-/// it: the tombstone keeps writes begun before the purge
-/// out (issue #350), and the purge stays active until
-/// the walk ends, so a lookup that overlaps the walk
-/// treats a copy the purge covers as a miss (issue #400).
+/// it: the generation tombstone keeps writes begun before
+/// the purge out (issue #350), and the purge's stamped
+/// tombstone, here and in the bucket, makes every copy
+/// written before the purge began a miss on every replica
+/// until the walk has removed it (issues #400, #461).
 const SHARED_PURGE_INLINE_SCAN: usize = 128;
 
-/// Queue the un-scanned remainder of a bounded shared
-/// purge, if any, on a background task (issue #368). The
-/// purge stays active until that task finishes; with
-/// nothing left to walk it ends here.
-fn spawn_shared_purge_rest(
+/// How often a replica re-reads the purge tombstones in the
+/// shared bucket (issue #461): the longest another replica's
+/// purge can take to reach this one's lookups.
+const TOMBSTONE_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Start a purge of `target`: record it in this process's
+/// guard and, with a shared tier, as a tombstone in the
+/// bucket (issue #461), before any tier is touched. The
+/// bucket record is what keeps the purge effective on
+/// other replicas, and on this one after a restart, while
+/// its walk runs. Returns the running purge and the
+/// tombstone's object name, `None` when there is no shared
+/// tier or the write failed (counted and logged by the
+/// store; the purge then holds on this process only).
+async fn begin_purge(
+    state: &AppState,
+    target: crate::cache::PurgeTarget,
+) -> (crate::cache::ActivePurge, Option<String>) {
+    let active = state.purge_guard.begin(target);
+    let tombstone = match &state.shared_store {
+        Some(shared) => {
+            shared
+                .put_tombstone(active.tombstone(), active.sequence())
+                .await
+        }
+        None => None,
+    };
+    (active, tombstone)
+}
+
+/// The shared tier's half of a purge (issues #368, #446):
+/// remove the covered copies written before the purge
+/// began, scanning at most [`SHARED_PURGE_INLINE_SCAN`]
+/// objects inline and queueing the remainder, if any, on a
+/// background task. The purge stays running until its walk
+/// ends, then its tombstone is marked ended (see
+/// [`end_purge`]). Returns what the inline part removed.
+async fn purge_shared_tier(
     shared: &Arc<crate::s3store::S3Store>,
-    pending: Option<crate::s3store::PendingPurge>,
     active: crate::cache::ActivePurge,
+    tombstone: Option<String>,
+    epoch_base: Option<String>,
     event: &'static str,
-    target: &str,
-) {
-    if let Some(pending) = pending {
-        let shared = shared.clone();
-        let target = target.to_string();
-        tokio::spawn(async move {
-            let removed = shared.finish_purge(pending).await;
-            drop(active);
-            purge_log(event, &target, Some(removed));
-        });
+    log_target: &str,
+) -> usize {
+    let target = active.tombstone().target.clone();
+    let cutoff = active.tombstone().cutoff;
+    let (removed, pending) = shared
+        .purge_bounded(
+            &target,
+            epoch_base.as_deref(),
+            cutoff,
+            SHARED_PURGE_INLINE_SCAN,
+        )
+        .await;
+    match pending {
+        Some(pending) => {
+            let shared = shared.clone();
+            let log_target = log_target.to_string();
+            tokio::spawn(async move {
+                let removed = shared.finish_purge(pending).await;
+                end_purge(&shared, active, tombstone).await;
+                purge_log(event, &log_target, Some(removed));
+            });
+        }
+        None => end_purge(shared, active, tombstone).await,
     }
+    removed
+}
+
+/// End a purge whose shared walk is done (issue #461):
+/// rewrite its bucket tombstone with the walk's end, from
+/// which every replica counts the grace period down and
+/// then collects it, and end the purge in this process,
+/// where its tombstone likewise outlives it for the grace.
+/// A tombstone that is never marked (the process stopped
+/// mid-walk) stays in force until a later purge of the same
+/// target finishes its walk.
+async fn end_purge(
+    shared: &crate::s3store::S3Store,
+    active: crate::cache::ActivePurge,
+    tombstone: Option<String>,
+) {
+    if let Some(object) = tombstone {
+        let mut ended = active.tombstone().clone();
+        ended.ended_ms = Some(crate::cache::now_ms());
+        shared.write_tombstone(&object, &ended).await;
+    }
+    drop(active);
+}
+
+/// Load the shared bucket's purge tombstones before serving
+/// (issue #461), then keep them fresh every
+/// `TOMBSTONE_REFRESH` on one background task. Without a
+/// shared tier there is nothing to read. A failed boot read
+/// is counted and logged, and the refresher retries: the
+/// tier stays best-effort, like every other shared read.
+pub async fn start_purge_tombstones(state: &AppState) {
+    let Some(shared) = state.shared_store.clone() else {
+        return;
+    };
+    shared.refresh_tombstones(&state.purge_guard).await;
+    let guard = state.purge_guard.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(TOMBSTONE_REFRESH);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            shared.refresh_tombstones(&guard).await;
+        }
+    });
 }
 
 /// One structured line per purge request (audit PL-8): the
@@ -1040,14 +1233,17 @@ async fn purge_handle(
     let task_state = state.clone();
     let task_target = target.to_string();
     let removed = tokio::spawn(async move {
-        // The tombstone lands before any tier is touched
-        // (issue #350): a write begun before this purge can
-        // then see it whenever it tries to land, including
-        // after this handler has finished. The purge stays
-        // active until the shared walk ends (issue #400).
-        let active = task_state
-            .purge_guard
-            .begin(crate::cache::PurgeTarget::Key(key_form.clone()));
+        // The tombstones land before any tier is touched
+        // (issues #350, #461): a write begun before this
+        // purge can then see it whenever it tries to land,
+        // including after this handler has finished, and
+        // every replica treats the copies it covers as
+        // purged until the shared walk ends (issue #400).
+        let (active, tombstone) = begin_purge(
+            &task_state,
+            crate::cache::PurgeTarget::Key(key_form.clone()),
+        )
+        .await;
         let mut removed = task_state.cache.purge_matching(&key_form);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1064,11 +1260,15 @@ async fn purge_handle(
             // its matching walk, which also reaches older
             // epochs and hint-variant spellings.
             let epoch_form = format!("{key_form}#cfg{}", task_state.config_fingerprint);
-            let (walked, pending) = shared
-                .purge_matching_bounded(&key_form, &epoch_form, SHARED_PURGE_INLINE_SCAN)
-                .await;
-            removed += walked;
-            spawn_shared_purge_rest(shared, pending, active, "purge", &task_target);
+            removed += purge_shared_tier(
+                shared,
+                active,
+                tombstone,
+                Some(epoch_form),
+                "purge",
+                &task_target,
+            )
+            .await;
         }
         task_state.metrics.record_purge();
         purge_log("purge", &task_target, Some(removed));
@@ -1148,11 +1348,10 @@ async fn purge_group_handle(
     let task_target = target.clone();
     let group = group.to_string();
     let removed = tokio::spawn(async move {
-        // Tombstone first, tiers second (issue #350), as in
-        // the per-URL purge.
-        let active = task_state
-            .purge_guard
-            .begin(crate::cache::PurgeTarget::Group(group.clone()));
+        // Tombstones first, tiers second (issues #350,
+        // #461), as in the per-URL purge.
+        let (active, tombstone) =
+            begin_purge(&task_state, crate::cache::PurgeTarget::Group(group.clone())).await;
         let mut removed = task_state.cache.purge_group(&group);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1163,11 +1362,9 @@ async fn purge_group_handle(
                 .unwrap_or(0);
         }
         if let Some(shared) = &task_state.shared_store {
-            let (walked, pending) = shared
-                .purge_group_bounded(&group, SHARED_PURGE_INLINE_SCAN)
-                .await;
-            removed += walked;
-            spawn_shared_purge_rest(shared, pending, active, "purge-group", &task_target);
+            removed +=
+                purge_shared_tier(shared, active, tombstone, None, "purge-group", &task_target)
+                    .await;
         }
         task_state.metrics.record_purge();
         purge_log("purge-group", &task_target, Some(removed));
@@ -1283,11 +1480,13 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
     let task_state = state.clone();
     let source = source.to_string();
     tokio::spawn(async move {
-        // Tombstone first, tiers second (issue #350), as in
-        // the per-URL purge.
-        let active = task_state
-            .purge_guard
-            .begin(crate::cache::PurgeTarget::Source(source.clone()));
+        // Tombstones first, tiers second (issues #350,
+        // #461), as in the per-URL purge.
+        let (active, tombstone) = begin_purge(
+            &task_state,
+            crate::cache::PurgeTarget::Source(source.clone()),
+        )
+        .await;
         let mut removed = task_state.cache.purge_source(&source);
         if let Some(store) = &task_state.store {
             let store = store.clone();
@@ -1298,11 +1497,8 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
                 .unwrap_or(0);
         }
         if let Some(shared) = &task_state.shared_store {
-            let (walked, pending) = shared
-                .purge_source_bounded(&source, SHARED_PURGE_INLINE_SCAN)
-                .await;
-            removed += walked;
-            spawn_shared_purge_rest(shared, pending, active, "purge-source", &source);
+            removed +=
+                purge_shared_tier(shared, active, tombstone, None, "purge-source", &source).await;
         }
         purge_log("purge-source", &source, Some(removed));
         removed
@@ -1312,10 +1508,10 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
 }
 
 /// `PUT /upload/<signature>/<name>`: store one original
-/// (issue #168). The route is registered only when a
-/// destination is configured, so `upload` here is always
-/// `Some`; the handler still answers 404 without one, so
-/// the rule holds however the state was built.
+/// (issue #168). The route is always registered; without
+/// a destination every request answers
+/// `404 uploads_not_configured` before anything else is
+/// checked (issue #467).
 ///
 /// The signature is an HMAC over the name under an upload
 /// subkey derived from the secret (see
@@ -1463,7 +1659,9 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // The read is bounded by the cap itself: it fails the
     // moment the body passes it, which is the oversize
     // answer (413) without ever holding more than the cap in
-    // memory; an unreadable body answers the same.
+    // memory. A body that cannot be read to its end (the
+    // client aborted it, or framed it badly) is the
+    // client's fault but not a size one: a 400 (issue #467).
     let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
     let cap = usize::try_from(upload.max_bytes).unwrap_or(usize::MAX);
     let bytes = match read_upload_body(body, cap, &charge).await {
@@ -1473,13 +1671,24 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             upload_log(name, "rejected:busy");
             return source_budget_busy(accept.as_deref());
         }
-        Err(_) => {
+        Err(LoadError::TooLarge { .. }) => {
             state.metrics.record_upload();
-            upload_log(name, "rejected:oversize-or-unreadable");
+            upload_log(name, "rejected:oversize");
             return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "upload_too_large",
                 format!("upload exceeds the {}-byte limit", upload.max_bytes),
+                accept.as_deref(),
+            );
+        }
+        Err(e) => {
+            eprintln!("upload body read failed: {e}");
+            state.metrics.record_upload();
+            upload_log(name, "rejected:unreadable");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "upload_unreadable",
+                "upload body could not be read".to_string(),
                 accept.as_deref(),
             );
         }
@@ -1659,12 +1868,23 @@ fn sf_quote(value: &str) -> String {
 
 /// Attach the cache observability headers (RFC 9211
 /// Cache-Status, RFC 9875 Cache-Group) to an image response.
-fn attach_cache_headers(response: &mut Response, cache_status: &str, groups: &[String]) {
+/// A sealed request gets no Cache-Group (issue #454): its
+/// groups are preset names read from inside the token, and
+/// listing them would show anyone who fetches the URL part
+/// of the recipe the token hides. Group purges still reach
+/// its entry, because the groups are recorded on the cache
+/// entry, never read back from this header.
+fn attach_cache_headers(
+    response: &mut Response,
+    cache_status: &str,
+    groups: &[String],
+    sealed: bool,
+) {
     response.headers_mut().insert(
         axum::http::HeaderName::from_static("cache-status"),
         axum::http::HeaderValue::from_str(cache_status).unwrap(),
     );
-    if !groups.is_empty() {
+    if !sealed && !groups.is_empty() {
         let list = groups
             .iter()
             .map(|g| sf_quote(g))
@@ -1913,6 +2133,25 @@ async fn serve(
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
         .to_string();
+    // Server-wide defaults (issue #145) merge here: prepended
+    // to the request's own operations, so the directive
+    // analysis below, the engine, and the cache key all see
+    // the merged list, and the URL wins every last-wins
+    // directive (format, quality, fill) by coming later. The
+    // signature never covers the defaults: they are operator
+    // configuration, not request content.
+    let ops = crate::url::merge_default_ops(&state.default_ops, ops);
+    // The operation cap (issue #469) counts this merged list,
+    // the one the engine runs, and answers here: before the
+    // cache, the gates, and the source fetch, so an over-cap
+    // URL (a short one repeating a preset included) costs a
+    // parse and nothing more.
+    if let Err(e) = crate::url::check_operation_count(&ops) {
+        if sealed {
+            return sealed_refusal(record);
+        }
+        return (parse_failure(&e, accept), record);
+    }
     // A root source expands here (issue #248): after
     // verification and the ops summary (which reads the
     // source as written), before the cache key and the
@@ -1933,14 +2172,6 @@ async fn serve(
             return (parse_failure(&e, accept), record);
         }
     };
-    // Server-wide defaults (issue #145) merge here: prepended
-    // to the request's own operations, so the directive
-    // analysis below, the engine, and the cache key all see
-    // the merged list, and the URL wins every last-wins
-    // directive (format, quality, fill) by coming later. The
-    // signature never covers the defaults: they are operator
-    // configuration, not request content.
-    let ops = crate::url::merge_default_ops(&state.default_ops, ops);
     // Expiry is enforced after signature verification (the
     // segment is inside the signed remainder, so a tampered
     // expiry already failed as a bad signature) and before the
@@ -2000,21 +2231,28 @@ async fn serve(
     let meta = wants_meta(accept);
     if meta && !state.meta_enabled {
         // Meta mode is switched off on this deployment
-        // (issue #390): refuse specifically, like the
-        // metrics endpoint does, rather than serving a
-        // render the caller did not ask for.
-        if sealed {
-            return sealed_refusal(record);
-        }
-        return (
-            error_response(
-                StatusCode::FORBIDDEN,
-                "meta_disabled",
-                "meta mode is disabled on this server".to_string(),
-                accept,
-            ),
-            record,
-        );
+        // (issue #390), as it is by default (issue #453):
+        // refuse specifically, like the metrics endpoint
+        // does, rather than serving a render the caller did
+        // not ask for. The refusal answers the URL's JSON
+        // representation, so it carries the meta document's
+        // caching headers: a cache that stored it under the
+        // bare URL would serve it to every image viewer.
+        let (response, record) = if sealed {
+            sealed_refusal(record)
+        } else {
+            (
+                error_response(
+                    StatusCode::FORBIDDEN,
+                    "meta_disabled",
+                    "meta mode is disabled on this server: set CRABCROP_META_MODE=1 to enable it"
+                        .to_string(),
+                    accept,
+                ),
+                record,
+            )
+        };
+        return (meta_cache_headers(response), record);
     }
     let placeholders = meta && wants_placeholders(accept);
     let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
@@ -2187,7 +2425,7 @@ async fn serve(
             record.bytes_out = hit.bytes.len();
             let etag = hit.etag.clone();
             let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
-            attach_cache_headers(&mut response, cache_status, &groups);
+            attach_cache_headers(&mut response, cache_status, &groups, sealed);
             finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
         }
@@ -2403,12 +2641,16 @@ async fn share_response(response: Response, cap: usize) -> (Response, Option<Sha
 /// answer.
 const MAX_FLIGHT_WAITS: u32 = 3;
 
-/// Whether a purge recorded after `snapshot` covers
-/// `entry` (issue #350): the write that carries this
-/// snapshot began before that purge, so its result must
-/// not stand in any tier.
+/// Whether `entry` must not stand in any tier: a purge
+/// recorded after `snapshot` covers it, so the write that
+/// carries the snapshot began before that purge (issue
+/// #350), or a live tombstone covers the copy by its stamp,
+/// as when it was rendered before another replica's purge
+/// began (issue #461).
 fn write_is_stale(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) -> bool {
-    state.purge_guard.purge_covers(snapshot, key, &entry.groups)
+    state
+        .purge_guard
+        .write_covered(snapshot, key, &entry.groups, entry.written)
 }
 
 /// Store `entry` in the memory tier under the purge
@@ -2417,8 +2659,9 @@ fn write_is_stale(state: &AppState, snapshot: u64, key: &str, entry: &CachedImag
 /// the write is in flight is reconciled right after: the
 /// entry just written is removed again, so the purge
 /// wins however the two interleave. The removal matches
-/// on the entry's ETag, so an entry a fresher write has
-/// already replaced under the same key is left alone.
+/// on the entry's ETag and stamp, so an entry a fresher
+/// write has already replaced under the same key is left
+/// alone.
 fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedImage) {
     if write_is_stale(state, snapshot, key, entry) {
         return;
@@ -2428,7 +2671,7 @@ fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedIma
         && state
             .cache
             .get(key)
-            .is_some_and(|held| held.etag == entry.etag)
+            .is_some_and(|held| crate::cache::same_copy(&held, entry))
     {
         state.cache.remove(key);
     }
@@ -2439,9 +2682,9 @@ fn put_memory_tier(state: &AppState, snapshot: u64, key: &str, entry: &CachedIma
 /// recorded after `snapshot` covers the entry and the
 /// disk tier still holds this exact copy, remove it, so
 /// the copy the write or merge just made is not left
-/// behind for the purge to miss. The ETag match leaves
-/// alone an entry a fresher write has already replaced
-/// under the same key.
+/// behind for the purge to miss. The ETag and stamp match
+/// leaves alone an entry a fresher write has already
+/// replaced under the same key.
 fn reconcile_disk(
     store: &crate::storage::DiskStore,
     guard: &crate::cache::PurgeGuard,
@@ -2449,8 +2692,10 @@ fn reconcile_disk(
     key: &str,
     entry: &CachedImage,
 ) {
-    if guard.purge_covers(snapshot, key, &entry.groups)
-        && store.get(key).is_some_and(|held| held.etag == entry.etag)
+    if guard.write_covered(snapshot, key, &entry.groups, entry.written)
+        && store
+            .get(key)
+            .is_some_and(|held| crate::cache::same_copy(&held, entry))
     {
         store.remove(key);
     }
@@ -2472,7 +2717,7 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
     let entry = entry.clone();
     let _ = store
         .blocking(move |store| {
-            if guard.purge_covers(snapshot, &key, &entry.groups) {
+            if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
                 return;
             }
             store.put(&key, &entry);
@@ -2486,7 +2731,9 @@ async fn put_disk_tier(state: &AppState, snapshot: u64, key: &str, entry: &Cache
 /// same skip-and-reconcile discipline as the local
 /// tiers, applied inside the spawned task, because the
 /// purge it must lose to can land at any point during
-/// the network write.
+/// the network write. The reconcile deletes only the
+/// object it read back (issue #446), so a fresher render
+/// that replaced it meanwhile stays.
 fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedImage) {
     let Some(shared) = &state.shared_store else {
         return;
@@ -2495,17 +2742,15 @@ fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedIma
     let shared = shared.clone();
     let key = key.to_string();
     tokio::spawn(async move {
-        if guard.purge_covers(snapshot, &key, &entry.groups) {
+        if guard.write_covered(snapshot, &key, &entry.groups, entry.written) {
             return;
         }
         shared.put(&key, &entry).await;
-        if guard.purge_covers(snapshot, &key, &entry.groups)
-            && shared
-                .get(&key)
-                .await
-                .is_some_and(|held| held.etag == entry.etag)
+        if guard.write_covered(snapshot, &key, &entry.groups, entry.written)
+            && let Some((held, etag)) = shared.get_tagged(&key).await
+            && crate::cache::same_copy(&held, &entry)
         {
-            shared.remove(&key).await;
+            shared.remove_if_match(&key, etag.as_deref()).await;
         }
     });
 }
@@ -2525,12 +2770,15 @@ fn spawn_shared_put(state: &AppState, snapshot: u64, key: &str, entry: CachedIma
 /// purge. Every write this chain makes (promotions,
 /// merge write-backs) runs under the purge guard, under
 /// the generation the lookup started with. A disk or
-/// shared copy that a purge covers is a miss, and is
-/// deleted on sight, when that purge was running at any
-/// point since the lookup began (issue #400): the purge
-/// may not have reached the copy when it was read, and
-/// serving or promoting it would outlive the purge. The
-/// memory tier needs no such check: a purge empties it
+/// shared copy is a miss, and is deleted on sight, when a
+/// live tombstone covers it: a purge, begun here or read
+/// from the shared bucket, that is still running or within
+/// its grace, and that began after the copy was written
+/// (issues #400, #446, #461). The purge may not have
+/// reached such a copy yet, and serving or promoting it
+/// would outlive the purge; a copy rendered after the
+/// purge began serves normally. The memory tier needs no
+/// such check: a purge empties this process's memory
 /// before any slower tier, and every way back in is a
 /// promotion through this chain or a guarded write.
 /// Returns the image and the `Cache-Status` value for
@@ -2602,16 +2850,18 @@ async fn lookup_tiers(
         }
     }
     if let Some(shared) = &state.shared_store
-        && let Some(mut image) = shared.get(cache_key).await
+        && let Some((mut image, etag)) = shared.get_tagged(cache_key).await
     {
-        // Checked after the read, against purges running at
-        // any point since the snapshot: a walk can delete
-        // this object and end while its bytes are in flight.
+        // Checked after the read: a walk can delete this
+        // object and end while its bytes are in flight, and
+        // an ended purge's tombstone still covers the copy.
+        // The delete is conditional on the copy read, so a
+        // fresh render that replaced it meanwhile stays.
         if state
             .purge_guard
-            .running_covers(snapshot, cache_key, &image.groups)
+            .running_covers(cache_key, &image.groups, image.written)
         {
-            shared.remove(cache_key).await;
+            shared.remove_if_match(cache_key, etag.as_deref()).await;
             return None;
         }
         if !groups.is_empty() {
@@ -2654,10 +2904,10 @@ async fn lookup_disk_tier(
     let (image, grew) = store
         .blocking(move |store| {
             let mut image = store.get(&key)?;
-            if guard.running_covers(snapshot, &key, &image.groups) {
-                // A purge running since the lookup began
-                // covers this copy (issue #400): drop it
-                // rather than serve and promote it.
+            if guard.running_covers(&key, &image.groups, image.written) {
+                // A live tombstone covers this copy (issues
+                // #400, #461): drop it rather than serve and
+                // promote it.
                 store.remove(&key);
                 return None;
             }
@@ -2700,10 +2950,12 @@ struct MissWork {
     max_age: Option<u32>,
     /// Whether the request arrived in the sealed spelling
     /// (issue #255). Meta for it redacts every operation and
-    /// source text. The flag describes this request, not the
-    /// render: meta bypasses the cache in both directions,
-    /// so a plain meta request on the same render still
-    /// reports in full.
+    /// source text, and its image responses carry no
+    /// Cache-Group (issue #454). The flag describes this
+    /// request, not the render: meta bypasses the cache in
+    /// both directions, so a plain meta request on the same
+    /// render still reports in full, and a plain hit on an
+    /// entry first served sealed still names its groups.
     sealed: bool,
 }
 
@@ -2744,6 +2996,12 @@ async fn serve_miss(
     // lands while the render runs must not be undone by
     // the population writes at its end.
     let write_snapshot = state.purge_guard.snapshot();
+    // Its write stamp (issues #446, #461), taken after the
+    // snapshot: a purge that begins after this point covers
+    // the copies this render writes (it may read the old
+    // source), and one that began before it does not, so
+    // they outlive that purge's walk.
+    let write_stamp = state.purge_guard.stamp();
     let MissWork {
         ops,
         source_url,
@@ -2801,10 +3059,15 @@ async fn serve_miss(
             // A policy refusal (Forbidden) is a decision, not a
             // failure: it never falls back. Neither does an
             // exhausted budget (issue #403): that is overload,
-            // and the fallback would need budget too. Any other
-            // load failure degrades to the configured fallback
-            // when there is one.
-            let fb = if matches!(e, LoadError::Forbidden(_) | LoadError::Busy) {
+            // and the fallback would need budget too. Nor does
+            // source text that does not parse (issue #467): a
+            // 400 stays honest, like a grammar failure. Any
+            // other load failure degrades to the configured
+            // fallback when there is one.
+            let fb = if matches!(
+                e,
+                LoadError::Forbidden(_) | LoadError::Busy | LoadError::InvalidSource(_)
+            ) {
                 None
             } else {
                 fallback_source_bytes(state, &charge).await
@@ -3225,6 +3488,7 @@ async fn serve_miss(
             quality: processed.quality,
             groups: groups.clone(),
             etag: render_etag.clone(),
+            written: Some(write_stamp),
         };
         // Population runs under the purge guard (issue
         // #350): a purge that landed while this render was
@@ -3241,13 +3505,6 @@ async fn serve_miss(
         put_disk_tier(state, write_snapshot, &cache_key, &entry).await;
     }
     record.bytes_out = processed.bytes.len();
-    // The render's AI permit drained with its job:
-    // run_process holds it until the work finishes, which
-    // on this success path has already happened, so the
-    // gate is free and the annotation paths acquire it per
-    // section like any other request. (The request's own
-    // AI permit does not outlive the run, audit R2-29.)
-    let ai_gated = false;
     // The annotation sections share one deadline, the
     // same process budget the render ran under: a
     // section that has not answered when it passes is
@@ -3262,7 +3519,7 @@ async fn serve_miss(
     let annotation = if meta {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(annotation_deadline),
-            annotate_meta(state, &processed, ai_gated),
+            annotate_meta(state, &processed),
         )
         .await
         .ok()
@@ -3273,7 +3530,7 @@ async fn serve_miss(
     let detections = if meta && wants_detections(accept) {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(annotation_deadline),
-            detect_meta(state, &processed, ai_gated),
+            detect_meta(state, &processed),
         )
         .await
         .ok()
@@ -3285,7 +3542,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                moderate_meta(state, &processed, ai_gated),
+                moderate_meta(state, &processed),
             )
             .await
             {
@@ -3305,7 +3562,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                embed_meta(state, &processed, ai_gated),
+                embed_meta(state, &processed),
             )
             .await
             {
@@ -3321,7 +3578,7 @@ async fn serve_miss(
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                ocr_meta(state, &processed, ai_gated, annotation_deadline),
+                ocr_meta(state, &processed, annotation_deadline),
             )
             .await
             {
@@ -3356,7 +3613,7 @@ async fn serve_miss(
         )
     };
     if !meta {
-        attach_cache_headers(&mut response, cache_status, &groups);
+        attach_cache_headers(&mut response, cache_status, &groups, sealed);
     }
     if used_fallback {
         record.fallback = true;
@@ -3448,9 +3705,9 @@ pub(in crate::server) use meta::{
 };
 pub use meta::{EmbeddingMeta, ModerationMeta, OcrMeta};
 pub(in crate::server) use meta::{
-    annotate_meta, compose_aesthetic, detect_meta, embed_meta, meta_response, moderate_meta,
-    ocr_meta, wants_detections, wants_embeddings, wants_meta, wants_moderation, wants_ocr,
-    wants_placeholders,
+    annotate_meta, compose_aesthetic, detect_meta, embed_meta, meta_cache_headers, meta_response,
+    moderate_meta, ocr_meta, wants_detections, wants_embeddings, wants_meta, wants_moderation,
+    wants_ocr, wants_placeholders,
 };
 
 /// Build a successful image response: content type, cache
@@ -3621,6 +3878,14 @@ fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
             "source_fetch_failed",
             "source fetch failed".to_string(),
         ),
+        // The caller's own source text is at fault, not an
+        // origin (issue #467), so this is a 400 like a
+        // grammar failure, not a gateway error.
+        LoadError::InvalidSource(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_source",
+            "invalid source URL".to_string(),
+        ),
         LoadError::WrongContentType(_) => (
             StatusCode::BAD_GATEWAY,
             "source_not_an_image",
@@ -3775,13 +4040,37 @@ fn engine_error_parts(e: EngineError) -> (StatusCode, &'static str, String) {
             "pdf_render_failed",
             "PDF rendering failed".to_string(),
         ),
+        // A dependency outage, not a broken encoder (issue
+        // #467): the output was rendered, but the timestamp
+        // authority signing needs did not answer, and a
+        // retry may find it back.
+        EngineError::ProvenanceUnavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provenance_unavailable",
+            "provenance signing is unavailable".to_string(),
+        ),
     }
 }
 
+/// `Retry-After` on a `provenance_unavailable` answer, in
+/// seconds. Longer than a gate's: an authority outage
+/// outlasts a queue, and every retry that meets it holds a
+/// process permit for up to the authority's 15-second
+/// bound before it fails again.
+const PROVENANCE_RETRY_AFTER_SECS: u64 = 30;
+
 fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
     eprintln!("engine error: {e}");
+    let retry_after = matches!(e, EngineError::ProvenanceUnavailable(_));
     let (status, code, message) = engine_error_parts(e);
-    error_response(status, code, message, accept)
+    let mut response = error_response(status, code, message, accept);
+    if retry_after {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            PROVENANCE_RETRY_AFTER_SECS.to_string().parse().unwrap(),
+        );
+    }
+    response
 }
 
 #[cfg(test)]
