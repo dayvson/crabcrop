@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Changed
+
+- The boot line `crabcrop listening on port N` names the port the server bound (issue #536). It printed the configured port, so `PORT=0`, which binds a free port, printed port 0; it now prints the port the system picked. For a fixed port the line is unchanged.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
@@ -43,6 +47,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 - Test and CI reliability. CI fails on a broken intra-doc link (PR #441). Property tests cover the URL grammar, signing and sealing, and crop windows; each property runs 64 cases, and `PROPTEST_CASES` runs more (issue #478). The unit tests that stand a script in for FFmpeg, pdftocairo, or pdfinfo now write it from a child process, which ends an intermittent `Text file busy` failure when test threads spawn tools in parallel (issue #523).
 
 - ThumbHash strings are the same bytes on every platform (issue #458). The encoder now takes its cosines from the portable `libm` crate instead of the system math library, whose last bit differs between glibc and Apple's libm. A coefficient that lands exactly on a rounding tie can therefore come out one step different from before on Linux, which changes that image's `thumbhash` in meta responses. Meta responses are never cached, so no stored entry is affected.
+
 - Shared-tier purges are paced and coalesced (issue #462). A purge reads entry headers 16 at a time instead of one by one, purge requests share a budget of 32 reads in flight, and at most two background walks run at once. A purge whose target is already being walked joins that walk instead of listing the bucket again, and one re-list afterwards removes copies rendered in between. A walk that the bucket fails part way (a listing, read or delete with no answer) no longer ends its purge: the tombstone stays in force until a later purge of the same target completes a walk, and each failure counts in `crabcrop_cache_tier_errors_total`.
 
 - The server drains for at most `CRABCROP_SHUTDOWN_GRACE_SECS` after `SIGTERM` or Ctrl-C, 8 seconds by default, then exits (issue #463). It stops accepting connections, lets the requests in flight finish, and waits for the shared-tier writes they left behind; a second signal ends the drain at once. Before, shutdown had no deadline, and background shared-tier writes died with the process. The Helm chart passes the new `shutdownGraceSeconds` value as `CRABCROP_SHUTDOWN_GRACE_SECS` and sets the pod's `terminationGracePeriodSeconds` to it plus 5 seconds. Shared-tier writes are bounded too: at most 64 run at once, and a render's write-through that finds no free slot is skipped and counted as `crabcrop_cache_shared_puts_skipped_total` on `/metrics`, next to `crabcrop_cache_shared_puts_in_flight` and `crabcrop_cache_shared_puts_capacity`. A cache entry's group write-back is never skipped.
