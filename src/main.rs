@@ -274,17 +274,40 @@ fn build_source_policy(get: impl Fn(&str) -> Option<String>) -> Result<SourcePol
     ))
 }
 
+/// A bucket store's base URL from the variable `name`: an
+/// http(s) URL, kept with any trailing slash trimmed. Every
+/// bucket fetch is an HTTP request to it, so any other
+/// scheme is a startup error, for the GCS endpoint as much
+/// as the S3 one (issue #455).
+fn store_endpoint(name: &str, endpoint: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(endpoint).map_err(|e| format!("invalid {name}: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!("{name} must be an http(s) URL"));
+    }
+    Ok(endpoint.trim_end_matches('/').to_string())
+}
+
+/// An error followed by its causes, `: `-separated. reqwest
+/// reports a client it cannot build only as "builder error";
+/// the reason (no CA roots on the host, say) is in the
+/// source chain, and a boot error should name it.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        message.push_str(": ");
+        message.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    message
+}
+
 fn build_source_config(get: impl Fn(&str) -> Option<String>) -> Result<SourceConfig, String> {
     let mut sources = SourceConfig::default();
     let nonempty = |name: &str| get(name).filter(|v| !v.is_empty());
 
     if let Some(endpoint) = nonempty("CRABCROP_S3_ENDPOINT") {
-        let parsed = reqwest::Url::parse(&endpoint)
-            .map_err(|e| format!("invalid CRABCROP_S3_ENDPOINT: {e}"))?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err("CRABCROP_S3_ENDPOINT must be an http(s) URL".to_string());
-        }
-        sources.s3_endpoint = Some(endpoint.trim_end_matches('/').to_string());
+        sources.s3_endpoint = Some(store_endpoint("CRABCROP_S3_ENDPOINT", &endpoint)?);
     }
     if let Some(region) = nonempty("CRABCROP_S3_REGION") {
         sources.s3_region = region;
@@ -306,9 +329,7 @@ fn build_source_config(get: impl Fn(&str) -> Option<String>) -> Result<SourceCon
         creds.session_token = nonempty("AWS_SESSION_TOKEN");
     }
     if let Some(endpoint) = nonempty("CRABCROP_GCS_ENDPOINT") {
-        reqwest::Url::parse(&endpoint)
-            .map_err(|e| format!("invalid CRABCROP_GCS_ENDPOINT: {e}"))?;
-        sources.gcs_endpoint = endpoint.trim_end_matches('/').to_string();
+        sources.gcs_endpoint = store_endpoint("CRABCROP_GCS_ENDPOINT", &endpoint)?;
     }
     if let Some(region) = nonempty("CRABCROP_GCS_REGION") {
         sources.gcs_region = region;
@@ -623,18 +644,20 @@ fn build_upload_store(
                 ));
             }
             let prefix = get("CRABCROP_UPLOAD_PREFIX").unwrap_or_default();
-            println!(
-                "uploads enabled: bucket {bucket} (cap {max_mb} MB, overwrite {allow_overwrite})"
-            );
-            Ok(Some(std::sync::Arc::new(crate::upload::UploadStore::s3(
-                bucket,
+            let store = crate::upload::UploadStore::s3(
+                bucket.clone(),
                 prefix,
                 sources.s3_endpoint.clone(),
                 sources.s3_region.clone(),
                 sources.aws_creds.clone(),
                 max_bytes,
                 allow_overwrite,
-            ))))
+            )
+            .map_err(|e| format!("cannot build the upload store client: {}", with_causes(&e)))?;
+            println!(
+                "uploads enabled: bucket {bucket} (cap {max_mb} MB, overwrite {allow_overwrite})"
+            );
+            Ok(Some(std::sync::Arc::new(store)))
         }
         _ => unreachable!("the both-set and neither-set cases returned above"),
     }
@@ -822,7 +845,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sources.s3_region.clone(),
                 sources.aws_creds.clone(),
                 entry_key.clone(),
-            );
+            )
+            .map_err(|e| {
+                format!(
+                    "cannot build the shared result store client: {}",
+                    with_causes(&e)
+                )
+            })?;
             println!("shared result storage: bucket {bucket}");
             Some(Arc::new(store))
         }
@@ -2795,23 +2824,49 @@ mod tests {
 
     #[test]
     fn source_config_construction_validates_endpoints_and_the_file_root() {
-        // A non-http(s) S3 endpoint is refused.
-        let err = expect_err(build_source_config(env_of(&[(
-            "CRABCROP_S3_ENDPOINT",
-            "ftp://example.com",
-        )])));
-        assert!(err.contains("must be an http(s) URL"), "{err}");
+        // Both store endpoints take the same check (issue
+        // #455: the GCS one used to boot with any scheme):
+        // a non-http(s) URL is refused, naming the variable,
+        // and so is a value that is not a URL at all.
+        for name in ["CRABCROP_S3_ENDPOINT", "CRABCROP_GCS_ENDPOINT"] {
+            for bad in [
+                "ftp://storage.example",
+                "file:///etc/passwd",
+                "gs://bucket",
+                "s3://bucket",
+                "data:text/plain,x",
+                "javascript:alert(1)",
+                "unix:/var/run/store.sock",
+            ] {
+                let err = expect_err(build_source_config(env_of(&[(name, bad)])));
+                assert_eq!(err, format!("{name} must be an http(s) URL"), "{bad}");
+            }
+            for bad in [
+                "storage.example",
+                "//storage.example",
+                "http://",
+                "http://[::1",
+                " ",
+            ] {
+                let err = expect_err(build_source_config(env_of(&[(name, bad)])));
+                assert!(
+                    err.starts_with(&format!("invalid {name}: ")),
+                    "{bad}: {err}"
+                );
+            }
+        }
         // A valid endpoint is stored with the trailing
         // slash trimmed.
-        let sources = build_source_config(env_of(&[(
-            "CRABCROP_S3_ENDPOINT",
-            "http://127.0.0.1:9000/",
-        )]))
+        let sources = build_source_config(env_of(&[
+            ("CRABCROP_S3_ENDPOINT", "http://127.0.0.1:9000/"),
+            ("CRABCROP_GCS_ENDPOINT", "https://gcs.example/"),
+        ]))
         .unwrap();
         assert_eq!(
             sources.s3_endpoint.as_deref(),
             Some("http://127.0.0.1:9000")
         );
+        assert_eq!(sources.gcs_endpoint, "https://gcs.example");
         // A file root that does not exist is refused...
         let missing = missing_path("root");
         let err = expect_err(build_source_config(env_of(&[(
