@@ -371,13 +371,16 @@ pub fn crop_to_aspect_point_traced(
     let cropped = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
     (DynamicImage::ImageRgba8(cropped), Some((x, y, cw, ch)))
 }
-/// the smallest region with that aspect which contains the face
-/// expanded by `padding` (a fraction of the face's size, added
-/// on every side), centered on the face's center and clamped
-/// into the image. When the padded region cannot fit (the
-/// image is too small on one axis) it shrinks to fit and the
-/// face fills more of the frame. The engine resizes the result
-/// to the exact target, like every other crop.
+
+/// Crop `img` to the `target_w:target_h` aspect ratio, framing
+/// a detected face: the smallest region with that aspect which
+/// contains the face expanded by `padding` (a fraction of the
+/// face's size, added on every side), centered on the face's
+/// center and clamped into the image. When the padded region
+/// cannot fit (the image is too small on one axis) it shrinks
+/// to fit and the face fills more of the frame. The engine
+/// resizes the result to the exact target, like every other
+/// crop.
 pub fn crop_around_face(
     img: DynamicImage,
     target_w: u32,
