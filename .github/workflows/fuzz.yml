@@ -1,0 +1,155 @@
+# Nightly fuzzing (issue #476). The live workflow is
+# .github/workflows/fuzz.yml and docs/fuzz-workflow.yml is its
+# mirror: keep the two identical (scripts/test_all.sh fails
+# when they differ).
+#
+# Every pull request runs the deterministic fuzz smoke
+# (scripts/test_all.sh). Open-ended, coverage-guided fuzzing
+# needs a nightly toolchain and minutes per target, so it
+# runs here, every night and by hand, never per pull
+# request: each of the five cargo-fuzz targets for 15
+# minutes, built with the fuzz crate's default features,
+# which include the dav1d AVIF decoder every shipped build
+# carries. A crash fails the target's job and uploads its
+# input; see "Real fuzzing" in fuzz/README.md for what
+# happens next.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One nightly run at a time: a run started by hand while the
+# scheduled one is going waits for it, so the two never race
+# on the corpus cache.
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Vendored static dav1d, as the release binaries build it
+  # (issue #141, option A).
+  SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: "always"
+
+jobs:
+  fuzz:
+
+    runs-on: ubuntu-latest
+    # 15 minutes of fuzzing after a cold sanitizer build,
+    # plus up to 10 for an input that hangs at the end.
+    timeout-minutes: 75
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_request, unseal, decode, source_meta, op_chain]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install meson, ninja, and nasm (vendored dav1d)
+        run: |
+          # The release build's pinned tools (see the step of
+          # the same name in docs/release-workflow.yml), in a
+          # virtual environment so the runner's system Python
+          # stays untouched.
+          python3 -m venv "$RUNNER_TEMP/meson-venv"
+          req="$RUNNER_TEMP/meson-requirements.txt"
+          printf '%s\n' 'meson==1.12.1 --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02' > "$req"
+          "$RUNNER_TEMP/meson-venv/bin/pip" install --require-hashes -r "$req"
+          "$RUNNER_TEMP/meson-venv/bin/pip" install "ninja==1.13.2"
+          sudo apt-get update && sudo apt-get install -y nasm
+          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
+      - name: Install the nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      # A cache key is written once, so each run attempt saves
+      # under its own key (a re-run keeps what it found too)
+      # and restores the newest key of any earlier run.
+      - name: Restore the corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/corpus/${{ matrix.target }}
+          key: fuzz-corpus-v1-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-v1-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }} for 15 minutes
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          corpus="$RUNNER_TEMP/corpus/$TARGET"
+          mkdir -p "$corpus"
+          # New inputs land in the cached corpus (the first
+          # directory); the committed seeds are read only.
+          # -rss_limit_mb caps the whole process at 2 GiB.
+          # -malloc_limit_mb caps any single allocation at
+          # twice the engine's 256 MiB decode budget
+          # (MAX_DECODE_ALLOC): one decoded buffer may reach
+          # the budget, and one same-size copy of it or one
+          # capacity doubling of a buffer near it stays within
+          # design, but an allocation past 512 MiB escaped the
+          # budget. -timeout turns a hang into a reported input
+          # instead of a job timeout with nothing to show. It
+          # is generous because the fuzzing build runs tight
+          # pixel loops over a hundred times slower than a debug
+          # build: the harness budgets keep a legitimate
+          # op_chain input near a minute at worst (an AVIF
+          # max_bytes ladder at 500x500 took 29 s), and 600 s
+          # leaves room for slower runners without reporting
+          # slow-but-bounded work as a hang.
+          cargo +nightly fuzz run "$TARGET" "$corpus" "fuzz/corpus/$TARGET" -- \
+            -max_total_time=900 \
+            -rss_limit_mb=2048 \
+            -malloc_limit_mb=512 \
+            -timeout=600 \
+            -print_final_stats=1
+      - name: Save the corpus
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/corpus/${{ matrix.target }}
+          key: fuzz-corpus-v1-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+  tests:
+
+    # The suites that want more time than a pull request
+    # gives them: the fuzz smoke with the AVIF decoder linked
+    # (it checks the AVIF seed decodes through dav1d, so the
+    # fuzz jobs above are known to fuzz it), and the
+    # workspace tests with ten thousand cases per property
+    # test (issue #478; the default is 256).
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install meson, ninja, and nasm (vendored dav1d)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/meson-venv"
+          req="$RUNNER_TEMP/meson-requirements.txt"
+          printf '%s\n' 'meson==1.12.1 --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02' > "$req"
+          "$RUNNER_TEMP/meson-venv/bin/pip" install --require-hashes -r "$req"
+          "$RUNNER_TEMP/meson-venv/bin/pip" install "ninja==1.13.2"
+          sudo apt-get update && sudo apt-get install -y nasm
+          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
+      - name: Fuzz smoke with the AVIF decoder
+        run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib --test smoke
+      - name: Workspace tests with 10000 cases per property
+        env:
+          PROPTEST_CASES: "10000"
+        run: cargo test --locked --workspace

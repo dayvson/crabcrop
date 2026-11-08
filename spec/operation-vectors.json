@@ -412,6 +412,18 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "crop:100x100:objects(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19,c20,c21,c22,c23,c24,c25,c26,c27,c28,c29,c30,E,e)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "crop:100x100:objects(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19,c20,c21,c22,c23,c24,c25,c26,c27,c28,c29,c30,E):1/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k):1/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "crop:300x0/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_crop",
@@ -485,6 +497,12 @@
   },
   {
    "remainder": "crop:100x100:objects(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19,c20,c21,c22,c23,c24,c25,c26,c27,c28,c29,c30,c31,c32)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_crop",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "crop:100x100:objects(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19,c20,c21,c22,c23,c24,c25,c26,c27,c28,c29,c30,%C3%89,%C3%A9)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_crop",
    "source": "https://example.com/a.jpg"
@@ -1474,6 +1492,12 @@
    "source": "https://example.com/a.jpg"
   },
   {
+   "remainder": "filters:quality(webp:85,png:80,jxl:75,jpeg:70,gif:60,avif:50)/https://example.com/a.jpg",
+   "ok": true,
+   "canonical": "filters:quality(avif:50,gif:60,jpeg:70,jxl:75,png:80,webp:85)/https://example.com/a.jpg",
+   "source": "https://example.com/a.jpg"
+  },
+  {
    "remainder": "filters:quality(0)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
@@ -1487,6 +1511,12 @@
   },
   {
    "remainder": "filters:quality(mp4:80)/https://example.com/a.jpg",
+   "ok": false,
+   "error": "invalid_filters",
+   "source": "https://example.com/a.jpg"
+  },
+  {
+   "remainder": "filters:quality(webm:80)/https://example.com/a.jpg",
    "ok": false,
    "error": "invalid_filters",
    "source": "https://example.com/a.jpg"
@@ -4493,6 +4523,110 @@
     100,
     100,
     [
+     "c0",
+     "c1",
+     "c2",
+     "c3",
+     "c4",
+     "c5",
+     "c6",
+     "c7",
+     "c8",
+     "c9",
+     "c10",
+     "c11",
+     "c12",
+     "c13",
+     "c14",
+     "c15",
+     "c16",
+     "c17",
+     "c18",
+     "c19",
+     "c20",
+     "c21",
+     "c22",
+     "c23",
+     "c24",
+     "c25",
+     "c26",
+     "c27",
+     "c28",
+     "c29",
+     "c30",
+     "E",
+     "e"
+    ]
+   ],
+   "segment": "crop:100x100:objects(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19,c20,c21,c22,c23,c24,c25,c26,c27,c28,c29,c30,E):1",
+   "canonical": "crop:100x100:objects(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19,c20,c21,c22,c23,c24,c25,c26,c27,c28,c29,c30,E):1"
+  },
+  {
+   "call": "ops.cropObjects",
+   "args": [
+    100,
+    100,
+    [
+     "c0",
+     "c1",
+     "c2",
+     "c3",
+     "c4",
+     "c5",
+     "c6",
+     "c7",
+     "c8",
+     "c9",
+     "c10",
+     "c11",
+     "c12",
+     "c13",
+     "c14",
+     "c15",
+     "c16",
+     "c17",
+     "c18",
+     "c19",
+     "c20",
+     "c21",
+     "c22",
+     "c23",
+     "c24",
+     "c25",
+     "c26",
+     "c27",
+     "c28",
+     "c29",
+     "c30",
+     "É",
+     "é"
+    ]
+   ],
+   "throws": true,
+   "segment": "crop:100x100:objects(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19,c20,c21,c22,c23,c24,c25,c26,c27,c28,c29,c30,%C3%89,%C3%A9):1",
+   "error": "invalid_crop"
+  },
+  {
+   "call": "ops.cropObjects",
+   "args": [
+    100,
+    100,
+    [
+     "É",
+     "é",
+     "K",
+     "k"
+    ]
+   ],
+   "segment": "crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k):1",
+   "canonical": "crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k):1"
+  },
+  {
+   "call": "ops.cropObjects",
+   "args": [
+    100,
+    100,
+    [
      " person "
     ]
    ],
@@ -4993,6 +5127,21 @@
    ],
    "segment": "quality(80,jpeg:90,webp:75)",
    "canonical": "quality(80,jpeg:90,webp:75)"
+  },
+  {
+   "call": "filter.qualityPerFormat",
+   "args": [
+    {
+     "webp": 85,
+     "png": 80,
+     "jxl": 75,
+     "jpeg": 70,
+     "gif": 60,
+     "avif": 50
+    }
+   ],
+   "segment": "quality(avif:50,gif:60,jpeg:70,jxl:75,png:80,webp:85)",
+   "canonical": "quality(avif:50,gif:60,jpeg:70,jxl:75,png:80,webp:85)"
   },
   {
    "call": "filter.palette",
