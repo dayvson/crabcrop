@@ -2,11 +2,10 @@
 //! CLIP label-signal provider.
 
 use image::DynamicImage;
-use image::imageops::FilterType;
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::clip::{crop224_resize_dims, first_row};
+use super::clip::{ChannelStats, crop224_preprocess, first_row};
 use super::session::{ModelOutput, build_session, collect_outputs, model_display_name};
 use super::{AiError, ModerationProvider, ModerationScores, TagProvider, TagScore};
 
@@ -59,7 +58,7 @@ impl OnnxModerationProvider {
     }
 
     fn logits(&self, img: &DynamicImage) -> Result<Vec<f32>, AiError> {
-        let input = preprocess_vit(img);
+        let input = crop224_preprocess(img, VIT_STATS);
         let tensor =
             ort::value::Tensor::from_array(([1, 3, 224, 224], input.into_boxed_slice()))
                 .map_err(|e| AiError::Inference(format!("cannot build the input tensor: {e}")))?;
@@ -208,31 +207,9 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     exps.iter().map(|e| e / total).collect()
 }
 
-/// The standard ViT preprocessing the moderation
-/// classifier was published with: resize the short side
-/// to 224 (bicubic), center crop 224x224, normalize with
-/// the ImageNet mean/std. Output is planar CHW. The
-/// geometry mirrors `preprocess_clip`; the statistics
-/// are the ones this model family declares.
-#[allow(clippy::excessive_precision)] // the model's published constants
-pub(super) fn preprocess_vit(img: &DynamicImage) -> Vec<f32> {
-    let (w, h) = (img.width(), img.height());
-    let (nw, nh) = crop224_resize_dims(w, h);
-    let resized = img.resize_exact(nw, nh, FilterType::CatmullRom);
-    let cropped = resized
-        .crop_imm((nw - 224) / 2, (nh - 224) / 2, 224, 224)
-        .to_rgb8();
-    const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-    const STD: [f32; 3] = [0.229, 0.224, 0.225];
-    let plane = 224 * 224;
-    let mut out = vec![0f32; 3 * plane];
-    for (i, px) in cropped.pixels().enumerate() {
-        for (c, (mean, std)) in MEAN.iter().zip(STD.iter()).enumerate() {
-            out[c * plane + i] = ((px[c] as f32 / 255.0) - mean) / std;
-        }
-    }
-    out
-}
+/// The ImageNet mean and std the moderation classifier
+/// was published with: the standard ViT preprocessing.
+pub(super) const VIT_STATS: ChannelStats = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]);
 
 #[cfg(test)]
 mod tests;

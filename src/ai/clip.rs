@@ -103,7 +103,7 @@ impl OnnxClipProvider {
     }
 
     fn embed_image(&self, img: &DynamicImage) -> Result<Vec<f32>, AiError> {
-        let input = preprocess_clip(img);
+        let input = crop224_preprocess(img, CLIP_STATS);
         if let Some((tensor, embedding)) = self
             .last_embedding
             .lock()
@@ -293,7 +293,7 @@ const PREPROCESS_MAX_SIDE: u32 = 4096;
 /// The resize dimensions for the 224-crop preprocessors:
 /// the short side scales to 224, the long side follows
 /// the aspect and clamps at [`PREPROCESS_MAX_SIDE`].
-pub(super) fn crop224_resize_dims(w: u32, h: u32) -> (u32, u32) {
+fn crop224_resize_dims(w: u32, h: u32) -> (u32, u32) {
     let (w, h) = (w.max(1), h.max(1));
     let scale = 224.0 / w.min(h) as f32;
     let nw = ((w as f32 * scale).round() as u32).clamp(224, PREPROCESS_MAX_SIDE);
@@ -301,24 +301,33 @@ pub(super) fn crop224_resize_dims(w: u32, h: u32) -> (u32, u32) {
     (nw, nh)
 }
 
-/// CLIP image preprocessing, matching the export's
-/// declared pipeline: resize the short side to 224
-/// (bicubic), center crop 224x224, normalize with the
-/// CLIP mean/std. Output is planar CHW.
+/// Per-channel normalization statistics, (mean, std), in
+/// RGB order.
+pub(super) type ChannelStats = ([f32; 3], [f32; 3]);
+
+/// The CLIP mean and std the export declares.
 #[allow(clippy::excessive_precision)] // the model's published constants
-fn preprocess_clip(img: &DynamicImage) -> Vec<f32> {
+const CLIP_STATS: ChannelStats = (
+    [0.48145466, 0.4578275, 0.40821073],
+    [0.26862954, 0.26130258, 0.27577711],
+);
+
+/// The 224-crop preprocessing CLIP and the ViT moderation
+/// classifier share, matching their exports' declared
+/// pipelines: resize the short side to 224 (bicubic),
+/// center crop 224x224, normalize with the model's own
+/// statistics. Output is planar CHW.
+pub(super) fn crop224_preprocess(img: &DynamicImage, (means, stds): ChannelStats) -> Vec<f32> {
     let (w, h) = (img.width(), img.height());
     let (nw, nh) = crop224_resize_dims(w, h);
     let resized = img.resize_exact(nw, nh, FilterType::CatmullRom);
     let cropped = resized
         .crop_imm((nw - 224) / 2, (nh - 224) / 2, 224, 224)
         .to_rgb8();
-    const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-    const STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
     let plane = 224 * 224;
     let mut out = vec![0f32; 3 * plane];
     for (i, px) in cropped.pixels().enumerate() {
-        for (c, (mean, std)) in MEAN.iter().zip(STD.iter()).enumerate() {
+        for (c, (mean, std)) in means.iter().zip(stds.iter()).enumerate() {
             out[c * plane + i] = ((px[c] as f32 / 255.0) - mean) / std;
         }
     }

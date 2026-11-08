@@ -9,7 +9,7 @@ fn preprocess_vit_normalizes_a_solid_image() {
         50,
         image::Rgb([255, 0, 0]),
     ));
-    let input = preprocess_vit(&img);
+    let input = crop224_preprocess(&img, VIT_STATS);
     assert_eq!(input.len(), 3 * 224 * 224);
     // (1 - 0.485) / 0.229 = 2.2489 in red, (0 - 0.456)
     // / 0.224 = -2.0357 in green.

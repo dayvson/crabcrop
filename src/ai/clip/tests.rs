@@ -1,5 +1,5 @@
 use super::*;
-use crate::ai::moderation::preprocess_vit;
+use crate::ai::moderation::VIT_STATS;
 
 #[test]
 fn crop224_resize_dims_clamps_the_long_side() {
@@ -23,10 +23,10 @@ fn preprocess_clip_survives_an_extreme_aspect() {
         1,
         image::Rgb([255, 0, 0]),
     ));
-    let input = preprocess_clip(&img);
+    let input = crop224_preprocess(&img, CLIP_STATS);
     assert_eq!(input.len(), 3 * 224 * 224);
     assert!(input.iter().all(|v| v.is_finite()));
-    let input = preprocess_vit(&img);
+    let input = crop224_preprocess(&img, VIT_STATS);
     assert_eq!(input.len(), 3 * 224 * 224);
 }
 
@@ -38,13 +38,34 @@ fn preprocess_clip_normalizes_a_solid_image() {
         50,
         image::Rgb([255, 0, 0]),
     ));
-    let input = preprocess_clip(&img);
+    let input = crop224_preprocess(&img, CLIP_STATS);
     assert_eq!(input.len(), 3 * 224 * 224);
     let r = (1.0f32 - 0.48145466) / 0.26862954;
     let g = (0.0f32 - 0.4578275) / 0.26130258;
     assert!((input[0] - r).abs() < 1e-4, "red plane {}", input[0]);
     assert!((input[224 * 224] - g).abs() < 1e-4, "green plane");
     assert!(input.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn crop224_preprocess_gives_clip_and_vit_the_same_crop() {
+    // One body serves both models (issue #484): undoing
+    // each model's normalization recovers the same
+    // 224x224 crop, so the statistics are all that differ.
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(300, 200, |x, y| {
+        image::Rgb([x as u8, y as u8, (x ^ y) as u8])
+    }));
+    let clip = crop224_preprocess(&img, CLIP_STATS);
+    let vit = crop224_preprocess(&img, VIT_STATS);
+    assert_eq!(clip.len(), 3 * 224 * 224);
+    assert_eq!(vit.len(), clip.len());
+    let plane = 224 * 224;
+    for (i, (a, b)) in clip.iter().zip(&vit).enumerate() {
+        let c = i / plane;
+        let from_clip = a * CLIP_STATS.1[c] + CLIP_STATS.0[c];
+        let from_vit = b * VIT_STATS.1[c] + VIT_STATS.0[c];
+        assert!((from_clip - from_vit).abs() < 1e-5, "value {i}");
+    }
 }
 
 #[test]
