@@ -4,7 +4,7 @@
 //! preprocessing shares.
 
 use image::imageops::FilterType;
-use image::{GrayImage, RgbImage};
+use image::{ImageBuffer, Luma, Pixel, Rgb};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use std::sync::OnceLock;
@@ -85,6 +85,21 @@ pub(super) fn build_session(
     Ok((session, input_name))
 }
 
+/// The pixel layouts `fir_resize` takes, each paired with
+/// its fast_image_resize layout: RGB model inputs and
+/// grayscale mask fields.
+pub(super) trait FirPixel: Pixel<Subpixel = u8> + 'static {
+    const LAYOUT: fast_image_resize::PixelType;
+}
+
+impl FirPixel for Rgb<u8> {
+    const LAYOUT: fast_image_resize::PixelType = fast_image_resize::PixelType::U8x3;
+}
+
+impl FirPixel for Luma<u8> {
+    const LAYOUT: fast_image_resize::PixelType = fast_image_resize::PixelType::U8;
+}
+
 /// Resample with fast_image_resize's Bilinear kernel instead
 /// of imageops Triangle (issue #283). The AI providers'
 /// resampling cost more than the small models' inference
@@ -94,48 +109,26 @@ pub(super) fn build_session(
 /// edges by a few levels of 255 at most, measured on the
 /// functional corpus and confirmed visually; the issue
 /// carries the bounds. Falls back to the Triangle path if
-/// the SIMD resizer rejects the geometry.
-pub(super) fn fir_resize_rgb(img: &RgbImage, w: u32, h: u32) -> RgbImage {
+/// the SIMD resizer rejects the geometry. One body serves
+/// RGB model inputs and grayscale mask fields.
+pub(super) fn fir_resize<P: FirPixel>(
+    img: &ImageBuffer<P, Vec<u8>>,
+    w: u32,
+    h: u32,
+) -> ImageBuffer<P, Vec<u8>> {
     use fast_image_resize::images::Image as FirImage;
-    use fast_image_resize::{PixelType, ResizeAlg, ResizeOptions, Resizer};
+    use fast_image_resize::{ResizeAlg, ResizeOptions, Resizer};
     let fallback = || image::imageops::resize(img, w, h, FilterType::Triangle);
-    let Ok(src) = FirImage::from_vec_u8(
-        img.width(),
-        img.height(),
-        img.as_raw().clone(),
-        PixelType::U8x3,
-    ) else {
+    let Ok(src) = FirImage::from_vec_u8(img.width(), img.height(), img.as_raw().clone(), P::LAYOUT)
+    else {
         return fallback();
     };
-    let mut dst = FirImage::new(w, h, PixelType::U8x3);
+    let mut dst = FirImage::new(w, h, P::LAYOUT);
     let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(
         fast_image_resize::FilterType::Bilinear,
     ));
     match Resizer::new().resize(&src, &mut dst, &opts) {
-        Ok(()) => RgbImage::from_raw(w, h, dst.into_vec()).unwrap_or_else(fallback),
-        Err(_) => fallback(),
-    }
-}
-
-/// The grayscale twin of `fir_resize_rgb`, for mask fields.
-pub(super) fn fir_resize_gray(img: &GrayImage, w: u32, h: u32) -> GrayImage {
-    use fast_image_resize::images::Image as FirImage;
-    use fast_image_resize::{PixelType, ResizeAlg, ResizeOptions, Resizer};
-    let fallback = || image::imageops::resize(img, w, h, FilterType::Triangle);
-    let Ok(src) = FirImage::from_vec_u8(
-        img.width(),
-        img.height(),
-        img.as_raw().clone(),
-        PixelType::U8,
-    ) else {
-        return fallback();
-    };
-    let mut dst = FirImage::new(w, h, PixelType::U8);
-    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(
-        fast_image_resize::FilterType::Bilinear,
-    ));
-    match Resizer::new().resize(&src, &mut dst, &opts) {
-        Ok(()) => GrayImage::from_raw(w, h, dst.into_vec()).unwrap_or_else(fallback),
+        Ok(()) => ImageBuffer::from_raw(w, h, dst.into_vec()).unwrap_or_else(fallback),
         Err(_) => fallback(),
     }
 }

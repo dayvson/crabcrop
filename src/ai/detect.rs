@@ -6,7 +6,7 @@ use ort::session::Session;
 use std::sync::Mutex;
 
 use super::clip::read_labels;
-use super::session::{build_session, collect_outputs, fir_resize_rgb};
+use super::session::{build_session, collect_outputs, fir_resize};
 use super::{AiError, Detection, DetectionProvider};
 
 /// The detector's fixed input edge (YOLO letterbox).
@@ -183,7 +183,7 @@ fn letterbox(img: &DynamicImage) -> (Vec<f32>, f32, u32, u32) {
     let scale = (DETECT_INPUT as f32 / w as f32).min(DETECT_INPUT as f32 / h as f32);
     let nw = ((w as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
     let nh = ((h as f32 * scale).round() as u32).clamp(1, DETECT_INPUT);
-    let resized = fir_resize_rgb(&img.to_rgb8(), nw, nh);
+    let resized = fir_resize(&img.to_rgb8(), nw, nh);
     let pad_x = (DETECT_INPUT - nw) / 2;
     let pad_y = (DETECT_INPUT - nh) / 2;
     let plane = (DETECT_INPUT * DETECT_INPUT) as usize;

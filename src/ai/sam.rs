@@ -5,7 +5,7 @@ use image::{DynamicImage, GrayImage};
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, fir_resize_rgb};
+use super::session::{build_session, fir_resize};
 use super::{AiError, SegmentEmbedding, SegmentProvider};
 
 /// The SAM encoder's fixed input edge.
@@ -32,7 +32,7 @@ pub fn segment_preprocess(img: &DynamicImage) -> Vec<f32> {
     const MEAN: [f32; 3] = [123.675, 116.28, 103.53];
     const STD: [f32; 3] = [58.395, 57.12, 57.375];
     let (nw, nh) = segment_input_dims(img.width(), img.height());
-    let resized = fir_resize_rgb(&img.to_rgb8(), nw, nh);
+    let resized = fir_resize(&img.to_rgb8(), nw, nh);
     let size = SEGMENT_INPUT as usize;
     let mut out = vec![0f32; 3 * size * size];
     for (i, px) in resized.pixels().enumerate() {

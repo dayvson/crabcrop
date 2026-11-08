@@ -5,7 +5,7 @@ use image::DynamicImage;
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::{build_session, fir_resize_rgb};
+use super::session::{build_session, fir_resize};
 use super::{AiError, FaceBox, FaceProvider};
 
 /// Face detection backed by YuNet (the 2023mar ONNX export):
@@ -69,7 +69,7 @@ impl FaceProvider for OnnxFaceProvider {
         // The export takes exactly 640x640. The image is scaled
         // to fit (the reference wrapper resizes the same way);
         // boxes map back with independent axis scales.
-        let small = fir_resize_rgb(&img.to_rgb8(), FACE_INPUT, FACE_INPUT);
+        let small = fir_resize(&img.to_rgb8(), FACE_INPUT, FACE_INPUT);
         // BGR planar floats at 0..255: the channel order and
         // scale the model was trained with.
         let plane = (FACE_INPUT * FACE_INPUT) as usize;
