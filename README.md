@@ -87,7 +87,7 @@ Send `Accept: application/json` with the same URL and the answer is the render's
 
 ## Features
 
-- **All major formats, in and out.** JPEG, PNG, WebP, GIF, AVIF, and JPEG XL, in and out. HEIC and HEIF decode only; SVG decodes, sanitized and rasterized. Name no format and the Accept header decides: AVIF first, then JPEG XL, then WebP. An explicit `format(...)` always wins.
+- **All major formats, in and out.** JPEG, PNG, WebP, GIF, AVIF, and JPEG XL, in and out. HEIC, HEIF, TIFF, BMP, and ICO decode only; SVG decodes, sanitized and rasterized. Name no format and the Accept header decides: AVIF first, then JPEG XL, then WebP. An explicit `format(...)` always wins.
 - **More than photos.** The source can be one frame of a video, one page of a PDF, an object in S3 or GCS, a local file, or a short `root:` reference. Originals can also arrive through the signed upload endpoint, off by default.
 - **51 filters, one chain.** Resize, crop, fit-in, and pad are their own path segments. The 51 filters chain inside one `filters:` segment, everything running in the order written.
 - **Smart crop, face safe.** The crop window finds the subject, and keeps detected faces whole instead of clipping them at the edge.

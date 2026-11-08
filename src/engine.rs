@@ -171,10 +171,10 @@ fn decode_webp_direct(bytes: &[u8]) -> Option<DynamicImage> {
 /// The media kind an upload validated as (issue #192):
 /// what the endpoint binds the object name's extension
 /// against, so a validated image cannot be stored under
-/// a name that presents it as something else. `Other` is
-/// a format the generic decoder accepts but the binding
-/// table does not enumerate (the PNM/TGA/QOI long tail);
-/// those carry no extension binding.
+/// a name that presents it as something else. Every kind
+/// carries a binding (issue #466): a body the generic
+/// decoder accepts but this table does not name is
+/// refused, never stored unbound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadMedia {
     Svg,
@@ -188,27 +188,24 @@ pub enum UploadMedia {
     Bmp,
     Tiff,
     Ico,
-    Other,
 }
 
 impl UploadMedia {
     /// The name extensions this media kind may be stored
-    /// under (lowercase, no dot), or `None` when the kind
-    /// carries no binding.
-    pub(crate) fn allowed_extensions(self) -> Option<&'static [&'static str]> {
+    /// under (lowercase, no dot).
+    pub(crate) fn allowed_extensions(self) -> &'static [&'static str] {
         match self {
-            UploadMedia::Svg => Some(&["svg"]),
-            UploadMedia::Heic => Some(&["heic", "heif"]),
-            UploadMedia::Jpeg => Some(&["jpg", "jpeg"]),
-            UploadMedia::Png => Some(&["png"]),
-            UploadMedia::Gif => Some(&["gif"]),
-            UploadMedia::WebP => Some(&["webp"]),
-            UploadMedia::Avif => Some(&["avif"]),
-            UploadMedia::Jxl => Some(&["jxl"]),
-            UploadMedia::Bmp => Some(&["bmp"]),
-            UploadMedia::Tiff => Some(&["tif", "tiff"]),
-            UploadMedia::Ico => Some(&["ico"]),
-            UploadMedia::Other => None,
+            UploadMedia::Svg => &["svg"],
+            UploadMedia::Heic => &["heic", "heif"],
+            UploadMedia::Jpeg => &["jpg", "jpeg"],
+            UploadMedia::Png => &["png"],
+            UploadMedia::Gif => &["gif"],
+            UploadMedia::WebP => &["webp"],
+            UploadMedia::Avif => &["avif"],
+            UploadMedia::Jxl => &["jxl"],
+            UploadMedia::Bmp => &["bmp"],
+            UploadMedia::Tiff => &["tif", "tiff"],
+            UploadMedia::Ico => &["ico"],
         }
     }
 
@@ -226,7 +223,6 @@ impl UploadMedia {
             UploadMedia::Bmp => "bmp",
             UploadMedia::Tiff => "tiff",
             UploadMedia::Ico => "ico",
-            UploadMedia::Other => "image",
         }
     }
 }
@@ -310,7 +306,11 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
     // The generic decode accepted the bytes; name what it
     // accepted. The guess mirrors the decoder's own, with
     // JPEG XL (which the image crate does not know) taken
-    // from the branch detection above.
+    // from the branch detection above. The image crate is
+    // built with these formats only (issue #466), so the
+    // last arm is unreachable today; it refuses rather
+    // than storing a kind no extension is bound to, should
+    // a feature change ever compile another decoder in.
     let media = if detected == ImageFormat::Jxl {
         UploadMedia::Jxl
     } else {
@@ -323,7 +323,12 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
             Ok(image::ImageFormat::Bmp) => UploadMedia::Bmp,
             Ok(image::ImageFormat::Tiff) => UploadMedia::Tiff,
             Ok(image::ImageFormat::Ico) => UploadMedia::Ico,
-            _ => UploadMedia::Other,
+            other => {
+                let format = other.map_or_else(|_| "unknown".to_string(), |f| format!("{f:?}"));
+                return Err(EngineError::Decode(format!(
+                    "the {format} format is not an upload format this server accepts"
+                )));
+            }
         }
     };
     Ok(PreparedUpload {
@@ -4812,3 +4817,6 @@ fn apply_fit_in(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_formats;
