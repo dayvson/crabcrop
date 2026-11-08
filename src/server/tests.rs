@@ -39,9 +39,31 @@ async fn spawn_watermark_server() -> String {
     spawn_bytes_server(png).await.replace("src.png", "wm.png")
 }
 
+/// Answer one HTTP/1.1 request the way a real origin does:
+/// read the request head, write the response, then close the
+/// write side. Writing and dropping the socket with the
+/// request still unread makes the kernel answer with a reset
+/// instead of a clean close, and on macOS that reset can reach
+/// the client before it has read the whole response ("error
+/// decoding response body", "error sending request").
+async fn reply_and_close(socket: &mut tokio::net::TcpStream, head: &[u8], body: &[u8]) {
+    let mut buf = [0u8; 1024];
+    let mut seen = Vec::new();
+    while !seen.windows(4).any(|w| w == b"\r\n\r\n") && seen.len() < 64 * 1024 {
+        match socket.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+    }
+    let _ = socket.write_all(head).await;
+    let _ = socket.write_all(body).await;
+    let _ = socket.shutdown().await;
+}
+
 async fn spawn_bytes_server(png: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let png = Arc::new(png);
     tokio::spawn(async move {
         // Serves every connection: cache-bypassing requests
         // (meta mode) fetch the source more than once.
@@ -49,12 +71,14 @@ async fn spawn_bytes_server(png: Vec<u8>) -> String {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                png.len()
-            );
-            let _ = socket.write_all(head.as_bytes()).await;
-            let _ = socket.write_all(&png).await;
+            let png = png.clone();
+            tokio::spawn(async move {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                );
+                reply_and_close(&mut socket, head.as_bytes(), &png).await;
+            });
         }
     });
     format!("http://{addr}/src.png")
@@ -3824,7 +3848,6 @@ async fn explain_reports_the_root_name_and_never_the_base() {
 /// how cache behavior becomes observable from outside.
 async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncWriteExt;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
@@ -3842,8 +3865,7 @@ async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::Atomic
                     "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(&body).await;
+                reply_and_close(&mut socket, head.as_bytes(), &body).await;
             });
         }
     });
@@ -12678,7 +12700,10 @@ async fn upload_rejects_names_that_misstate_the_media() {
         ("photo.jpg", StatusCode::UNSUPPORTED_MEDIA_TYPE),
         ("promo.html", StatusCode::UNSUPPORTED_MEDIA_TYPE),
         ("photo.png", StatusCode::CREATED),
-        ("photo.PNG", StatusCode::CREATED),
+        // Its own stem: on a case-insensitive file system
+        // (the macOS default) photo.PNG is the same file as
+        // photo.png and would be refused as existing.
+        ("upper.PNG", StatusCode::CREATED),
         ("photo", StatusCode::CREATED),
     ] {
         let sig = crate::url::upload_signature(SECRET, name);

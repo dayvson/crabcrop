@@ -32,6 +32,10 @@ fast-ssim2 = "0.9"
 fast_image_resize = { version = "6.1", features = ["image"] }
 hex = "0.4"
 hmac = "0.13"
+# Platform-independent cosine for thumbhash, so a placeholder is
+# the same bytes on every OS (the system libm differs in the last
+# bit between glibc and Apple). Already in the tree via image deps.
+libm = "0.2"
 jixel = "0.5"
 jpeg-encoder = { version = "0.7", features = ["simd"] }
 ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
