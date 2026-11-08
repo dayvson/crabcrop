@@ -2781,9 +2781,20 @@ async fn source_text_the_server_cannot_fetch_answers_400_invalid_source() {
     // a scheme the loader does not fetch, or is a
     // malformed bucket locator is the caller's fault, so
     // it answers 400, not the 502 a failing origin gets.
-    // Signed, so the signature is not what fails.
+    // Signed, so the signature is not what fails. The
+    // last two are a segment kind this server does not
+    // know, a prefix and a bare form: they read as source
+    // text and answer the same (spec/url-signing.md,
+    // Versioning).
     let base = spawn_app(false).await;
-    for source in ["ftp://8.8.8.8/a.jpg", "notaurl", "s3://", "gs://x"] {
+    for source in [
+        "ftp://8.8.8.8/a.jpg",
+        "notaurl",
+        "s3://",
+        "gs://x",
+        "newop:7/https://example.com/a.jpg",
+        "newop/https://example.com/a.jpg",
+    ] {
         let remainder = format!("100x50/{source}");
         let url = format!("{base}/{}/{remainder}", sign(&remainder));
         let plain = client().get(&url).send().await.unwrap();
