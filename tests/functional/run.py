@@ -10,9 +10,10 @@ Tiers:
           parity vectors). Hard budget: about 4 minutes wall clock
           including server boots (enforced with --enforce-budget).
   full    The whole CI matrix: every case in cases_core.json,
-          cases_overlay.json and cases_platform.json. Nightly and on
-          release tags; also on PRs whose diff touches Cargo.lock or
-          the encode pipeline (see docs/functional-workflow.yml).
+          cases_overlay.json and cases_platform.json. Nightly, on
+          pushes to main and on release tags; also on PRs whose diff
+          touches Cargo.lock, a manifest, anything under src/, or
+          this harness (see docs/functional-workflow.yml).
   local   The AI tier (cases_ai.json). Never runs in CI: models are
           deployment artifacts. Needs CRABCROP_FUNC_MODELS_DIR and
           CRABCROP_ORT_DYLIB; without them every AI case is recorded
