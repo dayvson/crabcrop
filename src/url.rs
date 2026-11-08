@@ -1010,9 +1010,11 @@ pub enum FrameSelection {
 
 /// The largest timestamp a `frame:` segment may name, in
 /// seconds: 24 hours. Real sources the loader will fetch
-/// (10 MiB, bounded decode) run far shorter; the cap keeps
-/// the grammar's numbers finite and small, and anything
-/// past a real duration clamps to the last frame anyway.
+/// (10 MiB by default, 1 GiB at most) almost always run
+/// shorter, and a percentage reaches any point of a longer
+/// one; the cap keeps the grammar's numbers finite and
+/// small, and anything past a real duration clamps to the
+/// last frame anyway.
 pub const MAX_FRAME_SECONDS: f64 = 86_400.0;
 
 /// The largest percentage a `frame:` segment may name.

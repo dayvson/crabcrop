@@ -45,13 +45,15 @@ use reqwest::{Client, Url, header, redirect};
 
 use crate::sigv4::{self, Credentials};
 
-/// Default cap on response bodies: 10 MiB. The upload
-/// endpoint's size cap is tied to this one (issue #168):
-/// an original larger than the loader will fetch could
-/// be stored but never served.
+/// Default cap on response bodies: 10 MiB, the default of
+/// `CRABCROP_SOURCE_MAX_MB` (issue #471). The upload
+/// endpoint's size cap is tied to the configured cap
+/// (issue #168): an original larger than the loader will
+/// fetch could be stored but never served.
 pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
-/// Default total request timeout: 10 seconds.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default total request timeout: 10 seconds, the default
+/// of `CRABCROP_SOURCE_TIMEOUT_SECS` (issue #471).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum redirects followed per request.
 const MAX_REDIRECTS: usize = 5;
 
@@ -430,6 +432,18 @@ impl SourcePolicy {
             allowed_suffixes,
             block_private,
         }
+    }
+
+    /// Whether fetches under this policy pin hostnames to
+    /// their validated addresses (see `check_policy`): the
+    /// private-address check is on and no allowlist is set.
+    /// With an allowlist, every host the loader fetches is
+    /// listed, and listed hosts skip the check and the pin.
+    /// A pinned fetch connects directly, never through a
+    /// proxy the environment configures, which boot warns
+    /// about (issue #471).
+    pub fn pins_hostnames(&self) -> bool {
+        self.block_private && self.allowed_suffixes.is_empty()
     }
 }
 

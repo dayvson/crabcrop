@@ -83,10 +83,10 @@ Every cacheable image response also carries a strong `ETag`: a digest of the res
 
 ### Source images
 
-The loader fetches the source under fixed limits, for every source kind:
+The loader fetches the source under bounded limits, for every source kind:
 
-- 10 seconds per source fetch in total: one budget spans the whole redirect chain and the body read, so a chain of fast hops cannot stretch a fetch past it.
-- 10 MiB maximum body; larger sources fail with `502` (the request was fine; the origin object is too big).
+- 10 seconds per source fetch in total by default (`CRABCROP_SOURCE_TIMEOUT_SECS`): one budget spans the whole redirect chain and the body read, so a chain of fast hops cannot stretch a fetch past it.
+- 10 MiB maximum body by default (`CRABCROP_SOURCE_MAX_MB`); larger sources fail with `502` (the request was fine; the origin object is too big).
 - If an HTTP response carries a `Content-Type` header, it must start with `image/`. The exceptions are the media selections: when the URL carries a `frame:` segment, a `video/*` Content-Type is accepted too (see [Video frames](media.md#video-frames)), and when it carries a `page:` segment, `application/pdf` is accepted (see [PDF pages](media.md#pdf-pages)). Both admissions belong to the request, never to the response alone.
 
 Decoding is bounded too, so a small file cannot expand into gigabytes: at most 16384 px per axis and 256 MiB of decoder allocations, and animated GIF and WebP sources at most 200 frames, 100 million decoded pixels, and 256 MiB of decoded frames in total. Sources past the bounds fail with `502`.
