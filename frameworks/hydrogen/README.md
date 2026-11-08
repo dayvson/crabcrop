@@ -4,7 +4,7 @@ A loader for `@shopify/hydrogen`'s `Image` component, for images that do **not**
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url`.
+1. Install the builder: `npm install @crabcrop/url` (0.9.12 or later, which exports the `MAX_DIMENSION` this file imports).
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project.
 3. Create the loader where you have configuration access (a route loader or a shared module fed from `context.env`), and pass it to `Image`:
 
@@ -38,6 +38,8 @@ This setup builds unsigned URLs; read [Signing and server modes](#signing-and-se
 
 The loader maps Hydrogen's `{src, width, height, scale}` calls onto the grammar: width and height together become `{w}x{h}` (with `scale` multiplied in, for device-pixel-ratio variants), width alone becomes `{w}x0`, height alone `0x{h}`. With a preset, `preset:<name>` leads and the sizing appends.
 
+Dimensions are multiplied by `scale` first, then follow one rule: a fraction rounds to whole pixels, a value that is not a size (0, negative, or not a number) is left out so the URL serves the source's own size, and a value past the server's per-axis cap (`MAX_DIMENSION` in `@crabcrop/url`) throws, as does `createCrabcropLoader` without a `base`, instead of minting a URL that cannot load. All five crabcrop integrations share this rule.
+
 ## Signing and server modes
 
 The setup above builds unsigned URLs. Hydrogen's `Image` calls the loader once per width, during server rendering and again in the browser, and the browser calls cannot sign. That decides which server mode fits:
@@ -50,6 +52,6 @@ The setup above builds unsigned URLs. Hydrogen's `Image` calls the loader once p
 
 ## Tests
 
-`npm test` in this directory pins the factory's output to exact URLs (signatures cross-checked with `node:crypto` directly). The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
+`npm test` in this directory pins the factory's output to exact URLs (signatures cross-checked with `node:crypto` directly). It also runs the dimension table all five integrations share ([`dimension-table.mjs`](../dimension-table.mjs)), so one mistake has one outcome in each. The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
 
 [`tests/browser-bundles`](../../tests/browser-bundles) builds this loader into a browser bundle with Vite and runs it with a browser's globals and none of Node's.

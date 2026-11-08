@@ -84,7 +84,15 @@ const operations = joinOps(
 const url = buildURL("https://images.example.com", "your-secret", operations, "https://example.com/photo.jpg");
 ```
 
-A value the server would reject (`filter.quality(0)`, `filter.brighten(256)`, `ops.crop(0, 100)`) throws at build time instead of minting a URL that fails at the edge. The closed sets are exported as types (`ImageFormat`, `CropAlign`, `Anchor`, `BlendMode`, `MaskShape`, `Dimension`), and `FILTER_DESCRIPTIONS` is the filter metadata table the explainer uses.
+A value the server would reject (`filter.quality(0)`, `filter.brighten(256)`, `ops.crop(0, 100)`) throws at build time instead of minting a URL that fails at the edge. The closed sets are exported as types (`ImageFormat`, `PerFormatQualityFormat`, `CropAlign`, `Anchor`, `BlendMode`, `MaskShape`, `CurveChannel`, `StudioMode`, `StudioShadow`, `Dimension`), and so are the option objects (`FormatOptions` for `filter.format`, `StudioOptions` for `filter.studio`). `MAX_DIMENSION` is the server's per-axis pixel cap, 16383. The size, box, region, border, radius, and pixelate builders check against it (source coordinates, as in `ops.cropRect` and `ops.focal`, are not capped), and the [framework integrations](../../frameworks) import it for their own checks. `FILTER_DESCRIPTIONS` is the filter metadata table the explainer uses.
+
+```ts
+import { filter, MAX_DIMENSION, ops, type FormatOptions } from "@crabcrop/url";
+
+const jpeg: FormatOptions = { progressive: true, subsampling: 420 };
+filter.format("jpeg", jpeg); // "format(jpeg,progressive,subsampling:420)"
+ops.size(Math.min(requestedWidth, MAX_DIMENSION), 0); // clamp rather than throw
+```
 
 ## Browsers and bundlers
 
@@ -110,6 +118,6 @@ The published package is compiled JavaScript (`dist/`) for Node >= 22. The sourc
 npm test
 ```
 
-`npm test` builds `dist/` first (the `#crypto` import resolves there), then runs the suite twice: on `node:crypto`, and again under `--conditions=browser` on the portable backend.
+`npm test` builds `dist/` first (the `#crypto` import resolves there) and type-checks [`test/exports.test.ts`](test/exports.test.ts), which imports the package by its own name, against the built declarations, so a type missing from the public index fails here. It then runs the suite twice: on `node:crypto`, and again under `--conditions=browser` on the portable backend.
 
 In this repository the framework loaders and the MCP server resolve `@crabcrop/url` to these sources, so build the package once (`npm run build`) before running their tests; a standalone install comes from npm once published, or from the repository with `"@crabcrop/url": "file:../typescript"` as the MCP package in this repo does.

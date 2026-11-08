@@ -4,6 +4,7 @@ import { createHmac } from "node:crypto";
 import { test } from "node:test";
 
 const { createCrabcropLoader } = await import("../crabcrop-loader.ts");
+const table = await import("../../dimension-table.mjs");
 
 const SRC = "https://cdn.example.com/a.jpg";
 const images = createCrabcropLoader({ base: "https://images.example.com" });
@@ -116,4 +117,13 @@ test("the factory requires a base; invalid options throw instead of minting dead
   assert.throws(() => images.url(SRC, { quality: 0 }), /quality must be/);
   assert.throws(() => images.srcset(SRC, [0]), /srcset width must be/);
   assert.throws(() => images.srcset(SRC, [640.5]), /srcset width must be/);
+});
+
+test("dimensions and the base follow the rule all five integrations share (issue #460)", () => {
+  const loader = createCrabcropLoader({ base: table.BASE });
+  table.checkDimensionTable({
+    width: (width: number) => loader.url(table.SRC, { width }),
+    height: (height: number) => loader.url(table.SRC, { height }),
+    emptyBase: () => createCrabcropLoader({ base: "" }),
+  });
 });

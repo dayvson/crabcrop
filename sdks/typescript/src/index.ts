@@ -13,6 +13,7 @@ import {
   timingSafeEqual,
 } from "#crypto";
 import { fromBase64Url, toBase64Url, toHex, utf8, utf8Strict } from "./bytes.ts";
+import { MAX_DIMENSION } from "./limits.ts";
 
 /**
  * Compute the signature segment for a remainder: the lowercase
@@ -314,9 +315,9 @@ function assertExpires(expires: number): void {
  * flip), so it throws here, at build time.
  */
 function assertWidth(width: number): void {
-  if (!Number.isSafeInteger(width) || width < 1 || width > 16383) {
+  if (!Number.isSafeInteger(width) || width < 1 || width > MAX_DIMENSION) {
     throw new Error(
-      `srcset width must be a positive integer no larger than 16383, got ${width}`,
+      `srcset width must be a positive integer no larger than ${MAX_DIMENSION}, got ${width}`,
     );
   }
 }
@@ -386,6 +387,7 @@ export function buildSrcSet(
 export { explainUrl } from "./explain.ts";
 export { FILTER_DESCRIPTIONS } from "./explain.ts";
 export type { ExplainedSegment, Explanation, SegmentKind, SignatureKind } from "./explain.ts";
+export { MAX_DIMENSION } from "./limits.ts";
 export { filter, joinOps, ops } from "./operations.ts";
 export type {
   Anchor,
@@ -393,8 +395,10 @@ export type {
   CropAlign,
   CurveChannel,
   Dimension,
+  FormatOptions,
   ImageFormat,
   MaskShape,
+  PerFormatQualityFormat,
   StudioMode,
   StudioOptions,
   StudioShadow,

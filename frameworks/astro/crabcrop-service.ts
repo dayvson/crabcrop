@@ -52,7 +52,7 @@
  * grammar (including "svg": use a plain <img> for those)
  * throw, rather than minting a URL the server would reject.
  */
-import { buildURL } from "@crabcrop/url";
+import { buildURL, MAX_DIMENSION } from "@crabcrop/url";
 
 export interface CrabcropServiceConfig {
   base: string;
@@ -94,9 +94,6 @@ export interface SrcSetValueLike {
   descriptor?: string;
   attributes?: Record<string, unknown>;
 }
-
-/** The server's per-axis dimension cap (the URL grammar's MAX_DIMENSION). */
-const MAX_DIMENSION = 16383;
 
 const dim = (v: number | undefined, name: string): number | undefined => {
   if (v === undefined) return undefined;
