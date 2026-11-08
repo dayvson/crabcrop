@@ -25,7 +25,9 @@ both SDKs must all pass.
   state in `engine/state.rs`), HTTP and caching in `server.rs`
   (request coalescing in `server/process.rs`, metadata responses in
   `server/meta.rs`), source fetching policy in `loader.rs`, AI
-  features in `ai.rs` and `studio.rs`.
+  features in `ai.rs` and `studio.rs`. A large module keeps its unit
+  tests in `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
+  `server.rs` and `engine.rs` do.
 - `crates/crabcrop-url`: the client-side library: signing, sealing,
   verification, and URL building. It does not parse operations; the
   server's parser is `src/url.rs`.
