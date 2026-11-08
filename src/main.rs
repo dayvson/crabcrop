@@ -1,305 +1,21 @@
 //! crabcrop: on-demand image optimization.
 //!
-//! Every image operation is encoded in the request URL:
+//! The `crabcrop` binary. With no arguments it reads its
+//! configuration from the environment, builds the server
+//! from the library's modules, and serves signed image URLs
+//! of the form `/<signature>/<operations...>/<image-url>`.
+//! When the first argument names a CLI verb, that verb runs
+//! instead of the server (see [`cli`]).
 //!
-//! ```text
-//! /<signature>/<operations...>/<image-url>
-//! ```
-//!
-//! The first path segment is the request [`url::Signature`]: either an
-//! HMAC-SHA256 of the rest of the path, or the literal `unsafe` when the
-//! server allows unsigned URLs.
-//!
-//! Configuration comes from the environment:
-//!
-//! - `CRABCROP_SECRET` (required, at least 16 bytes): the HMAC secret.
-//! - `CRABCROP_DEFAULT_OPS`: operations prepended to every
-//!   request (a house format, quality, watermark), parsed
-//!   and validated at boot.
-//! - `CRABCROP_SECRET_KEY_ID`: the current secret's key ID
-//!   (`current` when unset). During rotation,
-//!   `CRABCROP_SECRET_PREVIOUS` holds the outgoing secret
-//!   (same minimum length) under
-//!   `CRABCROP_SECRET_PREVIOUS_KEY_ID` (default `previous`);
-//!   the server then verifies both keys.
-//! - `CRABCROP_ALLOW_UNSAFE`: `1` or `true` to honor `unsafe` URLs.
-//! - `CRABCROP_CACHE_MAX_MB`: result cache budget in megabytes,
-//!   default 256; `0` disables the cache.
-//! - `CRABCROP_SSIM_TARGET`: SSIMULACRA2 target (0-100) that
-//!   `quality(auto)` verifies against for JPEG and JXL output,
-//!   default 75.
-//! - `CRABCROP_AVIF_SPEED`: ravif speed tier for AVIF encodes,
-//!   1 (slowest, smallest) to 10 (fastest), default 9.
-//! - `CRABCROP_METADATA`: `strip` (default) drops embedded
-//!   EXIF/XMP/IPTC on output; `preserve` copies them into
-//!   JPEG and PNG outputs.
-//! - `CRABCROP_META_MODE`: meta mode (a JSON document
-//!   describing a render, requested with an
-//!   `application/json` Accept header). On by default;
-//!   `0` or `false` disables it, and meta requests then
-//!   answer `403 meta_disabled`. Meta mode bypasses every
-//!   cache tier and runs a fresh render plus its
-//!   annotation inferences on every request, so a
-//!   deployment that does not use it can close that cost
-//!   off.
-//! - `CRABCROP_WIDTH_STEP`: quantization step in pixels for
-//!   width client hints, 1 to 2000, default 100.
-//! - `CRABCROP_JXL_SPEED`: jixel speed tier for JPEG XL encodes,
-//!   one of ultrafast, fastest, fast, medium, slow, extraslow,
-//!   default fastest.
-//! - `CRABCROP_ALLOWED_SOURCES`: comma-separated host suffixes the
-//!   loader may fetch from; unset means no allowlist. A listed
-//!   host is exempt from the private-address refusal below.
-//! - `CRABCROP_BLOCK_PRIVATE_SOURCES`: refuse sources resolving
-//!   to loopback, private, or link-local addresses. On by
-//!   default; `0` or `false` allows non-public sources.
-//! - `CRABCROP_ALLOW_ANY_SOURCE`: `1` or `true` to deliberately
-//!   allow every source: switches the private-address refusal
-//!   off (a configured allowlist still applies).
-//! - `CRABCROP_S3_ENDPOINT`: base URL of an S3-compatible
-//!   store for `s3://` sources (path-style addressing).
-//!   Unset means AWS S3 (virtual-hosted, region from
-//!   `CRABCROP_S3_REGION`, default `us-east-1`). Credentials
-//!   come from the `AWS_ACCESS_KEY_ID`,
-//!   `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`
-//!   environment variables, read once at startup; no AWS
-//!   credential chain is consulted. Both key parts must be
-//!   set together. Unset means unsigned fetches (public
-//!   buckets).
-//! - `CRABCROP_GCS_ENDPOINT` / `CRABCROP_GCS_REGION`: the
-//!   GCS XML API base for `gs://` sources (default
-//!   `https://storage.googleapis.com`) and its signing region
-//!   (default `auto`). Signing uses the HMAC pair
-//!   `CRABCROP_GCS_ACCESS_KEY` / `CRABCROP_GCS_SECRET_KEY`;
-//!   both or neither.
-//! - `CRABCROP_ALLOWED_BUCKETS`: comma-separated bucket
-//!   names the `s3://` and `gs://` schemes may read; unset
-//!   allows no bucket. `*` allows every bucket.
-//! - `CRABCROP_FILE_ROOT`: directory that `file://` sources
-//!   must stay under, canonicalized at boot. Unset disables
-//!   file sources.
-//! - `CRABCROP_PRESETS_FILE`: path to a presets file, one
-//!   `name = operations` entry per line (`#` comments and
-//!   blank lines skipped), validated at boot. Requests may
-//!   then use `preset:<name>` as an operation.
-//! - `CRABCROP_ONLY_PRESETS`: `1` or `true` rejects
-//!   free-form operations in requests; only preset references
-//!   (and `exp:` metadata) are allowed. Requires a presets
-//!   file with at least one entry.
-//! - `CRABCROP_SOURCE_ROOTS_FILE`: path to a source roots
-//!   file, one `name = base-url` entry per line (`#` comments
-//!   and blank lines skipped), validated at boot. Requests
-//!   may then use `root:<name>/<path>` as the source, which
-//!   the server expands against the named base URL after
-//!   signature verification.
-//! - `CRABCROP_REMOVEBG_MODEL`: path to a U²-Net-family ONNX
-//!   model for the `removebg` filter. Preloaded at boot; a set
-//!   but unloadable model is a startup error. Unset disables
-//!   the filter (requests fail cleanly).
-//! - `CRABCROP_UPSCALE_MODEL`: path to a super-resolution ONNX
-//!   model for the `upscale` filter. Same preload rule.
-//! - `CRABCROP_INPAINT_MODEL`: path to a LaMa-family ONNX
-//!   model (two inputs, image plus mask, at a fixed 512x512)
-//!   for the `remove_region` filter. Same preload rule.
-//! - `CRABCROP_SEGMENT_ENCODER_MODEL` /
-//!   `CRABCROP_SEGMENT_DECODER_MODEL`: a SAM-family ONNX
-//!   model pair (image encoder plus prompt decoder) that
-//!   gives the class filters mask-tight silhouettes instead
-//!   of detection rectangles. Both are required together; a
-//!   partial set is a startup error. Same preload rule.
-//! - `CRABCROP_FACE_MODEL`: path to a YuNet ONNX model for
-//!   face-aware smart crops. Same preload rule; unset means
-//!   smart crops use the saliency estimate.
-//! - `CRABCROP_FONT_PATH`: path to a TTF/OTF font for the
-//!   `text(...)` overlay filter, loaded at boot. Unset
-//!   disables the filter (requests fail cleanly).
-//! - `CRABCROP_CLIP_IMAGE_MODEL` / `CRABCROP_CLIP_TEXT_MODEL`:
-//!   a CLIP ONNX model pair for meta `tags` and `alt_text`,
-//!   with `CRABCROP_CLIP_TOKENIZER` (the export's
-//!   `tokenizer.json`) and `CRABCROP_CLIP_LABELS` (one label
-//!   per line). All four are required together; a partial set
-//!   is a startup error. `CRABCROP_CLIP_THRESHOLD` optionally
-//!   sets the tag score floor (default 0.05). Unset disables
-//!   annotation; meta responses then carry no tags. Meta
-//!   requests that opt in with `embeddings=1` also gain the
-//!   image embedding the tagger computes: base64-packed
-//!   float16, with the encoder identity, dimension, and
-//!   encoding named alongside it.
-//! - `CRABCROP_MODERATION_MODEL`: path to a ViT classifier
-//!   ONNX model (the Falconsai nsfw_image_detection shape)
-//!   whose per-category scores meta responses report when
-//!   they opt in with `moderation=1`. Preloaded at boot
-//!   like every model; a set but unloadable model is a
-//!   startup error. `CRABCROP_MODERATION_LABELS` (one
-//!   label per line) names the model's outputs in output
-//!   order; without it, a two-output model uses `normal`
-//!   and `nsfw`, and any other output count is a startup
-//!   error. With no model set, the labels file instead
-//!   names zero-shot prompt labels scored by the CLIP pair
-//!   (which must then be configured), reported in meta as
-//!   review signals, never verdicts. Both unset disables
-//!   moderation. Verdicts only annotate meta; nothing is
-//!   enforced at serve time.
-//! - `CRABCROP_AESTHETIC_HEAD`: path to a LAION-style
-//!   linear aesthetic head (the PyTorch save, e.g.
-//!   `sa_0_4_vit_b_32_linear.pth`) scored against the
-//!   CLIP embedding in meta. Requires the `CRABCROP_CLIP_*`
-//!   set: the head's input is the tagger's embedding. A
-//!   malformed file is a startup error. A dimension
-//!   mismatch between the head and the encoder is not:
-//!   meta reports a null score with a reason and the
-//!   expected and actual dimensions. The score is
-//!   descriptive only, never a gate.
-//! - `CRABCROP_OCR_DETECT_MODEL` /
-//!   `CRABCROP_OCR_RECOGNIZE_MODEL`: a PP-OCR-family
-//!   ONNX model pair (DB detection plus CTC recognition)
-//!   whose extracted text meta responses report when
-//!   they opt in with `ocr=1`, with
-//!   `CRABCROP_OCR_DICT` (the recognition model's
-//!   character dictionary, one character per line, in
-//!   class order). All three are required together; a
-//!   partial set is a startup error. Preloaded and
-//!   probed at boot like every model; the probe also
-//!   checks the dictionary against the recognition
-//!   model's output width. `CRABCROP_OCR_LANGUAGE`
-//!   optionally declares the language the recognition
-//!   model serves (default `und`), echoed in meta so
-//!   the response describes itself. Text only annotates
-//!   meta; nothing is enforced at serve time.
-//! - `CRABCROP_FALLBACK_IMAGE`: a URL or local file path for
-//!   the fallback image served (through the same operations,
-//!   marked `X-Crabcrop-Fallback: 1`) when a source cannot be
-//!   loaded or decoded. Unset keeps today's error behavior.
-//! - `CRABCROP_RESULT_BUCKET`: S3 bucket for the shared
-//!   result-storage tier (multi-replica), reusing
-//!   `CRABCROP_S3_ENDPOINT`, `CRABCROP_S3_REGION`, and the
-//!   AWS credentials from the environment;
-//!   `CRABCROP_RESULT_PREFIX` namespaces its objects.
-//! - `CRABCROP_RESULT_STORAGE_DIR`: directory for the
-//!   disk-backed result store (the persistent tier under the
-//!   memory cache). Unset disables it.
-//!   `CRABCROP_RESULT_STORAGE_MAX_MB` bounds it (default 512;
-//!   `0` disables storage even with a directory set).
-//! - `CRABCROP_DETECT_MODEL`: path to a YOLOv8-family ONNX
-//!   model for `blurclass` / `pixelateclass` redaction and
-//!   meta detections. Same preload rule. The class
-//!   vocabulary comes from the model's `names` metadata;
-//!   `CRABCROP_DETECT_LABELS` (one class per line) covers
-//!   exports without it. `CRABCROP_DETECT_THRESHOLD` sets
-//!   the score floor (default 0.5).
-//! - `CRABCROP_DETECTORS_FILE`: path to a JSON file
-//!   declaring additional detectors against two built-in
-//!   contracts (issue #166): `boxes` (a YOLO-family model
-//!   joining class redaction and meta detections) and
-//!   `focal` (a heatmap model feeding smart crops). Every
-//!   declaration is loaded and probed at boot; a broken
-//!   one is a startup error naming it. Unset declares
-//!   none. See the README's AI section for the format.
-//! - `CRABCROP_UPLOAD_DIR` / `CRABCROP_UPLOAD_BUCKET`:
-//!   the upload destination (issue #168), a local directory
-//!   or an S3 bucket (with `CRABCROP_UPLOAD_PREFIX`
-//!   namespacing its objects). Exactly one may be set;
-//!   neither means the upload endpoint does not exist.
-//!   A local directory doubles as the `file://` source
-//!   root when no `CRABCROP_FILE_ROOT` is configured.
-//!   `CRABCROP_UPLOAD_MAX_MB` caps one upload (default
-//!   tied to the source fetch cap, 10 MB), and
-//!   `CRABCROP_UPLOAD_ALLOW_OVERWRITE` (off by default)
-//!   lets a PUT replace an existing object.
-//! - `CRABCROP_ORT_DYLIB`: path to the ONNX Runtime shared
-//!   library, when it is not on the loader's search path.
-//! - `CRABCROP_VIDEO_ENCODER`: path to an external video
-//!   encoder program (FFmpeg is the reference) that
-//!   `format(mp4)` / `format(webm)` output runs under the
-//!   fixed pipe contract (frames in as rawvideo on stdin,
-//!   video out on stdout). Validated at boot: a set but
-//!   unusable path is a startup error. Unset disables
-//!   video output (requests fail cleanly with 501).
-//!   `CRABCROP_VIDEO_TIMEOUT_SECS` bounds one external
-//!   video tool run (default 30, 1 to 600) and
-//!   `CRABCROP_VIDEO_MAX_MB` caps the encoder's output
-//!   (default 64, 1 to 1024).
-//! - `CRABCROP_VIDEO_DECODER`: path to an external video
-//!   decoder program (FFmpeg is the reference) that a
-//!   `frame:` segment on a video source extracts its
-//!   still through, under the fixed probe-and-extract
-//!   contract (source bytes in on stdin, one PNG frame
-//!   out on stdout). Validated at boot the same way.
-//!   Unset disables frame selection (requests fail
-//!   cleanly with 501).
-//! - `CRABCROP_PDF_RENDERER`: path to an external PDF
-//!   renderer program (Poppler's pdftocairo is the
-//!   reference) that a `page:` segment on a PDF source
-//!   renders its page through, under the fixed
-//!   probe-and-render contract (PDF bytes in on stdin,
-//!   one PNG page out on stdout; the probe side is the
-//!   derived `pdfinfo` sibling). Both validated at boot
-//!   the same way. Unset disables page selection
-//!   (requests fail cleanly with 501).
-//!   `CRABCROP_PDF_TIMEOUT_SECS` bounds one renderer
-//!   run (default 30, 1 to 600).
-//!   All three external tools share one contract rule:
-//!   a tool must not daemonize or detach (no `setsid`,
-//!   no double-fork). Timeouts kill the tool's process
-//!   group; a detached descendant escapes the kill and
-//!   is the operator's responsibility (issue #272).
-//! - `CRABCROP_C2PA_CERT` / `CRABCROP_C2PA_KEY`: paths
-//!   to a PEM certificate chain and its private key (in
-//!   PKCS#8 PEM form): the
-//!   C2PA signing identity for output provenance (issue
-//!   #173). Both or neither; a partial set is a startup
-//!   error. The identity is proven at boot with a
-//!   sign-and-verify round trip, and a broken one (a bare
-//!   self-signed certificate, a mismatched key, a chain
-//!   outside the C2PA certificate profile) is a startup
-//!   error, not a first-request surprise. When set,
-//!   still JPEG, PNG, WebP, and AVIF outputs are signed:
-//!   a source manifest rides into the output as a parent
-//!   ingredient (byte preservation through a transform is
-//!   impossible), and AI-edited outputs record the edit.
-//!   `CRABCROP_C2PA_TSA_URL` optionally names a timestamp
-//!   authority. Unset: outputs are unsigned, and meta
-//!   still reports the provenance a source carries. A
-//!   chain that does not reach the C2PA trust list signs
-//!   and validates but public verifiers show the output
-//!   as valid-not-trusted; reaching the trust list is the
-//!   operator's certificate choice, not a server setting.
-//! - `CRABCROP_METRICS_TOKEN`: bearer token the
-//!   `/metrics` endpoint requires (`Authorization:
-//!   Bearer <token>`). Unset closes the endpoint (it
-//!   answers 403): the exposition is operational data
-//!   and is never served unauthenticated (issue #270).
-//!   `/health` stays open; it discloses only liveness.
-//! - `CRABCROP_PROCESS_TIMEOUT_SECS`: per-request
-//!   processing deadline in seconds (default 30, 1 to
-//!   600). The engine checks it between operations and
-//!   frames and inside its chunked encode loops, and
-//!   chained work that runs past it aborts with a 504
-//!   (issues #260, #322). A single opaque encoder call
-//!   is never interrupted mid-flight, but it cannot
-//!   hold the server: at the deadline plus a two-second
-//!   grace the request answers 504 and releases every
-//!   processing gate it holds, and the detached work
-//!   aborts at the first deadline check after the call
-//!   returns.
-//! - `CRABCROP_SLOW_LANE_PERMITS`: size of the slow lane
-//!   (default 1, 1 to 64), the separately bounded permits
-//!   long-running work draws from instead of the stills
-//!   process gate (issue #324): animated WebP encodes
-//!   and the external-tool work behind the video gate
-//!   (video encodes, frame extraction, page renders).
-//!   A saturated slow lane sheds its own requests with a
-//!   503 after a 10 second wait and never slows or sheds
-//!   a still render. `/metrics` reports both lanes'
-//!   occupancy.
-//! - `PORT`: listen port, default 3000.
+//! Every environment variable is documented in
+//! `docs/configuration.md`, the single reference for
+//! configuration.
 
 #![forbid(unsafe_code)]
 
 // The modules live in the library target (`src/lib.rs`);
-// importing them at the crate root keeps every `crate::`
-// path in this file resolving as it did when they were
-// declared here.
+// importing them at the crate root lets every `crate::`
+// path in this file resolve to them.
 use crabcrop::{
     ai, cache, cli, engine, frames, loader, observe, pdf, provenance, quality, s3store, server,
     sigv4, storage, text, upload, url, video,
@@ -673,9 +389,9 @@ fn parse_env_value<T: std::str::FromStr>(
 /// Read a boolean environment variable, strictly: `1`,
 /// `true`, `yes`, `on` (any case) are true; `0`, `false`,
 /// `no`, `off` are false; anything else is a startup error
-/// naming the variable. The lenient reading this replaces
-/// (only `1` or `true` count) made a typo like `ture`
-/// silently false, which for a safety flag such as
+/// naming the variable. A lenient reading (only `1` or
+/// `true` count) would make a typo like `ture` silently
+/// false, which for a safety flag such as
 /// CRABCROP_BLOCK_PRIVATE_SOURCES is the unsafe direction.
 fn parse_bool(name: &str, default: bool) -> Result<bool, String> {
     parse_bool_value(name, env::var(name).ok(), default)
@@ -1738,12 +1454,6 @@ fn pdf_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String
     Ok(secs)
 }
 
-/// Build the PDF renderer (issue #215) from
-/// `CRABCROP_PDF_RENDERER`: the document-side
-/// counterpart of the frame extractor. Same boot rule:
-/// a set path that is not a usable renderer, or one
-/// whose `pdfinfo` sibling is missing, is fatal here,
-/// not on the first `page:` request.
 /// Build the C2PA output signer from the environment
 /// (issue #173): the `CRABCROP_C2PA_CERT` /
 /// `CRABCROP_C2PA_KEY` pair (a PEM certificate chain and
@@ -1790,6 +1500,12 @@ fn build_provenance_signer(
     }
 }
 
+/// Build the PDF renderer (issue #215) from
+/// `CRABCROP_PDF_RENDERER`: the document-side
+/// counterpart of the frame extractor. Same boot rule:
+/// a set path that is not a usable renderer, or one
+/// whose `pdfinfo` sibling is missing, is fatal here,
+/// not on the first `page:` request.
 fn build_pdf_renderer(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Arc<crate::pdf::PdfRenderer>>, String> {
@@ -2216,9 +1932,6 @@ fn build_declared_detectors(
     Ok(DeclaredDetectors { boxes, focal })
 }
 
-/// Build the CLIP tag provider from the environment, when
-/// configured: preloaded like every other model, with a
-/// broken configuration failing startup.
 /// A loaded tag provider plus the threshold its meta
 /// annotations compose with, and the embedding
 /// provider built from the same tagger (issue #172).
@@ -2228,6 +1941,9 @@ struct TaggerSetup {
     embeddings: Arc<dyn crate::ai::EmbeddingProvider>,
 }
 
+/// Build the CLIP tag provider from the environment, when
+/// configured: preloaded like every other model, with a
+/// broken configuration failing startup.
 fn build_tagger(
     ort_dylib: Option<&str>,
     get: impl Fn(&str) -> Option<String>,

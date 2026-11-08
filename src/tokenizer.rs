@@ -227,10 +227,11 @@ fn normalize(text: &str) -> String {
 /// contractions (`'s`, `'t`, `'re`, `'ve`, `'m`, `'ll`, `'d`)
 /// stand alone, letter runs group, each digit stands alone,
 /// punctuation runs group, and no piece carries a space.
-/// Issue #377 replaced lone whitespace pieces with a space
-/// prefix on the following piece (GPT-2's ` ?\p{L}+`), which
-/// CLIP's pattern does not have; both put a space token CLIP
-/// never trained on between every two words (issue #404).
+/// Neither lone whitespace pieces nor a space prefix on the
+/// following piece (GPT-2's ` ?\p{L}+`, which CLIP's pattern
+/// does not have) is right: both put a space token CLIP
+/// never trained on between every two words (issues #377,
+/// #404).
 fn pretokenize(text: &str) -> Vec<String> {
     const CONTRACTIONS: [&str; 7] = ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"];
     let chars: Vec<char> = text.chars().collect();

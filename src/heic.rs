@@ -1,10 +1,10 @@
 //! HEIC/HEIF source decoding (issue #163): the pure-Rust
 //! `oxideav-heif` container + `oxideav-h265` codec, compiled in
 //! unconditionally — no cargo feature, no configuration, no
-//! external tool. Decode speed is what it is (the evaluation's
-//! spike measured the stack at roughly 3.7x FFmpeg's wall time on
-//! large single-stream photos); Max accepted that trade for a
-//! decoder that ships in every artifact.
+//! external tool. Decode speed is what it is (measured at
+//! roughly 3.7x FFmpeg's wall time on large single-stream
+//! photos); the trade buys a decoder that ships in every
+//! artifact.
 //!
 //! The decoded pixels join the normal pipeline: this module
 //! returns the image with the EXIF orientation already applied
@@ -276,7 +276,7 @@ fn check_coded_geometry(
 /// Metadata the decoder hands back, held to the same size caps
 /// the JPEG/PNG extraction path applies (issue #184): the crate
 /// is built without its `deflate` feature, so a deflated
-/// metadata item can no longer inflate toward the crate's 1 GiB
+/// metadata item cannot inflate toward the crate's 1 GiB
 /// cap on every decode, and anything still oversized after
 /// decode is dropped rather than cloned into the pipeline.
 fn cap_metadata(bytes: Option<Vec<u8>>, cap: usize) -> Option<Vec<u8>> {
@@ -300,7 +300,7 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 /// metadata. Failures are the pipeline's decode class (a 502
 /// upstream), naming HEIC, never a panic: the decoder is pure
 /// Rust and its error surface on hostile input is errors, not
-/// aborts (320 mutants, zero panics, in the issue #163 spike).
+/// aborts (issue #163: 320 mutants, zero panics).
 pub(crate) fn decode_heic(bytes: &[u8]) -> Result<(DynamicImage, SourceMeta), EngineError> {
     // The budget is enforced on the declared and coded geometry
     // of everything the decode will touch before it starts;

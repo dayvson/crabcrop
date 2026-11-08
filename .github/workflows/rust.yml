@@ -40,6 +40,10 @@ jobs:
         run: python3 scripts/check_versions.py
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Check doc links
+        run: cargo doc --no-deps --document-private-items --locked --workspace
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
       - name: Build
         run: cargo build --locked --verbose
       - name: Run tests
