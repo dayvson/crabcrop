@@ -107,4 +107,7 @@ both SDKs must all pass.
 
 See RELEASING.md for the full choreography. The hard rule: never tag or
 publish a release unless main CI is fully green on the release head, the
-cargo audit job included.
+cargo audit job included. The release workflow's preflight job enforces
+the `rust.yml` part: a tag whose commit has no passing `rust.yml` push run
+on main stops before anything builds. It does not look at the other
+workflows that run on main, such as functional.yml; check those yourself.
