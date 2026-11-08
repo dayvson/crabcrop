@@ -84,7 +84,7 @@ One membership subtlety, mirrored on both sides: crabcrop groups accumulate (an 
 Run against your zone after setup:
 
 1. Request a signed image URL twice. The second response shows `cf-cache-status: HIT`, and the first carries crabcrop's own `cache-status` header naming the tier that served the origin fill.
-2. Request the same URL as meta (`Accept: application/json`). It is never a HIT on repeat: `private, no-store` is respected. With meta mode off (the default) the answer is `403 meta_disabled`, which carries the same `private, no-store`, so the check holds either way.
+2. Request the same URL as meta (`Accept: application/json`). It is never a HIT on repeat: `private, no-store` is respected. The meta check needs meta mode on (`CRABCROP_META_MODE=1`). With it off (the default), the answer is `403 meta_disabled`, an error status that the CDN's error-caching rules govern instead, so it shows nothing about how `private, no-store` is handled.
 3. Purge one URL in both layers, then request it: `cf-cache-status: MISS`, then HIT again on the next request.
 4. If you use the tag bridge: request a `preset:` URL, purge by its tag, and request it again. A MISS proves the tag landed.
 5. If you left formats unpinned, request one URL with an AVIF `Accept` header and then with a JPEG-only one. Identical bytes mean your variant split from step 3 is not in effect.

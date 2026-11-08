@@ -4,7 +4,7 @@
 
 Send `Accept: application/json` with any image URL to get metadata about the processed image instead of the image bytes.
 
-Meta mode is off by default: turn it on with `CRABCROP_META_MODE=1` (see [Configuration](configuration.md)). While it is off, a meta request answers `403 meta_disabled` before any fetch or render, and the same URL without the header serves the image as usual. Know the cost before you turn it on. Meta requests are never cached, so each one fetches the source, renders it, and runs every configured annotation model again. Concurrent identical meta requests share one run; one after another, each pays in full. Any viewer of a signed URL can send the header, so enable meta only where you use it.
+Meta mode is off by default: turn it on with `CRABCROP_META_MODE=1` (see [Configuration](configuration.md)). While it is off, a meta request answers `403 meta_disabled` before any fetch or render, and the same URL without the header serves the image as usual. Know the cost before you turn it on. Meta requests are never cached, so each one fetches the source, renders it, and runs the configured annotation models again: CLIP tags and the aesthetic score on every request, the others when the request opts in, and any caller can opt in to all of them. Concurrent identical meta requests share one run; one after another, each pays in full. Any viewer of a signed URL can send the header, so enable meta only where you use it.
 
 With meta mode on:
 

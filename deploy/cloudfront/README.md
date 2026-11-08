@@ -83,7 +83,7 @@ Origin Shield adds one regional caching layer between the edge locations and you
 Run against your distribution after setup:
 
 1. Request a signed image URL twice. The second response shows `x-cache: Hit from cloudfront`, and the first carries crabcrop's own `cache-status` header naming the tier that served the origin fill.
-2. Request the same URL as meta (`Accept: application/json`). It is never a Hit on repeat: `private, no-store` is respected, which also proves your minimum TTL is 0. With meta mode off (the default) the answer is `403 meta_disabled`, which carries the same `private, no-store`, so the check holds either way.
+2. Request the same URL as meta (`Accept: application/json`). It is never a Hit on repeat: `private, no-store` is respected, which also proves your minimum TTL is 0. The meta check needs meta mode on (`CRABCROP_META_MODE=1`). With it off (the default), the answer is `403 meta_disabled`, an error status that the CDN's error-caching rules govern instead, so it shows nothing about how `private, no-store` is handled.
 3. Invalidate one URL in both layers, then request it: `x-cache: Miss from cloudfront`, then a Hit again on the next request.
 4. If you use tag invalidation: request a `preset:` URL, invalidate `#<name>`, and request it again. A Miss proves the tags landed.
 5. If you left formats unpinned with the function attached, request one URL with a Chrome `Accept` header and then with a Safari one. Different bytes (AVIF versus the Safari-negotiated format) under the two spellings that mean the same thing prove the normalization is keying correctly; identical bytes across an AVIF and a JPEG-only `Accept` mean it is not.
