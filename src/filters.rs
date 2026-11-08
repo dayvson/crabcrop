@@ -2287,7 +2287,41 @@ fn redact_faces(
 /// than `tolerance` in any channel (alpha included). A fully
 /// uniform image is returned unchanged, never emptied.
 fn trim(img: DynamicImage, tolerance: u8) -> DynamicImage {
-    let rgba = img.to_rgba8();
+    let found = trim_box(&img, tolerance);
+    trim_to(img, found, [0; 4])
+}
+
+/// Per-side trim (issue #313): the tolerance pass runs
+/// first, exactly as `trim` alone, then the named pixel
+/// amounts come off the left, top, right, and bottom of
+/// what remains. The amounts clamp so one pixel always
+/// survives on each axis: the near side takes from the
+/// dimension first and the far side takes from what is
+/// left, so an oversized pair can never underflow or
+/// produce an empty image.
+fn trim_sides(img: DynamicImage, tolerance: u8, sides: [u32; 4]) -> DynamicImage {
+    let found = trim_box(&img, tolerance);
+    trim_to(img, found, sides)
+}
+
+/// The box [`trim`]'s tolerance pass keeps, as (left, top,
+/// width, height): the bounding box of the pixels that differ
+/// from the top-left corner color by more than `tolerance` in
+/// any channel (alpha included), or `None` when no pixel
+/// does. The engine unions these boxes across the frames of
+/// an animation, so every frame takes one cut (issue #465).
+pub(crate) fn trim_box(img: &DynamicImage, tolerance: u8) -> Option<(u32, u32, u32, u32)> {
+    let converted;
+    let rgba = match img.as_rgba8() {
+        Some(rgba) => rgba,
+        None => {
+            converted = img.to_rgba8();
+            &converted
+        }
+    };
+    if rgba.width() == 0 || rgba.height() == 0 {
+        return None;
+    }
     let corner = *rgba.get_pixel(0, 0);
     let tol = tolerance as i32;
     let differs =
@@ -2304,35 +2338,44 @@ fn trim(img: DynamicImage, tolerance: u8) -> DynamicImage {
             max_y = max_y.max(y);
         }
     }
-    if !found {
-        return img;
-    }
-    DynamicImage::ImageRgba8(
-        image::imageops::crop_imm(&rgba, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
-            .to_image(),
-    )
+    found.then(|| (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
 }
 
-/// Per-side trim (issue #313): the tolerance pass runs
-/// first, exactly as `trim` alone, then the named pixel
-/// amounts come off the left, top, right, and bottom of
-/// what remains. The amounts clamp so one pixel always
-/// survives on each axis: the near side takes from the
-/// dimension first and the far side takes from what is
-/// left, so an oversized pair can never underflow or
-/// produce an empty image.
-fn trim_sides(img: DynamicImage, tolerance: u8, sides: [u32; 4]) -> DynamicImage {
-    let img = trim(img, tolerance);
-    let (w, h) = (img.width(), img.height());
+/// The window a trim keeps of a `w` x `h` frame, as (left,
+/// top, width, height): the tolerance box (`None` is the
+/// whole frame) less the `sides` pixels off its left, top,
+/// right, and bottom, clamped the way [`trim_sides`]
+/// describes.
+pub(crate) fn trim_window(
+    (w, h): (u32, u32),
+    found: Option<(u32, u32, u32, u32)>,
+    sides: [u32; 4],
+) -> (u32, u32, u32, u32) {
+    let (x, y, bw, bh) = found.unwrap_or((0, 0, w, h));
     let [left, top, right, bottom] = sides;
-    let left = left.min(w - 1);
-    let right = right.min(w - 1 - left);
-    let top = top.min(h - 1);
-    let bottom = bottom.min(h - 1 - top);
-    if left == 0 && top == 0 && right == 0 && bottom == 0 {
-        return img;
+    let left = left.min(bw.saturating_sub(1));
+    let right = right.min(bw.saturating_sub(1) - left);
+    let top = top.min(bh.saturating_sub(1));
+    let bottom = bottom.min(bh.saturating_sub(1) - top);
+    (x + left, y + top, bw - left - right, bh - top - bottom)
+}
+
+/// Cut `img` to its [`trim_window`]. A cut through a found
+/// box comes back as RGBA; with no box and no sides to shave
+/// the image comes back untouched, pixel type and all.
+pub(crate) fn trim_to(
+    img: DynamicImage,
+    found: Option<(u32, u32, u32, u32)>,
+    sides: [u32; 4],
+) -> DynamicImage {
+    let (x, y, w, h) = trim_window((img.width(), img.height()), found, sides);
+    if found.is_some() {
+        DynamicImage::ImageRgba8(img.crop_imm(x, y, w, h).to_rgba8())
+    } else if (x, y, w, h) == (0, 0, img.width(), img.height()) {
+        img
+    } else {
+        img.crop_imm(x, y, w, h)
     }
-    img.crop_imm(left, top, w - left - right, h - top - bottom)
 }
 
 /// Scale each pixel's distance from its luma by `amount`:
@@ -4518,6 +4561,42 @@ mod tests {
             &[Filter::TrimSides(0, [19, 0, 19, 0])],
         );
         assert_eq!((img.width(), img.height()), (1, 14));
+    }
+
+    #[test]
+    fn trim_window_shaves_the_sides_off_the_found_box() {
+        // The window the engine maps the focal forms through
+        // and shares across animation frames (issue #465) is
+        // the window the filter itself cuts.
+        let img = bordered([255, 255, 255], [255, 0, 0]);
+        let found = trim_box(&img, 0);
+        let window = trim_window((img.width(), img.height()), found, [5, 2, 5, 2]);
+        let (cut, _) = apply_filters(img.clone(), &[Filter::TrimSides(0, [5, 2, 5, 2])]);
+        assert_eq!((window.2, window.3), (cut.width(), cut.height()));
+        let (x, y, w, h) = window;
+        assert_eq!(
+            img.crop_imm(x, y, w, h).to_rgba8().as_raw(),
+            cut.to_rgba8().as_raw()
+        );
+        // No box: the sides come off the whole frame, and a
+        // frame with nothing to cut comes back untouched.
+        assert_eq!(trim_window((10, 8), None, [1, 1, 1, 1]), (1, 1, 8, 6));
+        assert_eq!(trim_window((10, 8), None, [0; 4]), (0, 0, 10, 8));
+    }
+
+    #[test]
+    fn trim_survives_degenerate_frames() {
+        // A zero-sized frame has no corner to compare with:
+        // no box, and the cut leaves it as it is instead of
+        // indexing a pixel that is not there.
+        let empty = DynamicImage::new_rgba8(0, 0);
+        assert_eq!(trim_box(&empty, 10), None);
+        let out = trim_to(empty, None, [3, 3, 3, 3]);
+        assert_eq!((out.width(), out.height()), (0, 0));
+        // A one-pixel frame keeps its pixel whatever the sides.
+        let dot = DynamicImage::new_rgba8(1, 1);
+        let out = trim_to(dot, None, [u32::MAX; 4]);
+        assert_eq!((out.width(), out.height()), (1, 1));
     }
 
     fn detection(x: u32, y: u32, w: u32, h: u32) -> crate::ai::Detection {

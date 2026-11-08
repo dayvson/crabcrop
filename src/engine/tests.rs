@@ -2338,6 +2338,258 @@ fn focal_point_without_a_crop_is_a_no_op() {
     assert_eq!(with_point.bytes, plain.bytes);
 }
 
+/// `w` x `h` with `n` equal vertical stripes, stripe `i` the
+/// gray `20 + 10 * i`: no stripe is black (the pad fill) or
+/// white (a trim border), and every stripe tells itself
+/// apart from its neighbors.
+fn stripes(w: u32, h: u32, n: u32) -> DynamicImage {
+    DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, _| {
+        let v = (20 + 10 * (x * n / w)) as u8;
+        image::Rgb([v, v, v])
+    }))
+}
+
+/// Which stripe of [`stripes`] the output pixel shows.
+fn stripe_at(img: &DynamicImage, x: u32, y: u32) -> i32 {
+    let v = img.to_rgb8().get_pixel(x, y)[0] as i32;
+    ((v - 20) as f32 / 10.0).round() as i32
+}
+
+#[test]
+fn focal_rect_follows_a_resize_to_its_crop() {
+    // Issue #465: the rectangle names stripe 6 of a
+    // 2000x1000 source of 100 px stripes. A resize between
+    // the segment and the crop left it in source
+    // coordinates, which the crop re-clamped onto the
+    // 500 px frame's right edge: the window centered on the
+    // stripe 14/15 boundary. The rectangle now scales with
+    // the image, so all three spellings agree on stripe 6.
+    let src = stripes(2000, 1000, 20);
+    let width_500 = size_op(Dimension::Pixels(500), Dimension::Proportional);
+    let spellings: [Vec<Operation>; 3] = [
+        vec![
+            focal_op(600, 0, 700, 100),
+            width_500.clone(),
+            crop_op(100, 100, Align::Center),
+        ],
+        vec![focal_op(600, 0, 700, 100), crop_op(100, 100, Align::Center)],
+        vec![
+            width_500,
+            focal_op(150, 0, 175, 25),
+            crop_op(100, 100, Align::Center),
+        ],
+    ];
+    for ops in &spellings {
+        let out = run_chain(&src, ops);
+        assert_eq!((out.width(), out.height()), (100, 100));
+        assert_eq!(stripe_at(&out, 50, 50), 6, "{ops:?}");
+    }
+}
+
+#[test]
+fn focal_point_follows_a_crop_rect_to_its_crop() {
+    // Issue #465: the point names stripe 12 (x 1200 of
+    // 2000). The crop-rect keeps x 1000..2000, where the
+    // stale fraction 0.6 lands on x 1600 instead, so the
+    // window centered near stripe 16. The point now moves
+    // with the cut: x 200 of the 1000 px frame, a window
+    // clamped to the frame's left edge, and stripe 12 at the
+    // output's center.
+    let src = stripes(2000, 1000, 20);
+    let ops = [
+        point_op(0.6, 0.5, 1.0),
+        rect_op(1000, 0, 2000, 500),
+        crop_op(100, 100, Align::Center),
+    ];
+    let out = run_chain(&src, &ops);
+    assert_eq!(stripe_at(&out, 50, 50), 12);
+    // The window starts at the cut's left edge (stripe 10),
+    // where the stale fraction's window started at stripe 13.
+    assert_eq!(stripe_at(&out, 5, 50), 10);
+}
+
+#[test]
+fn focal_forms_follow_a_flip_a_pad_and_a_trim() {
+    // 200x100, 10 px stripes: the rectangle names stripe 6.
+    let src = stripes(200, 100, 20);
+    let rect = || focal_op(60, 0, 70, 10);
+    let crop = || crop_op(100, 100, Align::Center);
+    // A resize flip mirrors the frame: stripe 6 now sits at
+    // x 130..140, and the rectangle goes with it.
+    let flipped = Operation::Size(ImageSize {
+        width: Dimension::Pixels(200),
+        height: Dimension::Pixels(100),
+        flip_horizontal: true,
+        flip_vertical: false,
+    });
+    let out = run_chain(&src, &[rect(), flipped, crop()]);
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+    // A pad sets the frame 100 px into a 400 px canvas; the
+    // stale rectangle centered the window on black fill, the
+    // stale point on stripe 3.
+    let out = run_chain(
+        &src,
+        &[rect(), pad_op(400, 100, PadFill::Directive), crop()],
+    );
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+    let out = run_chain(
+        &src,
+        &[
+            point_op(0.325, 0.5, 1.0),
+            pad_op(400, 100, PadFill::Directive),
+            crop(),
+        ],
+    );
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+    // A trim cuts a 10 px white border away: the rectangle,
+    // named on the bordered frame, moves with the cut (the
+    // stale one landed on stripe 7).
+    let mut bordered = image::RgbImage::from_pixel(220, 120, image::Rgb([255, 255, 255]));
+    image::imageops::overlay(&mut bordered, &src.to_rgb8(), 10, 10);
+    let bordered = DynamicImage::ImageRgb8(bordered);
+    let out = run_chain(
+        &bordered,
+        &[
+            focal_op(70, 10, 80, 20),
+            Operation::Filters(vec![Filter::Trim(10)]),
+            crop(),
+        ],
+    );
+    assert_eq!((out.width(), out.height()), (100, 100));
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+}
+
+#[test]
+fn focal_forms_survive_filters_that_paint_in_place_and_drop_on_ones_that_move() {
+    let src = stripes(200, 100, 20);
+    let crop = || crop_op(100, 100, Align::Center);
+    // A border paints over the frame without moving it: the
+    // rectangle still steers the crop.
+    let out = run_chain(
+        &src,
+        &[
+            focal_op(60, 0, 70, 10),
+            Operation::Filters(vec![Filter::Border(2, [255, 0, 0])]),
+            crop(),
+        ],
+    );
+    assert_eq!(stripe_at(&out, 50, 50), 6);
+    // A rotation moves every pixel in a way the chain does
+    // not track: the form drops, and the crop is the plain
+    // center crop of the rotated frame.
+    let rotate = || Operation::Filters(vec![Filter::Rotate(180.0)]);
+    let plain = run_chain(&src, &[rotate(), crop()]);
+    for focal in [focal_op(60, 0, 70, 10), point_op(0.3, 0.5, 1.0)] {
+        let out = run_chain(&src, &[focal, rotate(), crop()]);
+        assert_eq!(out.to_rgb8().as_raw(), plain.to_rgb8().as_raw());
+    }
+}
+
+#[test]
+fn focal_forms_survive_hostile_geometry() {
+    // Rectangles and points cut away by a crop-rect, pushed
+    // through one-pixel frames, flips and pads, never panic
+    // and never leave the frame: the crop always cuts a
+    // window of the requested size.
+    let src = stripes(200, 100, 20);
+    let focals = [
+        focal_op(0, 0, 1, 1),
+        focal_op(190, 90, 200, 100),
+        focal_op(0, 0, 200, 100),
+        point_op(0.0, 0.0, 1.0),
+        point_op(1.0, 1.0, 100.0),
+        point_op(0.5, 0.5, 0.01),
+    ];
+    let steps = [
+        rect_op(100, 50, 101, 51),
+        rect_op(0, 0, 50, 100),
+        rect_op(150, 0, 200, 100),
+        size_op(Dimension::Pixels(1), Dimension::Pixels(1)),
+        size_op(Dimension::Pixels(3), Dimension::Pixels(700)),
+        Operation::Size(ImageSize {
+            width: Dimension::Pixels(17),
+            height: Dimension::Pixels(5),
+            flip_horizontal: true,
+            flip_vertical: true,
+        }),
+        Operation::FitIn {
+            size: ImageSize {
+                width: Dimension::Pixels(1),
+                height: Dimension::Proportional,
+                flip_horizontal: false,
+                flip_vertical: false,
+            },
+            adaptive: false,
+        },
+        pad_op(1, 900, PadFill::Directive),
+        Operation::Filters(vec![Filter::TrimSides(0, [u32::MAX; 4])]),
+    ];
+    let ctx = ProcessContext::default();
+    for focal in &focals {
+        for step in &steps {
+            for second in &steps {
+                let ops = [
+                    focal.clone(),
+                    step.clone(),
+                    second.clone(),
+                    crop_op(7, 3, Align::Smart),
+                ];
+                let directives = crate::url::RequestDirectives::analyze(&ops);
+                // A crop-rect past a frame an earlier step
+                // shrank is the usual 400, never a panic.
+                match apply_operations(src.clone(), &ops, None, 1.0, &ctx, &directives, None) {
+                    Ok((out, ..)) => assert_eq!((out.width(), out.height()), (7, 3), "{ops:?}"),
+                    Err(err) => assert!(
+                        matches!(&err, EngineError::Unsupported(msg) if msg.contains("crop-rect")),
+                        "{ops:?}: {err:?}"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pending_focal_maps_through_each_step() {
+    // The geometry behind the crop tests, exactly.
+    let rect = PendingFocal::rect((60, 10, 70, 30), (200, 100));
+    assert_eq!(
+        rect.scaled((100, 50), false, false).resolve((100, 50)),
+        Focal::Rect((30, 5, 35, 15))
+    );
+    assert_eq!(
+        rect.scaled((200, 100), true, true).resolve((200, 100)),
+        Focal::Rect((130, 70, 140, 90))
+    );
+    // A cut keeps the part inside; a rectangle cut away
+    // entirely lands on the nearest edge.
+    assert_eq!(
+        rect.cropped((65, 0, 100, 100)).resolve((100, 100)),
+        Focal::Rect((0, 10, 5, 30))
+    );
+    assert_eq!(
+        rect.cropped((100, 0, 100, 100)).resolve((100, 100)),
+        Focal::Rect((0, 10, 0, 30))
+    );
+    assert_eq!(
+        rect.placed((100, 0, 200, 100), (400, 100))
+            .resolve((400, 100)),
+        Focal::Rect((160, 10, 170, 30))
+    );
+    // A point comes back as fractions of the frame in hand,
+    // exactly as named when nothing moved it.
+    let point = PendingFocal::point((0.6, 0.5, 2.0), (2000, 1000));
+    assert_eq!(point.resolve((2000, 1000)), Focal::Point((0.6, 0.5, 2.0)));
+    // 0.6 is not exact in f32, so the moved point is
+    // checked to within a rounding step.
+    let Focal::Point((x, y, zoom)) = point.cropped((1000, 0, 1000, 500)).resolve((1000, 500))
+    else {
+        panic!("a point resolves to a point");
+    };
+    assert!((x - 0.2).abs() < 1e-6, "{x}");
+    assert_eq!((y, zoom), (1.0, 2.0));
+}
+
 fn crop_op(w: u32, h: u32, align: Align) -> Operation {
     Operation::Crop {
         size: ImageSize {
@@ -4142,6 +4394,218 @@ fn animated_smart_crop_uses_one_window_for_every_frame() {
     assert!(center(&frames[0]) > 200, "frame one keeps its bright half");
     assert!(center(&frames[1]) < 55, "frame two replays the same window");
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// 64x64 white frames, each holding one black square given
+/// as (left, top, side); a side of 0 leaves the frame white.
+fn square_frames(squares: &[(u32, u32, u32)]) -> Vec<image::Frame> {
+    squares
+        .iter()
+        .map(|&(x, y, side)| {
+            let img = image::RgbaImage::from_fn(64, 64, |px, py| {
+                if (x..x + side).contains(&px) && (y..y + side).contains(&py) {
+                    image::Rgba([0, 0, 0, 255])
+                } else {
+                    image::Rgba([255, 255, 255, 255])
+                }
+            });
+            image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(100, 1))
+        })
+        .collect()
+}
+
+fn square_gif(squares: &[(u32, u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::codecs::gif::GifEncoder::new(&mut out)
+        .encode_frames(square_frames(squares))
+        .unwrap();
+    out
+}
+
+fn square_webp(squares: &[(u32, u32, u32)]) -> Vec<u8> {
+    let frames: Vec<_> = square_frames(squares)
+        .into_iter()
+        .map(|f| {
+            let buffer = f.into_buffer();
+            let image = oxideav_webp::WebpImage::from_rgba8(64, 64, buffer.into_raw()).unwrap();
+            oxideav_webp::Frame::new(image, Some(std::time::Duration::from_millis(100)))
+        })
+        .collect();
+    let opts = oxideav_webp::EncodeOptions::default()
+        .with_frame_mode(oxideav_webp::AnimFrameMode::Lossless);
+    oxideav_webp::encode_animation(&frames, &opts).unwrap()
+}
+
+/// A GIF frame's rectangle as (left, top, width, height).
+type GifRect = (u16, u16, u16, u16);
+
+/// A GIF's logical screen and each frame's rectangle, read
+/// from the file itself: the image crate's decoder
+/// composites every frame onto the screen and hides both.
+fn gif_layout(bytes: &[u8]) -> ((u16, u16), Vec<GifRect>) {
+    let mut options = gif::DecodeOptions::new();
+    options.skip_frame_decoding(true);
+    let mut decoder = options.read_info(bytes).unwrap();
+    let screen = (decoder.width(), decoder.height());
+    let mut frames = Vec::new();
+    while let Some(frame) = decoder.next_frame_info().unwrap() {
+        frames.push((frame.left, frame.top, frame.width, frame.height));
+    }
+    (screen, frames)
+}
+
+fn trim_to(format: ImageFormat, mut filters: Vec<Filter>) -> Vec<Operation> {
+    filters.push(Filter::Format(FormatSpec::plain(format)));
+    vec![Operation::Filters(filters)]
+}
+
+fn luma_at(frame: &image::Frame, x: u32, y: u32) -> u8 {
+    frame.buffer().get_pixel(x, y).0[0]
+}
+
+#[test]
+fn animated_trim_cuts_one_window_for_every_frame() {
+    // Issue #465: trim decided per frame, so frames whose
+    // content shrank came out at 60, 44, and 24 px, all
+    // pushed at 0,0 on a 60x60 screen taken from the first.
+    // The frames now share one cut, the union of their
+    // boxes: every frame fills the screen, and each square
+    // stays where it was relative to the others.
+    let engine = Engine;
+    let shrinking = [(2, 2, 60), (10, 10, 44), (20, 20, 24)];
+    let out = engine
+        .process(
+            &square_gif(&shrinking),
+            &trim_to(ImageFormat::Gif, vec![Filter::Trim(10)]),
+        )
+        .unwrap();
+    assert_eq!((out.width, out.height), (60, 60));
+    let (screen, rects) = gif_layout(&out.bytes);
+    assert_eq!(screen, (60, 60));
+    assert_eq!(rects, vec![(0, 0, 60, 60); 3]);
+    let frames = decoded_gif_frames(&out.bytes);
+    assert_eq!(luma_at(&frames[0], 0, 0), 0);
+    // The 44 px square sat at 10 of 64; the cut starts at 2.
+    assert_eq!(luma_at(&frames[1], 8, 8), 0);
+    assert_eq!(luma_at(&frames[1], 7, 7), 255);
+    assert_eq!(luma_at(&frames[1], 51, 51), 0);
+    assert_eq!(luma_at(&frames[1], 52, 52), 255);
+    assert_eq!(luma_at(&frames[2], 18, 18), 0);
+    assert_eq!(luma_at(&frames[2], 17, 17), 255);
+    // Later frames that trim larger set the canvas too: the
+    // screen once came from the first frame's 40 px, and
+    // the 60 and 63 px frames spilled past it.
+    let growing = [(12, 12, 40), (2, 2, 60), (1, 1, 63)];
+    let out = engine
+        .process(
+            &square_gif(&growing),
+            &trim_to(ImageFormat::Gif, vec![Filter::Trim(10)]),
+        )
+        .unwrap();
+    let (screen, rects) = gif_layout(&out.bytes);
+    assert_eq!(screen, (63, 63));
+    assert_eq!(rects, vec![(0, 0, 63, 63); 3]);
+    let frames = decoded_gif_frames(&out.bytes);
+    assert_eq!(luma_at(&frames[0], 11, 11), 0);
+    assert_eq!(luma_at(&frames[0], 10, 10), 255);
+}
+
+#[test]
+fn animated_trim_to_webp_and_video_shares_one_canvas() {
+    // Issue #465: the animated WebP encoder refused frames
+    // of different sizes, a 500 for any trimmed animation
+    // whose content moved; the video plan refused them with
+    // a 400. One cut gives every frame the same canvas.
+    let engine = Engine;
+    let shrinking = [(2, 2, 60), (10, 10, 44), (20, 20, 24)];
+    for src in [square_gif(&shrinking), square_webp(&shrinking)] {
+        let out = engine
+            .process(&src, &trim_to(ImageFormat::WebP, vec![Filter::Trim(10)]))
+            .unwrap();
+        assert_eq!(out.format, ImageFormat::WebP);
+        assert_eq!((out.width, out.height), (60, 60));
+        let frames = decoded_webp_frames(&out.bytes);
+        assert_eq!(frames.len(), 3);
+        for frame in &frames {
+            assert_eq!(frame.buffer().dimensions(), (60, 60));
+        }
+        // Lossy, so the squares are checked by band.
+        assert!(luma_at(&frames[1], 20, 20) < 60);
+        assert!(luma_at(&frames[1], 3, 3) > 200);
+        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let out = engine
+            .process_preferred(
+                &src,
+                &trim_to(ImageFormat::Mp4, vec![Filter::Trim(10)]),
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.bytes, b"ENGINE-VIDEO");
+        assert_eq!((out.width, out.height), (60, 60));
+    }
+}
+
+#[test]
+fn animated_trim_survives_hostile_frames() {
+    // Whatever the frames hold and however the chain trims
+    // them, every frame lands on the one screen.
+    let engine = Engine;
+    let one_canvas = |squares: &[(u32, u32, u32)], ops: &[Operation]| {
+        let out = engine.process(&square_gif(squares), ops).unwrap();
+        let (screen, rects) = gif_layout(&out.bytes);
+        assert_eq!(rects.len(), squares.len(), "{ops:?}");
+        for rect in &rects {
+            assert_eq!(*rect, (0, 0, screen.0, screen.1), "{ops:?}");
+        }
+        (screen.0 as u32, screen.1 as u32)
+    };
+    let trim = |filters: Vec<Filter>| trim_to(ImageFormat::Gif, filters);
+    // A blank frame has no box of its own: it takes the
+    // others' cut instead of keeping its whole 64x64.
+    let with_blank = [(2, 2, 60), (0, 0, 0), (20, 20, 24)];
+    assert_eq!(
+        one_canvas(&with_blank, &trim(vec![Filter::Trim(10)])),
+        (60, 60)
+    );
+    // Nothing to cut in any frame: nothing is cut.
+    let blank = [(0, 0, 0), (0, 0, 0)];
+    assert_eq!(one_canvas(&blank, &trim(vec![Filter::Trim(10)])), (64, 64));
+    // Sides past the box clamp to one pixel, in every frame.
+    let shrinking = [(2, 2, 60), (10, 10, 44), (20, 20, 24)];
+    assert_eq!(
+        one_canvas(
+            &shrinking,
+            &trim(vec![Filter::TrimSides(10, [u32::MAX; 4])])
+        ),
+        (1, 1)
+    );
+    // Trims chained around other geometry, a later trim
+    // surveyed on frames the earlier one already cut, and a
+    // shared smart crop after them.
+    let chained = [
+        rect_op(0, 0, 64, 40),
+        Operation::Filters(vec![Filter::Trim(10), Filter::Rotate(90.0)]),
+        size_op(Dimension::Pixels(30), Dimension::Proportional),
+        Operation::Filters(vec![Filter::TrimSides(0, [1, 0, 0, 2]), Filter::Trim(250)]),
+        crop_op(9, 7, Align::Smart),
+        Operation::Filters(vec![Filter::Format(FormatSpec::plain(ImageFormat::Gif))]),
+    ];
+    assert_eq!(one_canvas(&shrinking, &chained), (9, 7));
+    // The render's deadline bounds the survey too.
+    let err = engine
+        .process_preferred(
+            &square_gif(&shrinking),
+            &trim(vec![Filter::Trim(10)]),
+            ProcessContext {
+                deadline: Some(std::time::Instant::now()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Timeout), "{err:?}");
 }
 
 #[test]

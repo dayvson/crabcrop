@@ -48,7 +48,7 @@ Details an encoder setup has to match:
 | Encoder exits nonzero, produces nothing, exceeds the cap, or times out | `502`: `video encoding failed` (the cause, including the encoder's stderr excerpt, is in the server log) |
 | Encode queue full (both slots busy past a 10 s wait) | `503` |
 
-Video results cache like any other response, under the video content type (`video/mp4` or `video/webm`), and every operation in the URL (resize, crop, filters) applies per frame before the encode. A meta request (`Accept: application/json`) on a video URL answers `400`: meta describes images, and a video result is not one.
+Video results cache like any other response, under the video content type (`video/mp4` or `video/webm`), and every operation in the URL (resize, crop, filters) applies per frame before the encode; a `trim` cuts one window shared by every frame, so the encoder gets one frame size. A meta request (`Accept: application/json`) on a video URL answers `400`: meta describes images, and a video result is not one.
 
 ## Video frames
 
