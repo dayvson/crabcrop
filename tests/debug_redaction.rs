@@ -20,12 +20,9 @@ use crabcrop::storage::DiskStore;
 use crabcrop::upload::UploadStore;
 use crabcrop::url::{Keyring, entry_key};
 
-// The library's test helpers are not visible to an
-// integration test: its scratch directories come in by
-// path. Not every item is used here.
+// Not every shared item is used here.
 #[allow(dead_code)]
-#[path = "../src/test_support/scratch.rs"]
-mod test_support;
+mod common;
 
 const CURRENT_KEY: &str = "current-signing-key-0123456789";
 const PREVIOUS_KEY: &str = "previous-signing-key-9876543210";
@@ -210,7 +207,7 @@ fn state(dir: &std::path::Path) -> AppState {
 
 #[test]
 fn debug_output_names_each_secret_holder_without_its_secrets() {
-    let dir = test_support::scratch_dir("debug-redaction");
+    let dir = common::scratch_dir("debug-redaction");
 
     // The detector itself: what a derived `Debug` prints
     // for each secret, compact or pretty, is caught.

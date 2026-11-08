@@ -80,10 +80,18 @@ A test that writes files makes them in a directory of its own from
 `crate::test_support::scratch_dir(tag)`: it starts empty under
 `std::env::temp_dir()` and is removed when dropped. The binary's unit tests
 and `tests/*.rs` cannot see the library's test modules, so they include the
-same file, `src/test_support/scratch.rs`, with `#[path]`. Never build a temp
-name from the process ID alone: IDs repeat, and a later run inherits what an
-earlier one left (issue #526). Quote a path you splice into a fake tool's
-script (`>> '{}'`), so a temp dir with a space in it still works.
+same file, `src/test_support/scratch.rs`, with `#[path]`: the binary's tests
+directly, and `tests/*.rs` through the module they share, `tests/common`
+(`common::scratch_dir`). Never build a temp name from the process ID alone:
+IDs repeat, and a later run inherits what an earlier one left (issue #526).
+Quote a path you splice into a fake tool's script (`>> '{}'`), so a temp dir
+with a space in it still works.
+
+An integration test that boots the server starts it with `common::serve`,
+which runs the binary with `PORT=0` and returns the port its listening line
+names. Never pick a free port in the test and hand it to the server: another
+process can take it before the server binds, or another test's server can
+answer on it (issue #536).
 
 ## Code style
 

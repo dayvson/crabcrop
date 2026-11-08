@@ -12,6 +12,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The TypeScript SDK's `explainUrl` and `ops.cropObjects`, and the playground's explainer, fold repeated `objects(...)` class names ASCII-only, as the server does (issue #482). `É` and `é` (or `K` and the Kelvin sign) are two classes, so a list that reaches 33 distinct classes that way is now refused instead of passing the SDK and failing on the server with `400 invalid_crop`, and a shorter list keeps both spellings, as the server's canonical form does. The playground's explainer is now a generated build of the SDK's own, so its `studio(...)` description matches the SDK's.
 
+- The boot line `crabcrop listening on port N` names the port the server bound (issue #536). It printed the configured port, so `PORT=0`, which binds a free port, printed port 0; it now prints the port the system picked. For a fixed port the line is unchanged.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added

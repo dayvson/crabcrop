@@ -7,81 +7,79 @@
 //! and this pins that the wiring between them serves.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::net::TcpStream;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-// The library's test helpers are not visible to an
-// integration test: its scratch directories come in by
-// path. Not every item is used here.
+// Not every shared item is used here.
 #[allow(dead_code)]
-#[path = "../src/test_support/scratch.rs"]
-mod test_support;
+mod common;
 
-/// Kill the child on drop, so a failed assert cannot
-/// leak a listening server into later runs.
-struct ServerGuard(Child);
+use common::ServerGuard;
 
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// An ephemeral port, released before the server binds:
-/// the small race is the standard one, and the deadline
-/// loop below absorbs a lost race only by failing loudly.
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// One HTTP/1.0 GET on `port`, with `headers` (each line
+/// ending in CRLF): the response's status line.
+fn status_line(port: u16, path: &str, headers: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{headers}\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    response.lines().next().unwrap_or("").to_string()
 }
 
 #[test]
 fn the_binary_boots_and_answers_health() {
-    let port = free_port();
-    let workdir = test_support::scratch_dir("boot-smoke");
-    let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
-        .current_dir(&workdir)
-        // A hermetic environment: only what boot needs, so
-        // no operator variable from the test shell can leak
-        // into the configuration under test.
-        .env_clear()
-        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-        .env("PORT", port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = ServerGuard(child);
+    let workdir = common::scratch_dir("boot-smoke");
+    let (_server, port, _) = common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .current_dir(&workdir)
+            // A hermetic environment: only what boot needs, so
+            // no operator variable from the test shell can leak
+            // into the configuration under test.
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .stderr(Stdio::null()),
+    );
+    let status = status_line(port, "/health", "");
+    assert!(status.contains("200"), "no 200 from /health: {status:?}");
+}
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut status_line = String::new();
-    while Instant::now() < deadline {
-        if let Some(status) = server.0.try_wait().unwrap() {
-            panic!("the binary exited before serving: {status}");
-        }
-        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            if stream
-                .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-                .is_ok()
-            {
-                let mut response = String::new();
-                if stream.read_to_string(&mut response).is_ok() && !response.is_empty() {
-                    status_line = response.lines().next().unwrap_or("").to_string();
-                    break;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+#[test]
+fn port_zero_binds_a_free_port_and_the_listening_line_names_it() {
+    // Issue #536: the listening line printed the configured
+    // port, so with PORT=0 it named port 0 while the server
+    // held another. It names the bound port now. The
+    // metrics token is this boot's own: a 200 for it on the
+    // named port comes from this server, never from another
+    // test's on a port the line got wrong.
+    let token = format!("boot-port-zero-{}", std::process::id());
+    let (_server, port, _) = common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            // What common::serve sets for every boot, spelled
+            // out because it is what this test is about.
+            .env("PORT", "0")
+            .env("CRABCROP_METRICS_TOKEN", &token)
+            .stderr(Stdio::null()),
+    );
+    assert_ne!(port, 0);
+    let status = status_line(
+        port,
+        "/metrics",
+        &format!("Authorization: Bearer {token}\r\n"),
+    );
     assert!(
-        status_line.contains("200"),
-        "no 200 from /health before the deadline; got status line {status_line:?}"
+        status.contains("200"),
+        "/metrics on port {port}: {status:?}"
     );
 }
 
@@ -94,26 +92,24 @@ fn an_unknown_dash_argument_exits_with_an_error_and_never_serves() {
     // server takes no arguments, so each of these must be
     // the CLI's error exit, with nothing ever listening.
     for arg in ["--verison", "-x", "--", "-", "--base", "--port=8080"] {
-        let port = free_port();
         let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
             .arg(arg)
             .env_clear()
             .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-            .env("PORT", port.to_string())
+            .env("PORT", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let mut process = ServerGuard(child);
 
-        // No probe of `port` here: the other tests in this
-        // file run in parallel, each binding a port that
-        // free_port released, so a connection to `port` can
-        // reach another test's server and fail this one for
-        // nothing. A binary that served would never exit, so
-        // the deadline catches it, and a server would print
-        // its listening line, which the empty stdout below
-        // rules out.
+        // No probe of a port here: with PORT=0 a server
+        // would hold a port only it names, and a probe of any
+        // other can reach another test's server and fail this
+        // one for nothing. A binary that served would never
+        // exit, so the deadline catches it, and a server
+        // would print its listening line, which the empty
+        // stdout below rules out.
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
             if let Some(status) = process.0.try_wait().unwrap() {
@@ -121,7 +117,7 @@ fn an_unknown_dash_argument_exits_with_an_error_and_never_serves() {
             }
             assert!(
                 Instant::now() < deadline,
-                "`crabcrop {arg}` did not exit before the deadline (it may be serving on port {port})"
+                "`crabcrop {arg}` did not exit before the deadline (it may be serving)"
             );
             std::thread::sleep(Duration::from_millis(50));
         };
@@ -183,82 +179,33 @@ fn boot_with_no_source_configuration_serves_health() {
     // (private-address blocking on) and answers health.
     // The posture lives in the fetch policy, not in a
     // boot gate.
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
-        .env_clear()
-        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-        .env("PORT", port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = ServerGuard(child);
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut status_line = String::new();
-    while Instant::now() < deadline {
-        if let Some(status) = server.0.try_wait().unwrap() {
-            panic!("the binary exited before serving: {status}");
-        }
-        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            if stream
-                .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-                .is_ok()
-            {
-                let mut response = String::new();
-                if stream.read_to_string(&mut response).is_ok() && !response.is_empty() {
-                    status_line = response.lines().next().unwrap_or("").to_string();
-                    break;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        status_line.contains("200"),
-        "no 200 from /health before the deadline; got status line {status_line:?}"
+    let (_server, port, _) = common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .stderr(Stdio::null()),
     );
+    let status = status_line(port, "/health", "");
+    assert!(status.contains("200"), "no 200 from /health: {status:?}");
 }
 
-/// Boot with a minimal environment plus `env`, wait for
+/// Boot with a minimal environment plus `env`, check
 /// `/health`, stop the server, and return what it wrote
 /// to stderr while booting.
 fn boot_stderr(env: &[(&str, &str)]) -> String {
-    let port = free_port();
     let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
     command
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-        .env("PORT", port.to_string())
-        .stdout(Stdio::null())
         .stderr(Stdio::piped());
     for (name, value) in env {
         command.env(name, value);
     }
-    let mut server = ServerGuard(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut healthy = false;
-    while Instant::now() < deadline && !healthy {
-        if let Some(status) = server.0.try_wait().unwrap() {
-            panic!("the binary exited before serving: {status}");
-        }
-        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut response = String::new();
-            healthy = stream
-                .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-                .is_ok()
-                && stream.read_to_string(&mut response).is_ok()
-                && response.lines().next().unwrap_or("").contains("200");
-        }
-        if !healthy {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    assert!(healthy, "no 200 from /health before the deadline");
+    let (mut server, port, _) = common::serve(&mut command);
+    let status = status_line(port, "/health", "");
+    assert!(status.contains("200"), "no 200 from /health: {status:?}");
     // Boot writes its warnings before it listens, so they
-    // are all in the pipe once health answers.
+    // are all in the pipe once the listening line is out.
     let _ = server.0.kill();
     let _ = server.0.wait();
     let mut stderr = String::new();
@@ -301,8 +248,8 @@ fn boot_warns_when_pinned_source_fetches_bypass_a_proxy() {
 /// A model file that exists, so a boot failure is about
 /// the runtime, never about a missing model, and the
 /// directory it lives in.
-fn configured_model() -> (test_support::ScratchDir, std::path::PathBuf) {
-    let dir = test_support::scratch_dir("boot-model");
+fn configured_model() -> (common::ScratchDir, std::path::PathBuf) {
+    let dir = common::scratch_dir("boot-model");
     let model = dir.join("model.onnx");
     std::fs::write(&model, b"not a real model").unwrap();
     (dir, model)
@@ -320,7 +267,7 @@ fn boot_with_a_model_but_no_loadable_runtime_fails_with_the_diagnostic() {
     let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-        .env("PORT", free_port().to_string())
+        .env("PORT", "0")
         .env("CRABCROP_REMOVEBG_MODEL", &model)
         .env("ORT_DYLIB_PATH", "/nonexistent/libonnxruntime.so")
         .output()
@@ -352,7 +299,7 @@ fn boot_with_a_model_but_no_runtime_anywhere_fails_with_the_diagnostic() {
     let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-        .env("PORT", free_port().to_string())
+        .env("PORT", "0")
         .env("CRABCROP_REMOVEBG_MODEL", &model)
         .output()
         .unwrap();
@@ -394,7 +341,7 @@ fn boot_refuses_default_operations_with_metadata_or_over_the_cap() {
         let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
             .env_clear()
             .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-            .env("PORT", free_port().to_string())
+            .env("PORT", "0")
             .env("CRABCROP_DEFAULT_OPS", defaults)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -452,14 +399,16 @@ fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
             .output()
             .unwrap()
     };
-    let dead_base = format!("http://127.0.0.1:{}", free_port());
+    // Port 0: nothing ever listens there (binding port 0
+    // picks another), so the connection is refused.
+    let dead_base = "http://127.0.0.1:0";
     let target = "50x50/http://127.0.0.1:9/src.png";
 
     // Unreachable server: the request error, reported.
     let out = run(&[
         "meta",
         "--base",
-        dead_base.as_str(),
+        dead_base,
         "--secret",
         "cli-smoke-secret",
         target,
@@ -470,7 +419,7 @@ fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
     assert!(stderr.contains("crabcrop: request failed"), "{stderr}");
 
     // No secret anywhere: purge refuses before any request.
-    let out = run(&["purge", "--base", dead_base.as_str(), target]);
+    let out = run(&["purge", "--base", dead_base, target]);
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -496,13 +445,13 @@ fn cli_verbs_fail_with_an_exit_code_and_the_error_on_stderr() {
 /// loader does.
 #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
 fn boot_without_ca_roots(vars: &[(&str, &str)]) -> std::process::Output {
-    let dir = test_support::scratch_dir("boot-no-roots");
+    let dir = common::scratch_dir("boot-no-roots");
     let bundle = dir.join("empty-ca.pem");
     std::fs::write(&bundle, b"").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
         .env_clear()
         .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-        .env("PORT", free_port().to_string())
+        .env("PORT", "0")
         .env("SSL_CERT_FILE", &bundle)
         .envs(vars.iter().copied())
         .output()

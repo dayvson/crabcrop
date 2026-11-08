@@ -984,6 +984,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    // The port the listener holds, which the listening line
+    // names: the configured one, or for PORT=0 the free port
+    // the kernel picked (issue #536).
+    let port = listener.local_addr()?.port();
 
     // AI models are configured, never downloaded, and preloaded
     // at boot: a model that is set but broken is a startup

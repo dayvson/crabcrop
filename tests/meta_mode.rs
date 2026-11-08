@@ -8,32 +8,16 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// Not every shared item is used here.
+#[allow(dead_code)]
+mod common;
 
 const SECRET: &str = "meta-mode-secret-0123456789";
-
-/// Kill the child on drop, so a failed assert cannot
-/// leak a listening server into later runs.
-struct ServerGuard(Child);
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// An ephemeral port, released before the server binds.
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// A local origin serving the portrait fixture to every
 /// GET, counting the requests it answers: the count is how
@@ -73,31 +57,18 @@ fn spawn_origin() -> (String, Arc<AtomicUsize>) {
 /// the port, the local origin allowed as a source, and the
 /// given extra variables. Nothing else from the test shell
 /// can reach the configuration under test.
-fn boot(extra: &[(&str, &str)]) -> (ServerGuard, u16) {
-    let port = free_port();
+fn boot(extra: &[(&str, &str)]) -> (common::ServerGuard, u16) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
     command
         .env_clear()
         .env("CRABCROP_SECRET", SECRET)
-        .env("PORT", port.to_string())
         .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
-        .stdout(Stdio::null())
         .stderr(Stdio::null());
     for (name, value) in extra {
         command.env(name, value);
     }
-    let mut server = ServerGuard(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if let Some(status) = server.0.try_wait().unwrap() {
-            panic!("the binary exited before serving: {status}");
-        }
-        if get(port, "/health", None).is_some_and(|r| r.status == 200) {
-            return (server, port);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("no 200 from /health before the deadline");
+    let (server, port, _) = common::serve(&mut command);
+    (server, port)
 }
 
 struct Reply {
@@ -240,7 +211,7 @@ fn an_invalid_meta_mode_is_a_startup_error() {
         let out = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
             .env_clear()
             .env("CRABCROP_SECRET", SECRET)
-            .env("PORT", free_port().to_string())
+            .env("PORT", "0")
             .env("CRABCROP_META_MODE", value)
             .output()
             .unwrap();

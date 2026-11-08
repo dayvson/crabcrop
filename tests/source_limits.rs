@@ -11,27 +11,12 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Kill the child on drop, so a failed assert cannot
-/// leak a listening server into later runs.
-struct ServerGuard(Child);
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+// Not every shared item is used here.
+#[allow(dead_code)]
+mod common;
 
 /// One raw HTTP/1.0 GET: (status, raw head, body).
 fn get(port: u16, path: &str, headers: &str) -> (u16, String, Vec<u8>) {
@@ -61,33 +46,20 @@ fn get(port: u16, path: &str, headers: &str) -> (u16, String, Vec<u8>) {
 
 /// Boot the binary in unsafe mode with an allowlist that
 /// admits the local origin, plus `env`.
-fn boot(env: &[(&str, &str)]) -> (ServerGuard, u16) {
-    let port = free_port();
+fn boot(env: &[(&str, &str)]) -> (common::ServerGuard, u16) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
     command
         .env_clear()
         .env("CRABCROP_SECRET", "source-limits-secret-0123456789")
-        .env("PORT", port.to_string())
         .env("CRABCROP_ALLOW_UNSAFE", "1")
         .env("CRABCROP_META_MODE", "1")
         .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
-        .stdout(Stdio::null())
         .stderr(Stdio::null());
     for (name, value) in env {
         command.env(name, value);
     }
-    let mut server = ServerGuard(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if let Some(status) = server.0.try_wait().unwrap() {
-            panic!("the binary exited before serving: {status}");
-        }
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() && get(port, "/health", "").0 == 200 {
-            return (server, port);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("no /health before the deadline");
+    let (server, port, _) = common::serve(&mut command);
+    (server, port)
 }
 
 /// An uncompressed RGB TIFF: `width * height * 3` bytes of
