@@ -1488,6 +1488,79 @@ fn fit_in_box_swap_decision() {
     assert_eq!(fit_in_box(&orig, 200, 400, true), orig);
 }
 
+/// A size side written as a multi-digit zero (`00x100`) parses
+/// as an exact zero: the spec vectors pin the spelling, so the
+/// parser keeps it. The engine refuses it with
+/// `unsupported_operation` (issue #464) on every route a size
+/// reaches it by: before, the resize handed the encoder a
+/// 0-wide image (a 500), and DPR scaling or fit-in rounded the
+/// zero up to a 1-pixel render nobody asked for.
+#[test]
+fn a_zero_pixel_side_is_refused_on_every_route() {
+    let engine = Engine;
+    let still = png_bytes(&gradient_image());
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="48" height="32"><rect width="48" height="32" fill="red"/></svg>"#;
+    let sources: [(&str, &[u8]); 3] = [
+        ("png", &still),
+        ("animated gif", &animated_gif_bytes()),
+        ("svg", svg),
+    ];
+    let refused = [
+        "00x100",
+        "100x00",
+        "00x00",
+        "00xorig",
+        "origx00",
+        "-00x-100",
+        "000000x100",
+        "00x100/filters:dpr(2)",
+        "100x00/filters:dpr(3)",
+        "fit-in:00x100",
+        "fit-in:100x00",
+        "fit-in:00x00",
+        "fit-in:00x100:adaptive",
+        "fit-in:00x100/filters:dpr(2)",
+        // A later valid size does not rescue the request.
+        "00x100/50x50",
+    ];
+    for (kind, src) in sources {
+        // The crop+resize fusion resolves the size against
+        // the window, through the same check. (An SVG source
+        // rasterizes at the first size's target, too small
+        // for the rectangle, which is its own refusal.)
+        let fused = (kind != "svg").then_some("crop-rect:0x0:24x16/00x10");
+        for remainder in refused.into_iter().chain(fused) {
+            let (ops, _) =
+                crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+            let err = engine
+                .process(src, &ops)
+                .expect_err(&format!("{kind} {remainder}"));
+            assert!(
+                matches!(err, EngineError::Unsupported(_)),
+                "{kind} {remainder}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("zero pixel side"),
+                "{kind} {remainder}: {err}"
+            );
+        }
+    }
+    // A lone 0 keeps its meaning: proportional for a resize,
+    // unbounded for fit-in.
+    for (remainder, dims) in [
+        ("0x16", (24, 16)),
+        ("24x0", (24, 16)),
+        ("0x0", (48, 32)),
+        ("fit-in:0x16", (24, 16)),
+        ("fit-in:24x0", (24, 16)),
+    ] {
+        let (ops, _) =
+            crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+        let out = engine.process(&still, &ops).unwrap();
+        assert_eq!(decode_dims(&out.bytes), dims, "{remainder}");
+    }
+}
+
 #[test]
 fn crop_rect_extracts_the_exact_region() {
     let engine = Engine;
@@ -3111,6 +3184,221 @@ fn png_interlace_marks_the_file_and_round_trips() {
     assert_eq!(indexed[28], 1);
     let decoded = image::load_from_memory(&indexed).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (48, 32));
+}
+
+/// 16-bit samples in an interlaced PNG are written big-endian,
+/// as the format requires (issue #464): the hand-assembled
+/// Adam7 stream used to copy the image's native-order bytes,
+/// so a little-endian host swapped every sample of a 16-bit
+/// source's interlaced render.
+#[test]
+fn png_interlace_writes_16_bit_samples_big_endian() {
+    let deep = DynamicImage::ImageRgba16(
+        DynamicImage::ImageRgba32F(image::Rgba32FImage::from_fn(48, 32, |x, y| {
+            image::Rgba([x as f32 / 47.0, y as f32 / 31.0, 0.3, 0.6])
+        }))
+        .to_rgba16(),
+    );
+    let src = EncodeBuffers::new(&deep);
+    let interlaced = encode(
+        &src,
+        ImageFormat::Png,
+        None,
+        None,
+        None,
+        FormatOptions {
+            png_interlace: true,
+            ..FormatOptions::default()
+        },
+        DEFAULT_AVIF_SPEED,
+        DEFAULT_JXL_SPEED,
+    )
+    .unwrap();
+    assert_eq!(interlaced[28], 1, "IHDR interlace byte must be Adam7");
+    let decoded = image::load_from_memory(&interlaced).unwrap();
+    assert_eq!(decoded.color(), image::ColorType::Rgba16);
+    assert_eq!(decoded.to_rgba16(), deep.to_rgba16());
+}
+
+/// A float TIFF built in memory, which decodes to 32-bit
+/// float samples (Rgb32F, or Rgba32F with `alpha`).
+fn float_tiff(alpha: bool, sample: impl Fn(u32, u32) -> [f32; 4]) -> Vec<u8> {
+    let rgba = image::Rgba32FImage::from_fn(48, 32, |x, y| image::Rgba(sample(x, y)));
+    let img = if alpha {
+        DynamicImage::ImageRgba32F(rgba)
+    } else {
+        DynamicImage::ImageRgb32F(DynamicImage::ImageRgba32F(rgba).to_rgb32f())
+    };
+    let mut out = Vec::new();
+    img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Tiff)
+        .unwrap();
+    out
+}
+
+fn float_gradient(x: u32, y: u32) -> [f32; 4] {
+    [x as f32 / 47.0, y as f32 / 31.0, 0.25, 0.5]
+}
+
+/// The integer render a float source should get: its samples
+/// clamped to 0..1 at 16 bits.
+fn float_expected(bytes: &[u8]) -> DynamicImage {
+    let decoded = image::load_from_memory(bytes).unwrap();
+    if decoded.color().has_alpha() {
+        DynamicImage::ImageRgba16(decoded.to_rgba16())
+    } else {
+        DynamicImage::ImageRgb16(decoded.to_rgb16())
+    }
+}
+
+fn process_spelled(src: &[u8], remainder: &str, preferred: Option<ImageFormat>) -> ProcessedImage {
+    let path = if remainder.is_empty() {
+        "example.com/a.tif".to_string()
+    } else {
+        format!("{remainder}/example.com/a.tif")
+    };
+    let (ops, _) = crate::url::parse_operations(&path).unwrap();
+    Engine
+        .process_preferred(
+            src,
+            &ops,
+            ProcessContext {
+                preferred,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{remainder} ({preferred:?}): {e:?}"))
+}
+
+/// Float (HDR) sources decode to 32-bit float samples, which
+/// the PNG and AVIF encoders do not take: every PNG and AVIF
+/// render of one failed with a 500, including the request
+/// that names no format and negotiates AVIF from `Accept`
+/// (issue #464). They now encode from a 16-bit conversion; the
+/// lossless WebP encode, which takes only 8-bit samples, from
+/// the 8-bit layout the lossy encode already used.
+#[test]
+fn float_sources_encode_to_every_still_format() {
+    for alpha in [false, true] {
+        let tiff = float_tiff(alpha, float_gradient);
+        let source = image::load_from_memory(&tiff).unwrap();
+        assert_eq!(
+            source.color(),
+            if alpha {
+                image::ColorType::Rgba32F
+            } else {
+                image::ColorType::Rgb32F
+            }
+        );
+        let expected = float_expected(&tiff);
+        let png = process_spelled(&tiff, "filters:format(png)", None);
+        assert_eq!(png.format, ImageFormat::Png);
+        let decoded = image::load_from_memory(&png.bytes).unwrap();
+        assert_eq!(decoded.color(), expected.color(), "alpha {alpha}");
+        assert_eq!(decoded, expected, "alpha {alpha}");
+        // Interlaced: the same samples, Adam7-ordered.
+        let interlaced = process_spelled(&tiff, "filters:format(png,interlace)", None);
+        assert_eq!(interlaced.bytes[28], 1);
+        assert_eq!(
+            image::load_from_memory(&interlaced.bytes).unwrap(),
+            expected
+        );
+        // Indexed PNG already read the 8-bit layout.
+        let indexed = process_spelled(&tiff, "filters:format(png):palette(64)", None);
+        assert_eq!(decode_dims(&indexed.bytes), (48, 32));
+        // A resize keeps float samples, and still encodes.
+        let resized = process_spelled(&tiff, "24x0/filters:format(png)", None);
+        assert_eq!(decode_dims(&resized.bytes), (24, 16));
+        // AVIF, named and negotiated.
+        for (remainder, preferred) in [
+            ("filters:format(avif)", None),
+            ("filters:format(avif):quality(50)", None),
+            ("24x0", Some(ImageFormat::Avif)),
+        ] {
+            let avif = process_spelled(&tiff, remainder, preferred);
+            assert_eq!(avif.format, ImageFormat::Avif, "{remainder}");
+            assert_eq!(&avif.bytes[4..8], b"ftyp", "{remainder}");
+        }
+        // Lossless WebP keeps the 8-bit pixels exactly.
+        let webp = process_spelled(&tiff, "filters:format(webp):quality(100)", None);
+        let decoded = image::load_from_memory(&webp.bytes).unwrap();
+        assert_eq!(decoded.to_rgba8(), source.to_rgba8(), "alpha {alpha}");
+        // The formats that already worked still do.
+        for format in ["jpeg", "webp", "gif", "jxl"] {
+            let out = process_spelled(&tiff, &format!("filters:format({format})"), None);
+            assert!(!out.bytes.is_empty(), "{format}");
+        }
+    }
+}
+
+/// A Radiance HDR source takes the same route as a float TIFF.
+#[test]
+fn radiance_hdr_sources_encode_to_png_and_avif() {
+    let hdr_img = DynamicImage::ImageRgb32F(image::Rgb32FImage::from_fn(48, 32, |x, y| {
+        image::Rgb([x as f32 / 47.0, y as f32 / 31.0, 0.25])
+    }));
+    let mut hdr = Vec::new();
+    hdr_img
+        .write_to(&mut Cursor::new(&mut hdr), image::ImageFormat::Hdr)
+        .unwrap();
+    let png = process_spelled(&hdr, "filters:format(png)", None);
+    assert_eq!(
+        image::load_from_memory(&png.bytes).unwrap(),
+        float_expected(&hdr)
+    );
+    let interlaced = process_spelled(&hdr, "filters:format(png,interlace)", None);
+    assert_eq!(
+        image::load_from_memory(&interlaced.bytes).unwrap(),
+        float_expected(&hdr)
+    );
+    let avif = process_spelled(&hdr, "", Some(ImageFormat::Avif));
+    assert_eq!(avif.format, ImageFormat::Avif);
+}
+
+/// Float samples are source content: NaN, the infinities,
+/// negatives, values past 1 and subnormals all encode without
+/// a panic, clamped to the displayable range (NaN to the top
+/// of it, the image crate's rule for every integer layout).
+#[test]
+fn hostile_float_samples_clamp_instead_of_failing() {
+    let hostile = [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        -1.0,
+        2.0,
+        f32::MAX,
+        f32::MIN_POSITIVE / 2.0,
+        -0.0,
+    ];
+    for alpha in [false, true] {
+        let tiff = float_tiff(alpha, |x, y| {
+            let at = |i: u32| hostile[(i as usize) % hostile.len()];
+            [at(x), at(y), at(x + y), at(x * 3 + y)]
+        });
+        let expected = float_expected(&tiff);
+        for remainder in [
+            "filters:format(png)",
+            "filters:format(png,interlace)",
+            "filters:format(avif)",
+            "filters:format(webp):quality(100)",
+            "filters:format(webp)",
+            "filters:format(jpeg)",
+            "24x0/filters:format(png)",
+            "fit-in:20x20/filters:format(png,interlace)",
+        ] {
+            let out = process_spelled(&tiff, remainder, None);
+            assert!(!out.bytes.is_empty(), "{remainder}");
+        }
+        let png = process_spelled(&tiff, "filters:format(png)", None);
+        let decoded = image::load_from_memory(&png.bytes).unwrap();
+        assert_eq!(decoded, expected, "alpha {alpha}");
+        // Red reads the hostile list along x: NaN, then
+        // infinity, then negative infinity.
+        let red = |x: u32| decoded.to_rgba16().get_pixel(x, 0).0[0];
+        assert_eq!(red(0), u16::MAX, "NaN");
+        assert_eq!(red(1), u16::MAX, "infinity");
+        assert_eq!(red(2), 0, "negative infinity");
+    }
 }
 
 #[test]

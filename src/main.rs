@@ -972,7 +972,12 @@ async fn shutdown_signal() {
 /// under format negotiation #370, one smart crop
 /// window per animated render #376, detection memos
 /// dropped after geometric steps #373).
-const RENDERING_VERSION: u32 = 2;
+///
+/// 3: the first release after 0.9.11, which changes output
+/// for existing URLs (interlaced PNG output from a 16-bit
+/// source writes its samples big-endian instead of
+/// byte-swapped #464).
+const RENDERING_VERSION: u32 = 3;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
