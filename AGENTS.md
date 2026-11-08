@@ -71,8 +71,12 @@ both SDKs must all pass.
   it resets cache keys and invalidates existing URLs. Treat grammar work
   accordingly.
 - `Cargo.lock` moves with any version or dependency change. Version bumps
-  run through `scripts/bump_version.py` plus a lockfile refresh; a bump
-  without the lockfile update fails every `--locked` build.
+  run through `scripts/bump_version.py`, which moves every site listed in
+  `scripts/version_sites.py` (the lockfiles' own entries included) and
+  then runs `scripts/check_versions.py` over the same list. Never move a
+  site by hand: a file that starts carrying the release version joins
+  that list, or `scripts/test_version_tools.py` fails the gate on the
+  old version a bump leaves in it.
   `fuzz/Cargo.lock` moves too: the fuzz package builds the server
   library, so a dependency change that the root lockfile records needs
   the refresh in `fuzz/README.md`, or the fuzz smoke's `--locked` build

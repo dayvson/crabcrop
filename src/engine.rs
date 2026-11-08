@@ -35,14 +35,10 @@ const MAX_ANIMATED_FRAMES: usize = 200;
 const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 
-/// The most operations one request may execute, after preset
-/// expansion (issue #182, audit R2-12): each operation counts
-/// once, and each filter inside a `filters:` segment counts
-/// once, because each is a pass over the pixels. Real chains
-/// (a size, a crop, a dozen filters) sit far below this; the
-/// cap exists so thousands of repeated cheap operations
-/// cannot burn a process-gate slot on CPU alone.
-const MAX_OPERATIONS: usize = 100;
+// The operation cap lives with the grammar (issue #469);
+// the engine's tests reach it from here through `super::*`.
+#[cfg(test)]
+use crate::url::MAX_OPERATIONS;
 
 /// The per-request encode budget (audit E-6): the
 /// quality(auto) verification loop and the max_bytes ladder
@@ -71,8 +67,11 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// checked in our own code, because decoder adherence to
 /// `max_alloc` varies by format; a probe failure is not fatal
 /// (some valid files have headers the probe cannot read), the
-/// limited decode behind it is the second line. Public
-/// for the fuzz harness's decode target (issue #417).
+/// limited decode behind it is the second line. An AVIF
+/// container is screened before either (issue #522): its
+/// parser reserves what the boxes declare, ahead of every
+/// limit here. Public for the fuzz harness's decode target
+/// (issue #417).
 pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     // AVIF decoding is compiled in only with the avif-decode
     // feature (issue #141): dav1d is a C dependency the
@@ -86,6 +85,8 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
             "AVIF sources cannot be decoded in this build (built without AVIF decoding: the Docker image and release binaries include it; source builds enable it with --features avif-decode)".to_string(),
         ));
     }
+    let screened = crate::avif::screen(bytes)?;
+    let bytes: &[u8] = &screened;
     let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
     if let Ok(probe) = probe
         && let Ok((width, height)) = probe.into_dimensions()
@@ -475,10 +476,15 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
         _ if crate::pdf::sniff_pdf(bytes) => "pdf",
         _ => "unknown",
     };
-    let dimensions = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|probe| probe.into_dimensions().ok());
+    // The probe parses an AVIF container too, so it is
+    // screened first (issue #522); a refused one states no
+    // dimensions.
+    let dimensions = crate::avif::screen(bytes).ok().and_then(|bytes| {
+        image::ImageReader::new(Cursor::new(&*bytes))
+            .with_guessed_format()
+            .ok()
+            .and_then(|probe| probe.into_dimensions().ok())
+    });
     SourceProbe { kind, dimensions }
 }
 
@@ -566,24 +572,14 @@ impl OutputBudget {
     }
 }
 
-/// Reject a request whose expanded operation list runs past
-/// [`MAX_OPERATIONS`]: the count the engine executes, not the
-/// count the URL spells, so preset expansion cannot multiply
-/// work past the cap (issue #182, audit R2-12).
+/// Reject an operation list past
+/// [`crate::url::MAX_OPERATIONS`] (issue #182, audit
+/// R2-12). The server refuses such a request at parse time,
+/// before any fetch (issue #469); this is the backstop for
+/// every other caller of the engine, with the same message
+/// and the same `unsupported_operation` class.
 fn check_operation_count(ops: &[Operation]) -> Result<(), EngineError> {
-    let count: usize = ops
-        .iter()
-        .map(|op| match op {
-            Operation::Filters(filters) => filters.len(),
-            _ => 1,
-        })
-        .sum();
-    if count > MAX_OPERATIONS {
-        return Err(EngineError::Unsupported(format!(
-            "request has {count} operations, over the {MAX_OPERATIONS} operation limit"
-        )));
-    }
-    Ok(())
+    crate::url::check_operation_count(ops).map_err(|e| EngineError::Unsupported(e.to_string()))
 }
 
 mod state;

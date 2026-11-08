@@ -5197,7 +5197,6 @@ fn animated_gif_probe_survives_hostile_input() {
 /// A fake video encoder for the video tests: drains
 /// stdin and answers with the script's canned behavior.
 fn video_test_encoder(script: &str) -> crate::video::VideoEncoder {
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -5205,14 +5204,7 @@ fn video_test_encoder(script: &str) -> crate::video::VideoEncoder {
         std::env::temp_dir().join(format!("crabcrop-engine-video-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(&path, script);
     crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
         .unwrap()
 }
@@ -5227,7 +5219,6 @@ const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDE
 /// extractor (the script lives in a temp dir keyed by
 /// `name`).
 fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameExtractor {
-    use std::io::Write as _;
     let dir = std::env::temp_dir().join(format!(
         "crabcrop-engine-frame-{}-{name}",
         std::process::id()
@@ -5243,14 +5234,7 @@ fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameEx
         "#!/bin/sh\ncat > /dev/null\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' {report} | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n"
     );
     let path = dir.join("decoder.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(&path, &script);
     crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap()
 }
 
@@ -5613,7 +5597,6 @@ fn frame_percentage_without_a_duration_is_unsupported() {
 /// prints a real 8x6 PNG. Returns the renderer (the
 /// scripts live in a temp dir keyed by `name`).
 fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
-    use std::io::Write as _;
     let dir =
         std::env::temp_dir().join(format!("crabcrop-engine-pdf-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -5625,14 +5608,7 @@ fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
     let page_path = dir.join("page.png").display().to_string();
     let write = |file: &str, script: String| {
         let path = dir.join(file);
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(script.as_bytes()).unwrap();
-        drop(f);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, &script);
         path
     };
     write(

@@ -117,11 +117,13 @@ fn build_presets(
 }
 
 /// The most operations one preset body may carry: the
-/// engine's per-request operation cap, applied at boot
-/// (issue #268). A preset larger than any request may
-/// legally run would otherwise boot fine and make one
-/// cache-miss request do thousands of filter passes.
-const MAX_PRESET_OPERATIONS: usize = 100;
+/// per-request operation cap, applied at boot (issue #268)
+/// and counted the way requests count it (issue #469), so
+/// each filter in a `filters:` segment counts once. A
+/// preset larger than any request may legally run would
+/// otherwise boot fine and make every request that names
+/// it answer `400`.
+const MAX_PRESET_OPERATIONS: usize = crate::url::MAX_OPERATIONS;
 
 /// Parse preset definitions: one `name = operations` entry
 /// per line, blank lines and `#` comments skipped. Names are
@@ -152,10 +154,10 @@ fn parse_presets(text: &str) -> Result<std::collections::HashMap<String, String>
         }
         let parsed = crate::url::parse_preset_operations(ops)
             .map_err(|e| format!("invalid operations for preset {name}: {e}"))?;
-        if parsed.len() > MAX_PRESET_OPERATIONS {
+        let count = crate::url::operation_count(&parsed);
+        if count > MAX_PRESET_OPERATIONS {
             return Err(format!(
-                "preset {name} has {} operations, over the {MAX_PRESET_OPERATIONS} operation cap",
-                parsed.len()
+                "preset {name} has {count} operations, over the {MAX_PRESET_OPERATIONS} operation cap"
             ));
         }
         map.insert(name.to_string(), ops.to_string());
@@ -4398,5 +4400,15 @@ mod tests {
         );
         let err = parse_presets(&over_cap).unwrap_err();
         assert!(err.contains("operation cap"), "{err}");
+        // The count is the one requests are held to (issue
+        // #469): each filter counts, so one `filters:`
+        // segment carrying 101 filters is over the cap too.
+        let filters = |n: usize| format!("big = filters:{}", vec!["invert"; n].join(":"));
+        assert!(parse_presets(&filters(MAX_PRESET_OPERATIONS)).is_ok());
+        let err = parse_presets(&filters(MAX_PRESET_OPERATIONS + 1)).unwrap_err();
+        assert_eq!(
+            err,
+            "preset big has 101 operations, over the 100 operation cap"
+        );
     }
 }

@@ -725,14 +725,15 @@ fn probe_settled(head: &[u8]) -> bool {
 /// The checks mirror the image path exactly and run in its
 /// order: signature grammar, signature verification, the
 /// reserved-segment guard, preset expansion, operation
-/// parsing, expiry. Only then is the source touched, once,
-/// through the loader with all of its guards, and the
-/// facts come from header probing (`crate::engine::
-/// probe_source`): no decode, no detection, no process,
-/// AI, or video gate, and nothing written to any cache
-/// tier. A bad signature or an expired URL therefore costs
-/// zero source fetches, and answers with the image path's
-/// own status and body.
+/// parsing, the operation cap, expiry. Only then is the
+/// source touched, once, through the loader with all of
+/// its guards, and the facts come from header probing
+/// (`crate::engine::probe_source`): no decode, no
+/// detection, no process, AI, or video gate, and nothing
+/// written to any cache tier. A bad signature, an over-cap
+/// operation list, or an expired URL therefore costs zero
+/// source fetches, and answers with the image path's own
+/// status and body.
 async fn explain_handle(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -812,6 +813,16 @@ async fn explain_handle(
         Ok(v) => v,
         Err(e) => return parse_failure(&e, accept.as_deref()),
     };
+    // The operation cap (issue #469), on the list the image
+    // path counts (the defaults merged in) and at the same
+    // point: an over-cap URL answers its 400 here, before the
+    // probe fetch.
+    if let Err(e) = crate::url::check_operation_count(&crate::url::merge_default_ops(
+        &state.default_ops,
+        ops.clone(),
+    )) {
+        return parse_failure(&e, accept.as_deref());
+    }
     // A root source expands for the probe fetch only: the
     // report below carries the source exactly as written
     // and the root's name, never the base URL the reference
@@ -2122,6 +2133,25 @@ async fn serve(
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
         .to_string();
+    // Server-wide defaults (issue #145) merge here: prepended
+    // to the request's own operations, so the directive
+    // analysis below, the engine, and the cache key all see
+    // the merged list, and the URL wins every last-wins
+    // directive (format, quality, fill) by coming later. The
+    // signature never covers the defaults: they are operator
+    // configuration, not request content.
+    let ops = crate::url::merge_default_ops(&state.default_ops, ops);
+    // The operation cap (issue #469) counts this merged list,
+    // the one the engine runs, and answers here: before the
+    // cache, the gates, and the source fetch, so an over-cap
+    // URL (a short one repeating a preset included) costs a
+    // parse and nothing more.
+    if let Err(e) = crate::url::check_operation_count(&ops) {
+        if sealed {
+            return sealed_refusal(record);
+        }
+        return (parse_failure(&e, accept), record);
+    }
     // A root source expands here (issue #248): after
     // verification and the ops summary (which reads the
     // source as written), before the cache key and the
@@ -2142,14 +2172,6 @@ async fn serve(
             return (parse_failure(&e, accept), record);
         }
     };
-    // Server-wide defaults (issue #145) merge here: prepended
-    // to the request's own operations, so the directive
-    // analysis below, the engine, and the cache key all see
-    // the merged list, and the URL wins every last-wins
-    // directive (format, quality, fill) by coming later. The
-    // signature never covers the defaults: they are operator
-    // configuration, not request content.
-    let ops = crate::url::merge_default_ops(&state.default_ops, ops);
     // Expiry is enforced after signature verification (the
     // segment is inside the signed remainder, so a tampered
     // expiry already failed as a bad signature) and before the

@@ -42,6 +42,22 @@ cargo test
 cargo test -p crabcrop-url   # the signing crate
 ```
 
+Both include property tests ([proptest](https://docs.rs/proptest)):
+`tests/proptest_url.rs` (generated operation chains parse back to the
+operations they spell and canonicalize to a fixed point),
+`tests/proptest_crop.rs` (every crop window is non-empty, inside the image,
+no larger than the fill window, and at the target aspect within a pixel), and
+`crates/crabcrop-url/tests/proptest_sign.rs` (signatures and sealed tokens
+round-trip, and any one changed byte fails them). Each property runs 64 cases
+by default; `PROPTEST_CASES` runs more:
+
+```bash
+PROPTEST_CASES=10000 cargo test --workspace --test proptest_url --test proptest_crop --test proptest_sign
+```
+
+A failing case is saved as a seed in the `.proptest-regressions` file next to
+its suite and replayed first on every later run. Commit the seed with the fix.
+
 The full cross-language suite (Rust, the TypeScript and Python SDKs, the MCP
 server, the Nuxt module, and the playground, plus a fuzz smoke test) runs from
 one script, which starts and stops the local servers the integration tests
@@ -53,6 +69,12 @@ scripts/test_all.sh --skip-rust  # just the non-Rust suites
 ```
 
 The JavaScript suites need Node 22.18 or newer: they run the TypeScript sources directly, and type stripping is on by default from 22.18.
+
+A unit test that stands a script in for an external tool (FFmpeg,
+pdftocairo, pdfinfo) writes it with `crate::test_support::write_script`, not
+`std::fs::write`. A script written through the test process's own file
+descriptor can fail to start with "Text file busy" when another test thread
+spawns a child at the same moment (issue #523).
 
 ## Code style
 
