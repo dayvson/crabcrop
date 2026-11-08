@@ -9,8 +9,22 @@
  * pipeline and the equivalent hand-written string produce
  * byte-identical URLs. Validation throws at build time, like
  * `buildSrcSet` does for widths: a value the server would 400
- * never gets signed.
+ * never gets signed. The closed sets and the class-name checks
+ * come from the explainer (issue #482), so the builders and
+ * the explainer read one copy of that grammar.
  */
+import {
+  BLEND_MODES,
+  classFoldKey,
+  CROP_ALIGNS,
+  CURVE_CHANNELS,
+  IMAGE_FORMATS,
+  isClassName,
+  MAX_OBJECTS_CLASSES,
+  STUDIO_MODES,
+  STUDIO_SHADOWS,
+  TEXT_ANCHORS,
+} from "./explain.ts";
 import { MAX_DIMENSION } from "./limits.ts";
 
 /** Output formats the `format(...)` filter accepts. */
@@ -264,36 +278,13 @@ function encodeArg(text: string): string {
 
 function className(what: string, name: string): string {
   const trimmed = name.trim();
-  // The server's bound is on UTF-8 bytes, not UTF-16 code
-  // units: a name of multibyte characters can pass a
-  // length check here and still be rejected there, so
-  // measure the encoded form, as the explainer does.
-  const bytes = new TextEncoder().encode(trimmed).length;
-  if (bytes < 1 || bytes > 64 || !/^[\p{L}\p{N} _.\-/]+$/u.test(trimmed)) {
+  if (!isClassName(trimmed)) {
     fail(what, name, "1 to 64 UTF-8 bytes of letters, digits, space, `_`, `.`, `-`, `/`");
   }
   // The server trims the name before it validates and keys
   // on it, so the trimmed name is the canonical one.
   return encodeArg(trimmed);
 }
-
-const CROP_ALIGNS: readonly string[] = ["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"];
-const ANCHORS: readonly string[] = [
-  "top-left",
-  "top-center",
-  "top-right",
-  "center-left",
-  "center",
-  "center-right",
-  "bottom-left",
-  "bottom-center",
-  "bottom-right",
-];
-const BLEND_MODES: readonly string[] = ["normal", "multiply", "screen", "overlay"];
-const CURVE_CHANNELS: readonly string[] = ["rgb", "r", "g", "b"];
-const STUDIO_MODES: readonly string[] = ["product", "scene"];
-const STUDIO_SHADOWS: readonly string[] = ["soft", "strong", "none"];
-const IMAGE_FORMATS: readonly string[] = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"];
 
 /** Operation segments, one typed call per segment kind. */
 export const ops = {
@@ -337,10 +328,11 @@ export const ops = {
    * Needs a detection model configured on the server; when
    * none of the classes is detected the render falls back
    * to the plain center crop of the same size. Duplicate
-   * classes (case-insensitive) are spelled once, as the
-   * server's canonical form spells them; at most 32
-   * distinct classes, and a 33rd throws, since the server
-   * rejects it with `invalid_crop`.
+   * classes (ASCII case-insensitive, as the server compares
+   * them: `E` repeats `e`, `É` does not repeat `é`) are
+   * spelled once, as the server's canonical form spells
+   * them; at most 32 distinct classes, and a 33rd throws,
+   * since the server rejects it with `invalid_crop`.
    */
   cropObjects(width: number, height: number, classes: string[], scale = 1): string {
     if (!Array.isArray(classes) || classes.length < 1) {
@@ -352,9 +344,9 @@ export const ops = {
     const names: string[] = [];
     for (const name of classes) {
       const encoded = className("crop objects class", name);
-      const key = typeof name === "string" ? name.trim().toLowerCase() : "";
+      const key = classFoldKey(name.trim());
       if (!seen.has(key)) {
-        if (names.length === 32) {
+        if (names.length === MAX_OBJECTS_CLASSES) {
           fail("crop objects classes", classes, "an array of 1 to 32 distinct class names");
         }
         seen.add(key);
@@ -875,8 +867,8 @@ export const filter = {
    * canonical spelling is always eight lowercase hex digits.
    */
   text(content: string, size: number, color: string, anchor: Anchor): string {
-    if (!ANCHORS.includes(anchor)) {
-      fail("text anchor", anchor, `one of ${ANCHORS.join(", ")}`);
+    if (!TEXT_ANCHORS.includes(anchor)) {
+      fail("text anchor", anchor, `one of ${TEXT_ANCHORS.join(", ")}`);
     }
     if (content === "") fail("text", content, "a non-empty label");
     intIn("text size", size, 1, 1000);

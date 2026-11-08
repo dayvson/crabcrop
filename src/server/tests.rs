@@ -3201,8 +3201,8 @@ async fn generated_corpus_error_codes_match_the_http_envelope() {
 /// `spec/explain-verdicts.json` and the generated
 /// combinations in `spec/operation-vectors.json`. Every
 /// surface that reads a remainder (the Rust parser, the
-/// TypeScript explainer, the playground's copy) runs the
-/// same files in its own suite; a disagreement anywhere
+/// TypeScript explainer, the playground's build of it) runs
+/// the same files in its own suite; a disagreement anywhere
 /// fails the gate here or there, and the mismatch list is
 /// printed whole so one run shows every divergence.
 /// These tests were put here rather than in url.rs while

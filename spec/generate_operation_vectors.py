@@ -4,9 +4,9 @@ differential corpus for crabcrop's operation grammar (issue #353).
 
 Operation knowledge is implemented independently in the Rust
 parser and canonical serializer (src/url.rs), the explainer
-(src/explain.rs and the CLI gloss table), the TypeScript SDK's
-typed builders and explainer (sdks/typescript), and the
-playground's plain-JS explainer copy (playground/lib.mjs). The
+(src/explain.rs and the CLI gloss table), and the TypeScript
+SDK's typed builders and explainer (sdks/typescript), which the
+playground serves as built (playground/sdk/, issue #482). The
 hand-written verdict corpus (spec/explain-verdicts.json) samples
 that space; this corpus generates combinations across it and
 pins, for every generated remainder, the verdict every surface
@@ -139,6 +139,10 @@ SIZE = [
 # The objects class cap (issue #408) counts distinct names: 32
 # parse, a 33rd distinct name is a bad crop (never a silent
 # truncation), and repeats in any case fold before they count.
+# The fold is ASCII-only, as the server's eq_ignore_ascii_case
+# (issue #482): `E` repeats `e`, but `É` and `é` are two
+# classes, so 31 names plus both are 33 distinct.
+OBJ31 = ",".join(f"c{i}" for i in range(31))
 OBJ32 = ",".join(f"c{i}" for i in range(32))
 OBJ33 = ",".join(f"c{i}" for i in range(33))
 
@@ -164,6 +168,7 @@ CROP = [
     ("crop:100x100:objects(person):2.0", "crop:100x100:objects(person):2", None),
     (f"crop:100x100:objects({OBJ32})", f"crop:100x100:objects({OBJ32}):1", None),
     (f"crop:100x100:objects({OBJ32},C0,c31)", f"crop:100x100:objects({OBJ32}):1", None),
+    (f"crop:100x100:objects({OBJ31},E,e)", f"crop:100x100:objects({OBJ31},E):1", None),
     ("crop:300x0", None, "invalid_crop"),
     ("crop:0x200", None, "invalid_crop"),
     ("crop:-300x200", None, "invalid_crop"),
@@ -177,6 +182,7 @@ CROP = [
     ("crop:100x100:objects(person):101", None, "invalid_crop"),
     ("crop:100x100:objects(bad;name)", None, "invalid_crop"),
     (f"crop:100x100:objects({OBJ33})", None, "invalid_crop"),
+    (f"crop:100x100:objects({OBJ31},%C3%89,%C3%A9)", None, "invalid_crop"),
     ("crop:300", None, "invalid_crop"),
     ("crop:", None, "invalid_crop"),
 ]
@@ -794,6 +800,11 @@ builder("ops.cropObjects", [100, 100, OBJ32.split(",") + ["C0"]],
         f"crop:100x100:objects({OBJ32}):1")
 builder("ops.cropObjects", [100, 100, OBJ33.split(",")],
         f"crop:100x100:objects({OBJ33}):1", throws=True, code="invalid_crop")
+# Issue #482: the fold is ASCII-only, as on the server.
+builder("ops.cropObjects", [100, 100, OBJ31.split(",") + ["E", "e"]],
+        f"crop:100x100:objects({OBJ31},E):1")
+builder("ops.cropObjects", [100, 100, OBJ31.split(",") + ["É", "é"]],
+        f"crop:100x100:objects({OBJ31},%C3%89,%C3%A9):1", throws=True, code="invalid_crop")
 # Issue #472: the server trims a class name before it keys on
 # it, so the builder encodes the trimmed name.
 builder("ops.cropObjects", [100, 100, [" person "]],

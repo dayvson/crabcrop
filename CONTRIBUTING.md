@@ -72,6 +72,23 @@ runs as its test suite. If you change the grammar or the signing scheme, update
 the spec and the vectors, and keep the SDKs (Rust, TypeScript, Python) and the
 playground in sync so they all still pass the shared vectors.
 
+The grammar has one JavaScript implementation:
+[`sdks/typescript/src/explain.ts`](sdks/typescript/src/explain.ts). The typed
+builders in `operations.ts` import its checks, and the playground serves its
+build from `playground/sdk/`. To change what JavaScript accepts (a new filter,
+say), edit `explain.ts` and the builders, add the cases to
+`spec/generate_operation_vectors.py` or `spec/explain-verdicts.json`, and
+refresh the playground's copy:
+
+```bash
+(cd sdks/typescript && npm ci)   # once
+python3 scripts/sync_playground_sdk.py
+```
+
+`scripts/test_all.sh` runs the script with `--check`, which fails when
+`playground/sdk/` is stale or when a second copy of the grammar appears in the
+JavaScript sources.
+
 ## Changelog
 
 Give user-facing changes an entry under `## [Unreleased]` in

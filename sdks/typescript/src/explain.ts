@@ -1,9 +1,13 @@
 /**
  * Parse a crabcrop URL (or bare path) back into its pieces and
  * explain each segment, mirroring the server's grammar. This is
- * the canonical implementation: the playground keeps a plain-JS
- * copy for its no-build static page, and both are pinned to the
- * same verdict corpus (audit PL-10, P-3).
+ * the one JavaScript implementation of the grammar (issue #482):
+ * the typed builders in operations.ts validate with the checks
+ * exported here, and the playground serves this module's build
+ * (playground/sdk/, refreshed by scripts/sync_playground_sdk.py,
+ * whose --check fails on drift or on a second copy). Every
+ * surface is pinned to the same verdict corpora (audit PL-10,
+ * P-3).
  */
 import { MAX_DIMENSION } from "./limits.ts";
 
@@ -156,6 +160,68 @@ function sizeBlurb(seg: string): string {
   return `resize to ${describe(size.w, "width")} by ${describe(size.h, "height")}${flips.length ? ` (${flips.join(", ")})` : ""}`;
 }
 
+/** Crop alignments (url.rs parse_align); `center` is the bare `crop:WxH`. */
+export const CROP_ALIGNS: readonly string[] = ["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"];
+
+/** Text overlay anchors (url.rs Anchor::parse). */
+export const TEXT_ANCHORS: readonly string[] = [
+  "top-left",
+  "top-center",
+  "top-right",
+  "center-left",
+  "center",
+  "center-right",
+  "bottom-left",
+  "bottom-center",
+  "bottom-right",
+];
+
+/** Output formats `format(...)` names; `jpg` is an input alias of `jpeg`. */
+export const IMAGE_FORMATS: readonly string[] = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"];
+
+/** Overlay blend modes. */
+export const BLEND_MODES: readonly string[] = ["normal", "multiply", "screen", "overlay"];
+
+/** Channels `curve(...)` remaps. */
+export const CURVE_CHANNELS: readonly string[] = ["rgb", "r", "g", "b"];
+
+/** Modes `studio(...)` runs. */
+export const STUDIO_MODES: readonly string[] = ["product", "scene"];
+
+/** Contact shadow strengths for `studio(product, ...)`. */
+export const STUDIO_SHADOWS: readonly string[] = ["soft", "strong", "none"];
+
+/**
+ * The objects crop's cap on distinct class names (url.rs
+ * MAX_OBJECTS_CLASSES).
+ */
+export const MAX_OBJECTS_CLASSES = 32;
+
+/**
+ * A detection class name as the server's parse_class_name
+ * takes it, already trimmed: 1 to 64 UTF-8 bytes (bytes, not
+ * UTF-16 code units, as on the server) of letters, digits,
+ * space, `_`, `.`, `-`, `/`.
+ */
+export function isClassName(name: string): boolean {
+  return (
+    name.length >= 1 &&
+    new TextEncoder().encode(name).length <= 64 &&
+    /^[\p{L}\p{N} _.\-/]+$/u.test(name)
+  );
+}
+
+/**
+ * The key a class name folds to when the objects crop drops
+ * repeats. The server compares names with
+ * `eq_ignore_ascii_case` (url.rs parse_crop_align), so only
+ * A to Z fold: `E` and `e` are one class, `É` and `é` are two
+ * (issue #482).
+ */
+export function classFoldKey(name: string): string {
+  return name.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
 const NO_ARG_FILTERS = new Set([
   "grayscale",
   "invert",
@@ -168,18 +234,8 @@ const NO_ARG_FILTERS = new Set([
   "blurfaces",
   "pixelatefaces",
 ]);
-const FORMAT_NAMES = new Set(["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"]);
-const ANCHOR_NAMES = new Set([
-  "top-left",
-  "top-center",
-  "top-right",
-  "center-left",
-  "center",
-  "center-right",
-  "bottom-left",
-  "bottom-center",
-  "bottom-right",
-]);
+const FORMAT_NAMES = new Set(IMAGE_FORMATS);
+const ANCHOR_NAMES = new Set(TEXT_ANCHORS);
 
 function isIntIn(s: string, min: number, max: number): boolean {
   // Rust's integer from_str syntax: an optional sign (the
@@ -345,7 +401,7 @@ function validateFilter(name: string, args: string | null): string | null {
     case "curve": {
       if (args === null) return bad;
       const parts = args.split(",");
-      if (!["rgb", "r", "g", "b"].includes(parts[0])) return bad;
+      if (!CURVE_CHANNELS.includes(parts[0])) return bad;
       const coords = parts.slice(1);
       if (coords.length < 4 || coords.length > 32 || coords.length % 2 !== 0) return bad;
       if (!coords.every((p) => isIntIn(p, 0, 255))) return bad;
@@ -383,7 +439,7 @@ function validateFilter(name: string, args: string | null): string | null {
       if (args === null) return bad;
       const parts = args.split(",");
       const mode = parts[0];
-      if (mode !== "product" && mode !== "scene") return bad;
+      if (!STUDIO_MODES.includes(mode)) return bad;
       const seen = new Set<string>();
       for (const part of parts.slice(1)) {
         const cut = part.indexOf(":");
@@ -407,7 +463,7 @@ function validateFilter(name: string, args: string | null): string | null {
             return bad;
           }
         } else if (mode === "product" && key === "shadow") {
-          if (value !== "none" && value !== "soft" && value !== "strong") return bad;
+          if (!STUDIO_SHADOWS.includes(value)) return bad;
         } else {
           return bad;
         }
@@ -468,7 +524,7 @@ function validateFilter(name: string, args: string | null): string | null {
         rest = fields.slice(0, -1);
       }
       const blend = rest[rest.length - 1];
-      if (!["normal", "multiply", "screen", "overlay"].includes(blend)) return bad;
+      if (!BLEND_MODES.includes(blend)) return bad;
       if (!isIntIn(rest[rest.length - 2], 0, 100)) return bad;
       if (!isIntIn(rest[rest.length - 3], -2147483648, 2147483647)) return bad;
       if (!isIntIn(rest[rest.length - 4], -2147483648, 2147483647)) return bad;
@@ -479,13 +535,7 @@ function validateFilter(name: string, args: string | null): string | null {
     case "pixelateclass": {
       if (args === null) return bad;
       const decoded = percentDecodable(args);
-      if (decoded === null) return bad;
-      const name = decoded.trim();
-      return name.length >= 1 &&
-        new TextEncoder().encode(name).length <= 64 &&
-        /^[\p{L}\p{N} _.\-/]+$/u.test(name)
-        ? null
-        : bad;
+      return decoded !== null && isClassName(decoded.trim()) ? null : bad;
     }
     case "recolorclass": {
       if (args === null) return bad;
@@ -493,13 +543,7 @@ function validateFilter(name: string, args: string | null): string | null {
       if (cut < 0) return bad;
       if (!/^[0-9a-fA-F]{6}$/.test(args.slice(cut + 1))) return bad;
       const decoded = percentDecodable(args.slice(0, cut));
-      if (decoded === null) return bad;
-      const name = decoded.trim();
-      return name.length >= 1 &&
-        new TextEncoder().encode(name).length <= 64 &&
-        /^[\p{L}\p{N} _.\-/]+$/u.test(name)
-        ? null
-        : bad;
+      return decoded !== null && isClassName(decoded.trim()) ? null : bad;
     }
     case "blur_region":
     case "pixelate_region":
@@ -601,18 +645,18 @@ function explainFilters(rest: string): { detail?: string; error?: string } {
   return { detail: blurbs.join("; ") };
 }
 
-const ALIGN_NAMES = new Set(["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"]);
+const ALIGN_NAMES = new Set(CROP_ALIGNS);
 const U64_MAX = 18446744073709551615n;
 
 /**
  * The objects crop alignment (url.rs parse_objects, ported):
  * `objects(<class>[,<class>...])[:<scale>]`. Returns the
- * decoded class names (duplicates folded, first spelling
- * kept, as the server's canonical form folds them) and the
- * scale, or null when the server would reject the form.
- * The 32-class cap counts distinct names, as the server's
- * does: repeats are free, and a 33rd distinct name rejects
- * the form (issue #408).
+ * decoded class names (duplicates folded ASCII-only, first
+ * spelling kept, as the server's canonical form folds them)
+ * and the scale, or null when the server would reject the
+ * form. The 32-class cap counts distinct names, as the
+ * server's does: repeats are free, and a 33rd distinct name
+ * rejects the form (issue #408).
  */
 function parseObjectsAlign(align: string): { classes: string[]; scale: number } | null {
   if (!align.startsWith("objects(")) return null;
@@ -636,16 +680,10 @@ function parseObjectsAlign(align: string): { classes: string[]; scale: number } 
     const decoded = percentDecodable(part);
     if (decoded === null) return null;
     const name = decoded.trim();
-    if (
-      name.length < 1 ||
-      new TextEncoder().encode(name).length > 64 ||
-      !/^[\p{L}\p{N} _.\-/]+$/u.test(name)
-    ) {
-      return null;
-    }
-    const key = name.toLowerCase();
+    if (!isClassName(name)) return null;
+    const key = classFoldKey(name);
     if (!seen.has(key)) {
-      if (classes.length === 32) return null;
+      if (classes.length === MAX_OBJECTS_CLASSES) return null;
       seen.add(key);
       classes.push(name);
     }
