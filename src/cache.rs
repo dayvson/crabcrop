@@ -11,6 +11,7 @@
 //! successful responses are stored; errors are never cached.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -282,6 +283,13 @@ pub struct PurgeGuard {
     /// process compares its new copies with the margin
     /// against its own pre-restart purges.
     writer: u64,
+    /// The latest time this process has issued as a stamp
+    /// or a purge start. Copies and purges of one process
+    /// compare with no margin, so their times must follow
+    /// the order of events even if the host clock steps
+    /// back: issued times never decrease, and a purge
+    /// starts strictly after every stamp issued before it.
+    clock: AtomicU64,
 }
 
 impl Default for PurgeGuard {
@@ -409,7 +417,29 @@ impl PurgeGuard {
         Self {
             inner: Mutex::new(PurgeGuardInner::default()),
             writer: boot_writer_id(),
+            clock: AtomicU64::new(0),
         }
+    }
+
+    /// A stamp time for `now`: never earlier than any time
+    /// this process issued before.
+    fn stamp_ms(&self, now: u64) -> u64 {
+        self.clock.fetch_max(now, Ordering::SeqCst).max(now)
+    }
+
+    /// A purge start for `now`: strictly later than every
+    /// stamp this process issued before it, so a copy
+    /// rendered before the purge is covered by it even
+    /// within the same millisecond or after the host clock
+    /// stepped back, and every stamp issued after it is no
+    /// earlier.
+    fn purge_start_ms(&self, now: u64) -> u64 {
+        let next = |last: u64| last.saturating_add(1).max(now);
+        let last = self
+            .clock
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(next(last)))
+            .unwrap_or_else(|last| last);
+        next(last)
     }
 
     /// The current purge generation: a writer snapshots
@@ -423,11 +453,11 @@ impl PurgeGuard {
     /// (issues #446, #461). Taken after the render's
     /// [`PurgeGuard::snapshot`], so a purge that begins
     /// between the two is caught by the generation, and one
-    /// that begins after both sees a stamp no earlier than
-    /// its own start.
+    /// that begins after both starts strictly later than the
+    /// stamp, so it covers the render's copies.
     pub fn stamp(&self) -> WriteStamp {
         WriteStamp {
-            at_ms: now_ms(),
+            at_ms: self.stamp_ms(now_ms()),
             writer: self.writer,
         }
     }
@@ -444,7 +474,7 @@ impl PurgeGuard {
         let tombstone = Tombstone {
             target,
             cutoff: PurgeCutoff {
-                start_ms: now_ms(),
+                start_ms: self.purge_start_ms(now_ms()),
                 writer: self.writer,
             },
             ended_ms: None,
@@ -1187,6 +1217,55 @@ mod tests {
         // process compares its new copies against its old
         // purges with the margin.
         assert_ne!(PurgeGuard::new().writer, PurgeGuard::new().writer);
+    }
+
+    #[test]
+    fn one_process_orders_its_stamps_and_purges_by_event_not_by_wall_clock() {
+        // A copy and a purge of one process compare with no
+        // margin, so their times must follow the order of
+        // events. A copy rendered before a purge in the same
+        // millisecond, or before the host clock stepped
+        // back, must still be covered, or the walk would
+        // leave it in place for good; one rendered after the
+        // purge must not be, or it would churn.
+        let guard = PurgeGuard::new();
+        let own = |at_ms| {
+            Some(WriteStamp {
+                at_ms,
+                writer: guard.writer,
+            })
+        };
+        let cutoff = |start_ms| PurgeCutoff {
+            start_ms,
+            writer: guard.writer,
+        };
+        // The same millisecond: the purge starts after the
+        // render that preceded it.
+        let render = guard.stamp_ms(10_000);
+        let start = guard.purge_start_ms(10_000);
+        assert!(cutoff(start).covers(own(render)));
+        let after = guard.stamp_ms(10_000);
+        assert!(!cutoff(start).covers(own(after)));
+        // The clock steps back 3 s between a render and a
+        // purge: the purge still starts after the render.
+        let render = guard.stamp_ms(20_000);
+        let start = guard.purge_start_ms(17_000);
+        assert!(start > render);
+        assert!(cutoff(start).covers(own(render)));
+        // A render after that purge, before the wall clock
+        // has caught up, is not covered by it.
+        let after = guard.stamp_ms(17_001);
+        assert!(after >= start);
+        assert!(!cutoff(start).covers(own(after)));
+        // Once the wall clock passes, times follow it again.
+        assert_eq!(guard.stamp_ms(30_000), 30_000);
+        assert_eq!(guard.purge_start_ms(40_000), 40_000);
+        // The public paths use the same clock.
+        let purge = Arc::new(PurgeGuard::new());
+        let before = purge.stamp();
+        let active = purge.begin(PurgeTarget::Group("hero".into()));
+        assert!(active.tombstone().cutoff.start_ms > before.at_ms);
+        assert!(purge.stamp().at_ms >= active.tombstone().cutoff.start_ms);
     }
 
     #[test]
