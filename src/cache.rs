@@ -10,8 +10,10 @@
 //! by total bytes with least-recently-used eviction. Only
 //! successful responses are stored; errors are never cached.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::url::ImageFormat;
 
@@ -34,6 +36,156 @@ pub struct CachedImage {
     /// changed, the old entry was purged) carries a different
     /// validator.
     pub etag: String,
+    /// When and where the render behind these bytes began
+    /// (issues #446, #461), persisted with every disk and
+    /// shared copy and carried unchanged by promotions and
+    /// group merges, so a copy's age survives every tier it
+    /// passes through. `None` for an entry written before
+    /// stamps existed: such a copy counts as older than every
+    /// purge.
+    pub written: Option<WriteStamp>,
+}
+
+/// Whether two images are the same stored copy: the same
+/// bytes from the same render. A re-render of unchanged
+/// bytes has the same ETag but a later stamp, and a purge
+/// reconcile must not mistake it for the copy it removes.
+pub(crate) fn same_copy(a: &CachedImage, b: &CachedImage) -> bool {
+    a.etag == b.etag && a.written == b.written
+}
+
+/// The wall clock in Unix milliseconds: the time base that
+/// write stamps and purge starts share across replicas.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// When the render behind a copy began, and which process
+/// ran it (issues #446, #461). The time is taken when the
+/// render starts, before it reads its source, so a copy
+/// stamped after a purge began cannot hold bytes from
+/// before it. The writer is a per-boot process id: a copy
+/// and a purge from the same process share one clock and
+/// compare exactly, while a copy from any other process is
+/// compared with a clock-skew margin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteStamp {
+    pub at_ms: u64,
+    pub writer: u64,
+}
+
+/// How far another process's clock may run ahead of the one
+/// that started a purge before a copy it rendered just
+/// before the purge escapes it (issue #461). A copy from
+/// another process counts as written before the purge until
+/// this long after the purge began; NTP-synced hosts agree
+/// to within milliseconds. The cost of the margin is that a
+/// copy another process renders in the first seconds after
+/// a purge counts as purged: it is not cached, and the next
+/// request for it renders again.
+pub const CLOCK_SKEW_MARGIN_MS: u64 = 5_000;
+
+/// How long a purge's tombstone outlives the end of its
+/// shared-tier walk (issue #461). After the walk, the bucket
+/// holds no copy the purge covers, except ones written back
+/// by renders that were already running somewhere when the
+/// purge began; the grace keeps those missing while they
+/// land, so it sits well above the longest render plus the
+/// tombstone refresh interval.
+pub const TOMBSTONE_GRACE_MS: u64 = 15 * 60 * 1000;
+
+/// When a purge began, and on which process: the line
+/// between the copies it removes and the ones rendered
+/// after it (issues #446, #461).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeCutoff {
+    pub start_ms: u64,
+    pub writer: u64,
+}
+
+impl PurgeCutoff {
+    /// A cutoff that covers every copy, stamped or not: the
+    /// unbounded purge forms, which remove everything they
+    /// match.
+    pub const EVERYTHING: PurgeCutoff = PurgeCutoff {
+        start_ms: u64::MAX,
+        writer: 0,
+    };
+
+    /// Whether a copy stamped `written` was rendered before
+    /// this purge began. An unstamped copy predates every
+    /// purge. A copy from the purging process compares
+    /// exactly; one from any other process is covered until
+    /// [`CLOCK_SKEW_MARGIN_MS`] after the purge began, so a
+    /// writer whose clock runs ahead cannot slip a pre-purge
+    /// copy past it.
+    pub fn covers(&self, written: Option<WriteStamp>) -> bool {
+        match written {
+            None => true,
+            Some(stamp) if stamp.writer == self.writer => stamp.at_ms < self.start_ms,
+            Some(stamp) => stamp.at_ms < self.start_ms.saturating_add(CLOCK_SKEW_MARGIN_MS),
+        }
+    }
+
+    /// Whether every copy `other` covers, this cutoff covers
+    /// too. Same process: a start no earlier. Different
+    /// processes: a start at least the margin later, since
+    /// each one covers the other's copies with the margin.
+    fn includes(&self, other: &PurgeCutoff) -> bool {
+        if self.writer == other.writer {
+            other.start_ms <= self.start_ms
+        } else {
+            other.start_ms.saturating_add(CLOCK_SKEW_MARGIN_MS) <= self.start_ms
+        }
+    }
+}
+
+/// One purge as every replica sees it (issue #461): what it
+/// removes, when it began, and when its shared-tier walk
+/// ended. The process that starts a purge holds one in
+/// memory and writes it to the shared bucket, where the
+/// other replicas, and the same one after a restart, read
+/// it. While it lives, a disk or shared copy it covers that
+/// was written before the purge began is a miss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tombstone {
+    pub target: PurgeTarget,
+    pub cutoff: PurgeCutoff,
+    /// When the purge's walk ended; `None` while it runs, or
+    /// for a walk that never finished (its process stopped).
+    pub ended_ms: Option<u64>,
+}
+
+impl Tombstone {
+    /// Whether the tombstone still applies at `now_ms`: until
+    /// [`TOMBSTONE_GRACE_MS`] after its walk ended, and
+    /// indefinitely for a walk that has not.
+    pub fn live(&self, now_ms: u64) -> bool {
+        self.ended_ms
+            .is_none_or(|ended| now_ms < ended.saturating_add(TOMBSTONE_GRACE_MS))
+    }
+
+    /// Whether the purge removes a copy stored under `key`
+    /// with `groups`, stamped `written`.
+    pub fn covers(&self, key: &str, groups: &[String], written: Option<WriteStamp>) -> bool {
+        self.target.covers(key, groups) && self.cutoff.covers(written)
+    }
+
+    /// Whether this tombstone makes `other` redundant: same
+    /// target, a walk that has ended, and a cutoff that covers
+    /// strictly more. The finished walk removed every copy
+    /// `other` covers, so `other` can go; this is how a
+    /// re-purge clears the tombstone of a walk whose process
+    /// stopped before it ended.
+    pub fn supersedes(&self, other: &Tombstone) -> bool {
+        self.ended_ms.is_some()
+            && self.target == other.target
+            && self.cutoff != other.cutoff
+            && self.cutoff.includes(&other.cutoff)
+    }
 }
 
 /// The strong ETag for a body of rendered bytes: a quoted
@@ -74,13 +226,14 @@ pub(crate) fn union_groups(existing: &[String], extra: &[String]) -> Vec<String>
     out
 }
 
-/// How many tombstones of one kind the guard retains.
-/// Purges are operator actions, so the distinct targets
-/// stay few in practice; the cap only bounds the
-/// pathological, and a write old enough to outlive this
-/// many later purges is far outside any render's
-/// lifetime (renders are bounded by the process timeout,
-/// not by operator patience).
+/// How many generation tombstones of one kind the guard
+/// retains, and how many ended purges it keeps within
+/// their grace. Purges are operator actions, so the
+/// distinct targets stay few in practice; the cap only
+/// bounds the pathological, and a write old enough to
+/// outlive this many later purges is far outside any
+/// render's lifetime (renders are bounded by the process
+/// timeout, not by operator patience).
 const MAX_TOMBSTONES: usize = 1024;
 
 /// Purge generations and tombstones (issue #350): the
@@ -99,35 +252,57 @@ const MAX_TOMBSTONES: usize = 1024;
 /// the newer generation and is unaffected, so the guard
 /// costs a fresh render nothing.
 ///
-/// The guard also knows which purges are still running
-/// (issue #400). A shared-tier purge walk can outlive its
-/// request by minutes on a large bucket, and until it
-/// reaches an object that object still reads as a hit. A
-/// lookup that starts after the purge snapshots the newer
-/// generation, so the tombstone alone would let it serve
+/// The guard also decides which persisted copies a purge
+/// still removes after its request (issues #400, #446,
+/// #461). A shared-tier purge walk can outlive its request
+/// by minutes on a large bucket, and until it reaches an
+/// object that object still reads as a hit; a lookup that
+/// starts after the purge snapshots the newer generation,
+/// so the generation tombstone alone would let it serve
 /// that copy and promote it into the local tiers, where
-/// the walk never looks. While a purge is active, a copy
-/// it covers that a lookup finds in a persistent tier is
-/// therefore treated as already purged, whatever the
-/// lookup's snapshot. The same holds for a lookup that
-/// was under way while the purge ran and finishes after
-/// it ended: the copy it read may predate the walk's
-/// delete, so the guard also remembers when recent
-/// purges ended.
+/// the walk never looks. So every purge also leaves a
+/// [`Tombstone`]: from the moment it begins until a grace
+/// period after its walk ends, a disk or shared copy it
+/// covers that was written before it began is a miss, and
+/// is removed on sight. A copy rendered after it began is
+/// not: it is a valid render and serves normally, so a
+/// running walk costs no re-renders. The guard holds the
+/// tombstones of the purges this process started and the
+/// ones read from the shared bucket, which is how a purge
+/// reaches other replicas and survives a restart.
 ///
 /// The guard tracks purges, not entries: it holds no
 /// image data and its maps stay proportional to how many
 /// distinct targets were purged, capped above, plus the
-/// purges still running and as many recent endings.
-#[derive(Debug, Default)]
+/// purges still running and the live tombstones, also
+/// capped.
+#[derive(Debug)]
 pub struct PurgeGuard {
     inner: Mutex<PurgeGuardInner>,
+    /// This process's writer id for [`WriteStamp`]s and
+    /// purge cutoffs: random per boot, so a restarted
+    /// process compares its new copies with the margin
+    /// against its own pre-restart purges.
+    writer: u64,
+    /// The latest time this process has issued as a stamp
+    /// or a purge start. Copies and purges of one process
+    /// compare with no margin, so their times must follow
+    /// the order of events even if the host clock steps
+    /// back: issued times never decrease, and a purge
+    /// starts strictly after every stamp issued before it.
+    clock: AtomicU64,
+}
+
+impl Default for PurgeGuard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Default)]
 struct PurgeGuardInner {
-    /// Bumped by every recorded purge and by every purge
-    /// that ends; a snapshot is a reading of this counter.
+    /// Bumped by every recorded purge; a snapshot is a
+    /// reading of this counter.
     generation: u64,
     /// Base cache key -> generation of its purge. Matches
     /// the key itself and its `#`-suffixed variants, the
@@ -139,22 +314,20 @@ struct PurgeGuardInner {
     /// keys that derive from the source, the rule
     /// `Cache::purge_source` removes by.
     sources: HashMap<String, u64>,
-    /// Purges still running (issue #400), by generation:
-    /// one entry per [`ActivePurge`] handle alive. Not
-    /// capped: each entry belongs to a purge task that is
-    /// still doing work, and it leaves when that task ends.
-    active: HashMap<u64, PurgeTarget>,
-    /// Purges that have ended (issue #400), oldest first,
-    /// each with the generation recorded at its end, so a
-    /// lookup that overlapped one can tell. Capped at
-    /// [`MAX_TOMBSTONES`]; a lookup outlasting that many
-    /// purge endings is far outside any lookup's lifetime.
-    ended: VecDeque<(u64, PurgeTarget)>,
+    /// Tombstones of the purges this process started, by
+    /// generation: the running ones (one per live
+    /// [`ActivePurge`]) and the ended ones still within
+    /// their grace. Running ones are never trimmed; ended
+    /// ones are capped at [`MAX_TOMBSTONES`].
+    local: HashMap<u64, Tombstone>,
+    /// Tombstones read from the shared bucket (issue #461),
+    /// by object name, replaced whole by each refresh.
+    shared: HashMap<String, Tombstone>,
 }
 
 /// What one purge removes: the matching rule the tiers
 /// remove by, kept for as long as the purge runs.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PurgeTarget {
     /// A base cache key: the bare key and its
     /// `#`-suffixed variants.
@@ -168,9 +341,11 @@ pub enum PurgeTarget {
 impl PurgeTarget {
     /// Whether this purge removes an entry stored under
     /// `key` with `groups`.
-    fn covers(&self, key: &str, groups: &[String]) -> bool {
+    pub(crate) fn covers(&self, key: &str, groups: &[String]) -> bool {
         match self {
-            PurgeTarget::Key(base) => key == base || key.starts_with(&format!("{base}#")),
+            PurgeTarget::Key(base) => key
+                .strip_prefix(base.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('#')),
             PurgeTarget::Group(group) => groups.iter().any(|g| g == group),
             PurgeTarget::Source(source) => key_belongs_to_source(key, source),
         }
@@ -181,12 +356,29 @@ impl PurgeTarget {
 /// until the last tier it reaches is done, the shared
 /// walk's background remainder included. Dropping the
 /// handle ends it, so a purge task that finishes, panics,
-/// or is torn down never leaves it behind.
+/// or is torn down never leaves it behind; its tombstone
+/// then lives on for [`TOMBSTONE_GRACE_MS`].
 #[must_use = "the purge counts as active only while the handle lives"]
 #[derive(Debug)]
 pub struct ActivePurge {
     guard: Arc<PurgeGuard>,
     generation: u64,
+    tombstone: Tombstone,
+}
+
+impl ActivePurge {
+    /// The purge's tombstone as it stands while it runs:
+    /// what the shared bucket records for the other
+    /// replicas (issue #461).
+    pub fn tombstone(&self) -> &Tombstone {
+        &self.tombstone
+    }
+
+    /// The purge's generation, unique within this process:
+    /// part of its tombstone's object name.
+    pub fn sequence(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl Drop for ActivePurge {
@@ -196,20 +388,70 @@ impl Drop for ActivePurge {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(target) = inner.active.remove(&self.generation) {
-            inner.generation += 1;
-            let ended_at = inner.generation;
-            inner.ended.push_back((ended_at, target));
-            if inner.ended.len() > MAX_TOMBSTONES {
-                inner.ended.pop_front();
-            }
+        let now = now_ms();
+        if let Some(tombstone) = inner.local.get_mut(&self.generation) {
+            tombstone.ended_ms = Some(now);
+        }
+        trim_local(&mut inner.local, now);
+    }
+}
+
+/// Drop the local tombstones whose grace has passed, then
+/// the oldest ended ones past the cap. Running purges stay.
+fn trim_local(local: &mut HashMap<u64, Tombstone>, now: u64) {
+    local.retain(|_, tombstone| tombstone.live(now));
+    let mut ended: Vec<u64> = local
+        .iter()
+        .filter(|(_, tombstone)| tombstone.ended_ms.is_some())
+        .map(|(generation, _)| *generation)
+        .collect();
+    if ended.len() > MAX_TOMBSTONES {
+        ended.sort_unstable();
+        for generation in &ended[..ended.len() - MAX_TOMBSTONES] {
+            local.remove(generation);
         }
     }
 }
 
 impl PurgeGuard {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Mutex::new(PurgeGuardInner::default()),
+            writer: boot_writer_id(),
+            clock: AtomicU64::new(0),
+        }
+    }
+
+    /// A stamp time for `now`: never earlier than any time
+    /// this process issued before.
+    fn stamp_ms(&self, now: u64) -> u64 {
+        self.clock.fetch_max(now, Ordering::SeqCst).max(now)
+    }
+
+    /// A purge start for `now`: strictly later than every
+    /// stamp this process issued before it, so a copy
+    /// rendered before the purge is covered by it even
+    /// within the same millisecond or after the host clock
+    /// stepped back, and every stamp issued after it is no
+    /// earlier.
+    fn purge_start_ms(&self, now: u64) -> u64 {
+        let next = |last: u64| last.saturating_add(1).max(now);
+        // A plain compare-exchange loop rather than
+        // fetch_update, which newer toolchains deprecate in
+        // favour of try_update: the loop builds the same on
+        // every toolchain from the MSRV up.
+        let mut last = self.clock.load(Ordering::SeqCst);
+        loop {
+            match self.clock.compare_exchange_weak(
+                last,
+                next(last),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next(last),
+                Err(actual) => last = actual,
+            }
+        }
     }
 
     /// The current purge generation: a writer snapshots
@@ -219,20 +461,48 @@ impl PurgeGuard {
         self.inner.lock().unwrap().generation
     }
 
-    /// Start a purge of `target`: record its tombstone at
-    /// a fresh generation and mark it active, in one step,
-    /// so no lookup can fall between the two. The purge
-    /// stays active until the returned handle is dropped;
-    /// the caller holds it until every tier it purges is
-    /// done.
+    /// The stamp for a render starting now on this process
+    /// (issues #446, #461). Taken after the render's
+    /// [`PurgeGuard::snapshot`], so a purge that begins
+    /// between the two is caught by the generation, and one
+    /// that begins after both starts strictly later than the
+    /// stamp, so it covers the render's copies.
+    pub fn stamp(&self) -> WriteStamp {
+        WriteStamp {
+            at_ms: self.stamp_ms(now_ms()),
+            writer: self.writer,
+        }
+    }
+
+    /// Start a purge of `target`: record its generation
+    /// tombstone and its stamped tombstone in one step, so
+    /// no lookup or write can fall between the two. The
+    /// purge stays running until the returned handle is
+    /// dropped; the caller holds it until every tier it
+    /// purges is done.
     pub fn begin(self: &Arc<Self>, target: PurgeTarget) -> ActivePurge {
         let mut inner = self.inner.lock().unwrap();
         let generation = record_tombstone(&mut inner, &target);
-        inner.active.insert(generation, target);
+        let tombstone = Tombstone {
+            target,
+            cutoff: PurgeCutoff {
+                start_ms: self.purge_start_ms(now_ms()),
+                writer: self.writer,
+            },
+            ended_ms: None,
+        };
+        inner.local.insert(generation, tombstone.clone());
         ActivePurge {
             guard: Arc::clone(self),
             generation,
+            tombstone,
         }
+    }
+
+    /// Replace the tombstones read from the shared bucket
+    /// with a fresh reading (issue #461).
+    pub fn replace_shared(&self, tombstones: HashMap<String, Tombstone>) {
+        self.inner.lock().unwrap().shared = tombstones;
     }
 
     /// Record a purge of the entries keyed at `base` (the
@@ -261,32 +531,66 @@ impl PurgeGuard {
         record_tombstone(&mut self.inner.lock().unwrap(), &target)
     }
 
-    /// Whether a purge that was running at any point
-    /// since `snapshot` covers an entry stored under `key`
-    /// with `groups` (issue #400): one still running, or
-    /// one that ended after the reader took its snapshot,
-    /// whenever it began. A tier copy such a reader holds
-    /// may have been read before the purge reached it, so
-    /// it must read as a miss. A reader that starts after
-    /// the purge ended is unaffected.
-    pub fn running_covers(&self, snapshot: u64, key: &str, groups: &[String]) -> bool {
+    /// Whether a live tombstone covers a persisted copy
+    /// stored under `key` with `groups` and stamped
+    /// `written` (issues #400, #446, #461): a purge this
+    /// process started that is still running or within its
+    /// grace, or one read from the shared bucket, that began
+    /// after the copy was written. Such a copy is a miss,
+    /// whenever the lookup that found it started: the purge
+    /// may not have reached it yet. A copy rendered after
+    /// every matching purge began is not covered.
+    pub fn running_covers(
+        &self,
+        key: &str,
+        groups: &[String],
+        written: Option<WriteStamp>,
+    ) -> bool {
+        self.running_covers_at(now_ms(), key, groups, written)
+    }
+
+    /// [`PurgeGuard::running_covers`] at a given time.
+    pub(crate) fn running_covers_at(
+        &self,
+        now: u64,
+        key: &str,
+        groups: &[String],
+        written: Option<WriteStamp>,
+    ) -> bool {
         let inner = self.inner.lock().unwrap();
         inner
-            .active
+            .local
             .values()
-            .any(|target| target.covers(key, groups))
-            || inner
-                .ended
-                .iter()
-                .rev()
-                .take_while(|(ended_at, _)| *ended_at > snapshot)
-                .any(|(_, target)| target.covers(key, groups))
+            .chain(inner.shared.values())
+            .any(|tombstone| tombstone.live(now) && tombstone.covers(key, groups, written))
+    }
+
+    /// Whether a write of a copy stamped `written`, begun
+    /// under `snapshot`, must not stand: a purge recorded
+    /// after the snapshot covers it (issue #350), or a live
+    /// tombstone covers the copy itself (issue #461), as
+    /// when a replica writes back a copy it held from before
+    /// another replica's purge.
+    pub fn write_covered(
+        &self,
+        snapshot: u64,
+        key: &str,
+        groups: &[String],
+        written: Option<WriteStamp>,
+    ) -> bool {
+        self.purge_covers(snapshot, key, groups) || self.running_covers(key, groups, written)
     }
 
     /// How many purges are still running.
     #[cfg(test)]
     pub fn active_count(&self) -> usize {
-        self.inner.lock().unwrap().active.len()
+        self.inner
+            .lock()
+            .unwrap()
+            .local
+            .values()
+            .filter(|tombstone| tombstone.ended_ms.is_none())
+            .count()
     }
 
     /// Whether a purge recorded after `snapshot` covers
@@ -304,6 +608,23 @@ impl PurgeGuard {
                 *purge_gen > snapshot && key_belongs_to_source(key, source)
             })
     }
+}
+
+/// A per-boot process id for write stamps: random, from
+/// the standard library's per-process hash keys (seeded
+/// from the OS), mixed with the clock and the pid. It only
+/// has to tell processes apart; it guards nothing.
+fn boot_writer_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    hasher.write_u32(std::process::id());
+    hasher.finish()
 }
 
 /// Record `target`'s tombstone at a fresh generation
@@ -517,6 +838,7 @@ mod tests {
             format: ImageFormat::Png,
             quality: None,
             groups: Vec::new(),
+            written: None,
         }
     }
 
@@ -694,72 +1016,194 @@ mod tests {
         assert!(guard.purge_covers(mid, "any/key", &["thumb".to_string()]));
     }
 
-    #[test]
-    fn active_purges_cover_later_readers_until_they_end() {
-        // Issue #400: a reader that starts after a purge
-        // snapshots the newer generation, so the tombstone
-        // alone lets it through. While the purge is still
-        // running, the active mark does not.
-        let guard = Arc::new(PurgeGuard::new());
-        let key_purge = guard.begin(PurgeTarget::Key("30x20/http://x/cat.jpg".into()));
-        let after = guard.snapshot();
-        assert!(!guard.purge_covers(after, "30x20/http://x/cat.jpg#w300", &[]));
-        assert!(guard.running_covers(after, "30x20/http://x/cat.jpg#w300", &[]));
-        assert!(guard.running_covers(after, "30x20/http://x/cat.jpg", &[]));
-        assert!(!guard.running_covers(after, "30x20/http://x/cat.jpg2", &[]));
-        assert!(!guard.running_covers(after, "30x20/http://x/dog.jpg", &[]));
-        // The mark and the tombstone go up together: a
-        // write begun before `begin` is stale.
-        assert!(guard.purge_covers(0, "30x20/http://x/cat.jpg", &[]));
-        let group_purge = guard.begin(PurgeTarget::Group("hero".into()));
-        let source_purge = guard.begin(PurgeTarget::Source("file:///heroes/dog.jpg".into()));
-        assert_eq!(guard.active_count(), 3);
-        let now = guard.snapshot();
-        assert!(guard.running_covers(now, "any/key", &["hero".to_string()]));
-        assert!(!guard.running_covers(now, "any/key", &["thumb".to_string()]));
-        assert!(guard.running_covers(now, "300x200/file:///heroes/dog.jpg#cfg1", &[]));
-        assert!(!guard.running_covers(now, "300x200/file:///heroes/dog.jpg2", &[]));
-        // Ending one purge leaves the others active, and
-        // its tombstone outlives the mark.
-        drop(key_purge);
-        let now = guard.snapshot();
-        assert!(!guard.running_covers(now, "30x20/http://x/cat.jpg#w300", &[]));
-        assert!(guard.purge_covers(0, "30x20/http://x/cat.jpg", &[]));
-        assert!(guard.running_covers(now, "any/key", &["hero".to_string()]));
-        drop(group_purge);
-        drop(source_purge);
-        assert_eq!(guard.active_count(), 0);
-        let now = guard.snapshot();
-        assert!(!guard.running_covers(now, "any/key", &["hero".to_string()]));
+    /// A stamp `offset_ms` from `cutoff`'s start, by the
+    /// purging process or by another one.
+    fn stamp_near(cutoff: &PurgeCutoff, offset_ms: i64, same_writer: bool) -> Option<WriteStamp> {
+        Some(WriteStamp {
+            at_ms: cutoff.start_ms.saturating_add_signed(offset_ms),
+            writer: if same_writer {
+                cutoff.writer
+            } else {
+                cutoff.writer ^ 1
+            },
+        })
     }
 
     #[test]
-    fn a_purge_that_ends_mid_lookup_still_covers_that_lookup() {
-        // Issue #400: a lookup under way while the purge
-        // runs can read a copy the walk has not deleted
-        // yet and only check it after the walk ended. A
-        // purge that ended after the lookup's snapshot
-        // still covers it; one that ended before does not.
+    fn a_cutoff_covers_copies_written_before_the_purge_began() {
+        // Issues #446, #461: a copy rendered before the
+        // purge began is purged, one rendered after it is
+        // not, and an unstamped copy predates every purge.
+        let cutoff = PurgeCutoff {
+            start_ms: 1_000_000,
+            writer: 42,
+        };
+        assert!(cutoff.covers(None));
+        // The purging process shares the purge's clock:
+        // the line is exact.
+        assert!(cutoff.covers(stamp_near(&cutoff, -1, true)));
+        assert!(!cutoff.covers(stamp_near(&cutoff, 0, true)));
+        assert!(!cutoff.covers(stamp_near(&cutoff, 1, true)));
+        // Another process's clock may run ahead: its copies
+        // count as pre-purge until the margin has passed.
+        assert!(cutoff.covers(stamp_near(&cutoff, 0, false)));
+        let margin = CLOCK_SKEW_MARGIN_MS as i64;
+        assert!(cutoff.covers(stamp_near(&cutoff, margin - 1, false)));
+        assert!(!cutoff.covers(stamp_near(&cutoff, margin, false)));
+        // The unbounded purge forms cover everything.
+        assert!(PurgeCutoff::EVERYTHING.covers(stamp_near(&cutoff, margin * 1000, false)));
+        assert!(PurgeCutoff::EVERYTHING.covers(None));
+    }
+
+    #[test]
+    fn a_running_purge_covers_only_copies_written_before_it_began() {
+        // Issue #446: while a purge runs, a persisted copy
+        // it covers is a miss only if it predates the
+        // purge; a render that starts after `begin` keeps
+        // its copies.
         let guard = Arc::new(PurgeGuard::new());
-        let before = guard.snapshot();
-        let purge = guard.begin(PurgeTarget::Group("hero".into()));
-        let during = guard.snapshot();
-        drop(purge);
-        let after = guard.snapshot();
+        let key_purge = guard.begin(PurgeTarget::Key("30x20/http://x/cat.jpg".into()));
+        let cutoff = key_purge.tombstone().cutoff;
+        let before = stamp_near(&cutoff, -1, true).unwrap();
+        let after = guard.stamp();
+        let key = "30x20/http://x/cat.jpg#w300";
+        assert!(guard.running_covers(key, &[], None));
+        assert!(guard.running_covers("30x20/http://x/cat.jpg", &[], Some(before)));
+        assert!(guard.running_covers(key, &[], stamp_near(&cutoff, -1, true)));
+        assert!(!guard.running_covers(key, &[], Some(after)));
+        assert!(!guard.running_covers("30x20/http://x/cat.jpg2", &[], None));
+        assert!(!guard.running_covers("30x20/http://x/dog.jpg", &[], None));
+        // A copy another replica wrote just after the purge
+        // began is inside the skew margin; one well after
+        // it is not.
+        assert!(guard.running_covers(key, &[], stamp_near(&cutoff, 1, false)));
+        let late = CLOCK_SKEW_MARGIN_MS as i64 + 1;
+        assert!(!guard.running_covers(key, &[], stamp_near(&cutoff, late, false)));
+        // Writes: one begun before `begin` is stale by its
+        // generation; a pre-purge copy written back later
+        // is stale by its stamp; a post-purge render is not.
+        assert!(guard.purge_covers(0, "30x20/http://x/cat.jpg", &[]));
+        let now = guard.snapshot();
+        assert!(guard.write_covered(now, key, &[], Some(before)));
+        assert!(!guard.write_covered(now, key, &[], Some(after)));
+        let group_purge = guard.begin(PurgeTarget::Group("hero".into()));
+        let source_purge = guard.begin(PurgeTarget::Source("file:///heroes/dog.jpg".into()));
+        assert_eq!(guard.active_count(), 3);
         let hero = ["hero".to_string()];
-        assert!(guard.running_covers(before, "any/key", &hero));
-        assert!(guard.running_covers(during, "any/key", &hero));
-        assert!(!guard.running_covers(during, "any/key", &["thumb".to_string()]));
-        assert!(!guard.running_covers(after, "any/key", &hero));
-        // Ending a purge records no tombstone: a write
-        // begun during the purge is not stale.
+        assert!(guard.running_covers("any/key", &hero, Some(before)));
+        assert!(!guard.running_covers("any/key", &["thumb".to_string()], None));
+        assert!(guard.running_covers("300x200/file:///heroes/dog.jpg#cfg1", &[], None));
+        assert!(!guard.running_covers("300x200/file:///heroes/dog.jpg2", &[], None));
+        drop(key_purge);
+        drop(group_purge);
+        drop(source_purge);
+        assert_eq!(guard.active_count(), 0);
+    }
+
+    #[test]
+    fn an_ended_purge_covers_older_copies_for_its_grace_only() {
+        // Issues #400, #461: a lookup that read a copy
+        // before the walk deleted it may check it after the
+        // walk ended, and a pre-purge copy can still be
+        // written back by a render that was already running
+        // somewhere. An ended purge keeps covering copies
+        // older than itself for its grace period, then
+        // stops.
+        let guard = Arc::new(PurgeGuard::new());
+        let purge = guard.begin(PurgeTarget::Group("hero".into()));
+        let before = stamp_near(&purge.tombstone().cutoff, -1, true);
+        let after = Some(guard.stamp());
+        drop(purge);
+        let hero = ["hero".to_string()];
+        assert!(guard.running_covers("any/key", &hero, before));
+        assert!(guard.running_covers("any/key", &hero, None));
+        assert!(!guard.running_covers("any/key", &hero, after));
+        assert!(!guard.running_covers("any/key", &["thumb".to_string()], None));
+        let past_grace = now_ms() + TOMBSTONE_GRACE_MS + 1;
+        assert!(!guard.running_covers_at(past_grace, "any/key", &hero, None));
+        // Ending a purge records no generation tombstone: a
+        // write begun during the purge is not stale.
+        let during = guard.snapshot();
         assert!(!guard.purge_covers(during, "any/key", &hero));
-        // Only recent endings are kept.
+        // Only the most recent endings are kept.
         for i in 0..MAX_TOMBSTONES {
             drop(guard.begin(PurgeTarget::Key(format!("k{i}"))));
         }
-        assert!(!guard.running_covers(during, "any/key", &hero));
-        assert!(guard.running_covers(during, "k0#w300", &[]));
+        assert!(!guard.running_covers("any/key", &hero, None));
+        assert!(guard.running_covers("k0#w300", &[], None));
+    }
+
+    #[test]
+    fn shared_tombstones_cover_until_their_grace_passes() {
+        // Issue #461: tombstones read from the shared
+        // bucket cover this process's copies by the same
+        // rule as its own purges.
+        let guard = PurgeGuard::new();
+        let cutoff = PurgeCutoff {
+            start_ms: now_ms(),
+            writer: 7,
+        };
+        let running = Tombstone {
+            target: PurgeTarget::Group("hero".into()),
+            cutoff,
+            ended_ms: None,
+        };
+        let ended = Tombstone {
+            target: PurgeTarget::Source("file:///a.jpg".into()),
+            cutoff,
+            ended_ms: Some(cutoff.start_ms),
+        };
+        guard.replace_shared(HashMap::from([
+            ("purges/a".to_string(), running),
+            ("purges/b".to_string(), ended),
+        ]));
+        let hero = ["hero".to_string()];
+        let own = guard.stamp();
+        assert!(guard.running_covers("k", &hero, None));
+        assert!(guard.running_covers("k", &hero, stamp_near(&cutoff, -10, false)));
+        // This process's copy written now is inside the
+        // margin of another process's purge that began now.
+        assert!(guard.running_covers("k", &hero, Some(own)));
+        assert!(!guard.running_covers("k", &hero, stamp_near(&cutoff, 6_000, false)));
+        assert!(guard.running_covers("1x1/file:///a.jpg", &[], None));
+        let later = cutoff.start_ms + TOMBSTONE_GRACE_MS + 1;
+        assert!(!guard.running_covers_at(later, "1x1/file:///a.jpg", &[], None));
+        // A tombstone whose walk never ended never expires.
+        assert!(guard.running_covers_at(later, "k", &hero, None));
+        // A refresh replaces the whole set.
+        guard.replace_shared(HashMap::new());
+        assert!(!guard.running_covers("k", &hero, None));
+    }
+
+    #[test]
+    fn an_ended_purge_supersedes_older_tombstones_of_its_target() {
+        let target = PurgeTarget::Group("hero".into());
+        let tombstone = |start_ms, writer, ended_ms| Tombstone {
+            target: target.clone(),
+            cutoff: PurgeCutoff { start_ms, writer },
+            ended_ms,
+        };
+        let crashed = tombstone(1_000, 1, None);
+        // A later walk by the same process that ended.
+        assert!(tombstone(2_000, 1, Some(9_000)).supersedes(&crashed));
+        // A walk still running supersedes nothing.
+        assert!(!tombstone(2_000, 1, None).supersedes(&crashed));
+        // Another process: only when it began at least the
+        // margin later, since each covers the other's copies
+        // with the margin.
+        assert!(!tombstone(2_000, 2, Some(9_000)).supersedes(&crashed));
+        let far = 1_000 + CLOCK_SKEW_MARGIN_MS;
+        assert!(tombstone(far, 2, Some(far)).supersedes(&crashed));
+        // Never an equal cutoff (two copies of one purge
+        // must not remove each other), an older one, or
+        // another target.
+        assert!(!tombstone(1_000, 1, Some(9_000)).supersedes(&crashed));
+        assert!(!crashed.supersedes(&tombstone(500, 1, Some(9_000))));
+        let other = Tombstone {
+            target: PurgeTarget::Group("thumb".into()),
+            ..tombstone(2_000, 1, Some(9_000))
+        };
+        assert!(!other.supersedes(&crashed));
     }
 
     #[test]
@@ -773,8 +1217,67 @@ mod tests {
         .join();
         assert!(joined.is_err());
         assert_eq!(guard.active_count(), 0);
-        let now = guard.snapshot();
-        assert!(!guard.running_covers(now, "any/key", &["hero".to_string()]));
+        // The tombstone outlives the task for its grace,
+        // ended, not running.
+        let fresh = guard.stamp();
+        assert!(!guard.running_covers("any/key", &["hero".to_string()], Some(fresh)));
+    }
+
+    #[test]
+    fn writer_ids_differ_per_guard() {
+        // Each boot gets its own writer id, so a restarted
+        // process compares its new copies against its old
+        // purges with the margin.
+        assert_ne!(PurgeGuard::new().writer, PurgeGuard::new().writer);
+    }
+
+    #[test]
+    fn one_process_orders_its_stamps_and_purges_by_event_not_by_wall_clock() {
+        // A copy and a purge of one process compare with no
+        // margin, so their times must follow the order of
+        // events. A copy rendered before a purge in the same
+        // millisecond, or before the host clock stepped
+        // back, must still be covered, or the walk would
+        // leave it in place for good; one rendered after the
+        // purge must not be, or it would churn.
+        let guard = PurgeGuard::new();
+        let own = |at_ms| {
+            Some(WriteStamp {
+                at_ms,
+                writer: guard.writer,
+            })
+        };
+        let cutoff = |start_ms| PurgeCutoff {
+            start_ms,
+            writer: guard.writer,
+        };
+        // The same millisecond: the purge starts after the
+        // render that preceded it.
+        let render = guard.stamp_ms(10_000);
+        let start = guard.purge_start_ms(10_000);
+        assert!(cutoff(start).covers(own(render)));
+        let after = guard.stamp_ms(10_000);
+        assert!(!cutoff(start).covers(own(after)));
+        // The clock steps back 3 s between a render and a
+        // purge: the purge still starts after the render.
+        let render = guard.stamp_ms(20_000);
+        let start = guard.purge_start_ms(17_000);
+        assert!(start > render);
+        assert!(cutoff(start).covers(own(render)));
+        // A render after that purge, before the wall clock
+        // has caught up, is not covered by it.
+        let after = guard.stamp_ms(17_001);
+        assert!(after >= start);
+        assert!(!cutoff(start).covers(own(after)));
+        // Once the wall clock passes, times follow it again.
+        assert_eq!(guard.stamp_ms(30_000), 30_000);
+        assert_eq!(guard.purge_start_ms(40_000), 40_000);
+        // The public paths use the same clock.
+        let purge = Arc::new(PurgeGuard::new());
+        let before = purge.stamp();
+        let active = purge.begin(PurgeTarget::Group("hero".into()));
+        assert!(active.tombstone().cutoff.start_ms > before.at_ms);
+        assert!(purge.stamp().at_ms >= active.tombstone().cutoff.start_ms);
     }
 
     #[test]

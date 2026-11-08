@@ -86,6 +86,8 @@ Pinned fetches connect directly and never go through a proxy: a proxy resolves t
 
 - **The signature never covers the defaults.** They are operator configuration, applied after verification, like preset expansion.
 - **Defaults sit before the URL's own operations**, and for the singleton directives (format, quality, fill, dpr, max_bytes) the URL wins by the default being dropped from the merged list. A bare request under defaults and the same request spelled out in full therefore produce the same operations and share a cache entry. Everything else (sizes, filters, watermarks) applies from both, in order: a default blur and a URL blur stack.
+- **Defaults are operations only.** `exp:` and `maxage:` are per-request metadata, so a defaults string that carries either refuses the boot with `invalid CRABCROP_DEFAULT_OPS`, as a preset definition carrying them does. Set a shorter cache lifetime on the URLs that need it.
+- **Defaults count against the 100-operation cap** together with each URL's own operations, after the merge: a default the URL overrides is dropped and does not count (see [the URL grammar](url-grammar.md#how-requests-work)). A defaults string that alone runs past the cap refuses the boot, since every request under it would answer `400`.
 - **Cache entries key on the merged operations**, exactly like presets, so changing the defaults changes the keys and old entries age out unused. Purges account for the merge too: purging a URL removes its merged entry.
 - **Presets-only mode is unaffected in what it rejects** (the URL's own operations), and the defaults still apply: they are not URL content.
 - Cache groups stay the URL's own presets; a preset referenced only by the defaults does not join entries to its group.
@@ -100,3 +102,7 @@ Rotation never invalidates a URL that is already in the wild, in three steps:
 3. **Close the window.** When the old key's URLs have aged out of your caches and pages (the result cache's `max-age` is one year, but in practice your own TTLs and page lifetimes govern), remove `CRABCROP_SECRET_PREVIOUS` and restart. From that moment the old secret verifies nothing: its remaining URLs answer `403`, which is the point of rotating.
 
 An unknown key ID is indistinguishable from a bad signature, by design: `403`, no hint about which IDs exist.
+
+### Diagnostics
+
+`CRABCROP_STUDIO_TIMING`, set to any value, prints the elapsed time of each `studio(...)` pipeline stage to stderr, one `[studio-timing] <stage>: <ms> ms` line per stage. It is a profiling aid, read once per process: responses, cache keys, and the configuration fingerprint are unchanged. Leave it unset in production.

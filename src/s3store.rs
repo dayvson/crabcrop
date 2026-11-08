@@ -9,25 +9,55 @@
 //! prefix. Purges match on each entry's stored key and
 //! groups, read from the entry header alone (a ranged read,
 //! never the whole object; audit R2-24), and per-URL purges
-//! additionally delete the target's enumerable key variants
-//! directly by their deterministic object names.
+//! additionally reach the target's enumerable key variants
+//! directly by their deterministic object names. A purge
+//! removes only the copies written before it began (issue
+//! #446, by the write stamp in each header), and deletes
+//! each one conditionally on the ETag it read, so a fresh
+//! render that replaces the object meanwhile survives.
+//!
+//! Purges also leave tombstones in the bucket (issue #461),
+//! under the `purges/` sub-prefix, which the walk skips:
+//! every replica reads them at boot and on a short refresh,
+//! so a purge stays effective on every replica, and across
+//! a restart, while its walk runs and for a grace period
+//! after.
 //!
 //! Like the disk store, every operation is best-effort: a
 //! network or service error degrades to a miss or a dropped
 //! write, never a failed request, because a cache must not
 //! take the pipeline down with it. Requests are signed with
 //! SigV4 exactly like the source loader's (`sigv4`), with the
-//! same ambient AWS credential chain; with no credentials the
-//! requests go unsigned, for local S3-compatible development
-//! stores.
+//! same credentials: `AWS_ACCESS_KEY_ID` and
+//! `AWS_SECRET_ACCESS_KEY`, plus the optional
+//! `AWS_SESSION_TOKEN`, read once from the environment at
+//! startup (no credential chain is consulted). With no
+//! credentials the requests go unsigned, for local
+//! S3-compatible development stores.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::cache::{CachedImage, key_belongs_to_source};
+use crate::cache::{CachedImage, PurgeCutoff, PurgeGuard, PurgeTarget, Tombstone, now_ms};
 use crate::sigv4::{self, Credentials};
-use crate::storage::{MAX_ENTRY_BYTES, key_stem, parse_entry, parse_entry_header, serialize_entry};
+use crate::storage::{
+    HeaderProbe, MAX_ENTRY_BYTES, MAX_TOMBSTONE_BYTES, key_stem, parse_entry, parse_entry_header,
+    parse_tombstone, serialize_entry, serialize_tombstone,
+};
+
+/// The sub-prefix purge tombstones live under (issue #461),
+/// inside the store prefix. The purge walk never reads it,
+/// and entry objects (`<64 hex>.bin`) never fall inside it.
+const TOMBSTONE_DIR: &str = "purges/";
+
+/// How many tombstones a refresh keeps, newest first. Purges
+/// are operator actions and a tombstone expires a grace
+/// period after its walk ends, so the live set stays small;
+/// the cap bounds the reads a hostile or neglected prefix
+/// can cost a refresh.
+const MAX_SHARED_TOMBSTONES: usize = 1024;
 
 /// The outcome of a conditional raw write
 /// ([`S3Store::put_raw_if_absent`]).
@@ -63,6 +93,11 @@ pub struct S3Store {
     /// not turn a lookup or a purge walk into an unbounded
     /// allocation.
     max_entry_bytes: usize,
+    /// The tombstones the last refresh read (issue #461),
+    /// by object name, with the ETag the listing gave each:
+    /// a refresh fetches only the objects that are new or
+    /// changed since.
+    tombstones: std::sync::Mutex<HashMap<String, (String, Tombstone)>>,
     /// Tier failures, counted and logged as they happen
     /// (issue #367): the shared tier stays best-effort,
     /// but a store that rejects every write must be
@@ -119,6 +154,7 @@ impl S3Store {
             region,
             creds,
             entry_key,
+            tombstones: std::sync::Mutex::new(HashMap::new()),
             max_entry_bytes: MAX_ENTRY_BYTES,
             errors: std::sync::atomic::AtomicU64::new(0),
         })
@@ -144,21 +180,8 @@ impl S3Store {
     /// as it passes the cap instead of after it has been
     /// buffered whole. `None` on a transport error or an
     /// oversized body; both read as a cache miss upstream.
-    async fn read_capped(&self, mut resp: reqwest::Response) -> Option<Vec<u8>> {
-        if resp
-            .content_length()
-            .is_some_and(|n| n > self.max_entry_bytes as u64)
-        {
-            return None;
-        }
-        let mut data = Vec::new();
-        while let Some(chunk) = resp.chunk().await.ok()? {
-            if data.len().checked_add(chunk.len())? > self.max_entry_bytes {
-                return None;
-            }
-            data.extend_from_slice(&chunk);
-        }
-        Some(data)
+    async fn read_capped(&self, resp: reqwest::Response) -> Option<Vec<u8>> {
+        read_capped_at(resp, self.max_entry_bytes).await
     }
 
     fn object_key(&self, stem: &str) -> String {
@@ -272,6 +295,14 @@ impl S3Store {
     /// is an ordinary miss, but a store that cannot be
     /// reached at all must not look like one.
     pub async fn get(&self, key: &str) -> Option<CachedImage> {
+        self.get_tagged(key).await.map(|(image, _)| image)
+    }
+
+    /// [`S3Store::get`], plus the object's ETag as the store
+    /// reported it, so a caller that decides to delete the
+    /// copy it read can delete exactly that copy (issue
+    /// #446) with [`S3Store::remove_if_match`].
+    pub async fn get_tagged(&self, key: &str) -> Option<(CachedImage, Option<String>)> {
         let object = self.object_key(&key_stem(key));
         let resp = match self.request("GET", &object, &[], Vec::new()).await {
             Some(resp) => resp,
@@ -283,12 +314,13 @@ impl S3Store {
         if !resp.status().is_success() {
             return None;
         }
+        let etag = response_etag(&resp);
         let data = self.read_capped(resp).await?;
         let (stored_key, image) = parse_entry(&data, &self.entry_key)?;
         if stored_key != key {
             return None;
         }
-        Some(image)
+        Some((image, etag))
     }
 
     /// Store `image` under `key`. The write stays
@@ -314,6 +346,19 @@ impl S3Store {
     pub async fn remove(&self, key: &str) {
         let object = self.object_key(&key_stem(key));
         self.delete_object(&object).await;
+    }
+
+    /// Delete the entry stored under `key` only while the
+    /// object is still the one whose ETag is `etag` (issue
+    /// #446): a copy a lookup found purged is removed, but a
+    /// fresh render that replaced it since is left alone.
+    /// Without an ETag the delete is unconditional. A store
+    /// that ignores the precondition, or refuses it as not
+    /// implemented, deletes unconditionally, the behavior
+    /// before it.
+    pub async fn remove_if_match(&self, key: &str, etag: Option<&str>) {
+        let object = self.object_key(&key_stem(key));
+        self.delete_object_if_match(&object, etag).await;
     }
 
     /// Store raw bytes under `name`, verbatim (issue #168):
@@ -396,44 +441,56 @@ impl S3Store {
     }
 
     /// Every object key under the store prefix, following
-    /// continuation tokens. An error yields what was listed so
-    /// far (possibly nothing).
+    /// continuation tokens, minus the tombstone sub-prefix
+    /// (issue #461): the purge walk's input. An error yields
+    /// what was listed so far (possibly nothing).
     async fn list_objects(&self) -> Vec<String> {
-        let mut keys = Vec::new();
+        let tombstones = self.tombstone_prefix();
+        self.list_under(&self.prefix)
+            .await
+            .0
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| !key.starts_with(&tombstones))
+            .collect()
+    }
+
+    /// Every (object key, ETag) under `prefix`, following
+    /// continuation tokens, and whether the listing ran to
+    /// its end. An error stops the listing where it is.
+    async fn list_under(&self, prefix: &str) -> (Vec<(String, String)>, bool) {
+        let mut listed = Vec::new();
         let mut token: Option<String> = None;
         loop {
             let mut query: Vec<(&str, &str)> = vec![("list-type", "2")];
-            if !self.prefix.is_empty() {
-                query.push(("prefix", self.prefix.as_str()));
+            if !prefix.is_empty() {
+                query.push(("prefix", prefix));
             }
             if let Some(t) = &token {
                 query.push(("continuation-token", t.as_str()));
             }
             let Some(resp) = self.request("GET", "", &query, Vec::new()).await else {
-                break;
+                return (listed, false);
             };
             if !resp.status().is_success() {
-                break;
+                return (listed, false);
             }
-            let Ok(text) = resp.text().await else { break };
-            for chunk in text.split("<Key>").skip(1) {
-                if let Some(end) = chunk.find("</Key>") {
-                    keys.push(xml_unescape(&chunk[..end]));
+            let Ok(text) = resp.text().await else {
+                return (listed, false);
+            };
+            for block in text.split("<Contents>").skip(1) {
+                if let Some(key) = xml_field(block, "Key") {
+                    listed.push((key, xml_field(block, "ETag").unwrap_or_default()));
                 }
             }
             if !text.contains("<IsTruncated>true</IsTruncated>") {
-                break;
+                return (listed, true);
             }
-            token = text
-                .split("<NextContinuationToken>")
-                .nth(1)
-                .and_then(|rest| rest.split("</NextContinuationToken>").next())
-                .map(xml_unescape);
+            token = xml_field(&text, "NextContinuationToken");
             if token.is_none() {
-                break;
+                return (listed, false);
             }
         }
-        keys
     }
 
     /// How much of an object the purge walk reads to learn
@@ -454,7 +511,7 @@ impl S3Store {
     /// are only ever SERVED through `get`, which verifies.
     /// Objects past the entry size ceiling are refused
     /// outright, exactly as `get` refuses them.
-    async fn read_entry_header(&self, object: &str) -> Option<(String, Vec<String>)> {
+    async fn read_entry_header(&self, object: &str) -> Option<ProbedEntry> {
         let range = format!("bytes=0-{}", Self::HEADER_PROBE_BYTES - 1);
         let resp = self
             .request_h("GET", object, &[], Vec::new(), &[("range", range.as_str())])
@@ -462,6 +519,8 @@ impl S3Store {
         if !resp.status().is_success() {
             return None;
         }
+        // A ranged GET reports the whole object's ETag.
+        let etag = response_etag(&resp);
         let partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         // The object's real length: from Content-Range on a
         // partial response, else the response's own length.
@@ -476,14 +535,22 @@ impl S3Store {
             return None;
         }
         let data = self.read_capped(resp).await?;
+        let whole = |data: &[u8]| {
+            let (key, image) = parse_entry(data, &self.entry_key)?;
+            Some(HeaderProbe {
+                key,
+                groups: image.groups,
+                written: image.written,
+            })
+        };
         if !partial || data.len() as u64 >= total {
             // The whole object arrived (the store ignored
             // the range, or the entry fits in the probe).
-            let (key, image) = parse_entry(&data, &self.entry_key)?;
-            return Some((key, image.groups));
+            let header = whole(&data)?;
+            return Some(ProbedEntry { header, etag });
         }
         match parse_entry_header(&data, total as usize) {
-            Some(found) => Some(found),
+            Some(header) => Some(ProbedEntry { header, etag }),
             None => {
                 // The header outgrew the probe: one full
                 // read of this object settles it.
@@ -491,9 +558,10 @@ impl S3Store {
                 if !resp.status().is_success() {
                     return None;
                 }
+                let etag = response_etag(&resp);
                 let data = self.read_capped(resp).await?;
-                let (key, image) = parse_entry(&data, &self.entry_key)?;
-                Some((key, image.groups))
+                let header = whole(&data)?;
+                Some(ProbedEntry { header, etag })
             }
         }
     }
@@ -509,10 +577,59 @@ impl S3Store {
     /// Delete one object; returns whether the store
     /// accepted the deletion.
     async fn delete_object(&self, object: &str) -> bool {
-        match self.request("DELETE", object, &[], Vec::new()).await {
+        self.delete_object_if_match(object, None).await
+    }
+
+    /// Delete one object, conditionally on its ETag when one
+    /// is given (`If-Match`): the store refuses with `412`
+    /// when the object changed since it was read, and the
+    /// delete then reports false. Returns whether the store
+    /// accepted the deletion.
+    async fn delete_object_if_match(&self, object: &str, etag: Option<&str>) -> bool {
+        let headers: Vec<(&str, &str)> = match etag {
+            Some(etag) => vec![("if-match", etag)],
+            None => Vec::new(),
+        };
+        match self
+            .request_h("DELETE", object, &[], Vec::new(), &headers)
+            .await
+        {
+            // A store without conditional deletes may refuse
+            // the precondition outright instead of ignoring
+            // it. The caller has just read this copy and
+            // found it purged, so delete it as before
+            // preconditions were sent; otherwise no purge
+            // could remove anything from such a store.
+            Some(resp)
+                if etag.is_some() && resp.status() == reqwest::StatusCode::NOT_IMPLEMENTED =>
+            {
+                match self.request("DELETE", object, &[], Vec::new()).await {
+                    Some(resp) => resp.status().is_success(),
+                    None => false,
+                }
+            }
             Some(resp) => resp.status().is_success(),
             None => false,
         }
+    }
+
+    /// Purge one object if it holds a copy `target` covers
+    /// that was written before `cutoff` (issue #446): read
+    /// its header, then delete it conditionally on the ETag
+    /// that read saw. A copy written after the purge began,
+    /// or one that changed between the read and the delete,
+    /// stays and is not counted. Returns whether a covered
+    /// copy was deleted.
+    async fn purge_object(&self, object: &str, target: &PurgeTarget, cutoff: PurgeCutoff) -> bool {
+        let Some(probed) = self.read_entry_header(object).await else {
+            return false;
+        };
+        let header = &probed.header;
+        if !target.covers(&header.key, &header.groups) || !cutoff.covers(header.written) {
+            return false;
+        }
+        self.delete_object_if_match(object, probed.etag.as_deref())
+            .await
     }
 
     /// Remove every entry whose stored key is `base` or one
@@ -537,41 +654,52 @@ impl S3Store {
     /// unbounded `purge_group` and `purge_source` below.
     #[allow(dead_code)]
     pub async fn purge_matching(&self, base: &str, epoch_base: &str) -> usize {
-        let mut removed = self.delete_epoch_variants(epoch_base).await;
-        removed += self
-            .purge_where(&PurgeCriterion::KeyOrVariant(base.to_string()), None)
-            .await
-            .0;
-        removed
+        let target = PurgeTarget::Key(base.to_string());
+        self.purge_bounded(
+            &target,
+            Some(epoch_base),
+            PurgeCutoff::EVERYTHING,
+            usize::MAX,
+        )
+        .await
+        .0
     }
 
-    /// [`S3Store::purge_matching`] with a bounded inline
-    /// scan (issue #368): the walk reads at most `budget`
-    /// entry headers before returning, and any remainder
-    /// comes back as a [`PendingPurge`] for
-    /// [`S3Store::finish_purge`]. The direct variant
-    /// deletes are bounded by construction and always run
-    /// inline.
-    pub async fn purge_matching_bounded(
+    /// Remove the copies `target` covers that were written
+    /// before `cutoff` (issues #368, #446), with a bounded
+    /// inline scan: the walk reads at most `budget` entry
+    /// headers before returning, and any remainder comes
+    /// back as a [`PendingPurge`] for
+    /// [`S3Store::finish_purge`]. For a per-URL purge,
+    /// `epoch_base` names the current epoch's form of the
+    /// key, whose enumerable variants are reached directly
+    /// by object name first; those reads are bounded by
+    /// construction and always run inline.
+    pub async fn purge_bounded(
         &self,
-        base: &str,
-        epoch_base: &str,
+        target: &PurgeTarget,
+        epoch_base: Option<&str>,
+        cutoff: PurgeCutoff,
         budget: usize,
     ) -> (usize, Option<PendingPurge>) {
-        let mut removed = self.delete_epoch_variants(epoch_base).await;
-        let (walked, pending) = self
-            .purge_where(
-                &PurgeCriterion::KeyOrVariant(base.to_string()),
-                Some(budget),
-            )
-            .await;
-        removed += walked;
-        (removed, pending)
+        let mut removed = 0;
+        if let Some(epoch_base) = epoch_base {
+            removed += self.purge_epoch_variants(epoch_base, target, cutoff).await;
+        }
+        let objects = self.list_objects().await;
+        let (walked, pending) = self.purge_walk(target, cutoff, objects, budget).await;
+        (removed + walked, pending)
     }
 
-    /// Delete the current epoch's enumerable variants of
-    /// a key directly by object name (audit R2-24).
-    async fn delete_epoch_variants(&self, epoch_base: &str) -> usize {
+    /// Purge the current epoch's enumerable variants of a
+    /// key directly by object name (audit R2-24), under the
+    /// same stamp rule as the walk.
+    async fn purge_epoch_variants(
+        &self,
+        epoch_base: &str,
+        target: &PurgeTarget,
+        cutoff: PurgeCutoff,
+    ) -> usize {
         let mut removed = 0;
         for candidate in [
             epoch_base.to_string(),
@@ -581,7 +709,7 @@ impl S3Store {
             format!("{epoch_base}#source"),
         ] {
             let object = self.object_key(&key_stem(&candidate));
-            if self.object_exists(&object).await && self.delete_object(&object).await {
+            if self.purge_object(&object, target, cutoff).await {
                 removed += 1;
             }
         }
@@ -592,20 +720,10 @@ impl S3Store {
     /// how many entries were removed.
     #[allow(dead_code)]
     pub async fn purge_group(&self, group: &str) -> usize {
-        self.purge_where(&PurgeCriterion::Group(group.to_string()), None)
+        let target = PurgeTarget::Group(group.to_string());
+        self.purge_bounded(&target, None, PurgeCutoff::EVERYTHING, usize::MAX)
             .await
             .0
-    }
-
-    /// [`S3Store::purge_group`] with a bounded inline scan
-    /// (issue #368); see [`S3Store::purge_matching_bounded`].
-    pub async fn purge_group_bounded(
-        &self,
-        group: &str,
-        budget: usize,
-    ) -> (usize, Option<PendingPurge>) {
-        self.purge_where(&PurgeCriterion::Group(group.to_string()), Some(budget))
-            .await
     }
 
     /// Remove every entry whose result derives from
@@ -615,103 +733,181 @@ impl S3Store {
     /// Returns how many entries were removed.
     #[allow(dead_code)]
     pub async fn purge_source(&self, source: &str) -> usize {
-        self.purge_where(&PurgeCriterion::Source(source.to_string()), None)
+        let target = PurgeTarget::Source(source.to_string());
+        self.purge_bounded(&target, None, PurgeCutoff::EVERYTHING, usize::MAX)
             .await
             .0
-    }
-
-    /// [`S3Store::purge_source`] with a bounded inline
-    /// scan (issue #368); see
-    /// [`S3Store::purge_matching_bounded`].
-    pub async fn purge_source_bounded(
-        &self,
-        source: &str,
-        budget: usize,
-    ) -> (usize, Option<PendingPurge>) {
-        self.purge_where(&PurgeCriterion::Source(source.to_string()), Some(budget))
-            .await
     }
 
     /// Complete a bounded purge's remainder (issue #368):
     /// walk the objects the inline budget did not reach
-    /// and delete the matches. Returns how many entries
-    /// were removed.
+    /// and delete the covered copies. Returns how many
+    /// entries were removed.
     pub async fn finish_purge(&self, pending: PendingPurge) -> usize {
-        self.purge_walk(&pending.criterion, pending.objects, None)
+        self.purge_walk(&pending.target, pending.cutoff, pending.objects, usize::MAX)
             .await
             .0
     }
 
-    /// List the tier and walk it under `criterion`,
-    /// reading at most `budget` entry headers when a
-    /// budget is given; the un-scanned remainder comes
-    /// back as a [`PendingPurge`].
-    async fn purge_where(
-        &self,
-        criterion: &PurgeCriterion,
-        budget: Option<usize>,
-    ) -> (usize, Option<PendingPurge>) {
-        let objects = self.list_objects().await;
-        self.purge_walk(criterion, objects, budget).await
-    }
-
     /// The shared purge walk: read each entry's header,
-    /// delete the matches. Reads are header-sized (see
-    /// [`S3Store::read_entry_header`]), never whole
+    /// delete the covered copies (see
+    /// [`S3Store::purge_object`]). Reads are header-sized
+    /// (see [`S3Store::read_entry_header`]), never whole
     /// entries.
     async fn purge_walk(
         &self,
-        criterion: &PurgeCriterion,
+        target: &PurgeTarget,
+        cutoff: PurgeCutoff,
         objects: Vec<String>,
-        budget: Option<usize>,
+        budget: usize,
     ) -> (usize, Option<PendingPurge>) {
         let mut removed = 0;
         for (index, object) in objects.iter().enumerate() {
-            if budget.is_some_and(|b| index >= b) {
+            if index >= budget {
                 return (
                     removed,
                     Some(PendingPurge {
-                        criterion: criterion.clone(),
+                        target: target.clone(),
+                        cutoff,
                         objects: objects[index..].to_vec(),
                     }),
                 );
             }
-            let Some((stored_key, groups)) = self.read_entry_header(object).await else {
-                continue;
-            };
-            if !criterion.matches(&stored_key, &groups) {
-                continue;
-            }
-            if self.delete_object(object).await {
+            if self.purge_object(object, target, cutoff).await {
                 removed += 1;
             }
         }
         (removed, None)
     }
-}
 
-/// What a shared-tier purge walk removes (issue #368):
-/// the matching rule of one purge call, named so an
-/// unfinished walk can travel to a background task.
-#[derive(Clone)]
-enum PurgeCriterion {
-    /// The key itself or one of its `#`-suffixed variants.
-    KeyOrVariant(String),
-    /// Entries recorded in the named cache group.
-    Group(String),
-    /// Entries derived from the named source.
-    Source(String),
-}
+    fn tombstone_prefix(&self) -> String {
+        format!("{}{TOMBSTONE_DIR}", self.prefix)
+    }
 
-impl PurgeCriterion {
-    fn matches(&self, stored_key: &str, groups: &[String]) -> bool {
-        match self {
-            PurgeCriterion::KeyOrVariant(base) => {
-                stored_key == base.as_str() || stored_key.starts_with(&format!("{base}#"))
-            }
-            PurgeCriterion::Group(group) => groups.iter().any(|g| g == group),
-            PurgeCriterion::Source(source) => key_belongs_to_source(stored_key, source),
+    /// Record `tombstone` in the bucket (issue #461), under
+    /// a name unique to its purge: its start, its writer,
+    /// and `sequence`, unique within the writer. Returns the
+    /// object name, for marking the walk's end; `None` when
+    /// the write failed, which is counted and logged: the
+    /// purge then holds on this process only, as before
+    /// tombstones existed.
+    pub async fn put_tombstone(&self, tombstone: &Tombstone, sequence: u64) -> Option<String> {
+        let object = format!(
+            "{}{}-{:016x}-{sequence}",
+            self.tombstone_prefix(),
+            tombstone.cutoff.start_ms,
+            tombstone.cutoff.writer
+        );
+        self.write_tombstone(&object, tombstone)
+            .await
+            .then_some(object)
+    }
+
+    /// Write `tombstone` to `object`: the first record, or
+    /// the rewrite that marks its walk's end. Returns
+    /// whether the store accepted it.
+    pub async fn write_tombstone(&self, object: &str, tombstone: &Tombstone) -> bool {
+        let data = serialize_tombstone(tombstone, &self.entry_key);
+        if data.len() > MAX_TOMBSTONE_BYTES {
+            self.note_error("cannot record a purge tombstone", "target too long");
+            return false;
         }
+        match self.request("PUT", object, &[], data).await {
+            Some(resp) if resp.status().is_success() => true,
+            Some(resp) => {
+                self.note_error(
+                    "cannot record a purge tombstone",
+                    &format!("status {}", resp.status()),
+                );
+                false
+            }
+            None => {
+                self.note_error("cannot record a purge tombstone", "transport error");
+                false
+            }
+        }
+    }
+
+    /// Read one tombstone object: capped, authenticated, and
+    /// consistent with the name it is stored under. Anything
+    /// else (a plant, another deployment's record, a copy
+    /// moved to another name) is ignored, never trusted.
+    async fn read_tombstone(&self, object: &str, start_ms: u64, writer: u64) -> Option<Tombstone> {
+        let resp = self.request("GET", object, &[], Vec::new()).await?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let data = read_capped_at(resp, MAX_TOMBSTONE_BYTES).await?;
+        let tombstone = parse_tombstone(&data, &self.entry_key)?;
+        (tombstone.cutoff.start_ms == start_ms && tombstone.cutoff.writer == writer)
+            .then_some(tombstone)
+    }
+
+    /// Re-read the bucket's tombstones into `guard` (issue
+    /// #461): list the tombstone sub-prefix, fetch what is
+    /// new or changed since the last refresh (newest first,
+    /// at most `MAX_SHARED_TOMBSTONES`), and replace the
+    /// guard's shared set. Tombstones whose grace has passed,
+    /// or that a finished walk of the same target superseded,
+    /// are deleted from the bucket on the way: every replica
+    /// collects them, so no single process has to outlive
+    /// its grace period. A listing that fails part way keeps
+    /// the previous set, so a flaky store cannot make a purge
+    /// lapse; the failure is counted. Returns whether the
+    /// refresh completed.
+    pub async fn refresh_tombstones(&self, guard: &PurgeGuard) -> bool {
+        let prefix = self.tombstone_prefix();
+        let (listed, complete) = self.list_under(&prefix).await;
+        if !complete {
+            self.note_error("cannot list purge tombstones", "listing failed");
+            return false;
+        }
+        let mut named: Vec<(u64, u64, String, String)> = listed
+            .into_iter()
+            .filter_map(|(object, etag)| {
+                let (start_ms, writer) = parse_tombstone_name(object.strip_prefix(&prefix)?)?;
+                Some((start_ms, writer, object, etag))
+            })
+            .collect();
+        named.sort_by_key(|(start_ms, ..)| std::cmp::Reverse(*start_ms));
+        named.truncate(MAX_SHARED_TOMBSTONES);
+        let previous = self.tombstones.lock().unwrap().clone();
+        let mut fresh: HashMap<String, (String, Tombstone)> = HashMap::new();
+        for (start_ms, writer, object, etag) in named {
+            if !etag.is_empty()
+                && let Some((seen, tombstone)) = previous.get(&object)
+                && *seen == etag
+            {
+                fresh.insert(object, (etag, tombstone.clone()));
+                continue;
+            }
+            if let Some(tombstone) = self.read_tombstone(&object, start_ms, writer).await {
+                fresh.insert(object, (etag, tombstone));
+            }
+        }
+        let now = now_ms();
+        let spent: Vec<String> = fresh
+            .iter()
+            .filter(|(object, (_, tombstone))| {
+                !tombstone.live(now)
+                    || fresh
+                        .iter()
+                        .any(|(other, (_, newer))| other != *object && newer.supersedes(tombstone))
+            })
+            .map(|(object, _)| object.clone())
+            .collect();
+        for object in &spent {
+            fresh.remove(object);
+            self.delete_object(object).await;
+        }
+        guard.replace_shared(
+            fresh
+                .iter()
+                .map(|(object, (_, tombstone))| (object.clone(), tombstone.clone()))
+                .collect(),
+        );
+        *self.tombstones.lock().unwrap() = fresh;
+        true
     }
 }
 
@@ -721,8 +917,74 @@ impl PurgeCriterion {
 /// it to [`S3Store::finish_purge`] to complete the
 /// purge off the request path.
 pub struct PendingPurge {
-    criterion: PurgeCriterion,
+    target: PurgeTarget,
+    cutoff: PurgeCutoff,
     objects: Vec<String>,
+}
+
+/// The outcome of reading one entry's header for a purge:
+/// what the header claims, and the object's ETag at the
+/// moment it was read, for a conditional delete.
+struct ProbedEntry {
+    header: HeaderProbe,
+    etag: Option<String>,
+}
+
+/// Read a response body under `cap` bytes, streaming so an
+/// oversized object is refused as soon as it passes the cap
+/// instead of after it has been buffered whole. `None` on a
+/// transport error or an oversized body; both read as a
+/// miss upstream.
+async fn read_capped_at(mut resp: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return None;
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if data.len().checked_add(chunk.len())? > cap {
+            return None;
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Some(data)
+}
+
+/// The ETag a store reported for an object, verbatim.
+fn response_etag(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Parse a tombstone's object name below the sub-prefix,
+/// `<start-ms>-<writer, 16 hex>-<sequence>`, into its start
+/// and writer. Anything else is not a tombstone this build
+/// wrote, and is never fetched.
+fn parse_tombstone_name(name: &str) -> Option<(u64, u64)> {
+    let mut parts = name.split('-');
+    let (start, writer, sequence) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    if parts.next().is_some()
+        || !digits(start)
+        || !digits(sequence)
+        || writer.len() != 16
+        || !writer.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((start.parse().ok()?, u64::from_str_radix(writer, 16).ok()?))
+}
+
+/// The unescaped text of the first `<tag>` element in
+/// `xml`, if any.
+fn xml_field(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml_unescape(&xml[start..end]))
 }
 
 /// The five predefined XML entities, the only escaping S3
@@ -751,6 +1013,9 @@ pub(crate) mod test_support {
         pub put: bool,
         pub delete: bool,
         pub list: bool,
+        /// Answer a conditional DELETE with 501, as a store
+        /// without conditional deletes may.
+        pub if_match_delete: bool,
     }
 
     /// A minimal in-process S3: PUT/GET/DELETE plus
@@ -780,7 +1045,20 @@ pub(crate) mod test_support {
         pub hold_object_gets: Arc<AtomicBool>,
         /// Whole-object GETs held right now.
         pub held_object_gets: Arc<AtomicUsize>,
+        /// While set, a DELETE waits before it is handled,
+        /// so a test can replace the object between a purge
+        /// walk's header read and its delete.
+        pub hold_deletes: Arc<AtomicBool>,
+        /// DELETEs held right now.
+        pub held_deletes: Arc<AtomicUsize>,
         pub endpoint: String,
+    }
+
+    /// The ETag the fake reports for an object's bytes:
+    /// quoted, and different whenever the bytes differ.
+    pub fn etag_of(data: &[u8]) -> String {
+        use sha2::Digest as _;
+        format!("\"{}\"", hex::encode(&sha2::Sha256::digest(data)[..16]))
     }
 
     pub async fn start_fake() -> FakeS3 {
@@ -791,6 +1069,8 @@ pub(crate) mod test_support {
         let hold_ranged_after: Arc<StdMutex<Option<usize>>> = Arc::new(StdMutex::new(None));
         let hold_object_gets = Arc::new(AtomicBool::new(false));
         let held_object_gets = Arc::new(AtomicUsize::new(0));
+        let hold_deletes = Arc::new(AtomicBool::new(false));
+        let held_deletes = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = objects.clone();
@@ -800,6 +1080,8 @@ pub(crate) mod test_support {
         let shared_hold = hold_ranged_after.clone();
         let shared_hold_objects = hold_object_gets.clone();
         let shared_held_objects = held_object_gets.clone();
+        let shared_hold_deletes = hold_deletes.clone();
+        let shared_held_deletes = held_deletes.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let objects = shared.clone();
@@ -809,6 +1091,8 @@ pub(crate) mod test_support {
                 let hold_ranged_after = shared_hold.clone();
                 let hold_object_gets = shared_hold_objects.clone();
                 let held_object_gets = shared_held_objects.clone();
+                let hold_deletes = shared_hold_deletes.clone();
+                let held_deletes = shared_held_deletes.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -830,6 +1114,7 @@ pub(crate) mod test_support {
                     let mut content_length: usize = 0;
                     let mut range_end: Option<usize> = None;
                     let mut if_none_match: Option<String> = None;
+                    let mut if_match: Option<String> = None;
                     let mut content_type: Option<String> = None;
                     for line in lines {
                         let lower = line.to_ascii_lowercase();
@@ -848,6 +1133,9 @@ pub(crate) mod test_support {
                         if let Some(v) = lower.strip_prefix("if-none-match:") {
                             if_none_match = Some(v.trim().to_string());
                         }
+                        if let Some(v) = lower.strip_prefix("if-match:") {
+                            if_match = Some(v.trim().to_string());
+                        }
                     }
                     while buf.len() < header_end + content_length {
                         let n = socket.read(&mut chunk).await.unwrap_or(0);
@@ -860,6 +1148,13 @@ pub(crate) mod test_support {
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default().to_string();
                     let target = parts.next().unwrap_or_default().to_string();
+                    if method == "DELETE" && hold_deletes.load(Ordering::SeqCst) {
+                        held_deletes.fetch_add(1, Ordering::SeqCst);
+                        while hold_deletes.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        held_deletes.fetch_sub(1, Ordering::SeqCst);
+                    }
                     if method == "GET" && range_end.is_some() {
                         let seen = ranged_gets.fetch_add(1, Ordering::SeqCst);
                         while hold_ranged_after
@@ -882,6 +1177,9 @@ pub(crate) mod test_support {
                         if if_none_match.is_some() {
                             line.push_str(" if-none-match");
                         }
+                        if if_match.is_some() {
+                            line.push_str(" if-match");
+                        }
                         if let Some(content_type) = &content_type {
                             line.push_str(&format!(" content-type={content_type}"));
                         }
@@ -894,7 +1192,10 @@ pub(crate) mod test_support {
                         &target,
                         body,
                         range_end,
-                        if_none_match.as_deref(),
+                        Conditions {
+                            if_none_match: if_none_match.as_deref(),
+                            if_match: if_match.as_deref(),
+                        },
                     );
                     if method == "GET"
                         && range_end.is_none()
@@ -928,6 +1229,8 @@ pub(crate) mod test_support {
             hold_ranged_after,
             hold_object_gets,
             held_object_gets,
+            hold_deletes,
+            held_deletes,
             endpoint: format!("http://127.0.0.1:{port}"),
         }
     }
@@ -955,6 +1258,12 @@ pub(crate) mod test_support {
         String::from_utf8_lossy(&out).to_string()
     }
 
+    /// The conditional request headers the fake honors.
+    struct Conditions<'a> {
+        if_none_match: Option<&'a str>,
+        if_match: Option<&'a str>,
+    }
+
     fn handle(
         objects: &StdMutex<HashMap<String, Vec<u8>>>,
         fail: &StdMutex<FailFlags>,
@@ -962,8 +1271,12 @@ pub(crate) mod test_support {
         target: &str,
         body: Vec<u8>,
         range_end: Option<usize>,
-        if_none_match: Option<&str>,
+        conditions: Conditions<'_>,
     ) -> (String, Vec<u8>, String) {
+        let Conditions {
+            if_none_match,
+            if_match,
+        } = conditions;
         let (path, query) = match target.split_once('?') {
             Some((p, q)) => (p, q),
             None => (target, ""),
@@ -1003,46 +1316,70 @@ pub(crate) mod test_support {
                 // Keys list in ascending order, as S3 lists
                 // them, so a test can place objects ahead of
                 // others in a purge walk.
-                let mut keys: Vec<String> = objects
+                let mut keys: Vec<(String, String)> = objects
                     .lock()
                     .unwrap()
-                    .keys()
-                    .filter(|k| k.starts_with(&prefix))
-                    .cloned()
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, v)| (k.clone(), etag_of(v)))
                     .collect();
                 keys.sort();
-                for k in keys {
-                    xml += &format!("<Contents><Key>{k}</Key></Contents>");
+                for (k, etag) in keys {
+                    // S3 escapes the ETag's quotes in listings.
+                    let etag = etag.replace('"', "&quot;");
+                    xml += &format!("<Contents><Key>{k}</Key><ETag>{etag}</ETag></Contents>");
                 }
                 xml += "</ListBucketResult>";
                 ("200 OK".into(), xml.into_bytes(), String::new())
             }
             ("GET", false) if fail.get_object => error,
             ("GET", false) => match objects.lock().unwrap().get(&key) {
-                Some(v) => match range_end {
-                    Some(end) if end + 1 < v.len() => {
-                        let total = v.len();
-                        (
-                            "206 Partial Content".into(),
-                            v[..=end].to_vec(),
-                            format!("content-range: bytes 0-{end}/{total}\r\n"),
-                        )
+                Some(v) => {
+                    let etag = format!("etag: {}\r\n", etag_of(v));
+                    match range_end {
+                        Some(end) if end + 1 < v.len() => {
+                            let total = v.len();
+                            (
+                                "206 Partial Content".into(),
+                                v[..=end].to_vec(),
+                                format!("content-range: bytes 0-{end}/{total}\r\n{etag}"),
+                            )
+                        }
+                        _ => ("200 OK".into(), v.clone(), etag),
                     }
-                    _ => ("200 OK".into(), v.clone(), String::new()),
-                },
+                }
                 None => ("404 Not Found".into(), Vec::new(), String::new()),
             },
             ("HEAD", _) if fail.get_object => error,
             ("HEAD", _) => match objects.lock().unwrap().get(&key) {
                 // The payload stands in for the length; the
                 // connection loop writes none of it.
-                Some(v) => ("200 OK".into(), v.clone(), String::new()),
+                Some(v) => (
+                    "200 OK".into(),
+                    v.clone(),
+                    format!("etag: {}\r\n", etag_of(v)),
+                ),
                 None => ("404 Not Found".into(), Vec::new(), String::new()),
             },
             ("DELETE", _) if fail.delete => error,
+            ("DELETE", _) if fail.if_match_delete && if_match.is_some() => {
+                ("501 Not Implemented".into(), Vec::new(), String::new())
+            }
             ("DELETE", _) => {
-                objects.lock().unwrap().remove(&key);
-                ("204 No Content".into(), Vec::new(), String::new())
+                let mut objects = objects.lock().unwrap();
+                match (if_match, objects.get(&key)) {
+                    // A conditional delete of a missing
+                    // object, or of one whose bytes changed
+                    // since the ETag was read, is refused.
+                    (Some(_), None) => ("404 Not Found".into(), Vec::new(), String::new()),
+                    (Some(expected), Some(v)) if etag_of(v) != expected => {
+                        ("412 Precondition Failed".into(), Vec::new(), String::new())
+                    }
+                    _ => {
+                        objects.remove(&key);
+                        ("204 No Content".into(), Vec::new(), String::new())
+                    }
+                }
             }
             _ => ("400 Bad Request".into(), Vec::new(), String::new()),
         }
@@ -1079,6 +1416,26 @@ mod tests {
             quality: Some(80),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             etag: crate::cache::etag_for_bytes(bytes),
+            written: None,
+        }
+    }
+
+    /// `image`, stamped `offset_ms` from `cutoff`'s start by
+    /// the purging process.
+    fn stamped(bytes: &[u8], groups: &[&str], cutoff: &PurgeCutoff, offset_ms: i64) -> CachedImage {
+        CachedImage {
+            written: Some(crate::cache::WriteStamp {
+                at_ms: cutoff.start_ms.saturating_add_signed(offset_ms),
+                writer: cutoff.writer,
+            }),
+            ..image(bytes, groups)
+        }
+    }
+
+    fn hero_cutoff() -> PurgeCutoff {
+        PurgeCutoff {
+            start_ms: 1_762_000_000_000,
+            writer: 0xabc,
         }
     }
 
@@ -1189,7 +1546,10 @@ mod tests {
             s.put(&format!("k{i}"), &image(b"x", &["hero"])).await;
         }
         s.put("other", &image(b"x", &["side"])).await;
-        let (removed, pending) = s.purge_group_bounded("hero", 2).await;
+        let hero = PurgeTarget::Group("hero".into());
+        let (removed, pending) = s
+            .purge_bounded(&hero, None, PurgeCutoff::EVERYTHING, 2)
+            .await;
         assert!(removed <= 2, "inline removals bounded: {removed}");
         let pending = pending.expect("a remainder past the budget");
         let rest = s.finish_purge(pending).await;
@@ -1198,9 +1558,368 @@ mod tests {
         // A budget above the object count leaves nothing
         // pending.
         s.put("k9", &image(b"x", &["hero"])).await;
-        let (removed, pending) = s.purge_group_bounded("hero", 128).await;
+        let (removed, pending) = s
+            .purge_bounded(&hero, None, PurgeCutoff::EVERYTHING, 128)
+            .await;
         assert_eq!(removed, 1);
         assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_walk_leaves_and_does_not_count_copies_written_after_the_purge_began() {
+        // Issue #446: the walk removes the copies written
+        // before the purge began (and unstamped ones, which
+        // predate every purge) and leaves fresh renders in
+        // place, uncounted, inline and in the remainder alike.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        let cutoff = hero_cutoff();
+        s.put("old", &stamped(b"1", &["hero"], &cutoff, -1)).await;
+        s.put("legacy", &image(b"2", &["hero"])).await;
+        s.put("fresh", &stamped(b"3", &["hero"], &cutoff, 0)).await;
+        s.put("fresher", &stamped(b"4", &["hero"], &cutoff, 60_000))
+            .await;
+        // Another replica's copy from just after the purge
+        // began is inside the skew margin: purged.
+        let mut foreign = stamped(b"5", &["hero"], &cutoff, 1_000);
+        foreign.written.as_mut().unwrap().writer ^= 1;
+        s.put("foreign", &foreign).await;
+        let hero = PurgeTarget::Group("hero".into());
+        let (inline, pending) = s.purge_bounded(&hero, None, cutoff, 2).await;
+        let rest = s.finish_purge(pending.expect("a remainder")).await;
+        assert_eq!(inline + rest, 3);
+        assert!(s.get("old").await.is_none());
+        assert!(s.get("legacy").await.is_none());
+        assert!(s.get("foreign").await.is_none());
+        assert!(s.get("fresh").await.is_some());
+        assert!(s.get("fresher").await.is_some());
+        // A per-URL purge's direct variant reads apply the
+        // same rule.
+        let base = "30x20/http://x/a.jpg";
+        let epoch = format!("{base}#cfgtest");
+        s.put(&epoch, &stamped(b"6", &[], &cutoff, -5)).await;
+        s.put(&format!("{epoch}#avif"), &stamped(b"7", &[], &cutoff, 5))
+            .await;
+        let key = PurgeTarget::Key(base.into());
+        let (removed, _) = s.purge_bounded(&key, Some(&epoch), cutoff, 128).await;
+        assert_eq!(removed, 1);
+        assert!(s.get(&epoch).await.is_none());
+        assert!(s.get(&format!("{epoch}#avif")).await.is_some());
+        // Every delete the walk sent was conditional.
+        let requests = fake.requests.lock().unwrap().clone();
+        let deletes: Vec<&String> = requests
+            .iter()
+            .filter(|r| r.starts_with("DELETE"))
+            .collect();
+        assert!(!deletes.is_empty());
+        assert!(
+            deletes.iter().all(|r| r.ends_with(" if-match")),
+            "{deletes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_walk_spares_a_copy_replaced_between_its_read_and_its_delete() {
+        // Issue #446 (and the older #368 race): a fresh
+        // render that lands under the object name the walk
+        // just read must survive its delete and not count.
+        let fake = start_fake().await;
+        let s = std::sync::Arc::new(store(&fake.endpoint));
+        let cutoff = hero_cutoff();
+        s.put("k", &stamped(b"old", &["hero"], &cutoff, -1)).await;
+        fake.hold_deletes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let walker = s.clone();
+        let walk = tokio::spawn(async move {
+            let hero = PurgeTarget::Group("hero".into());
+            walker.purge_bounded(&hero, None, cutoff, 128).await.0
+        });
+        for _ in 0..500 {
+            if fake.held_deletes.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fake.held_deletes.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        // A post-purge render overwrites the object while
+        // the delete is in flight.
+        s.put("k", &stamped(b"new", &["hero"], &cutoff, 10)).await;
+        fake.hold_deletes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(walk.await.unwrap(), 0);
+        assert_eq!(
+            s.get("k").await.unwrap().bytes,
+            bytes::Bytes::from_static(b"new")
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_if_match_removes_only_the_copy_it_read() {
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        s.put("k", &image(b"one", &[])).await;
+        let (_, etag) = s.get_tagged("k").await.unwrap();
+        let etag = etag.expect("the store reports an ETag");
+        s.put("k", &image(b"two", &[])).await;
+        s.remove_if_match("k", Some(&etag)).await;
+        assert!(s.get("k").await.is_some(), "a replaced copy was removed");
+        let (_, etag) = s.get_tagged("k").await.unwrap();
+        s.remove_if_match("k", etag.as_deref()).await;
+        assert!(s.get("k").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_store_that_refuses_conditional_deletes_still_purges() {
+        // A store without conditional deletes may answer an
+        // If-Match DELETE with 501 instead of ignoring the
+        // header. Purges must still remove the copies they
+        // found purged, in the walk and on sight, or nothing
+        // would ever leave such a store.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        fake.fail.lock().unwrap().if_match_delete = true;
+        let cutoff = hero_cutoff();
+        s.put("old", &stamped(b"1", &["hero"], &cutoff, -1)).await;
+        s.put("fresh", &stamped(b"2", &["hero"], &cutoff, 1)).await;
+        let hero = PurgeTarget::Group("hero".into());
+        let (removed, pending) = s.purge_bounded(&hero, None, cutoff, 128).await;
+        assert_eq!(removed, 1);
+        assert!(pending.is_none());
+        assert!(s.get("old").await.is_none());
+        assert!(s.get("fresh").await.is_some());
+        s.put("k", &image(b"one", &[])).await;
+        let (_, etag) = s.get_tagged("k").await.unwrap();
+        s.remove_if_match("k", etag.as_deref()).await;
+        assert!(s.get("k").await.is_none());
+        // Each removal was tried with the precondition first.
+        let requests = fake.requests.lock().unwrap().clone();
+        let conditional = requests
+            .iter()
+            .filter(|r| r.starts_with("DELETE") && r.ends_with(" if-match"))
+            .count();
+        assert_eq!(conditional, 2, "{requests:?}");
+    }
+
+    fn tombstone_for(group: &str, cutoff: PurgeCutoff, ended_ms: Option<u64>) -> Tombstone {
+        Tombstone {
+            target: PurgeTarget::Group(group.into()),
+            cutoff,
+            ended_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn tombstones_reach_another_replica_and_the_walk_skips_them() {
+        // Issue #461: a purge's tombstone, written by one
+        // replica, covers another replica's copies once it
+        // refreshes, and the purge walk never reads or
+        // deletes it.
+        let fake = start_fake().await;
+        let a = store(&fake.endpoint);
+        let b = store(&fake.endpoint);
+        let cutoff = PurgeCutoff {
+            start_ms: now_ms(),
+            writer: 0xa,
+        };
+        let name = a
+            .put_tombstone(&tombstone_for("hero", cutoff, None), 1)
+            .await
+            .expect("tombstone stored");
+        assert!(name.starts_with("cache/purges/"), "{name}");
+        let guard = PurgeGuard::new();
+        assert!(b.refresh_tombstones(&guard).await);
+        assert!(guard.running_covers("k", &["hero".to_string()], None));
+        assert!(!guard.running_covers("k", &["side".to_string()], None));
+        // Neither the walk nor its count sees it: it is
+        // never read, deleted, or counted.
+        let gets_before = count_gets(&fake, &name);
+        s_put_hero(&a).await;
+        assert_eq!(a.purge_group("hero").await, 1);
+        assert!(fake.objects.lock().unwrap().contains_key(&name));
+        assert_eq!(count_gets(&fake, &name), gets_before);
+        // A second refresh reuses what it read: no new GET.
+        assert!(b.refresh_tombstones(&guard).await);
+        assert_eq!(count_gets(&fake, &name), gets_before);
+        // Marking the walk's end rewrites the record, which
+        // the next refresh picks up by its new ETag; the
+        // tombstone still covers during its grace.
+        let ended = tombstone_for("hero", cutoff, Some(now_ms()));
+        assert!(a.write_tombstone(&name, &ended).await);
+        assert!(b.refresh_tombstones(&guard).await);
+        assert_eq!(count_gets(&fake, &name), gets_before + 1);
+        assert!(guard.running_covers("k", &["hero".to_string()], None));
+    }
+
+    async fn s_put_hero(s: &S3Store) {
+        s.put("member", &image(b"m", &["hero"])).await;
+    }
+
+    fn count_gets(fake: &super::test_support::FakeS3, object: &str) -> usize {
+        let line = format!("GET {object}");
+        fake.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| **r == line)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn spent_tombstones_are_collected_and_live_ones_kept() {
+        // Issue #461: a tombstone whose grace has passed, or
+        // that a finished walk of the same target
+        // supersedes, is deleted by whichever replica
+        // refreshes next; a walk that never ended keeps its
+        // tombstone until then.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        let now = now_ms();
+        let at = |start_ms| PurgeCutoff {
+            start_ms,
+            writer: 0xa,
+        };
+        let expired = s
+            .put_tombstone(
+                &tombstone_for(
+                    "old",
+                    at(now - 2 * crate::cache::TOMBSTONE_GRACE_MS),
+                    Some(now - crate::cache::TOMBSTONE_GRACE_MS - 1),
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        let crashed = s
+            .put_tombstone(&tombstone_for("hero", at(now - 10_000), None), 2)
+            .await
+            .unwrap();
+        let repurged = s
+            .put_tombstone(&tombstone_for("hero", at(now - 5_000), Some(now)), 3)
+            .await
+            .unwrap();
+        let unrelated = s
+            .put_tombstone(&tombstone_for("side", at(now - 60_000), None), 4)
+            .await
+            .unwrap();
+        let guard = PurgeGuard::new();
+        assert!(s.refresh_tombstones(&guard).await);
+        let objects = fake.objects.lock().unwrap().clone();
+        assert!(!objects.contains_key(&expired));
+        assert!(!objects.contains_key(&crashed));
+        assert!(objects.contains_key(&repurged));
+        assert!(objects.contains_key(&unrelated));
+        assert!(guard.running_covers("k", &["hero".to_string()], None));
+        assert!(guard.running_covers("k", &["side".to_string()], None));
+        assert!(!guard.running_covers("k", &["old".to_string()], None));
+    }
+
+    #[tokio::test]
+    async fn hostile_tombstone_objects_are_ignored() {
+        // Hostile input: the bucket is operator-adjacent,
+        // not trusted. Plants without the secret, records
+        // moved to another name, oversized and malformed
+        // objects, and foreign names are ignored (and never
+        // deleted); a listing failure keeps the previous set
+        // instead of letting a purge lapse.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        let cutoff = PurgeCutoff {
+            start_ms: now_ms(),
+            writer: 0xa,
+        };
+        let real = s
+            .put_tombstone(&tombstone_for("hero", cutoff, None), 1)
+            .await
+            .unwrap();
+        let mut other_secret = store(&fake.endpoint);
+        other_secret.entry_key = crate::url::entry_key(b"another deployment");
+        let planted = other_secret
+            .put_tombstone(&tombstone_for("victim", cutoff, None), 2)
+            .await
+            .unwrap();
+        let record = fake.objects.lock().unwrap()[&real].clone();
+        let moved = format!(
+            "cache/purges/{}-{:016x}-9",
+            cutoff.start_ms + 1,
+            cutoff.writer
+        );
+        let junk = [
+            (moved.clone(), record.clone()),
+            ("cache/purges/garbage".to_string(), record.clone()),
+            (
+                format!("cache/purges/1-{:016x}-1", 7),
+                vec![b'x'; MAX_TOMBSTONE_BYTES + 1],
+            ),
+            (
+                format!("cache/purges/2-{:016x}-1", 7),
+                b"CRABPURGE1\nnot a record".to_vec(),
+            ),
+        ];
+        for (name, data) in &junk {
+            fake.objects
+                .lock()
+                .unwrap()
+                .insert(name.clone(), data.clone());
+        }
+        let guard = PurgeGuard::new();
+        assert!(s.refresh_tombstones(&guard).await);
+        assert!(guard.running_covers("k", &["hero".to_string()], None));
+        assert!(!guard.running_covers("k", &["victim".to_string()], None));
+        let objects = fake.objects.lock().unwrap().clone();
+        assert!(objects.contains_key(&planted));
+        for (name, _) in &junk {
+            assert!(objects.contains_key(name), "{name} was deleted");
+        }
+        // Names that are not tombstone names are never
+        // fetched.
+        let requests = fake.requests.lock().unwrap().clone();
+        assert!(
+            !requests.iter().any(|r| r == "GET cache/purges/garbage"),
+            "{requests:?}"
+        );
+        // A failed listing keeps what the guard had.
+        fake.fail.lock().unwrap().list = true;
+        assert!(!s.refresh_tombstones(&guard).await);
+        assert!(guard.running_covers("k", &["hero".to_string()], None));
+        fake.fail.lock().unwrap().list = false;
+        // A store that cannot be reached cannot record one;
+        // the failure is counted, not silent.
+        let unreachable = store("http://127.0.0.1:1");
+        let before = unreachable.errors();
+        assert!(
+            unreachable
+                .put_tombstone(&tombstone_for("hero", cutoff, None), 1)
+                .await
+                .is_none()
+        );
+        assert!(!unreachable.refresh_tombstones(&guard).await);
+        assert_eq!(unreachable.errors(), before + 2);
+    }
+
+    #[test]
+    fn tombstone_names_parse_strictly() {
+        assert_eq!(
+            parse_tombstone_name("1762000000000-00000000000000ab-3"),
+            Some((1_762_000_000_000, 0xab))
+        );
+        for bad in [
+            "",
+            "garbage",
+            "1-00000000000000ab",
+            "1-00000000000000ab-3-4",
+            "x-00000000000000ab-3",
+            "1-0000000000000ab-3",
+            "1-00000000000000ag-3",
+            "1-00000000000000ab-",
+            "-00000000000000ab-3",
+            "99999999999999999999999-00000000000000ab-3",
+            "18446744073709551616-00000000000000ab-3",
+        ] {
+            assert_eq!(parse_tombstone_name(bad), None, "{bad:?}");
+        }
     }
 
     #[tokio::test]

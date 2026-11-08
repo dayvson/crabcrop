@@ -35,14 +35,10 @@ const MAX_ANIMATED_FRAMES: usize = 200;
 const MAX_ANIMATED_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_OUTPUT_PIXELS: u64 = 100_000_000;
 
-/// The most operations one request may execute, after preset
-/// expansion (issue #182, audit R2-12): each operation counts
-/// once, and each filter inside a `filters:` segment counts
-/// once, because each is a pass over the pixels. Real chains
-/// (a size, a crop, a dozen filters) sit far below this; the
-/// cap exists so thousands of repeated cheap operations
-/// cannot burn a process-gate slot on CPU alone.
-const MAX_OPERATIONS: usize = 100;
+// The operation cap lives with the grammar (issue #469);
+// the engine's tests reach it from here through `super::*`.
+#[cfg(test)]
+use crate::url::MAX_OPERATIONS;
 
 /// The per-request encode budget (audit E-6): the
 /// quality(auto) verification loop and the max_bytes ladder
@@ -71,8 +67,11 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// checked in our own code, because decoder adherence to
 /// `max_alloc` varies by format; a probe failure is not fatal
 /// (some valid files have headers the probe cannot read), the
-/// limited decode behind it is the second line. Public
-/// for the fuzz harness's decode target (issue #417).
+/// limited decode behind it is the second line. An AVIF
+/// container is screened before either (issue #522): its
+/// parser reserves what the boxes declare, ahead of every
+/// limit here. Public for the fuzz harness's decode target
+/// (issue #417).
 pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     // AVIF decoding is compiled in only with the avif-decode
     // feature (issue #141): dav1d is a C dependency the
@@ -86,6 +85,8 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
             "AVIF sources cannot be decoded in this build (built without AVIF decoding: the Docker image and release binaries include it; source builds enable it with --features avif-decode)".to_string(),
         ));
     }
+    let screened = crate::avif::screen(bytes)?;
+    let bytes: &[u8] = &screened;
     let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
     if let Ok(probe) = probe
         && let Ok((width, height)) = probe.into_dimensions()
@@ -475,10 +476,15 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
         _ if crate::pdf::sniff_pdf(bytes) => "pdf",
         _ => "unknown",
     };
-    let dimensions = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|probe| probe.into_dimensions().ok());
+    // The probe parses an AVIF container too, so it is
+    // screened first (issue #522); a refused one states no
+    // dimensions.
+    let dimensions = crate::avif::screen(bytes).ok().and_then(|bytes| {
+        image::ImageReader::new(Cursor::new(&*bytes))
+            .with_guessed_format()
+            .ok()
+            .and_then(|probe| probe.into_dimensions().ok())
+    });
     SourceProbe { kind, dimensions }
 }
 
@@ -535,24 +541,14 @@ impl OutputBudget {
     }
 }
 
-/// Reject a request whose expanded operation list runs past
-/// [`MAX_OPERATIONS`]: the count the engine executes, not the
-/// count the URL spells, so preset expansion cannot multiply
-/// work past the cap (issue #182, audit R2-12).
+/// Reject an operation list past
+/// [`crate::url::MAX_OPERATIONS`] (issue #182, audit
+/// R2-12). The server refuses such a request at parse time,
+/// before any fetch (issue #469); this is the backstop for
+/// every other caller of the engine, with the same message
+/// and the same `unsupported_operation` class.
 fn check_operation_count(ops: &[Operation]) -> Result<(), EngineError> {
-    let count: usize = ops
-        .iter()
-        .map(|op| match op {
-            Operation::Filters(filters) => filters.len(),
-            _ => 1,
-        })
-        .sum();
-    if count > MAX_OPERATIONS {
-        return Err(EngineError::Unsupported(format!(
-            "request has {count} operations, over the {MAX_OPERATIONS} operation limit"
-        )));
-    }
-    Ok(())
+    crate::url::check_operation_count(ops).map_err(|e| EngineError::Unsupported(e.to_string()))
 }
 
 mod state;
@@ -697,12 +693,17 @@ impl Default for ProcessContext<'_> {
 /// sources (issue #261): the animated paths apply the
 /// chain per frame, so one request would run inference
 /// up to 200 times and hold an AI gate permit for
-/// minutes to hours. The set mirrors the AI gate's own
-/// (`RequestDirectives::uses_ai`) minus saliency smart
-/// crop, which is bounded pixel work, not inference,
-/// and stays available on animated sources under the
-/// processing deadline. A still spelling of the same
-/// source (a `frame:` selection renders one frame)
+/// minutes to hours. The set is the AI gate's own
+/// (`RequestDirectives::uses_ai_beyond_smart_crop`): a
+/// smart crop stays available on animated sources under
+/// the processing deadline. Its focal analysis is the
+/// built-in saliency statistic, or, with a face or focal
+/// provider configured, an inference that takes the AI
+/// gate like any other (issue #379). An animated image
+/// render runs that analysis once, on the first frame,
+/// and replays the window (issue #376); a video render
+/// still runs it on every frame. A still spelling of the
+/// same source (a `frame:` selection renders one frame)
 /// runs these operations normally.
 fn refuse_animated_ai(directives: &crate::url::RequestDirectives) -> Result<(), EngineError> {
     let inference_bound = directives.removebg
@@ -4249,12 +4250,6 @@ pub(in crate::engine) use encode::{
     EncodeBuffers, encode, gif_frame_quantized, max_quality_attempts, next_quality,
 };
 
-/// Overlay `wm` onto `base` at (x, y) with `alpha` percent
-/// opacity, honoring the watermark's own alpha channel.
-/// Negative coordinates anchor from the right/bottom edges
-/// (x = -1 puts the watermark's right edge one pixel from the
-/// base's right edge). Parts falling outside the base are
-/// clipped, never a panic.
 /// One channel of a blend mode: the CSS formulas on the
 /// 0-255 scale (`b` is the base channel, `o` the overlay's).
 fn blend_channel(mode: crate::url::BlendMode, b: f32, o: f32) -> f32 {
@@ -4358,6 +4353,12 @@ fn blend_overlay(
     Ok(DynamicImage::ImageRgba8(out))
 }
 
+/// Overlay `wm` onto `base` at (x, y) with `alpha` percent
+/// opacity, honoring the watermark's own alpha channel.
+/// Negative coordinates anchor from the right/bottom edges
+/// (x = -1 puts the watermark's right edge one pixel from the
+/// base's right edge). Parts falling outside the base are
+/// clipped, never a panic.
 fn overlay_watermark(
     base: &DynamicImage,
     wm: &DynamicImage,
@@ -4670,9 +4671,6 @@ pub(crate) fn resize_lanczos3_cropped(
     }
 }
 
-/// Scale proportionally to fit inside the `fit-in` box, preserving
-/// aspect and never distorting. A 0 dimension bounds nothing;
-/// `orig` bounds at the source dimension (a scale of 1).
 /// Pad `img` to exactly `target_w` x `target_h`: fit the image
 /// inside the box (the fit-in rules, `no_upscale` cap included),
 /// center it, and fill the rest of the canvas: a solid color
@@ -4771,6 +4769,12 @@ fn fit_in_box(size: &ImageSize, sw: u32, sh: u32, adaptive: bool) -> ImageSize {
     }
 }
 
+/// Scale proportionally to fit inside the `fit-in` box, preserving
+/// aspect and never distorting. A 0 dimension bounds nothing;
+/// `orig` bounds at the source dimension (a scale of 1). The box
+/// scales by `dpr` first, and with `adaptive` its axes swap to
+/// match the source's orientation (see [`fit_in_box`]); `cap`
+/// then shrinks the result to fit inside it (`no_upscale`).
 fn apply_fit_in(
     img: DynamicImage,
     size: &ImageSize,

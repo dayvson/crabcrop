@@ -18,6 +18,8 @@ GET /<signature>/<operations>/<source-url>
 /unsafe/crop:1200x630:smart/filters:grayscale:quality(80)/https://example.com/photo.jpg
 ```
 
+A request runs at most 100 operations. Each segment counts once, except `filters:`, where each filter counts once: the example above is three operations. The count is taken on what the server will run, after `preset:` references expand and with any server-wide default operations (`CRABCROP_DEFAULT_OPS`) merged in; `exp:` and `maxage:` are not operations and do not count. A request over the cap answers `400` with the code `unsupported_operation` and a body that names the count, such as `request has 101 operations, over the 100 operation limit`. The check runs right after parsing, on the image and `/explain` routes alike, so an over-cap URL never fetches its source. Real chains sit far below the cap; it exists so a URL that repeats cheap operations, or repeats a preset, cannot buy unbounded processing time.
+
 ### Sign a request
 
 Compute HMAC-SHA256 over the remainder of the path, the operations and the source URL exactly as they appear, with no leading slash, keyed with your `CRABCROP_SECRET`, and hex-encode the result:
@@ -89,7 +91,7 @@ The loader fetches the source under bounded limits, for every source kind:
 - 10 MiB maximum body by default (`CRABCROP_SOURCE_MAX_MB`); larger sources fail with `502` (the request was fine; the origin object is too big).
 - If an HTTP response carries a `Content-Type` header, it must start with `image/`. The exceptions are the media selections: when the URL carries a `frame:` segment, a `video/*` Content-Type is accepted too (see [Video frames](media.md#video-frames)), and when it carries a `page:` segment, `application/pdf` is accepted (see [PDF pages](media.md#pdf-pages)). Both admissions belong to the request, never to the response alone.
 
-Decoding is bounded too, so a small file cannot expand into gigabytes: at most 16384 px per axis and 256 MiB of decoder allocations, and animated GIF and WebP sources at most 200 frames, 100 million decoded pixels, and 256 MiB of decoded frames in total. Sources past the bounds fail with `502`.
+Decoding is bounded too, so a small file cannot expand into gigabytes: at most 16384 px per axis and 256 MiB of decoder allocations, and animated GIF and WebP sources at most 200 frames, 100 million decoded pixels, and 256 MiB of decoded frames in total. Sources past the bounds fail with `502`. An AVIF source's container is checked before it is parsed, since the parser sets memory aside for what the file declares: a box declaring more bytes than the file (or the box around it) holds, or an item count its box has no room for, fails with `502` before anything is set aside.
 
 HTTP and HTTPS sources additionally allow up to 5 redirects, with the [source policy](configuration.md#configuration) re-checked on every hop.
 

@@ -466,7 +466,6 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
 /// canned behavior, so the whole video path runs without
 /// a real encoder.
 async fn spawn_app_with_video(script: &str) -> String {
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -474,14 +473,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         std::env::temp_dir().join(format!("crabcrop-server-video-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(&path, script);
     let encoder =
         crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
             .unwrap();
@@ -553,7 +545,6 @@ async fn spawn_app_with_video(script: &str) -> String {
 /// and its extraction answers with the test PNG, so the
 /// whole frame path runs without a real decoder.
 async fn spawn_app_with_frame_decoder(report: &str) -> String {
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -566,14 +557,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         "#!/bin/sh\ncat > /dev/null\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then cat \"{frame_path}\"; exit 0; fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' {report} | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n"
     );
     let path = dir.join("decoder.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(&path, &script);
     let extractor =
         crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap();
     let state = AppState {
@@ -836,7 +820,6 @@ async fn explain_labels_a_video_source() {
 /// the bytes is a password refusal, CORRUPT is
 /// unreadable.
 async fn spawn_app_with_pdf_renderer() -> String {
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -847,14 +830,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
     let page_path = dir.join("page.png").display().to_string();
     let write_tool = |name: &str, script: String| {
         let path = dir.join(name);
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, &script);
         path
     };
     write_tool(
@@ -6532,15 +6508,14 @@ async fn meta_includes_the_inpaint_record() {
 }
 
 #[tokio::test]
-async fn meta_annotations_reuse_the_requests_ai_permit() {
+async fn ai_render_meta_sections_acquire_the_gate_after_the_render() {
     // A removebg request (AI use) answering meta on a
     // one-permit AI gate: the annotations must not wait
     // out the full gate timeout and silently drop both
-    // the tags and the detections (audit R2-29). They
-    // once ran under the permit the request held for
-    // its render; that permit now drains with the
-    // render job itself, so by annotation time the gate
-    // is free and the sections acquire it directly.
+    // the tags and the detections (audit R2-29). The
+    // render's permit drains with its job, so by
+    // annotation time the gate is free and each section
+    // acquires the one permit in turn.
     let src = spawn_image_server().await;
     let base = spawn_app_with_ai_and_meta().await;
     let remainder = format!("filters:removebg:format(png)/{src}");
@@ -8394,7 +8369,19 @@ fn tier_test_entry() -> CachedImage {
         quality: Some(80),
         groups: Vec::new(),
         etag: crate::cache::etag_for_bytes(b"tier-test-pixels"),
+        written: None,
     }
+}
+
+/// How many cache entry objects the fake bucket holds,
+/// leaving out purge tombstones (issue #461).
+fn entry_objects(fake: &crate::s3store::test_support::FakeS3) -> usize {
+    fake.objects
+        .lock()
+        .unwrap()
+        .keys()
+        .filter(|k| k.ends_with(".bin"))
+        .count()
 }
 
 /// Poll a lookup future exactly once, then drop it:
@@ -8691,6 +8678,135 @@ async fn default_ops_apply_in_presets_only_mode() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
+}
+
+/// GET a signed remainder on the image route (`""`) or
+/// the explain route (`"explain/"`), asking for the JSON
+/// envelope: the status and the parsed body.
+async fn get_signed_json(
+    base: &str,
+    route: &str,
+    remainder: &str,
+) -> (StatusCode, serde_json::Value) {
+    let resp = client()
+        .get(format!("{base}/{route}{}/{remainder}", sign(remainder)))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = serde_json::from_str(&resp.text().await.unwrap()).unwrap_or_default();
+    (status, body)
+}
+
+#[tokio::test]
+async fn over_cap_requests_answer_400_before_any_fetch() {
+    // Issue #469: the cap used to be checked by the engine
+    // alone, after the source was fetched and decoded, so an
+    // over-cap URL cost a fetch, and repeating a preset made
+    // one short to spell. It is checked on the expanded list
+    // at parse time now: every over-cap spelling below
+    // answers 400 on the image and explain routes, and the
+    // counting origin sees no request at all.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_presets(preset_test_map(), false).await;
+    let over_cap = [
+        // One segment, one filter past the cap.
+        format!("filters:{}", vec!["invert"; 101].join(":")),
+        // 101 single-operation segments.
+        vec!["30x20"; 101].join("/"),
+        // The issue's evidence: 4,985 preset references, a
+        // path of about 64 KB that expands to 4,985 sizes.
+        vec!["preset:small"; 4_985].join("/"),
+        // Metadata does not count and does not hide the
+        // operations around it.
+        format!(
+            "exp:{}/{}/maxage:60",
+            now_unix() + 3600,
+            vec!["preset:gray"; 101].join("/")
+        ),
+        // The longest single filters segment a URL can carry.
+        format!("filters:{}", vec!["invert"; 9_000].join(":")),
+    ];
+    let counts = [101, 101, 4_985, 101, 9_000];
+    for (ops, count) in over_cap.iter().zip(counts) {
+        let remainder = format!("{ops}/{src}");
+        for route in ["", "explain/"] {
+            let (status, body) = get_signed_json(&base, route, &remainder).await;
+            let label = format!("{route}{}", &ops[..ops.len().min(40)]);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(body["error"]["code"], "unsupported_operation", "{label}");
+            assert_eq!(
+                body["error"]["message"],
+                format!("request has {count} operations, over the 100 operation limit"),
+                "{label}"
+            );
+        }
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "an over-cap request fetched its source"
+    );
+    // Without the JSON ask the body is the plain message.
+    let remainder = format!("{}/{src}", over_cap[0]);
+    let resp = get_signed(&base, &remainder).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "request has 101 operations, over the 100 operation limit"
+    );
+    // A sealed spelling gets the uniform refusal, also
+    // without a fetch.
+    let resp = client()
+        .get(format!("{base}/{}", sealed_path(&remainder, Some("a.png"))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.text().await.unwrap(), "bad signature");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // Exactly at the cap still renders: the check refuses
+    // only past it, and the server survived the barrage.
+    let at_cap = format!("{}/{src}", vec!["30x20"; 100].join("/"));
+    let resp = get_signed(&base, &at_cap).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn over_cap_counts_the_default_operations_before_any_fetch() {
+    // Issue #469: the cap counts the merged list, defaults
+    // included, on both routes, and a default the URL
+    // overrides is dropped before counting.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app_with_defaults("filters:format(webp)", false).await;
+    // 100 of the URL's own plus the default format: 101.
+    let over = format!("{}/{src}", vec!["filters:invert"; 100].join("/"));
+    for route in ["", "explain/"] {
+        let (status, body) = get_signed_json(&base, route, &over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 101 operations, over the 100 operation limit",
+            "{route}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // 99 plus the default fits.
+    let fits = format!("{}/{src}", vec!["filters:invert"; 99].join("/"));
+    let resp = get_signed(&base, &fits).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // The URL's own format drops the default one, so 99
+    // plus the URL's format is 100, not 101.
+    let own_format = format!(
+        "{}/filters:format(png)/{src}",
+        vec!["filters:invert"; 99].join("/")
+    );
+    let resp = get_signed(&base, &own_format).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
 }
 
 #[tokio::test]
@@ -9551,22 +9667,16 @@ async fn timed_out_encode_releases_the_process_gate() {
     // get a genuine encode attempt on the freed gate
     // instead of the gate-held 503 (Busy) the soak's
     // follow-up requests got.
-    use std::io::Write as _;
     let dir = std::env::temp_dir().join(format!(
         "crabcrop-server-stuck-encode-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let script_path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&script_path).unwrap();
-    file.write_all(b"#!/bin/sh\ncat > /dev/null\nsleep 9\nprintf 'x'\n")
-        .unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(
+        &script_path,
+        "#!/bin/sh\ncat > /dev/null\nsleep 9\nprintf 'x'\n",
+    );
     let encoder = crate::video::VideoEncoder::new(
         script_path,
         std::time::Duration::from_secs(30),
@@ -9954,28 +10064,19 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
     // budget, still has budget left when the lane
     // drains at 6 s, so it enters its own encode
     // instead of aborting at its first checkpoint.
-    use std::io::Write as _;
     let dir =
         std::env::temp_dir().join(format!("crabcrop-server-lane-bound-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let log_path = dir.join("runs.log");
     let script_path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&script_path).unwrap();
-    file.write_all(
-        format!(
+    crate::test_support::write_script(
+        &script_path,
+        &format!(
             "#!/bin/sh\ncat > /dev/null\necho S >> {}\nsleep 6\necho E >> {}\nprintf 'x'\n",
             log_path.display(),
             log_path.display()
-        )
-        .as_bytes(),
-    )
-    .unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+        ),
+    );
     let encoder = crate::video::VideoEncoder::new(
         script_path,
         std::time::Duration::from_secs(30),
@@ -10216,7 +10317,7 @@ async fn a_timed_out_annotation_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        annotate_meta(&state, &processed, false),
+        annotate_meta(&state, &processed),
     )
     .await
     .is_err();
@@ -10237,7 +10338,7 @@ async fn a_timed_out_moderation_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        moderate_meta(&state, &processed, false),
+        moderate_meta(&state, &processed),
     )
     .await
     .is_err();
@@ -10257,11 +10358,61 @@ async fn a_timed_out_detection_keeps_its_ai_gate_slot() {
     let processed = still_processed(test_png(), ImageFormat::Png);
     let timed_out = tokio::time::timeout_at(
         tokio::time::Instant::now() + std::time::Duration::from_millis(300),
-        detect_meta(&state, &processed, false),
+        detect_meta(&state, &processed),
     )
     .await
     .is_err();
     assert_meta_slot_drains_with_inference(&state, &release, timed_out).await;
+}
+
+#[tokio::test]
+async fn meta_sections_never_run_inference_without_an_ai_permit() {
+    // Every meta section acquires its own AI permit; none
+    // runs under one the request claims to hold (issue
+    // #456). With the gate's only permit held elsewhere,
+    // each section degrades after the gate wait instead
+    // of reaching its provider: tags and detections are
+    // omitted, and the explicit-outcome sections report
+    // "busy". Once the permit returns, the same sections
+    // answer, so the degrade is the gate's doing.
+    let mut state = lane_test_state(std::time::Duration::from_secs(30), 4, 2);
+    state.ai_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    state.tagger = Some(Arc::new(FakeTagger));
+    state.detect = Some(Arc::new(FakeDetector));
+    state.moderation = Some(Arc::new(FakeModeration));
+    state.embeddings = Some(Arc::new(FakeEmbedding));
+    state.ocr = Some(Arc::new(FakeOcr));
+    let processed = still_processed(test_png(), ImageFormat::Png);
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let held = state.ai_gate.clone().acquire_owned().await.unwrap();
+    let (tags, boxes, moderation, embedding, ocr) = tokio::join!(
+        annotate_meta(&state, &processed),
+        detect_meta(&state, &processed),
+        moderate_meta(&state, &processed),
+        embed_meta(&state, &processed),
+        ocr_meta(&state, &processed, deadline),
+    );
+    assert!(tags.is_none(), "tags ran without a permit");
+    assert!(boxes.is_none(), "detections ran without a permit");
+    assert_eq!(moderation, ModerationMeta::Unavailable("busy"));
+    assert_eq!(embedding, EmbeddingMeta::Unavailable("busy"));
+    assert_eq!(ocr, OcrMeta::Unavailable("busy"));
+    drop(held);
+    assert!(annotate_meta(&state, &processed).await.is_some());
+    assert!(detect_meta(&state, &processed).await.is_some());
+    assert!(matches!(
+        moderate_meta(&state, &processed).await,
+        ModerationMeta::Report(_)
+    ));
+    assert!(matches!(
+        embed_meta(&state, &processed).await,
+        EmbeddingMeta::Report(_)
+    ));
+    assert!(matches!(
+        ocr_meta(&state, &processed, deadline).await,
+        OcrMeta::Report(_)
+    ));
+    assert_eq!(state.ai_gate.available_permits(), 1);
 }
 
 /// A state for the slow-lane tests (issue #324): the
@@ -10368,20 +10519,12 @@ fn lane_test_job(
 /// deterministic long encode inside a single opaque
 /// stage.
 fn fake_long_encoder(dir: &std::path::Path, sleep_secs: u32) -> crate::video::VideoEncoder {
-    use std::io::Write as _;
     std::fs::create_dir_all(dir).unwrap();
     let script_path = dir.join("encoder.sh");
-    let mut file = std::fs::File::create(&script_path).unwrap();
-    file.write_all(
-        format!("#!/bin/sh\ncat > /dev/null\nsleep {sleep_secs}\nprintf 'x'\n").as_bytes(),
-    )
-    .unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_support::write_script(
+        &script_path,
+        &format!("#!/bin/sh\ncat > /dev/null\nsleep {sleep_secs}\nprintf 'x'\n"),
+    );
     crate::video::VideoEncoder::new(
         script_path,
         std::time::Duration::from_secs(30),
@@ -12536,8 +12679,9 @@ async fn purge_during_a_render_keeps_the_entry_out_of_every_tier() {
     // Give the background shared-tier write every
     // chance to land: it must never appear.
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    assert!(
-        fake.objects.lock().unwrap().is_empty(),
+    assert_eq!(
+        entry_objects(&fake),
+        0,
         "the shared tier holds the purged render"
     );
     let on_disk = std::fs::read_dir(&dir)
@@ -12626,6 +12770,7 @@ struct WalkFixture {
     dir: std::path::PathBuf,
     hits: Arc<AtomicUsize>,
     probe: AppState,
+    server: tokio::task::JoinHandle<()>,
     base: String,
     url: String,
     object: String,
@@ -12644,7 +12789,7 @@ impl WalkFixture {
         let probe = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             axum::serve(listener, app(state)).await.unwrap();
         });
         let preset = format!("preset:small/{src}");
@@ -12688,12 +12833,43 @@ impl WalkFixture {
             dir,
             hits,
             probe,
+            server,
             base,
             url,
             object,
             key,
             stale,
         }
+    }
+
+    /// Whether the bucket copy is the stale one.
+    fn bucket_holds_stale(&self) -> bool {
+        self.fake
+            .objects
+            .lock()
+            .unwrap()
+            .get(&self.object)
+            .and_then(|data| {
+                crate::storage::parse_entry(data, &crate::url::entry_key(b"disk-key-test"))
+            })
+            .is_some_and(|(_, image)| image.etag == self.stale.etag)
+    }
+
+    /// Put the stale copy back in the bucket, as the walk
+    /// left it: unreached.
+    async fn restore_stale_bucket_copy(&self) {
+        let shared = self.probe.shared_store.clone().unwrap();
+        shared.put(&self.key, &self.stale).await;
+        assert!(self.bucket_holds_stale());
+    }
+
+    /// A replica over the fixture's bucket that did not
+    /// receive the purge, with its own disk tier at `dir`
+    /// when given.
+    fn other_replica(&self, dir: Option<&std::path::Path>) -> AppState {
+        let mut state = tier_test_state(dir, &self.fake.endpoint);
+        state.presets = preset_test_map();
+        state
     }
 
     /// Purge group `small` and wait until its background
@@ -12786,7 +12962,7 @@ async fn lookups_during_a_background_purge_walk_do_not_resurrect_the_entry() {
             .lock()
             .unwrap()
             .iter()
-            .any(|r| r == &format!("DELETE {}", fx.object)),
+            .any(|r| r == &format!("DELETE {} if-match", fx.object)),
         "the lookup did not delete the purged bucket copy"
     );
     fx.finish_walk().await;
@@ -12859,11 +13035,220 @@ async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
     shared.put(key, &tier_test_entry()).await;
     assert!(lookup_tiers(&state, key, &[]).await.is_none());
     assert!(shared.get(key).await.is_none());
+    // A copy rendered after the purge began is not
+    // covered (issue #446): it serves while the purge runs.
+    let fresh = CachedImage {
+        written: Some(state.purge_guard.stamp()),
+        ..tier_test_entry()
+    };
+    shared.put(key, &fresh).await;
+    let (_, status) = lookup_tiers(&state, key, &[]).await.unwrap();
+    assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
     drop(active);
+    // Once the purge has ended, its tombstone still covers
+    // copies older than it for the grace period (issue
+    // #461), but not fresh ones.
+    state.cache.remove(key);
+    store.remove(key);
     shared.put(key, &tier_test_entry()).await;
+    assert!(lookup_tiers(&state, key, &[]).await.is_none());
+    shared.put(key, &fresh).await;
     let (_, status) = lookup_tiers(&state, key, &[]).await.unwrap();
     assert_eq!(status, "crabcrop; hit; detail=\"shared\"");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_render_after_a_purge_began_keeps_caching_during_the_walk() {
+    // Issue #446: while a purge's background walk runs,
+    // the receiving server treated every disk or bucket
+    // copy the purge covers as purged, including copies
+    // rendered after the purge began: each lookup deleted
+    // the fresh render and rendered again, and the walk
+    // deleted (and counted) the render too. A copy written
+    // after the purge began now keeps serving from every
+    // persistent tier, and the walk leaves it in place.
+    let fx = WalkFixture::new("walk-fresh").await;
+    fx.purge_and_park_walk().await;
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    let fresh = header(&resp, "etag");
+    assert_ne!(fresh, fx.stale.etag);
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+    let shared = fx.probe.shared_store.clone().unwrap();
+    let store = fx.probe.store.clone().unwrap();
+    // The render's write-through lands in the bucket.
+    for _ in 0..250 {
+        if shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh));
+    let deletes = || {
+        fx.fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with(&format!("DELETE {}", fx.object)))
+            .count()
+    };
+    let deletes_after_render = deletes();
+    // With memory cleared, the next lookup hits the disk
+    // tier, while the walk is still parked...
+    fx.probe.cache.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"disk\""
+    );
+    assert_eq!(header(&resp, "etag"), fresh);
+    // ...and with the disk copy gone too, the bucket.
+    fx.probe.cache.remove(&fx.key);
+    store.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"shared\""
+    );
+    assert_eq!(header(&resp, "etag"), fresh);
+    assert_eq!(
+        fx.hits.load(Ordering::SeqCst),
+        2,
+        "a fresh copy re-rendered"
+    );
+    assert_eq!(
+        fx.probe.purge_guard.active_count(),
+        1,
+        "the walk ended early"
+    );
+    // The walk then reaches the object, reads a copy
+    // written after the purge began, and leaves it: no
+    // delete, so nothing counted.
+    fx.finish_walk().await;
+    assert_eq!(deletes(), deletes_after_render);
+    assert!(shared.get(&fx.key).await.is_some_and(|e| e.etag == fresh));
+    fx.probe.cache.remove(&fx.key);
+    store.remove(&fx.key);
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"shared\""
+    );
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
+    // Issue #461: the guard that kept a purge effective
+    // during its walk lived only in memory, and so did the
+    // walk's remainder. A restart mid-walk lost both: the
+    // unreached bucket copy then served again on every
+    // replica, the receiving one included. The purge's
+    // tombstone in the bucket now keeps it effective.
+    let fx = WalkFixture::new("walk-restart").await;
+    // A replica already running, which never receives the
+    // purge: it read the bucket's tombstones at boot.
+    let running = fx.other_replica(None);
+    start_purge_tombstones(&running).await;
+    fx.purge_and_park_walk().await;
+    // The receiving server stops mid-walk: its memory, its
+    // guard, and the walk's remainder are gone. The bucket
+    // still holds the unreached copy and the tombstone, not
+    // marked ended.
+    fx.server.abort();
+    assert!(fx.bucket_holds_stale());
+    let tombstone = {
+        let objects = fx.fake.objects.lock().unwrap();
+        let (_, data) = objects
+            .iter()
+            .find(|(name, _)| name.starts_with("purges/"))
+            .expect("the purge left a tombstone in the bucket");
+        crate::storage::parse_tombstone(data, &crate::url::entry_key(b"disk-key-test")).unwrap()
+    };
+    assert_eq!(
+        tombstone.target,
+        crate::cache::PurgeTarget::Group("small".into())
+    );
+    assert_eq!(tombstone.ended_ms, None);
+    // The running replica learns the purge at its next
+    // refresh and misses on the unreached copy.
+    let shared = running.shared_store.clone().unwrap();
+    assert!(shared.refresh_tombstones(&running.purge_guard).await);
+    assert!(lookup_tiers(&running, &fx.key, &[]).await.is_none());
+    assert!(
+        !fx.bucket_holds_stale(),
+        "the copy was not removed on sight"
+    );
+    // A replica that boots after the purge, with a disk of
+    // its own that kept a pre-purge copy, misses on both.
+    fx.restore_stale_bucket_copy().await;
+    let other_dir = fx.dir.with_extension("other");
+    let _ = std::fs::remove_dir_all(&other_dir);
+    let booted = fx.other_replica(Some(&other_dir));
+    let booted_disk = booted.store.clone().unwrap();
+    booted_disk.put(&fx.key, &fx.stale);
+    start_purge_tombstones(&booted).await;
+    assert!(lookup_tiers(&booted, &fx.key, &[]).await.is_none());
+    assert!(booted_disk.get(&fx.key).is_none(), "the disk copy survived");
+    assert!(!fx.bucket_holds_stale(), "the bucket copy survived");
+    let _ = std::fs::remove_dir_all(&other_dir);
+    // The restarted receiving server, over the same disk
+    // and bucket with fresh memory, misses on the purged
+    // URL and renders it again from the origin.
+    fx.restore_stale_bucket_copy().await;
+    let restarted = fx.other_replica(Some(&fx.dir));
+    start_purge_tombstones(&restarted).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app(restarted)).await.unwrap();
+    });
+    let url = fx.url.replace(&fx.base, &base);
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_ne!(header(&resp, "etag"), fx.stale.etag);
+    assert_ne!(resp.bytes().await.unwrap().as_ref(), b"stale-pixels");
+    assert_eq!(fx.hits.load(Ordering::SeqCst), 2);
+    assert!(!fx.bucket_holds_stale());
+}
+
+#[tokio::test]
+async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
+    // Issue #461: a replica that held a copy from before
+    // another replica's purge must not write it back to
+    // the shared tier once it knows the purge, or the copy
+    // would outlive the walk that removed it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let holder = tier_test_state(None, &fake.endpoint);
+    let purger = tier_test_state(None, &fake.endpoint);
+    let key = "40x24/example.com/i.png#cfgtest";
+    holder.cache.put(key.to_string(), tier_test_entry());
+    let (active, tombstone) = begin_purge(
+        &purger,
+        crate::cache::PurgeTarget::Key("40x24/example.com/i.png".into()),
+    )
+    .await;
+    assert!(tombstone.is_some());
+    let shared = holder.shared_store.clone().unwrap();
+    assert!(shared.refresh_tombstones(&holder.purge_guard).await);
+    // The memory hit still serves (another process's
+    // memory is out of a purge's reach), but the group it
+    // learns does not carry the copy back to the bucket.
+    let (_, status) = lookup_tiers(&holder, key, &["thumb".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(status, "crabcrop; hit");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        entry_objects(&fake),
+        0,
+        "the pre-purge copy was written back"
+    );
+    drop(active);
 }
 
 /// An app over a disk tier under a chosen

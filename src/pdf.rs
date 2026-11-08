@@ -38,10 +38,10 @@
 //! dimensions and allocation, output pixels) applies to
 //! it unchanged.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use crate::toolrun::{ToolCommand, ToolError, ToolInput, ToolRun, run_tool, tool_cpu_limit};
 
 /// The most pages a document may have before the
 /// pipeline refuses it (issue #215). The cap bounds
@@ -357,7 +357,7 @@ impl PdfRenderer {
             return Err(PdfError::Failed(format!(
                 "PDF renderer exited with {}: {}",
                 run.status,
-                stderr_excerpt(&run.stderr)
+                run.stderr_excerpt()
             )));
         }
         if run.stdout.is_empty() {
@@ -379,14 +379,10 @@ impl PdfRenderer {
         })
     }
 
-    /// Run one of the tools once under the standing
-    /// bounds: the source bytes on stdin, stdout capped
-    /// at `max_stdout` (past the cap the process group is
-    /// killed and the run fails), stderr kept up to a cap
-    /// while the rest is drained so the tool never blocks
-    /// on a full pipe, an empty environment, and the
-    /// wall-clock timeout. Mirrors the frame extractor's
-    /// discipline exactly.
+    /// Run one of the tools once through the shared runner
+    /// ([`crate::toolrun::run_tool`]): the source bytes on
+    /// stdin, stdout capped at `max_stdout`, and stderr kept
+    /// up to the report cap.
     fn run(
         &self,
         program: &Path,
@@ -396,179 +392,31 @@ impl PdfRenderer {
         max_stdout: usize,
         deadline: Instant,
     ) -> Result<ToolRun, PdfError> {
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear()
-            .current_dir(std::env::temp_dir());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        let mut child = cmd.spawn().map_err(|e| {
-            PdfError::Failed(format!(
-                "could not start the PDF {name} {}: {e}",
-                program.display()
-            ))
-        })?;
-        let pid = child.id();
-        crate::toolrun::limit_child(
-            pid,
-            crate::toolrun::tool_cpu_limit(self.timeout),
-            crate::toolrun::TOOL_MAX_ADDRESS_SPACE,
-        );
-
-        let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
-        let input = stdin_bytes.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin_pipe.write_all(&input);
-        });
-
-        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
-        let stdout_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 64 * 1024];
-            let result = loop {
-                match stdout_pipe.read(&mut chunk) {
-                    Ok(0) => break Ok(buf),
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.len() > max_stdout {
-                            break Err(format!(
-                                "the PDF {name}'s output passed the {max_stdout} byte cap"
-                            ));
-                        }
-                    }
-                    Err(e) => break Err(format!("reading the PDF {name}'s output failed: {e}")),
+        run_tool(ToolCommand {
+            program,
+            args,
+            input: ToolInput::Bytes(stdin_bytes),
+            max_stdout,
+            max_stderr: PROBE_REPORT_CAP,
+            deadline,
+            cpu_limit: tool_cpu_limit(self.timeout),
+        })
+        .map_err(|e| {
+            PdfError::Failed(match e {
+                ToolError::Spawn(e) => {
+                    format!("could not start the PDF {name} {}: {e}", program.display())
                 }
-            };
-            let _ = out_tx.send(result);
-        });
-
-        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-        let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
-        let stderr_thread = std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut chunk = [0u8; 16 * 1024];
-            loop {
-                match stderr_pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if kept.len() < PROBE_REPORT_CAP {
-                            let take = (PROBE_REPORT_CAP - kept.len()).min(n);
-                            kept.extend_from_slice(&chunk[..take]);
-                        }
-                    }
+                ToolError::OutputCap(cap) => {
+                    format!("the PDF {name}'s output passed the {cap} byte cap")
                 }
-            }
-            let _ = err_tx.send(String::from_utf8_lossy(&kept).into_owned());
-        });
-
-        let timeout = self.timeout;
-        // Wait for the exit status without ever blocking
-        // past the deadline: a tool that closed its stdout
-        // and then hung still gets killed on time.
-        let wait_status =
-            |child: &mut std::process::Child| -> Result<std::process::ExitStatus, PdfError> {
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => return Ok(status),
-                        Ok(None) => {
-                            if Instant::now() >= deadline {
-                                kill_process_group(pid);
-                                let _ = child.wait();
-                                return Err(PdfError::Failed(format!(
-                                    "PDF {name} timed out after {}s",
-                                    timeout.as_secs()
-                                )));
-                            }
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(e) => {
-                            return Err(PdfError::Failed(format!(
-                                "waiting on the PDF {name} failed: {e}"
-                            )));
-                        }
-                    }
+                ToolError::Read(e) => format!("reading the PDF {name}'s output failed: {e}"),
+                ToolError::TimedOut => {
+                    format!("PDF {name} timed out after {}s", self.timeout.as_secs())
                 }
-            };
-        let (status, stdout) = loop {
-            match out_rx.try_recv() {
-                Ok(Ok(bytes)) => {
-                    let status = wait_status(&mut child)?;
-                    break (status, bytes);
-                }
-                Ok(Err(why)) => {
-                    kill_process_group(pid);
-                    let _ = child.wait();
-                    return Err(PdfError::Failed(why));
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if Instant::now() >= deadline {
-                        kill_process_group(pid);
-                        let _ = child.wait();
-                        return Err(PdfError::Failed(format!(
-                            "PDF {name} timed out after {}s",
-                            timeout.as_secs()
-                        )));
-                    }
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            // The process is gone; its stdout
-                            // reader finishes at EOF. Give it
-                            // a moment, then take what arrived.
-                            match out_rx.recv_timeout(Duration::from_secs(2)) {
-                                Ok(Ok(bytes)) => break (status, bytes),
-                                Ok(Err(why)) => return Err(PdfError::Failed(why)),
-                                Err(_) => break (status, Vec::new()),
-                            }
-                        }
-                        Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                        Err(e) => {
-                            return Err(PdfError::Failed(format!(
-                                "waiting on the PDF {name} failed: {e}"
-                            )));
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    let status = wait_status(&mut child)?;
-                    break (status, Vec::new());
-                }
-            }
-        };
-        let _ = writer.join();
-        // The reader threads are deliberately never
-        // joined (issue #263, the video.rs pattern): a
-        // grandchild that inherited the pipes and holds
-        // them open would block a join for its whole
-        // lifetime, defeating the timeout above. stderr
-        // is worth a short grace through its channel, no
-        // more; the stdout result already arrived through
-        // its own channel.
-        let stderr = err_rx
-            .recv_timeout(Duration::from_millis(200))
-            .unwrap_or_default();
-        drop(stdout_thread);
-        drop(stderr_thread);
-        Ok(ToolRun {
-            status,
-            stdout,
-            stderr,
+                ToolError::Wait(e) => format!("waiting on the PDF {name} failed: {e}"),
+            })
         })
     }
-}
-
-/// One finished tool run.
-#[derive(Debug)]
-struct ToolRun {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: String,
 }
 
 /// The probe program for a renderer path: the `pdfinfo`
@@ -700,43 +548,6 @@ fn not_pdf() -> PdfError {
         "the source is not a PDF the probe can read (not a PDF, or a corrupt document)".to_string(),
     )
 }
-
-/// The tail of a tool's stderr, for error text: capped,
-/// the same as the frame extractor's excerpts.
-fn stderr_excerpt(stderr: &str) -> String {
-    let tail: String = stderr
-        .chars()
-        .rev()
-        .take(500)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    let tail = tail.trim();
-    if tail.is_empty() {
-        "no error output".to_string()
-    } else {
-        tail.to_string()
-    }
-}
-
-/// Kill a runaway tool's whole process group (it may
-/// have spawned helpers). Mirrors the frame extractor's
-/// discipline exactly. The group kill is the whole
-/// mechanism (issue #272): a descendant that detaches
-/// (setsid, double-fork) escapes it by design of the
-/// tool contract, which forbids daemonizing.
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    if let Ok(pid) = i32::try_from(pid)
-        && let Some(pid) = rustix::process::Pid::from_raw(pid)
-    {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
 
 #[cfg(test)]
 mod tests {
@@ -902,13 +713,7 @@ Page size:       792 x 612 pts (letter)
 
     fn write_tool(dir: &Path, name: &str, script: &str) -> PathBuf {
         let path = dir.join(name);
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, script);
         path
     }
 
