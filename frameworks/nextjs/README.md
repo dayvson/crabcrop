@@ -4,7 +4,7 @@ A custom loader for `next/image` that routes every image through your crabcrop d
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (or copy `sdks/typescript/src/index.ts` into your project and adjust the import).
+1. Install the builder: `npm install @crabcrop/url`.
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project root.
 3. Point Next at it:
 
@@ -42,4 +42,6 @@ Define the transform policy as a server-side [preset](../../docs/operations.md#p
 
 ## Tests
 
-`npm test` in this directory runs the loader against exact expected URLs (signatures cross-checked with `node:crypto` directly). The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs`; in a real project the installed package resolves it.
+`npm test` in this directory runs the loader against exact expected URLs (signatures cross-checked with `node:crypto` directly). The tests map the `@crabcrop/url` import to the in-repo SDK through `test/register.mjs` (build the SDK first: `npm run build` in `sdks/typescript`); in a real project the installed package resolves it.
+
+[`tests/browser-bundles`](../../tests/browser-bundles) builds this loader into a browser bundle with Vite and runs it with a browser's globals and none of Node's.

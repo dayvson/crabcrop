@@ -238,7 +238,7 @@ test("purge_result only purges on the configured origin and refuses dot segments
     // No request reaches any of them, so there is no
     // timing, status, or body signal to tell them apart.
     const refusal = new RegExp(
-      `^purge_result: refusing to purge .*; only the configured server origin \\(${configuredOrigin.replaceAll(".", "\\.")}\\) is allowed$`,
+      `^purge_result: refusing base .*; a base argument must equal CRABCROP_BASE \\(${configuredOrigin.replaceAll(".", "\\.")}\\)$`,
     );
     for (const base of [
       internalOrigin,
@@ -274,6 +274,9 @@ test("purge_result only purges on the configured origin and refuses dot segments
       "purged 1",
     );
     assert.equal(hits.configured.length, 3);
+    for (const hit of hits.configured) {
+      assert.match(hit, /^POST \/purge\/[0-9a-f]{64}\/300x200\//);
+    }
 
     // With no CRABCROP_BASE configured there is no origin
     // to check a per-call base against, so the tool refuses
@@ -289,6 +292,177 @@ test("purge_result only purges on the configured origin and refuses dot segments
     mcpNoBase.kill();
     configuredServer.close();
     internalServer.close();
+  }
+});
+
+/** Spawn the stdio server with `env` and run the MCP handshake. */
+async function startMcp(env) {
+  const child = spawn(
+    process.execPath,
+    ["--import", `${root}sdks/mcp/test/register.mjs`, `${root}sdks/mcp/src/index.ts`],
+    { env, stdio: ["pipe", "pipe", "inherit"] },
+  );
+  const client = new McpClient(child);
+  await client.request("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "mcp-test", version: "0" },
+  });
+  client.notify("notifications/initialized", {});
+  return client;
+}
+
+test("purge_result POSTs only to /purge/ under CRABCROP_BASE, whatever the base argument (issue #459)", { timeout: 60000 }, async () => {
+  // Before the fix only the per-call base's origin was
+  // checked and the request URL was concatenated, so a base
+  // on the configured origin moved the POST: with
+  // `<origin>/admin/delete-everything#` the server POSTed to
+  // /admin/delete-everything and handed the body back. The
+  // recorder counts what actually arrives, so a refusal is
+  // proven by the absence of a request, not by the text.
+  const { createServer } = await import("node:http");
+  const hits = [];
+  const recorder = createServer((req, res) => {
+    hits.push(`${req.method} ${req.url}`);
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("purged 1");
+  });
+  await new Promise((resolve) => recorder.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${recorder.address().port}`;
+  const env = { ...process.env, CRABCROP_SECRET: "mcp-test-secret-0123456" };
+  const path = "300x200/https://example.com/a.jpg";
+  // The purge signature: HMAC-SHA256 of the target under the
+  // secret's purge subkey (spec/url-signing.md).
+  const purgeKey = createHmac("sha256", "mcp-test-secret-0123456").update("crabcrop/purge-key").digest();
+  const sig = createHmac("sha256", purgeKey).update(path).digest("hex");
+  const clients = [];
+  const start = async (base) => {
+    const client = await startMcp({ ...env, CRABCROP_BASE: base });
+    clients.push(client);
+    return client;
+  };
+  try {
+    // A server mounted under a path prefix: the purge goes
+    // to /purge/ under that prefix, and a base argument that
+    // equals CRABCROP_BASE but for trailing slashes is
+    // accepted.
+    const mounted = await start(`${origin}/img/`);
+    assert.equal(await mounted.call("purge_result", { path }), "purged 1");
+    assert.equal(await mounted.call("purge_result", { path, base: `${origin}/img` }), "purged 1");
+    assert.equal(await mounted.call("purge_result", { path, base: `${origin}/img//` }), "purged 1");
+    assert.deepEqual(hits, Array(3).fill(`POST /img/purge/${sig}/${path}`));
+
+    // Every other base is refused before any request: a
+    // path, a query, or a fragment on the configured origin,
+    // and the bare origin, which names a different path.
+    const mountedRefusal = new RegExp(
+      `^purge_result: refusing base .*; a base argument must equal CRABCROP_BASE \\(${origin.replaceAll(".", "\\.")}/img\\)$`,
+    );
+    for (const base of [
+      origin,
+      `${origin}/`,
+      `${origin}/img/admin`,
+      `${origin}/img/#`,
+      `${origin}/img?x=`,
+      `${origin}/img/../admin`,
+      `${origin}/img/%2e%2e/admin`,
+    ]) {
+      assert.match(await mounted.call("purge_result", { path, base }), mountedRefusal, base);
+    }
+    assert.equal(hits.length, 3);
+
+    // The issue's reproduction, against a base that is the
+    // bare origin: each of these used to reach the recorder
+    // somewhere other than /purge/.
+    const bare = await start(origin);
+    const refusal = new RegExp(
+      `^purge_result: refusing base .*; a base argument must equal CRABCROP_BASE \\(${origin.replaceAll(".", "\\.")}\\)$`,
+    );
+    for (const base of [
+      `${origin}/admin/delete-everything#`,
+      `${origin}/admin?x=`,
+      `${origin}/admin/`,
+      `${origin}#`,
+      `${origin}?`,
+      `${origin}/?purge=`,
+      `${origin}/purge/x/..`,
+    ]) {
+      assert.match(await bare.call("purge_result", { path, base }), refusal, base);
+    }
+    assert.equal(hits.length, 3);
+
+    // The URL parser drops ASCII tabs and newlines, so
+    // `.<TAB>.` reaches the server as `..`: those spellings
+    // are dot segments too, and are refused before sending.
+    for (const badPath of [
+      "300x200/.\t./.\t./.\n./admin/hook",
+      "300x200/.\r./x.jpg",
+      "300x200/%2e\t%2e/x.jpg",
+      "300x200/\t.\n/x.jpg",
+    ]) {
+      assert.match(await bare.call("purge_result", { path: badPath }), /refusing a path with dot segments/);
+    }
+    assert.equal(hits.length, 3);
+
+    // A `?` or `#` in the path stays in the path,
+    // percent-encoded, instead of starting a query or a
+    // fragment that would cut the request short.
+    assert.equal(await bare.call("purge_result", { path: `${path}?v=2#top` }), "purged 1");
+    assert.equal(hits.length, 4);
+    assert.match(hits[3], /^POST \/purge\/[0-9a-f]{64}\/300x200\/https:\/\/example\.com\/a\.jpg%3Fv=2%23top$/);
+
+    // Every request that arrived is a purge under the
+    // configured base.
+    for (const hit of hits) {
+      assert.match(hit, /^POST \/(img\/)?purge\/[0-9a-f]{64}\/300x200\//);
+    }
+  } finally {
+    for (const client of clients) client.child.kill();
+    recorder.close();
+  }
+});
+
+test("purge_result refuses a CRABCROP_BASE with userinfo, a query, a fragment, or another scheme (issue #459)", { timeout: 60000 }, async () => {
+  // The base is parsed once and the purge URL appended to
+  // its path, so a base whose query or fragment would
+  // swallow that path is refused outright, as are bases
+  // that are not http(s) URLs. Userinfo is refused too, and
+  // the refusal does not echo it: fetch would otherwise
+  // fail with an error that carries the credentials.
+  const { createServer } = await import("node:http");
+  const hits = [];
+  const recorder = createServer((req, res) => {
+    hits.push(`${req.method} ${req.url}`);
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("purged 1");
+  });
+  await new Promise((resolve) => recorder.listen(0, "127.0.0.1", resolve));
+  const hostPort = `127.0.0.1:${recorder.address().port}`;
+  const env = { ...process.env, CRABCROP_SECRET: "mcp-test-secret-0123456" };
+  const clients = [];
+  try {
+    for (const base of [
+      `http://${hostPort}/?x=1`,
+      `http://${hostPort}?`,
+      `http://${hostPort}#`,
+      `http://${hostPort}/img#frag`,
+      `http://user:hunter2@${hostPort}`,
+      `ftp://${hostPort}`,
+      "not a url",
+    ]) {
+      const client = await startMcp({ ...env, CRABCROP_BASE: base });
+      clients.push(client);
+      const out = await client.call("purge_result", { path: "300x200/https://example.com/a.jpg" });
+      assert.equal(
+        out,
+        "purge_result: CRABCROP_BASE must be an absolute http(s) URL with no userinfo, query, or fragment",
+        base,
+      );
+    }
+    assert.deepEqual(hits, []);
+  } finally {
+    for (const client of clients) client.child.kill();
+    recorder.close();
   }
 });
 

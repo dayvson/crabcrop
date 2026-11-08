@@ -2324,6 +2324,12 @@ fn load_error_cases() -> Vec<(LoadError, StatusCode, &'static str, String)> {
             "source_too_large",
             "source exceeds 10 bytes".to_string(),
         ),
+        (
+            LoadError::Busy,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_busy",
+            "server busy: too many source images held in memory".to_string(),
+        ),
     ]
 }
 
@@ -8761,7 +8767,7 @@ fn provenance_job(
         brand_color: None,
         ops: Vec::new(),
         preferred: None,
-        watermark_sources: Vec::new(),
+        watermark_sources: Default::default(),
         placeholders: false,
         mask_provider: None,
         upscale_provider: None,
@@ -9095,7 +9101,7 @@ async fn processing_gate_bounds_concurrency() {
         brand_color: None,
         ops: Vec::new(),
         preferred: None,
-        watermark_sources: Vec::new(),
+        watermark_sources: Default::default(),
         placeholders: false,
         mask_provider: None,
         upscale_provider: None,
@@ -9235,7 +9241,7 @@ async fn timed_out_encode_releases_the_process_gate() {
             brand_color: None,
             ops,
             preferred: None,
-            watermark_sources: Vec::new(),
+            watermark_sources: Default::default(),
             placeholders: false,
             mask_provider: None,
             upscale_provider: None,
@@ -9413,6 +9419,65 @@ async fn an_ai_permit_is_held_until_the_job_actually_finishes() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(back, "the permit must return when the job drains");
+}
+
+#[tokio::test]
+async fn a_source_budget_share_is_held_until_the_job_actually_finishes() {
+    // Issue #403: the charge serve_miss holds for a
+    // source travels into the run with the bytes. A run
+    // shed at its deadline leaves the detached job
+    // holding the bytes, so the share must stay held
+    // with it, and come back only once the job finishes
+    // and has dropped them; freed at the shed, it would
+    // let new loads buffer on top of bytes still in
+    // memory.
+    let state = lane_test_state(std::time::Duration::from_millis(300), 1, 1);
+    let budget = crate::loader::SourceBudget::new(1 << 20);
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let mut job = lane_test_job(None, "filters:upscale(2)/example.com/i.png");
+    job.upscale_provider = Some(Arc::new(BlockingUpscale {
+        release: release.clone(),
+    }));
+    let png = test_png();
+    let share = budget.charge(std::time::Duration::from_secs(1));
+    share.grow_to(png.len()).await.unwrap();
+    assert_eq!(budget.in_use(), png.len());
+    let source = JobSource {
+        bytes: png.clone(),
+        share: Some(share),
+    };
+    let result = run_process(
+        &state,
+        &job,
+        source,
+        Lane::Process,
+        std::time::Instant::now() + state.process_timeout,
+        JobPermits::default(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ProcessFailure::TimedOut)),
+        "the blocked run must answer TimedOut at its deadline, got {result:?}"
+    );
+    assert_eq!(
+        budget.in_use(),
+        png.len(),
+        "the share must stay with the detached job after the shed"
+    );
+    {
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    let mut back = false;
+    for _ in 0..100 {
+        if budget.in_use() == 0 {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(back, "the share must return when the job drains");
 }
 
 #[tokio::test]
@@ -9866,7 +9931,7 @@ fn lane_test_job(
         brand_color: None,
         ops,
         preferred: None,
-        watermark_sources: Vec::new(),
+        watermark_sources: Default::default(),
         placeholders: false,
         mask_provider: None,
         upscale_provider: None,
@@ -10305,10 +10370,13 @@ async fn watermark_decode_waits_for_the_process_gate() {
         brand_color: None,
         ops: Vec::new(),
         preferred: None,
-        watermark_sources: vec![(
-            "http://img/wm.png".to_string(),
-            b"this is not an image".to_vec(),
-        )],
+        watermark_sources: Arc::new(WatermarkSources {
+            images: vec![(
+                "http://img/wm.png".to_string(),
+                b"this is not an image".to_vec(),
+            )],
+            share: None,
+        }),
         placeholders: false,
         mask_provider: None,
         upscale_provider: None,

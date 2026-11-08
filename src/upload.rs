@@ -258,7 +258,10 @@ impl UploadStore {
     /// object (the handler enforces the overwrite policy
     /// through [`UploadStore::exists`] before calling
     /// this). Local writes go to a temp file renamed into
-    /// place, so a crash never leaves a partial object.
+    /// place, so a process crash never leaves a partial
+    /// object. Nothing is synced to disk before the rename,
+    /// so after a power loss or kernel crash the object can
+    /// still come back empty or truncated.
     pub async fn put(&self, name: &str, bytes: &[u8]) -> Result<(), UploadError> {
         match &self.backend {
             Backend::Local(dir) => {

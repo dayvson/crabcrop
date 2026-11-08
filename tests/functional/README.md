@@ -59,7 +59,7 @@ their index.
 ## Running it
 
 Prerequisites: Python 3 with Pillow (`pip install pillow`), a Rust
-toolchain, and (full tier only) Node 22+ for the parity and MCP
+toolchain, and (full tier only) Node 22.18+ for the parity and MCP
 cells.
 
 ```bash

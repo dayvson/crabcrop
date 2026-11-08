@@ -13,12 +13,20 @@
   "name": "@crabcrop/url",
   "keywords": ["image", "url", "signing", "hmac", "cdn", "crabcrop"],
   "files": ["dist"],
+  "imports": {
+    "#crypto": {
+      "browser": "./dist/crypto/portable.js",
+      "node": "./dist/crypto/node.js",
+      "default": "./dist/crypto/portable.js"
+    }
+  },
   "publishConfig": { "access": "public" },
   "repository": { "type": "git", "url": "git+https://github.com/dayvson/crabcrop.git", "directory": "sdks/typescript" },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsc -p tsconfig.browser.json",
     "prepack": "npm run build",
-    "test": "node --test"
+    "pretest": "npm run build",
+    "test": "node --test && node --conditions=browser --test"
   },
   "type": "module",
   "version": "0.9.11",

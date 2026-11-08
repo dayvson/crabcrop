@@ -2,14 +2,15 @@
 # Run every test suite in the repository: Rust (binary and
 # crate), the TypeScript SDK, the Python SDK, the MCP server,
 # the framework modules (Nuxt, Next.js, Hydrogen, Astro,
-# SvelteKit), the WordPress plugin, and the playground (unit
-# and integration).
+# SvelteKit) and browser builds of their client code, the
+# WordPress plugin, and the playground (unit and integration).
 #
 # The integration suites need live servers; this script starts
 # and stops them:
 #   - a static server for test-fixtures/ on 127.0.0.1:8909
 #     (playground integration; the MCP suite starts its own on
-#     8912 against the same directory);
+#     8912 against the same directory, and the browser-bundles
+#     suite serves its Nuxt build on a free port);
 #   - crabcrop on 127.0.0.1:3321 with the playground's secret.
 #
 # Usage: scripts/test_all.sh [--skip-rust]
@@ -116,6 +117,9 @@ step "Astro module"
 
 step "SvelteKit module"
 (cd frameworks/sveltekit && npm ci --no-audit --no-fund && npm test)
+
+step "Browser bundles (client builds of the integrations: Vite, and a full Nuxt build)"
+(cd tests/browser-bundles && npm ci --no-audit --no-fund && npm test)
 
 step "WordPress plugin"
 (cd plugins/wordpress && php tests/run.php)
