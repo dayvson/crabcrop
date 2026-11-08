@@ -436,11 +436,22 @@ impl PurgeGuard {
     /// earlier.
     fn purge_start_ms(&self, now: u64) -> u64 {
         let next = |last: u64| last.saturating_add(1).max(now);
-        let last = self
-            .clock
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(next(last)))
-            .unwrap_or_else(|last| last);
-        next(last)
+        // A plain compare-exchange loop rather than
+        // fetch_update, which newer toolchains deprecate in
+        // favour of try_update: the loop builds the same on
+        // every toolchain from the MSRV up.
+        let mut last = self.clock.load(Ordering::SeqCst);
+        loop {
+            match self.clock.compare_exchange_weak(
+                last,
+                next(last),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next(last),
+                Err(actual) => last = actual,
+            }
+        }
     }
 
     /// The current purge generation: a writer snapshots
