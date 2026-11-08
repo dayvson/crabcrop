@@ -89,9 +89,11 @@ with a space in it still works.
 
 An integration test that boots the server starts it with `common::serve`,
 which runs the binary with `PORT=0` and returns the port its listening line
-names. Never pick a free port in the test and hand it to the server: another
-process can take it before the server binds, or another test's server can
-answer on it (issue #536).
+names. It reads the server's stdout and stderr itself, so leave both alone;
+`ServerGuard::stderr` returns what the server wrote there. Never pick a free
+port in the test and hand it to the server: another process can take it
+before the server binds, or another test's server can answer on it
+(issue #536).
 
 ## Code style
 

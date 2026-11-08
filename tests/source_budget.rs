@@ -11,7 +11,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -80,8 +80,7 @@ fn boot(budget_mb: u32, upload_dir: &std::path::Path) -> (common::ServerGuard, u
             .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
             .env("CRABCROP_METRICS_TOKEN", "budget-token")
             .env("CRABCROP_SOURCE_BUFFER_MAX_MB", budget_mb.to_string())
-            .env("CRABCROP_META_MODE", "1")
-            .stderr(Stdio::null()),
+            .env("CRABCROP_META_MODE", "1"),
     );
     (server, port)
 }

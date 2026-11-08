@@ -12,7 +12,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crabcrop::svg::{WORKER_ARG, WorkerCommand, prepare, screen};
@@ -73,8 +73,7 @@ fn boot(root: &Path, extra_env: &[(&str, &str)]) -> (common::ServerGuard, u16) {
         .env("CRABCROP_ALLOW_UNSAFE", "1")
         .env("CRABCROP_FILE_ROOT", root)
         .env("CRABCROP_CACHE_MAX_MB", "0")
-        .env("CRABCROP_METRICS_TOKEN", METRICS_TOKEN)
-        .stderr(Stdio::null());
+        .env("CRABCROP_METRICS_TOKEN", METRICS_TOKEN);
     for (name, value) in extra_env {
         command.env(name, value);
     }

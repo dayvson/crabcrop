@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -62,8 +62,7 @@ fn boot(extra: &[(&str, &str)]) -> (common::ServerGuard, u16) {
     command
         .env_clear()
         .env("CRABCROP_SECRET", SECRET)
-        .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
-        .stderr(Stdio::null());
+        .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1");
     for (name, value) in extra {
         command.env(name, value);
     }

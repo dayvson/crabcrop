@@ -45,8 +45,7 @@ fn the_binary_boots_and_answers_health() {
             // no operator variable from the test shell can leak
             // into the configuration under test.
             .env_clear()
-            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-            .stderr(Stdio::null()),
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789"),
     );
     let status = status_line(port, "/health", "");
     assert!(status.contains("200"), "no 200 from /health: {status:?}");
@@ -68,8 +67,7 @@ fn port_zero_binds_a_free_port_and_the_listening_line_names_it() {
             // What common::serve sets for every boot, spelled
             // out because it is what this test is about.
             .env("PORT", "0")
-            .env("CRABCROP_METRICS_TOKEN", &token)
-            .stderr(Stdio::null()),
+            .env("CRABCROP_METRICS_TOKEN", &token),
     );
     assert_ne!(port, 0);
     let status = status_line(
@@ -80,6 +78,25 @@ fn port_zero_binds_a_free_port_and_the_listening_line_names_it() {
     assert!(
         status.contains("200"),
         "/metrics on port {port}: {status:?}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "stderr: crabcrop: invalid CRABCROP_DEFAULT_OPS")]
+fn a_boot_that_exits_before_it_listens_fails_with_its_stderr() {
+    // Issue #536 review: common::serve read stderr only when
+    // the caller piped it, and most passed Stdio::null(), so
+    // a boot that failed (a bad setting, a port in use) said
+    // only `exit status: 1`. It reads stderr itself now and
+    // puts it in the failure.
+    common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .env(
+                "CRABCROP_DEFAULT_OPS",
+                "exp:1893456000/filters:format(webp)",
+            ),
     );
 }
 
@@ -101,7 +118,7 @@ fn an_unknown_dash_argument_exits_with_an_error_and_never_serves() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut process = ServerGuard(child);
+        let mut process = ServerGuard::new(child);
 
         // No probe of a port here: with PORT=0 a server
         // would hold a port only it names, and a probe of any
@@ -182,8 +199,7 @@ fn boot_with_no_source_configuration_serves_health() {
     let (_server, port, _) = common::serve(
         Command::new(env!("CARGO_BIN_EXE_crabcrop"))
             .env_clear()
-            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-            .stderr(Stdio::null()),
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789"),
     );
     let status = status_line(port, "/health", "");
     assert!(status.contains("200"), "no 200 from /health: {status:?}");
@@ -196,8 +212,7 @@ fn boot_stderr(env: &[(&str, &str)]) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_crabcrop"));
     command
         .env_clear()
-        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
-        .stderr(Stdio::piped());
+        .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789");
     for (name, value) in env {
         command.env(name, value);
     }
@@ -208,15 +223,7 @@ fn boot_stderr(env: &[(&str, &str)]) -> String {
     // are all in the pipe once the listening line is out.
     let _ = server.0.kill();
     let _ = server.0.wait();
-    let mut stderr = String::new();
-    server
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    stderr
+    server.stderr()
 }
 
 #[test]
@@ -347,7 +354,7 @@ fn boot_refuses_default_operations_with_metadata_or_over_the_cap() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut server = ServerGuard(child);
+        let mut server = ServerGuard::new(child);
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
             if let Some(status) = server.0.try_wait().unwrap() {
@@ -659,8 +666,7 @@ fn serving_unsafe_urls(
             .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
             .env("CRABCROP_ALLOW_UNSAFE", "1")
             .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
-            .envs(envs.iter().copied())
-            .stderr(Stdio::piped()),
+            .envs(envs.iter().copied()),
     )
 }
 
@@ -706,15 +712,7 @@ fn exit_of(server: &mut ServerGuard, within: Duration) -> (std::process::ExitSta
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    let mut stderr = String::new();
-    server
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    (status, stderr)
+    (status, server.stderr())
 }
 
 #[test]

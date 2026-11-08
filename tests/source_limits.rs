@@ -11,7 +11,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 // Not every shared item is used here.
@@ -53,8 +53,7 @@ fn boot(env: &[(&str, &str)]) -> (common::ServerGuard, u16) {
         .env("CRABCROP_SECRET", "source-limits-secret-0123456789")
         .env("CRABCROP_ALLOW_UNSAFE", "1")
         .env("CRABCROP_META_MODE", "1")
-        .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
-        .stderr(Stdio::null());
+        .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1");
     for (name, value) in env {
         command.env(name, value);
     }
