@@ -320,7 +320,7 @@ pub struct AppState {
 
 /// Build the router.
 pub fn app(state: AppState) -> Router {
-    let mut router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/explain/{*path}", get(explain_handle))
@@ -328,26 +328,25 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/purge-group/{*path}",
             axum::routing::post(purge_group_handle),
-        );
-    // The upload route exists only when a destination is
-    // configured (issue #168): an unconfigured server has
-    // no PUT surface at all, so the request is a plain 404.
-    if state.upload.is_some() {
-        router = router.route("/upload/{*path}", axum::routing::put(upload_handle));
-    }
-    router
+        )
+        // The upload route is registered whether or not a
+        // destination is configured (issue #467): without
+        // one, the handler answers `uploads_not_configured`,
+        // so a client can tell a server with uploads off
+        // from a mistyped path.
+        .route("/upload/{*path}", axum::routing::put(upload_handle))
         .route("/{*path}", get(handle))
         // A PUT that matched no upload route is a 404, not
         // the 405 the GET catch-all would otherwise produce
-        // for it: without an upload destination there is no
-        // PUT surface on this server at all (issue #168).
+        // for it: the upload route is this server's only
+        // PUT surface (issue #168).
         .route("/{*path}", axum::routing::put(put_not_found))
         .with_state(state)
         .layer(axum::middleware::from_fn(security_headers))
 }
 
-/// The PUT fallback: every PUT that is not an upload to a
-/// configured destination is simply not found.
+/// The PUT fallback: every PUT that is not to the upload
+/// route is simply not found.
 async fn put_not_found(headers: HeaderMap) -> Response {
     let accept = headers
         .get(header::ACCEPT)
@@ -1312,10 +1311,10 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
 }
 
 /// `PUT /upload/<signature>/<name>`: store one original
-/// (issue #168). The route is registered only when a
-/// destination is configured, so `upload` here is always
-/// `Some`; the handler still answers 404 without one, so
-/// the rule holds however the state was built.
+/// (issue #168). The route is always registered; without
+/// a destination every request answers
+/// `404 uploads_not_configured` before anything else is
+/// checked (issue #467).
 ///
 /// The signature is an HMAC over the name under an upload
 /// subkey derived from the secret (see
@@ -1463,7 +1462,9 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // The read is bounded by the cap itself: it fails the
     // moment the body passes it, which is the oversize
     // answer (413) without ever holding more than the cap in
-    // memory; an unreadable body answers the same.
+    // memory. A body that cannot be read to its end (the
+    // client aborted it, or framed it badly) is the
+    // client's fault but not a size one: a 400 (issue #467).
     let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
     let cap = usize::try_from(upload.max_bytes).unwrap_or(usize::MAX);
     let bytes = match read_upload_body(body, cap, &charge).await {
@@ -1473,13 +1474,24 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             upload_log(name, "rejected:busy");
             return source_budget_busy(accept.as_deref());
         }
-        Err(_) => {
+        Err(LoadError::TooLarge { .. }) => {
             state.metrics.record_upload();
-            upload_log(name, "rejected:oversize-or-unreadable");
+            upload_log(name, "rejected:oversize");
             return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "upload_too_large",
                 format!("upload exceeds the {}-byte limit", upload.max_bytes),
+                accept.as_deref(),
+            );
+        }
+        Err(e) => {
+            eprintln!("upload body read failed: {e}");
+            state.metrics.record_upload();
+            upload_log(name, "rejected:unreadable");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "upload_unreadable",
+                "upload body could not be read".to_string(),
                 accept.as_deref(),
             );
         }
@@ -2801,10 +2813,15 @@ async fn serve_miss(
             // A policy refusal (Forbidden) is a decision, not a
             // failure: it never falls back. Neither does an
             // exhausted budget (issue #403): that is overload,
-            // and the fallback would need budget too. Any other
-            // load failure degrades to the configured fallback
-            // when there is one.
-            let fb = if matches!(e, LoadError::Forbidden(_) | LoadError::Busy) {
+            // and the fallback would need budget too. Nor does
+            // source text that does not parse (issue #467): a
+            // 400 stays honest, like a grammar failure. Any
+            // other load failure degrades to the configured
+            // fallback when there is one.
+            let fb = if matches!(
+                e,
+                LoadError::Forbidden(_) | LoadError::Busy | LoadError::InvalidSource(_)
+            ) {
                 None
             } else {
                 fallback_source_bytes(state, &charge).await
@@ -3621,6 +3638,14 @@ fn load_error_parts(e: LoadError) -> (StatusCode, &'static str, String) {
             "source_fetch_failed",
             "source fetch failed".to_string(),
         ),
+        // The caller's own source text is at fault, not an
+        // origin (issue #467), so this is a 400 like a
+        // grammar failure, not a gateway error.
+        LoadError::InvalidSource(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_source",
+            "invalid source URL".to_string(),
+        ),
         LoadError::WrongContentType(_) => (
             StatusCode::BAD_GATEWAY,
             "source_not_an_image",
@@ -3775,13 +3800,37 @@ fn engine_error_parts(e: EngineError) -> (StatusCode, &'static str, String) {
             "pdf_render_failed",
             "PDF rendering failed".to_string(),
         ),
+        // A dependency outage, not a broken encoder (issue
+        // #467): the output was rendered, but the timestamp
+        // authority signing needs did not answer, and a
+        // retry may find it back.
+        EngineError::ProvenanceUnavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provenance_unavailable",
+            "provenance signing is unavailable".to_string(),
+        ),
     }
 }
 
+/// `Retry-After` on a `provenance_unavailable` answer, in
+/// seconds. Longer than a gate's: an authority outage
+/// outlasts a queue, and every retry that meets it holds a
+/// process permit for up to the authority's 15-second
+/// bound before it fails again.
+const PROVENANCE_RETRY_AFTER_SECS: u64 = 30;
+
 fn engine_error_response(e: EngineError, accept: Option<&str>) -> Response {
     eprintln!("engine error: {e}");
+    let retry_after = matches!(e, EngineError::ProvenanceUnavailable(_));
     let (status, code, message) = engine_error_parts(e);
-    error_response(status, code, message, accept)
+    let mut response = error_response(status, code, message, accept);
+    if retry_after {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            PROVENANCE_RETRY_AFTER_SECS.to_string().parse().unwrap(),
+        );
+    }
+    response
 }
 
 #[cfg(test)]
