@@ -1,7 +1,16 @@
-//! Shared resource bounds for the external tool runners
-//! (issue #362): the frame extractor (frames.rs), the PDF
-//! tools (pdf.rs), and the video encoder (video.rs) each
-//! spawn operator-configured programs. Their wall-clock
+//! One runner for the external tools (issue #481): the
+//! frame extractor (frames.rs) and the PDF tools (pdf.rs)
+//! start their operator-configured programs through
+//! [`run_tool`], which holds the whole discipline in one
+//! place: no shell, an empty environment, the temporary
+//! directory as the working directory, the program's own
+//! process group (killed whole at the deadline or the
+//! output cap), a capped stdout, a drained stderr, and the
+//! kernel limits below. A tool module keeps only its argv,
+//! its input, its caps, and how a [`ToolError`] reads in
+//! its own error type.
+//!
+//! The resource bounds (issue #362): the wall-clock
 //! timeouts kill the process group, but the children also
 //! run under kernel resource limits, so a tool that
 //! allocates without bound or spins on CPU meets a hard
@@ -23,7 +32,281 @@
 //! the wall clock and the group kill are the bounds, as
 //! they were before this module.
 
-use std::time::Duration;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// What a tool reads on its stdin.
+pub(crate) enum ToolInput<'a> {
+    /// A file handed over as the tool's stdin, read from
+    /// wherever its offset stands: a regular file, which the
+    /// tool can seek (the frame extractor's staged source,
+    /// issue #411).
+    File(File),
+    /// Bytes fed through a pipe from a writer thread, so a
+    /// tool that reads slowly, or not at all, never blocks
+    /// the caller.
+    Bytes(&'a [u8]),
+}
+
+/// One run of an external tool: the program, its argv, its
+/// input, and the bounds the run obeys.
+pub(crate) struct ToolCommand<'a> {
+    /// The program, started directly, never through a shell.
+    pub(crate) program: &'a Path,
+    /// The argv, built in full by the calling module.
+    pub(crate) args: &'a [&'a str],
+    /// What the tool reads on stdin.
+    pub(crate) input: ToolInput<'a>,
+    /// The most stdout the run accepts: one byte more kills
+    /// the process group and fails the run.
+    pub(crate) max_stdout: usize,
+    /// How much of stderr the run keeps for the caller to
+    /// read. The rest is drained, so the tool never blocks
+    /// on a full pipe, and dropped.
+    pub(crate) max_stderr: usize,
+    /// When the process group is killed and the run fails.
+    /// A caller that stacks runs (a probe, then the work)
+    /// passes all of them one deadline (issue #362).
+    pub(crate) deadline: Instant,
+    /// The kernel's CPU-time backstop for the child:
+    /// [`tool_cpu_limit`] of the tool's timeout.
+    pub(crate) cpu_limit: Duration,
+}
+
+/// A run that finished inside its deadline and its stdout
+/// cap, whatever its exit status.
+#[derive(Debug)]
+pub(crate) struct ToolRun {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    /// The head of stderr, up to `max_stderr` bytes, as
+    /// lossy UTF-8.
+    pub(crate) stderr: String,
+    /// Whether stderr passed `max_stderr` and was cut.
+    pub(crate) stderr_truncated: bool,
+}
+
+impl ToolRun {
+    /// The tail of the tool's stderr, for error text: its
+    /// last 500 characters, trimmed.
+    pub(crate) fn stderr_excerpt(&self) -> String {
+        let tail: String = self
+            .stderr
+            .chars()
+            .rev()
+            .take(500)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let tail = tail.trim();
+        if tail.is_empty() {
+            "no error output".to_string()
+        } else {
+            tail.to_string()
+        }
+    }
+}
+
+/// Why a run produced no [`ToolRun`]. Each tool module maps
+/// these to its own error type, in its own words.
+#[derive(Debug)]
+pub(crate) enum ToolError {
+    /// The program could not be started.
+    Spawn(std::io::Error),
+    /// Stdout passed the cap, carried here; the process
+    /// group was killed.
+    OutputCap(usize),
+    /// Reading stdout failed; the process group was killed.
+    Read(std::io::Error),
+    /// The deadline passed; the process group was killed.
+    TimedOut,
+    /// Waiting on the program failed.
+    Wait(std::io::Error),
+}
+
+/// Run a tool once under the standing bounds: the input on
+/// stdin, stdout capped at `max_stdout` (past the cap the
+/// process group is killed and the run fails), stderr kept
+/// up to `max_stderr` while the rest is drained so the tool
+/// never blocks on a full pipe, an empty environment, the
+/// temporary directory as the working directory, its own
+/// process group, the kernel limits, and the deadline.
+pub(crate) fn run_tool(command: ToolCommand<'_>) -> Result<ToolRun, ToolError> {
+    let ToolCommand {
+        program,
+        args,
+        input,
+        max_stdout,
+        max_stderr,
+        deadline,
+        cpu_limit,
+    } = command;
+    let (stdin, feed) = match input {
+        ToolInput::File(file) => (Stdio::from(file), None),
+        ToolInput::Bytes(bytes) => (Stdio::piped(), Some(bytes.to_vec())),
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .current_dir(std::env::temp_dir());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(ToolError::Spawn)?;
+    let pid = child.id();
+    limit_child(pid, cpu_limit, TOOL_MAX_ADDRESS_SPACE);
+
+    let writer = feed.map(|input| {
+        let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
+        std::thread::spawn(move || {
+            let _ = stdin_pipe.write_all(&input);
+        })
+    });
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let (out_tx, out_rx) = mpsc::channel::<Result<Vec<u8>, ToolError>>();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        let result = loop {
+            match stdout_pipe.read(&mut chunk) {
+                Ok(0) => break Ok(buf),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > max_stdout {
+                        break Err(ToolError::OutputCap(max_stdout));
+                    }
+                }
+                Err(e) => break Err(ToolError::Read(e)),
+            }
+        };
+        let _ = out_tx.send(result);
+    });
+
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let (err_tx, err_rx) = mpsc::channel::<(String, bool)>();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match stderr_pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let take = (max_stderr - kept.len()).min(n);
+                    kept.extend_from_slice(&chunk[..take]);
+                    truncated |= take < n;
+                }
+            }
+        }
+        let _ = err_tx.send((String::from_utf8_lossy(&kept).into_owned(), truncated));
+    });
+
+    // Wait for the exit status without ever blocking past
+    // the deadline: a tool that closed its stdout and then
+    // hung still gets killed on time.
+    let wait_status = |child: &mut Child| -> Result<ExitStatus, ToolError> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        kill_process_group(pid);
+                        let _ = child.wait();
+                        return Err(ToolError::TimedOut);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(ToolError::Wait(e)),
+            }
+        }
+    };
+    let (status, stdout) = loop {
+        match out_rx.try_recv() {
+            Ok(Ok(bytes)) => {
+                let status = wait_status(&mut child)?;
+                break (status, bytes);
+            }
+            Ok(Err(e)) => {
+                kill_process_group(pid);
+                let _ = child.wait();
+                return Err(e);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if Instant::now() >= deadline {
+                    kill_process_group(pid);
+                    let _ = child.wait();
+                    return Err(ToolError::TimedOut);
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        // The process is gone; its stdout
+                        // reader finishes at EOF. Give it
+                        // a moment, then take what arrived.
+                        match out_rx.recv_timeout(Duration::from_secs(2)) {
+                            Ok(Ok(bytes)) => break (status, bytes),
+                            Ok(Err(e)) => return Err(e),
+                            Err(_) => break (status, Vec::new()),
+                        }
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(e) => return Err(ToolError::Wait(e)),
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let status = wait_status(&mut child)?;
+                break (status, Vec::new());
+            }
+        }
+    };
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    // The reader threads are deliberately never joined
+    // (issue #263): a grandchild that inherited the pipes
+    // and holds them open would block a join for its whole
+    // lifetime, defeating the deadline above. stderr is
+    // worth a short grace through its channel, no more; the
+    // stdout result already arrived through its own channel.
+    let (stderr, stderr_truncated) = err_rx
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default();
+    drop(stdout_thread);
+    drop(stderr_thread);
+    Ok(ToolRun {
+        status,
+        stdout,
+        stderr,
+        stderr_truncated,
+    })
+}
+
+/// Kill a runaway tool's whole process group (it may have
+/// spawned helpers). The group kill is the whole mechanism
+/// (issue #272): a descendant that detaches (setsid,
+/// double-fork) escapes it by design of the tool contract,
+/// which forbids daemonizing.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid)
+        && let Some(pid) = rustix::process::Pid::from_raw(pid)
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 /// The address-space ceiling for a tool child: generous
 /// headroom over the largest legitimate workload (the
