@@ -3315,10 +3315,87 @@ mod clip_tests {
         assert_eq!(normalize(&[0.0, 0.0]), [0.0, 0.0]);
     }
 
-    /// Live check with a real CLIP export: tags a fixture
-    /// photo and asserts the annotation is sane. Ignored:
+    /// Reference token ids for label-shaped text under the
+    /// CLIP ViT-B/32 tokenizer (issue #414). Not derived
+    /// from this crate: OpenAI's reference tokenizer over
+    /// its `bpe_simple_vocab_16e6` merges and Hugging Face
+    /// `tokenizers` over a CLIP `tokenizer.json` both produce
+    /// every row. Whitespace separates pieces and is
+    /// never a token itself, so a phrase is exactly its
+    /// words' ids between SOT (49406) and EOT (49407); the
+    /// multi-word rows are what a stray space token (#404)
+    /// would shift. The last rows cover the other piece
+    /// kinds: a contraction, single digits, punctuation
+    /// runs, and whitespace and case normalization.
+    const CLIP_REFERENCE_IDS: &[(&str, &[i64])] = &[
+        (
+            "a photo of a dog",
+            &[49406, 320, 1125, 539, 320, 1929, 49407],
+        ),
+        ("kite surfing", &[49406, 19867, 15762, 49407]),
+        ("palm tree", &[49406, 8612, 2677, 49407]),
+        ("city skyline", &[49406, 1305, 14606, 49407]),
+        ("aerial view", &[49406, 12440, 1093, 49407]),
+        ("night scene", &[49406, 930, 3562, 49407]),
+        ("dog", &[49406, 1929, 49407]),
+        ("it's me", &[49406, 585, 568, 614, 49407]),
+        ("top 10", &[49406, 1253, 272, 271, 49407]),
+        ("sun-set!", &[49406, 2176, 268, 1167, 256, 49407]),
+        ("  Kite   SURFING ", &[49406, 19867, 15762, 49407]),
+    ];
+
+    /// Encode every [`CLIP_REFERENCE_IDS`] row with the real
+    /// tokenizer file and compare the unpadded ids (mask 1),
+    /// reporting every mismatch at once.
+    fn assert_clip_reference_ids(tokenizer_path: &str) {
+        let tokenizer = crate::tokenizer::ClipTokenizer::load(tokenizer_path).unwrap();
+        let mismatches: Vec<String> = CLIP_REFERENCE_IDS
+            .iter()
+            .filter_map(|(text, expected)| {
+                let (ids, mask) = tokenizer.encode(text).unwrap();
+                let got = &ids[..mask.iter().filter(|&&m| m == 1).count()];
+                (got != *expected).then(|| format!("{text:?}: got {got:?}, reference {expected:?}"))
+            })
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "the CLIP tokenizer differs from the reference ids:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// The tokenizer half of the live CLIP check, runnable
+    /// without the runtime or the models. Ignored: needs
+    /// the export's tokenizer file:
+    /// CRABCROP_TEST_CLIP_TOKENIZER=...
+    #[test]
+    #[ignore = "needs the CLIP tokenizer.json (env-configured)"]
+    fn clip_tokenizer_matches_the_reference_ids() {
+        assert_clip_reference_ids(&std::env::var("CRABCROP_TEST_CLIP_TOKENIZER").unwrap());
+    }
+
+    /// The labels of the ai-models workflow's set that
+    /// describe its fixture photo (Ultralytics' bus.jpg:
+    /// people on a city street in front of a bus). Which of
+    /// them wins depends on the export, so the live check
+    /// is membership: a broken preprocess, shifted label
+    /// embeddings, or a mismatched model pair puts an
+    /// unrelated label (a landscape, an animal, food) on top.
+    const CLIP_FIXTURE_TOP_LABELS: &[&str] = &[
+        "people",
+        "street",
+        "buildings",
+        "city skyline",
+        "portrait",
+        "car",
+    ];
+
+    /// Live check with a real CLIP export: the tokenizer
+    /// matches the reference ids, and tagging the fixture
+    /// photo puts a label that describes it on top. Ignored:
     /// needs the runtime, both models, the tokenizer, a
-    /// label file, and a photo:
+    /// label file, and a photo (the expectations are the
+    /// ai-models workflow's label set and bus.jpg):
     /// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_CLIP_IMAGE_MODEL=...
     /// CRABCROP_TEST_CLIP_TEXT_MODEL=... CRABCROP_TEST_CLIP_TOKENIZER=...
     /// CRABCROP_TEST_CLIP_LABELS=... CRABCROP_TEST_IMAGE=...
@@ -3326,6 +3403,10 @@ mod clip_tests {
     #[ignore = "needs the ONNX runtime and CLIP model files (env-configured)"]
     fn clip_live_tags_a_photo() {
         let var = |name: &str| std::env::var(name).unwrap();
+        // The labels are embedded from these ids at load, so
+        // a tokenizer regression fails here by name instead of
+        // as quietly shifted scores.
+        assert_clip_reference_ids(&var("CRABCROP_TEST_CLIP_TOKENIZER"));
         let provider = OnnxClipProvider::load(
             Some(&var("CRABCROP_TEST_ORT_DYLIB")),
             &var("CRABCROP_TEST_CLIP_IMAGE_MODEL"),
@@ -3336,9 +3417,16 @@ mod clip_tests {
         .unwrap();
         let img = image::open(var("CRABCROP_TEST_IMAGE")).unwrap();
         let scores = provider.scores(&img).unwrap();
-        println!("scores: {scores:?}");
         assert_eq!(scores.len(), provider.label_count());
-        assert!(scores.iter().all(|s| s.score.is_finite()));
+        assert!(scores.iter().all(|s| s.score.is_finite()), "{scores:?}");
+        let mut ranked: Vec<&TagScore> = scores.iter().collect();
+        ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
+        println!("ranked: {ranked:?}");
+        assert!(
+            CLIP_FIXTURE_TOP_LABELS.contains(&ranked[0].label.as_str()),
+            "top label {:?} does not describe the fixture photo; ranked: {ranked:?}",
+            ranked[0].label
+        );
     }
 
     /// Write bytes to a fresh temp file and return its
@@ -4796,7 +4884,8 @@ mod moderation_tests {
         let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
         let img = image::load_from_memory(bytes).unwrap();
         let report = provider.moderate(&img).unwrap();
-        assert_eq!(report.model, model);
+        // Meta names a model by its file name, not the operator's path.
+        assert_eq!(report.model, model_display_name(&model));
         assert!(report.signals.is_empty());
         assert_eq!(report.scores.len(), 2);
         assert_eq!(report.scores[0].label, "normal");
@@ -6534,7 +6623,8 @@ mod embedding_tests {
         let bytes = include_bytes!("../tests/fixtures/portrait.jpg");
         let img = image::load_from_memory(bytes).unwrap();
         let embedding = provider.embed(&img).unwrap();
-        assert_eq!(embedding.model, image_model);
+        // Meta names a model by its file name, not the operator's path.
+        assert_eq!(embedding.model, model_display_name(&image_model));
         assert_eq!(embedding.vector.len(), 512);
         let norm: f32 = embedding.vector.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-3, "norm {norm}");
