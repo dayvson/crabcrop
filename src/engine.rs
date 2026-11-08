@@ -531,27 +531,6 @@ fn check_output_size(width: u32, height: u32, input: (u32, u32)) -> Result<(), E
     check_output_pixels(width, height)
 }
 
-/// Hold the image a render at a hinted DPR factor past 1
-/// ends with to [`crate::url::MAX_DIMENSION`] per axis, a
-/// size no step changed included (issue #529). The steps let
-/// a size they did not change pass ([`check_output_size`]),
-/// so a hinted factor could take a resize to a 16384 px
-/// source's own size and serve that side (or, as WebP, fail
-/// to encode it), past the limit a stepped factor promises to
-/// fit. The refusal is an output-size refusal, so the factor
-/// steps down. At factor 1 the render is the one the URL gets
-/// without the hint, under its own rules.
-fn check_hinted_output(width: u32, height: u32) -> Result<(), EngineError> {
-    let max = crate::url::MAX_DIMENSION;
-    if width > max || height > max {
-        return Err(EngineError::Unsupported(format!(
-            "requested output {width}x{height} exceeds the {max} pixel limit per axis; \
-             resize or crop it to fit"
-        )));
-    }
-    Ok(())
-}
-
 /// A running total of output pixels across the frames of one
 /// animated or video output, charged against the same budget
 /// a single still output gets (issue #182, audit R2-01). The
@@ -2462,6 +2441,27 @@ fn is_output_size_refusal(err: &EngineError) -> bool {
             .any(|opening| what.starts_with(opening)),
         _ => false,
     }
+}
+
+/// Hold the image a render at a hinted DPR factor past 1
+/// ends with to [`crate::url::MAX_DIMENSION`] per axis, a
+/// size no step changed included (issue #529). The steps let
+/// a size they did not change pass ([`check_output_size`]),
+/// so a hinted factor could take a resize to a 16384 px
+/// source's own size and serve that side (or, as WebP, fail
+/// to encode it), past the limit a stepped factor promises to
+/// fit. The refusal is an output-size refusal, so the factor
+/// steps down. At factor 1 the render is the one the URL gets
+/// without the hint, under its own rules.
+fn check_hinted_output(width: u32, height: u32) -> Result<(), EngineError> {
+    let max = crate::url::MAX_DIMENSION;
+    if width > max || height > max {
+        return Err(EngineError::Unsupported(format!(
+            "requested output {width}x{height} exceeds the {max} pixel limit per axis; \
+             resize or crop it to fit"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether any step of `ops` names a pixel size, the one
