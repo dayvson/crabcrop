@@ -1771,19 +1771,19 @@ fn apply_to_region(
 
 /// Write the redacted pixels `done` over the rectangle of
 /// `base` at (x, y), replacing every channel (issue #444).
-/// Compositing them (`imageops::overlay`) let the original
-/// show through wherever the redacted alpha was below 255:
-/// all of it at alpha 0, a third at alpha 128. The face
-/// detector reads RGB only and a JPEG output writes the
-/// stored RGB, so a face stored at alpha 0 was detected and
-/// then served intact.
+/// Compositing them (`imageops::overlay`) would let the
+/// original show through wherever the redacted alpha is
+/// below 255: all of it at alpha 0, a third at alpha 128.
+/// The face detector reads RGB only and a JPEG output writes
+/// the stored RGB, so a face stored at alpha 0 would be
+/// detected and then served intact.
 ///
 /// A rectangle of uniform alpha keeps that alpha exactly: it
 /// carries no detail to redact, and the blur's fixed-point
-/// kernel sums to slightly under one at large sigmas (from
-/// about 25), which would turn an opaque rectangle into
-/// alpha 253. Like `overlay`, it clips to `base`, so an
-/// empty or out-of-frame rectangle is a no-op.
+/// kernel sums to slightly under one from a sigma of about
+/// 18, which would leave an opaque rectangle's alpha just
+/// under 255 (253 at sigma 30). Like `overlay`, it clips to
+/// `base`, so an empty or out-of-frame rectangle is a no-op.
 fn put_redacted(base: &mut image::RgbaImage, mut done: image::RgbaImage, x: u32, y: u32) {
     let w = done.width().min(base.width().saturating_sub(x));
     let h = done.height().min(base.height().saturating_sub(y));
