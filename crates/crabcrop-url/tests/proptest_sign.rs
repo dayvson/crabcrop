@@ -41,14 +41,29 @@ fn config() -> ProptestConfig {
     config
 }
 
-/// A secret: arbitrary bytes, empty included, without NUL.
-/// HMAC pads a key shorter than its block with zero bytes
-/// (RFC 2104), so two secrets differing only by trailing
-/// NULs are one key; configured secrets are environment
-/// text, which cannot hold a NUL, and leaving it out keeps
-/// "a different secret" meaning a different key.
+/// A secret: arbitrary bytes, empty and NUL included (the
+/// API takes bytes, and a secret drawn from a random source
+/// holds NULs).
 fn secret() -> impl Strategy<Value = Vec<u8>> {
-    prop::collection::vec(1u8..=255, 0..=96)
+    prop::collection::vec(any::<u8>(), 0..=96)
+}
+
+/// Whether two secrets may be one key. HMAC zero-pads a key
+/// shorter than its block (RFC 2104), so secrets that differ
+/// only by trailing NULs sign and seal alike; "another
+/// secret" must differ by more than that.
+fn may_be_one_key(a: &[u8], b: &[u8]) -> bool {
+    let trim = |s: &[u8]| s[..s.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)].to_vec();
+    trim(a) == trim(b)
+}
+
+/// `secret` with the byte at `at` changed: always another
+/// key, since the change survives the zero padding and a key
+/// longer than the block is hashed whole.
+fn change_secret_byte(secret: &[u8], at: usize, flip: u8) -> Vec<u8> {
+    let mut changed = secret.to_vec();
+    changed[at] ^= flip;
+    changed
 }
 
 /// A key ID per the grammar: 1 to 32 of `[A-Za-z0-9_-]`.
@@ -137,7 +152,10 @@ proptest! {
 
     /// Changing any one byte of the remainder or of the
     /// decoded tag fails verification, as do a tag one byte
-    /// short or long and a different secret.
+    /// short or long and a different secret. Each case
+    /// changes the first byte, the last, and one at random,
+    /// so a bug that skips an end of the input fails every
+    /// run, not one in a few hundred cases.
     #[test]
     fn signatures_refuse_one_byte_changes(
         secret in secret(),
@@ -146,21 +164,39 @@ proptest! {
         at in any::<Index>(),
         delta in 1u8..95,
         tag_at in 0usize..32,
+        secret_at in any::<Index>(),
         flip in 1u8..=255,
     ) {
         let tag = sign(&secret, &remainder);
-        let changed = change_ascii_byte(&remainder, at.index(remainder.len()), delta);
-        prop_assert!(!verify(&secret, &tag, &changed));
+        let len = remainder.len();
+        for at in [0, len - 1, at.index(len)] {
+            let changed = change_ascii_byte(&remainder, at, delta);
+            prop_assert!(
+                !verify(&secret, &tag, &changed),
+                "remainder byte {} changed",
+                at
+            );
+        }
 
         let mut raw = hex::decode(&tag).unwrap();
-        raw[tag_at] ^= flip;
-        prop_assert!(!verify(&secret, &hex::encode(&raw), &remainder));
-        raw[tag_at] ^= flip;
+        for at in [0, 31, tag_at] {
+            raw[at] ^= flip;
+            prop_assert!(
+                !verify(&secret, &hex::encode(&raw), &remainder),
+                "tag byte {} changed",
+                at
+            );
+            raw[at] ^= flip;
+        }
         prop_assert!(!verify(&secret, &hex::encode(&raw[..31]), &remainder));
         raw.push(0);
         prop_assert!(!verify(&secret, &hex::encode(&raw), &remainder));
 
-        prop_assume!(other != secret);
+        if !secret.is_empty() {
+            let changed = change_secret_byte(&secret, secret_at.index(secret.len()), flip);
+            prop_assert!(!verify(&changed, &tag, &remainder));
+        }
+        prop_assume!(!may_be_one_key(&other, &secret));
         prop_assert!(!verify(&other, &tag, &remainder));
     }
 
@@ -174,6 +210,8 @@ proptest! {
         remainder in any_remainder(),
         kid in key_id(),
         nonce in any::<[u8; 12]>(),
+        secret_at in any::<Index>(),
+        flip in 1u8..=255,
     ) {
         let token = seal_with_nonce(&secret, None, &nonce, &remainder).unwrap();
         prop_assert!(token.starts_with(SEALED_PREFIX));
@@ -189,14 +227,20 @@ proptest! {
         let fresh_keyed = seal_with_key_id(&secret, &kid, &remainder).unwrap();
         prop_assert_eq!(unseal(&secret, &fresh_keyed), Ok(remainder.clone()));
 
-        prop_assume!(other != secret);
+        if !secret.is_empty() {
+            let changed = change_secret_byte(&secret, secret_at.index(secret.len()), flip);
+            prop_assert_eq!(unseal(&changed, &token), Err(SealError::OpenFailed));
+        }
+        prop_assume!(!may_be_one_key(&other, &secret));
         prop_assert_eq!(unseal(&other, &token), Err(SealError::OpenFailed));
         prop_assert_eq!(unseal(&other, &keyed), Err(SealError::OpenFailed));
     }
 
     /// Changing any one byte of the decoded token (nonce,
     /// ciphertext, or tag) or cutting it short fails the open
-    /// with the one opaque error, keyed and bare.
+    /// with the one opaque error, keyed and bare. Each case
+    /// changes the first byte (the nonce's), the last (the
+    /// tag's), and one at random.
     #[test]
     fn sealed_tokens_refuse_one_byte_changes(
         secret in secret(),
@@ -211,14 +255,21 @@ proptest! {
         let mut raw = token_bytes(&token);
         let len = raw.len();
         prop_assert_eq!(len, 12 + remainder.len() + 16);
-        raw[at.index(len)] ^= flip;
-        let damaged = token_from(&raw);
-        prop_assert_eq!(unseal(&secret, &damaged), Err(SealError::OpenFailed));
-        prop_assert_eq!(
-            unseal(&secret, &format!("{kid}:{damaged}")),
-            Err(SealError::OpenFailed)
-        );
-        raw[at.index(len)] ^= flip;
+        for at in [0, len - 1, at.index(len)] {
+            raw[at] ^= flip;
+            let damaged = token_from(&raw);
+            prop_assert_eq!(
+                unseal(&secret, &damaged),
+                Err(SealError::OpenFailed),
+                "token byte {} changed",
+                at
+            );
+            prop_assert_eq!(
+                unseal(&secret, &format!("{kid}:{damaged}")),
+                Err(SealError::OpenFailed)
+            );
+            raw[at] ^= flip;
+        }
         let short = token_from(&raw[..cut.index(len)]);
         prop_assert_eq!(unseal(&secret, &short), Err(SealError::OpenFailed));
     }
