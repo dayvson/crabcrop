@@ -66,9 +66,7 @@ CLI_ENV = {"CRABCROP_BASE": "docs/endpoints.md"}
 
 # Documented codes the server need not build. Codes are frozen as published,
 # so a retired code keeps its row, marked reserved, instead of disappearing.
-# uploads_not_configured is still built but cannot be sent today: without an
-# upload destination the route is not registered (issue #467).
-RESERVED = {"uploads_not_configured"}
+RESERVED = set()
 
 # Documented codes no test names yet. This list only shrinks: write the test
 # rather than add an entry. A listed code that a test names fails the check
@@ -78,13 +76,11 @@ UNTESTED = {
     "invalid_purge_group",
     "invalid_upload_name",
     "meta_not_available",
-    "not_found",
     "processing_failed",
     "reserved_segment",
     "upload_media_mismatch",
     "upload_store_failed",
     "upload_store_unavailable",
-    "uploads_not_configured",
     "validation_failed",
 }
 
