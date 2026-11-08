@@ -73,6 +73,7 @@ jobs:
                 src/text.rs|src/video.rs|src/studio.rs|src/ai.rs) tier=full ;;
                 src/frames.rs|src/pdf.rs|src/loader.rs|src/url.rs) tier=full ;;
                 tests/functional/*) tier=full ;;
+                src/url/*) tier=full ;;
               esac
             done <<< "$files"
           fi

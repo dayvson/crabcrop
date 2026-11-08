@@ -20,7 +20,9 @@ both SDKs must all pass.
 - `src/`: the server. `lib.rs` declares the modules as a library
   target, which the fuzz harness and the integration tests import;
   `main.rs` is the binary, reading configuration and booting the
-  server. The operation parser and canonical forms in `url.rs`,
+  server. The operation parser and canonical forms in `url.rs`
+  (a filter is one row of the table in `url/filters.rs`, which
+  generates both its parser and its canonical spelling),
   pipeline in `engine.rs` (encoders in `engine/encode.rs`, pipeline
   state in `engine/state.rs`), HTTP and caching in `server.rs`
   (request coalescing in `server/process.rs`, metadata responses in
