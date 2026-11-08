@@ -160,11 +160,17 @@ function sizeBlurb(seg: string): string {
   return `resize to ${describe(size.w, "width")} by ${describe(size.h, "height")}${flips.length ? ` (${flips.join(", ")})` : ""}`;
 }
 
+// The grammar's closed sets, declared once for the explainer
+// and the typed builders (issue #482). Each is `as const` so
+// test/grammar-sets.test.ts can check it against the union
+// type operations.ts gives callers: a value added to one side
+// only fails the type check.
+
 /** Crop alignments (url.rs parse_align); `center` is the bare `crop:WxH`. */
-export const CROP_ALIGNS: readonly string[] = ["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"];
+export const CROP_ALIGNS = ["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"] as const;
 
 /** Text overlay anchors (url.rs Anchor::parse). */
-export const TEXT_ANCHORS: readonly string[] = [
+export const TEXT_ANCHORS = [
   "top-left",
   "top-center",
   "top-right",
@@ -174,22 +180,53 @@ export const TEXT_ANCHORS: readonly string[] = [
   "bottom-left",
   "bottom-center",
   "bottom-right",
-];
+] as const;
 
 /** Output formats `format(...)` names; `jpg` is an input alias of `jpeg`. */
-export const IMAGE_FORMATS: readonly string[] = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"];
+export const IMAGE_FORMATS = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"] as const;
+
+/**
+ * Formats a per-format `quality(...)` entry names, in
+ * canonical (name) order: the still formats, since a video
+ * format's quality is not the server's to set. `jpg` is
+ * accepted as the input alias of `jpeg`.
+ */
+export const QUALITY_FORMATS = ["avif", "gif", "jpeg", "jxl", "png", "webp"] as const;
+
+/** JPEG chroma subsamplings `format(jpeg,subsampling:...)` takes. */
+export const JPEG_SUBSAMPLINGS = [444, 422, 420] as const;
 
 /** Overlay blend modes. */
-export const BLEND_MODES: readonly string[] = ["normal", "multiply", "screen", "overlay"];
+export const BLEND_MODES = ["normal", "multiply", "screen", "overlay"] as const;
 
 /** Channels `curve(...)` remaps. */
-export const CURVE_CHANNELS: readonly string[] = ["rgb", "r", "g", "b"];
+export const CURVE_CHANNELS = ["rgb", "r", "g", "b"] as const;
 
 /** Modes `studio(...)` runs. */
-export const STUDIO_MODES: readonly string[] = ["product", "scene"];
+export const STUDIO_MODES = ["product", "scene"] as const;
+
+/** Named backdrops for `studio(product,bg:...)`; any RRGGBB color also works. */
+export const STUDIO_BACKDROPS = ["white", "brand", "none"] as const;
 
 /** Contact shadow strengths for `studio(product, ...)`. */
-export const STUDIO_SHADOWS: readonly string[] = ["soft", "strong", "none"];
+export const STUDIO_SHADOWS = ["soft", "strong", "none"] as const;
+
+/** Factors `upscale(...)` takes. */
+export const UPSCALE_FACTORS = [2, 4] as const;
+
+/** Device pixel ratios `dpr(...)` takes. */
+export const DPR_FACTORS = [1, 1.5, 2, 3] as const;
+
+/** Shapes `mask(...)` cuts. */
+export const MASK_SHAPES = ["circle", "ellipse"] as const;
+
+/** Axes `flip(...)` mirrors across. */
+export const FLIP_AXES = ["h", "v"] as const;
+
+/** Whether `value` is a member of the closed set `list`. */
+export function isOneOf<T extends string | number>(list: readonly T[], value: unknown): value is T {
+  return (list as readonly unknown[]).includes(value);
+}
 
 /**
  * The objects crop's cap on distinct class names (url.rs
@@ -234,8 +271,8 @@ const NO_ARG_FILTERS = new Set([
   "blurfaces",
   "pixelatefaces",
 ]);
-const FORMAT_NAMES = new Set(IMAGE_FORMATS);
-const ANCHOR_NAMES = new Set(TEXT_ANCHORS);
+const FORMAT_NAMES = new Set<string>(IMAGE_FORMATS);
+const ANCHOR_NAMES = new Set<string>(TEXT_ANCHORS);
 
 function isIntIn(s: string, min: number, max: number): boolean {
   // Rust's integer from_str syntax: an optional sign (the
@@ -352,8 +389,8 @@ function validateFilter(name: string, args: string | null): string | null {
         } else {
           const name = part.slice(0, colon);
           const value = part.slice(colon + 1);
-          if (!FORMAT_NAMES.has(name) || name === "mp4" || name === "webm") return bad;
           const canonical = name === "jpg" ? "jpeg" : name;
+          if (!isOneOf(QUALITY_FORMATS, canonical)) return bad;
           if (seen.has(canonical)) return bad;
           seen.add(canonical);
           if (!(value === "auto" || isIntIn(value, 1, 100))) return bad;
@@ -377,7 +414,7 @@ function validateFilter(name: string, args: string | null): string | null {
         seen.add(key);
         if (name === "jpeg" || name === "jpg") {
           if (option === "progressive") continue;
-          if (/^subsampling:(444|422|420)$/.test(option)) continue;
+          if (JPEG_SUBSAMPLINGS.some((s) => option === `subsampling:${s}`)) continue;
           return bad;
         }
         if (name === "png") {
@@ -401,7 +438,7 @@ function validateFilter(name: string, args: string | null): string | null {
     case "curve": {
       if (args === null) return bad;
       const parts = args.split(",");
-      if (!CURVE_CHANNELS.includes(parts[0])) return bad;
+      if (!isOneOf(CURVE_CHANNELS, parts[0])) return bad;
       const coords = parts.slice(1);
       if (coords.length < 4 || coords.length > 32 || coords.length % 2 !== 0) return bad;
       if (!coords.every((p) => isIntIn(p, 0, 255))) return bad;
@@ -425,7 +462,7 @@ function validateFilter(name: string, args: string | null): string | null {
         ? null
         : bad;
     case "upscale":
-      return args !== null && /^[+-]?\d+$/.test(args) && (Number(args) === 2 || Number(args) === 4)
+      return args !== null && /^[+-]?\d+$/.test(args) && isOneOf(UPSCALE_FACTORS, Number(args))
         ? null
         : bad;
     case "studio": {
@@ -439,7 +476,7 @@ function validateFilter(name: string, args: string | null): string | null {
       if (args === null) return bad;
       const parts = args.split(",");
       const mode = parts[0];
-      if (!STUDIO_MODES.includes(mode)) return bad;
+      if (!isOneOf(STUDIO_MODES, mode)) return bad;
       const seen = new Set<string>();
       for (const part of parts.slice(1)) {
         const cut = part.indexOf(":");
@@ -454,16 +491,9 @@ function validateFilter(name: string, args: string | null): string | null {
           // is bounded to 40.
           if (!/^\+?\d+$/.test(value) || BigInt(value) > 40n) return bad;
         } else if (mode === "product" && key === "bg") {
-          if (
-            value !== "white" &&
-            value !== "brand" &&
-            value !== "none" &&
-            !/^[0-9a-fA-F]{6}$/.test(value)
-          ) {
-            return bad;
-          }
+          if (!isOneOf(STUDIO_BACKDROPS, value) && !/^[0-9a-fA-F]{6}$/.test(value)) return bad;
         } else if (mode === "product" && key === "shadow") {
-          if (!STUDIO_SHADOWS.includes(value)) return bad;
+          if (!isOneOf(STUDIO_SHADOWS, value)) return bad;
         } else {
           return bad;
         }
@@ -471,7 +501,7 @@ function validateFilter(name: string, args: string | null): string | null {
       return null;
     }
     case "dpr":
-      return args !== null && isFloat(args) && [1, 1.5, 2, 3].includes(Number(args))
+      return args !== null && isFloat(args) && isOneOf(DPR_FACTORS, Number(args))
         ? null
         : bad;
     case "rotate":
@@ -498,7 +528,7 @@ function validateFilter(name: string, args: string | null): string | null {
         : bad;
     }
     case "mask":
-      return args === "circle" || args === "ellipse" ? null : bad;
+      return isOneOf(MASK_SHAPES, args) ? null : bad;
     case "duotone": {
       if (args === null) return bad;
       const parts = args.split(",");
@@ -509,7 +539,7 @@ function validateFilter(name: string, args: string | null): string | null {
     case "pixelate":
       return args !== null && isIntIn(args, 1, MAX_DIMENSION) ? null : bad;
     case "flip":
-      return args === "h" || args === "v" ? null : bad;
+      return isOneOf(FLIP_AXES, args) ? null : bad;
     case "overlay": {
       if (args === null) return bad;
       // The server splits from the right (rsplitn(6, ',')):
@@ -524,7 +554,7 @@ function validateFilter(name: string, args: string | null): string | null {
         rest = fields.slice(0, -1);
       }
       const blend = rest[rest.length - 1];
-      if (!BLEND_MODES.includes(blend)) return bad;
+      if (!isOneOf(BLEND_MODES, blend)) return bad;
       if (!isIntIn(rest[rest.length - 2], 0, 100)) return bad;
       if (!isIntIn(rest[rest.length - 3], -2147483648, 2147483647)) return bad;
       if (!isIntIn(rest[rest.length - 4], -2147483648, 2147483647)) return bad;
@@ -645,7 +675,7 @@ function explainFilters(rest: string): { detail?: string; error?: string } {
   return { detail: blurbs.join("; ") };
 }
 
-const ALIGN_NAMES = new Set(CROP_ALIGNS);
+const ALIGN_NAMES = new Set<string>(CROP_ALIGNS);
 const U64_MAX = 18446744073709551615n;
 
 /**

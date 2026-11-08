@@ -9,21 +9,32 @@
  * pipeline and the equivalent hand-written string produce
  * byte-identical URLs. Validation throws at build time, like
  * `buildSrcSet` does for widths: a value the server would 400
- * never gets signed. The closed sets and the class-name checks
- * come from the explainer (issue #482), so the builders and
- * the explainer read one copy of that grammar.
+ * never gets signed. The closed sets (formats, aligns, anchors,
+ * modes, factors, shapes) and the class-name checks come from
+ * the explainer (issue #482), so the builders and the
+ * explainer read one copy of them. The numeric bounds are
+ * still written on each side: the builders check numbers, the
+ * explainer checks their spellings.
  */
 import {
   BLEND_MODES,
   classFoldKey,
   CROP_ALIGNS,
   CURVE_CHANNELS,
+  DPR_FACTORS,
+  FLIP_AXES,
   IMAGE_FORMATS,
   isClassName,
+  isOneOf,
+  JPEG_SUBSAMPLINGS,
+  MASK_SHAPES,
   MAX_OBJECTS_CLASSES,
+  QUALITY_FORMATS,
+  STUDIO_BACKDROPS,
   STUDIO_MODES,
   STUDIO_SHADOWS,
   TEXT_ANCHORS,
+  UPSCALE_FACTORS,
 } from "./explain.ts";
 import { MAX_DIMENSION } from "./limits.ts";
 
@@ -32,15 +43,6 @@ export type ImageFormat = "jpeg" | "jpg" | "png" | "webp" | "jxl" | "avif" | "gi
 
 /** Formats a per-format quality entry can name (the video formats take no quality). */
 export type PerFormatQualityFormat = "jpeg" | "png" | "webp" | "jxl" | "avif" | "gif";
-
-const PER_FORMAT_QUALITY_FORMATS: PerFormatQualityFormat[] = [
-  "avif",
-  "gif",
-  "jpeg",
-  "jxl",
-  "png",
-  "webp",
-];
 
 /** Per-format encoder options for the `format(...)` filter (issue #319). */
 export interface FormatOptions {
@@ -122,6 +124,13 @@ export type Dimension = number | "orig";
 
 function fail(what: string, value: unknown, rule: string): never {
   throw new Error(`${what} must be ${rule}, got ${JSON.stringify(value)}`);
+}
+
+/** A closed set spelled for an error message: `2 or 4`, `1, 1.5, 2, or 3`. */
+function eitherOf(values: readonly (string | number)[], quote = false): string {
+  const words = values.map((v) => (quote ? `"${v}"` : String(v)));
+  const last = words.pop();
+  return words.length === 1 ? `${words[0]} or ${last}` : `${words.join(", ")}, or ${last}`;
 }
 
 function intIn(what: string, value: number, min: number, max: number): number {
@@ -313,7 +322,7 @@ export const ops = {
 
   /** `crop:300x200` or `crop:300x200:smart`; an exact pixel box. */
   crop(width: number, height: number, align: CropAlign = "center"): string {
-    if (!CROP_ALIGNS.includes(align)) {
+    if (!isOneOf(CROP_ALIGNS, align)) {
       fail("crop align", align, `one of ${CROP_ALIGNS.join(", ")}`);
     }
     const box = pixelBox("crop", width, height);
@@ -553,7 +562,7 @@ export const filter = {
    * nearest end value.
    */
   curve(channel: CurveChannel, points: [number, number][]): string {
-    if (!CURVE_CHANNELS.includes(channel)) {
+    if (!isOneOf(CURVE_CHANNELS, channel)) {
       fail("curve channel", channel, `one of ${CURVE_CHANNELS.join(", ")}`);
     }
     if (points.length < 2 || points.length > 16) {
@@ -663,8 +672,8 @@ export const filter = {
       parts.push(fallback === "auto" ? "auto" : String(intIn("quality", fallback, 1, 100)));
     }
     for (const name of names.sort()) {
-      if (!PER_FORMAT_QUALITY_FORMATS.includes(name)) {
-        fail("quality", name, `one of ${PER_FORMAT_QUALITY_FORMATS.join(", ")}`);
+      if (!isOneOf(QUALITY_FORMATS, name)) {
+        fail("quality", name, `one of ${QUALITY_FORMATS.join(", ")}`);
       }
       const value = entries[name]!;
       parts.push(`${name}:${value === "auto" ? "auto" : intIn("quality", value, 1, 100)}`);
@@ -683,7 +692,7 @@ export const filter = {
    * format cannot honour throws here, like the server's 400.
    */
   format(format: ImageFormat, options: FormatOptions = {}): string {
-    if (!IMAGE_FORMATS.includes(format)) {
+    if (!isOneOf(IMAGE_FORMATS, format)) {
       fail("format", format, `one of ${IMAGE_FORMATS.join(", ")}`);
     }
     // The output segment is the canonical spelling: the
@@ -698,8 +707,8 @@ export const filter = {
       }
       if (options.progressive) args.push("progressive");
       if (options.subsampling !== undefined) {
-        if (![444, 422, 420].includes(options.subsampling)) {
-          fail("subsampling", options.subsampling, "one of 444, 422, 420");
+        if (!isOneOf(JPEG_SUBSAMPLINGS, options.subsampling)) {
+          fail("subsampling", options.subsampling, `one of ${JPEG_SUBSAMPLINGS.join(", ")}`);
         }
         args.push(`subsampling:${options.subsampling}`);
       }
@@ -751,7 +760,7 @@ export const filter = {
    * `studio("product")` are the same string.
    */
   studio(mode: StudioMode, options: StudioOptions = {}): string {
-    if (!STUDIO_MODES.includes(mode)) {
+    if (!isOneOf(STUDIO_MODES, mode)) {
       fail("studio mode", mode, `one of ${STUDIO_MODES.join(", ")}`);
     }
     const { bg, shadow, pad } = options;
@@ -761,12 +770,11 @@ export const filter = {
     const parts: string[] = [mode];
     if (mode === "product") {
       if (bg !== undefined) {
-        const value =
-          bg === "white" || bg === "brand" || bg === "none" ? bg : hex6("studio bg", bg);
+        const value = isOneOf(STUDIO_BACKDROPS, bg) ? bg : hex6("studio bg", bg);
         parts.push(`bg:${value}`);
       }
       if (shadow !== undefined) {
-        if (!STUDIO_SHADOWS.includes(shadow)) {
+        if (!isOneOf(STUDIO_SHADOWS, shadow)) {
           fail("studio shadow", shadow, `one of ${STUDIO_SHADOWS.join(", ")}`);
         }
         if (shadow !== "soft") parts.push(`shadow:${shadow}`);
@@ -780,15 +788,15 @@ export const filter = {
   },
   /** AI upscale by the given factor. */
   upscale(factor: 2 | 4): string {
-    if (factor !== 2 && factor !== 4) {
-      fail("upscale factor", factor, "2 or 4");
+    if (!isOneOf(UPSCALE_FACTORS, factor)) {
+      fail("upscale factor", factor, eitherOf(UPSCALE_FACTORS));
     }
     return `upscale(${factor})`;
   },
   /** Device pixel ratio the sizes are multiplied by. */
   dpr(factor: 1 | 1.5 | 2 | 3): string {
-    if (![1, 1.5, 2, 3].includes(factor)) {
-      fail("dpr", factor, "1, 1.5, 2, or 3");
+    if (!isOneOf(DPR_FACTORS, factor)) {
+      fail("dpr", factor, eitherOf(DPR_FACTORS));
     }
     return `dpr(${num(factor)})`;
   },
@@ -810,8 +818,8 @@ export const filter = {
     return `border(${intIn("border width", width, 0, MAX_DIMENSION)},${hex6("border color", color)})`;
   },
   mask(shape: MaskShape): string {
-    if (shape !== "circle" && shape !== "ellipse") {
-      fail("mask shape", shape, '"circle" or "ellipse"');
+    if (!isOneOf(MASK_SHAPES, shape)) {
+      fail("mask shape", shape, eitherOf(MASK_SHAPES, true));
     }
     return `mask(${shape})`;
   },
@@ -826,8 +834,8 @@ export const filter = {
     return `pixelate(${intIn("pixelate size", blockSize, 1, MAX_DIMENSION)})`;
   },
   flip(axis: "h" | "v"): string {
-    if (axis !== "h" && axis !== "v") {
-      fail("flip axis", axis, '"h" or "v"');
+    if (!isOneOf(FLIP_AXES, axis)) {
+      fail("flip axis", axis, eitherOf(FLIP_AXES, true));
     }
     return `flip(${axis})`;
   },
@@ -855,7 +863,7 @@ export const filter = {
     intIn("overlay x", x, -2147483648, 2147483647);
     intIn("overlay y", y, -2147483648, 2147483647);
     intIn("overlay alpha", alpha, 0, 100);
-    if (!BLEND_MODES.includes(blend)) {
+    if (!isOneOf(BLEND_MODES, blend)) {
       fail("overlay blend", blend, `one of ${BLEND_MODES.join(", ")}`);
     }
     if (url === "") fail("overlay url", url, "a non-empty URL");
@@ -867,7 +875,7 @@ export const filter = {
    * canonical spelling is always eight lowercase hex digits.
    */
   text(content: string, size: number, color: string, anchor: Anchor): string {
-    if (!TEXT_ANCHORS.includes(anchor)) {
+    if (!isOneOf(TEXT_ANCHORS, anchor)) {
       fail("text anchor", anchor, `one of ${TEXT_ANCHORS.join(", ")}`);
     }
     if (content === "") fail("text", content, "a non-empty label");

@@ -112,6 +112,11 @@ function sizeBlurb(seg) {
     ].filter(Boolean);
     return `resize to ${describe(size.w, "width")} by ${describe(size.h, "height")}${flips.length ? ` (${flips.join(", ")})` : ""}`;
 }
+// The grammar's closed sets, declared once for the explainer
+// and the typed builders (issue #482). Each is `as const` so
+// test/grammar-sets.test.ts can check it against the union
+// type operations.ts gives callers: a value added to one side
+// only fails the type check.
 /** Crop alignments (url.rs parse_align); `center` is the bare `crop:WxH`. */
 export const CROP_ALIGNS = ["center", "smart", "face", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left", "bottom-right"];
 /** Text overlay anchors (url.rs Anchor::parse). */
@@ -128,14 +133,37 @@ export const TEXT_ANCHORS = [
 ];
 /** Output formats `format(...)` names; `jpg` is an input alias of `jpeg`. */
 export const IMAGE_FORMATS = ["jpeg", "jpg", "png", "webp", "jxl", "avif", "gif", "mp4", "webm"];
+/**
+ * Formats a per-format `quality(...)` entry names, in
+ * canonical (name) order: the still formats, since a video
+ * format's quality is not the server's to set. `jpg` is
+ * accepted as the input alias of `jpeg`.
+ */
+export const QUALITY_FORMATS = ["avif", "gif", "jpeg", "jxl", "png", "webp"];
+/** JPEG chroma subsamplings `format(jpeg,subsampling:...)` takes. */
+export const JPEG_SUBSAMPLINGS = [444, 422, 420];
 /** Overlay blend modes. */
 export const BLEND_MODES = ["normal", "multiply", "screen", "overlay"];
 /** Channels `curve(...)` remaps. */
 export const CURVE_CHANNELS = ["rgb", "r", "g", "b"];
 /** Modes `studio(...)` runs. */
 export const STUDIO_MODES = ["product", "scene"];
+/** Named backdrops for `studio(product,bg:...)`; any RRGGBB color also works. */
+export const STUDIO_BACKDROPS = ["white", "brand", "none"];
 /** Contact shadow strengths for `studio(product, ...)`. */
 export const STUDIO_SHADOWS = ["soft", "strong", "none"];
+/** Factors `upscale(...)` takes. */
+export const UPSCALE_FACTORS = [2, 4];
+/** Device pixel ratios `dpr(...)` takes. */
+export const DPR_FACTORS = [1, 1.5, 2, 3];
+/** Shapes `mask(...)` cuts. */
+export const MASK_SHAPES = ["circle", "ellipse"];
+/** Axes `flip(...)` mirrors across. */
+export const FLIP_AXES = ["h", "v"];
+/** Whether `value` is a member of the closed set `list`. */
+export function isOneOf(list, value) {
+    return list.includes(value);
+}
 /**
  * The objects crop's cap on distinct class names (url.rs
  * MAX_OBJECTS_CLASSES).
@@ -293,9 +321,9 @@ function validateFilter(name, args) {
                 else {
                     const name = part.slice(0, colon);
                     const value = part.slice(colon + 1);
-                    if (!FORMAT_NAMES.has(name) || name === "mp4" || name === "webm")
-                        return bad;
                     const canonical = name === "jpg" ? "jpeg" : name;
+                    if (!isOneOf(QUALITY_FORMATS, canonical))
+                        return bad;
                     if (seen.has(canonical))
                         return bad;
                     seen.add(canonical);
@@ -325,7 +353,7 @@ function validateFilter(name, args) {
                 if (name === "jpeg" || name === "jpg") {
                     if (option === "progressive")
                         continue;
-                    if (/^subsampling:(444|422|420)$/.test(option))
+                    if (JPEG_SUBSAMPLINGS.some((s) => option === `subsampling:${s}`))
                         continue;
                     return bad;
                 }
@@ -355,7 +383,7 @@ function validateFilter(name, args) {
             if (args === null)
                 return bad;
             const parts = args.split(",");
-            if (!CURVE_CHANNELS.includes(parts[0]))
+            if (!isOneOf(CURVE_CHANNELS, parts[0]))
                 return bad;
             const coords = parts.slice(1);
             if (coords.length < 4 || coords.length > 32 || coords.length % 2 !== 0)
@@ -386,7 +414,7 @@ function validateFilter(name, args) {
                 ? null
                 : bad;
         case "upscale":
-            return args !== null && /^[+-]?\d+$/.test(args) && (Number(args) === 2 || Number(args) === 4)
+            return args !== null && /^[+-]?\d+$/.test(args) && isOneOf(UPSCALE_FACTORS, Number(args))
                 ? null
                 : bad;
         case "studio": {
@@ -401,7 +429,7 @@ function validateFilter(name, args) {
                 return bad;
             const parts = args.split(",");
             const mode = parts[0];
-            if (!STUDIO_MODES.includes(mode))
+            if (!isOneOf(STUDIO_MODES, mode))
                 return bad;
             const seen = new Set();
             for (const part of parts.slice(1)) {
@@ -421,15 +449,11 @@ function validateFilter(name, args) {
                         return bad;
                 }
                 else if (mode === "product" && key === "bg") {
-                    if (value !== "white" &&
-                        value !== "brand" &&
-                        value !== "none" &&
-                        !/^[0-9a-fA-F]{6}$/.test(value)) {
+                    if (!isOneOf(STUDIO_BACKDROPS, value) && !/^[0-9a-fA-F]{6}$/.test(value))
                         return bad;
-                    }
                 }
                 else if (mode === "product" && key === "shadow") {
-                    if (!STUDIO_SHADOWS.includes(value))
+                    if (!isOneOf(STUDIO_SHADOWS, value))
                         return bad;
                 }
                 else {
@@ -439,7 +463,7 @@ function validateFilter(name, args) {
             return null;
         }
         case "dpr":
-            return args !== null && isFloat(args) && [1, 1.5, 2, 3].includes(Number(args))
+            return args !== null && isFloat(args) && isOneOf(DPR_FACTORS, Number(args))
                 ? null
                 : bad;
         case "rotate":
@@ -468,7 +492,7 @@ function validateFilter(name, args) {
                 : bad;
         }
         case "mask":
-            return args === "circle" || args === "ellipse" ? null : bad;
+            return isOneOf(MASK_SHAPES, args) ? null : bad;
         case "duotone": {
             if (args === null)
                 return bad;
@@ -480,7 +504,7 @@ function validateFilter(name, args) {
         case "pixelate":
             return args !== null && isIntIn(args, 1, MAX_DIMENSION) ? null : bad;
         case "flip":
-            return args === "h" || args === "v" ? null : bad;
+            return isOneOf(FLIP_AXES, args) ? null : bad;
         case "overlay": {
             if (args === null)
                 return bad;
@@ -498,7 +522,7 @@ function validateFilter(name, args) {
                 rest = fields.slice(0, -1);
             }
             const blend = rest[rest.length - 1];
-            if (!BLEND_MODES.includes(blend))
+            if (!isOneOf(BLEND_MODES, blend))
                 return bad;
             if (!isIntIn(rest[rest.length - 2], 0, 100))
                 return bad;

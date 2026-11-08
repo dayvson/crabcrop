@@ -169,6 +169,10 @@ CROP = [
     (f"crop:100x100:objects({OBJ32})", f"crop:100x100:objects({OBJ32}):1", None),
     (f"crop:100x100:objects({OBJ32},C0,c31)", f"crop:100x100:objects({OBJ32}):1", None),
     (f"crop:100x100:objects({OBJ31},E,e)", f"crop:100x100:objects({OBJ31},E):1", None),
+    # Below the cap, the non-ASCII case pairs stay two classes:
+    # `É`/`é`, and the Kelvin sign U+212A beside `k`.
+    ("crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k)",
+     "crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k):1", None),
     ("crop:300x0", None, "invalid_crop"),
     ("crop:0x200", None, "invalid_crop"),
     ("crop:-300x200", None, "invalid_crop"),
@@ -405,9 +409,14 @@ filter_cases([
     ("quality(webp:75,80,jpeg:90)", "quality(80,jpeg:90,webp:75)", None),
     ("quality(jpg:90)", "quality(jpeg:90)", None),
     ("quality(jpeg:auto)", None, None),
+    # Every still format takes an entry; the builders and the
+    # explainer read this set from one list (issue #482).
+    ("quality(webp:85,png:80,jxl:75,jpeg:70,gif:60,avif:50)",
+     "quality(avif:50,gif:60,jpeg:70,jxl:75,png:80,webp:85)", None),
     ("quality(0)", None, "invalid_filters"),
     ("quality(101)", None, "invalid_filters"),
     ("quality(mp4:80)", None, "invalid_filters"),
+    ("quality(webm:80)", None, "invalid_filters"),
     ("quality(jpeg:90,jpg:80)", None, "invalid_filters"),
     ("quality(80,90)", None, "invalid_filters"),
     ("quality(jpeg:0)", None, "invalid_filters"),
@@ -805,6 +814,8 @@ builder("ops.cropObjects", [100, 100, OBJ31.split(",") + ["E", "e"]],
         f"crop:100x100:objects({OBJ31},E):1")
 builder("ops.cropObjects", [100, 100, OBJ31.split(",") + ["É", "é"]],
         f"crop:100x100:objects({OBJ31},%C3%89,%C3%A9):1", throws=True, code="invalid_crop")
+builder("ops.cropObjects", [100, 100, ["É", "é", "\u212a", "k"]],
+        "crop:100x100:objects(%C3%89,%C3%A9,%E2%84%AA,k):1")
 # Issue #472: the server trims a class name before it keys on
 # it, so the builder encodes the trimmed name.
 builder("ops.cropObjects", [100, 100, [" person "]],
@@ -876,6 +887,9 @@ builder("filter.quality", ["auto"], "quality(auto)")
 builder("filter.quality", [0], "quality(0)", throws=True, code="invalid_filters")
 builder("filter.qualityPerFormat", [{"webp": 75, "jpeg": 90}, 80],
         "quality(80,jpeg:90,webp:75)")
+builder("filter.qualityPerFormat",
+        [{"webp": 85, "png": 80, "jxl": 75, "jpeg": 70, "gif": 60, "avif": 50}],
+        "quality(avif:50,gif:60,jpeg:70,jxl:75,png:80,webp:85)")
 builder("filter.palette", [64], "palette(64)")
 builder("filter.palette", [1], "palette(1)", throws=True, code="invalid_filters")
 builder("filter.format", ["jpg"], "format(jpeg)")
