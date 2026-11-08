@@ -10,6 +10,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Shared-tier purges are paced and coalesced (issue #462). A purge reads entry headers 16 at a time instead of one by one, purge requests share a budget of 32 reads in flight, and at most two background walks run at once. A purge whose target is already being walked joins that walk instead of listing the bucket again, and one re-list afterwards removes copies rendered in between. A walk that the bucket fails part way (a listing, read or delete with no answer) no longer ends its purge: the tombstone stays in force until a later purge of the same target completes a walk, and each failure counts in `crabcrop_cache_tier_errors_total`.
 
+- The server drains for at most `CRABCROP_SHUTDOWN_GRACE_SECS` after `SIGTERM` or Ctrl-C, 8 seconds by default, then exits (issue #463). It stops accepting connections, lets the requests in flight finish, and waits for the shared-tier writes they left behind; a second signal ends the drain at once. Before, shutdown had no deadline, and background shared-tier writes died with the process. The Helm chart passes the new `shutdownGraceSeconds` value as `CRABCROP_SHUTDOWN_GRACE_SECS` and sets the pod's `terminationGracePeriodSeconds` to it plus 5 seconds. Shared-tier writes are bounded too: at most 64 run at once, and a render's write-through that finds no free slot is skipped and counted as `crabcrop_cache_shared_puts_skipped_total` on `/metrics`, next to `crabcrop_cache_shared_puts_in_flight` and `crabcrop_cache_shared_puts_capacity`. A cache entry's group write-back is never skipped.
+
 ## [0.9.11] - 2026-11-07
 
 ### Added
