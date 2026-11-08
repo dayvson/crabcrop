@@ -8511,8 +8511,8 @@ async fn disk_task_panic_degrades_and_counts_the_error() {
 }
 
 /// Holds the server's read of a FIFO that stands in for a
-/// stored entry, and lets it go on every exit path (issue
-/// #543).
+/// stored entry, and lets it go on every exit path once it
+/// has it (issue #543).
 ///
 /// A thread of its own opens the FIFO's write end, so a read
 /// that wrongly blocks the runtime thread is still let go,
@@ -8520,6 +8520,14 @@ async fn disk_task_panic_degrades_and_counts_the_error() {
 /// Every open it makes is non-blocking: an open for write
 /// fails at once while no reader has the FIFO open, so the
 /// thread never parks and can always be joined.
+///
+/// It lets readers go only while it lives. A read that first
+/// opens the FIFO after the gate's last open, and before the
+/// scratch directory unlinks it, still parks with no writer
+/// left, and the runtime's drop waits on it. Reaching that
+/// takes the request to miss the 30 s deadline for opening
+/// the entry and then arrive within microseconds of the
+/// gate's drop.
 ///
 /// The test used to release the read with a detached thread
 /// that slept two seconds and then made one blocking open.
@@ -8675,10 +8683,10 @@ async fn within<F: std::future::Future>(
 /// A disk read that blocks must not stall the runtime
 /// worker (issue #347): the stored entry's file is
 /// swapped for a FIFO whose read is held, and /health has
-/// to answer while it is. Every wait has a deadline and
-/// the gate lets the read go on every exit path, so a
-/// failure is reported rather than hanging the suite
-/// (issue #543).
+/// to answer while it is. Every request and the wait for
+/// the read have a deadline, and the gate lets a held read
+/// go on every exit path, so a failure is reported rather
+/// than hanging the suite (issue #543).
 #[cfg(unix)]
 #[tokio::test]
 async fn blocked_disk_read_leaves_health_responsive() {
@@ -8742,8 +8750,11 @@ async fn blocked_disk_read_leaves_health_responsive() {
     assert_eq!(health.status(), 200);
     assert!(
         !gate.released(),
-        "/health answered {:?} after the disk read was held, only once \
-         the read was let go: it waited behind the read",
+        "/health answered only after the gate's {:?} backstop let the \
+         held read go ({:?} after it was held): the runtime thread was \
+         blocked while the read was held, by the read itself (#347) or \
+         by a starved runner",
+        FifoGate::BACKSTOP,
         held_at.elapsed()
     );
     gate.release();

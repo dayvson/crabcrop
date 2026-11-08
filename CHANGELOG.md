@@ -6,7 +6,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Changed
 
-- Test and CI reliability. A failed check in the disk-read test that blocks on a FIFO no longer hangs the suite: the test lets the read go on every exit path and puts a deadline on every wait, and every job in `rust.yml` and `functional.yml` has a `timeout-minutes` (issue #543).
+- Test and CI reliability. A failed check in the disk-read test that blocks on a FIFO no longer hangs the suite: the test lets the held read go on every exit path and puts a deadline on each request and on the wait for the read, and every job in `rust.yml` and `functional.yml` has a `timeout-minutes` (issue #543).
 
 ## [0.10.0] - 2026-11-08
 
