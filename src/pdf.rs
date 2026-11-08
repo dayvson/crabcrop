@@ -31,7 +31,8 @@
 //!   `-png -singlefile -f <n> -l <n> -r <dpi> - -`: the
 //!   PDF on stdin, one PNG on stdout, at a fixed scale
 //!   of 2.0 (144 DPI) clamped so neither raster axis
-//!   exceeds the 16383 px output limit.
+//!   exceeds the 16383 px output limit at the probed
+//!   page size.
 //!
 //! The rendered PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
@@ -67,15 +68,24 @@ pub const MAX_PAGE_PNG_BYTES: usize = 256 * 1024 * 1024;
 /// knob.
 pub const RENDER_SCALE: f64 = 2.0;
 
-/// The size a rendered raster axis may not exceed, in
-/// pixels: the 16383 px output limit, one under the
-/// decode chain's 16384 (issue #528), applied before the
-/// tool runs so a poster page renders at a clamped scale
-/// instead of asking for a raster the pipeline would
-/// refuse. A page rendered at the decode cap that no step
-/// resized would end past the output limit, which the
-/// engine refuses.
-const MAX_RASTER_AXIS: f64 = crate::url::MAX_DIMENSION as f64;
+/// The size a rendered raster axis may not exceed at the
+/// probed page size, in pixels: one under the 16383 px
+/// output limit, itself one under the decode chain's 16384
+/// (issue #528), applied before the tool runs so a poster
+/// page renders at a clamped scale instead of asking for a
+/// raster the pipeline would refuse. A page rendered at the
+/// decode cap that no step resized would end past the output
+/// limit, which the engine refuses.
+///
+/// The pixel of margin is for the probe's rounding: it
+/// prints the page size to six significant digits (an
+/// 8191.5004 pt side prints as 8191.5), and the renderer
+/// rounds the raster up, so a scale that put the printed
+/// size at exactly 16383 px could render the true size at
+/// 16384. Six digits are off by at most a part in 200,000,
+/// under a tenth of a pixel at this size, which the margin
+/// absorbs.
+const MAX_RASTER_AXIS: f64 = (crate::url::MAX_DIMENSION - 1) as f64;
 
 /// The total raster area a render may not exceed, in
 /// pixels: 64 Mpx, the raster the 256 MB decode budget
@@ -663,12 +673,13 @@ Page size:       792 x 612 pts (letter)
         assert!(axis * axis <= 64_000_001.0, "{axis}");
         // A wide-but-short page still clamps by axis, to
         // the output limit rather than the decode cap
-        // (issue #528): an 8192 pt page at the fixed scale
-        // would render 16384 px wide.
+        // (issue #528), less the probe's rounding margin: an
+        // 8192 pt page at the fixed scale would render 16384
+        // px wide.
         let scale = render_scale(20_000.0, 100.0);
-        assert!((scale - 16_383.0 / 20_000.0).abs() < 1e-9, "{scale}");
+        assert!((scale - 16_382.0 / 20_000.0).abs() < 1e-9, "{scale}");
         let scale = render_scale(8_192.0, 100.0);
-        assert!((scale - 16_383.0 / 8_192.0).abs() < 1e-9, "{scale}");
+        assert!((scale - 16_382.0 / 8_192.0).abs() < 1e-9, "{scale}");
         assert!((8_192.0 * (scale * 72.0).floor() / 72.0) <= 16_383.0);
         // The hostile MediaBox from the finding: a
         // 100000 pt square page renders at 8000 px per
@@ -678,6 +689,63 @@ Page size:       792 x 612 pts (letter)
         // A degenerate size keeps the fixed scale; the
         // renderer run is where that document fails.
         assert_eq!(render_scale(0.0, 0.0), 2.0);
+    }
+
+    /// The raster side the reference renderer draws for a
+    /// page side of `points` at `dpi`: the scaled size,
+    /// rounded up.
+    fn raster_side(points: f64, dpi: f64) -> f64 {
+        (points * dpi / 72.0).ceil()
+    }
+
+    #[test]
+    fn a_page_the_probe_rounds_down_stays_within_the_output_limit() {
+        // The probe prints a page side to six significant
+        // digits, and the renderer rounds the raster up
+        // (issue #528). An 8191.5004 pt side printed as
+        // 8191.5, which at the old 16383 px cap kept the
+        // scale at 2: the page rendered 16384 px wide and the
+        // output check refused it. Every printed size within
+        // a pixel or two of a DPI step, short side or long,
+        // renders within the limit at the largest true size
+        // that prints that way.
+        let max = f64::from(crate::url::MAX_DIMENSION);
+        let dpi_at = |w: f64, h: f64| (render_scale(w, h) * 72.0).floor().max(1.0);
+        assert_eq!(dpi_at(8_191.5, 100.0), 143.0);
+        assert_eq!(raster_side(8_191.500_4, 143.0), 16_270.0);
+        assert_eq!(raster_side(8_191.500_4, 144.0), 16_384.0);
+        // The sides that render at exactly the limit at each
+        // DPI the clamp can pick, and two points either way.
+        for step in 72..=144u32 {
+            let edge = max * 72.0 / f64::from(step);
+            for tenths in -20..=20 {
+                let printed = sig6(edge + f64::from(tenths) / 10.0);
+                let truth = printed + half_unit_of_six_digits(printed);
+                for (w, h, tw, th) in [
+                    (printed, 100.0, truth, 100.0),
+                    (100.0, printed, 100.0, truth),
+                ] {
+                    let dpi = dpi_at(w, h);
+                    assert!(
+                        raster_side(tw, dpi) <= max && raster_side(th, dpi) <= max,
+                        "{w}x{h} pt printed, {tw}x{th} pt true, at {dpi} dpi"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `value` rounded to six significant digits, as the
+    /// probe's `%g` prints it.
+    fn sig6(value: f64) -> f64 {
+        format!("{value:.5e}").parse().unwrap()
+    }
+
+    /// Half a unit in the sixth significant digit of
+    /// `value`: how far the true size can sit from the
+    /// printed one.
+    fn half_unit_of_six_digits(value: f64) -> f64 {
+        0.5 * 10f64.powi(value.abs().log10().floor() as i32 - 5)
     }
 
     #[test]
