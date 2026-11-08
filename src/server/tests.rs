@@ -186,6 +186,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -328,6 +329,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -389,6 +391,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -450,6 +453,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -521,6 +525,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -602,6 +607,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -884,6 +890,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -1242,6 +1249,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -1309,6 +1317,7 @@ async fn spawn_app_rotating() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -1380,6 +1389,7 @@ async fn spawn_app_with_fallback() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -3059,6 +3069,7 @@ async fn spawn_app_with_presets_and_roots(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -4296,6 +4307,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -4476,6 +4488,7 @@ async fn spawn_app_with_moderation(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -4808,6 +4821,7 @@ async fn spawn_app_with_ocr_timeout(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -5229,6 +5243,7 @@ async fn spawn_app_with_embeddings(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -5973,6 +5988,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6036,6 +6052,7 @@ async fn spawn_app_with_studio() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6099,6 +6116,7 @@ async fn spawn_app_with_inpaint() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6194,6 +6212,7 @@ async fn spawn_app_with_segment() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6685,6 +6704,7 @@ async fn spawn_app_with_providers(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6762,6 +6782,7 @@ async fn spawn_app_full(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -8254,6 +8275,7 @@ async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -8339,6 +8361,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     }
@@ -9457,6 +9480,7 @@ async fn spawn_app_with_provenance_signer(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: Some(signer),
         config_fingerprint: "test".to_string(),
     };
@@ -9586,6 +9610,7 @@ async fn processing_gate_bounds_concurrency() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -9714,6 +9739,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -10449,6 +10475,7 @@ fn lane_test_state(
         slow_gate: Arc::new(Gate::new(slow_permits)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     }
@@ -10733,6 +10760,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         slow_gate,
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -10888,6 +10916,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -11576,6 +11605,7 @@ async fn spawn_app_with_upload_gate(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -13793,6 +13823,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: fingerprint.to_string(),
     };
@@ -15046,6 +15077,7 @@ async fn spawn_explain_app_with_roots(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -15339,4 +15371,370 @@ async fn explain_escapes_markup_bearing_strings() {
     let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(json["source"]["url"], src);
     assert_eq!(json["presets"][0]["name"], "a&b");
+}
+
+/// Serve `state` on an ephemeral port: the tests that read
+/// `/metrics` while they drive the state directly.
+async fn serve_state(state: &AppState) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = state.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state)).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The `/metrics` exposition, read with `token`.
+async fn scrape(base: &str, token: &str) -> String {
+    let resp = client()
+        .get(format!("{base}/metrics"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
+    // Issue #463: every shared write-through was a bare
+    // spawn, so a stalled bucket let them pile up, one per
+    // miss, each holding a whole entry. Now at most
+    // SHARED_PUTS_AT_ONCE are in flight, and one that finds
+    // every slot taken is skipped and counted, not queued.
+    let fake = crate::s3store::test_support::start_fake().await;
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let mut state = tier_test_state(None, &fake.endpoint);
+    state.metrics_token = Some("metrics-token".to_string());
+    let shared = state.shared_store.clone().unwrap();
+    let base = serve_state(&state).await;
+    let snapshot = state.purge_guard.snapshot();
+    let key = |i: usize| format!("{i}/example.com/a.png");
+    for i in 0..SHARED_PUTS_AT_ONCE {
+        spawn_shared_put(
+            &state,
+            snapshot,
+            &key(i),
+            tier_test_entry(),
+            SharedWrite::Render,
+        );
+    }
+    wait_until("every slot's write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == SHARED_PUTS_AT_ONCE
+    })
+    .await;
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains(&format!(
+            "crabcrop_cache_shared_puts_in_flight {SHARED_PUTS_AT_ONCE}\n"
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(&format!(
+            "crabcrop_cache_shared_puts_capacity {SHARED_PUTS_AT_ONCE}\n"
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_skipped_total 0\n"),
+        "{metrics}"
+    );
+
+    // Every slot is taken: the next write is skipped on the
+    // spot and counted, and nothing more reaches the bucket.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        &key(1000),
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 1);
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_skipped_total 1\n"),
+        "{metrics}"
+    );
+    assert_eq!(fake.held_puts.load(Ordering::SeqCst), SHARED_PUTS_AT_ONCE);
+
+    // The bucket answers: the held writes land, tracked to
+    // the end, and give their slots back.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let left = state.background.drain(deadline).await;
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 0
+        }
+    );
+    assert_eq!(state.background.puts_in_flight(), 0);
+    assert_eq!(entry_objects(&fake), SHARED_PUTS_AT_ONCE);
+    assert!(shared.get(&key(0)).await.is_some());
+    assert!(shared.get(&key(1000)).await.is_none());
+
+    // With a slot free again, a write goes through.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        &key(1001),
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    state.background.drain(deadline).await;
+    assert!(shared.get(&key(1001)).await.is_some());
+    assert_eq!(state.background.puts_skipped(), 1);
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_in_flight 0\n"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_waits_for_a_write_through_until_its_deadline() {
+    // Issue #463: at shutdown the detached writes died with
+    // the runtime once the connections drained. The drain
+    // now waits for them, and stops waiting at its deadline.
+    let fake = crate::s3store::test_support::start_fake().await;
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let state = tier_test_state(None, &fake.endpoint);
+    let shared = state.shared_store.clone().unwrap();
+    let key = "40x24/example.com/i.png";
+    spawn_shared_put(
+        &state,
+        state.purge_guard.snapshot(),
+        key,
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    wait_until("the write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // The bucket holds the write past the deadline: the
+    // drain gives up at it and reports the write.
+    let grace = std::time::Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let left = state.background.drain(started + grace).await;
+    assert!(started.elapsed() >= grace);
+    assert_eq!(
+        left,
+        Drained {
+            writes: 1,
+            walks: 0
+        }
+    );
+    assert_eq!(entry_objects(&fake), 0);
+    // Answered in time, the write lands before the drain
+    // returns.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let left = state.background.drain(deadline).await;
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 0
+        }
+    );
+    assert!(shared.get(key).await.is_some());
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_counts_purge_walks_but_never_waits_for_them() {
+    // Issue #463: a purge's background walk is tracked, but
+    // a shutdown does not wait for it. Cut short, it leaves
+    // the purge's tombstone unended, which keeps the purge
+    // in force (issue #461).
+    let fake = crate::s3store::test_support::start_fake().await;
+    {
+        let mut objects = fake.objects.lock().unwrap();
+        for i in 0..SHARED_PURGE_INLINE_SCAN + 8 {
+            objects.insert(format!("0-filler-{i:04}"), b"not a cache entry".to_vec());
+        }
+    }
+    // The request scans the inline budget itself; the
+    // background walk parks on its first read past it.
+    *fake.hold_ranged_after.lock().unwrap() = Some(SHARED_PURGE_INLINE_SCAN);
+    let state = tier_test_state(None, &fake.endpoint);
+    purge_source_everywhere(&state, "example.com/i.png").await;
+    wait_until("the background walk parks", || {
+        fake.ranged_gets.load(Ordering::SeqCst) > SHARED_PURGE_INLINE_SCAN
+    })
+    .await;
+    assert_eq!(state.purge_guard.active_count(), 1);
+    // A deadline far off: the drain returns as soon as the
+    // writes are done, with the parked walk still running.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let left = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        state.background.drain(deadline),
+    )
+    .await
+    .expect("the drain must not wait for the walk");
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 1
+        }
+    );
+    assert_eq!(state.purge_guard.active_count(), 1);
+    // Released, the walk ends the purge as before.
+    *fake.hold_ranged_after.lock().unwrap() = None;
+    wait_until("the purge walk ends", || {
+        state.purge_guard.active_count() == 0
+    })
+    .await;
+}
+
+/// Fill every shared write slot against a stalled bucket:
+/// `SHARED_PUTS_AT_ONCE` render write-throughs, each held.
+async fn hold_every_shared_write_slot(
+    state: &AppState,
+    fake: &crate::s3store::test_support::FakeS3,
+) {
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let snapshot = state.purge_guard.snapshot();
+    for i in 0..SHARED_PUTS_AT_ONCE {
+        spawn_shared_put(
+            state,
+            snapshot,
+            &format!("{i}/example.com/filler.png"),
+            tier_test_entry(),
+            SharedWrite::Render,
+        );
+    }
+    wait_until("every slot's write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == SHARED_PUTS_AT_ONCE
+    })
+    .await;
+}
+
+/// A group-free copy is served to a grouped request while
+/// every shared write slot is taken, from memory or from the
+/// bucket; then the bucket recovers and the group is purged.
+/// The purge must reach the bucket copy, on this replica and
+/// on any other.
+async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool) {
+    // Issue #463 review: the bound skipped a tier hit's
+    // group write-back like a render write-through. The
+    // local merge had already recorded the group, so nothing
+    // sent it again; the bucket copy never learned it, the
+    // group purge left it, and every replica served it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let state = tier_test_state(None, &fake.endpoint);
+    let shared = state.shared_store.clone().unwrap();
+    let key = "40x24/example.com/hero.png";
+    let entry = tier_test_entry();
+    shared.put(key, &entry).await;
+    if from_memory {
+        put_memory_tier(&state, state.purge_guard.snapshot(), key, &entry);
+    }
+    hold_every_shared_write_slot(&state, &fake).await;
+
+    let groups = vec!["hero".to_string()];
+    let (_, status) = lookup_tiers(&state, key, &groups).await.unwrap();
+    let expected = if from_memory {
+        "crabcrop; hit"
+    } else {
+        "crabcrop; hit; detail=\"shared\""
+    };
+    assert_eq!(status, expected);
+    // The write-back waits for a slot rather than take a
+    // sixty-fifth: the bound on writes in flight holds.
+    assert_eq!(state.background.puts_in_flight(), SHARED_PUTS_AT_ONCE);
+    assert_eq!(fake.held_puts.load(Ordering::SeqCst), SHARED_PUTS_AT_ONCE);
+    // The next hit is a memory hit that already carries the
+    // group: it sends nothing.
+    let (_, status) = lookup_tiers(&state, key, &groups).await.unwrap();
+    assert_eq!(status, "crabcrop; hit");
+
+    // The bucket recovers: the held writes land, then the
+    // write-back takes a freed slot and lands too.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(state.background.drain(far).await.writes, 0);
+    assert_eq!(
+        shared.get(key).await.unwrap().groups,
+        groups,
+        "the bucket copy never learned the group"
+    );
+    assert_eq!(state.background.puts_skipped(), 0);
+
+    let base = serve_state(&state).await;
+    let sig = crate::url::purge_group_signature(SECRET, "hero");
+    let resp = client()
+        .post(format!("{base}/purge-group/{sig}/hero"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    wait_until("the group purge ends", || {
+        state.purge_guard.active_count() == 0
+    })
+    .await;
+    assert!(
+        shared.get(key).await.is_none(),
+        "the purge answered {body:?}, yet the bucket copy survived it"
+    );
+    assert!(lookup_tiers(&state, key, &groups).await.is_none());
+    // Another replica, with the bucket's tombstones read,
+    // misses as well.
+    let other = tier_test_state(None, &fake.endpoint);
+    shared.refresh_tombstones(&other.purge_guard).await;
+    assert!(lookup_tiers(&other, key, &groups).await.is_none());
+}
+
+#[tokio::test]
+async fn a_memory_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
+    group_purge_after_a_hit_with_every_write_slot_taken(true).await;
+}
+
+#[tokio::test]
+async fn a_shared_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
+    group_purge_after_a_hit_with_every_write_slot_taken(false).await;
+}
+
+#[tokio::test]
+async fn a_render_write_a_purge_covers_is_dropped_but_not_counted_as_skipped() {
+    // Issue #463 review: the skip counter is for renders the
+    // bucket missed because every slot was taken. A write a
+    // running purge already covers would never land, so it
+    // is not one of them.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let state = tier_test_state(None, &fake.endpoint);
+    let snapshot = state.purge_guard.snapshot();
+    hold_every_shared_write_slot(&state, &fake).await;
+    let covered = "40x24/example.com/covered.png";
+    let _purge = state
+        .purge_guard
+        .begin(crate::cache::PurgeTarget::Key(covered.to_string()));
+    spawn_shared_put(
+        &state,
+        snapshot,
+        covered,
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 0);
+    // One the purge does not cover is skipped and counted.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        "40x24/example.com/other.png",
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 1);
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(state.background.drain(far).await.writes, 0);
+    assert_eq!(entry_objects(&fake), SHARED_PUTS_AT_ONCE);
 }

@@ -118,6 +118,13 @@ gif = "0.14"
 quantizr = "1.4"
 png = "0.18"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "fs", "io-util", "signal"] }
+# The work handlers leave running (issue #463) is spawned on a
+# TaskTracker, so a shutdown can wait for it up to a deadline.
+# Already in the tree through h2 (hyper, reqwest). `rt` is the
+# feature that carries the tracker; it turns on futures-util's
+# default features for tokio-util, which add one build-time
+# crate, futures-macro, from the same futures release.
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 
 # Safe process-group signalling for the video encoder's
 # timeout kill (issue #194, audit R2-31): the crate forbids
