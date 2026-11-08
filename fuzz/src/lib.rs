@@ -2,25 +2,82 @@
 //! of the server: the URL parser (issue #146), the
 //! sealed-token opener (issue #255), and the byte
 //! surfaces behind them (issue #387): image decode,
-//! source metadata extraction, and filter chains.
+//! source metadata extraction, and operation chains.
 //!
 //! The harness depends on the server's library target
 //! (issue #417), so every check runs the server's own
 //! code: the parser in `crabcrop::url`, the decode
-//! dispatch in `crabcrop::engine`, the metadata code in
-//! `crabcrop::color`, the filters in `crabcrop::filters`,
-//! and the SVG pipeline in `crabcrop::svg`. The opener
-//! lives in `crabcrop-url`, a direct dependency.
-//! `check` drives the parser target, `check_seal` the
-//! opener target, and `check_decode`, `check_meta`, and
-//! `check_chain` the byte targets; all of them also run
-//! under the deterministic smoke test.
+//! dispatch and the render pipeline in `crabcrop::engine`,
+//! the metadata code in `crabcrop::color`, the filters in
+//! `crabcrop::filters`, and the SVG pipeline in
+//! `crabcrop::svg`. The opener lives in `crabcrop-url`, a
+//! direct dependency. `check` drives the parser target,
+//! `check_seal` the opener target, and `check_decode`,
+//! `check_meta`, and `check_chain` the byte targets; all of
+//! them also run under the deterministic smoke test.
 
-pub use crabcrop::{color, filters, svg, url};
+pub use crabcrop::{color, engine, filters, svg, url};
 
-use crabcrop::engine;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
-use url::Signature;
+use url::{Dimension, Filter, Operation, Signature};
+
+/// The preset map `check` expands requests against: a
+/// fixed stand-in for operator configuration (issue
+/// #476), the way the root map below stands in for
+/// `CRABCROP_SOURCE_ROOTS`. Every definition is one the
+/// server would accept at boot (`parse_preset_operations`;
+/// the smoke checks that), so expansion splices real
+/// operation text into the request.
+pub fn presets() -> &'static HashMap<String, String> {
+    static PRESETS: OnceLock<HashMap<String, String>> = OnceLock::new();
+    PRESETS.get_or_init(|| {
+        [
+            ("thumb", "300x200/filters:quality(80)"),
+            (
+                "card",
+                "crop:160x90:smart/filters:format(webp):sharpen(0.5)",
+            ),
+            ("hero", "fit-in:1200x630:adaptive/filters:dpr(2)"),
+            ("avatar", "crop:96x96:face/filters:mask(circle)"),
+        ]
+        .into_iter()
+        .map(|(name, ops)| (name.to_string(), ops.to_string()))
+        .collect()
+    })
+}
+
+/// The signature segment a parsed signature re-serializes
+/// to, key ID included.
+fn signature_segment(signature: &Signature, key_id: Option<&str>) -> String {
+    match signature {
+        Signature::Unsafe => "unsafe".to_string(),
+        Signature::Hmac(hex) => match key_id {
+            Some(kid) => format!("{kid}:{hex}"),
+            None => hex.clone(),
+        },
+    }
+}
+
+/// A path that parses canonicalizes to a fixed point:
+/// canonical form, re-parsed and re-canonicalized, is
+/// byte-identical, signature and key ID included.
+fn check_round_trip(input: &str) {
+    if let Ok((signature, key_id, request)) = url::parse_request(input) {
+        let canonical = url::canonical_form(&request.operations, request.source_url);
+        let rebuilt = format!(
+            "/{}/{canonical}",
+            signature_segment(&signature, key_id.as_deref())
+        );
+        let reparsed = url::parse_request(&rebuilt);
+        let (sig2, kid2, request2) = reparsed.expect("the canonical form must re-parse");
+        assert_eq!(sig2, signature, "signature changed across canonicalization");
+        assert_eq!(kid2, key_id, "key ID changed across canonicalization");
+        let canonical2 = url::canonical_form(&request2.operations, request2.source_url);
+        assert_eq!(canonical, canonical2, "canonical form is not a fixed point");
+    }
+}
 
 /// The round-trip invariants every input must satisfy,
 /// however malformed:
@@ -31,24 +88,13 @@ use url::Signature;
 ///   canonical form, re-parsed and re-canonicalized, is
 ///   byte-identical.
 /// - The canonical key form is likewise a fixed point.
+/// - Preset expansion against [`presets`] is total, with
+///   and without the presets-only policy, and a path the
+///   server would parse after expansion satisfies the same
+///   fixed point: the expanded text is what the server
+///   parses and keys the cache on.
 pub fn check(input: &str) {
-    if let Ok((signature, key_id, request)) = url::parse_request(input) {
-        let canonical = url::canonical_form(&request.operations, request.source_url);
-        let segment = match &signature {
-            Signature::Unsafe => "unsafe".to_string(),
-            Signature::Hmac(hex) => match &key_id {
-                Some(kid) => format!("{kid}:{hex}"),
-                None => hex.clone(),
-            },
-        };
-        let rebuilt = format!("/{segment}/{canonical}");
-        let reparsed = url::parse_request(&rebuilt);
-        let (sig2, kid2, request2) = reparsed.expect("the canonical form must re-parse");
-        assert_eq!(sig2, signature, "signature changed across canonicalization");
-        assert_eq!(kid2, key_id, "key ID changed across canonicalization");
-        let canonical2 = url::canonical_form(&request2.operations, request2.source_url);
-        assert_eq!(canonical, canonical2, "canonical form is not a fixed point");
-    }
+    check_round_trip(input);
     if let Ok((_, _, rest)) = url::parse_signature(input) {
         let key1 = url::canonical_key_form(rest);
         let key2 = url::canonical_key_form(&key1);
@@ -57,13 +103,21 @@ pub fn check(input: &str) {
     // The remaining entry points over untrusted text: total
     // by assertion (a panic fails the run).
     let _ = url::parse_signature(input);
-    let _ = url::expand_presets(input, &std::collections::HashMap::new(), false);
+    let _ = url::expand_presets(input, &HashMap::new(), false);
     let _ = url::preset_names(input);
+    if let Ok((signature, key_id, rest)) = url::parse_signature(input) {
+        let segment = signature_segment(&signature, key_id.as_deref());
+        for only_presets in [false, true] {
+            if let Ok(expanded) = url::expand_presets(rest, presets(), only_presets) {
+                check_round_trip(&format!("/{segment}/{expanded}"));
+            }
+        }
+    }
     // Root expansion (issue #250): total over untrusted
     // text, and a successful expansion stays under the
     // named root's base by construction. The map is a
     // fixed stand-in for operator configuration.
-    let roots: std::collections::HashMap<String, String> = [
+    let roots: HashMap<String, String> = [
         (
             "photos".to_string(),
             "https://cdn.example.com/photos".to_string(),
@@ -77,15 +131,14 @@ pub fn check(input: &str) {
     .collect();
     let _ = url::expand_source_root(input, &roots);
     let _ = url::expand_source_root_in_remainder(input, &roots);
-    if let Ok((_, _, request)) = url::parse_request(input) {
-        if let Ok((expanded, Some(reference))) = url::expand_source_root(request.source_url, &roots)
-        {
-            let base = &roots[&reference.name];
-            assert!(
-                expanded.starts_with(&format!("{base}/")),
-                "root expansion escaped its base: {expanded}"
-            );
-        }
+    if let Ok((_, _, request)) = url::parse_request(input)
+        && let Ok((expanded, Some(reference))) = url::expand_source_root(request.source_url, &roots)
+    {
+        let base = &roots[&reference.name];
+        assert!(
+            expanded.starts_with(&format!("{base}/")),
+            "root expansion escaped its base: {expanded}"
+        );
     }
 }
 
@@ -200,28 +253,79 @@ pub fn check_meta(data: &[u8]) {
             .with_guessed_format()
             .ok()
             .and_then(|r| r.into_dimensions().ok());
-        if let Some((w, h)) = dims {
-            if w <= 1024 && h <= 1024 {
-                if let Ok(img) = image::load_from_memory(data) {
-                    let _ = color::convert_to_srgb(img, icc);
-                }
-            }
+        if let Some((w, h)) = dims
+            && w <= 1024
+            && h <= 1024
+            && let Ok(img) = image::load_from_memory(data)
+        {
+            let _ = color::convert_to_srgb(img, icc);
         }
     }
 }
 
-/// The largest canvas the chain harness lets a rotation
-/// allocate. The engine checks every rotation against the
-/// output pixel budget before the canvas exists (issue
-/// #182); the harness applies filters directly, so it
-/// applies the same kind of check with a budget sized for
-/// fuzzing throughput: a chain whose next rotation would
-/// land on a larger canvas stops there.
-const CHAIN_MAX_PIXELS: u64 = 1 << 18;
+/// The largest canvas the chain harness lets a chain
+/// allocate. The engine checks every canvas against its
+/// output pixel budget (100 million pixels) before it
+/// allocates (issue #182); the harness holds both legs of
+/// `check_chain` to this much smaller budget, sized for
+/// fuzzing throughput and for the fuzzer's per-allocation
+/// limit: a rotation in the filter leg whose canvas would
+/// exceed it ends that leg, and a request whose canvas
+/// could exceed it at any step never reaches the engine.
+pub const CHAIN_MAX_PIXELS: u64 = 1 << 18;
 
-/// The operation-chain invariants (issues #387, #415): a
-/// parsed filter chain applied to an image is total, and
-/// every filter lands on the canvas its kind predicts:
+/// The size of the harness's stand-in source.
+const SOURCE_WIDTH: u32 = 24;
+const SOURCE_HEIGHT: u32 = 18;
+
+/// The harness's stand-in source: a small gradient, so
+/// every filter and crop has varied pixels to work on.
+fn synthetic_image() -> image::DynamicImage {
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+        SOURCE_WIDTH,
+        SOURCE_HEIGHT,
+        |x, y| image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 3) as u8]),
+    ))
+}
+
+/// [`synthetic_image`] as the PNG body the engine decodes,
+/// encoded once per process.
+fn synthetic_png() -> &'static [u8] {
+    static PNG: OnceLock<Vec<u8>> = OnceLock::new();
+    PNG.get_or_init(|| {
+        let mut out = std::io::Cursor::new(Vec::new());
+        synthetic_image()
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("the synthetic source encodes");
+        out.into_inner()
+    })
+}
+
+/// What [`check_chain`] did with an input, so the smoke can
+/// tell an engine render from a refusal or a skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainOutcome {
+    /// The input does not parse: nothing ran.
+    Unparsed,
+    /// The filter leg ran; the request could outgrow
+    /// [`CHAIN_MAX_PIXELS`] somewhere in its chain, so the
+    /// engine leg was skipped.
+    OverBudget,
+    /// The engine refused the request.
+    Refused(engine::EngineError),
+    /// The engine rendered the request at this size.
+    Rendered { width: u32, height: u32 },
+}
+
+/// The operation-chain invariants (issues #387, #415,
+/// #476). A parsed request runs through two legs.
+///
+/// The filter leg applies the filters of every `filters:`
+/// segment, one at a time in URL order, to the synthetic
+/// source with the request's `fill` color (resolved the way
+/// the engine resolves it) for the corners an arbitrary
+/// rotation uncovers. Application is total, and every
+/// filter lands on the canvas its kind predicts:
 ///
 /// - a rotation lands on [`filters::rotated_canvas`] of the
 ///   canvas it turns: quarter turns swap the axes, any
@@ -230,43 +334,61 @@ const CHAIN_MAX_PIXELS: u64 = 1 << 18;
 /// - every other filter keeps the dimensions;
 /// - no filter leaves a zero dimension.
 ///
-/// The chain runs on a small synthetic image (the
-/// harness's stand-in source), one filter at a time, in URL
-/// order across every `filters:` segment, with the
-/// request's `fill` color, resolved the way the engine
-/// resolves it, for the corners an arbitrary rotation
-/// uncovers. Resize, crop, and focal operations
-/// are not applied: they run in the engine, which this
-/// package cannot link while the server is binary-only
-/// (issue #417).
-pub fn check_chain(input: &str) {
+/// The engine leg runs the whole operation list (resize,
+/// crop, fit-in, pad, crop-rect, focal, debug view, filters
+/// and the encode) through `engine::Engine::process` on the
+/// synthetic source as a PNG, under the default context: no
+/// AI providers, watermarks, text renderer, frame extractor
+/// or PDF renderer, so those operations refuse. A request
+/// whose canvas could exceed [`CHAIN_MAX_PIXELS`] at any
+/// step (see [`canvas_bound`]) skips this leg. Otherwise
+/// the engine either refuses with an `EngineError` or
+/// renders an image inside [`check_render_size`]'s bounds;
+/// a panic in either leg is the failure.
+pub fn check_chain(input: &str) -> ChainOutcome {
     let Ok((_, _, request)) = url::parse_request(input) else {
-        return;
+        return ChainOutcome::Unparsed;
     };
-    let chain: Vec<&url::Filter> = request
-        .operations
+    check_filter_leg(&request.operations);
+    let Some(bound) = canvas_bound(&request.operations) else {
+        return ChainOutcome::OverBudget;
+    };
+    match engine::Engine.process(synthetic_png(), &request.operations) {
+        Err(error) => ChainOutcome::Refused(error),
+        Ok(out) => {
+            assert!(!out.bytes.is_empty(), "the engine rendered an empty body");
+            check_render_size(out.width, out.height, bound);
+            ChainOutcome::Rendered {
+                width: out.width,
+                height: out.height,
+            }
+        }
+    }
+}
+
+/// The filter leg of [`check_chain`].
+fn check_filter_leg(ops: &[Operation]) {
+    let chain: Vec<&Filter> = ops
         .iter()
         .filter_map(|op| match op {
-            url::Operation::Filters(filters) => Some(filters.iter()),
+            Operation::Filters(filters) => Some(filters.iter()),
             _ => None,
         })
         .flatten()
         .collect();
-    let fill = url::RequestDirectives::analyze(&request.operations).fill;
-    let mut img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 18, |x, y| {
-        image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 3) as u8])
-    }));
+    let fill = url::RequestDirectives::analyze(ops).fill;
+    let mut img = synthetic_image();
     for filter in chain {
         let (w, h) = (img.width(), img.height());
         let predicted = match filter {
-            url::Filter::Rotate(degrees) => {
+            Filter::Rotate(degrees) => {
                 let (rw, rh) = filters::rotated_canvas(w, h, *degrees);
                 if rw as u64 * rh as u64 > CHAIN_MAX_PIXELS {
                     return;
                 }
                 Some((rw, rh))
             }
-            url::Filter::Trim(_) | url::Filter::TrimSides(..) => None,
+            Filter::Trim(_) | Filter::TrimSides(..) => None,
             _ => Some((w, h)),
         };
         let (out, _) = filters::apply_filters_filled(img, std::slice::from_ref(filter), fill);
@@ -290,4 +412,265 @@ pub fn check_chain(input: &str) {
         }
         img = out;
     }
+}
+
+/// The size invariant on an engine render: both axes are
+/// at least 1 and at most `url::MAX_DIMENSION`, the largest
+/// dimension a request may name and the strictest encoder
+/// limit, and neither axis is past the per-axis `bound`
+/// [`canvas_bound`] proved for the request, so the guard
+/// that keeps the engine leg inside the harness budget is
+/// itself checked on every render.
+pub fn check_render_size(width: u32, height: u32, bound: (u64, u64)) {
+    let max = url::MAX_DIMENSION;
+    assert!(
+        (1..=max).contains(&width) && (1..=max).contains(&height),
+        "the engine rendered {width}x{height}, outside 1..={max} per axis"
+    );
+    assert!(
+        u64::from(width) <= bound.0 && u64::from(height) <= bound.1,
+        "the engine rendered {width}x{height}, past the harness bound {}x{}",
+        bound.0,
+        bound.1
+    );
+}
+
+/// Bounds on one axis of the engine's running canvas: the
+/// real size lies within `lo..=hi`, and `lo` is at least 1.
+#[derive(Debug, Clone, Copy)]
+struct Axis {
+    lo: u64,
+    hi: u64,
+}
+
+impl Axis {
+    fn exact(n: u64) -> Self {
+        let n = n.max(1);
+        Axis { lo: n, hi: n }
+    }
+
+    /// Bounds on a real-valued size, padded a pixel each way
+    /// for the engine's rounding. The float-to-int casts
+    /// saturate, so an infinite or huge bound stays huge.
+    fn around(lo: f64, hi: f64) -> Self {
+        let hi = (hi.ceil() + 1.0).max(1.0) as u64;
+        let lo = ((lo.floor() - 1.0).max(1.0) as u64).min(hi);
+        Axis { lo, hi }
+    }
+
+    /// A pixel target under the DPR factor (the engine's
+    /// `scale_px`: identity at 1, else rounded, never 0).
+    fn pixels(n: u32, dpr: f64) -> Self {
+        if dpr == 1.0 {
+            Axis::exact(u64::from(n))
+        } else {
+            let scaled = f64::from(n) * dpr;
+            Axis::around(scaled, scaled)
+        }
+    }
+
+    /// `no_upscale` caps a resize at the source, which can
+    /// only shrink it: keep the upper bound, give up the
+    /// lower one.
+    fn capped(self, no_upscale: bool) -> Self {
+        if no_upscale {
+            Axis { lo: 1, hi: self.hi }
+        } else {
+            self
+        }
+    }
+}
+
+/// The proportional axis of a resize: the running axis
+/// scaled by the named axis over the running other axis
+/// (the engine's `apply_size`), bounded from both ends.
+fn proportional(axis: Axis, other: Axis, target: Axis) -> Axis {
+    Axis::around(
+        axis.lo as f64 * target.lo as f64 / other.hi as f64,
+        axis.hi as f64 * target.hi as f64 / other.lo as f64,
+    )
+}
+
+/// Conservative per-axis bounds on every canvas the engine
+/// builds for `ops` from the synthetic source: `None` when
+/// some step's canvas could exceed [`CHAIN_MAX_PIXELS`],
+/// else the largest upper bound each axis reaches anywhere
+/// in the chain (the output, and the `debug:focal` view,
+/// which draws on a canvas the chain passed through, both
+/// sit inside it). The walk mirrors the engine's size
+/// resolution: DPR-scaled pixel targets, proportional and
+/// `orig` axes against the running canvas, the adaptive
+/// fit-in box swap, rotated bounding boxes, and trims and
+/// `no_upscale` that only ever shrink. The filters whose
+/// size it cannot predict without running them (the AI,
+/// overlay and text filters) need a provider the default
+/// context does not have, so they refuse before touching
+/// pixels; it keeps their dimensions, except `upscale`,
+/// which it scales anyway.
+pub fn canvas_bound(ops: &[Operation]) -> Option<(u64, u64)> {
+    let directives = url::RequestDirectives::analyze(ops);
+    let dpr = f64::from(directives.dpr.unwrap_or(1.0));
+    let cap = directives.no_upscale;
+    let mut cur = (
+        Axis::exact(u64::from(SOURCE_WIDTH)),
+        Axis::exact(u64::from(SOURCE_HEIGHT)),
+    );
+    let mut peak = (cur.0.hi, cur.1.hi);
+    let mut step = |cur: (Axis, Axis)| -> Option<(Axis, Axis)> {
+        if cur.0.hi.saturating_mul(cur.1.hi) > CHAIN_MAX_PIXELS {
+            return None;
+        }
+        peak = (peak.0.max(cur.0.hi), peak.1.max(cur.1.hi));
+        Some(cur)
+    };
+    for op in ops {
+        match op {
+            Operation::Size(size) => {
+                let w = match (size.width, size.height) {
+                    (Dimension::Pixels(n), _) => Axis::pixels(n, dpr),
+                    (Dimension::Proportional, Dimension::Pixels(m)) => {
+                        proportional(cur.0, cur.1, Axis::pixels(m, dpr))
+                    }
+                    _ => cur.0,
+                };
+                let h = match (size.height, size.width) {
+                    (Dimension::Pixels(n), _) => Axis::pixels(n, dpr),
+                    (Dimension::Proportional, Dimension::Pixels(m)) => {
+                        proportional(cur.1, cur.0, Axis::pixels(m, dpr))
+                    }
+                    _ => cur.1,
+                };
+                cur = step((w.capped(cap), h.capped(cap)))?;
+            }
+            // Crop and pad take an exact box; the parser
+            // refuses any other spelling.
+            Operation::Crop { size, .. } | Operation::Pad { size, .. } => {
+                if let (Dimension::Pixels(w), Dimension::Pixels(h)) = (size.width, size.height) {
+                    cur = step((
+                        Axis::pixels(w, dpr).capped(cap),
+                        Axis::pixels(h, dpr).capped(cap),
+                    ))?;
+                }
+            }
+            Operation::FitIn { size, adaptive } => {
+                cur = step(fit_in_bound(cur, size, *adaptive, dpr, cap))?;
+            }
+            Operation::CropRect {
+                left,
+                top,
+                right,
+                bottom,
+            } => {
+                cur = step((
+                    Axis::exact(u64::from(right.saturating_sub(*left))),
+                    Axis::exact(u64::from(bottom.saturating_sub(*top))),
+                ))?;
+            }
+            Operation::FocalRect { .. }
+            | Operation::FocalPoint { .. }
+            | Operation::DebugFocal
+            | Operation::Frame(_)
+            | Operation::Page(_) => {}
+            Operation::Filters(filters) => {
+                for filter in filters {
+                    cur = match filter {
+                        Filter::Rotate(degrees) => {
+                            // The rotated bounding box grows with
+                            // either side, so the bounds rotate
+                            // with their ends.
+                            let lo = rotated(cur.0.lo, cur.1.lo, *degrees);
+                            let hi = rotated(cur.0.hi, cur.1.hi, *degrees);
+                            step((
+                                Axis::around(lo.0 as f64, hi.0 as f64),
+                                Axis::around(lo.1 as f64, hi.1 as f64),
+                            ))?
+                        }
+                        Filter::Trim(_) | Filter::TrimSides(..) => (
+                            Axis {
+                                lo: 1,
+                                hi: cur.0.hi,
+                            },
+                            Axis {
+                                lo: 1,
+                                hi: cur.1.hi,
+                            },
+                        ),
+                        Filter::Upscale(factor) => {
+                            let f = u64::from(*factor);
+                            step((
+                                Axis {
+                                    lo: cur.0.lo.saturating_mul(f),
+                                    hi: cur.0.hi.saturating_mul(f),
+                                },
+                                Axis {
+                                    lo: cur.1.lo.saturating_mul(f),
+                                    hi: cur.1.hi.saturating_mul(f),
+                                },
+                            ))?
+                        }
+                        _ => cur,
+                    };
+                }
+            }
+        }
+    }
+    Some(peak)
+}
+
+/// [`filters::rotated_canvas`] on bounds the budget has
+/// already capped (each axis is at most
+/// [`CHAIN_MAX_PIXELS`], so it fits a `u32`).
+fn rotated(w: u64, h: u64, degrees: f32) -> (u32, u32) {
+    let fit = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+    filters::rotated_canvas(fit(w), fit(h), degrees)
+}
+
+/// The fit-in step of [`canvas_bound`]: the engine scales
+/// the canvas by the smallest of the box-over-canvas ratios
+/// of the constrained axes (a pixel axis bounds at the box,
+/// `orig` at a scale of 1, a proportional axis bounds
+/// nothing), after the adaptive swap. Bounding the swap by
+/// the larger box side for the upper bound and the smaller
+/// for the lower covers both orientations.
+fn fit_in_bound(
+    cur: (Axis, Axis),
+    size: &url::ImageSize,
+    adaptive: bool,
+    dpr: f64,
+    cap: bool,
+) -> (Axis, Axis) {
+    let both = match (size.width, size.height) {
+        (Dimension::Pixels(w), Dimension::Pixels(h)) => {
+            Some((Axis::pixels(w, dpr), Axis::pixels(h, dpr)))
+        }
+        _ => None,
+    };
+    // (scale lower bound, scale upper bound) for one axis.
+    let ratio = |d: Dimension, axis: Axis| -> Option<(f64, f64)> {
+        let b = match (d, both) {
+            (Dimension::Proportional, _) => return None,
+            (Dimension::Original, _) => return Some((1.0, 1.0)),
+            (Dimension::Pixels(_), Some((bw, bh))) if adaptive => Axis {
+                lo: bw.lo.min(bh.lo),
+                hi: bw.hi.max(bh.hi),
+            },
+            (Dimension::Pixels(n), _) => Axis::pixels(n, dpr),
+        };
+        Some((b.lo as f64 / axis.hi as f64, b.hi as f64 / axis.lo as f64))
+    };
+    let ratios = [ratio(size.width, cur.0), ratio(size.height, cur.1)];
+    let mut scale: Option<(f64, f64)> = None;
+    for (lo, hi) in ratios.into_iter().flatten() {
+        scale = Some(match scale {
+            Some((l, h)) => (l.min(lo), h.min(hi)),
+            None => (lo, hi),
+        });
+    }
+    let Some((lo, hi)) = scale else {
+        return cur;
+    };
+    (
+        Axis::around(cur.0.lo as f64 * lo, cur.0.hi as f64 * hi).capped(cap),
+        Axis::around(cur.1.lo as f64 * lo, cur.1.hi as f64 * hi).capped(cap),
+    )
 }

@@ -31,7 +31,7 @@ fi
 step() { printf '\n=== %s ===\n' "$1"; }
 
 step "Workflow mirrors (docs copies match the live workflows)"
-for pair in "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml" "release.yml release-workflow.yml" "rust.yml rust-workflow.yml"; do
+for pair in "functional.yml functional-workflow.yml" "fuzz.yml fuzz-workflow.yml" "perf.yml perf-workflow.yml" "release.yml release-workflow.yml" "rust.yml rust-workflow.yml"; do
   set -- $pair
   if ! cmp -s ".github/workflows/$1" "docs/$2"; then
     echo "workflow mirror drift: docs/$2 differs from .github/workflows/$1; sync the mirror to the live workflow" >&2
@@ -156,6 +156,8 @@ done
 (cd playground && npm run test:integration)
 
 step "Fuzz smoke (parser invariants, corpus + mutations)"
-cargo test --locked --manifest-path fuzz/Cargo.toml --lib --test smoke
+# Without the fuzz crate's default avif-decode feature, so the
+# smoke needs no dav1d; the nightly fuzz workflow runs it with.
+cargo test --locked --manifest-path fuzz/Cargo.toml --no-default-features --lib --test smoke
 
 step "All suites passed"
