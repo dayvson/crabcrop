@@ -10049,7 +10049,7 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
     crate::test_support::write_script(
         &script_path,
         &format!(
-            "#!/bin/sh\ncat > /dev/null\necho S >> {}\nsleep 6\necho E >> {}\nprintf 'x'\n",
+            "#!/bin/sh\ncat > /dev/null\necho S >> '{}'\nsleep 6\necho E >> '{}'\nprintf 'x'\n",
             log_path.display(),
             log_path.display()
         ),

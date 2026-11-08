@@ -818,7 +818,7 @@ exit 0\n";
         let marker = dir.join("rendered");
         write_tool(&dir, "pdfinfo", INFO_OK);
         let render = format!(
-            "#!/bin/sh\ncat > /dev/null\ntouch {}\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
+            "#!/bin/sh\ncat > /dev/null\ntouch '{}'\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
             marker.display()
         );
         let program = write_tool(&dir, "pdftocairo", &render);

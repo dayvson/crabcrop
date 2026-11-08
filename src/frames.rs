@@ -1221,7 +1221,7 @@ exit 1\n";
         let records = temp_dir("whitelists");
         let record = records.join("argv.log");
         let script = format!(
-            "#!/bin/sh\ncat > /dev/null\necho \"$@\" >> {}\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n",
+            "#!/bin/sh\ncat > /dev/null\necho \"$@\" >> '{}'\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n",
             record.display()
         );
         let (_tool, program) = fake_tool("whitelists", &script);
@@ -1268,7 +1268,7 @@ exit 1\n";
             "#!/bin/sh\n\
 n=$(cat | wc -c)\n\
 if [ -f /dev/stdin ]; then kind=file; else kind=other; fi\n\
-echo \"$n $kind $(readlink /proc/self/fd/0)\" >> {}\n\
+echo \"$n $kind $(readlink /proc/self/fd/0)\" >> '{}'\n\
 sep=', '\n\
 prev=\n\
 for a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\n\
