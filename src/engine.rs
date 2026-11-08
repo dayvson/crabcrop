@@ -1082,7 +1082,9 @@ impl Engine {
             // then runs exactly as for the other formats.
             let (mut img, meta) = crate::heic::decode_heic(bytes)?;
             source_meta = meta;
-            if !keep_profile && let Some(icc) = &source_meta.icc {
+            if let Some(icc) = &source_meta.icc
+                && !(keep_profile && crate::color::icc_embeddable(icc))
+            {
                 img = crate::color::convert_to_srgb(img, icc);
             }
             img
@@ -1103,7 +1105,12 @@ impl Engine {
             // stage works in one known space, unless the
             // request asked to keep the profile (then the
             // profile is embedded at encode time instead).
-            if !keep_profile && let Some(icc) = &source_meta.icc {
+            // A profile the output will not carry (malformed,
+            // or past the embed cap, issue #445) converts
+            // anyway: untagged pixels would show wrong colors.
+            if let Some(icc) = &source_meta.icc
+                && !(keep_profile && crate::color::icc_embeddable(icc))
+            {
                 img = crate::color::convert_to_srgb(img, icc);
             }
             img

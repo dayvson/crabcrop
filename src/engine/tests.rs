@@ -773,6 +773,7 @@ fn meta_jpeg() -> Vec<u8> {
         icc: None,
         exif_tiff: Some(tiff),
         xmp: Some(b"<x:xmpmeta>fixture</x:xmpmeta>".to_vec()),
+        xmp_compressed: false,
         photoshop: None,
     };
     crate::color::inject_jpeg(&base, None, &meta, true)
@@ -849,7 +850,7 @@ fn png_metadata_bombs_render_like_the_plain_png() {
     let mut iccp = b"ICC Profile\0\0".to_vec();
     iccp.extend_from_slice(&zlib_bomb(crate::color::MAX_ICC_BYTES + 1));
     let mut itxt = b"XML:com.adobe.xmp\0\x01\0\0\0".to_vec();
-    itxt.extend_from_slice(&zlib_bomb(crate::color::MAX_META_BYTES + 1));
+    itxt.extend_from_slice(&zlib_bomb(crate::color::MAX_XMP_BYTES + 1));
     let mut chunks: Vec<(&[u8; 4], &[u8])> = Vec::new();
     for _ in 0..40 {
         chunks.push((b"iCCP", &iccp));
@@ -868,6 +869,202 @@ fn png_metadata_bombs_render_like_the_plain_png() {
         let want = engine.process_preferred(&plain, &[], ctx()).unwrap();
         let got = engine.process_preferred(&bombed, &[], ctx()).unwrap();
         assert_eq!(got.bytes, want.bytes, "preserve {preserve_metadata}");
+    }
+}
+
+/// An `iCCP` chunk payload carrying `profile`, compressed.
+fn iccp_chunk(profile: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(profile).unwrap();
+    let mut data = b"ICC Profile\0\0".to_vec();
+    data.extend_from_slice(&encoder.finish().unwrap());
+    data
+}
+
+/// `len` zero bytes behind an ICC header that describes
+/// them: the size field and the `acsp` signature in place,
+/// no tags. Passes the embed check up to the embed cap.
+fn padded_profile(len: usize) -> Vec<u8> {
+    let mut icc = vec![0u8; len];
+    icc[0..4].copy_from_slice(&(len as u32).to_be_bytes());
+    icc[36..40].copy_from_slice(b"acsp");
+    icc
+}
+
+/// `32x32/filters:[keep_profile:]format(<format>)`.
+fn small_render(format: ImageFormat, keep_profile: bool) -> Vec<Operation> {
+    let mut filters = vec![Filter::Format(FormatSpec::plain(format))];
+    if keep_profile {
+        filters.insert(0, Filter::KeepProfile);
+    }
+    vec![
+        size_op(Dimension::Pixels(32), Dimension::Pixels(32)),
+        Operation::Filters(filters),
+    ]
+}
+
+#[test]
+fn compressed_png_metadata_does_not_inflate_the_output() {
+    // Issue #445: metadata inflated from compressed PNG
+    // chunks was written back raw. Under preserve, a
+    // 64x64 PNG carrying a 16 MiB XMP packet in a 16 KB
+    // stream rendered to a 16 MiB PNG at 32x32; under the
+    // default policy, keep_profile with JPEG output turned
+    // a 4 MiB iCCP of zeros into a 4 MiB JPEG. Past their
+    // caps, neither is copied now, into either format: the
+    // render is the one the source without the chunk gets.
+    let plain = gradient_png();
+    let xmp_chunk = |len: usize| {
+        let mut data = b"XML:com.adobe.xmp\0\x01\0\0\0".to_vec();
+        data.extend_from_slice(&zlib_bomb(len));
+        data
+    };
+    let xmp_issue = xmp_chunk(crate::color::MAX_META_BYTES);
+    let iccp_zeros = iccp_chunk(&vec![0u8; crate::color::MAX_ICC_BYTES]);
+    let iccp_headed = iccp_chunk(&padded_profile(crate::color::MAX_ICC_BYTES));
+    let with = |kind: &[u8; 4], chunk: &[u8]| with_chunks_after_ihdr(&plain, &[(kind, chunk)]);
+    let engine = Engine;
+    let render = |src: &[u8], format, preserve_metadata, keep_profile| {
+        let ctx = ProcessContext {
+            preserve_metadata,
+            ..Default::default()
+        };
+        let out = engine
+            .process_preferred(src, &small_render(format, keep_profile), ctx)
+            .unwrap();
+        assert_eq!(out.format, format);
+        out.bytes
+    };
+    let cases = [
+        ("16 MiB XMP", with(b"iTXt", &xmp_issue), true, false),
+        (
+            "16 MiB XMP, keep_profile",
+            with(b"iTXt", &xmp_issue),
+            true,
+            true,
+        ),
+        (
+            "4 MiB iCCP of zeros",
+            with(b"iCCP", &iccp_zeros),
+            false,
+            true,
+        ),
+        (
+            "4 MiB iCCP, preserve",
+            with(b"iCCP", &iccp_zeros),
+            true,
+            true,
+        ),
+        (
+            "4 MiB iCCP behind a header",
+            with(b"iCCP", &iccp_headed),
+            false,
+            true,
+        ),
+    ];
+    for (name, bombed, preserve, keep) in cases {
+        assert!(bombed.len() < 32 * 1024, "{name}: {} bytes", bombed.len());
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            let want = render(&plain, format, preserve, keep);
+            let got = render(&bombed, format, preserve, keep);
+            assert!(
+                got == want,
+                "{name} as {format:?}: {} bytes against {} without the chunk",
+                got.len(),
+                want.len()
+            );
+        }
+    }
+    // A packet at its cap is copied into PNG, compressed as
+    // the source stored it (a JPEG segment holds 64 KiB, so
+    // not into JPEG): the render grows by no more than the
+    // chunk weighed in the source.
+    let bombed = with(b"iTXt", &xmp_chunk(crate::color::MAX_XMP_BYTES));
+    let carried = bombed.len() - plain.len();
+    let want = render(&plain, ImageFormat::Png, true, false);
+    let got = render(&bombed, ImageFormat::Png, true, false);
+    assert!(
+        got.len() <= want.len() + carried,
+        "{} bytes against {} plus the {carried}-byte chunk",
+        got.len(),
+        want.len()
+    );
+    let xmp = crate::color::extract_source_meta(&got, true).xmp;
+    assert_eq!(xmp.map(|xmp| xmp.len()), Some(crate::color::MAX_XMP_BYTES));
+    let want = render(&plain, ImageFormat::Jpeg, true, false);
+    assert!(render(&bombed, ImageFormat::Jpeg, true, false) == want);
+    // The ceiling on what a profile can still add: one at
+    // the embed cap is kept and goes into a JPEG raw, in
+    // APP2 segments of at most 65519 bytes plus 18 bytes
+    // of marker, length, and chunk header.
+    let at_cap = padded_profile(crate::color::MAX_EMBED_ICC_BYTES);
+    let bombed = with(b"iCCP", &iccp_chunk(&at_cap));
+    let want = render(&plain, ImageFormat::Jpeg, false, true);
+    let got = render(&bombed, ImageFormat::Jpeg, false, true);
+    let segments = crate::color::MAX_EMBED_ICC_BYTES.div_ceil(65519);
+    assert_eq!(
+        got.len(),
+        want.len() + crate::color::MAX_EMBED_ICC_BYTES + 18 * segments
+    );
+    assert_eq!(
+        crate::color::extract_source_meta(&got, false).icc,
+        Some(at_cap)
+    );
+}
+
+#[test]
+fn keep_profile_converts_a_profile_it_cannot_embed() {
+    // Issue #445: keep_profile is convert-or-tag (issue
+    // #374), and a profile that fails the embed check is
+    // not tagged, so its pixels must be converted like
+    // the default's. Two Display P3 profiles that still
+    // parse: one with a byte past its declared size, one
+    // grown past the embed cap with its size field
+    // rewritten to match.
+    let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(3, 1, |x, _| {
+        [
+            image::Rgb([200, 80, 40]),
+            image::Rgb([40, 120, 200]),
+            image::Rgb([90, 160, 90]),
+        ][x as usize]
+    }));
+    let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let mut trailing = p3.clone();
+    trailing.push(0);
+    let mut oversized = p3.clone();
+    oversized.resize(crate::color::MAX_EMBED_ICC_BYTES + 4, 0);
+    let len = oversized.len() as u32;
+    oversized[0..4].copy_from_slice(&len.to_be_bytes());
+    let engine = Engine;
+    for (name, icc) in [("trailing byte", trailing), ("past the cap", oversized)] {
+        assert!(!crate::color::icc_embeddable(&icc), "{name}");
+        assert!(moxcms::ColorProfile::new_from_slice(&icc).is_ok(), "{name}");
+        let src = with_chunks_after_ihdr(&png_bytes(&img), &[(b"iCCP", &iccp_chunk(&icc))]);
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            let ops = |keep: bool| {
+                let mut filters = vec![Filter::Format(FormatSpec::plain(format))];
+                if keep {
+                    filters.insert(0, Filter::KeepProfile);
+                }
+                [Operation::Filters(filters)]
+            };
+            let kept = engine.process(&src, &ops(true)).unwrap();
+            let converted = engine.process(&src, &ops(false)).unwrap();
+            assert_eq!(kept.bytes, converted.bytes, "{name} as {format:?}");
+            assert!(
+                crate::color::extract_source_meta(&kept.bytes, false)
+                    .icc
+                    .is_none(),
+                "{name} as {format:?}"
+            );
+            // And the conversion really ran: the lossless
+            // pixel is not the raw P3 value.
+            if format == ImageFormat::Png {
+                let px = image::load_from_memory(&kept.bytes).unwrap().to_rgb8();
+                assert_ne!(px.get_pixel(0, 0).0, [200, 80, 40], "{name}");
+            }
+        }
     }
 }
 
