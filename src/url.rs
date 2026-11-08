@@ -4047,6 +4047,9 @@ mod tests {
             (ParseError::InvalidFrame("x".into()), "invalid_frame"),
             (ParseError::InvalidPage("x".into()), "invalid_page"),
             (ParseError::MissingSourceUrl, "missing_source_url"),
+            // The engine's code, kept when the cap check moved
+            // to parse time (issue #469).
+            (ParseError::TooManyOperations(101), "unsupported_operation"),
         ];
         let mut seen = std::collections::HashSet::new();
         for (err, expected) in &cases {
