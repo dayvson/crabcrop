@@ -88,28 +88,51 @@ pub(crate) struct ToolRun {
     pub(crate) stderr: String,
     /// Whether stderr passed `max_stderr` and was cut.
     pub(crate) stderr_truncated: bool,
+    /// The end of the whole stderr stream, for
+    /// [`ToolRun::stderr_excerpt`].
+    stderr_tail: String,
 }
 
+/// How many characters of stderr an error message quotes.
+const STDERR_EXCERPT_CHARS: usize = 500;
+
+/// How many bytes of stderr's end a run keeps for its
+/// excerpt, whatever `max_stderr` keeps of the head: room
+/// for the excerpt at four bytes a character, plus a
+/// character the cut splits.
+const STDERR_TAIL_BYTES: usize = 4 * STDERR_EXCERPT_CHARS + 4;
+
 impl ToolRun {
-    /// The tail of the tool's stderr, for error text: its
-    /// last 500 characters, trimmed.
+    /// The end of the tool's stderr, for error text: the
+    /// last 500 characters of the whole stream, where a tool
+    /// reports its failure, trimmed.
     pub(crate) fn stderr_excerpt(&self) -> String {
-        let tail: String = self
-            .stderr
-            .chars()
-            .rev()
-            .take(500)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let tail = tail.trim();
-        if tail.is_empty() {
-            "no error output".to_string()
-        } else {
-            tail.to_string()
-        }
+        excerpt(&self.stderr_tail)
     }
+}
+
+/// The last [`STDERR_EXCERPT_CHARS`] characters of `text`,
+/// trimmed, or "no error output" when nothing is left.
+fn excerpt(text: &str) -> String {
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(STDERR_EXCERPT_CHARS - 1)
+        .map_or(0, |(at, _)| at);
+    let tail = text[start..].trim();
+    if tail.is_empty() {
+        "no error output".to_string()
+    } else {
+        tail.to_string()
+    }
+}
+
+/// What the stderr drain hands back.
+#[derive(Default)]
+struct Stderr {
+    head: String,
+    truncated: bool,
+    tail: String,
 }
 
 /// Why a run produced no [`ToolRun`]. Each tool module maps
@@ -209,10 +232,11 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     });
 
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-    let (err_tx, err_rx) = mpsc::channel::<(String, bool)>();
+    let (err_tx, err_rx) = mpsc::channel::<Stderr>();
     let stderr_thread = std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut truncated = false;
+        let mut tail = Vec::new();
         let mut chunk = [0u8; 16 * 1024];
         loop {
             match stderr_pipe.read(&mut chunk) {
@@ -221,10 +245,19 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
                     let take = (max_stderr - kept.len()).min(n);
                     kept.extend_from_slice(&chunk[..take]);
                     truncated |= take < n;
+                    tail.extend_from_slice(&chunk[..n]);
+                    if tail.len() > 2 * STDERR_TAIL_BYTES {
+                        tail.drain(..tail.len() - STDERR_TAIL_BYTES);
+                    }
                 }
             }
         }
-        let _ = err_tx.send((String::from_utf8_lossy(&kept).into_owned(), truncated));
+        let tail = &tail[tail.len().saturating_sub(STDERR_TAIL_BYTES)..];
+        let _ = err_tx.send(Stderr {
+            head: String::from_utf8_lossy(&kept).into_owned(),
+            truncated,
+            tail: String::from_utf8_lossy(tail).into_owned(),
+        });
     });
 
     // Wait for the exit status without ever blocking past
@@ -290,7 +323,7 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     // lifetime, defeating the deadline above. stderr is
     // worth a short grace through its channel, no more; the
     // stdout result already arrived through its own channel.
-    let (stderr, stderr_truncated) = err_rx
+    let stderr = err_rx
         .recv_timeout(Duration::from_millis(200))
         .unwrap_or_default();
     drop(stdout_thread);
@@ -298,8 +331,9 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     Ok(ToolRun {
         status,
         stdout,
-        stderr,
-        stderr_truncated,
+        stderr: stderr.head,
+        stderr_truncated: stderr.truncated,
+        stderr_tail: stderr.tail,
     })
 }
 
@@ -646,5 +680,44 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn the_excerpt_is_the_end_of_stderr() {
+        // Issue #481: error text quotes the last 500
+        // characters of stderr, where a tool reports its
+        // failure, even past the head the run keeps.
+        let argv = [
+            "-c",
+            "head -c 100000 /dev/zero | tr '\\000' x >&2; echo 'the real failure' >&2; exit 1",
+        ];
+        let mut command = shell(&argv, ToolInput::Bytes(b""));
+        command.max_stderr = 1024;
+        let run = run_tool(command).unwrap();
+        assert!(!run.status.success());
+        assert_eq!(run.stderr.len(), 1024);
+        assert!(run.stderr_truncated);
+        let excerpt = run.stderr_excerpt();
+        assert!(excerpt.ends_with("xthe real failure"), "{excerpt}");
+        // The last 500 characters, less the final newline the
+        // trim drops.
+        assert_eq!(excerpt.chars().count(), 499);
+    }
+
+    #[test]
+    fn the_excerpt_counts_characters_and_trims() {
+        assert_eq!(excerpt(""), "no error output");
+        assert_eq!(excerpt(" \n\t\n"), "no error output");
+        assert_eq!(excerpt("  short failure\n"), "short failure");
+        // Characters, not bytes: 600 two-byte characters keep
+        // their last 500, whole.
+        let text = format!("{}{}", "a".repeat(10), "\u{e9}".repeat(600));
+        assert_eq!(excerpt(&text), "\u{e9}".repeat(500));
+        // Whitespace inside the last 500 counts; only the
+        // edges are trimmed.
+        let text = format!("{}end\n{}", "b".repeat(600), " ".repeat(10));
+        let quoted = excerpt(&text);
+        assert!(quoted.ends_with("bend"), "{quoted}");
+        assert_eq!(quoted.chars().count(), 500 - 10 - 1);
     }
 }
