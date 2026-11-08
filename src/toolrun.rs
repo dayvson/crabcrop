@@ -179,8 +179,7 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
         cmd.process_group(0);
     }
     let mut child = cmd.spawn().map_err(ToolError::Spawn)?;
-    let pid = child.id();
-    limit_child(pid, cpu_limit, TOOL_MAX_ADDRESS_SPACE);
+    limit_child(child.id(), cpu_limit, TOOL_MAX_ADDRESS_SPACE);
 
     let writer = feed.map(|input| {
         let mut stdin_pipe = child.stdin.take().expect("stdin was piped");
@@ -237,8 +236,7 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        kill_process_group(pid);
-                        let _ = child.wait();
+                        kill_tool(child);
                         return Err(ToolError::TimedOut);
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -254,14 +252,12 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
                 break (status, bytes);
             }
             Ok(Err(e)) => {
-                kill_process_group(pid);
-                let _ = child.wait();
+                kill_tool(&mut child);
                 return Err(e);
             }
             Err(mpsc::TryRecvError::Empty) => {
                 if Instant::now() >= deadline {
-                    kill_process_group(pid);
-                    let _ = child.wait();
+                    kill_tool(&mut child);
                     return Err(ToolError::TimedOut);
                 }
                 match child.try_wait() {
@@ -307,22 +303,27 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
     })
 }
 
-/// Kill a runaway tool's whole process group (it may have
-/// spawned helpers). The group kill is the whole mechanism
+/// Kill a runaway tool and reap it. On Unix the tool leads
+/// its own process group, and the whole group takes the
+/// signal, so the helpers a wrapper script started die with
+/// it (audit R2-31). The direct kill follows: the fallback
+/// there, and the whole kill on platforms without process
+/// groups. The group kill is the whole mechanism on Unix
 /// (issue #272): a descendant that detaches (setsid,
 /// double-fork) escapes it by design of the tool contract,
 /// which forbids daemonizing.
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    if let Ok(pid) = i32::try_from(pid)
-        && let Some(pid) = rustix::process::Pid::from_raw(pid)
+fn kill_tool(child: &mut Child) {
+    #[cfg(unix)]
     {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        if let Ok(pid) = i32::try_from(child.id())
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
     }
+    let _ = child.kill();
+    let _ = child.wait();
 }
-
-#[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
 
 /// The address-space ceiling for a tool child: generous
 /// headroom over the largest legitimate workload (the
@@ -610,5 +611,40 @@ mod tests {
             printed_dir(&run),
             std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_process_group() {
+        // Every tool, not only the encoder (audit R2-31): a
+        // wrapper that forks a long-lived grandchild and waits
+        // on it is killed at the deadline, grandchild and all.
+        let pid_file =
+            std::env::temp_dir().join(format!("crabcrop-toolrun-group-{}.pid", std::process::id()));
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let argv = ["-c", script.as_str()];
+        let mut command = shell(&argv, ToolInput::Bytes(b""));
+        command.deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = run_tool(command).unwrap_err();
+        assert!(matches!(err, ToolError::TimedOut), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        // Signal 0 finds nothing once the grandchild is gone;
+        // give the kill a moment to land before concluding.
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            assert!(
+                std::time::Instant::now() < until,
+                "grandchild {} survived the process-group kill",
+                pid.trim()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
