@@ -70,6 +70,12 @@ scripts/test_all.sh --skip-rust  # just the non-Rust suites
 
 The JavaScript suites need Node 22.18 or newer: they run the TypeScript sources directly, and type stripping is on by default from 22.18.
 
+A unit test that stands a script in for an external tool (FFmpeg,
+pdftocairo, pdfinfo) writes it with `crate::test_support::write_script`, not
+`std::fs::write`. A script written through the test process's own file
+descriptor can fail to start with "Text file busy" when another test thread
+spawns a child at the same moment (issue #523).
+
 ## Code style
 
 CI enforces formatting and lints. Run both before pushing:
