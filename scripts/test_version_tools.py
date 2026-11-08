@@ -215,19 +215,27 @@ class VersionToolsTest(unittest.TestCase):
         text = path.read_text(encoding="utf-8")
         const = RENDERING_CONST.search(text)
         self.assertIsNotNone(const, f"RENDERING_VERSION left {rel}: move HISTORY_FILE with it")
+        # The comment starts after the last blank line above the const.
+        comment = text.rindex("\n\n", 0, const.start()) + 2
+        above = f"// the first release after {old}, above the comment\n"
         entries = (
             f"/// 8: the first release after {old}, which changes\n"
             f"/// 9: the first release after\n/// {old}, wrapped.\n"
             f"/// Built by crabcrop {old}.\n"
         )
         elsewhere = f'\n// the first release after {old}\nfn later() {{}}\n\npub const PINNED: &str = "{old}";\n'
-        path.write_text(text[: const.start()] + entries + text[const.start() :] + elsewhere, encoding="utf-8")
+        path.write_text(
+            text[:comment] + above + text[comment : const.start()] + entries + text[const.start() :] + elsewhere,
+            encoding="utf-8",
+        )
         found = [hit.split(": ", 1)[1] for hit in self.leftovers(old) if hit.startswith(f"{rel}:")]
         # Entries in the comment are skipped, the file's own history
-        # included; any other mention, in the comment or not, counts.
+        # included; any other mention, in the comment or not, before
+        # the const or after it, counts.
         self.assertEqual(
             found,
             [
+                f"// the first release after {old}, above the comment",
                 f"/// Built by crabcrop {old}.",
                 f"// the first release after {old}",
                 f'pub const PINNED: &str = "{old}";',
