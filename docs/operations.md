@@ -96,7 +96,7 @@ curl "http://localhost:3000/unsafe/crop:800x800:objects(dog):1.5/https://example
 crop-rect:<left>x<top>:<right>x<bottom>
 ```
 
-Cuts the exact pixel rectangle between the two corners. `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside the source image fails with `400`.
+Cuts the exact pixel rectangle between the two corners, in the pixels of the image as it stands at the segment (the source, when nothing runs before it). `right` must be greater than `left`, and `bottom` greater than `top`. A rectangle that falls outside that image fails with `400`.
 
 ```bash
 curl "http://localhost:3000/unsafe/crop-rect:100x50:700x450/https://example.com/photo.jpg"
