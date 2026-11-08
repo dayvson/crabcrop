@@ -26,9 +26,14 @@
 //! Walks are paced (issue #462): one walk reads
 //! [`PURGE_READS_AT_ONCE`] headers at a time, at most
 //! [`PURGE_WALKS_AT_ONCE`] walks run in the background at
-//! once, and a purge whose target already has a walk
+//! once, the inline parts of all purge requests together
+//! keep at most [`PURGE_INLINE_READS_AT_ONCE`] reads in
+//! flight, and a purge whose target already has a walk
 //! running in this process joins that walk instead of
-//! starting another (see [`S3Store::lead_or_join`]).
+//! starting another (see [`S3Store::lead_or_join`]). A
+//! walk that the store fails part way reports itself
+//! incomplete (see [`Swept`]), and its purges are not
+//! marked ended.
 //!
 //! Like the disk store, every operation is best-effort: a
 //! network or service error degrades to a miss or a dropped
@@ -83,8 +88,21 @@ pub const PURGE_READS_AT_ONCE: usize = 16;
 /// the store's request rate between them, while each one
 /// keeps its purge running (its tombstone open) until it
 /// ends. A purge's inline part (issue #368) is bounded on
-/// its own and never waits for a turn.
+/// its own and never waits for a turn (see
+/// [`PURGE_INLINE_READS_AT_ONCE`]).
 pub const PURGE_WALKS_AT_ONCE: usize = 2;
+
+/// How many entry header reads the inline parts of all of
+/// this process's purge requests keep in flight together
+/// (issue #462), first come first served. Walk turns bound
+/// the background walks only, so without this N concurrent
+/// purges of different targets would put N times
+/// [`PURGE_READS_AT_ONCE`] reads on the store at once. The
+/// background walks do not draw on it, so a request's scan
+/// never waits behind them: a process keeps at most this
+/// many purge reads in flight plus [`PURGE_READS_AT_ONCE`]
+/// for each of the [`PURGE_WALKS_AT_ONCE`] walks.
+pub const PURGE_INLINE_READS_AT_ONCE: usize = 2 * PURGE_READS_AT_ONCE;
 
 /// The outcome of a conditional raw write
 /// ([`S3Store::put_raw_if_absent`]).
@@ -133,6 +151,9 @@ pub struct S3Store {
     /// [`PURGE_WALKS_AT_ONCE`] permits, granted in arrival
     /// order.
     walk_turns: tokio::sync::Semaphore,
+    /// Inline purge header reads in flight (issue #462):
+    /// [`PURGE_INLINE_READS_AT_ONCE`] permits, one per read.
+    inline_reads: tokio::sync::Semaphore,
     /// Tier failures, counted and logged as they happen
     /// (issue #367): the shared tier stays best-effort,
     /// but a store that rejects every write must be
@@ -192,6 +213,7 @@ impl S3Store {
             tombstones: std::sync::Mutex::new(HashMap::new()),
             walks: std::sync::Mutex::new(HashMap::new()),
             walk_turns: tokio::sync::Semaphore::new(PURGE_WALKS_AT_ONCE),
+            inline_reads: tokio::sync::Semaphore::new(PURGE_INLINE_READS_AT_ONCE),
             max_entry_bytes: MAX_ENTRY_BYTES,
             errors: std::sync::atomic::AtomicU64::new(0),
         })
@@ -479,17 +501,23 @@ impl S3Store {
 
     /// Every object key under the store prefix, following
     /// continuation tokens, minus the tombstone sub-prefix
-    /// (issue #461): the purge walk's input. An error yields
-    /// what was listed so far (possibly nothing).
-    async fn list_objects(&self) -> Vec<String> {
+    /// (issue #461): the purge walk's input, and whether the
+    /// listing ran to its end. An error yields what was
+    /// listed so far (possibly nothing), and is counted and
+    /// logged: the walk then cannot have reached every copy
+    /// (issue #462).
+    async fn list_objects(&self) -> (Vec<String>, bool) {
         let tombstones = self.tombstone_prefix();
-        self.list_under(&self.prefix)
-            .await
-            .0
+        let (listed, complete) = self.list_under(&self.prefix).await;
+        if !complete {
+            self.note_error("purge walk", "listing the bucket failed");
+        }
+        let objects = listed
             .into_iter()
             .map(|(key, _)| key)
             .filter(|key| !key.starts_with(&tombstones))
-            .collect()
+            .collect();
+        (objects, complete)
     }
 
     /// Every (object key, ETag) under `prefix`, following
@@ -548,57 +576,76 @@ impl S3Store {
     /// are only ever SERVED through `get`, which verifies.
     /// Objects past the entry size ceiling are refused
     /// outright, exactly as `get` refuses them.
-    async fn read_entry_header(&self, object: &str) -> Option<ProbedEntry> {
+    ///
+    /// A read the store did not answer is told apart from an
+    /// object with nothing to purge in it (issue #462): the
+    /// walk that meets one has not judged that object.
+    async fn read_entry_header(&self, object: &str) -> HeaderRead {
         let range = format!("bytes=0-{}", Self::HEADER_PROBE_BYTES - 1);
-        let resp = self
+        let Some(resp) = self
             .request_h("GET", object, &[], Vec::new(), &[("range", range.as_str())])
-            .await?;
+            .await
+        else {
+            return HeaderRead::Failed;
+        };
         if !resp.status().is_success() {
-            return None;
+            return HeaderRead::unanswered(resp.status());
         }
         // A ranged GET reports the whole object's ETag.
         let etag = response_etag(&resp);
         let partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         // The object's real length: from Content-Range on a
         // partial response, else the response's own length.
-        let total = resp
+        let Some(total) = resp
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit('/').next())
             .and_then(|v| v.parse::<u64>().ok())
-            .or_else(|| resp.content_length())?;
+            .or_else(|| resp.content_length())
+        else {
+            return HeaderRead::Nothing;
+        };
         if total > self.max_entry_bytes as u64 {
-            return None;
+            return HeaderRead::Nothing;
         }
-        let data = self.read_capped(resp).await?;
-        let whole = |data: &[u8]| {
-            let (key, image) = parse_entry(data, &self.entry_key)?;
-            Some(HeaderProbe {
-                key,
-                groups: image.groups,
-                written: image.written,
-            })
+        // The length was checked above, so a body that does
+        // not arrive whole is a transport failure.
+        let Some(data) = self.read_capped(resp).await else {
+            return HeaderRead::Failed;
+        };
+        let whole = |data: &[u8], etag: Option<String>| match parse_entry(data, &self.entry_key) {
+            Some((key, image)) => HeaderRead::Entry(ProbedEntry {
+                header: HeaderProbe {
+                    key,
+                    groups: image.groups,
+                    written: image.written,
+                },
+                etag,
+            }),
+            None => HeaderRead::Nothing,
         };
         if !partial || data.len() as u64 >= total {
             // The whole object arrived (the store ignored
             // the range, or the entry fits in the probe).
-            let header = whole(&data)?;
-            return Some(ProbedEntry { header, etag });
+            return whole(&data, etag);
         }
         match parse_entry_header(&data, total as usize) {
-            Some(header) => Some(ProbedEntry { header, etag }),
+            Some(header) => HeaderRead::Entry(ProbedEntry { header, etag }),
             None => {
                 // The header outgrew the probe: one full
                 // read of this object settles it.
-                let resp = self.request("GET", object, &[], Vec::new()).await?;
+                let Some(resp) = self.request("GET", object, &[], Vec::new()).await else {
+                    return HeaderRead::Failed;
+                };
                 if !resp.status().is_success() {
-                    return None;
+                    return HeaderRead::unanswered(resp.status());
                 }
                 let etag = response_etag(&resp);
-                let data = self.read_capped(resp).await?;
-                let header = whole(&data)?;
-                Some(ProbedEntry { header, etag })
+                match self.read_capped(resp).await {
+                    Some(data) => whole(&data, etag),
+                    None => HeaderRead::Failed,
+                }
             }
         }
     }
@@ -623,31 +670,37 @@ impl S3Store {
     /// delete then reports false. Returns whether the store
     /// accepted the deletion.
     async fn delete_object_if_match(&self, object: &str, etag: Option<&str>) -> bool {
+        self.delete_answer(object, etag)
+            .await
+            .is_some_and(|status| status.is_success())
+    }
+
+    /// The store's answer to [`S3Store::delete_object_if_match`]'s
+    /// delete: its status, or `None` when the request got no
+    /// answer.
+    async fn delete_answer(&self, object: &str, etag: Option<&str>) -> Option<reqwest::StatusCode> {
         let headers: Vec<(&str, &str)> = match etag {
             Some(etag) => vec![("if-match", etag)],
             None => Vec::new(),
         };
-        match self
+        let status = self
             .request_h("DELETE", object, &[], Vec::new(), &headers)
-            .await
-        {
-            // A store without conditional deletes may refuse
-            // the precondition outright instead of ignoring
-            // it. The caller has just read this copy and
-            // found it purged, so delete it as before
-            // preconditions were sent; otherwise no purge
-            // could remove anything from such a store.
-            Some(resp)
-                if etag.is_some() && resp.status() == reqwest::StatusCode::NOT_IMPLEMENTED =>
-            {
-                match self.request("DELETE", object, &[], Vec::new()).await {
-                    Some(resp) => resp.status().is_success(),
-                    None => false,
-                }
-            }
-            Some(resp) => resp.status().is_success(),
-            None => false,
+            .await?
+            .status();
+        // A store without conditional deletes may refuse the
+        // precondition outright instead of ignoring it. The
+        // caller has just read this copy and found it purged,
+        // so delete it as before preconditions were sent;
+        // otherwise no purge could remove anything from such
+        // a store.
+        if etag.is_some() && status == reqwest::StatusCode::NOT_IMPLEMENTED {
+            return Some(
+                self.request("DELETE", object, &[], Vec::new())
+                    .await?
+                    .status(),
+            );
         }
+        Some(status)
     }
 
     /// Purge one object if it holds a copy `target` covers
@@ -655,18 +708,29 @@ impl S3Store {
     /// its header, then delete it conditionally on the ETag
     /// that read saw. A copy written after the purge began,
     /// or one that changed between the read and the delete,
-    /// stays and is not counted. Returns whether a covered
-    /// copy was deleted.
-    async fn purge_object(&self, object: &str, target: &PurgeTarget, cutoff: PurgeCutoff) -> bool {
-        let Some(probed) = self.read_entry_header(object).await else {
-            return false;
+    /// stays and is not counted. A read or a delete the
+    /// store did not answer leaves the object unjudged
+    /// (issue #462).
+    async fn purge_object(
+        &self,
+        object: &str,
+        target: &PurgeTarget,
+        cutoff: PurgeCutoff,
+    ) -> ObjectPurge {
+        let probed = match self.read_entry_header(object).await {
+            HeaderRead::Entry(probed) => probed,
+            HeaderRead::Nothing => return ObjectPurge::Kept,
+            HeaderRead::Failed => return ObjectPurge::Failed,
         };
         let header = &probed.header;
         if !target.covers(&header.key, &header.groups) || !cutoff.covers(header.written) {
-            return false;
+            return ObjectPurge::Kept;
         }
-        self.delete_object_if_match(object, probed.etag.as_deref())
-            .await
+        match self.delete_answer(object, probed.etag.as_deref()).await {
+            Some(status) if status.is_success() => ObjectPurge::Deleted,
+            Some(status) if !store_failed(status) => ObjectPurge::Kept,
+            _ => ObjectPurge::Failed,
+        }
     }
 
     /// Remove every entry whose stored key is `base` or one
@@ -700,6 +764,7 @@ impl S3Store {
         )
         .await
         .0
+        .removed
     }
 
     /// Remove the copies `target` covers that were written
@@ -711,21 +776,31 @@ impl S3Store {
     /// `epoch_base` names the current epoch's form of the
     /// key, whose enumerable variants are reached directly
     /// by object name first; those reads are bounded by
-    /// construction and always run inline.
+    /// construction and always run inline. Whether the scan
+    /// was complete covers the listing and the walk: the
+    /// walk lists the variants and reads them again, so a
+    /// failed read by name is one the walk repairs.
     pub async fn purge_bounded(
         &self,
         target: &PurgeTarget,
         epoch_base: Option<&str>,
         cutoff: PurgeCutoff,
         budget: usize,
-    ) -> (usize, Option<PendingPurge>) {
+    ) -> (Swept, Option<PendingPurge>) {
         let mut removed = 0;
         if let Some(epoch_base) = epoch_base {
-            removed += self.purge_epoch_variants(epoch_base, target, cutoff).await;
+            removed += self
+                .purge_epoch_variants(epoch_base, target, cutoff)
+                .await
+                .removed;
         }
-        let objects = self.list_objects().await;
+        let (objects, listed) = self.list_objects().await;
         let (walked, pending) = self.purge_walk(target, cutoff, objects, budget).await;
-        (removed + walked, pending)
+        let swept = Swept {
+            removed: removed + walked.removed,
+            complete: listed && walked.complete,
+        };
+        (swept, pending)
     }
 
     /// Purge the current epoch's enumerable variants of a
@@ -738,7 +813,7 @@ impl S3Store {
         epoch_base: &str,
         target: &PurgeTarget,
         cutoff: PurgeCutoff,
-    ) -> usize {
+    ) -> Swept {
         let objects: Vec<String> = [
             epoch_base.to_string(),
             format!("{epoch_base}#avif"),
@@ -749,7 +824,8 @@ impl S3Store {
         .iter()
         .map(|candidate| self.object_key(&key_stem(candidate)))
         .collect();
-        self.purge_objects(objects, target, cutoff).await
+        self.purge_objects(objects, target, cutoff, Some(&self.inline_reads))
+            .await
     }
 
     /// Remove every entry belonging to `group`. Returns
@@ -760,6 +836,7 @@ impl S3Store {
         self.purge_bounded(&target, None, PurgeCutoff::EVERYTHING, usize::MAX)
             .await
             .0
+            .removed
     }
 
     /// Remove every entry whose result derives from
@@ -773,65 +850,115 @@ impl S3Store {
         self.purge_bounded(&target, None, PurgeCutoff::EVERYTHING, usize::MAX)
             .await
             .0
+            .removed
     }
 
     /// Complete a bounded purge's remainder (issue #368):
     /// walk the objects the inline budget did not reach
     /// and delete the covered copies. Returns how many
-    /// entries were removed.
-    pub async fn finish_purge(&self, pending: PendingPurge) -> usize {
-        self.purge_walk(&pending.target, pending.cutoff, pending.objects, usize::MAX)
+    /// entries were removed, and whether every object was
+    /// judged. A background walk: the caller holds a
+    /// [`S3Store::walk_turn`].
+    pub async fn finish_purge(&self, pending: PendingPurge) -> Swept {
+        self.purge_objects(pending.objects, &pending.target, pending.cutoff, None)
             .await
-            .0
+    }
+
+    /// One whole pass over the bucket for the purges that
+    /// joined a walk (issue #462): list it afresh and purge
+    /// what `target` covers under `cutoff`. A background
+    /// walk: the caller holds a [`S3Store::walk_turn`].
+    pub async fn relist(&self, target: &PurgeTarget, cutoff: PurgeCutoff) -> Swept {
+        let (objects, listed) = self.list_objects().await;
+        let walked = self.purge_objects(objects, target, cutoff, None).await;
+        Swept {
+            removed: walked.removed,
+            complete: listed && walked.complete,
+        }
     }
 
     /// The shared purge walk: read each entry's header,
     /// delete the covered copies (see
     /// [`S3Store::purge_object`]), the first `budget`
-    /// objects now and the rest handed back. Reads are
-    /// header-sized (see [`S3Store::read_entry_header`]),
-    /// never whole entries.
+    /// objects now, under the inline read budget, and the
+    /// rest handed back. Reads are header-sized (see
+    /// [`S3Store::read_entry_header`]), never whole
+    /// entries.
     async fn purge_walk(
         &self,
         target: &PurgeTarget,
         cutoff: PurgeCutoff,
         mut objects: Vec<String>,
         budget: usize,
-    ) -> (usize, Option<PendingPurge>) {
+    ) -> (Swept, Option<PendingPurge>) {
         let rest = (objects.len() > budget).then(|| objects.split_off(budget));
-        let removed = self.purge_objects(objects, target, cutoff).await;
+        let swept = self
+            .purge_objects(objects, target, cutoff, Some(&self.inline_reads))
+            .await;
         let pending = rest.map(|objects| PendingPurge {
             target: target.clone(),
             cutoff,
             objects,
         });
-        (removed, pending)
+        (swept, pending)
     }
 
     /// Purge each of `objects` (see
     /// [`S3Store::purge_object`]), [`PURGE_READS_AT_ONCE`]
     /// at a time (issue #462): a header read is one round
     /// trip, and one after another they made a walk's time
-    /// the object count times the store's latency. Returns
-    /// how many covered copies were deleted.
+    /// the object count times the store's latency. With
+    /// `shared`, each read also holds one of its permits,
+    /// a budget concurrent purges share (see
+    /// [`PURGE_INLINE_READS_AT_ONCE`]). Returns how many
+    /// covered copies were deleted, and whether the store
+    /// answered for every object; the objects it did not
+    /// answer for are counted and logged as one failure.
     async fn purge_objects(
         &self,
         objects: Vec<String>,
         target: &PurgeTarget,
         cutoff: PurgeCutoff,
-    ) -> usize {
+        shared: Option<&tokio::sync::Semaphore>,
+    ) -> Swept {
         use futures_util::StreamExt as _;
+        let total = objects.len();
         // Each name moves into its read: a stream of borrowed
         // names makes the spawned walk fail the compiler's
         // Send check (a known limitation with higher-ranked
         // lifetimes).
-        futures_util::stream::iter(objects)
-            .map(move |object| async move { self.purge_object(&object, target, cutoff).await })
-            .buffer_unordered(PURGE_READS_AT_ONCE)
-            .fold(0, |removed, deleted| {
-                std::future::ready(removed + usize::from(deleted))
+        let (removed, failed) = futures_util::stream::iter(objects)
+            .map(move |object| async move {
+                let _read = match shared {
+                    Some(budget) => Some(
+                        budget
+                            .acquire()
+                            .await
+                            .expect("the purge read budget is never closed"),
+                    ),
+                    None => None,
+                };
+                self.purge_object(&object, target, cutoff).await
             })
-            .await
+            .buffer_unordered(PURGE_READS_AT_ONCE)
+            .fold((0, 0), |(removed, failed), outcome| {
+                std::future::ready(match outcome {
+                    ObjectPurge::Deleted => (removed + 1, failed),
+                    ObjectPurge::Kept => (removed, failed),
+                    ObjectPurge::Failed => (removed, failed + 1),
+                })
+            })
+            .await;
+        if failed > 0 {
+            self.note_error(
+                "purge walk",
+                &format!("the store did not answer for {failed} of {total} objects"),
+            );
+        }
+        Swept {
+            removed,
+            complete: failed == 0,
+        }
     }
 
     /// Lead or join the walk of `purge`'s target (issue
@@ -872,10 +999,12 @@ impl S3Store {
     /// Wait for a background walk's turn (issue #462): at
     /// most [`PURGE_WALKS_AT_ONCE`] walks hold one at a
     /// time, and the others queue in arrival order. The
-    /// semaphore is never closed, so the permit is always
-    /// there; it is returned when dropped.
-    pub async fn walk_turn(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
-        self.walk_turns.acquire().await.ok()
+    /// turn is returned when the permit is dropped.
+    pub async fn walk_turn(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.walk_turns
+            .acquire()
+            .await
+            .expect("the walk turn semaphore is never closed")
     }
 
     fn tombstone_prefix(&self) -> String {
@@ -1018,6 +1147,67 @@ pub struct PendingPurge {
     target: PurgeTarget,
     cutoff: PurgeCutoff,
     objects: Vec<String>,
+}
+
+/// What a purge pass did (issue #462): how many covered
+/// copies it deleted, and whether it judged every object in
+/// the bucket. A pass is incomplete when its listing
+/// stopped early, or when the store did not answer a header
+/// read or a covered copy's delete. Such a pass must not
+/// mark its purges ended: a copy it missed would serve
+/// again once their tombstones expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Swept {
+    pub removed: usize,
+    pub complete: bool,
+}
+
+/// What a purge did to one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectPurge {
+    /// It held a covered copy, now deleted.
+    Deleted,
+    /// It holds nothing the purge removes: no entry, an
+    /// entry the purge does not cover or that was written
+    /// after the purge began, or a copy replaced since it
+    /// was read.
+    Kept,
+    /// The store did not answer the read or the delete, so
+    /// the object was not judged.
+    Failed,
+}
+
+/// The outcome of reading one object's header for a purge.
+enum HeaderRead {
+    /// The object holds an entry.
+    Entry(ProbedEntry),
+    /// Nothing to purge: the object is gone, is not a cache
+    /// entry, or is past the entry size ceiling.
+    Nothing,
+    /// The store did not answer (see [`store_failed`]).
+    Failed,
+}
+
+impl HeaderRead {
+    /// A read the store answered with an error `status`.
+    fn unanswered(status: reqwest::StatusCode) -> Self {
+        if store_failed(status) {
+            HeaderRead::Failed
+        } else {
+            HeaderRead::Nothing
+        }
+    }
+}
+
+/// Whether an error status means the store did not act on
+/// a request, rather than that the request had no object
+/// to act on (issue #462): a server error, throttling, or a
+/// timeout. A purge pass that meets one has not judged that
+/// object; a 404 or a 412 is an answer.
+fn store_failed(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
 }
 
 /// A purge on its way through the shared tier (issues
@@ -1798,10 +1988,11 @@ mod tests {
         let (removed, pending) = s
             .purge_bounded(&hero, None, PurgeCutoff::EVERYTHING, 2)
             .await;
-        assert!(removed <= 2, "inline removals bounded: {removed}");
+        assert!(removed.complete);
+        assert!(removed.removed <= 2, "inline removals bounded: {removed:?}");
         let pending = pending.expect("a remainder past the budget");
-        let rest = s.finish_purge(pending).await;
-        assert_eq!(removed + rest, 5);
+        let rest = s.finish_purge(pending).await.removed;
+        assert_eq!(removed.removed + rest, 5);
         assert!(s.get("other").await.is_some());
         // A budget above the object count leaves nothing
         // pending.
@@ -1809,7 +2000,13 @@ mod tests {
         let (removed, pending) = s
             .purge_bounded(&hero, None, PurgeCutoff::EVERYTHING, 128)
             .await;
-        assert_eq!(removed, 1);
+        assert_eq!(
+            removed,
+            Swept {
+                removed: 1,
+                complete: true
+            }
+        );
         assert!(pending.is_none());
     }
 
@@ -1835,7 +2032,7 @@ mod tests {
         let hero = PurgeTarget::Group("hero".into());
         let (inline, pending) = s.purge_bounded(&hero, None, cutoff, 2).await;
         let rest = s.finish_purge(pending.expect("a remainder")).await;
-        assert_eq!(inline + rest, 3);
+        assert_eq!(inline.removed + rest.removed, 3);
         assert!(s.get("old").await.is_none());
         assert!(s.get("legacy").await.is_none());
         assert!(s.get("foreign").await.is_none());
@@ -1850,7 +2047,7 @@ mod tests {
             .await;
         let key = PurgeTarget::Key(base.into());
         let (removed, _) = s.purge_bounded(&key, Some(&epoch), cutoff, 128).await;
-        assert_eq!(removed, 1);
+        assert_eq!(removed.removed, 1);
         assert!(s.get(&epoch).await.is_none());
         assert!(s.get(&format!("{epoch}#avif")).await.is_some());
         // Every delete the walk sent was conditional.
@@ -2009,6 +2206,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_walk_the_store_does_not_answer_is_incomplete() {
+        // Issue #462 review: a walk whose listing, header
+        // reads or deletes fail cannot have reached every
+        // covered copy, and must say so, so that its purge's
+        // tombstone stays in force instead of being marked
+        // ended. Each failure is counted for /metrics.
+        // Objects that are not entries are answers, not
+        // failures.
+        let fake = start_fake().await;
+        let s = store(&fake.endpoint);
+        seed_fillers(&fake, "cache/f", 4);
+        s.put("old", &image(b"1", &["hero"])).await;
+        let hero = PurgeTarget::Group("hero".into());
+        let errors = s.errors();
+        let incomplete = Swept {
+            removed: 0,
+            complete: false,
+        };
+        let failing: [fn(&mut super::test_support::FailFlags, bool); 3] = [
+            |fail, on| fail.list = on,
+            |fail, on| fail.get_object = on,
+            |fail, on| fail.delete = on,
+        ];
+        for (n, switch) in failing.iter().enumerate() {
+            switch(&mut fake.fail.lock().unwrap(), true);
+            let (swept, _) = s
+                .purge_bounded(&hero, None, PurgeCutoff::EVERYTHING, usize::MAX)
+                .await;
+            switch(&mut fake.fail.lock().unwrap(), false);
+            assert_eq!(swept, incomplete, "failure {n}");
+            assert_eq!(s.errors(), errors + n as u64 + 1, "failure {n}");
+            assert!(s.get("old").await.is_some(), "failure {n}");
+        }
+        let (swept, _) = s
+            .purge_bounded(&hero, None, PurgeCutoff::EVERYTHING, usize::MAX)
+            .await;
+        assert_eq!(
+            swept,
+            Swept {
+                removed: 1,
+                complete: true
+            }
+        );
+        assert_eq!(s.errors(), errors + 3);
+    }
+
+    #[tokio::test]
     async fn a_walk_spares_a_copy_replaced_between_its_read_and_its_delete() {
         // Issue #446 (and the older #368 race): a fresh
         // render that lands under the object name the walk
@@ -2022,7 +2266,11 @@ mod tests {
         let walker = s.clone();
         let walk = tokio::spawn(async move {
             let hero = PurgeTarget::Group("hero".into());
-            walker.purge_bounded(&hero, None, cutoff, 128).await.0
+            walker
+                .purge_bounded(&hero, None, cutoff, 128)
+                .await
+                .0
+                .removed
         });
         for _ in 0..500 {
             if fake.held_deletes.load(std::sync::atomic::Ordering::SeqCst) == 1 {
@@ -2076,7 +2324,7 @@ mod tests {
         s.put("fresh", &stamped(b"2", &["hero"], &cutoff, 1)).await;
         let hero = PurgeTarget::Group("hero".into());
         let (removed, pending) = s.purge_bounded(&hero, None, cutoff, 128).await;
-        assert_eq!(removed, 1);
+        assert_eq!(removed.removed, 1);
         assert!(pending.is_none());
         assert!(s.get("old").await.is_none());
         assert!(s.get("fresh").await.is_some());

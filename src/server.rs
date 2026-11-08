@@ -1017,8 +1017,9 @@ async fn begin_purge(
 /// [`crate::s3store::S3Store::lead_or_join`]), which
 /// re-lists the bucket for it once its current pass ends.
 /// A purge stays running until the walk that covers it
-/// ends, then its tombstone is marked ended (see
-/// [`end_purge`]). Returns what the inline part removed.
+/// ends, then its tombstone is marked ended if the walk
+/// reached every object (see [`end_purge`]). Returns what
+/// the inline part removed.
 async fn purge_shared_tier(
     shared: &Arc<crate::s3store::S3Store>,
     active: crate::cache::ActivePurge,
@@ -1029,11 +1030,14 @@ async fn purge_shared_tier(
 ) -> usize {
     let target = active.tombstone().target.clone();
     let cutoff = active.tombstone().cutoff;
+    // The walk lists these variants and reads them again, so
+    // a read here that fails is one the walk repairs.
     let mut removed = match &epoch_base {
         Some(epoch_base) => {
             shared
                 .purge_epoch_variants(epoch_base, &target, cutoff)
                 .await
+                .removed
         }
         None => 0,
     };
@@ -1046,27 +1050,27 @@ async fn purge_shared_tier(
     let Some((mut lease, purge)) = shared.lead_or_join(purge) else {
         return removed;
     };
-    let (walked, pending) = shared
+    let (inline, pending) = shared
         .purge_bounded(&target, None, cutoff, SHARED_PURGE_INLINE_SCAN)
         .await;
-    removed += walked;
+    removed += inline.removed;
     let shared = shared.clone();
     match pending {
         Some(pending) => {
             tokio::spawn(async move {
-                let removed = {
+                let rest = {
                     let _turn = shared.walk_turn().await;
                     shared.finish_purge(pending).await
                 };
                 let (event, log_target) = (purge.event, purge.log_target.clone());
-                end_purge(&shared, purge).await;
-                purge_log(event, &log_target, Some(removed));
+                end_purge(&shared, purge, inline.complete && rest.complete).await;
+                purge_log(event, &log_target, Some(rest.removed));
                 let joined = lease.take_joined();
                 walk_for_joined(&shared, lease, joined).await;
             });
         }
         None => {
-            end_purge(&shared, purge).await;
+            end_purge(&shared, purge, inline.complete).await;
             let joined = lease.take_joined();
             if !joined.is_empty() {
                 tokio::spawn(async move { walk_for_joined(&shared, lease, joined).await });
@@ -1083,7 +1087,8 @@ async fn purge_shared_tier(
 /// lists the bucket afresh, and judges copies by the
 /// latest joined purge's start: the purges come from one
 /// process, so its cutoff covers every copy the earlier
-/// ones do.
+/// ones do. Each purge the pass served logs the pass's
+/// count under its own target.
 async fn walk_for_joined(
     shared: &crate::s3store::S3Store,
     mut lease: crate::s3store::WalkLease,
@@ -1095,18 +1100,15 @@ async fn walk_for_joined(
     {
         let target = latest.active.tombstone().target.clone();
         let cutoff = latest.active.tombstone().cutoff;
-        let (event, log_target) = (latest.event, latest.log_target.clone());
-        let removed = {
+        let swept = {
             let _turn = shared.walk_turn().await;
-            shared
-                .purge_bounded(&target, None, cutoff, usize::MAX)
-                .await
-                .0
+            shared.relist(&target, cutoff).await
         };
         for purge in joined {
-            end_purge(shared, purge).await;
+            let (event, log_target) = (purge.event, purge.log_target.clone());
+            end_purge(shared, purge, swept.complete).await;
+            purge_log(event, &log_target, Some(swept.removed));
         }
-        purge_log(event, &log_target, Some(removed));
         joined = lease.take_joined();
     }
 }
@@ -1118,9 +1120,17 @@ async fn walk_for_joined(
 /// where its tombstone likewise outlives it for the grace.
 /// A tombstone that is never marked (the process stopped
 /// mid-walk) stays in force until a later purge of the same
-/// target finishes its walk.
-async fn end_purge(shared: &crate::s3store::S3Store, purge: crate::s3store::SharedPurge) {
-    if let Some(object) = &purge.tombstone {
+/// target finishes its walk. So does the tombstone of a
+/// walk that was not `complete` (issue #462): the store
+/// failed to list the bucket or to answer for an object, so
+/// a copy the purge covers may still be there, and it must
+/// stay a miss after the grace.
+async fn end_purge(
+    shared: &crate::s3store::S3Store,
+    purge: crate::s3store::SharedPurge,
+    complete: bool,
+) {
+    if complete && let Some(object) = &purge.tombstone {
         let mut ended = purge.active.tombstone().clone();
         ended.ended_ms = Some(crate::cache::now_ms());
         shared.write_tombstone(object, &ended).await;
