@@ -8,6 +8,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - In the library, `crabcrop::url::Quality::resolved_for` returns `Option<ResolvedQuality>` instead of `Option<Quality>` (issue #480). `ResolvedQuality` is a new name for `QualityValue`, the two forms a resolved quality takes, so code that matched `Quality::Value` or `Quality::Auto` on the result matches `ResolvedQuality::Value` or `ResolvedQuality::Auto` instead and needs no arm for the per-format list, which the method never returned. Inside the engine, invariants it checked at run time are now carried by its types (the frame decoders return a list that cannot be empty, the still encoder takes a format with no video variant, and the request's operations are analyzed once), and the GIF and animated WebP decode branches, the animated and video frame loops, and the overlay and watermark compositing each share one implementation. Behavior and rendered bytes are unchanged.
 
+### Fixed
+
+- Documentation corrections for the upload endpoint in docs/endpoints.md (issue #562). With no upload destination configured, the upload route answers `404 uploads_not_configured`; the endpoint table said the route exists only when uploads are configured. The upload cap defaults to `CRABCROP_SOURCE_MAX_MB` and may not exceed it, where the docs gave 10 MB for both. The response body is the source reference followed by a newline, and the `X-Crabcrop-Source` header carries the reference without it. With a `CRABCROP_FILE_ROOT` above the upload directory, the reference includes the directory's path under the root. The Rust crate mints the expiring upload form with `upload_signature_with_expiry`, not an `expires` argument.
+
 ## [0.10.1] - 2026-11-09
 
 ### Changed

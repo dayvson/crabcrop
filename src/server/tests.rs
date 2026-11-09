@@ -12266,8 +12266,11 @@ async fn upload_stores_and_the_object_is_served_by_a_transform_url() {
         resp.headers().get("x-crabcrop-source").unwrap(),
         "file:///heroes/cat.png"
     );
-    let source_ref = resp.text().await.unwrap().trim().to_string();
-    assert_eq!(source_ref, "file:///heroes/cat.png");
+    // The body is the same reference plus a newline, as
+    // docs/endpoints.md tells clients to expect.
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "file:///heroes/cat.png\n");
+    let source_ref = body.trim_end();
     // The bytes landed verbatim under the name.
     assert_eq!(
         std::fs::read(dir.join("heroes/cat.png")).unwrap(),
