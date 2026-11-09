@@ -62,8 +62,10 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// Decode an image from memory under the shared decode limits.
 /// Every decode of untrusted bytes routes through here (the
 /// main pipeline, the quality loop's re-decodes, watermark
-/// images in the server), so no entry point can be bombed past
-/// the budget. The declared dimensions are probed first and
+/// images in the server), or, for an AVIF source in the server,
+/// through [`decode_source_image`] and the worker's decode under
+/// the same limits, so no entry point can be bombed past the
+/// budget. The declared dimensions are probed first and
 /// checked in our own code, because decoder adherence to
 /// `max_alloc` varies by format; a probe failure is not fatal
 /// (some valid files have headers the probe cannot read), the
@@ -139,9 +141,10 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
 
 /// Decode an untrusted still source, routing an AVIF through
 /// the capped worker process with a deadline (issue #522): the
-/// dav1d decode can spin forever on a crafted AVIF, so the
-/// worker SVG rendering already uses (issue #447) takes the
-/// spin and the parent kills it at `deadline`. The container is
+/// AV1 decode is a large native decoder fed untrusted bytes, so
+/// it runs in the worker SVG rendering already uses (issue
+/// #447), and a decode still running at `deadline` is killed
+/// with the worker, not left on a render thread. The container is
 /// screened in this process first (the cheap box and item
 /// checks), then the screened bytes are handed to the worker,
 /// which runs the same bounded image-crate decode the

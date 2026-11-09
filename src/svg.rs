@@ -73,9 +73,9 @@ pub use worker::{
 use image::DynamicImage;
 
 /// Decode an AVIF source in the capped worker when SVG work is
-/// isolated (issue #522): the dav1d decode that can spin on a
-/// crafted file (issue #447's hazard, now AVIF's too) runs in
-/// the worker, killed at `deadline`. `None` means no worker is
+/// isolated (issue #522): the AV1 decode runs in the worker
+/// under its caps, killed at `deadline`, as an SVG render is
+/// (issue #447). `None` means no worker is
 /// configured (the library, the fuzz harness, the CLI), so the
 /// caller decodes in process. The limits are the engine's
 /// decode bounds, passed through to the worker.

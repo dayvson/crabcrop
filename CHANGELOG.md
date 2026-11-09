@@ -26,7 +26,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Security
 
-- AVIF sources are checked for consistent container sizes before decoding, and the decode runs in the capped worker process with a deadline (issue #522). The container screen now also reads the item table: an item that lists more extents than a small cap, or whose extent lengths sum to more bytes than the file holds for it (which would make the parser copy the same bytes many times), and a primary image whose declared `ispe` size is past the decode limits, each fail with `502` before any decoding. An AVIF's size for the explain report now comes from that declared `ispe`, with no decode. The dav1d decode itself, which can loop indefinitely on some bitstreams, runs in the same worker process that SVG rendering uses, killed at the request's processing deadline, so such an AVIF costs one worker and one `502` (or `504` at the deadline) instead of a stuck render thread; a valid file decodes to the same pixels as before.
+- AVIF sources are checked for consistent container sizes before decoding, and decoding runs in the capped worker process with a deadline (issue #522). An AVIF whose item table does not agree with the data the file holds, or whose declared image size is past the decode limits, fails with `502` (`415` as an upload) before any decoding; the explain report reads an AVIF's size from the container without decoding it; and an AVIF still decoding at the processing deadline fails with `504` while the server carries on. Valid files decode to the same pixels as before.
 
 ### Fixed
 
