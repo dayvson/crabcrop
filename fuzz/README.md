@@ -135,8 +135,13 @@ passes, so the fuzzer runs decoder versions the server
 does not ship: `scripts/check_locks.py` (CI's build job
 and `scripts/test_all.sh`) fails whenever the two
 lockfiles disagree on a package both carry, or either
-locks a decoder at two versions (issue #552). Refresh
-it from the root lockfile:
+locks a decoder at two versions (issue #552). A
+Dependabot cargo pull request moves the root lockfile
+alone, so one that moves a package both carry fails
+that check until this refresh is pushed to its branch;
+Dependabot's own entry for this directory updates only
+`libfuzzer-sys`, which the root lockfile does not
+carry. Refresh it from the root lockfile:
 
 ```sh
 cp Cargo.lock fuzz/Cargo.lock

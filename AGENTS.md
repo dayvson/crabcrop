@@ -92,7 +92,9 @@ both SDKs must all pass.
   in CI fails. `scripts/check_locks.py` fails CI when the two lockfiles
   disagree on a package both carry, or when either locks a decoder at
   two versions: one decoder version is what ships, pre-checks and
-  fuzzes.
+  fuzzes. A Dependabot cargo pull request moves the root lockfile only,
+  so one that moves a package both carry fails that check until the
+  refresh is pushed to its branch.
 - One binary, configuration-gated: AI and provenance features are enabled
   by environment configuration in the same binary, not by separate builds
   or cargo features. Never commit model files, certificates, or keys.
