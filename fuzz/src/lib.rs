@@ -93,6 +93,9 @@ fn check_round_trip(input: &str) {
 ///   server would parse after expansion satisfies the same
 ///   fixed point: the expanded text is what the server
 ///   parses and keys the cache on.
+/// - Expansion, which counts a remainder before it builds
+///   anything, agrees with splicing every reference and
+///   parsing the result (see [`check_counted_expansion`]).
 pub fn check(input: &str) {
     check_round_trip(input);
     if let Ok((_, _, rest)) = url::parse_signature(input) {
@@ -112,6 +115,7 @@ pub fn check(input: &str) {
                 check_round_trip(&format!("/{segment}/{expanded}"));
             }
         }
+        check_counted_expansion(rest);
     }
     // Root expansion (issue #250): total over untrusted
     // text, and a successful expansion stays under the
@@ -139,6 +143,96 @@ pub fn check(input: &str) {
             expanded.starts_with(&format!("{base}/")),
             "root expansion escaped its base: {expanded}"
         );
+    }
+}
+
+/// Splice every `preset:` reference before the source into
+/// its definition, counting nothing: the plain expansion
+/// that [`check_counted_expansion`] holds `expand_presets`
+/// to. A segment is an operation when it parses as a
+/// one-segment preset body, which is the operation dispatch
+/// minus the metadata and reference prefixes handled first.
+/// `None` for an unknown name.
+fn spliced(rest: &str, presets: &url::Presets) -> Option<String> {
+    let mut out = String::new();
+    let mut tail = rest;
+    loop {
+        let (seg, remaining) = tail.split_once('/').unwrap_or((tail, ""));
+        if let Some(name) = seg.strip_prefix("preset:") {
+            out.push_str(presets.get(name)?.as_str());
+        } else if seg.starts_with("exp:")
+            || seg.starts_with("maxage:")
+            || url::parse_preset_operations(seg).is_ok()
+        {
+            out.push_str(seg);
+        } else {
+            out.push_str(tail);
+            return Some(out);
+        }
+        if remaining.is_empty() {
+            return Some(out);
+        }
+        out.push('/');
+        tail = remaining;
+    }
+}
+
+/// `expand_presets` counts a remainder's operations and the
+/// length of its expansion before building it. Whatever it
+/// answers must match the plain expansion ([`spliced`]):
+///
+/// - Accepted: the same text, within the length cap, and a
+///   parse of it counts at most the operation cap.
+/// - Refused for the count: over the cap, and a parse of
+///   the plain expansion, when it parses, counts the same.
+/// - Refused for the length: the plain expansion's length,
+///   over the cap.
+/// - An unknown name is refused as unknown.
+///
+/// With the presets-only policy, any answer other than the
+/// policy's own refusal is the answer without it.
+pub fn check_counted_expansion(rest: &str) {
+    let presets = presets();
+    let counted = url::expand_presets(rest, presets, false);
+    match url::expand_presets(rest, presets, true) {
+        Err(url::ParseError::PresetsOnly(_)) => {}
+        only => assert_eq!(
+            only, counted,
+            "presets-only changed the answer for {rest:?}"
+        ),
+    }
+    let Some(full) = spliced(rest, presets) else {
+        assert!(
+            matches!(counted, Err(url::ParseError::UnknownPreset(_))),
+            "an unknown reference got {counted:?} for {rest:?}"
+        );
+        return;
+    };
+    let parsed = url::parse_operations_with_expiry(&full)
+        .ok()
+        .map(|(ops, _, _, _)| url::operation_count(&ops));
+    match counted {
+        Ok(expanded) => {
+            assert_eq!(expanded, full, "expansion differs from the splice");
+            assert!(expanded.len() <= url::MAX_EXPANDED_LEN);
+            if let Some(count) = parsed {
+                assert!(
+                    count <= url::MAX_OPERATIONS,
+                    "accepted {count} operations for {rest:?}"
+                );
+            }
+        }
+        Err(url::ParseError::TooManyOperations(count)) => {
+            assert!(count > url::MAX_OPERATIONS, "refused {count} for {rest:?}");
+            if let Some(parsed) = parsed {
+                assert_eq!(parsed, count, "count differs from the parse for {rest:?}");
+            }
+        }
+        Err(url::ParseError::ExpansionTooLong(len)) => {
+            assert_eq!(len, full.len(), "length differs from the splice");
+            assert!(len > url::MAX_EXPANDED_LEN);
+        }
+        Err(e) => panic!("unexpected refusal {e:?} for {rest:?}"),
     }
 }
 
