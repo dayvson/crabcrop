@@ -3097,7 +3097,7 @@ mod tests {
             let gets = count_gets(&fake, &name);
             let later = now_ms() + 2 * crate::cache::TOMBSTONE_GRACE_MS;
             for round in 1..=2 {
-                assert!(!b.refresh_tombstones(&guard).await, "{how}");
+                let refreshed = b.refresh_tombstones(&guard).await;
                 assert_eq!(count_gets(&fake, &name), gets + round, "{how}");
                 assert!(
                     guard.running_covers_at(later, "k", &hero, None),
@@ -3108,6 +3108,7 @@ mod tests {
                     round as u64,
                     "{how}: the failed read was not counted"
                 );
+                assert!(!refreshed, "{how}: the failed read passed for an answer");
             }
             *switch.lock().unwrap() = None;
             assert!(b.refresh_tombstones(&guard).await, "{how}");
