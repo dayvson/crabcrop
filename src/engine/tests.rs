@@ -2175,7 +2175,7 @@ fn run_chain(img: &DynamicImage, ops: &[Operation]) -> DynamicImage {
     let ctx = ProcessContext::default();
     apply_operations(img.clone(), ops, None, 1.0, &ctx, &directives, None)
         .unwrap()
-        .0
+        .img
 }
 
 #[test]
@@ -2662,7 +2662,9 @@ fn focal_forms_survive_hostile_geometry() {
                 // A crop-rect past a frame an earlier step
                 // shrank is the usual 400, never a panic.
                 match apply_operations(src.clone(), &ops, None, 1.0, &ctx, &directives, None) {
-                    Ok((out, ..)) => assert_eq!((out.width(), out.height()), (7, 3), "{ops:?}"),
+                    Ok(ApplyOutcome { img: out, .. }) => {
+                        assert_eq!((out.width(), out.height()), (7, 3), "{ops:?}")
+                    }
                     Err(err) => assert!(
                         matches!(&err, EngineError::Unsupported(msg) if msg.contains("crop-rect")),
                         "{ops:?}: {err:?}"
@@ -3536,8 +3538,9 @@ fn rotate_canvas_is_checked_before_it_allocates() {
     // A quarter turn keeps the pixel count and passes.
     let ops = [Operation::Filters(vec![Filter::Rotate(90.0)])];
     let directives = crate::url::RequestDirectives::analyze(&ops);
-    let (out, _, _, _, _, _) =
-        apply_operations(img, &ops, None, 1.0, &ctx, &directives, None).unwrap();
+    let out = apply_operations(img, &ops, None, 1.0, &ctx, &directives, None)
+        .unwrap()
+        .img;
     assert_eq!((out.width(), out.height()), (8000, 8000));
 }
 
@@ -3726,7 +3729,9 @@ fn rotate_canvas_is_checked_per_axis() {
     // the test log.
     let err = match apply_operations(img, &ops, None, 1.0, &ctx, &directives, None) {
         Err(err) => err,
-        Ok((out, ..)) => panic!("rotated to {}x{}", out.width(), out.height()),
+        Ok(ApplyOutcome { img: out, .. }) => {
+            panic!("rotated to {}x{}", out.width(), out.height())
+        }
     };
     assert_eq!(
         err.to_string(),
@@ -3747,7 +3752,7 @@ fn chain_dims(img: DynamicImage, remainder: &str) -> Result<(u32, u32), EngineEr
     let ctx = ProcessContext::default();
     let dpr = directives.dpr.unwrap_or(1.0);
     apply_operations(img, &ops, cap, dpr, &ctx, &directives, None)
-        .map(|(out, ..)| (out.width(), out.height()))
+        .map(|outcome| (outcome.img.width(), outcome.img.height()))
 }
 
 #[test]
@@ -4143,7 +4148,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         .unwrap();
     let now = encode(
         &src,
-        ImageFormat::Jpeg,
+        StillFormat::Jpeg,
         Some(80),
         None,
         None,
@@ -4165,7 +4170,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         .to_vec();
     let now = encode(
         &src,
-        ImageFormat::WebP,
+        StillFormat::WebP,
         Some(80),
         None,
         None,
@@ -4183,7 +4188,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         .unwrap();
     let now = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4202,7 +4207,7 @@ fn jpeg_options_change_the_encode() {
     let encode_with = |options: FormatOptions| {
         encode(
             &src,
-            ImageFormat::Jpeg,
+            StillFormat::Jpeg,
             Some(80),
             None,
             None,
@@ -4247,7 +4252,7 @@ fn png_interlace_marks_the_file_and_round_trips() {
     let src = EncodeBuffers::new(&img);
     let plain = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4261,7 +4266,7 @@ fn png_interlace_marks_the_file_and_round_trips() {
     assert_eq!(plain[28], 0);
     let interlaced = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4299,7 +4304,7 @@ fn png_interlace_writes_16_bit_samples_big_endian() {
     let src = EncodeBuffers::new(&deep);
     let interlaced = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4481,7 +4486,7 @@ fn webp_options_change_the_encode() {
     let encode_with = |options: FormatOptions| {
         encode(
             &src,
-            ImageFormat::WebP,
+            StillFormat::WebP,
             Some(80),
             None,
             None,
@@ -4516,7 +4521,7 @@ fn webp_options_change_the_encode() {
     // and still decodes to the same pixels.
     let lossless = encode(
         &src,
-        ImageFormat::WebP,
+        StillFormat::WebP,
         Some(100),
         None,
         None,
@@ -4540,7 +4545,7 @@ fn format_options_do_not_leak_across_formats() {
     // JPEG encode must be the default one.
     let jpeg = encode(
         &src,
-        ImageFormat::Jpeg,
+        StillFormat::Jpeg,
         Some(80),
         None,
         None,
@@ -4556,7 +4561,7 @@ fn format_options_do_not_leak_across_formats() {
     .unwrap();
     let jpeg_default = encode(
         &src,
-        ImageFormat::Jpeg,
+        StillFormat::Jpeg,
         Some(80),
         None,
         None,
@@ -4569,7 +4574,7 @@ fn format_options_do_not_leak_across_formats() {
     // JPEG fields set while encoding a PNG.
     let png = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4584,7 +4589,7 @@ fn format_options_do_not_leak_across_formats() {
     .unwrap();
     let png_default = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4654,7 +4659,7 @@ fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
     let img = DynamicImage::ImageRgb8(image::RgbImage::new(24, 16));
     let bytes = encode(
         &EncodeBuffers::new(&img),
-        ImageFormat::Jxl,
+        StillFormat::Jxl,
         Some(80),
         None,
         None,
@@ -6240,11 +6245,11 @@ fn animated_webp_fixture_decodes_to_its_frames() {
     let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
     assert_eq!(delays, [100, 200, 300]);
     assert_eq!(
-        frames[0].buffer().get_pixel(0, 0),
+        frames.first.buffer().get_pixel(0, 0),
         &image::Rgba([255, 0, 0, 255])
     );
     assert_eq!(
-        frames[2].buffer().get_pixel(0, 0),
+        frames.rest[1].buffer().get_pixel(0, 0),
         &image::Rgba([0, 0, 255, 255])
     );
 }
@@ -6364,22 +6369,22 @@ fn animated_webp_encode_honors_a_passed_deadline() {
     // instead of feeding every frame to libwebp when
     // the deadline has already passed.
     let delay = image::Delay::from_numer_denom_ms(100, 1);
-    let frames = vec![
-        image::Frame::from_parts(
+    let frames = Frames {
+        first: image::Frame::from_parts(
             image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255])),
             0,
             0,
             delay,
         ),
-        image::Frame::from_parts(
+        rest: vec![image::Frame::from_parts(
             image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 0, 255, 255])),
             0,
             0,
             delay,
-        ),
-    ];
+        )],
+    };
     let err = encode_animated_webp(
-        frames,
+        &frames,
         0,
         None,
         FormatOptions::default(),
@@ -9672,7 +9677,7 @@ fn a_dpr_hint_past_the_pixel_budget_steps_down() {
             };
             let img = DynamicImage::new_rgb8(8000, 8000);
             let factor = dpr_factor(directives.dpr, &ctx);
-            let (out, ..) = apply_operations(img, &ops, None, factor, &ctx, &directives, None)?;
+            let out = apply_operations(img, &ops, None, factor, &ctx, &directives, None)?.img;
             Ok(((out.width(), out.height()), factor))
         })
         .unwrap();
@@ -9964,7 +9969,7 @@ fn a_stepped_hint_never_serves_a_side_past_the_limit() {
     let img = DynamicImage::new_rgb8(16_384, 4);
     let err = match apply_operations(img, &ops, None, 2.0, &ctx, &directives, None) {
         Err(err) => err,
-        Ok((img, ..)) => panic!("rendered {}x{}", img.width(), img.height()),
+        Ok(ApplyOutcome { img, .. }) => panic!("rendered {}x{}", img.width(), img.height()),
     };
     assert_eq!(
         err.to_string(),
@@ -10093,8 +10098,8 @@ fn quality_ladder_steps_by_format() {
         q = next_quality(q, steps_left);
     }
     assert_eq!(q, 1, "four planned steps from 95 reach the floor");
-    assert_eq!(max_quality_attempts(ImageFormat::Avif), 4);
-    assert!(max_quality_attempts(ImageFormat::Jpeg) > 4);
+    assert_eq!(max_quality_attempts(StillFormat::Avif), 4);
+    assert!(max_quality_attempts(StillFormat::Jpeg) > 4);
 }
 
 #[test]
@@ -10196,4 +10201,98 @@ fn avif_encode_bench() {
         start.elapsed(),
         out.bytes.len()
     );
+}
+
+#[test]
+fn the_format_types_cover_the_output_formats() {
+    // Issue #480: the still encoder takes every output format
+    // but the video ones, and the animated path takes GIF and
+    // WebP. Each type turns back into the format it came from.
+    let all = [
+        ImageFormat::Jpeg,
+        ImageFormat::Png,
+        ImageFormat::WebP,
+        ImageFormat::Jxl,
+        ImageFormat::Avif,
+        ImageFormat::Gif,
+        ImageFormat::Mp4,
+        ImageFormat::WebM,
+    ];
+    for format in all {
+        assert_eq!(
+            StillFormat::of(format).map(ImageFormat::from),
+            (!format.is_video()).then_some(format),
+            "{format:?}"
+        );
+        assert_eq!(
+            AnimatedFormat::of(format).map(ImageFormat::from),
+            matches!(format, ImageFormat::Gif | ImageFormat::WebP).then_some(format),
+            "{format:?}"
+        );
+        assert_eq!(
+            StillFormat::of(format).is_some_and(StillFormat::carries_quality),
+            matches!(
+                format,
+                ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
+            ),
+            "{format:?}"
+        );
+    }
+}
+
+#[test]
+fn collected_frames_keep_their_order_and_refuse_none() {
+    // Issue #480: the frame decoders hand back the first frame
+    // and the rest, in order, and a source with no frames is
+    // refused rather than handed on empty.
+    let frame = |shade: u8, delay_ms: u32| {
+        Ok::<image::Frame, image::ImageError>(image::Frame::from_parts(
+            image::RgbaImage::from_pixel(4, 3, image::Rgba([shade, 0, 0, 255])),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(delay_ms, 1),
+        ))
+    };
+    let frames = collect_frames(
+        [frame(10, 100), frame(20, 200), frame(30, 300)].into_iter(),
+        "GIF",
+    )
+    .unwrap();
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames.dimensions(), (4, 3));
+    let shades: Vec<u8> = frames
+        .iter()
+        .map(|f| f.buffer().get_pixel(0, 0)[0])
+        .collect();
+    assert_eq!(shades, [10, 20, 30]);
+    let delays: Vec<u64> = frames.into_iter().map(|f| frame_delay_ms(&f)).collect();
+    assert_eq!(delays, [100, 200, 300]);
+    let err = match collect_frames(std::iter::empty(), "GIF") {
+        Ok(_) => panic!("an empty animation must be refused"),
+        Err(e) => e,
+    };
+    assert_eq!(err, EngineError::Decode("GIF has no frames".to_string()));
+}
+
+#[test]
+fn quality_in_force_resolves_each_form() {
+    // Issue #480: the still and the animated WebP encodes share
+    // this resolution. An explicit value stands and is not
+    // reported, auto is picked and reported, and Save-Data steps
+    // only a quality nobody set.
+    let never = || -> u8 { panic!("only quality(auto) picks") };
+    let in_force = |encode, chosen| QualityInForce { encode, chosen };
+    assert_eq!(
+        quality_in_force(Some(ResolvedQuality::Value(55)), true, never),
+        in_force(Some(55), None)
+    );
+    assert_eq!(
+        quality_in_force(Some(ResolvedQuality::Auto), true, || 63),
+        in_force(Some(63), Some(63))
+    );
+    assert_eq!(
+        quality_in_force(None, true, never),
+        in_force(Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY))
+    );
+    assert_eq!(quality_in_force(None, false, never), in_force(None, None));
 }

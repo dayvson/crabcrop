@@ -4,6 +4,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Changed
+
+- In the library, `crabcrop::url::Quality::resolved_for` returns `Option<ResolvedQuality>` instead of `Option<Quality>` (issue #480). `ResolvedQuality` is a new name for `QualityValue`, the two forms a resolved quality takes, so code that matched `Quality::Value` or `Quality::Auto` on the result matches `ResolvedQuality::Value` or `ResolvedQuality::Auto` instead and needs no arm for the per-format list, which the method never returned. Inside the engine, invariants it checked at run time are now carried by its types (the frame decoders return a list that cannot be empty, the still encoder takes a format with no video variant, and the request's operations are analyzed once), and the GIF and animated WebP decode branches, the animated and video frame loops, and the overlay and watermark compositing each share one implementation. Behavior and rendered bytes are unchanged.
+
 ## [0.10.1] - 2026-11-09
 
 ### Changed

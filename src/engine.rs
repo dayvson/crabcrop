@@ -11,7 +11,8 @@ use image::DynamicImage;
 use crate::filters::EncodeOptions;
 use crate::quality::auto_quality;
 use crate::url::{
-    Align, Dimension, Filter, FormatOptions, ImageFormat, ImageSize, Operation, PadFill, Quality,
+    Align, Dimension, Filter, FormatOptions, ImageFormat, ImageSize, Operation, PadFill,
+    ResolvedQuality,
 };
 
 /// Register the JPEG XL decoder with the image crate, once.
@@ -933,9 +934,11 @@ struct StillQuality {
     /// The quality reported back, set when the service
     /// picked it (`quality(auto)`, the Save-Data step).
     chosen_quality: Option<u8>,
-    /// Whether `quality(auto)` verifies its pick through
-    /// SSIMULACRA2 (JPEG and JPEG XL outputs).
-    perceptual: bool,
+    /// The first guess of the SSIMULACRA2 loop, set when
+    /// `quality(auto)` verifies its pick through it (JPEG and
+    /// JPEG XL outputs): the heuristic pick, which is also
+    /// `encode_quality`.
+    perceptual: Option<u8>,
 }
 
 /// The still encode's result: the bytes, the quality the
@@ -945,6 +948,43 @@ struct StillEncode {
     bytes: Vec<u8>,
     chosen_quality: Option<u8>,
     ssim: Option<f64>,
+}
+
+/// A resolved quality directive as an encode runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct QualityInForce {
+    /// The quality the encode uses; `None` keeps the encoder
+    /// default.
+    encode: Option<u8>,
+    /// The quality reported back, set when the service chose
+    /// it rather than the caller.
+    chosen: Option<u8>,
+}
+
+/// Resolve a quality directive for an encode. `quality(auto)`
+/// is chosen by `pick` and reported. With no directive in
+/// force, `save_data` steps the default down one notch and
+/// reports the step like an auto pick; an explicit
+/// `quality(...)` of either kind stands. The still and the
+/// animated WebP encodes both resolve through here.
+fn quality_in_force(
+    resolved: Option<ResolvedQuality>,
+    save_data: bool,
+    pick: impl FnOnce() -> u8,
+) -> QualityInForce {
+    let chosen = |q| QualityInForce {
+        encode: Some(q),
+        chosen: Some(q),
+    };
+    match resolved {
+        Some(ResolvedQuality::Value(q)) => QualityInForce {
+            encode: Some(q),
+            chosen: None,
+        },
+        Some(ResolvedQuality::Auto) => chosen(pick()),
+        None if save_data => chosen(SAVE_DATA_QUALITY),
+        None => QualityInForce::default(),
+    }
 }
 
 /// Decodes, resizes, and encodes images.
@@ -1012,7 +1052,7 @@ impl Engine {
         // it starts only before the deadline.
         step_down_hint(bytes, ops, &directives, ctx.dpr, |dpr| {
             let ctx = ProcessContext { dpr, ..ctx.clone() };
-            self.process_selected(bytes, ops, ctx, directives.clone(), video, pdf)
+            self.process_selected(bytes, ops, ctx, &directives, video, pdf)
         })
     }
 
@@ -1021,12 +1061,14 @@ impl Engine {
     /// sniffing, preflight, decode, the operation chain, the
     /// still encode, and metadata embedding. `video` and `pdf`
     /// are the selection's records, carried onto the result.
+    /// `directives` are the request's one analysis of `ops`,
+    /// which every stage below reads (issue #480).
     fn process_selected(
         &self,
         bytes: &[u8],
         ops: &[Operation],
         ctx: ProcessContext<'_>,
-        directives: crate::url::RequestDirectives,
+        directives: &crate::url::RequestDirectives,
         video: Option<VideoSourceMeta>,
         pdf: Option<PdfSourceMeta>,
     ) -> Result<ProcessedImage, EngineError> {
@@ -1053,9 +1095,9 @@ impl Engine {
             .unwrap_or(detected);
         let keep_profile = directives.keep_profile
             && matches!(resolved_output, ImageFormat::Jpeg | ImageFormat::Png);
-        Self::preflight(&directives, &ctx, detected)?;
+        Self::preflight(directives, &ctx, detected)?;
         let (img, source_meta) =
-            match self.decode_source(&source, ops, &ctx, &directives, keep_profile)? {
+            match Self::decode_source(&source, ops, &ctx, directives, keep_profile)? {
                 Decoded::Still(img, source_meta) => (img, source_meta),
                 Decoded::Rendered(processed) => return Ok(*processed),
             };
@@ -1070,13 +1112,20 @@ impl Engine {
             None
         };
         ctx.check_deadline()?;
-        let (img, encode_opts, studio, inpaint, segments, objects_crop) = apply_operations(
+        let ApplyOutcome {
+            img,
+            encode_opts,
+            studio,
+            inpaint,
+            segments,
+            objects_crop,
+        } = apply_operations(
             img,
             ops,
             cap,
             dpr_factor(directives.dpr, &ctx),
             &ctx,
-            &directives,
+            directives,
             None,
         )?;
         ctx.check_deadline()?;
@@ -1097,7 +1146,7 @@ impl Engine {
         // returned through `process_video` at decode. There is
         // no first-frame fallback: the request named a video
         // and this source cannot become one.
-        if format.is_video() {
+        let Some(still) = StillFormat::of(format) else {
             if directives.debug_focal {
                 return Err(EngineError::Unsupported(format!(
                     "debug:focal renders a diagnostic image and cannot be served as \
@@ -1110,11 +1159,11 @@ impl Engine {
                  (an animated GIF or WebP); this source is a still image",
                 crate::url::format_text(format)
             )));
-        }
-        let encoded = Self::encode_still(&img, format, &encode_opts, &ctx)?;
+        };
+        let encoded = Self::encode_still(&img, still, &encode_opts, &ctx)?;
         let bytes = Self::embed_source_meta(
             encoded.bytes,
-            format,
+            still,
             encode_opts.keep_profile,
             &source_meta,
             &ctx,
@@ -1417,7 +1466,6 @@ impl Engine {
     /// rendered whole by the animated or video path instead,
     /// and comes back as [`Decoded::Rendered`].
     fn decode_source(
-        &self,
         source: &SniffedSource<'_>,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
@@ -1437,87 +1485,27 @@ impl Engine {
         // chain, whose metadata comes from the decoder rather
         // than the container bytes.
         let mut source_meta = crate::color::extract_source_meta(bytes, ctx.preserve_metadata);
-        // An animated WebP source (one carrying an ANIM chunk)
-        // gets the GIF treatment below; the probe also yields
-        // the loop count the animated path carries over.
-        let webp_anim = if detected == ImageFormat::WebP {
-            webp_animation_params(bytes)
-        } else {
-            None
+        // GIF sources, and WebP sources carrying an ANIM chunk
+        // (whose probe also yields the loop count the animated
+        // path carries over), decode frame by frame.
+        let animated = match detected {
+            ImageFormat::Gif => Some((AnimatedFormat::Gif, None)),
+            ImageFormat::WebP => webp_animation_params(bytes)
+                .map(|(loop_count, _)| (AnimatedFormat::WebP, Some(loop_count))),
+            _ => None,
         };
-        let img = if detected == ImageFormat::Gif {
-            // GIF sources decode frame by frame: an animated source
-            // whose output stays GIF keeps its frames (each runs the
-            // operations, delays preserved); anything else continues
-            // with the first frame, which is also what converting an
-            // animated GIF to a still format means.
-            let frames = decode_gif_frames(bytes)?;
-            if frames.len() > 1 && directives.debug_focal {
-                return Err(EngineError::Unsupported(
-                    "debug:focal renders a diagnostic image and cannot annotate an animated source"
-                        .to_string(),
-                ));
-            }
-            if frames.len() > 1 {
-                let resolved = animated_output_format(
-                    ImageFormat::Gif,
-                    directives.explicit_format,
-                    ctx.preferred,
-                );
-                if matches!(resolved, ImageFormat::Gif | ImageFormat::WebP) {
-                    let processed = self.process_animated(frames, ops, ctx, resolved, None)?;
-                    return Ok(Decoded::Rendered(Box::new(processed)));
-                }
-                if resolved.is_video() {
-                    let processed = self.process_video(frames, ops, ctx, resolved)?;
-                    return Ok(Decoded::Rendered(Box::new(processed)));
-                }
-            }
-            DynamicImage::ImageRgba8(
-                frames
-                    .into_iter()
-                    .next()
-                    .expect("decode_gif_frames returns at least one frame")
-                    .into_buffer(),
-            )
-        } else if let Some((loop_count, _)) = webp_anim {
-            // Animated WebP sources decode frame by frame, like
-            // GIFs: an animated output (WebP or GIF) keeps its
-            // frames (each runs the operations, delays preserved);
-            // anything else continues with the first frame, which
-            // is also what converting an animated WebP to a still
-            // format means.
-            let frames = decode_webp_frames(bytes)?;
-            if frames.len() > 1 && directives.debug_focal {
-                return Err(EngineError::Unsupported(
-                    "debug:focal renders a diagnostic image and cannot annotate an animated source"
-                        .to_string(),
-                ));
-            }
-            if frames.len() > 1 {
-                let resolved = animated_output_format(
-                    ImageFormat::WebP,
-                    directives.explicit_format,
-                    ctx.preferred,
-                );
-                if matches!(resolved, ImageFormat::WebP | ImageFormat::Gif) {
-                    let processed =
-                        self.process_animated(frames, ops, ctx, resolved, Some(loop_count))?;
-                    return Ok(Decoded::Rendered(Box::new(processed)));
-                }
-                if resolved.is_video() {
-                    let processed = self.process_video(frames, ops, ctx, resolved)?;
-                    return Ok(Decoded::Rendered(Box::new(processed)));
-                }
-            }
-            DynamicImage::ImageRgba8(
-                frames
-                    .into_iter()
-                    .next()
-                    .expect("decode_webp_frames returns at least one frame")
-                    .into_buffer(),
-            )
-        } else if let Some(screened) = &source.svg {
+        if let Some((format, loop_count)) = animated {
+            return Self::decode_animated(
+                bytes,
+                format,
+                loop_count,
+                ops,
+                ctx,
+                directives,
+                source_meta,
+            );
+        }
+        let img = if let Some(screened) = &source.svg {
             // Rasterize at the size the request is heading for
             // (or the intrinsic size when it asks for none), so
             // vectors stay crisp; the normal pipeline runs on
@@ -1583,11 +1571,55 @@ impl Engine {
         Ok(Decoded::Still(img, source_meta))
     }
 
+    /// Decode an animated GIF or WebP source frame by frame. An
+    /// animated source whose output stays animated (GIF or
+    /// WebP) keeps its frames, each running the operations with
+    /// its delay preserved, and one whose output is a video
+    /// encodes them: either render is the request's result.
+    /// Anything else continues with the first frame, which is
+    /// also what converting an animation to a still format
+    /// means, as does a source with one frame.
+    fn decode_animated(
+        bytes: &[u8],
+        source: AnimatedFormat,
+        loop_count: Option<u16>,
+        ops: &[Operation],
+        ctx: &ProcessContext<'_>,
+        directives: &crate::url::RequestDirectives,
+        source_meta: crate::color::SourceMeta,
+    ) -> Result<Decoded, EngineError> {
+        let frames = match source {
+            AnimatedFormat::Gif => decode_gif_frames(bytes)?,
+            AnimatedFormat::WebP => decode_webp_frames(bytes)?,
+        };
+        if frames.len() > 1 {
+            if directives.debug_focal {
+                return Err(EngineError::Unsupported(
+                    "debug:focal renders a diagnostic image and cannot annotate an animated source"
+                        .to_string(),
+                ));
+            }
+            let resolved =
+                animated_output_format(source.into(), directives.explicit_format, ctx.preferred);
+            if let Some(format) = AnimatedFormat::of(resolved) {
+                let processed =
+                    Self::process_animated(frames, ops, ctx, directives, format, loop_count)?;
+                return Ok(Decoded::Rendered(Box::new(processed)));
+            }
+            if resolved.is_video() {
+                let processed = Self::process_video(frames, ops, ctx, directives, resolved)?;
+                return Ok(Decoded::Rendered(Box::new(processed)));
+            }
+        }
+        let first = DynamicImage::ImageRgba8(frames.first.into_buffer());
+        Ok(Decoded::Still(first, source_meta))
+    }
+
     /// Resolve the quality directive against the final image
     /// and the settled output format, for the still encode.
     fn resolve_still_quality(
         img: &DynamicImage,
-        format: ImageFormat,
+        format: StillFormat,
         encode_opts: &EncodeOptions,
         ctx: &ProcessContext<'_>,
     ) -> StillQuality {
@@ -1601,38 +1633,23 @@ impl Engine {
         let resolved_quality = encode_opts
             .quality
             .as_ref()
-            .and_then(|q| q.resolved_for(format));
-        let (encode_quality, chosen_quality) = match resolved_quality {
-            Some(Quality::Value(q)) => (Some(q), None),
-            Some(Quality::Auto) => {
-                let q = auto_quality(img);
-                (Some(q), Some(q))
-            }
-            // resolved_for never returns the list itself.
-            Some(Quality::PerFormat(_)) => {
-                unreachable!("resolved_for resolves per-format quality to a single value")
-            }
-            // Save-Data steps the default quality down one
-            // notch (80 to 70) on the formats that carry a
-            // quality, and reports the step like an auto pick.
-            // An explicit quality(...) of either kind stands.
-            None if ctx.save_data
-                && matches!(
-                    format,
-                    ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
-                ) =>
-            {
-                (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY))
-            }
-            None => (None, None),
-        };
+            .and_then(|q| q.resolved_for(format.into()));
+        // Save-Data steps the default quality down one notch
+        // (80 to 70) on the formats that carry a quality.
+        let save_data = ctx.save_data && format.carries_quality();
+        let QualityInForce {
+            encode: encode_quality,
+            chosen: chosen_quality,
+        } = quality_in_force(resolved_quality, save_data, || auto_quality(img));
         // `quality(auto)` on a format with a decoder to verify
         // against (JPEG, JXL) closes the loop: encode, decode,
         // score with SSIMULACRA2, and bisect on quality until the
         // score lands in the target band. The heuristic pick is
         // the first guess. Other formats keep the one-shot pick.
-        let perceptual = matches!(resolved_quality, Some(Quality::Auto))
-            && matches!(format, ImageFormat::Jpeg | ImageFormat::Jxl);
+        let perceptual = encode_quality.filter(|_| {
+            matches!(resolved_quality, Some(ResolvedQuality::Auto))
+                && matches!(format, StillFormat::Jpeg | StillFormat::Jxl)
+        });
         StillQuality {
             encode_quality,
             chosen_quality,
@@ -1646,7 +1663,7 @@ impl Engine {
     /// ladder, all drawing on one per-request encode budget.
     fn encode_still(
         img: &DynamicImage,
-        format: ImageFormat,
+        format: StillFormat,
         encode_opts: &EncodeOptions,
         ctx: &ProcessContext<'_>,
     ) -> Result<StillEncode, EngineError> {
@@ -1657,9 +1674,21 @@ impl Engine {
         } = Self::resolve_still_quality(img, format, encode_opts, ctx);
         let mut ssim: Option<f64> = None;
         let enc_src = EncodeBuffers::new(img);
+        // Every encode of this image differs only in its quality.
+        let encode_at = |quality: Option<u8>| {
+            encode(
+                &enc_src,
+                format,
+                quality,
+                encode_opts.fill,
+                encode_opts.palette,
+                encode_opts.format_options,
+                ctx.avif_speed,
+                ctx.jxl_speed,
+            )
+        };
         let mut encode_budget = MAX_REQUEST_ENCODES;
-        let mut bytes = if perceptual {
-            let first_guess = encode_quality.expect("auto quality resolves a value");
+        let mut bytes = if let Some(first_guess) = perceptual {
             let scored = crate::quality::encode_to_target(
                 first_guess,
                 ctx.ssim_target,
@@ -1670,16 +1699,7 @@ impl Engine {
                     // ignores the deadline would keep
                     // encoding long past it.
                     ctx.check_deadline()?;
-                    let candidate = encode(
-                        &enc_src,
-                        format,
-                        Some(q),
-                        encode_opts.fill,
-                        encode_opts.palette,
-                        encode_opts.format_options,
-                        ctx.avif_speed,
-                        ctx.jxl_speed,
-                    )?;
+                    let candidate = encode_at(Some(q))?;
                     let score = decode_image(&candidate)
                         .ok()
                         .and_then(|decoded| crate::quality::ssimulacra2(img, &decoded));
@@ -1691,16 +1711,7 @@ impl Engine {
             scored.bytes
         } else {
             let t_timing = std::time::Instant::now();
-            let bytes = encode(
-                &enc_src,
-                format,
-                encode_quality,
-                encode_opts.fill,
-                encode_opts.palette,
-                encode_opts.format_options,
-                ctx.avif_speed,
-                ctx.jxl_speed,
-            )?;
+            let bytes = encode_at(encode_quality)?;
             crate::studio::timing_mark("encode", t_timing);
             encode_budget -= 1;
             bytes
@@ -1718,12 +1729,8 @@ impl Engine {
         // instead of wherever the encode pool runs out, and a
         // tight budget is never left silently unchased (issue
         // #229).
-        let quality_bearing = matches!(
-            format,
-            ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
-        );
         let mut ladder_ran = false;
-        if let Some(budget) = encode_opts.max_bytes.filter(|_| quality_bearing) {
+        if let Some(budget) = encode_opts.max_bytes.filter(|_| format.carries_quality()) {
             let mut current = chosen_quality.or(encode_quality).unwrap_or(80);
             let mut attempts = 0;
             while bytes.len() as u64 > budget
@@ -1738,16 +1745,7 @@ impl Engine {
                 let steps_remaining =
                     (max_quality_attempts(format) - attempts).min(encode_budget as u32);
                 current = next_quality(current, steps_remaining);
-                bytes = encode(
-                    &enc_src,
-                    format,
-                    Some(current),
-                    encode_opts.fill,
-                    encode_opts.palette,
-                    encode_opts.format_options,
-                    ctx.avif_speed,
-                    ctx.jxl_speed,
-                )?;
+                bytes = encode_at(Some(current))?;
                 encode_budget -= 1;
                 chosen_quality = Some(current);
                 attempts += 1;
@@ -1776,7 +1774,7 @@ impl Engine {
     /// JPEG and PNG outputs carry either in this pass.
     fn embed_source_meta(
         bytes: Vec<u8>,
-        format: ImageFormat,
+        format: StillFormat,
         keep_profile: bool,
         source_meta: &crate::color::SourceMeta,
         ctx: &ProcessContext<'_>,
@@ -1788,10 +1786,10 @@ impl Engine {
                 None
             };
             match format {
-                ImageFormat::Jpeg => {
+                StillFormat::Jpeg => {
                     crate::color::inject_jpeg(&bytes, embed_icc, source_meta, ctx.preserve_metadata)
                 }
-                ImageFormat::Png => {
+                StillFormat::Png => {
                     crate::color::inject_png(&bytes, embed_icc, source_meta, ctx.preserve_metadata)
                 }
                 _ => bytes,
@@ -1809,56 +1807,24 @@ impl Engine {
     /// #323); GIF output keeps the GIF encoder's default, as it
     /// always has, and has no quality lever.
     fn process_animated(
-        &self,
-        frames: Vec<image::Frame>,
+        frames: Frames,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
-        format: ImageFormat,
+        directives: &crate::url::RequestDirectives,
+        format: AnimatedFormat,
         loop_count: Option<u16>,
     ) -> Result<ProcessedImage, EngineError> {
-        let directives = crate::url::RequestDirectives::analyze(ops);
-        refuse_animated_ai(&directives)?;
-        let (source_width, source_height) = {
-            let b = frames[0].buffer();
-            (b.width(), b.height())
-        };
-        let first = frames[0].buffer();
-        let cap = if directives.no_upscale {
-            Some((first.width(), first.height()))
-        } else {
-            None
-        };
-        let dpr = dpr_factor(directives.dpr, ctx);
-        let mut budget = OutputBudget::new();
-        let mut out_frames = Vec::with_capacity(frames.len());
-        // The encoding directives are a property of the ops,
-        // not of a frame, so every frame reports the same ones;
-        // the first frame's copy is the request's.
-        let mut encode_opts = EncodeOptions::default();
+        let (source_width, source_height) = frames.dimensions();
         // One smart crop window per crop for the whole
         // animation (issue #376): the first frame decides,
         // the rest replay. One trim window per trim (issue
         // #465): the union over every frame, settled before
         // any frame renders, so the frames share one canvas.
-        let mut share = FrameShare {
+        let share = FrameShare {
             smart_windows: Some(SmartWindows::default()),
             ..FrameShare::default()
         };
-        survey_trims(&frames, ops, cap, dpr, ctx, &directives, &mut share)?;
-        let frame_count = frames.len();
-        for frame in frames {
-            ctx.check_deadline()?;
-            let delay = frame.delay();
-            let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, opts, _, _, _, _) =
-                apply_operations(img, ops, cap, dpr, ctx, &directives, Some(&mut share))?;
-            if out_frames.is_empty() {
-                encode_opts = opts;
-                budget.check_frames(img.width(), img.height(), frame_count)?;
-            }
-            budget.charge(img.width(), img.height())?;
-            out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
-        }
+        let (frames, encode_opts) = render_frames(frames, ops, ctx, directives, share)?;
         // Resolve the quality directive for a WebP output the
         // same way the still path does: an explicit value is
         // used as given, `quality(auto)` is picked from the
@@ -1866,102 +1832,42 @@ impl Engine {
         // describes) and reported back, and Save-Data steps an
         // unspecified quality down one notch. GIF output has no
         // quality lever, so nothing resolves for it.
-        let (encode_quality, chosen_quality) = if format == ImageFormat::WebP {
-            match encode_opts
-                .quality
-                .as_ref()
-                .and_then(|q| q.resolved_for(format))
-            {
-                Some(Quality::Value(q)) => (Some(q), None),
-                Some(Quality::Auto) => {
-                    let first = out_frames
-                        .first()
-                        .expect("process_animated is called with at least one frame");
-                    let q = auto_quality(&DynamicImage::ImageRgba8(first.buffer().clone()));
-                    (Some(q), Some(q))
-                }
-                // resolved_for never returns the list itself.
-                Some(Quality::PerFormat(_)) => {
-                    unreachable!("resolved_for resolves per-format quality to a single value")
-                }
-                None if ctx.save_data => (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY)),
-                None => (None, None),
+        let quality = match format {
+            AnimatedFormat::WebP => {
+                let resolved = encode_opts
+                    .quality
+                    .as_ref()
+                    .and_then(|q| q.resolved_for(ImageFormat::WebP));
+                quality_in_force(resolved, ctx.save_data, || {
+                    auto_quality(&DynamicImage::ImageRgba8(frames.first.buffer().clone()))
+                })
             }
-        } else {
-            (None, None)
+            AnimatedFormat::Gif => QualityInForce::default(),
         };
-        let (width, height) = out_frames
-            .first()
-            .map(|f| (f.buffer().width(), f.buffer().height()))
-            .unwrap_or((source_width, source_height));
+        let (width, height) = frames.dimensions();
         // An animated output's placeholder comes from its first
         // processed frame.
         let placeholder = if ctx.placeholders {
-            out_frames
-                .first()
-                .map(|f| crate::placeholder::compute(&DynamicImage::ImageRgba8(f.buffer().clone())))
+            Some(crate::placeholder::compute(&DynamicImage::ImageRgba8(
+                frames.first.buffer().clone(),
+            )))
         } else {
             None
         };
         let out = match format {
-            ImageFormat::Gif => {
-                let mut out = Vec::new();
-                let first = out_frames
-                    .first()
-                    .expect("process_animated is called with at least one frame");
-                let (canvas_w, canvas_h) = (first.buffer().width(), first.buffer().height());
-                let mut enc = gif::Encoder::new(
-                    &mut out,
-                    u16::try_from(canvas_w).map_err(|_| {
-                        EngineError::Encode("gif: width exceeds the 65535 format limit".to_string())
-                    })?,
-                    u16::try_from(canvas_h).map_err(|_| {
-                        EngineError::Encode(
-                            "gif: height exceeds the 65535 format limit".to_string(),
-                        )
-                    })?,
-                    &[],
-                )
-                .map_err(|e| EngineError::Encode(e.to_string()))?;
-                for f in &out_frames {
-                    // The deadline is checked per frame inside
-                    // the encode loop itself (issue #322): a
-                    // many-frame GIF encode is chunked work, so
-                    // it aborts at the deadline instead of
-                    // running every frame's quantization first
-                    // and being noticed only afterwards.
-                    ctx.check_deadline()?;
-                    // GIF delays are hundredths of a second; the
-                    // image crate saturated this conversion at
-                    // u16::MAX, and so does this.
-                    let (numer, denom) = f.delay().numer_denom_ms();
-                    let delay = u16::try_from(numer / denom / 10).unwrap_or(u16::MAX);
-                    let buffer = f.buffer();
-                    let frame = gif_frame_quantized(
-                        buffer.as_raw(),
-                        buffer.width(),
-                        buffer.height(),
-                        delay,
-                    )?;
-                    enc.write_frame(&frame)
-                        .map_err(|e| EngineError::Encode(e.to_string()))?;
-                }
-                drop(enc);
-                out
-            }
-            ImageFormat::WebP => encode_animated_webp(
-                out_frames,
+            AnimatedFormat::Gif => encode_animated_gif(&frames, ctx.deadline)?,
+            AnimatedFormat::WebP => encode_animated_webp(
+                &frames,
                 loop_count.unwrap_or(0),
-                encode_quality,
+                quality.encode,
                 encode_opts.format_options,
                 ctx.deadline,
             )?,
-            _ => unreachable!("process_animated is only called for GIF and WebP"),
         };
         Ok(ProcessedImage {
             bytes: out,
-            format,
-            quality: chosen_quality,
+            format: format.into(),
+            quality: quality.chosen,
             width,
             height,
             source_width,
@@ -1990,10 +1896,10 @@ impl Engine {
     /// even for 4:2:0, or crops down at the per-axis limit
     /// (see [`crate::video::even_dimension`]).
     fn process_video(
-        &self,
-        frames: Vec<image::Frame>,
+        frames: Frames,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
+        directives: &crate::url::RequestDirectives,
         format: ImageFormat,
     ) -> Result<ProcessedImage, EngineError> {
         let encoder = ctx.video_encoder.ok_or_else(|| {
@@ -2002,60 +1908,33 @@ impl Engine {
                     .to_string(),
             )
         })?;
-        let directives = crate::url::RequestDirectives::analyze(ops);
-        refuse_animated_ai(&directives)?;
-        let (source_width, source_height) = {
-            let b = frames[0].buffer();
-            (b.width(), b.height())
-        };
-        let first = frames[0].buffer();
-        let cap = if directives.no_upscale {
-            Some((first.width(), first.height()))
-        } else {
-            None
-        };
-        let dpr = dpr_factor(directives.dpr, ctx);
-        let mut budget = OutputBudget::new();
-        let mut out_frames = Vec::with_capacity(frames.len());
+        let (source_width, source_height) = frames.dimensions();
         // The frames share their trim windows (issue #465),
         // as on the animated image paths: the encoder takes
         // one frame size.
-        let mut share = FrameShare::default();
-        survey_trims(&frames, ops, cap, dpr, ctx, &directives, &mut share)?;
-        let frame_count = frames.len();
-        for frame in frames {
-            ctx.check_deadline()?;
-            let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
-            let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _, _, _, _) =
-                apply_operations(img, ops, cap, dpr, ctx, &directives, Some(&mut share))?;
-            if out_frames.is_empty() {
-                budget.check_frames(img.width(), img.height(), frame_count)?;
-            }
-            budget.charge(img.width(), img.height())?;
-            out_frames.push(crate::video::VideoFrame {
-                pixels: img.to_rgba8(),
-                delay_ms,
-            });
-        }
+        let (frames, _) = render_frames(frames, ops, ctx, directives, FrameShare::default())?;
         // The placeholder (a meta-only surface; meta itself
         // refuses video URLs in the server) describes the
         // first processed frame, as the animated paths do.
         let placeholder = if ctx.placeholders {
-            out_frames
-                .first()
-                .map(|f| crate::placeholder::compute(&DynamicImage::ImageRgba8(f.pixels.clone())))
+            Some(crate::placeholder::compute(&DynamicImage::ImageRgba8(
+                frames.first.buffer().clone(),
+            )))
         } else {
             None
         };
+        let (width, height) = frames.dimensions();
+        let out_frames: Vec<crate::video::VideoFrame> = frames
+            .into_iter()
+            .map(|frame| crate::video::VideoFrame {
+                delay_ms: std::time::Duration::from(frame.delay()).as_millis() as u64,
+                pixels: frame.into_buffer(),
+            })
+            .collect();
         let bytes = encoder.encode(&out_frames, format).map_err(|e| match e {
             crate::video::VideoError::Unsupported(what) => EngineError::Unsupported(what),
             crate::video::VideoError::Failed(what) => EngineError::Video(what),
         })?;
-        let (width, height) = out_frames
-            .first()
-            .map(|f| (f.pixels.width(), f.pixels.height()))
-            .unwrap_or((source_width, source_height));
         Ok(ProcessedImage {
             bytes,
             format,
@@ -2077,6 +1956,98 @@ impl Engine {
     }
 }
 
+/// Run the operations over every frame of an animated render,
+/// for the animated image and the video paths alike: the
+/// inference-class operations refused first (see
+/// [`refuse_animated_ai`]), the frames' shared geometry in
+/// `share` settled before any frame renders (see
+/// [`survey_trims`]), and the run's pixels charged against one
+/// output budget, which the first frame's size settles up front
+/// (see [`OutputBudget::check_frames`]). The rendered frames
+/// keep their delays. The encoding directives are a property of
+/// the ops, not of a frame, so every frame reports the same
+/// ones; the first frame's copy is the request's and comes back
+/// with the frames.
+fn render_frames(
+    frames: Frames,
+    ops: &[Operation],
+    ctx: &ProcessContext<'_>,
+    directives: &crate::url::RequestDirectives,
+    mut share: FrameShare,
+) -> Result<(Frames, EncodeOptions), EngineError> {
+    refuse_animated_ai(directives)?;
+    let cap = if directives.no_upscale {
+        Some(frames.dimensions())
+    } else {
+        None
+    };
+    let dpr = dpr_factor(directives.dpr, ctx);
+    survey_trims(&frames, ops, cap, dpr, ctx, directives, &mut share)?;
+    let frame_count = frames.len();
+    let mut budget = OutputBudget::new();
+    let mut render = |frame: image::Frame| {
+        ctx.check_deadline()?;
+        let delay = frame.delay();
+        let img = DynamicImage::ImageRgba8(frame.into_buffer());
+        let outcome = apply_operations(img, ops, cap, dpr, ctx, directives, Some(&mut share))?;
+        Ok::<_, EngineError>((outcome.img, outcome.encode_opts, delay))
+    };
+    let (img, encode_opts, delay) = render(frames.first)?;
+    budget.check_frames(img.width(), img.height(), frame_count)?;
+    budget.charge(img.width(), img.height())?;
+    let first = image::Frame::from_parts(img.to_rgba8(), 0, 0, delay);
+    let mut rest = Vec::with_capacity(frames.rest.len());
+    for frame in frames.rest {
+        let (img, _, delay) = render(frame)?;
+        budget.charge(img.width(), img.height())?;
+        rest.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
+    }
+    Ok((Frames { first, rest }, encode_opts))
+}
+
+/// Encode rendered frames as an animated GIF: one screen the
+/// first frame's size, and each frame quantized onto a palette
+/// of its own (see [`gif_frame_quantized`]) with its delay in
+/// hundredths of a second. GIF output has no quality lever and
+/// keeps the GIF encoder's defaults otherwise, as it always has.
+fn encode_animated_gif(
+    frames: &Frames,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>, EngineError> {
+    let mut out = Vec::new();
+    let (canvas_w, canvas_h) = frames.dimensions();
+    let mut enc = gif::Encoder::new(
+        &mut out,
+        u16::try_from(canvas_w).map_err(|_| {
+            EngineError::Encode("gif: width exceeds the 65535 format limit".to_string())
+        })?,
+        u16::try_from(canvas_h).map_err(|_| {
+            EngineError::Encode("gif: height exceeds the 65535 format limit".to_string())
+        })?,
+        &[],
+    )
+    .map_err(|e| EngineError::Encode(e.to_string()))?;
+    for f in frames.iter() {
+        // The deadline is checked per frame inside the encode
+        // loop itself (issue #322): a many-frame GIF encode is
+        // chunked work, so it aborts at the deadline instead of
+        // running every frame's quantization first and being
+        // noticed only afterwards.
+        state::check_deadline(deadline)?;
+        // GIF delays are hundredths of a second; the image
+        // crate saturated this conversion at u16::MAX, and so
+        // does this.
+        let (numer, denom) = f.delay().numer_denom_ms();
+        let delay = u16::try_from(numer / denom / 10).unwrap_or(u16::MAX);
+        let buffer = f.buffer();
+        let frame = gif_frame_quantized(buffer.as_raw(), buffer.width(), buffer.height(), delay)?;
+        enc.write_frame(&frame)
+            .map_err(|e| EngineError::Encode(e.to_string()))?;
+    }
+    drop(enc);
+    Ok(out)
+}
+
 /// Collect an animation decoder's frames under the shared
 /// limits: a frame cap, a total-decoded-pixels budget, and
 /// the decode allocation budget charged on the retained
@@ -2090,13 +2061,13 @@ impl Engine {
 fn collect_frames(
     frames: impl Iterator<Item = Result<image::Frame, image::ImageError>>,
     format: &str,
-) -> Result<Vec<image::Frame>, EngineError> {
-    let mut collected = Vec::new();
+) -> Result<Frames, EngineError> {
+    let mut collected: Option<Frames> = None;
     let mut total_pixels: u64 = 0;
     let mut total_bytes: u64 = 0;
     for frame in frames {
         let frame = frame.map_err(|e| EngineError::Decode(e.to_string()))?;
-        if collected.len() >= MAX_ANIMATED_FRAMES {
+        if collected.as_ref().map_or(0, Frames::len) >= MAX_ANIMATED_FRAMES {
             return Err(EngineError::Decode(format!(
                 "{format} has more than {MAX_ANIMATED_FRAMES} frames"
             )));
@@ -2114,19 +2085,58 @@ fn collect_frames(
                 "{format} frames exceed the {MAX_DECODE_ALLOC} byte decode allocation limit"
             )));
         }
-        collected.push(frame);
+        match &mut collected {
+            None => {
+                collected = Some(Frames {
+                    first: frame,
+                    rest: Vec::new(),
+                })
+            }
+            Some(frames) => frames.rest.push(frame),
+        }
     }
-    if collected.is_empty() {
-        return Err(EngineError::Decode(format!("{format} has no frames")));
+    collected.ok_or_else(|| EngineError::Decode(format!("{format} has no frames")))
+}
+
+/// The frames of an animated source (issue #480): never empty,
+/// so the first frame is always there to read, the one a still
+/// conversion keeps and whose size an animated render starts
+/// from.
+struct Frames {
+    first: image::Frame,
+    rest: Vec<image::Frame>,
+}
+
+impl Frames {
+    fn len(&self) -> usize {
+        1 + self.rest.len()
     }
-    Ok(collected)
+
+    fn iter(&self) -> impl Iterator<Item = &image::Frame> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    /// The first frame's width and height.
+    fn dimensions(&self) -> (u32, u32) {
+        self.first.buffer().dimensions()
+    }
+}
+
+impl IntoIterator for Frames {
+    type Item = image::Frame;
+    type IntoIter =
+        std::iter::Chain<std::iter::Once<image::Frame>, std::vec::IntoIter<image::Frame>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self.first).chain(self.rest)
+    }
 }
 
 /// Decode all frames of a GIF source, under the shared limits:
 /// the decoder gets explicit dimension/allocation limits (its
 /// defaults are none) and collection enforces the shared
 /// frame and pixel budgets (see [`collect_frames`]).
-fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
+fn decode_gif_frames(bytes: &[u8]) -> Result<Frames, EngineError> {
     use image::{AnimationDecoder, ImageDecoder};
     let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
@@ -2208,6 +2218,44 @@ pub(crate) fn animated_output_format(
     }
 }
 
+/// The formats an animation keeps its frames in (issue #480):
+/// an animated source's own format, and the format its frames
+/// render to on the animated path. The video formats take the
+/// frames too, on the video path, and every other format takes
+/// the first frame as a still.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimatedFormat {
+    Gif,
+    WebP,
+}
+
+impl AnimatedFormat {
+    /// The animated format `format` names, or `None` for one
+    /// that cannot keep frames. Every format is listed, so a
+    /// new one has to say which it is.
+    fn of(format: ImageFormat) -> Option<Self> {
+        match format {
+            ImageFormat::Gif => Some(AnimatedFormat::Gif),
+            ImageFormat::WebP => Some(AnimatedFormat::WebP),
+            ImageFormat::Jpeg
+            | ImageFormat::Png
+            | ImageFormat::Jxl
+            | ImageFormat::Avif
+            | ImageFormat::Mp4
+            | ImageFormat::WebM => None,
+        }
+    }
+}
+
+impl From<AnimatedFormat> for ImageFormat {
+    fn from(format: AnimatedFormat) -> Self {
+        match format {
+            AnimatedFormat::Gif => ImageFormat::Gif,
+            AnimatedFormat::WebP => ImageFormat::WebP,
+        }
+    }
+}
+
 /// Decode all frames of an animated WebP source, under the
 /// same limits as GIF. The in-tree decoder (image-webp)
 /// composites every frame onto the full canvas, honoring
@@ -2217,7 +2265,7 @@ pub(crate) fn animated_output_format(
 /// first (the decoder otherwise leaves the disposed rectangle
 /// in place), so the color is read from the container and set
 /// before iterating.
-fn decode_webp_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
+fn decode_webp_frames(bytes: &[u8]) -> Result<Frames, EngineError> {
     use image::{AnimationDecoder, ImageDecoder};
     let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
@@ -2276,16 +2324,13 @@ fn decode_webp_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
 /// longer than about 24 days) falls back to a zero-based
 /// timeline and that average.
 fn encode_animated_webp(
-    frames: Vec<image::Frame>,
+    frames: &Frames,
     loop_count: u16,
     quality: Option<u8>,
     format_options: FormatOptions,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, EngineError> {
-    let first = frames
-        .first()
-        .ok_or_else(|| EngineError::Encode("webp: animation has no frames".to_string()))?;
-    let (width, height) = (first.buffer().width(), first.buffer().height());
+    let (width, height) = frames.dimensions();
     // VP8 frames carry 14-bit dimensions, as on the still path.
     if width > 16383 || height > 16383 {
         return Err(EngineError::Encode(
@@ -2327,11 +2372,7 @@ fn encode_animated_webp(
         // stage: it cannot be interrupted mid-call, and
         // the server side bounds what it can hold (see
         // `run_process` in server/process.rs).
-        if let Some(deadline) = deadline
-            && std::time::Instant::now() >= deadline
-        {
-            return Err(EngineError::Timeout);
-        }
+        state::check_deadline(deadline)?;
         let buffer = frame.buffer();
         if buffer.width() != width || buffer.height() != height {
             return Err(EngineError::Encode(
@@ -2503,6 +2544,7 @@ fn hint_start(
     });
     Some(crate::explain::settle_hint(
         ops,
+        directives,
         &SourceProbe {
             dimensions,
             ..probe
@@ -2853,11 +2895,10 @@ fn segment_detection(
     det: &crate::ai::Detection,
 ) -> Result<image::GrayImage, EngineError> {
     let dims = (img.width(), img.height());
-    let stale = !matches!(memo, Some((w, h, _)) if (*w, *h) == dims);
-    if stale {
-        *memo = Some((dims.0, dims.1, provider.encode(img)));
+    if memo.as_ref().is_some_and(|(w, h, _)| (*w, *h) != dims) {
+        *memo = None;
     }
-    let (_, _, cached) = memo.as_ref().expect("memo just populated");
+    let (_, _, cached) = memo.get_or_insert_with(|| (dims.0, dims.1, provider.encode(img)));
     let embedding = cached
         .as_ref()
         .map_err(|e| EngineError::Inference(e.clone()))?;
@@ -2938,16 +2979,20 @@ fn check_region(
 
 /// What [`apply_operations`] hands back: the rendered
 /// image, its encode options, and the records the
-/// operations produced (studio, inpaint, segments) for
-/// the meta response.
-type ApplyOutcome = (
-    DynamicImage,
-    EncodeOptions,
-    Option<crate::studio::StudioRecord>,
-    Option<InpaintRecord>,
-    Option<SegmentRecord>,
-    Option<ObjectsCropRecord>,
-);
+/// operations produced for the meta response.
+#[derive(Debug)]
+struct ApplyOutcome {
+    img: DynamicImage,
+    encode_opts: EncodeOptions,
+    /// The studio record (issue #197).
+    studio: Option<crate::studio::StudioRecord>,
+    /// The region-removal record (issue #176).
+    inpaint: Option<InpaintRecord>,
+    /// The segmentation record (issue #175).
+    segments: Option<SegmentRecord>,
+    /// The objects-crop record (issue #318).
+    objects_crop: Option<ObjectsCropRecord>,
+}
 
 /// A crop+resize fusion the chain qualifies for (issue
 /// #287): the rectangle a `crop-rect` cuts, resampled to the
@@ -3099,6 +3144,40 @@ impl SmartWindows {
             .map(|e| e.window)
     }
 
+    /// A smart crop in an animated render sharing windows
+    /// across frames (issue #376): the first frame decides
+    /// through the traced crop (the trace reports the very
+    /// window the crop used) and later frames replay that
+    /// window verbatim, so the analysis runs once and the
+    /// framing cannot jitter. `op_index` is the crop's
+    /// position in the chain.
+    fn crop(
+        &mut self,
+        img: DynamicImage,
+        (tw, th): (u32, u32),
+        op_index: usize,
+        align: &Align,
+        ctx: &ProcessContext<'_>,
+    ) -> DynamicImage {
+        let key = (op_index, img.width(), img.height());
+        if let Some((x, y, cw, ch)) = self.get(key) {
+            DynamicImage::ImageRgba8(image::imageops::crop_imm(&img, x, y, cw, ch).to_image())
+        } else {
+            let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                img,
+                tw,
+                th,
+                align.clone(),
+                ctx.face_provider,
+                ctx.focal_provider,
+            );
+            if let Some(trace) = trace {
+                self.set(key, trace.window);
+            }
+            cropped
+        }
+    }
+
     fn set(&mut self, key: (usize, u32, u32), window: (u32, u32, u32, u32)) {
         if let Some(entry) = self
             .entries
@@ -3202,7 +3281,7 @@ fn union_box(a: Option<Window>, b: Option<Window>) -> Option<Window> {
 /// the render's own deadline. A lone frame has nothing to
 /// share and trims for itself.
 fn survey_trims(
-    frames: &[image::Frame],
+    frames: &Frames,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
     dpr: f32,
@@ -3226,7 +3305,7 @@ fn survey_trims(
             let key = (op_index, filter_index);
             // The first frame's dimensions and the union so far.
             let mut surveyed: Option<((u32, u32), Option<Window>)> = None;
-            for frame in frames {
+            for frame in frames.iter() {
                 ctx.check_deadline()?;
                 let img = DynamicImage::ImageRgba8(frame.buffer().clone());
                 let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
@@ -3270,7 +3349,7 @@ fn apply_operations(
     }
     let outcome = chain.finish(img)?;
     if directives.dpr.is_none() && dpr > 1.0 && scales_with_dpr(ops) {
-        check_hinted_output(outcome.0.width(), outcome.0.height())?;
+        check_hinted_output(outcome.img.width(), outcome.img.height())?;
     }
     Ok(outcome)
 }
@@ -3597,11 +3676,10 @@ impl<'r, 'a> ChainState<'r, 'a> {
             // runs on.
             Operation::Page(_) => {}
             Operation::Size(size) => {
-                img = if self.fusion.is_some_and(|plan| plan.size_index == op_index) {
-                    let window = self
-                        .fused_window
-                        .take()
-                        .expect("the fusion plan pairs this resize with its crop");
+                // A pending fused window (issue #287) is the
+                // plan's crop, waiting for this resize: the plan
+                // admits one resize per chain, after the crop.
+                img = if let Some(window) = self.fused_window.take() {
                     apply_size_cropped(
                         img,
                         window,
@@ -3865,12 +3943,12 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
             cropped
         } else if *align == Align::Smart
-            && self
+            && let Some(windows) = self
                 .share
-                .as_ref()
-                .is_some_and(|s| s.smart_windows.is_some())
+                .as_deref_mut()
+                .and_then(|s| s.smart_windows.as_mut())
         {
-            self.shared_smart_crop(img, (tw, th), op_index, align)
+            windows.crop(img, (tw, th), op_index, align, self.ctx)
         } else {
             crate::crop::crop_to_aspect_with(
                 img,
@@ -3965,12 +4043,17 @@ impl<'r, 'a> ChainState<'r, 'a> {
         (tw, th): (u32, u32),
         canvas: Option<DynamicImage>,
     ) -> Result<DynamicImage, EngineError> {
-        let cropped = match detect_faces(&mut self.face_memo, &img, self.ctx) {
-            Ok(faces) if !faces.is_empty() => {
-                let face = *faces
-                    .iter()
-                    .max_by_key(|f| f.w as u64 * f.h as u64)
-                    .expect("faces is non-empty");
+        let faces = match detect_faces(&mut self.face_memo, &img, self.ctx) {
+            Ok(faces) => faces,
+            Err(EngineError::Inference(_)) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let largest = faces
+            .iter()
+            .max_by_key(|f| f.w as u64 * f.h as u64)
+            .copied();
+        let cropped = match largest {
+            Some(face) => {
                 if let Some(canvas) = canvas {
                     let (cropped, window) = crate::crop::crop_around_face_traced(
                         img,
@@ -3992,7 +4075,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     crate::crop::crop_around_face(img, tw, th, &face, self.directives.face_padding)
                 }
             }
-            Ok(_) | Err(EngineError::Inference(_)) => {
+            None => {
                 if let Some(canvas) = canvas {
                     let (cropped, trace) = crate::crop::crop_to_aspect_traced(
                         img,
@@ -4017,7 +4100,6 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     )
                 }
             }
-            Err(e) => return Err(e),
         };
         Ok(cropped)
     }
@@ -4108,43 +4190,6 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
         };
         Ok(cropped)
-    }
-
-    /// A smart crop in an animated render sharing windows
-    /// across frames (issue #376): the first frame decides
-    /// through the traced crop (the trace reports the very
-    /// window the crop used) and later frames replay that
-    /// window verbatim, so the analysis runs once and the
-    /// framing cannot jitter.
-    fn shared_smart_crop(
-        &mut self,
-        img: DynamicImage,
-        (tw, th): (u32, u32),
-        op_index: usize,
-        align: &Align,
-    ) -> DynamicImage {
-        let windows = self
-            .share
-            .as_deref_mut()
-            .and_then(|s| s.smart_windows.as_mut())
-            .expect("the crop checked the option");
-        let key = (op_index, img.width(), img.height());
-        if let Some((x, y, cw, ch)) = windows.get(key) {
-            DynamicImage::ImageRgba8(image::imageops::crop_imm(&img, x, y, cw, ch).to_image())
-        } else {
-            let (cropped, trace) = crate::crop::crop_to_aspect_traced(
-                img,
-                tw,
-                th,
-                align.clone(),
-                self.ctx.face_provider,
-                self.ctx.focal_provider,
-            );
-            if let Some(trace) = trace {
-                windows.set(key, trace.window);
-            }
-            cropped
-        }
     }
 
     /// Apply one filter of a `filters:` segment: watermark
@@ -4440,14 +4485,14 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 objects: self.segment_objects,
             })
         };
-        Ok((
+        Ok(ApplyOutcome {
             img,
-            self.encode_opts,
-            self.studio_record,
-            inpaint_record,
-            segment_record,
-            self.objects_crop_record,
-        ))
+            encode_opts: self.encode_opts,
+            studio: self.studio_record,
+            inpaint: inpaint_record,
+            segments: segment_record,
+            objects_crop: self.objects_crop_record,
+        })
     }
 }
 
@@ -4670,7 +4715,7 @@ mod encode;
 #[cfg(test)]
 pub(in crate::engine) use encode::encode_png_indexed;
 pub(in crate::engine) use encode::{
-    EncodeBuffers, encode, gif_frame_quantized, max_quality_attempts, next_quality,
+    EncodeBuffers, StillFormat, encode, gif_frame_quantized, max_quality_attempts, next_quality,
 };
 
 /// One channel of a blend mode: the CSS formulas on the
@@ -4737,43 +4782,17 @@ fn blend_overlay(
         }
         None => ov,
     };
-    let mut out = base.to_rgba8();
-    let ov = ov.to_rgba8();
-    let left = if x >= 0 {
-        x as i64
-    } else {
-        out.width() as i64 - ov.width() as i64 + x as i64
-    };
-    let top = if y >= 0 {
-        y as i64
-    } else {
-        out.height() as i64 - ov.height() as i64 + y as i64
-    };
-    let opacity = alpha as f32 / 100.0;
-    let (bw, bh) = (out.width() as i64, out.height() as i64);
-    for oy in 0..ov.height() as i64 {
-        // The blend walks every overlay pixel; a large
-        // legal pair still runs long, so the deadline is
-        // honored per row (issue #358).
-        ctx.check_deadline()?;
-        for ox in 0..ov.width() as i64 {
-            let (bx, by) = (left + ox, top + oy);
-            if bx < 0 || by < 0 || bx >= bw || by >= bh {
-                continue;
-            }
-            let top_px = ov.get_pixel(ox as u32, oy as u32);
-            let a = opacity * (top_px[3] as f32 / 255.0);
-            if a <= 0.0 {
-                continue;
-            }
-            let bot = out.get_pixel_mut(bx as u32, by as u32);
-            for c in 0..3 {
-                let blended = blend_channel(mode, bot[c] as f32, top_px[c] as f32);
-                bot[c] = (bot[c] as f32 * (1.0 - a) + blended * a).round() as u8;
-            }
-        }
-    }
-    Ok(DynamicImage::ImageRgba8(out))
+    // The blend walks every overlay pixel; a large legal pair
+    // still runs long, so the deadline is honored per row
+    // (issue #358).
+    composite(
+        base,
+        &ov.to_rgba8(),
+        (x, y),
+        alpha,
+        || ctx.check_deadline(),
+        |b, o| blend_channel(mode, b, o),
+    )
 }
 
 /// Overlay `wm` onto `base` at (x, y) with `alpha` percent
@@ -4789,38 +4808,62 @@ fn overlay_watermark(
     y: i32,
     alpha: u8,
 ) -> DynamicImage {
+    let no_check = || Ok::<(), std::convert::Infallible>(());
+    let Ok(out) = composite(base, &wm.to_rgba8(), (x, y), alpha, no_check, |_, o| o);
+    out
+}
+
+/// The anchor, clip, and alpha loop the overlay and the
+/// watermark share (issue #480). `top` sits on `base` at
+/// `(x, y)`, a negative coordinate anchoring from the right or
+/// bottom edge, and whatever falls outside `base` is clipped.
+/// Each covered pixel's effective alpha is the top pixel's own
+/// alpha times `alpha` percent, and each color channel moves
+/// that far toward `blend(base, top)`, the per-pixel blend of
+/// the base channel and the top one; the base alpha channel is
+/// kept. `each_row` runs before each row of `top`, where the
+/// overlay checks its deadline.
+fn composite<E>(
+    base: &DynamicImage,
+    top: &image::RgbaImage,
+    (x, y): (i32, i32),
+    alpha: u8,
+    mut each_row: impl FnMut() -> Result<(), E>,
+    blend: impl Fn(f32, f32) -> f32,
+) -> Result<DynamicImage, E> {
     let mut out = base.to_rgba8();
-    let wm = wm.to_rgba8();
     let left = if x >= 0 {
         x as i64
     } else {
-        out.width() as i64 - wm.width() as i64 + x as i64
+        out.width() as i64 - top.width() as i64 + x as i64
     };
-    let top = if y >= 0 {
+    let upper = if y >= 0 {
         y as i64
     } else {
-        out.height() as i64 - wm.height() as i64 + y as i64
+        out.height() as i64 - top.height() as i64 + y as i64
     };
     let opacity = alpha as f32 / 100.0;
     let (bw, bh) = (out.width() as i64, out.height() as i64);
-    for wy in 0..wm.height() as i64 {
-        for wx in 0..wm.width() as i64 {
-            let (bx, by) = (left + wx, top + wy);
+    for ty in 0..top.height() as i64 {
+        each_row()?;
+        for tx in 0..top.width() as i64 {
+            let (bx, by) = (left + tx, upper + ty);
             if bx < 0 || by < 0 || bx >= bw || by >= bh {
                 continue;
             }
-            let top_px = wm.get_pixel(wx as u32, wy as u32);
+            let top_px = top.get_pixel(tx as u32, ty as u32);
             let a = opacity * (top_px[3] as f32 / 255.0);
             if a <= 0.0 {
                 continue;
             }
             let bot = out.get_pixel_mut(bx as u32, by as u32);
             for c in 0..3 {
-                bot[c] = (bot[c] as f32 * (1.0 - a) + top_px[c] as f32 * a).round() as u8;
+                let blended = blend(bot[c] as f32, top_px[c] as f32);
+                bot[c] = (bot[c] as f32 * (1.0 - a) + blended * a).round() as u8;
             }
         }
     }
-    DynamicImage::ImageRgba8(out)
+    Ok(DynamicImage::ImageRgba8(out))
 }
 
 /// Composite an image over a solid background color, dropping the

@@ -415,14 +415,12 @@ pub enum QualityValue {
     Auto,
 }
 
-impl QualityValue {
-    fn to_quality(self) -> Quality {
-        match self {
-            QualityValue::Value(v) => Quality::Value(v),
-            QualityValue::Auto => Quality::Auto,
-        }
-    }
-}
+/// The quality in force for one output format (issue #480):
+/// what [`Quality::resolved_for`] settles a `quality(...)`
+/// filter to once format negotiation is done. It has the two
+/// forms a value takes and no per-format list, so an encoder
+/// reading it has no list left to handle.
+pub type ResolvedQuality = QualityValue;
 
 impl Quality {
     /// The quality in force once the output format is known:
@@ -431,16 +429,16 @@ impl Quality {
     /// fallback, else `None` (no quality directive in force
     /// for this format, so encoder defaults and the Save-Data
     /// step-down apply as if quality were absent).
-    pub fn resolved_for(&self, format: ImageFormat) -> Option<Quality> {
+    pub fn resolved_for(&self, format: ImageFormat) -> Option<ResolvedQuality> {
         match self {
-            Quality::Value(v) => Some(Quality::Value(*v)),
-            Quality::Auto => Some(Quality::Auto),
+            Quality::Value(v) => Some(ResolvedQuality::Value(*v)),
+            Quality::Auto => Some(ResolvedQuality::Auto),
             Quality::PerFormat(entries) => {
                 let mut fallback = None;
                 for (key, value) in entries {
                     match key {
-                        Some(f) if *f == format => return Some(value.to_quality()),
-                        None => fallback = Some(value.to_quality()),
+                        Some(f) if *f == format => return Some(*value),
+                        None => fallback = Some(*value),
                         _ => {}
                     }
                 }
@@ -5108,21 +5106,30 @@ mod tests {
             (Some(ImageFormat::Jpeg), QualityValue::Value(90)),
             (Some(ImageFormat::WebP), QualityValue::Auto),
         ]);
-        assert_eq!(q.resolved_for(ImageFormat::Jpeg), Some(Quality::Value(90)));
-        assert_eq!(q.resolved_for(ImageFormat::WebP), Some(Quality::Auto));
+        assert_eq!(
+            q.resolved_for(ImageFormat::Jpeg),
+            Some(ResolvedQuality::Value(90))
+        );
+        assert_eq!(
+            q.resolved_for(ImageFormat::WebP),
+            Some(ResolvedQuality::Auto)
+        );
         // Unlisted formats fall back.
-        assert_eq!(q.resolved_for(ImageFormat::Avif), Some(Quality::Value(70)));
+        assert_eq!(
+            q.resolved_for(ImageFormat::Avif),
+            Some(ResolvedQuality::Value(70))
+        );
         // No entry and no fallback: no directive in force.
         let q = Quality::PerFormat(vec![(Some(ImageFormat::Jpeg), QualityValue::Value(90))]);
         assert_eq!(q.resolved_for(ImageFormat::WebP), None);
         // Plain forms resolve to themselves for every format.
         assert_eq!(
             Quality::Value(55).resolved_for(ImageFormat::Png),
-            Some(Quality::Value(55))
+            Some(ResolvedQuality::Value(55))
         );
         assert_eq!(
             Quality::Auto.resolved_for(ImageFormat::Gif),
-            Some(Quality::Auto)
+            Some(ResolvedQuality::Auto)
         );
     }
 

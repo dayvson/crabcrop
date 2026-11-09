@@ -239,10 +239,10 @@ fn forecast(
     dpr_hint: Option<f32>,
 ) -> (Forecast, DprForecast) {
     let directives = RequestDirectives::analyze(ops);
+    let url_directives = RequestDirectives::analyze(url_ops);
+    let url_names_format = url_directives.explicit_format.is_some();
     let (mut factor, from) = match (directives.dpr, dpr_hint) {
-        (Some(factor), _) if RequestDirectives::analyze(url_ops).dpr.is_some() => {
-            (factor, "operation")
-        }
+        (Some(factor), _) if url_directives.dpr.is_some() => (factor, "operation"),
         (Some(factor), _) => (factor, "default"),
         (None, Some(factor)) => (factor, "hint"),
         (None, None) => (1.0, "none"),
@@ -251,11 +251,11 @@ fn forecast(
     // hinted factor steps, and only when the chain has a
     // pixel size for it to scale.
     let forecast = if from == "hint" && crate::engine::scales_with_dpr(ops) {
-        let (forecast, settled) = step_hint(ops, url_ops, probe, factor);
+        let (forecast, settled) = step_hint(ops, &directives, url_names_format, probe, factor);
         factor = settled;
         forecast
     } else {
-        forecast_at(ops, url_ops, probe, factor)
+        forecast_at(ops, &directives, url_names_format, probe, factor)
     };
     (forecast, DprForecast { factor, from })
 }
@@ -267,8 +267,16 @@ fn forecast(
 /// this walk sees past the limits costs no decode; it steps
 /// further on a refusal the walk cannot see (a size that
 /// hangs on the pixels, an overlay, an animation's frames).
-pub(crate) fn settle_hint(ops: &[Operation], probe: &SourceProbe, hint: f32) -> f32 {
-    step_hint(ops, ops, probe, hint).1
+/// `directives` are the engine's analysis of `ops` (issue
+/// #480), which the walk reads instead of analyzing `ops` again.
+pub(crate) fn settle_hint(
+    ops: &[Operation],
+    directives: &RequestDirectives,
+    probe: &SourceProbe,
+    hint: f32,
+) -> f32 {
+    let url_names_format = directives.explicit_format.is_some();
+    step_hint(ops, directives, url_names_format, probe, hint).1
 }
 
 /// The walk of [`settle_hint`], with the forecast at the
@@ -276,17 +284,18 @@ pub(crate) fn settle_hint(ops: &[Operation], probe: &SourceProbe, hint: f32) -> 
 /// request without the hint gets, refused or not.
 fn step_hint(
     ops: &[Operation],
-    url_ops: &[Operation],
+    directives: &RequestDirectives,
+    url_names_format: bool,
     probe: &SourceProbe,
     hint: f32,
 ) -> (Forecast, f32) {
     let mut factor = hint;
-    let mut forecast = forecast_at(ops, url_ops, probe, factor);
+    let mut forecast = forecast_at(ops, directives, url_names_format, probe, factor);
     while refused_at(&forecast, factor)
         && let Some(lower) = crate::engine::dpr_step_below(factor)
     {
         factor = lower;
-        forecast = forecast_at(ops, url_ops, probe, factor);
+        forecast = forecast_at(ops, directives, url_names_format, probe, factor);
     }
     (forecast, factor)
 }
@@ -315,11 +324,11 @@ fn refused_at(forecast: &Forecast, factor: f32) -> bool {
 /// count is over the budget (issue #468).
 fn forecast_at(
     ops: &[Operation],
-    url_ops: &[Operation],
+    directives: &RequestDirectives,
+    url_names_format: bool,
     probe: &SourceProbe,
     dpr: f32,
 ) -> Forecast {
-    let directives = RequestDirectives::analyze(ops);
     // An SVG source is rasterized before the chain runs, at
     // the size the engine picks for it (held to 4096 px per
     // axis), and every step resolves against that raster.
@@ -447,9 +456,6 @@ fn forecast_at(
         over_dimension = true;
     }
     let pixels = cur.map(|(w, h)| w.saturating_mul(h));
-    let url_names_format = RequestDirectives::analyze(url_ops)
-        .explicit_format
-        .is_some();
     let (format, format_from_operation) = match directives.explicit_format {
         Some(format) => (format_text(format).to_string(), url_names_format),
         None => (default_format(probe.kind).to_string(), false),
