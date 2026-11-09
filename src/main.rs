@@ -513,13 +513,14 @@ const RENDERING_VERSION: u32 = 4;
 /// replacing a model or a font in place at the same path
 /// must start a fresh epoch, and the same contents under
 /// a new path must not. The fingerprint is embedded in
-/// every cache key (see `serve`), so a restart under
-/// changed settings starts a fresh cache epoch instead
-/// of serving the old settings' renders from the
-/// persistent tiers. Settings that are already visible
-/// in the key (presets, default ops: both change the
-/// canonical form) are deliberately excluded, and so is
-/// the fallback image, whose responses are never cached.
+/// every cache key (see `cache_key_for` in `server.rs`),
+/// so a restart under changed settings starts a fresh
+/// cache epoch instead of serving the old settings'
+/// renders from the persistent tiers. Settings that are
+/// already visible in the key (presets, default ops: both
+/// change the canonical form) are deliberately excluded,
+/// and so is the fallback image, whose responses are
+/// never cached.
 ///
 /// Resolved through `get` (a name to value lookup, so
 /// tests can drive it without the process environment).

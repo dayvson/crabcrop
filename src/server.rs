@@ -1865,8 +1865,9 @@ async fn finish_upload(state: &AppState, outcome: UploadOutcome, accept: Option<
 /// The stages of an upload (issue #479), cheapest first:
 /// [`authorize_upload`], [`read_upload`], the overwrite
 /// policy (so a refused duplicate never pays a decode),
-/// [`validate_upload`], and [`store_upload`]. A refusal
-/// ends the chain as its [`UploadOutcome`].
+/// [`validate_upload`], and [`store_upload`]. `Ok` is
+/// always [`UploadOutcome::Stored`]; a refusal ends the
+/// chain as its [`UploadOutcome`] in `Err`.
 async fn receive_upload(
     state: &AppState,
     path: &str,
@@ -1886,7 +1887,7 @@ async fn receive_upload(
         return Err(upload_exists(name));
     }
     let prepared = validate_upload(state, bytes, name).await?;
-    Ok(store_upload(upload, name, prepared, existed).await)
+    store_upload(upload, name, prepared, existed).await
 }
 
 /// The upload's first stage: a configured destination, a
@@ -2140,13 +2141,15 @@ async fn validate_upload(
     Ok(prepared)
 }
 
-/// Write the prepared upload to the destination.
+/// Write the prepared upload to the destination: the
+/// stored outcome, or a refusal (a name claimed by a
+/// racing upload, a failed write).
 async fn store_upload(
     upload: &crate::upload::UploadStore,
     name: &str,
     prepared: crate::engine::PreparedUpload,
     existed: bool,
-) -> UploadOutcome {
+) -> Result<UploadOutcome, UploadOutcome> {
     // What lands is the prepared form, and with
     // overwriting off the write is a conditional create:
     // the exists check above is the cheap refusal, this
@@ -2159,15 +2162,15 @@ async fn store_upload(
         upload.put_new(name, &prepared.stored).await
     };
     match stored {
-        Ok(()) => UploadOutcome::Stored {
+        Ok(()) => Ok(UploadOutcome::Stored {
             name: name.to_string(),
             source: upload.source_ref(name),
             replaced: existed,
-        },
-        Err(crate::upload::UploadError::AlreadyExists) => upload_exists(name),
+        }),
+        Err(crate::upload::UploadError::AlreadyExists) => Err(upload_exists(name)),
         Err(crate::upload::UploadError::Backend(cause)) => {
             eprintln!("upload failed: {cause}");
-            UploadOutcome::rejected(
+            Err(UploadOutcome::rejected(
                 name,
                 "rejected:store-failed",
                 (
@@ -2175,11 +2178,11 @@ async fn store_upload(
                     "upload_store_unavailable",
                     "the upload store is unavailable".to_string(),
                 ),
-            )
+            ))
         }
         Err(crate::upload::UploadError::Io(cause)) => {
             eprintln!("upload failed: {cause}");
-            UploadOutcome::rejected(
+            Err(UploadOutcome::rejected(
                 name,
                 "rejected:store-failed",
                 (
@@ -2187,7 +2190,7 @@ async fn store_upload(
                     "upload_store_failed",
                     "the upload could not be stored".to_string(),
                 ),
-            )
+            ))
         }
     }
 }
@@ -2343,15 +2346,18 @@ enum Refusal {
 
 impl Refusal {
     /// The answer to this refusal, for a request in the
-    /// sealed spelling or not.
+    /// sealed spelling or not. A sealed payload refusal
+    /// answers the uniform refusal without building its
+    /// own answer first.
     fn answer(self, sealed: bool, accept: Option<&str>) -> Response {
         let own =
             |(status, code, message): ErrorParts| error_response(status, code, message, accept);
         match self {
             Refusal::Unopened => sealed_refusal_response(),
-            Refusal::Payload(parts) => sealed_or(sealed, own(parts)),
-            Refusal::MetaDisabled(parts) => meta_cache_headers(sealed_or(sealed, own(parts))),
-            Refusal::AsIs(parts) => own(parts),
+            Refusal::Payload(_) if sealed => sealed_refusal_response(),
+            Refusal::MetaDisabled(_) if sealed => meta_cache_headers(sealed_refusal_response()),
+            Refusal::Payload(parts) | Refusal::AsIs(parts) => own(parts),
+            Refusal::MetaDisabled(parts) => meta_cache_headers(own(parts)),
         }
     }
 }
@@ -4552,9 +4558,12 @@ fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
 /// failures carry the codes assigned at their builders
 /// (issue #356). Codes are frozen once published, like
 /// the parser's: a failure class may be renamed in code,
-/// but its code never changes. Sealed requests never
-/// reach this builder for a payload failure: they answer
-/// the uniform refusal instead (see `sealed_or`).
+/// but its code never changes. What this builds is never
+/// sent to a sealed request for a payload failure, which
+/// answers the uniform refusal instead: the image path's
+/// [`Refusal::answer`] skips this builder, and the miss
+/// path's [`sealed_or`] drops the answer its failure
+/// built.
 fn error_response(
     status: StatusCode,
     code: &str,
