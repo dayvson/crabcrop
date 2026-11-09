@@ -344,6 +344,23 @@ class TreeChecks(unittest.TestCase):
         )
         self.assertOnly("env", "documents CRABCROP_ONLY_IN_A_UNIX_TEST, which no server code reads")
 
+    def test_env_variable_read_only_by_a_path_test_module_is_not_read(self):
+        # main.rs is a crate root, so it loads its tests from src/main/tests.rs
+        # through #[path]; a plain `mod tests;` there would be src/tests.rs.
+        text = (self.root / "src/main.rs").read_text(encoding="utf-8")
+        head, rest = text.split("#[cfg(test)]\nmod tests {\n", 1)
+        body, tail = rest.split("\n}\n", 1)
+        declaration = '#[cfg(test)]\n#[path = "main/tests.rs"]\nmod tests;\n'
+        self.write("src/main.rs", head + declaration + tail)
+        self.write("src/main/tests.rs", body + "\n")
+        self.assertEqual(self.problems(), [])
+        self.edit(
+            "docs/configuration.md",
+            "| `PORT`",
+            "| `CRABCROP_ONLY_IN_A_TEST` | unset | No. |\n| `PORT`",
+        )
+        self.assertOnly("env", "documents CRABCROP_ONLY_IN_A_TEST, which no server code reads")
+
     def test_env_code_after_a_test_module_is_server_code(self):
         # The braces inside the module's strings, comment and char literal
         # must not end it early or late: CRABCROP_LATE, read after it, counts.

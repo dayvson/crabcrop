@@ -139,9 +139,13 @@ STATUS_PAIR = re.compile(r'StatusCode::([A-Z_]+)\s*,\s*"([a-z][a-z0-9_]*)"')
 TICKED = re.compile(r"`([^`]+)`")
 # `#[cfg(test)]`, or `#[cfg(all(test, ...))]` as src/toolrun.rs gates its tests.
 CFG_TEST_MOD = re.compile(
-    r"#\[cfg\((?:test|all\(\s*test\s*,[^\]]*\))\)\]\s*(?:#\[[^\]]*\]\s*)*"
+    r"#\[cfg\((?:test|all\(\s*test\s*,[^\]]*\))\)\]\s*((?:#\[[^\]]*\]\s*)*)"
     r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])"
 )
+# #[path] names a test module's file relative to the declaring file's
+# directory. main.rs, a crate root, loads src/main/tests.rs this way, where a
+# bare `mod tests;` would load src/tests.rs.
+PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\s*\]')
 
 # A default the check can judge is a literal or a constant's path; anything
 # else (a computed budget, a variable) is left alone.
@@ -237,14 +241,16 @@ def matching_brace(text, start):
 
 def split_tests(text):
     """(code, tests, external): the text outside #[cfg(test)] modules, the
-    inline modules' text, and the names of `#[cfg(test)] mod name;` files."""
+    inline modules' text, and (name, path attribute or None) for each
+    `#[cfg(test)] mod name;` file."""
     code, tests, external = [], [], []
     pos = 0
     for m in CFG_TEST_MOD.finditer(text):
         if m.start() < pos:
             continue
-        if m.group(2) == ";":
-            external.append(m.group(1))
+        if m.group(3) == ";":
+            path = PATH_ATTR.search(m.group(1))
+            external.append((m.group(2), path.group(1) if path else None))
             continue
         end = matching_brace(text, m.end() - 1)
         code.append(text[pos : m.start()])
@@ -269,7 +275,10 @@ def rust_sources(root):
             raise CheckError(f"{rel}: {e}") from None
         split[path] = (code, tests)
         home = path.parent if path.stem in ("main", "lib", "mod") else path.with_suffix("")
-        for name in external:
+        for name, attr in external:
+            if attr:
+                test_files.add(path.parent / attr)
+                continue
             test_files.add(home / f"{name}.rs")
             test_files.update((home / name).rglob("*.rs"))
     if not split:
