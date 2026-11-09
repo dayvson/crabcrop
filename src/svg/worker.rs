@@ -900,8 +900,10 @@ fn build_dynamic_image(
     use image::{DynamicImage, ImageBuffer};
     fn u16s(bytes: Vec<u8>) -> Vec<u16> {
         bytes
-            .chunks_exact(2)
-            .map(|p| u16::from_ne_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_ne_bytes(*p))
             .collect()
     }
     Some(match tag {
