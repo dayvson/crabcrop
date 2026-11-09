@@ -223,6 +223,13 @@ const AI_GATE_PERMITS: usize = 2;
 /// run one at a time, on top of the slow lane (issue #324).
 const ANIM_GATE_PERMITS: usize = 1;
 
+/// Permits on the probe gate: heavy `/explain` probes (an
+/// SVG's parse in a worker process, an AVIF's decode) run
+/// on blocking threads, at most two at once, so a burst of
+/// explain requests cannot occupy the async runtime or
+/// start a worker per request.
+const PROBE_GATE_PERMITS: usize = 2;
+
 /// The result stores a configuration names, opened (see
 /// [`open_stores`]) for [`build_state`].
 struct Stores {
@@ -397,6 +404,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         provenance_signer,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(ANIM_GATE_PERMITS)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(PROBE_GATE_PERMITS)),
         inflight: Arc::new(crate::server::Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
         background: crate::server::Background::default(),
@@ -2452,6 +2460,7 @@ mod tests {
         // The gate sizes are the documented constants.
         assert_eq!(state.ai_gate.available_permits(), AI_GATE_PERMITS);
         assert_eq!(state.anim_gate.available_permits(), ANIM_GATE_PERMITS);
+        assert_eq!(state.probe_gate.available_permits(), PROBE_GATE_PERMITS);
         assert_eq!(
             state.video_gate.available_permits(),
             crate::video::GATE_PERMITS

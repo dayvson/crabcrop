@@ -40,7 +40,7 @@
 //! itself (a marker never draws inside its own content) and
 //! which therefore cost nothing here either.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use roxmltree::Node;
 
@@ -200,7 +200,7 @@ enum Role {
 /// The kinds of element usvg resolves by walking a chain of
 /// `href` links of the same kind (`HrefIter`, and the
 /// `find_*`/`resolve_*_attr` helpers in usvg's parser).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum HrefKind {
     Gradient,
     Pattern,
@@ -227,72 +227,103 @@ fn href_kind(node: Node) -> Option<HrefKind> {
 /// of, such as `#a`→`#b`→`#c`→`#b`, is followed with no end,
 /// and the blocking thread never returns.
 ///
-/// This mirrors that walk exactly: from each gradient, pattern,
-/// or filter, it follows the same-kind `href` with usvg's stop
-/// rule and a per-origin visited set, and refuses the moment a
-/// link re-enters the chain anywhere but at its origin. A chain
-/// that ends, or self-links, or returns to its origin (all of
-/// which usvg terminates) is not refused, so no legitimate
-/// `href` inheritance chain is. Nodes whose chain ends without
-/// such a re-entry are memoized, keeping the pass linear.
+/// This decides what that walk does from every gradient,
+/// pattern, and filter, with usvg's stop rule: the walk from an
+/// element ends when its chain ends or comes back to the
+/// element itself, and loops when the chain runs into a cycle
+/// the element is not on. So a chain that ends, or a pure ring
+/// of links, is not refused (no legitimate `href` inheritance
+/// chain is), and a chain that leads into a ring from outside
+/// it is.
+///
+/// Each element has at most one same-kind successor, so the
+/// pass is linear: every element is walked onto once, and its
+/// fate is recorded when the walk that reached it settles (the
+/// chain ends, or it is a member of a ring). A later walk that
+/// reaches a settled element stops there: at one whose chain
+/// ends, it ends too; at a ring member, it came from outside
+/// the ring, so usvg would loop from where it began. A shared
+/// id costs nothing extra: the successor lookup reads at most
+/// two candidates per id and kind.
 fn check_href_cycles<'a, 'input>(
     doc: &'a roxmltree::Document<'input>,
     facts: &Facts<'a, 'input>,
 ) -> Result<(), Refusal> {
-    // The same-kind element `node`'s `href` names, the way
-    // usvg's walk continues (it stops at a kind change).
+    // usvg's walk continues at the first element of the same
+    // kind that an `href` names, other than the element it
+    // stands on (it stops at a kind change). Of the elements
+    // sharing an id, only the first two of each kind in
+    // document order can be that element, so they are kept
+    // instead of scanning every element sharing the id.
+    let mut candidates: HashMap<(&str, HrefKind), [Option<Node<'a, 'input>>; 2]> = HashMap::new();
+    for (&id, nodes) in &facts.ids {
+        for &node in nodes {
+            let Some(kind) = href_kind(node) else {
+                continue;
+            };
+            let pair = candidates.entry((id, kind)).or_default();
+            if let Some(slot) = pair.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(node);
+            }
+        }
+    }
     let successor = |node: Node<'a, 'input>| -> Option<Node<'a, 'input>> {
         let kind = href_kind(node)?;
         node.attributes()
             .filter(|a| a.name().eq_ignore_ascii_case("href"))
             .filter_map(|a| iri_id(a.value()))
-            .filter_map(|id| facts.ids.get(id))
-            .flatten()
-            .copied()
-            .find(|target| *target != node && href_kind(*target) == Some(kind))
+            .filter_map(|id| candidates.get(&(id, kind)))
+            .flat_map(|pair| pair.iter().flatten().copied())
+            .find(|target| *target != node)
     };
-    // Nodes whose chain ends without re-entering it: they
-    // terminate from any origin and need not be walked again.
-    let mut safe: HashSet<usize> = HashSet::new();
-    for node in doc.descendants().filter(Node::is_element) {
-        if href_kind(node).is_none() {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fate {
+        Unseen,
+        /// On the chain being walked, at this position.
+        OnPath(usize),
+        /// Its chain ends: usvg stops from it, and from
+        /// anything leading to it.
+        Ends,
+        /// A member of a pure ring: usvg stops from it when
+        /// the walk comes back to it.
+        Ring,
+    }
+    let count = doc.descendants().len() + 1;
+    let mut fate = vec![Fate::Unseen; count];
+    // A backstop on the pass's total work: every element is
+    // walked onto at most once, so the steps across the whole
+    // pass never pass the node count.
+    let mut steps = count;
+    let mut path: Vec<usize> = Vec::new();
+    for node in doc.descendants().filter(|n| href_kind(*n).is_some()) {
+        if fate[node.id().get_usize()] != Fate::Unseen {
             continue;
         }
-        let origin = node.id().get_usize();
-        if safe.contains(&origin) {
-            continue;
-        }
-        let mut path: Vec<usize> = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
+        path.clear();
         let mut curr = node;
-        loop {
+        let settled = loop {
             let curr_id = curr.id().get_usize();
-            let Some(next) = successor(curr) else {
-                // No further same-kind link: the walk ends.
-                safe.insert(curr_id);
-                safe.extend(path.iter().copied());
-                break;
-            };
-            let next_id = next.id().get_usize();
-            if next_id == curr_id || next_id == origin {
-                // usvg stops on a self-link or a return to the
-                // element the walk began at (origin-dependent,
-                // so do not memoize the chain as safe).
-                break;
-            }
-            if safe.contains(&next_id) {
-                safe.insert(curr_id);
-                safe.extend(path.iter().copied());
-                break;
-            }
-            if seen.contains(&next_id) {
-                // A link back into the chain, not to its origin:
-                // usvg follows it with no end.
-                return Err(Refusal::Cycle);
-            }
-            seen.insert(curr_id);
+            steps = steps.checked_sub(1).ok_or(Refusal::Nodes)?;
+            fate[curr_id] = Fate::OnPath(path.len());
             path.push(curr_id);
-            curr = next;
+            let Some(next) = successor(curr) else {
+                break Fate::Ends;
+            };
+            match fate[next.id().get_usize()] {
+                Fate::Unseen => curr = next,
+                Fate::Ends => break Fate::Ends,
+                // Back at the element the walk began at: every
+                // element on the path is on the ring, and the
+                // walk from each comes back to it.
+                Fate::OnPath(0) => break Fate::Ring,
+                // Into a ring the walk's origin is not on, met
+                // on this walk or an earlier one: usvg follows
+                // it with no end.
+                Fate::OnPath(_) | Fate::Ring => return Err(Refusal::Cycle),
+            }
+        };
+        for &id in &path {
+            fate[id] = settled;
         }
     }
     Ok(())

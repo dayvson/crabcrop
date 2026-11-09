@@ -30,6 +30,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Uploads to `CRABCROP_UPLOAD_BUCKET` and shared-tier writes no longer fail when the store takes more than 10 seconds to receive them. Every request to either bucket had a fixed 10-second limit, so with `CRABCROP_SOURCE_MAX_MB` raised, or over a slow link to the store, a large upload answered `502 upload_store_unavailable` even while the store kept receiving it: an 18 MB upload to a store reading 1 MB a second failed at 11 s. A write now gets 10 seconds plus one second per MiB of its body, 17 minutes 14 seconds at the largest upload cap. A shared-tier lookup gets the same for the length the store declares, so large entries are read back too; it must still start answering within 10 seconds, and a body that goes 10 seconds without a byte fails sooner. A lookup whose body breaks off or runs out of time now counts in `crabcrop_cache_tier_errors_total`, like one the store never answers, instead of passing as a plain miss. Every other request keeps its 10-second limit. `CRABCROP_SOURCE_TIMEOUT_SECS` still bounds source fetches only, and no setting changes the bucket limits; docs/configuration.md describes them under Bucket request timeouts (issue #550).
 
+### Security
+
+- SVG handling stays off the server's request threads and within the request deadline. The `/explain` size probe of an SVG or AVIF source runs on a blocking thread, at most two at once, shedding with `503` (`server_busy`) when it cannot start within 5 seconds, and the probe load no longer sizes those kinds after every chunk. The pre-parse check on SVG `href` inheritance chains is linear in the document, as documented, and an image request checks its deadline before it screens an SVG source.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
