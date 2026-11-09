@@ -3695,7 +3695,7 @@ async fn serve_miss(
         // Once a token has opened, every failure answers
         // the uniform refusal (issues #255, #259); a plain
         // request gets the failure's own answer.
-        Err(refusal) => return (sealed_or(sealed, refusal), record, None),
+        Err(refusal) => return (sealed_or(sealed, *refusal), record, None),
     };
     let accept = accept.as_deref();
     let cache_status = "crabcrop; fwd=uri-miss";
@@ -3775,12 +3775,14 @@ async fn serve_miss(
 /// [`render_with_fallback`], which takes the gates through
 /// [`acquire_job_permits`]. A failure is the plain
 /// request's answer, which [`serve_miss`] maps for a sealed
-/// one.
+/// one. These stages box it: a bare `Response` is 128
+/// bytes, too large for an `Err` (clippy's
+/// `result_large_err`).
 async fn render_miss(
     state: &AppState,
     work: &MissWork,
     record: &mut RequestRecord,
-) -> Result<Rendered, Response> {
+) -> Result<Rendered, Box<Response>> {
     let accept = work.accept.as_deref();
     let directives = &work.directives;
     let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
@@ -3866,7 +3868,7 @@ async fn load_source(
     charge: &crate::loader::SourceCharge,
     accept: Option<&str>,
     record: &mut RequestRecord,
-) -> Result<(Vec<u8>, bool), Response> {
+) -> Result<(Vec<u8>, bool), Box<Response>> {
     let load_start = Instant::now();
     let loaded = match state
         .loader
@@ -3900,7 +3902,7 @@ async fn load_source(
                     if e != LoadError::Busy {
                         record.fail = FailStage::Load;
                     }
-                    return Err(load_error_response(e, accept));
+                    return Err(Box::new(load_error_response(e, accept)));
                 }
             }
         }
@@ -3930,7 +3932,7 @@ async fn load_watermarks(
     charge: &crate::loader::SourceCharge,
     accept: Option<&str>,
     record: &mut RequestRecord,
-) -> Result<Arc<WatermarkSources>, Response> {
+) -> Result<Arc<WatermarkSources>, Box<Response>> {
     let mut watermark_images: Vec<(String, Vec<u8>)> = Vec::new();
     for wm_url in urls {
         record.load_ran = true;
@@ -3944,7 +3946,7 @@ async fn load_watermarks(
                 if e != LoadError::Busy {
                     record.fail = FailStage::Load;
                 }
-                return Err(load_error_response(e, accept));
+                return Err(Box::new(load_error_response(e, accept)));
             }
         };
         watermark_images.push((wm_url.to_string(), wm_bytes));
@@ -4039,7 +4041,7 @@ async fn render_with_fallback(
     plan: RunPlan,
     accept: Option<&str>,
     record: &mut RequestRecord,
-) -> Result<Rendered, Response> {
+) -> Result<Rendered, Box<Response>> {
     // The request's one process deadline starts with the
     // process phase, so the gate waits and the run itself
     // share a single budget (run_process takes it as a
@@ -4047,11 +4049,11 @@ async fn render_with_fallback(
     let deadline = plan.start + state.process_timeout;
     let permits = acquire_job_permits(state, plan.needs)
         .await
-        .map_err(|busy| busy.response(accept))?;
+        .map_err(|busy| Box::new(busy.response(accept)))?;
     let processed = match run_process(state, job, source, plan.lane, deadline, permits).await {
         Ok(p) => p,
         Err(ProcessFailure::Busy) => {
-            return Err(match plan.lane {
+            return Err(Box::new(match plan.lane {
                 Lane::Slow => busy_response(
                     "server busy: long-running processing lane is full",
                     5,
@@ -4060,25 +4062,25 @@ async fn render_with_fallback(
                 Lane::Process => {
                     busy_response("server busy: too many images processing at once", 1, accept)
                 }
-            });
+            }));
         }
         Err(ProcessFailure::Panicked) => {
             record.fail = FailStage::Engine;
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "processing_failed",
                 "image processing failed".to_string(),
                 accept,
-            ));
+            )));
         }
         Err(ProcessFailure::TimedOut) => {
             record.fail = FailStage::Engine;
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "processing_timeout",
                 "processing timed out".to_string(),
                 accept,
-            ));
+            )));
         }
         Err(ProcessFailure::Engine(e)) => {
             record.process = plan.start.elapsed();
@@ -4099,7 +4101,7 @@ async fn render_with_fallback(
                 }
                 None => {
                     record.fail = FailStage::Engine;
-                    return Err(engine_error_response(e, accept));
+                    return Err(Box::new(engine_error_response(e, accept)));
                 }
             }
         }
