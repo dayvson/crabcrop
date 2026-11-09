@@ -83,6 +83,42 @@ pub struct ProcessedImage {
     pub provenance: Option<crate::provenance::ProvenanceFacts>,
 }
 
+impl ProcessedImage {
+    /// A render from the frame paths (animated image and
+    /// video): `size` is the output's width and height,
+    /// `source_size` the source's. The records only the still
+    /// pipeline produces (studio, inpaint, segments, objects
+    /// crop, SSIMULACRA2 score, video frame and PDF page) are
+    /// `None`, and so is provenance, which the server fills in.
+    pub(in crate::engine) fn from_frames(
+        bytes: Vec<u8>,
+        format: ImageFormat,
+        quality: Option<u8>,
+        (width, height): (u32, u32),
+        (source_width, source_height): (u32, u32),
+        placeholder: Option<crate::placeholder::Placeholder>,
+    ) -> Self {
+        ProcessedImage {
+            bytes,
+            format,
+            quality,
+            width,
+            height,
+            source_width,
+            source_height,
+            placeholder,
+            studio: None,
+            inpaint: None,
+            segments: None,
+            objects_crop: None,
+            ssimulacra2: None,
+            video: None,
+            pdf: None,
+            provenance: None,
+        }
+    }
+}
+
 /// Facts about a video source, probed at frame
 /// extraction (issue #214), reported in meta responses.
 #[derive(Debug, Clone, Copy, PartialEq)]
