@@ -2,11 +2,12 @@
 //! compositing around it.
 
 use image::imageops::FilterType;
-use image::{DynamicImage, GrayImage};
+use image::{DynamicImage, GrayImage, ImageBuffer, Pixel};
 use ort::session::Session;
 use std::sync::Mutex;
 
-use super::session::build_session;
+use super::depth::{Sample, SampleDepth, with_source_alpha};
+use super::session::{TensorOutput, build_session, first_output};
 use super::{AiError, InpaintProvider};
 
 /// The LaMa export's fixed input size: image and mask are
@@ -75,17 +76,32 @@ fn inpaint_window(img_w: u32, img_h: u32, bbox: (u32, u32, u32, u32)) -> (u32, u
 /// original, bit for bit. The model's output is a
 /// regeneration of the whole window, plausible everywhere
 /// but faithful nowhere, so only the hole may be taken
-/// from it. The source's alpha, when it has one, is kept:
-/// the model sees RGB only, and inpainting fills color,
-/// not transparency.
+/// from it. The result keeps the source's sample depth and,
+/// when the source has one, its alpha, sample for sample:
+/// the model sees RGB only, and inpainting fills color, not
+/// transparency (issue #551). The fill may come at any
+/// depth; it is converted to the source's.
 pub fn composite_inpaint(
     img: &DynamicImage,
     mask: &GrayImage,
     window: (u32, u32, u32, u32),
-    filled: &image::RgbImage,
+    filled: &DynamicImage,
+) -> DynamicImage {
+    match SampleDepth::of(img) {
+        SampleDepth::Eight => composite_at::<u8>(img, mask, window, &u8::rgb(filled)),
+        SampleDepth::Sixteen => composite_at::<u16>(img, mask, window, &u16::rgb(filled)),
+        SampleDepth::Float => composite_at::<f32>(img, mask, window, &f32::rgb(filled)),
+    }
+}
+
+fn composite_at<S: Sample>(
+    img: &DynamicImage,
+    mask: &GrayImage,
+    window: (u32, u32, u32, u32),
+    filled: &ImageBuffer<S::Rgb, Vec<S>>,
 ) -> DynamicImage {
     let (wx, wy, ww, wh) = window;
-    let mut rgb = img.to_rgb8();
+    let mut rgb = S::rgb(img);
     let fitted;
     let filled = if filled.width() == ww && filled.height() == wh {
         filled
@@ -101,19 +117,7 @@ pub fn composite_inpaint(
             }
         }
     }
-    let out = DynamicImage::ImageRgb8(rgb);
-    if matches!(
-        img,
-        DynamicImage::ImageRgba8(_) | DynamicImage::ImageLumaA8(_)
-    ) {
-        let src = img.to_rgba8();
-        let mut rgba = out.to_rgba8();
-        for (px, s) in rgba.pixels_mut().zip(src.pixels()) {
-            px[3] = s[3];
-        }
-        return DynamicImage::ImageRgba8(rgba);
-    }
-    out
+    with_source_alpha(img, rgb)
 }
 
 /// Region removal backed by a LaMa-family ONNX model
@@ -186,95 +190,123 @@ impl std::fmt::Debug for OnnxInpaintProvider {
 
 impl InpaintProvider for OnnxInpaintProvider {
     fn inpaint(&self, img: &DynamicImage, mask: &GrayImage) -> Result<DynamicImage, AiError> {
-        let fitted;
-        let mask = if mask.width() == img.width() && mask.height() == img.height() {
-            mask
-        } else {
-            fitted = image::imageops::resize(mask, img.width(), img.height(), FilterType::Triangle);
-            &fitted
-        };
-        let Some(bbox) = mask_bbox(mask) else {
-            return Ok(img.clone());
-        };
-        let window = inpaint_window(img.width(), img.height(), bbox);
-        let (wx, wy, ww, wh) = window;
-        let size = INPAINT_INPUT_SIZE as usize;
-        let crop = img.crop_imm(wx, wy, ww, wh).to_rgb8();
-        let crop = image::imageops::resize(
-            &crop,
-            INPAINT_INPUT_SIZE,
-            INPAINT_INPUT_SIZE,
-            FilterType::Triangle,
-        );
-        let mask_crop = image::imageops::crop_imm(mask, wx, wy, ww, wh).to_image();
-        let mask_crop = image::imageops::resize(
-            &mask_crop,
-            INPAINT_INPUT_SIZE,
-            INPAINT_INPUT_SIZE,
-            FilterType::Triangle,
-        );
-        let mut image_input = vec![0f32; 3 * size * size];
-        for (i, px) in crop.pixels().enumerate() {
-            for c in 0..3 {
-                image_input[c * size * size + i] = px[c] as f32 / 255.0;
-            }
-        }
-        let mut mask_input = vec![0f32; size * size];
-        for (i, px) in mask_crop.pixels().enumerate() {
-            mask_input[i] = px[0] as f32 / 255.0;
-        }
-        let image_tensor =
-            ort::value::Tensor::from_array(([1, 3, size, size], image_input.into_boxed_slice()))
-                .map_err(|e| AiError::Inference(format!("cannot build the image tensor: {e}")))?;
-        let mask_tensor =
-            ort::value::Tensor::from_array(([1, 1, size, size], mask_input.into_boxed_slice()))
-                .map_err(|e| AiError::Inference(format!("cannot build the mask tensor: {e}")))?;
-        let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
-        let outputs = session
-            .run(ort::inputs![
-                self.image_input.as_str() => image_tensor,
-                self.mask_input.as_str() => mask_tensor
-            ])
-            .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
-        let (_, first) = outputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))?;
-        let (shape, data) = first
-            .try_extract_tensor::<f32>()
-            .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
-        if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
-            return Err(AiError::BadOutput(format!(
-                "unexpected model output shape: {shape:?}"
-            )));
-        }
-        let (ow, oh) = (shape[3] as u32, shape[2] as u32);
-        // The claimed shape must fit the values actually
-        // returned before anything indexes by it (issue
-        // #267): a corrupt-but-loadable model can claim
-        // dimensions its tensor does not carry.
-        let plane = (ow as usize).checked_mul(oh as usize).ok_or_else(|| {
-            AiError::BadOutput(format!("model output shape overflows: {shape:?}"))
-        })?;
-        if data.len() < plane * 3 {
-            return Err(AiError::BadOutput(format!(
-                "model output has {} values, short of the {} its shape claims",
-                data.len(),
-                plane * 3
-            )));
-        }
-        // The export answers in 0..255 (see the type's
-        // contract note), so the values clamp there, not
-        // at 1.
-        let mut filled = image::RgbImage::new(ow, oh);
-        for (i, px) in filled.pixels_mut().enumerate() {
-            for c in 0..3 {
-                let v = data[c * plane + i];
-                px[c] = v.clamp(0.0, 255.0).round() as u8;
-            }
-        }
-        Ok(composite_inpaint(img, mask, window, &filled))
+        inpaint_with(img, mask, |image_input, mask_input| {
+            let size = INPAINT_INPUT_SIZE as usize;
+            let image_tensor = ort::value::Tensor::from_array((
+                [1, 3, size, size],
+                image_input.into_boxed_slice(),
+            ))
+            .map_err(|e| AiError::Inference(format!("cannot build the image tensor: {e}")))?;
+            let mask_tensor =
+                ort::value::Tensor::from_array(([1, 1, size, size], mask_input.into_boxed_slice()))
+                    .map_err(|e| {
+                        AiError::Inference(format!("cannot build the mask tensor: {e}"))
+                    })?;
+            let mut session = self.session.lock().map_err(|_| AiError::LockPoisoned)?;
+            let outputs = session
+                .run(ort::inputs![
+                    self.image_input.as_str() => image_tensor,
+                    self.mask_input.as_str() => mask_tensor
+                ])
+                .map_err(|e| AiError::Inference(format!("inference failed: {e}")))?;
+            first_output(outputs)
+        })
     }
+}
+
+/// One region removal around a model run: `run` takes the
+/// planar image and mask inputs, at the model's fixed
+/// [`INPAINT_INPUT_SIZE`], and returns the model's output.
+/// The provider passes its session; the tests pass a fake
+/// model. The source is read and the result written at the
+/// source's own sample depth, with its alpha kept (issue
+/// #551).
+fn inpaint_with<O: TensorOutput>(
+    img: &DynamicImage,
+    mask: &GrayImage,
+    run: impl FnOnce(Vec<f32>, Vec<f32>) -> Result<O, AiError>,
+) -> Result<DynamicImage, AiError> {
+    match SampleDepth::of(img) {
+        SampleDepth::Eight => inpaint_at::<u8, O>(img, mask, run),
+        SampleDepth::Sixteen => inpaint_at::<u16, O>(img, mask, run),
+        SampleDepth::Float => inpaint_at::<f32, O>(img, mask, run),
+    }
+}
+
+fn inpaint_at<S: Sample, O: TensorOutput>(
+    img: &DynamicImage,
+    mask: &GrayImage,
+    run: impl FnOnce(Vec<f32>, Vec<f32>) -> Result<O, AiError>,
+) -> Result<DynamicImage, AiError> {
+    let fitted;
+    let mask = if mask.width() == img.width() && mask.height() == img.height() {
+        mask
+    } else {
+        fitted = image::imageops::resize(mask, img.width(), img.height(), FilterType::Triangle);
+        &fitted
+    };
+    let Some(bbox) = mask_bbox(mask) else {
+        return Ok(img.clone());
+    };
+    let window = inpaint_window(img.width(), img.height(), bbox);
+    let (wx, wy, ww, wh) = window;
+    let size = INPAINT_INPUT_SIZE as usize;
+    let crop = S::rgb(&img.crop_imm(wx, wy, ww, wh));
+    let crop = image::imageops::resize(
+        &crop,
+        INPAINT_INPUT_SIZE,
+        INPAINT_INPUT_SIZE,
+        FilterType::Triangle,
+    );
+    let mask_crop = image::imageops::crop_imm(mask, wx, wy, ww, wh).to_image();
+    let mask_crop = image::imageops::resize(
+        &mask_crop,
+        INPAINT_INPUT_SIZE,
+        INPAINT_INPUT_SIZE,
+        FilterType::Triangle,
+    );
+    let mut image_input = vec![0f32; 3 * size * size];
+    for (i, px) in crop.pixels().enumerate() {
+        for (c, v) in px.channels().iter().enumerate() {
+            image_input[c * size * size + i] = v.to_unit();
+        }
+    }
+    let mut mask_input = vec![0f32; size * size];
+    for (i, px) in mask_crop.pixels().enumerate() {
+        mask_input[i] = px[0] as f32 / 255.0;
+    }
+    let output = run(image_input, mask_input)?;
+    let (shape, data) = output.f32_tensor()?;
+    if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
+        return Err(AiError::BadOutput(format!(
+            "unexpected model output shape: {shape:?}"
+        )));
+    }
+    let (ow, oh) = (shape[3] as u32, shape[2] as u32);
+    // The claimed shape must fit the values actually
+    // returned before anything indexes by it (issue
+    // #267): a corrupt-but-loadable model can claim
+    // dimensions its tensor does not carry.
+    let plane = (ow as usize)
+        .checked_mul(oh as usize)
+        .ok_or_else(|| AiError::BadOutput(format!("model output shape overflows: {shape:?}")))?;
+    if data.len() < plane * 3 {
+        return Err(AiError::BadOutput(format!(
+            "model output has {} values, short of the {} its shape claims",
+            data.len(),
+            plane * 3
+        )));
+    }
+    // The export answers in 0..255 (see the type's
+    // contract note), so the values clamp there, not
+    // at 1.
+    let mut filled = ImageBuffer::<S::Rgb, Vec<S>>::new(ow, oh);
+    for (i, px) in filled.pixels_mut().enumerate() {
+        for (c, v) in px.channels_mut().iter_mut().enumerate() {
+            *v = S::from_255(data[c * plane + i]);
+        }
+    }
+    Ok(composite_at(img, mask, window, &filled))
 }
 
 #[cfg(test)]

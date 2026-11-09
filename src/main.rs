@@ -474,7 +474,10 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// 16384x2 #529; JPEG XL output written by the jixel 0.5.5
 /// encoder, whose files run 11 to 19 percent smaller at
 /// slightly lower fidelity than 0.5.2 at the same quality
-/// setting, PR #493).
+/// setting, PR #493; `upscale` and `remove_region` on a
+/// 16-bit or float source keep its alpha and its depth
+/// instead of serving opaque 8-bit RGB, which showed the
+/// color stored under transparent pixels #551).
 const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered
