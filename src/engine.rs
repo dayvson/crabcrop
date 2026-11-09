@@ -63,8 +63,10 @@ pub(crate) fn decode_limits() -> image::Limits {
 /// Decode an image from memory under the shared decode limits.
 /// Every decode of untrusted bytes routes through here (the
 /// main pipeline, the quality loop's re-decodes, watermark
-/// images in the server), so no entry point can be bombed past
-/// the budget. The declared dimensions are probed first and
+/// images in the server), or, for an AVIF source in the server,
+/// through [`decode_source_image`] and the worker's decode under
+/// the same limits, so no entry point can be bombed past the
+/// budget. The declared dimensions are probed first and
 /// checked in our own code, because decoder adherence to
 /// `max_alloc` varies by format; a probe failure is not fatal
 /// (some valid files have headers the probe cannot read), the
@@ -88,15 +90,25 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     }
     let screened = crate::avif::screen(bytes)?;
     let bytes: &[u8] = &screened;
-    let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
-    if let Ok(probe) = probe
-        && let Ok((width, height)) = probe.into_dimensions()
-    {
-        check_decoded_dimensions(width as u64, height as u64)?;
-        if width as u64 * height as u64 * 4 > MAX_DECODE_ALLOC {
-            return Err(EngineError::Decode(format!(
-                "image dimensions {width}x{height} exceed the decode allocation limit"
-            )));
+    // An AVIF's declared size was checked against the decode
+    // limits in the screen, from its `ispe` property, so the
+    // dimension probe here would only re-run the decoder it
+    // bounds (issue #522). Every other format is probed first
+    // and checked in our own code, because decoder adherence to
+    // `max_alloc` varies by format; a probe failure is not fatal
+    // (some valid files have headers the probe cannot read), the
+    // limited decode behind it is the second line.
+    if !matches!(image::guess_format(bytes), Ok(image::ImageFormat::Avif)) {
+        let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
+        if let Ok(probe) = probe
+            && let Ok((width, height)) = probe.into_dimensions()
+        {
+            check_decoded_dimensions(width as u64, height as u64)?;
+            if width as u64 * height as u64 * 4 > MAX_DECODE_ALLOC {
+                return Err(EngineError::Decode(format!(
+                    "image dimensions {width}x{height} exceed the decode allocation limit"
+                )));
+            }
         }
     }
     // Fast paths for the two hottest source formats, taken only
@@ -126,6 +138,47 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     reader
         .decode()
         .map_err(|e| EngineError::Decode(e.to_string()))
+}
+
+/// Decode an untrusted still source, routing an AVIF through
+/// the capped worker process with a deadline (issue #522): the
+/// AV1 decode is a large native decoder fed untrusted bytes, so
+/// it runs in the worker SVG rendering already uses (issue
+/// #447), and a decode still running at `deadline` is killed
+/// with the worker, not left on a render thread. The container is
+/// screened in this process first (the cheap box and item
+/// checks), then the screened bytes are handed to the worker,
+/// which runs the same bounded image-crate decode the
+/// in-process path runs, so a valid file decodes to the same
+/// pixels either way. Non-AVIF sources, and builds or contexts
+/// with no worker (the library, the fuzz harness, the CLI),
+/// decode in process through [`decode_image`]. The server's own
+/// freshly encoded output is re-decoded in process through
+/// [`decode_image`], which keeps the quality search off the
+/// per-decode worker spawn.
+pub(crate) fn decode_source_image(
+    bytes: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> Result<DynamicImage, EngineError> {
+    #[cfg(feature = "avif-decode")]
+    if matches!(image::guess_format(bytes), Ok(image::ImageFormat::Avif)) {
+        let screened = crate::avif::screen(bytes)?;
+        let worker_deadline =
+            deadline.unwrap_or_else(|| std::time::Instant::now() + crate::svg::WORKER_TIMEOUT);
+        if let Some(result) = crate::svg::decode_avif_in_worker(
+            &screened,
+            MAX_DECODE_DIMENSION,
+            MAX_DECODE_ALLOC,
+            worker_deadline,
+        ) {
+            return result.map_err(|e| match e {
+                crate::svg::RenderError::TimedOut(_) if deadline.is_some() => EngineError::Timeout,
+                e => EngineError::Decode(e.to_string()),
+            });
+        }
+    }
+    let _ = deadline;
+    decode_image(bytes)
 }
 
 /// JPEG decode through zune-jpeg directly: the same decoder
@@ -304,7 +357,10 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
     if detected == ImageFormat::Jxl {
         check_jxl_dimensions(bytes)?;
     }
-    decode_image(bytes)?;
+    // Upload validation has no request deadline, so an AVIF
+    // upload decodes in the worker under its default timeout
+    // (issue #522); every other still decodes in process.
+    decode_source_image(bytes, None)?;
     // The generic decode accepted the bytes; name what it
     // accepted. The guess mirrors the decoder's own, with
     // JPEG XL (which the image crate does not know) taken
@@ -421,39 +477,19 @@ pub struct SourceProbe {
 /// for any document within the bounds.
 const SVG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Probe source bytes for the explain report: kind and
-/// dimensions, headers only (see [`SourceProbe`]).
-pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
+/// The media kind [`probe_source`] reports for `bytes`, from
+/// their signatures alone: no header is parsed for it.
+pub(crate) fn probe_kind(bytes: &[u8]) -> &'static str {
     if crate::svg::is_svg(bytes) {
-        // The intrinsic size takes a parse, which runs in the
-        // SVG worker (issue #447) under the probe's own short
-        // deadline: the explain handler waits on it.
-        let deadline = std::time::Instant::now() + SVG_PROBE_TIMEOUT;
-        let dimensions = crate::svg::screen(bytes)
-            .ok()
-            .and_then(|screened| screened.intrinsic_size(Some(deadline)).ok())
-            .and_then(|(w, h)| {
-                let (w, h) = (w.round() as u32, h.round() as u32);
-                if w >= 1 && h >= 1 { Some((w, h)) } else { None }
-            });
-        return SourceProbe {
-            kind: "svg",
-            dimensions,
-        };
+        return "svg";
     }
     if is_heic(bytes) {
-        return SourceProbe {
-            kind: "heic",
-            dimensions: crate::heic::probe_dimensions(bytes),
-        };
+        return "heic";
     }
     if is_jxl(bytes) {
-        return SourceProbe {
-            kind: "jxl",
-            dimensions: jxl_dimensions(bytes),
-        };
+        return "jxl";
     }
-    let kind = match image::guess_format(bytes) {
+    match image::guess_format(bytes) {
         Ok(image::ImageFormat::Jpeg) => "jpeg",
         Ok(image::ImageFormat::Png) => "png",
         Ok(image::ImageFormat::Gif) => "gif",
@@ -476,16 +512,79 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
         // explain never runs, so they stay unknown.
         _ if crate::pdf::sniff_pdf(bytes) => "pdf",
         _ => "unknown",
+    }
+}
+
+/// Whether sizing a source of `kind` is more than a header
+/// read: an SVG's intrinsic size takes a parse of the whole
+/// document in the SVG worker (up to [`SVG_PROBE_TIMEOUT`]),
+/// and an AVIF's goes through the decoder. A caller on an
+/// async runtime runs [`probe_source`] for these on a
+/// blocking thread.
+pub(crate) fn probe_is_heavy(kind: &str) -> bool {
+    matches!(kind, "svg" | "avif")
+}
+
+/// A test hook standing in for an SVG whose size probe is
+/// slow (a document whose usvg parse runs near the probe's
+/// deadline), without relying on usvg's timing or crafting
+/// such a document: an SVG source whose bytes contain this
+/// marker makes [`probe_source`] sleep [`SVG_PROBE_TEST_DELAY`]
+/// while it sizes it. The sleep runs wherever `probe_source`
+/// runs, so it blocks a request thread when the probe is on
+/// one and a blocking thread when it is not.
+#[cfg(test)]
+pub(crate) const SVG_PROBE_SLOW_MARKER: &[u8] = b"crabcrop-slow-probe";
+
+/// How long the [`SVG_PROBE_SLOW_MARKER`] hook sleeps.
+#[cfg(test)]
+pub(crate) const SVG_PROBE_TEST_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Probe source bytes for the explain report: kind and
+/// dimensions, headers only (see [`SourceProbe`]). For the
+/// kinds [`probe_is_heavy`] names, this blocks for as long as
+/// the parse or the decode takes.
+pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
+    let kind = probe_kind(bytes);
+    #[cfg(test)]
+    if kind == "svg"
+        && bytes
+            .windows(SVG_PROBE_SLOW_MARKER.len())
+            .any(|w| w == SVG_PROBE_SLOW_MARKER)
+    {
+        std::thread::sleep(SVG_PROBE_TEST_DELAY);
+    }
+    let dimensions = match kind {
+        // The intrinsic size takes a parse, which runs in the
+        // SVG worker (issue #447) under the probe's own short
+        // deadline: the explain handler waits on it.
+        "svg" => {
+            let deadline = std::time::Instant::now() + SVG_PROBE_TIMEOUT;
+            crate::svg::screen(bytes)
+                .ok()
+                .and_then(|screened| screened.intrinsic_size(Some(deadline)).ok())
+                .and_then(|(w, h)| {
+                    let (w, h) = (w.round() as u32, h.round() as u32);
+                    if w >= 1 && h >= 1 { Some((w, h)) } else { None }
+                })
+        }
+        "heic" => crate::heic::probe_dimensions(bytes),
+        "jxl" => jxl_dimensions(bytes),
+        // An AVIF's size is read from its container's `ispe`
+        // property, not by decoding it: sizing an AVIF no longer
+        // runs the decoder. A container the walk refuses, or one
+        // that names no `ispe`, states no dimensions.
+        "avif" => crate::avif::declared_size(bytes),
+        // Every other format reads its size from the image
+        // crate's header probe, after the same container screen
+        // (issue #522), so a refused one states no dimensions.
+        _ => crate::avif::screen(bytes).ok().and_then(|bytes| {
+            image::ImageReader::new(Cursor::new(&*bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|probe| probe.into_dimensions().ok())
+        }),
     };
-    // The probe parses an AVIF container too, so it is
-    // screened first (issue #522); a refused one states no
-    // dimensions.
-    let dimensions = crate::avif::screen(bytes).ok().and_then(|bytes| {
-        image::ImageReader::new(Cursor::new(&*bytes))
-            .with_guessed_format()
-            .ok()
-            .and_then(|probe| probe.into_dimensions().ok())
-    });
     SourceProbe { kind, dimensions }
 }
 
@@ -949,14 +1048,9 @@ impl Engine {
         // runs again for a lower factor. A retry does run the
         // stages after it again (the decode, and for an SVG
         // the rasterizing worker), but only for a refusal the
-        // header walk could not foresee.
-        let mut retry = false;
+        // header walk could not foresee; like the first run,
+        // it starts only before the deadline.
         step_down_hint(bytes, ops, &directives, ctx.dpr, |dpr| {
-            // A retry decodes again: none starts past the
-            // deadline.
-            if std::mem::replace(&mut retry, true) {
-                ctx.check_deadline()?;
-            }
             let ctx = ProcessContext { dpr, ..ctx.clone() };
             self.process_selected(bytes, ops, ctx, &directives, video, pdf)
         })
@@ -978,6 +1072,11 @@ impl Engine {
         video: Option<VideoSourceMeta>,
         pdf: Option<PdfSourceMeta>,
     ) -> Result<ProcessedImage, EngineError> {
+        // Sniffing screens an SVG in this process, and the
+        // stages before it (frame or page selection, a run at
+        // a higher factor) may have used the whole budget:
+        // nothing here starts past the deadline.
+        ctx.check_deadline()?;
         let source = Self::sniff_source(bytes)?;
         let detected = source.detected;
         // keep_profile is convert-or-tag (issue #374): the
@@ -1443,7 +1542,10 @@ impl Engine {
             if detected == ImageFormat::Jxl {
                 check_jxl_dimensions(bytes)?;
             }
-            let mut img = decode_image(bytes)?;
+            // An AVIF source decodes in the capped worker, killed
+            // at the request deadline (issue #522); every other
+            // still decodes in process.
+            let mut img = decode_source_image(bytes, ctx.deadline)?;
             // Phone photos store rotation in the EXIF orientation
             // tag instead of the pixels. Honor it before any
             // operation, so sizes and crops see the image as the

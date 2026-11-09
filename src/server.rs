@@ -239,7 +239,7 @@ pub struct AppState {
     pub brand_color: Option<[u8; 3]>,
     /// Named operation presets from `CRABCROP_PRESETS_FILE`:
     /// name to operation string, validated at boot.
-    pub presets: std::collections::HashMap<String, String>,
+    pub presets: crate::url::Presets,
     /// Presets-only mode, from `CRABCROP_ONLY_PRESETS`: reject
     /// free-form operations in requests.
     pub only_presets: bool,
@@ -299,6 +299,13 @@ pub struct AppState {
     /// top of the slow lane (issue #324), which is what
     /// keeps it from holding stills permits while it runs.
     pub anim_gate: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent heavy `/explain` probes (an SVG's
+    /// parse in the worker, an AVIF's decode), which run on
+    /// blocking threads (see `explain_probe`): a burst of
+    /// them waits here, or sheds with a 503, instead of
+    /// occupying the async runtime or starting a worker
+    /// process per request.
+    pub probe_gate: Arc<tokio::sync::Semaphore>,
     /// In-flight miss coalescing (audit R2-09): concurrent
     /// misses for one cache key share one fetch and one
     /// encode instead of stampeding the origin and the
@@ -744,9 +751,57 @@ async fn fallback_source_bytes(
 /// has the dimensions or the kind is one whose dimensions
 /// never live in headers (video, PDF). Anything else means
 /// the identifying header may still be on its way.
+///
+/// The load asks this after every chunk, on the async
+/// runtime, so it never sizes a kind whose probe is heavy
+/// ([`crate::engine::probe_is_heavy`]): an SVG's size needs
+/// the whole document anyway, and an AVIF's a decode. Those
+/// read on to the end of the body (or the head cap), and
+/// [`explain_probe`] sizes them once, off the runtime.
 fn probe_settled(head: &[u8]) -> bool {
-    let probe = crate::engine::probe_source(head);
-    probe.kind != "unknown" && (probe.dimensions.is_some() || matches!(probe.kind, "video" | "pdf"))
+    let kind = crate::engine::probe_kind(head);
+    match kind {
+        "unknown" => false,
+        "video" | "pdf" => true,
+        _ if crate::engine::probe_is_heavy(kind) => false,
+        _ => crate::engine::probe_source(head).dimensions.is_some(),
+    }
+}
+
+/// How long an explain probe may wait for a probe slot
+/// before the server sheds it with a 503: the stills
+/// gate's wait.
+const PROBE_GATE_WAIT: std::time::Duration = PROCESS_GATE_WAIT;
+
+/// The explain report's source probe. A heavy probe (an
+/// SVG's parse in the worker, which may take the probe's
+/// whole 5 s, or an AVIF's decode) runs on a blocking
+/// thread under the probe gate, so the async runtime, and
+/// every route it serves, never waits on one; the permit
+/// moves into the job, so a probe whose request went away
+/// still counts until it ends. Every other kind's probe
+/// reads headers alone and runs inline. `None` means the
+/// gate stayed full past its wait.
+async fn explain_probe(state: &AppState, head: Vec<u8>) -> Option<crate::engine::SourceProbe> {
+    let kind = crate::engine::probe_kind(&head);
+    if !crate::engine::probe_is_heavy(kind) {
+        return Some(crate::engine::probe_source(&head));
+    }
+    let permit = tokio::time::timeout(PROBE_GATE_WAIT, state.probe_gate.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()?;
+    let probe = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::engine::probe_source(&head)
+    })
+    .await;
+    // A probe that panicked states the kind and no size, as
+    // one that failed does.
+    Some(probe.unwrap_or(crate::engine::SourceProbe {
+        kind,
+        dimensions: None,
+    }))
 }
 
 /// `GET /explain/<signature>/<operations...>/<image-url>`:
@@ -760,8 +815,9 @@ fn probe_settled(head: &[u8]) -> bool {
 /// source touched, once, through the loader with all of
 /// its guards, and the facts come from header probing
 /// (`crate::engine::probe_source`): no decode, no
-/// detection, no process, AI, or video gate, and nothing
-/// written to any cache tier. A bad signature, an over-cap
+/// detection, no process, AI, or video gate (an SVG or AVIF
+/// probe takes the probe gate, see [`explain_probe`]), and
+/// nothing written to any cache tier. A bad signature, an over-cap
 /// operation list, or an expired URL therefore costs zero
 /// source fetches, and answers with the image path's own
 /// status and body.
@@ -917,7 +973,13 @@ async fn explain_handle(
         Ok(fetched) => fetched,
         Err(e) => return explain_load_error(e, accept.as_deref()),
     };
-    let probe = crate::engine::probe_source(&fetched.head);
+    let Some(probe) = explain_probe(&state, fetched.head).await else {
+        return busy_response(
+            "server busy: too many source probes running at once",
+            5,
+            accept.as_deref(),
+        );
+    };
 
     // Each referenced preset with the operations its
     // definition expands to. Definitions were validated at
@@ -928,7 +990,9 @@ async fn explain_handle(
         let entry_ops = state
             .presets
             .get(name)
-            .and_then(|definition| crate::url::parse_default_ops(definition, &state.presets).ok())
+            .and_then(|definition| {
+                crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
+            })
             .unwrap_or_default();
         presets.push(crate::explain::preset_entry(name, &entry_ops));
     }
@@ -3243,8 +3307,9 @@ async fn serve_miss(
     // instead of each buffering a whole source first; a miss
     // whose wait for budget runs out sheds like a full gate.
     // Nothing is charged before an origin answers, and an
-    // origin that answers and then stalls holds only what it
-    // has delivered (see `SourceCharge`).
+    // origin that answers and then falls behind, stalling or
+    // trickling, holds only what it has delivered (see
+    // `SourceCharge`).
     let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
     let load_start = Instant::now();
     let mut used_fallback = false;

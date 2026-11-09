@@ -207,6 +207,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -350,6 +351,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate,
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -412,6 +414,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -474,6 +477,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -546,6 +550,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -628,6 +633,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -911,6 +917,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
         pdf_renderer: Some(Arc::new(renderer)),
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -1270,6 +1277,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -1338,6 +1346,7 @@ async fn spawn_app_rotating() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -1410,6 +1419,7 @@ async fn spawn_app_with_fallback() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -3012,19 +3022,16 @@ async fn unconfigured_features_answer_501_not_400() {
     );
 }
 
-fn preset_test_map() -> std::collections::HashMap<String, String> {
+fn preset_test_map() -> crate::url::Presets {
     [
-        ("small".to_string(), "30x20".to_string()),
-        ("gray".to_string(), "filters:grayscale".to_string()),
+        ("small".to_string(), "30x20".parse().unwrap()),
+        ("gray".to_string(), "filters:grayscale".parse().unwrap()),
     ]
     .into_iter()
     .collect()
 }
 
-async fn spawn_app_with_presets(
-    presets: std::collections::HashMap<String, String>,
-    only_presets: bool,
-) -> String {
+async fn spawn_app_with_presets(presets: crate::url::Presets, only_presets: bool) -> String {
     spawn_app_with_presets_and_roots(presets, only_presets, std::collections::HashMap::new()).await
 }
 
@@ -3040,7 +3047,7 @@ fn root_test_map(origin: &str) -> std::collections::HashMap<String, String> {
 }
 
 async fn spawn_app_with_presets_and_roots(
-    presets: std::collections::HashMap<String, String>,
+    presets: crate::url::Presets,
     only_presets: bool,
     source_roots: std::collections::HashMap<String, String>,
 ) -> String {
@@ -3090,6 +3097,7 @@ async fn spawn_app_with_presets_and_roots(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -3135,7 +3143,7 @@ async fn preset_urls_and_explicit_chains_serve_identical_bytes() {
     let mut presets = preset_test_map();
     presets.insert(
         "card".to_string(),
-        "crop:40x30:smart/filters:quality(80)".to_string(),
+        "crop:40x30:smart/filters:quality(80)".parse().unwrap(),
     );
     let base = spawn_app_with_presets(presets, false).await;
     let chains = [
@@ -3445,12 +3453,12 @@ fn preset_spellings_and_their_expansions_share_one_cache_key() {
     // expands to are one request: the server expands
     // before keying, so both spellings canonicalize to
     // the same cache key form.
-    let presets: std::collections::HashMap<String, String> = [
-        ("small".to_string(), "30x20".to_string()),
-        ("gray".to_string(), "filters:grayscale".to_string()),
+    let presets: crate::url::Presets = [
+        ("small".to_string(), "30x20".parse().unwrap()),
+        ("gray".to_string(), "filters:grayscale".parse().unwrap()),
         (
             "card".to_string(),
-            "crop:1200x630:smart/filters:quality(80)".to_string(),
+            "crop:1200x630:smart/filters:quality(80)".parse().unwrap(),
         ),
     ]
     .into_iter()
@@ -3459,7 +3467,7 @@ fn preset_spellings_and_their_expansions_share_one_cache_key() {
     for (name, definition) in &presets {
         let spelled = format!("preset:{name}/{src}");
         let expanded = crate::url::expand_presets(&spelled, &presets, false).unwrap();
-        assert_eq!(expanded, format!("{definition}/{src}"));
+        assert_eq!(expanded, format!("{}/{src}", definition.as_str()));
     }
     // A preset followed by more chain composes with it,
     // and the composed spelling keys like the fully
@@ -4326,6 +4334,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -4507,6 +4516,7 @@ async fn spawn_app_with_moderation(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -4840,6 +4850,7 @@ async fn spawn_app_with_ocr_timeout(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -5262,6 +5273,7 @@ async fn spawn_app_with_embeddings(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6007,6 +6019,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6071,6 +6084,7 @@ async fn spawn_app_with_studio() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6135,6 +6149,7 @@ async fn spawn_app_with_inpaint() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6231,6 +6246,7 @@ async fn spawn_app_with_segment() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6723,6 +6739,7 @@ async fn spawn_app_with_providers(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6742,7 +6759,7 @@ async fn spawn_app_with_providers(
 /// caller-chosen memory cache size (0 disables the
 /// memory tier so disk behavior is observable).
 async fn spawn_app_full(
-    presets: std::collections::HashMap<String, String>,
+    presets: crate::url::Presets,
     dir: Option<&std::path::Path>,
     cache_bytes: usize,
 ) -> String {
@@ -6801,6 +6818,7 @@ async fn spawn_app_full(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -8306,6 +8324,7 @@ async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -8392,6 +8411,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -8484,21 +8504,68 @@ async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
-async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
-    let fake = crate::s3store::test_support::start_fake().await;
-    let dir = crate::test_support::scratch_dir("srv-drop4");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
-    let shared = state.shared_store.clone().unwrap();
-    let key = "40x24/example.com/i.png";
-    state.cache.put(key.to_string(), tier_test_entry());
-    shared.put(key, &tier_test_entry()).await;
-    // The memory hit's shared propagation is owed
-    // before any wait (issue #347): one poll and a
-    // drop cannot strand it.
-    poll_lookup_once(&state, key, &["thumb".to_string()]);
-    shared_learns_group(&shared, key, "thumb").await;
-    let _ = std::fs::remove_dir_all(&dir);
+/// Holds the only blocking thread of a runtime built with
+/// `max_blocking_threads(1)` until it is dropped (issue
+/// #546). The pool queues every task past its thread cap
+/// until a busy thread is free, so a disk operation the
+/// code under test hands to the pool meanwhile waits
+/// behind the gate, however the threads are scheduled.
+/// Dropping the gate lets the thread go on every exit
+/// path, so a failed check cannot leave the runtime's
+/// drop waiting for it.
+struct BlockingThreadGate {
+    /// Never sent on: dropping it ends the held task.
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+impl BlockingThreadGate {
+    /// Takes the pool's thread, and returns once the
+    /// thread is held.
+    async fn hold() -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        // Detached: the task holds the thread until the
+        // gate drops `release`, waited on or not.
+        drop(tokio::task::spawn_blocking(move || {
+            let _ = held_tx.send(());
+            let _ = released.recv();
+        }));
+        held_rx.await.expect("the gate takes the blocking thread");
+        BlockingThreadGate { _release: release }
+    }
+}
+
+#[test]
+fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
+    // One blocking thread, for the gate below to hold
+    // (issue #546).
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = crate::test_support::scratch_dir("srv-drop4");
+        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let shared = state.shared_store.clone().unwrap();
+        let key = "40x24/example.com/i.png";
+        state.cache.put(key.to_string(), tier_test_entry());
+        shared.put(key, &tier_test_entry()).await;
+        // The memory hit's shared propagation is owed
+        // before any wait (issue #347): one poll and a
+        // drop cannot strand it. The disk merge the hit
+        // then waits on queues behind the gate, so the
+        // one poll finds the lookup waiting on it
+        // (issue #546). Unheld, the merge could finish
+        // on the blocking pool before the poll looked,
+        // and the lookup returned instead of waiting.
+        let gate = BlockingThreadGate::hold().await;
+        poll_lookup_once(&state, key, &["thumb".to_string()]);
+        drop(gate);
+        shared_learns_group(&shared, key, "thumb").await;
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 #[tokio::test]
@@ -9046,6 +9113,73 @@ async fn over_cap_counts_the_default_operations_before_any_fetch() {
     let resp = get_signed(&base, &own_format).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+    // A URL whose own operations already pass the cap is
+    // refused while its presets expand, before the defaults
+    // merge: the count names the URL's own operations.
+    let own_over = format!("{}/{src}", vec!["filters:invert"; 101].join("/"));
+    let fetched = hits.load(Ordering::SeqCst);
+    for route in ["", "explain/"] {
+        let (status, body) = get_signed_json(&base, route, &own_over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 101 operations, over the 100 operation limit",
+            "{route}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), fetched);
+}
+
+#[tokio::test]
+async fn repeated_preset_references_are_refused_before_expanding() {
+    // A short URL that repeats a long preset used to expand
+    // in full, then parse every operation it expanded to,
+    // before the cap refused it: 7,000 references to a
+    // 100-operation preset of 5x5 convolutions built and
+    // parsed 700,000 operations (about 80 MB of text) per
+    // request. Expansion now counts each reference by the
+    // count settled when the presets loaded and refuses
+    // before building anything, on the image and explain
+    // routes alike, with the same answer as before.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let kernel = format!("convolution({},1)", vec!["0.5"; 25].join(","));
+    let presets: crate::url::Presets = [
+        (
+            "c".to_string(),
+            format!("filters:{}", vec![kernel; 100].join(":"))
+                .parse()
+                .unwrap(),
+        ),
+        ("small".to_string(), "30x20".parse().unwrap()),
+    ]
+    .into_iter()
+    .collect();
+    let base = spawn_app_with_presets(presets, true).await;
+    let remainder = format!("{}{src}", "preset:c/".repeat(7_000));
+    for route in ["", "explain/"] {
+        let started = std::time::Instant::now();
+        let (status, body) = get_signed_json(&base, route, &remainder).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "/{route}");
+        assert_eq!(body["error"]["code"], "unsupported_operation", "/{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 700000 operations, over the 100 operation limit",
+            "/{route}"
+        );
+        // The refusal costs a pass over the URL's own text;
+        // expanding and parsing it took seconds.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "/{route} took {elapsed:?}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // A realistic reference still renders, and the
+    // 100-operation preset alone is within the cap.
+    let resp = get_signed(&base, &format!("preset:small/{src}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (status, body) = get_signed_json(&base, "explain/", &format!("preset:c/{src}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
@@ -9705,6 +9839,7 @@ async fn spawn_app_with_provenance_signer(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -9835,6 +9970,7 @@ async fn processing_gate_bounds_concurrency() {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -9964,6 +10100,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -10700,6 +10837,7 @@ fn lane_test_state(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(slow_permits)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -10985,6 +11123,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate,
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -11141,6 +11280,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -12089,6 +12229,7 @@ async fn spawn_app_with_upload_gate(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -14307,6 +14448,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -15608,15 +15750,12 @@ fn sign_with(secret: &[u8], remainder: &str) -> String {
 /// An app with presets and a caller-built loader, for
 /// the explain tests (preset expansion, object-store
 /// sources).
-async fn spawn_explain_app(
-    presets: std::collections::HashMap<String, String>,
-    loader: Loader,
-) -> String {
+async fn spawn_explain_app(presets: crate::url::Presets, loader: Loader) -> String {
     spawn_explain_app_with_roots(presets, loader, std::collections::HashMap::new()).await
 }
 
 async fn spawn_explain_app_with_roots(
-    presets: std::collections::HashMap<String, String>,
+    presets: crate::url::Presets,
     loader: Loader,
     source_roots: std::collections::HashMap<String, String>,
 ) -> String {
@@ -15666,6 +15805,7 @@ async fn spawn_explain_app_with_roots(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -15861,7 +16001,10 @@ async fn explain_unsafe_form_honors_the_policy() {
 async fn explain_lists_preset_expansions_and_the_group() {
     let src = spawn_image_server().await;
     let mut presets = std::collections::HashMap::new();
-    presets.insert("small".to_string(), "100x50/filters:grayscale".to_string());
+    presets.insert(
+        "small".to_string(),
+        "100x50/filters:grayscale".parse().unwrap(),
+    );
     let base = spawn_explain_app(presets, Loader::with_defaults().unwrap()).await;
     let remainder = format!("preset:small/{src}");
     let sig = sign(&remainder);
@@ -15935,7 +16078,7 @@ async fn explain_escapes_markup_bearing_strings() {
     let raw = spawn_bytes_server(test_png()).await;
     let src = raw.replace("src.png", "a&lt;b.png");
     let mut presets = std::collections::HashMap::new();
-    presets.insert("a&b".to_string(), "100x50".to_string());
+    presets.insert("a&b".to_string(), "100x50".parse().unwrap());
     let base = spawn_explain_app(presets, Loader::with_defaults().unwrap()).await;
     let remainder = format!("preset:a&b/{src}");
     let sig = sign(&remainder);
@@ -16329,4 +16472,163 @@ async fn a_render_write_a_purge_covers_is_dropped_but_not_counted_as_skipped() {
     let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     assert_eq!(state.background.drain(far).await.writes, 0);
     assert_eq!(entry_objects(&fake), SHARED_PUTS_AT_ONCE);
+}
+
+/// A minimal, valid SVG that sizes instantly but carries
+/// [`crate::engine::SVG_PROBE_SLOW_MARKER`], so the probe's
+/// test hook sleeps while sizing it: a stand-in for an SVG
+/// whose parse is slow, without crafting a slow document.
+const SLOW_PROBE_SVG: &[u8] = b"<!--crabcrop-slow-probe--><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
+
+/// A blocking HTTP origin on its own OS thread (not the
+/// server's runtime), so serving the source never competes
+/// with the server for a request thread: the only thing
+/// that holds a request thread in these tests is the probe.
+fn spawn_blocking_svg_origin() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    SLOW_PROBE_SVG.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(SLOW_PROBE_SVG);
+                let _ = stream.flush();
+            });
+        }
+    });
+    format!("http://{addr}/slow.svg")
+}
+
+/// Fetch `url` over a plain blocking socket, off the tokio
+/// runtime, and return its status and how long it took. Used
+/// to time /health while the server's request threads may be
+/// blocked: a measurement on the runtime could not run then.
+fn blocking_get(url: &str) -> (u16, std::time::Duration) {
+    use std::io::{Read, Write};
+    let rest = url.strip_prefix("http://").expect("http url");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let addr: std::net::SocketAddr = authority.parse().expect("host:port");
+    let start = std::time::Instant::now();
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(20)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let elapsed = start.elapsed();
+    let status = std::str::from_utf8(&buf)
+        .ok()
+        .and_then(|t| t.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, elapsed)
+}
+
+/// Fire several concurrent /explain requests for a
+/// slow-to-size SVG (the `urls` are distinct, so the loader
+/// does not coalesce them into one probe) and, from off the
+/// runtime, time /health while they run. The probes run off
+/// the request threads (issue #447), so /health answers
+/// promptly; on a server that sizes SVG on the request
+/// threads, the probes hold every request thread and /health
+/// waits for one to finish. More requests than the two
+/// request threads keeps them held for the whole window.
+async fn health_stays_responsive_during_slow_explains(urls: Vec<String>, base: &str) {
+    let health_url = format!("{base}/health");
+    let prober = std::thread::spawn(move || {
+        // Let the explains seize the request threads first.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        blocking_get(&health_url)
+    });
+    let mut tasks = Vec::new();
+    for url in urls {
+        tasks.push(tokio::spawn(async move {
+            client()
+                .get(url)
+                .timeout(std::time::Duration::from_secs(20))
+                .send()
+                .await
+        }));
+    }
+    let (status, elapsed) = tokio::task::spawn_blocking(move || prober.join().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "/health did not answer 200");
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "/health took {elapsed:?} while slow SVG explains ran: the probes held the request threads"
+    );
+    for task in tasks {
+        let _ = within(
+            std::time::Duration::from_secs(20),
+            "a slow explain to finish",
+            task,
+        )
+        .await;
+    }
+}
+
+/// A burst of /explain probes for a slow-to-size SVG file
+/// source leaves /health responsive: the probes run off the
+/// request threads (issue #447). On a server that sized SVG
+/// on the request threads, these would hold /health until a
+/// probe finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_slow_svg_file_explains_leave_health_responsive() {
+    let dir = crate::test_support::scratch_dir("explain-slow-svg-file");
+    let root = std::fs::canonicalize(&dir).unwrap();
+    std::fs::write(root.join("slow.svg"), SLOW_PROBE_SVG).unwrap();
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        });
+    let base = spawn_explain_app_with_roots(Default::default(), loader, Default::default()).await;
+    // Distinct output sizes, so the requests are distinct and
+    // each runs its own probe.
+    let urls = (0..6)
+        .map(|i| {
+            let remainder = format!("64x{}/file:///slow.svg", 60 + i);
+            format!("{base}/explain/{}/{remainder}", sign(&remainder))
+        })
+        .collect();
+    health_stays_responsive_during_slow_explains(urls, &base).await;
+    drop(dir);
+}
+
+/// The same as [`concurrent_slow_svg_file_explains_leave_health_responsive`]
+/// over HTTP, where a probe runs for both the per-chunk
+/// settle check and the handler on a server that sizes SVG
+/// on the request threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_slow_svg_http_explains_leave_health_responsive() {
+    let origin = spawn_blocking_svg_origin();
+    let base = spawn_explain_app_with_roots(
+        Default::default(),
+        Loader::with_defaults().unwrap(),
+        Default::default(),
+    )
+    .await;
+    let urls = (0..6)
+        .map(|i| {
+            let remainder = format!("64x{}/{origin}", 60 + i);
+            format!("{base}/explain/{}/{remainder}", sign(&remainder))
+        })
+        .collect();
+    health_stays_responsive_during_slow_explains(urls, &base).await;
 }

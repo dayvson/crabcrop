@@ -197,6 +197,7 @@ fn state(dir: &std::path::Path) -> AppState {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(1)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(PurgeGuard::new()),

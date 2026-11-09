@@ -21,8 +21,31 @@
 //! it: one node per element instance and per character of text,
 //! plus the `data:` payload bytes of every image instance, and
 //! the depth of the recursion. Results are memoized per element
-//! and role, so the walk is linear in the document, and it stops
-//! as soon as a partial sum passes a limit.
+//! and role, and it stops as soon as a partial sum passes a
+//! limit.
+//!
+//! The walk is linear in the document because every step it
+//! takes spends fuel: every evaluation of an element in a
+//! role, a memoized result reused included; every declared
+//! value examined for a reference, in proportion to its length
+//! ([`scan_units`]), a value shared by many elements through an
+//! id or an `inherit`, `context-*`, or `<use>` list included;
+//! every node a text element reads, the text a `tref` copies
+//! included; every child of a filter examined for an
+//! `feImage`; and the path data a marked shape's vertices are
+//! counted from. The fuel is a small multiple of the node
+//! limit, so the total work the walk does is bounded by it
+//! however the references fan out, and a document that would
+//! make the walk do more is refused (as `Nodes`) instead. The
+//! facts the walk reads are gathered once, under the same kind
+//! of bound: each element's declarations are grouped by
+//! property, so reading one property's values up the ancestors
+//! costs those values and not every declaration on the way,
+//! the style sheet's declarations are checked against a set of
+//! the ids that name a costly element, the nodes inside
+//! `<use>` targets are marked once each, and matching the kept
+//! rules against the elements is capped at
+//! [`MAX_STYLE_MATCHES`] comparisons.
 //!
 //! It never undercounts those conversions. A reference whose
 //! source is ambiguous without usvg's full style resolution
@@ -113,6 +136,35 @@ pub(super) enum Refusal {
     Bytes,
     Cycle,
     Depth,
+    /// Bounding the document needs more pre-parse work than
+    /// its structure is allowed: the style sheet's kept rules
+    /// against the elements passed [`MAX_STYLE_MATCHES`]. Kept
+    /// separate from `Nodes` so the message names the cause.
+    Work,
+}
+
+/// The most element-by-rule comparisons [`Facts::gather`] makes
+/// when it matches the kept style rules against the elements. A
+/// document with `R` kept rules and `E` elements costs `R * E`
+/// comparisons; both are bounded only by the node cap, so their
+/// product is quadratic, and a crafted document reaches it in a
+/// few kilobytes. The cap is well above any real style sheet
+/// (even a few hundred rules against the whole 10,000-node cap
+/// stays under it) and refuses the quadratic case before it
+/// runs.
+const MAX_STYLE_MATCHES: u64 = 4_000_000;
+
+/// The bytes of a value that one unit of the walk's fuel pays
+/// to scan. A value of a property the walk follows is a few
+/// dozen bytes in a real drawing, one unit; a longer one costs
+/// in proportion, so a value examined from many sites (through
+/// an `inherit` or a shared id) spends fuel for the bytes read,
+/// not only for the times it is read.
+const SCAN_BYTES_PER_UNIT: usize = 64;
+
+/// The fuel scanning `len` bytes of a value spends.
+fn scan_units(len: usize) -> u64 {
+    1 + (len / SCAN_BYTES_PER_UNIT) as u64
 }
 
 /// The segments usvg may cut one elliptical arc into. kurbo
@@ -200,7 +252,7 @@ enum Role {
 /// The kinds of element usvg resolves by walking a chain of
 /// `href` links of the same kind (`HrefIter`, and the
 /// `find_*`/`resolve_*_attr` helpers in usvg's parser).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum HrefKind {
     Gradient,
     Pattern,
@@ -227,72 +279,103 @@ fn href_kind(node: Node) -> Option<HrefKind> {
 /// of, such as `#a`→`#b`→`#c`→`#b`, is followed with no end,
 /// and the blocking thread never returns.
 ///
-/// This mirrors that walk exactly: from each gradient, pattern,
-/// or filter, it follows the same-kind `href` with usvg's stop
-/// rule and a per-origin visited set, and refuses the moment a
-/// link re-enters the chain anywhere but at its origin. A chain
-/// that ends, or self-links, or returns to its origin (all of
-/// which usvg terminates) is not refused, so no legitimate
-/// `href` inheritance chain is. Nodes whose chain ends without
-/// such a re-entry are memoized, keeping the pass linear.
+/// This decides what that walk does from every gradient,
+/// pattern, and filter, with usvg's stop rule: the walk from an
+/// element ends when its chain ends or comes back to the
+/// element itself, and loops when the chain runs into a cycle
+/// the element is not on. So a chain that ends, or a pure ring
+/// of links, is not refused (no legitimate `href` inheritance
+/// chain is), and a chain that leads into a ring from outside
+/// it is.
+///
+/// Each element has at most one same-kind successor, so the
+/// pass is linear: every element is walked onto once, and its
+/// fate is recorded when the walk that reached it settles (the
+/// chain ends, or it is a member of a ring). A later walk that
+/// reaches a settled element stops there: at one whose chain
+/// ends, it ends too; at a ring member, it came from outside
+/// the ring, so usvg would loop from where it began. A shared
+/// id costs nothing extra: the successor lookup reads at most
+/// two candidates per id and kind.
 fn check_href_cycles<'a, 'input>(
     doc: &'a roxmltree::Document<'input>,
     facts: &Facts<'a, 'input>,
 ) -> Result<(), Refusal> {
-    // The same-kind element `node`'s `href` names, the way
-    // usvg's walk continues (it stops at a kind change).
+    // usvg's walk continues at the first element of the same
+    // kind that an `href` names, other than the element it
+    // stands on (it stops at a kind change). Of the elements
+    // sharing an id, only the first two of each kind in
+    // document order can be that element, so they are kept
+    // instead of scanning every element sharing the id.
+    let mut candidates: HashMap<(&str, HrefKind), [Option<Node<'a, 'input>>; 2]> = HashMap::new();
+    for (&id, nodes) in &facts.ids {
+        for &node in nodes {
+            let Some(kind) = href_kind(node) else {
+                continue;
+            };
+            let pair = candidates.entry((id, kind)).or_default();
+            if let Some(slot) = pair.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(node);
+            }
+        }
+    }
     let successor = |node: Node<'a, 'input>| -> Option<Node<'a, 'input>> {
         let kind = href_kind(node)?;
         node.attributes()
             .filter(|a| a.name().eq_ignore_ascii_case("href"))
             .filter_map(|a| iri_id(a.value()))
-            .filter_map(|id| facts.ids.get(id))
-            .flatten()
-            .copied()
-            .find(|target| *target != node && href_kind(*target) == Some(kind))
+            .filter_map(|id| candidates.get(&(id, kind)))
+            .flat_map(|pair| pair.iter().flatten().copied())
+            .find(|target| *target != node)
     };
-    // Nodes whose chain ends without re-entering it: they
-    // terminate from any origin and need not be walked again.
-    let mut safe: HashSet<usize> = HashSet::new();
-    for node in doc.descendants().filter(Node::is_element) {
-        if href_kind(node).is_none() {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fate {
+        Unseen,
+        /// On the chain being walked, at this position.
+        OnPath(usize),
+        /// Its chain ends: usvg stops from it, and from
+        /// anything leading to it.
+        Ends,
+        /// A member of a pure ring: usvg stops from it when
+        /// the walk comes back to it.
+        Ring,
+    }
+    let count = doc.descendants().len() + 1;
+    let mut fate = vec![Fate::Unseen; count];
+    // A backstop on the pass's total work: every element is
+    // walked onto at most once, so the steps across the whole
+    // pass never pass the node count.
+    let mut steps = count;
+    let mut path: Vec<usize> = Vec::new();
+    for node in doc.descendants().filter(|n| href_kind(*n).is_some()) {
+        if fate[node.id().get_usize()] != Fate::Unseen {
             continue;
         }
-        let origin = node.id().get_usize();
-        if safe.contains(&origin) {
-            continue;
-        }
-        let mut path: Vec<usize> = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
+        path.clear();
         let mut curr = node;
-        loop {
+        let settled = loop {
             let curr_id = curr.id().get_usize();
-            let Some(next) = successor(curr) else {
-                // No further same-kind link: the walk ends.
-                safe.insert(curr_id);
-                safe.extend(path.iter().copied());
-                break;
-            };
-            let next_id = next.id().get_usize();
-            if next_id == curr_id || next_id == origin {
-                // usvg stops on a self-link or a return to the
-                // element the walk began at (origin-dependent,
-                // so do not memoize the chain as safe).
-                break;
-            }
-            if safe.contains(&next_id) {
-                safe.insert(curr_id);
-                safe.extend(path.iter().copied());
-                break;
-            }
-            if seen.contains(&next_id) {
-                // A link back into the chain, not to its origin:
-                // usvg follows it with no end.
-                return Err(Refusal::Cycle);
-            }
-            seen.insert(curr_id);
+            steps = steps.checked_sub(1).ok_or(Refusal::Nodes)?;
+            fate[curr_id] = Fate::OnPath(path.len());
             path.push(curr_id);
-            curr = next;
+            let Some(next) = successor(curr) else {
+                break Fate::Ends;
+            };
+            match fate[next.id().get_usize()] {
+                Fate::Unseen => curr = next,
+                Fate::Ends => break Fate::Ends,
+                // Back at the element the walk began at: every
+                // element on the path is on the ring, and the
+                // walk from each comes back to it.
+                Fate::OnPath(0) => break Fate::Ring,
+                // Into a ring the walk's origin is not on, met
+                // on this walk or an earlier one: usvg follows
+                // it with no end.
+                Fate::OnPath(_) | Fate::Ring => return Err(Refusal::Cycle),
+            }
+        };
+        for &id in &path {
+            fate[id] = settled;
         }
     }
     Ok(())
@@ -300,7 +383,7 @@ fn check_href_cycles<'a, 'input>(
 
 /// Bound what usvg builds for `doc`, or say why it is refused.
 pub(super) fn bound(doc: &roxmltree::Document, limits: Limits) -> Result<Cost, Refusal> {
-    let facts = Facts::gather(doc);
+    let facts = Facts::gather(doc)?;
     // usvg follows `href` on gradients, patterns, and filters
     // with a guard that misses cycles not passing through the
     // element it started from, so such a cycle hangs it before
@@ -311,8 +394,19 @@ pub(super) fn bound(doc: &roxmltree::Document, limits: Limits) -> Result<Cost, R
         .nodes
         .saturating_mul(4)
         .saturating_add(4 * doc.descendants().len() as u64);
+    run_walk(doc, &facts, limits, fuel)
+}
+
+/// The expansion walk from the document's root, with `fuel`
+/// units of work to spend (see the module docs).
+fn run_walk<'a, 'input>(
+    doc: &'a roxmltree::Document<'input>,
+    facts: &Facts<'a, 'input>,
+    limits: Limits,
+    fuel: u64,
+) -> Result<Cost, Refusal> {
     let mut walk = Walk {
-        facts: &facts,
+        facts,
         limits,
         memo: HashMap::new(),
         depth: 0,
@@ -331,7 +425,9 @@ struct Facts<'a, 'input> {
     /// The values each element declares for each property, by
     /// node index: attributes, matching style sheet rules, and
     /// the `style` attribute. usvg's cascade keeps one of them;
-    /// the walk charges the costliest.
+    /// the walk charges the costliest. Each element's list is
+    /// grouped by property, in declaration order within each,
+    /// so [`Facts::values`] reads one property as a slice.
     decls: Vec<Vec<(Prop, &'a str)>>,
     /// Whether a node sits inside the target of some `<use>`,
     /// where it inherits from the `<use>` site too.
@@ -346,7 +442,7 @@ struct Facts<'a, 'input> {
 }
 
 impl<'a, 'input> Facts<'a, 'input> {
-    fn gather(doc: &'a roxmltree::Document<'input>) -> Self {
+    fn gather(doc: &'a roxmltree::Document<'input>) -> Result<Self, Refusal> {
         let count = doc.descendants().len() + 1;
         let mut facts = Facts {
             ids: HashMap::new(),
@@ -363,6 +459,12 @@ impl<'a, 'input> Facts<'a, 'input> {
             }
         }
         let rules = facts.style_rules(doc);
+        // Matching every kept rule against every element is
+        // quadratic in the document, so it is capped: a
+        // document whose rules and elements together would make
+        // more than `MAX_STYLE_MATCHES` comparisons is refused
+        // here, before the matching runs long.
+        let mut matches_left = MAX_STYLE_MATCHES;
         for node in doc.descendants().filter(Node::is_element) {
             let mut decls = Vec::new();
             for attr in node.attributes() {
@@ -371,6 +473,7 @@ impl<'a, 'input> Facts<'a, 'input> {
                 }
             }
             for rule in &rules {
+                matches_left = matches_left.checked_sub(1).ok_or(Refusal::Work)?;
                 if rule.selector.matches(&XmlNode(node)) {
                     for decl in &rule.declarations {
                         for &prop in Prop::named(decl.name) {
@@ -388,6 +491,10 @@ impl<'a, 'input> Facts<'a, 'input> {
                     }
                 }
             }
+            // A stable sort keeps each property's values in
+            // declaration order, which is all any reader of
+            // them sees.
+            decls.sort_by_key(|&(prop, _)| prop.index());
             for &(prop, value) in &decls {
                 if !is_inherit(value) {
                     facts.anywhere[prop.index()].push(value);
@@ -401,8 +508,18 @@ impl<'a, 'input> Facts<'a, 'input> {
             .collect();
         for &use_node in &uses {
             for target in facts.href_targets(use_node) {
-                for node in target.descendants() {
-                    facts.in_use[node.id().get_usize()] = true;
+                // A node already marked was marked with its whole
+                // subtree, so the marking stops there: each node
+                // is marked once, however many `<use>` elements
+                // reach it or however its targets nest.
+                let mut stack = vec![target];
+                while let Some(node) = stack.pop() {
+                    let index = node.id().get_usize();
+                    if facts.in_use[index] {
+                        continue;
+                    }
+                    facts.in_use[index] = true;
+                    stack.extend(node.children());
                 }
             }
         }
@@ -412,14 +529,18 @@ impl<'a, 'input> Facts<'a, 'input> {
                 facts.at_use[prop.index()].extend(values);
             }
         }
-        facts
+        Ok(facts)
     }
 
+    /// The values `node` declares for `prop`. They are one run
+    /// of the node's grouped list, found by binary search, so
+    /// [`Facts::declared_up`] pays for the values it reads at
+    /// each ancestor, not for every other declaration there.
     fn values(&self, node: Node<'a, 'input>, prop: Prop) -> impl Iterator<Item = &'a str> + '_ {
-        self.decls[node.id().get_usize()]
-            .iter()
-            .filter(move |(p, _)| *p == prop)
-            .map(|(_, v)| *v)
+        let decls = &self.decls[node.id().get_usize()];
+        let start = decls.partition_point(|(p, _)| p.index() < prop.index());
+        let len = decls[start..].partition_point(|(p, _)| *p == prop);
+        decls[start..start + len].iter().map(|(_, v)| *v)
     }
 
     /// The values `prop` can take at `node` from the node and
@@ -518,19 +639,30 @@ impl<'a, 'input> Facts<'a, 'input> {
                 sheet.parse_more(text);
             }
         }
+        if sheet.rules.is_empty() {
+            return Vec::new();
+        }
+        // The ids naming at least one element of a kind that
+        // converts content, gathered once: checking each
+        // declaration against every element sharing its id
+        // would cost the declarations times the elements.
+        let costly_ids: HashSet<&str> = self
+            .ids
+            .iter()
+            .filter(|(_, nodes)| {
+                nodes.iter().any(|n| {
+                    matches!(
+                        n.tag_name().name(),
+                        "filter" | "mask" | "clipPath" | "marker" | "pattern"
+                    )
+                })
+            })
+            .map(|(&id, _)| id)
+            .collect();
         let costly = |value: &str| {
             is_inherit(value)
                 || starts_with_ci(value.trim_start(), "context-")
-                || url_ids(value).into_iter().any(|id| {
-                    self.ids.get(id).is_some_and(|nodes| {
-                        nodes.iter().any(|n| {
-                            matches!(
-                                n.tag_name().name(),
-                                "filter" | "mask" | "clipPath" | "marker" | "pattern"
-                            )
-                        })
-                    })
-                })
+                || url_ids(value).into_iter().any(|id| costly_ids.contains(id))
         };
         let mut rules = sheet.rules;
         for rule in &mut rules {
@@ -557,13 +689,20 @@ struct Walk<'f, 'a, 'input> {
     /// Frames above it computed a cost that holds only inside
     /// that marker, so they are not memoized.
     guard: usize,
-    /// Evaluations left: a backstop for the frames the marker
-    /// guard keeps out of the memo.
+    /// Work left: every evaluation, value examined, and text
+    /// or path data read spends from it (see the module docs).
+    /// It also backstops the frames the marker guard keeps out
+    /// of the memo.
     fuel: u64,
 }
 
 impl<'a, 'input> Walk<'_, 'a, 'input> {
     fn eval(&mut self, node: Node<'a, 'input>, role: Role) -> Result<Cost, Refusal> {
+        // Every visit spends a unit, a memoized result reused
+        // included, so the number of visits across the whole
+        // walk is bounded however references fan out onto an
+        // element shared by many sites (issue #443).
+        self.spend(1)?;
         let key = (node.id().get_usize(), role);
         match self.memo.get(&key) {
             // A memoized conversion repeats its whole recursion
@@ -582,7 +721,6 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
         if self.depth >= self.limits.depth {
             return Err(Refusal::Depth);
         }
-        self.fuel = self.fuel.checked_sub(1).ok_or(Refusal::Nodes)?;
         let depth = self.depth;
         self.memo.insert(key, Slot::Active(depth));
         self.depth += 1;
@@ -597,6 +735,12 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
             self.memo.remove(&key);
         }
         Ok(cost)
+    }
+
+    /// Spend `units` of fuel, refusing once it runs out.
+    fn spend(&mut self, units: u64) -> Result<(), Refusal> {
+        self.fuel = self.fuel.checked_sub(units).ok_or(Refusal::Nodes)?;
+        Ok(())
     }
 
     /// Add `more` to `sum`, refusing as soon as a limit is
@@ -626,6 +770,13 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
     fn refs(&mut self, values: &[&str], role: Role, sum: bool) -> Result<Cost, Refusal> {
         let mut best = Cost::ZERO;
         for value in values {
+            // Every value examined spends fuel for its length,
+            // so a list grown by an `inherit`, `context-*`, or
+            // `<use>` fan-out (which can repeat a value once per
+            // declaration) cannot make the walk do unbounded
+            // work before it finds the references in it, however
+            // long the repeated value is.
+            self.spend(scan_units(value.len()))?;
             let mut total = Cost::ZERO;
             for targets in self.facts.url_targets(value) {
                 let mut cost = Cost::ZERO;
@@ -691,7 +842,13 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
             return self.linked(node, Role::Filter);
         }
         let mut sum = Cost::ZERO;
-        for primitive in node.children().filter(|c| c.tag_name().name() == "feImage") {
+        for primitive in node.children() {
+            // Every child examined spends a unit, so a filter
+            // evaluated again reads its children within the fuel.
+            self.spend(1)?;
+            if primitive.tag_name().name() != "feImage" {
+                continue;
+            }
             // An feImage naming an element converts it into a
             // fresh group; one holding a data: payload decodes
             // it. With both href spellings present, usvg uses
@@ -802,6 +959,16 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
         let start = self.refs(&start, Role::Marker, false)?;
         let end = self.refs(&end, Role::Marker, false)?;
         let mid = self.refs(&mid, Role::Marker, false)?;
+        // Counting the vertices reads the path data: it spends
+        // fuel for its length, as a value examined does.
+        let data: usize = node
+            .attributes()
+            .filter(|a| {
+                a.name().eq_ignore_ascii_case("d") || a.name().eq_ignore_ascii_case("points")
+            })
+            .map(|a| a.value().len())
+            .sum();
+        self.spend(scan_units(data))?;
         let sum = self.add(start, end)?;
         self.add(sum, mid.times(segments(node)))
     }
@@ -813,7 +980,12 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
         let facts = self.facts;
         let mut units = 1u64;
         let mut paint = Cost::ZERO;
+        // Every node read spends fuel (a text node for its
+        // length), and the count stops as soon as it passes the
+        // node limit, so neither a text evaluated again nor many
+        // `tref` copies of one text read more than the bound.
         for d in node.descendants() {
+            self.spend(text_units(d))?;
             if d.is_text() {
                 units = units.saturating_add(char_count(d));
             } else if d.is_element() {
@@ -821,16 +993,35 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
                 paint = paint.max(self.paint(d)?);
                 if d.tag_name().name() == "tref" {
                     for target in facts.href_targets(d) {
-                        for t in target.descendants().filter(Node::is_text) {
-                            units = units.saturating_add(char_count(t));
+                        for t in target.descendants() {
+                            self.spend(text_units(t))?;
+                            if t.is_text() {
+                                units = units.saturating_add(char_count(t));
+                                if units > self.limits.nodes {
+                                    return Err(Refusal::Nodes);
+                                }
+                            }
                         }
                     }
                 }
+            }
+            if units > self.limits.nodes {
+                return Err(Refusal::Nodes);
             }
         }
         // Each span's fill and stroke are processed for the
         // span, its layout, and its flattened path.
         self.add(Cost::nodes(units), paint.times(units.saturating_mul(4)))
+    }
+}
+
+/// The fuel reading `node` inside a text spends: a unit, or a
+/// text node's length in [`scan_units`].
+fn text_units(node: Node) -> u64 {
+    if node.is_text() {
+        scan_units(node.text().map_or(0, str::len))
+    } else {
+        1
     }
 }
 
@@ -1035,6 +1226,24 @@ mod tests {
         )
     }
 
+    /// The walk alone, with `fuel` units to spend: shows which
+    /// steps spend fuel without a document big enough to run
+    /// out of the real budget.
+    fn walk_with_fuel(svg: &str, fuel: u64) -> Result<Cost, Refusal> {
+        let doc = roxmltree::Document::parse(svg).unwrap();
+        let facts = Facts::gather(&doc).unwrap();
+        run_walk(
+            &doc,
+            &facts,
+            Limits {
+                nodes: 100_000,
+                bytes: 1 << 28,
+                depth: 128,
+            },
+            fuel,
+        )
+    }
+
     fn svg(body: &str) -> String {
         format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"10\" height=\"10\">{body}</svg>"
@@ -1204,5 +1413,226 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(cost.bytes, 2 * payload.len() as u64);
+    }
+
+    /// An id carried by many elements, each referenced from
+    /// many sites, makes the walk re-reach every one of them
+    /// from every site. Each visit (a memoized one included)
+    /// spends fuel, so the document is refused instead of
+    /// walked a quadratic number of times. Without the fuel
+    /// charge on memoized visits, the walk runs
+    /// `gradients * fills` times and is not refused at all.
+    #[test]
+    fn a_shared_id_referenced_many_times_is_refused_not_walked() {
+        let mut body = String::from("<defs>");
+        for _ in 0..500 {
+            // All share one id, so each `url(#g)` resolves to
+            // every one of them.
+            body.push_str("<linearGradient id=\"g\"/>");
+        }
+        body.push_str("</defs>");
+        for _ in 0..1000 {
+            body.push_str("<rect width=\"1\" height=\"1\" fill=\"url(#g)\"/>");
+        }
+        assert_eq!(bound_of(&svg(&body)), Err(Refusal::Nodes));
+        // A handful of the same references is walked and
+        // accepted, so it is the fan-out, not the shape, that
+        // is refused.
+        let mut small = String::from("<defs><linearGradient id=\"g\"/></defs>");
+        for _ in 0..4 {
+            small.push_str("<rect width=\"1\" height=\"1\" fill=\"url(#g)\"/>");
+        }
+        assert!(bound_of(&svg(&small)).is_ok());
+    }
+
+    /// An `inherit` pulls every value a property takes anywhere
+    /// in the document into the list examined for references.
+    /// With one such list per element, the lists examined grow
+    /// to the square of the document. Each value examined
+    /// spends fuel, so the document is refused; without that
+    /// charge the walk examines `declarations * inheritors`
+    /// values and is not refused.
+    #[test]
+    fn an_inherit_value_list_fanned_out_is_refused() {
+        let mut body = String::new();
+        // Each contributes a `filter` value to what an
+        // `inherit` resolves to.
+        for _ in 0..750 {
+            body.push_str("<rect width=\"1\" height=\"1\" filter=\"none\"/>");
+        }
+        // Each examines all of them.
+        for _ in 0..750 {
+            body.push_str("<rect width=\"1\" height=\"1\" filter=\"inherit\"/>");
+        }
+        assert_eq!(bound_of(&svg(&body)), Err(Refusal::Nodes));
+    }
+
+    /// Matching the kept style rules against the elements is
+    /// capped: a `<style>` with many referencing rules and many
+    /// elements for them to match is refused before the
+    /// quadratic matching runs. Without the cap it runs
+    /// `rules * elements` comparisons and is accepted.
+    #[test]
+    fn style_rules_matching_is_capped() {
+        let mut style = String::from("<style>");
+        for i in 0..2100 {
+            // Each rule references a filter, so it is kept, and
+            // each is a distinct selector.
+            style.push_str(&format!(".c{i} {{ filter: url(#f) }}"));
+        }
+        style.push_str("</style>");
+        let mut body = format!("<defs><filter id=\"f\"><feFlood/></filter></defs>{style}");
+        for _ in 0..2100 {
+            body.push_str("<rect width=\"1\" height=\"1\"/>");
+        }
+        assert_eq!(bound_of(&svg(&body)), Err(Refusal::Work));
+        // A small style sheet matched against few elements is
+        // under the cap and is bounded as before.
+        let ok = svg("<style>.c { filter: url(#f) }</style>\
+             <defs><filter id=\"f\"><feFlood/></filter></defs>\
+             <rect class=\"c\" width=\"1\" height=\"1\"/>");
+        assert!(bound_of(&ok).is_ok());
+    }
+
+    /// The fuel and the style cap do not refuse a document
+    /// whose reuse is ordinary: an element reused a modest
+    /// number of times, with an `inherit`, is bounded, and to
+    /// the same cost as the reuse written out by hand.
+    #[test]
+    fn ordinary_reuse_is_bounded_unchanged() {
+        let reused = bound_of(&svg(
+            "<defs><g id=\"t\"><rect width=\"1\" height=\"1\"/><rect width=\"1\" height=\"1\"/></g></defs>\
+             <use href=\"#t\"/><use href=\"#t\"/><use href=\"#t\"/>",
+        ))
+        .unwrap();
+        // svg + 3 * (use + its group node + (g + 2 rects)).
+        assert_eq!(reused.nodes, 1 + 3 * (1 + 1 + (1 + 2)));
+        // An `inherit` on a non-inherited property still lands
+        // under the caps for a normal document.
+        assert!(
+            bound_of(&svg("<defs><filter id=\"f\"><feFlood/></filter></defs>\
+             <rect width=\"1\" height=\"1\" filter=\"url(#f)\"/>\
+             <rect width=\"1\" height=\"1\" filter=\"inherit\"/>",))
+            .is_ok()
+        );
+    }
+
+    /// A ring of same-kind `href` links, a tail leading into a
+    /// ring, and a chain that ends keep the results they had
+    /// before the check was made linear: usvg terminates on a
+    /// pure ring (every member returns to where it began) and
+    /// on a chain that ends, and loops when a chain leads into
+    /// a ring it is not part of, so the first two are accepted
+    /// and the third is refused.
+    #[test]
+    fn rings_and_chains_keep_their_results() {
+        // A pure ring: a0 -> a1 -> a2 -> a0.
+        let pure_ring = "<defs><filter id=\"a0\" href=\"#a1\"/><filter id=\"a1\" href=\"#a2\"/>\
+             <filter id=\"a2\" href=\"#a0\"/></defs><rect width=\"1\" height=\"1\"/>";
+        assert!(bound_of(&svg(pure_ring)).is_ok());
+        // A tail into a ring: t -> a0, and a0 -> a1 -> a2 -> a0.
+        let tail = "<defs><filter id=\"t\" href=\"#a0\"/>\
+             <filter id=\"a0\" href=\"#a1\"/><filter id=\"a1\" href=\"#a2\"/>\
+             <filter id=\"a2\" href=\"#a0\"/></defs><rect width=\"1\" height=\"1\"/>";
+        assert_eq!(bound_of(&svg(tail)), Err(Refusal::Cycle));
+        // A chain that ends at a missing id.
+        let chain = "<defs><filter id=\"a0\" href=\"#a1\"/><filter id=\"a1\" href=\"#a2\"/>\
+             <filter id=\"a2\" href=\"#end\"/></defs><rect width=\"1\" height=\"1\"/>";
+        assert!(bound_of(&svg(chain)).is_ok());
+    }
+
+    /// A pure ring of 10,000 same-kind `href` links is checked
+    /// in linear time: before the check was made linear it
+    /// walked the ring from every member, so a ring this size
+    /// took seconds. The bound here is far above the linear
+    /// cost and far below the quadratic one.
+    #[test]
+    fn a_large_href_ring_is_checked_quickly() {
+        // svg + defs + 9997 filters + rect = the 10,000-node
+        // document cap.
+        const N: usize = 9997;
+        let mut body = String::from("<defs>");
+        for i in 0..N {
+            body.push_str(&format!("<filter id=\"a{i}\" href=\"#a{}\"/>", (i + 1) % N));
+        }
+        body.push_str("</defs><rect width=\"1\" height=\"1\"/>");
+        let text = svg(&body);
+        let doc = roxmltree::Document::parse(&text).unwrap();
+        let start = std::time::Instant::now();
+        let result = bound(
+            &doc,
+            Limits {
+                nodes: 100_000,
+                bytes: 1 << 28,
+                depth: 128,
+            },
+        );
+        let elapsed = start.elapsed();
+        // A pure ring is accepted, as it was before.
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "checking a {N}-element ring took {elapsed:?}; the check is not linear"
+        );
+    }
+
+    /// A value examined from many sites spends fuel for its
+    /// length each time, so the bytes the walk scans stay within
+    /// the fuel: the structure with a short value is bounded, and
+    /// with a long one it is refused. One unit per value,
+    /// whatever its length, let the scanning grow as the value's
+    /// length times the sites examining it.
+    #[test]
+    fn a_long_value_examined_from_many_sites_spends_fuel_for_its_length() {
+        let sites = "<rect width=\"1\" height=\"1\" filter=\"inherit\"/>".repeat(500);
+        let short = svg(&format!(
+            "<rect width=\"1\" height=\"1\" filter=\"none\"/>{sites}"
+        ));
+        assert!(bound_of(&short).is_ok());
+        let padding = " ".repeat(64 * 1024);
+        let long = svg(&format!(
+            "<rect width=\"1\" height=\"1\" filter=\"none{padding}\"/>{sites}"
+        ));
+        assert_eq!(bound_of(&long), Err(Refusal::Nodes));
+    }
+
+    /// A text element spends fuel for every node it reads, the
+    /// text each `tref` copies included, so a text evaluated
+    /// again, or copying one text many times, reads no more
+    /// than the fuel allows. With the real budget a text of many
+    /// `tref` copies is bounded as before; with little fuel it
+    /// is refused, which it was not while the text loop spent
+    /// nothing.
+    #[test]
+    fn text_content_spends_fuel_for_what_it_reads() {
+        let trefs = "<tref href=\"#t\"/>".repeat(200);
+        let doc = svg(&format!(
+            "<defs><text id=\"t\">abc</text></defs><text>{trefs}</text>"
+        ));
+        assert!(bound_of(&doc).is_ok());
+        assert_eq!(walk_with_fuel(&doc, 100), Err(Refusal::Nodes));
+    }
+
+    /// A style rule is kept when any element its `url()` names
+    /// is of a kind that costs, not only the first carrying the
+    /// id: a rule naming an id that a rect carries first and a
+    /// filter after it is charged like the same attribute.
+    #[test]
+    fn a_style_rule_naming_a_shared_id_is_kept_for_any_costly_element() {
+        let defs = "<rect id=\"x\" width=\"1\" height=\"1\"/>\
+             <defs><filter id=\"x\"><feImage href=\"#y\"/></filter>\
+             <g id=\"y\"><rect width=\"1\" height=\"1\"/></g></defs>";
+        let by_rule = bound_of(&svg(&format!(
+            "<style>.c {{ filter: url(#x) }}</style>{defs}\
+             <rect class=\"c\" width=\"1\" height=\"1\"/>"
+        )))
+        .unwrap();
+        let by_attr = bound_of(&svg(&format!(
+            "{defs}<rect filter=\"url(#x)\" width=\"1\" height=\"1\"/>"
+        )))
+        .unwrap();
+        let plain = bound_of(&svg(&format!("{defs}<rect width=\"1\" height=\"1\"/>"))).unwrap();
+        assert_eq!(by_rule, by_attr);
+        assert!(by_rule.nodes > plain.nodes);
     }
 }

@@ -23,16 +23,22 @@
 //!   renderer, in the same directory. Run as
 //!   `-f <n> -l <n> -` over the source on stdin, it
 //!   prints the document's page count, its encryption
-//!   state, and the selected page's size in points.
+//!   state, and the selected page's size in points: the
+//!   size of its crop box (clipped to its media box).
 //!   Facts the design needs before rendering are probe
 //!   facts, so the probe runs first, every time.
 //! - Render: the configured program (Poppler's
 //!   `pdftocairo` is the reference), run as
-//!   `-png -singlefile -f <n> -l <n> -r <dpi> - -`: the
-//!   PDF on stdin, one PNG on stdout, at a fixed scale
-//!   of 2.0 (144 DPI) clamped so neither raster axis
-//!   exceeds the 16383 px output limit at the probed
-//!   page size.
+//!   `-png -singlefile -cropbox -f <n> -l <n> -r <dpi> - -`:
+//!   the PDF on stdin, one PNG on stdout, at a fixed
+//!   scale of 2.0 (144 DPI) clamped so neither raster
+//!   axis exceeds the 16383 px output limit, and the
+//!   raster area stays within 64 Mpx, at the probed page
+//!   size. `-cropbox` makes the renderer draw the crop
+//!   box, the box the probe measured, so the clamp is
+//!   computed from the box that is drawn. Without it the
+//!   renderer draws the media box, which a page may
+//!   declare far larger than its crop box.
 //!
 //! The rendered PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
@@ -95,6 +101,15 @@ const MAX_RASTER_AXIS: f64 = (crate::url::MAX_DIMENSION - 1) as f64;
 /// reaches trivially (issue #262).
 const MAX_RASTER_PIXELS: f64 = 64_000_000.0;
 
+/// The lowest resolution the renderer is asked for, in
+/// dots per inch. The clamped scale's DPI is floored to a
+/// whole number, and this is the smallest one above zero,
+/// so a page that does not fit [`MAX_RASTER_AXIS`] and
+/// [`MAX_RASTER_PIXELS`] at this resolution cannot be
+/// clamped into them: it is refused before the renderer
+/// runs (see [`fits_at_min_dpi`]).
+const MIN_RENDER_DPI: f64 = 1.0;
+
 /// How much of a probe report the parser keeps. The
 /// report is a few hundred bytes; this is generous
 /// headroom for chatty builds.
@@ -121,9 +136,11 @@ pub struct PdfProbe {
     /// only a document that actually needs a password
     /// fails, and it fails at the probe.
     pub encrypted: bool,
-    /// The selected page's width in points.
+    /// The selected page's width in points: its crop
+    /// box, the area the renderer draws.
     pub page_width: f64,
-    /// The selected page's height in points.
+    /// The selected page's height in points: its crop
+    /// box, the area the renderer draws.
     pub page_height: f64,
 }
 
@@ -311,7 +328,8 @@ impl PdfRenderer {
     /// first: the page count cap and the page range are
     /// enforced against the probe before the renderer
     /// runs, and the render scale is computed from the
-    /// probed page size.
+    /// probed page size, the crop box the renderer then
+    /// draws.
     pub fn render_page(&self, pdf: &[u8], page: u32) -> Result<RenderedPage, PdfError> {
         // One deadline for the probe and the render
         // together (issue #362).
@@ -330,19 +348,34 @@ impl PdfRenderer {
                 if probe.pages == 1 { "page" } else { "pages" }
             )));
         }
+        if !fits_at_min_dpi(probe.page_width, probe.page_height) {
+            return Err(PdfError::NotPdf(format!(
+                "page {page} is {} x {} pts, too large to render within the raster limits ({MAX_RASTER_AXIS} px per axis, {} megapixels) at {MIN_RENDER_DPI} dpi, the lowest resolution the renderer is asked for",
+                probe.page_width,
+                probe.page_height,
+                MAX_RASTER_PIXELS / 1_000_000.0
+            )));
+        }
         let scale = render_scale(probe.page_width, probe.page_height);
         // Floor the DPI so the clamped scale can never
         // round a raster axis past the axis cap; at the
-        // fixed scale this is exactly 144.
-        let dpi = (scale * 72.0).floor().max(1.0);
+        // fixed scale this is exactly 144. The page fits the
+        // limits at the minimum DPI (checked above), so
+        // raising a smaller DPI to the minimum keeps the
+        // raster within them.
+        let dpi = (scale * 72.0).floor().max(MIN_RENDER_DPI);
         let dpi_arg = format!("{dpi}");
         let page_arg = page.to_string();
+        // `-cropbox`: draw the crop box, the size the probe
+        // reported and the scale was clamped for, not the
+        // media box, which can be larger.
         let run = self.run(
             &self.program,
             "renderer",
             &[
                 "-png",
                 "-singlefile",
+                "-cropbox",
                 "-f",
                 &page_arg,
                 "-l",
@@ -489,6 +522,20 @@ pub fn render_scale(page_width: f64, page_height: f64) -> f64 {
     scale
 }
 
+/// Whether a page of the given size in points renders
+/// within [`MAX_RASTER_AXIS`] and [`MAX_RASTER_PIXELS`] at
+/// [`MIN_RENDER_DPI`]. [`render_scale`] can clamp any
+/// smaller page into the limits, but the DPI it becomes
+/// does not go below the minimum, so a page past it (over
+/// 16382 inches on a side, or 64 million square inches)
+/// would render past the limits at the minimum DPI. A
+/// size that is not a finite number never fits.
+fn fits_at_min_dpi(page_width: f64, page_height: f64) -> bool {
+    let per_point = MIN_RENDER_DPI / 72.0;
+    let (width, height) = (page_width * per_point, page_height * per_point);
+    width <= MAX_RASTER_AXIS && height <= MAX_RASTER_AXIS && width * height <= MAX_RASTER_PIXELS
+}
+
 /// Parse the probe facts out of a `pdfinfo` report: the
 /// `Pages:` and `Encrypted:` lines and the selected
 /// page's size (printed as `Page size:` for a whole-
@@ -548,7 +595,12 @@ fn parse_page_size(line: &str, page: u32) -> Option<(f64, f64)> {
     };
     let width: f64 = w.parse().ok()?;
     let height: f64 = h.parse().ok()?;
-    if width <= 0.0 || height <= 0.0 {
+    // A size must be a positive, finite number. The probe
+    // prints a box with an overflowing coordinate as `inf`
+    // or `-nan`, which `f64` parses, and a NaN side passes
+    // a plain `<= 0.0` test and skips the raster clamp.
+    let usable = |side: f64| side.is_finite() && side > 0.0;
+    if !usable(width) || !usable(height) {
         return None;
     }
     Some((width, height))
@@ -657,6 +709,19 @@ Page size:       792 x 612 pts (letter)
         assert!(parse_probe("", 1).is_none());
         // A degenerate size is not a size.
         assert!(parse_probe("Pages: 1\nEncrypted: no\nPage size: 0 x 792 pts\n", 1).is_none());
+        // Nor is one that is not a finite number: the probe
+        // prints a box with an overflowing coordinate this
+        // way, and f64 parses every one of these spellings.
+        for size in [
+            "-nan x -nan",
+            "nan x 792",
+            "612 x inf",
+            "inf x inf",
+            "-inf x 792",
+        ] {
+            let report = format!("Pages: 1\nEncrypted: no\nPage    1 size:  {size} pts\n");
+            assert!(parse_probe(&report, 1).is_none(), "{size}");
+        }
     }
 
     #[test]
@@ -689,6 +754,46 @@ Page size:       792 x 612 pts (letter)
         // A degenerate size keeps the fixed scale; the
         // renderer run is where that document fails.
         assert_eq!(render_scale(0.0, 0.0), 2.0);
+    }
+
+    #[test]
+    fn pages_past_the_raster_limits_at_the_minimum_dpi_do_not_fit() {
+        // Ordinary and poster pages fit.
+        assert!(fits_at_min_dpi(612.0, 792.0));
+        assert!(fits_at_min_dpi(14_400.0, 14_400.0));
+        // The axis limit at 1 dpi: 16382 px is 1179504 pt.
+        assert!(fits_at_min_dpi(1_179_504.0, 10.0));
+        assert!(fits_at_min_dpi(10.0, 1_179_504.0));
+        assert!(!fits_at_min_dpi(1_179_600.0, 10.0));
+        assert!(!fits_at_min_dpi(10.0, 1_179_600.0));
+        // The area limit at 1 dpi: 64 Mpx is 576000 pt
+        // square.
+        assert!(fits_at_min_dpi(570_000.0, 570_000.0));
+        assert!(!fits_at_min_dpi(580_000.0, 580_000.0));
+        assert!(!fits_at_min_dpi(2_000_000.0, 2_000_000.0));
+        // A size that is not a finite number never fits.
+        assert!(!fits_at_min_dpi(f64::NAN, 100.0));
+        assert!(!fits_at_min_dpi(100.0, f64::NAN));
+        assert!(!fits_at_min_dpi(f64::INFINITY, 100.0));
+        // Every page that fits renders within both limits at
+        // the DPI the clamp gives it.
+        for (w, h) in [
+            (1_179_504.0, 10.0),
+            (570_000.0, 570_000.0),
+            (300_000.0, 1_000.0),
+            (14_400.0, 14_400.0),
+        ] {
+            let dpi = (render_scale(w, h) * 72.0).floor().max(MIN_RENDER_DPI);
+            let (rw, rh) = (raster_side(w, dpi), raster_side(h, dpi));
+            assert!(
+                rw <= MAX_RASTER_AXIS && rh <= MAX_RASTER_AXIS,
+                "{w}x{h} at {dpi}"
+            );
+            assert!(
+                rw * rh <= MAX_RASTER_PIXELS + rw + rh + 1.0,
+                "{w}x{h} at {dpi}"
+            );
+        }
     }
 
     /// The raster side the reference renderer draws for a
@@ -863,6 +968,42 @@ exit 0\n";
     }
 
     #[test]
+    fn render_asks_the_renderer_for_the_crop_box() {
+        // The probe reports the crop box as the page size
+        // and the scale is clamped for that size, so the
+        // renderer is asked to draw the crop box too: its
+        // default, the media box, can be larger. The fake
+        // renderer records its argv, one argument per line.
+        let dir = temp_dir("argv");
+        let argv = dir.join("argv");
+        write_tool(&dir, "pdfinfo", INFO_OK);
+        let render = format!(
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' \"$@\" > '{}'\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
+            argv.display()
+        );
+        let program = write_tool(&dir, "pdftocairo", &render);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        renderer.render_page(b"%PDF- fake", 2).unwrap();
+        let recorded = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            [
+                "-png",
+                "-singlefile",
+                "-cropbox",
+                "-f",
+                "2",
+                "-l",
+                "2",
+                "-r",
+                "144",
+                "-",
+                "-"
+            ]
+        );
+    }
+
+    #[test]
     fn render_refuses_a_password_document_from_the_probe() {
         let (_tools, program) = fake_pair(
             "password",
@@ -885,6 +1026,37 @@ exit 0\n";
         let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
         let err = renderer.render_page(b"junk", 1).unwrap_err();
         assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+    }
+
+    #[test]
+    fn render_refuses_a_page_too_large_for_the_minimum_dpi_before_rendering() {
+        // A page past the raster limits even at 1 dpi, the
+        // lowest resolution the renderer is asked for, is
+        // refused from the probe's size: the renderer never
+        // runs (its marker file stays absent).
+        for size in [
+            "2e+06 x 2e+06",
+            "1.5e+06 x 10",
+            "10 x 1.5e+06",
+            "580000 x 580000",
+        ] {
+            let dir = temp_dir("too-large");
+            let marker = dir.join("rendered");
+            let info = format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page    1 size:  {size} pts'\nexit 0\n"
+            );
+            let render = format!(
+                "#!/bin/sh\ncat > /dev/null\ntouch \"{}\"\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
+                marker.display()
+            );
+            write_tool(&dir, "pdfinfo", &info);
+            let program = write_tool(&dir, "pdftocairo", &render);
+            let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+            let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
+            assert!(matches!(err, PdfError::NotPdf(_)), "{size}: {err}");
+            assert!(err.to_string().contains("too large"), "{size}: {err}");
+            assert!(!marker.exists(), "{size}: the renderer must not run");
+        }
     }
 
     #[test]
@@ -1044,24 +1216,37 @@ exit 0\n";
     /// so the real-tool test needs no generator.
     fn two_page_pdf() -> Vec<u8> {
         let content = |color: &str| format!("{color} rg\n0 0 612 792 re\nf\n");
-        let objects: Vec<String> = vec![
+        pdf_document(&[
+            ("/MediaBox [0 0 612 792]", content("1 0 0")),
+            ("/MediaBox [0 0 612 792]", content("0 0 1")),
+        ])
+    }
+
+    /// A PDF written by hand, one page per entry: the
+    /// page dictionary's box (and rotation) entries, and
+    /// its uncompressed content stream.
+    fn pdf_document(pages: &[(&str, String)]) -> Vec<u8> {
+        let kids: Vec<String> = (0..pages.len())
+            .map(|i| format!("{} 0 R", 3 + 2 * i))
+            .collect();
+        let mut objects: Vec<String> = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-            "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".to_string(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>"
-                .to_string(),
             format!(
-                "<< /Length {} >>\nstream\n{}endstream",
-                content("1 0 0").len(),
-                content("1 0 0")
-            ),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << >> >>"
-                .to_string(),
-            format!(
-                "<< /Length {} >>\nstream\n{}endstream",
-                content("0 0 1").len(),
-                content("0 0 1")
+                "<< /Type /Pages /Kids [{}] /Count {} >>",
+                kids.join(" "),
+                pages.len()
             ),
         ];
+        for (i, (boxes, content)) in pages.iter().enumerate() {
+            objects.push(format!(
+                "<< /Type /Page /Parent 2 0 R {boxes} /Contents {} 0 R /Resources << >> >>",
+                4 + 2 * i
+            ));
+            objects.push(format!(
+                "<< /Length {} >>\nstream\n{content}endstream",
+                content.len()
+            ));
+        }
         let mut out = Vec::new();
         out.extend_from_slice(b"%PDF-1.4\n");
         let mut offsets = Vec::new();
@@ -1083,6 +1268,14 @@ exit 0\n";
             .as_bytes(),
         );
         out
+    }
+
+    /// A PNG's width and height from its header, without
+    /// decoding the raster.
+    fn png_size(png: &[u8]) -> (u32, u32) {
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n") && png.len() >= 24);
+        let be = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+        (be(16), be(20))
     }
 
     /// The reference tools' directory, resolved from
@@ -1140,5 +1333,125 @@ exit 0\n";
         // Junk bytes are not a PDF, from the real probe.
         let err = renderer.render_page(b"not a pdf at all", 1).unwrap_err();
         assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+    }
+
+    /// End to end against the real Poppler: a page whose
+    /// media box is ten times its crop box on each side.
+    /// The probe reports the crop box, the clamp is sized
+    /// from it, and the raster is that same box. Drawn
+    /// whole at the scale the crop box allows, the 4100 pt
+    /// media box would be 8200 px square, 67.24 Mpx, past
+    /// the 64 Mpx area clamp.
+    #[test]
+    fn real_tools_draw_the_crop_box_the_clamp_is_sized_from() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program, Duration::from_secs(60)).unwrap();
+        // The media box is blue and the crop box, at the
+        // origin, red: a raster with any blue in it drew
+        // past the crop box.
+        let bytes = pdf_document(&[(
+            "/MediaBox [0 0 4100 4100] /CropBox [0 0 410 410]",
+            "0 0 1 rg\n0 0 4100 4100 re\nf\n1 0 0 rg\n0 0 410 410 re\nf\n".to_string(),
+        )]);
+        let probe = renderer.probe(&bytes, 1).unwrap();
+        assert_eq!((probe.page_width, probe.page_height), (410.0, 410.0));
+        assert_eq!(render_scale(410.0, 410.0), RENDER_SCALE);
+
+        let page = renderer.render_page(&bytes, 1).unwrap();
+        let (width, height) = png_size(&page.png);
+        assert_eq!(
+            (width, height),
+            (820, 820),
+            "the raster is the crop box at the clamped scale"
+        );
+        assert!(f64::from(width) * f64::from(height) <= MAX_RASTER_PIXELS);
+        assert_eq!((page.page_width, page.page_height), (410.0, 410.0));
+        let img = image::load_from_memory(&page.png).unwrap().to_rgb8();
+        for (x, y) in [(0, 0), (819, 0), (0, 819), (819, 819), (410, 410)] {
+            let p = img.get_pixel(x, y);
+            assert!(
+                p[0] > 200 && p[1] < 60 && p[2] < 60,
+                "({x}, {y}) is inside the crop box: {p:?}"
+            );
+        }
+    }
+
+    /// End to end against the real Poppler: a page whose
+    /// crop box is its media box but too long to fit 16382
+    /// px even at 1 dpi is refused from the probe's size,
+    /// before the renderer draws it past the axis limit.
+    #[test]
+    fn real_tools_refuse_a_page_too_large_for_the_minimum_dpi() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program, Duration::from_secs(30)).unwrap();
+        let bytes = pdf_document(&[(
+            "/MediaBox [0 0 1500000 10]",
+            "0 0 1 rg\n0 0 1500000 10 re\nf\n".to_string(),
+        )]);
+        let probe = renderer.probe(&bytes, 1).unwrap();
+        assert_eq!((probe.page_width, probe.page_height), (1_500_000.0, 10.0));
+        let err = renderer.render_page(&bytes, 1).unwrap_err();
+        assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    /// End to end against the real Poppler: a page whose
+    /// crop box is its media box, stated or by default, and
+    /// a rotated one, render the same bytes as the renderer
+    /// run without `-cropbox`, the invocation before the
+    /// renderer was asked for the crop box.
+    #[test]
+    fn real_tools_render_pages_with_matching_boxes_as_before() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program.clone(), Duration::from_secs(30)).unwrap();
+        let fill = |color: &str, w: u32, h: u32| format!("{color} rg\n0 0 {w} {h} re\nf\n");
+        let stated = pdf_document(&[
+            (
+                "/MediaBox [0 0 612 792] /CropBox [0 0 612 792]",
+                fill("0 1 0", 300, 400),
+            ),
+            (
+                "/MediaBox [0 0 595 842] /Rotate 90",
+                fill("1 0 1", 200, 600),
+            ),
+        ]);
+        for bytes in [two_page_pdf(), stated] {
+            for page in 1..=2u32 {
+                let rendered = renderer.render_page(&bytes, page).unwrap();
+                let page_arg = page.to_string();
+                let before = renderer
+                    .run(
+                        &program,
+                        "renderer",
+                        &[
+                            "-png",
+                            "-singlefile",
+                            "-f",
+                            &page_arg,
+                            "-l",
+                            &page_arg,
+                            "-r",
+                            "144",
+                            "-",
+                            "-",
+                        ],
+                        &bytes,
+                        MAX_PAGE_PNG_BYTES,
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .unwrap();
+                assert!(before.status.success(), "{}", before.stderr_excerpt());
+                assert!(
+                    rendered.png == before.stdout,
+                    "page {page} renders the bytes it rendered before"
+                );
+            }
+        }
     }
 }

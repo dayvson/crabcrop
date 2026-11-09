@@ -223,6 +223,13 @@ const AI_GATE_PERMITS: usize = 2;
 /// run one at a time, on top of the slow lane (issue #324).
 const ANIM_GATE_PERMITS: usize = 1;
 
+/// Permits on the probe gate: heavy `/explain` probes (an
+/// SVG's parse in a worker process, an AVIF's decode) run
+/// on blocking threads, at most two at once, so a burst of
+/// explain requests cannot occupy the async runtime or
+/// start a worker per request.
+const PROBE_GATE_PERMITS: usize = 2;
+
 /// The result stores a configuration names, opened (see
 /// [`open_stores`]) for [`build_state`].
 struct Stores {
@@ -397,6 +404,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         provenance_signer,
         video_gate: Arc::new(tokio::sync::Semaphore::new(crate::video::GATE_PERMITS)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(ANIM_GATE_PERMITS)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(PROBE_GATE_PERMITS)),
         inflight: Arc::new(crate::server::Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
         background: crate::server::Background::default(),
@@ -477,7 +485,19 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// setting, PR #493; `upscale` and `remove_region` on a
 /// 16-bit or float source keep its alpha and its depth
 /// instead of serving opaque 8-bit RGB, which showed the
-/// color stored under transparent pixels #551).
+/// color stored under transparent pixels #551; SVG sources
+/// whose reference fan-out (an id carried by many elements,
+/// an `inherit`, `context-*`, or `<use>` value list, or a
+/// memoized subtree reached from many sites) or whose
+/// stylesheet matching made the in-process pre-parse bound
+/// take time more than linear in the document, which usvg
+/// would render but are now refused with `502` instead, so
+/// the bound stays within the linear work its documentation
+/// promises; a PDF page whose crop box is smaller than its
+/// media box rendered as its crop box, the size the probe
+/// measures, instead of its media box; and a PDF page too
+/// large to fit the raster limits at 1 dpi refused instead
+/// of rendered past them).
 const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered
@@ -2452,6 +2472,7 @@ mod tests {
         // The gate sizes are the documented constants.
         assert_eq!(state.ai_gate.available_permits(), AI_GATE_PERMITS);
         assert_eq!(state.anim_gate.available_permits(), ANIM_GATE_PERMITS);
+        assert_eq!(state.probe_gate.available_permits(), PROBE_GATE_PERMITS);
         assert_eq!(
             state.video_gate.available_permits(),
             crate::video::GATE_PERMITS

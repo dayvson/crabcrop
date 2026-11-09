@@ -268,6 +268,7 @@ fn the_preset_map_holds_definitions_the_server_accepts() {
     // real operations: each definition passes the boot-time
     // validation, and a request naming one expands and parses.
     for (name, definition) in crabcrop_fuzz::presets() {
+        let definition = definition.as_str();
         assert!(
             url::parse_preset_operations(definition).is_ok(),
             "preset {name} = {definition} would be refused at boot"
@@ -281,6 +282,40 @@ fn the_preset_map_holds_definitions_the_server_accepts() {
             "{name} expands to {expanded}, which does not parse"
         );
         crabcrop_fuzz::check(&request);
+    }
+}
+
+#[test]
+fn repeated_references_satisfy_the_counted_expansion_invariants() {
+    // Expansion counts before it builds. Around and far past
+    // the operation cap, by references alone, interleaved with
+    // free-form operations or metadata, and followed by every
+    // kind of tail (a source, none, an empty segment, a
+    // malformed operation, an unknown name, a bad expiry, a
+    // source holding `preset:` text), its answer must match
+    // splicing every reference and parsing the result.
+    let tails = [
+        "example.com/img.jpg",
+        "",
+        "/example.com/img.jpg",
+        "filters:bogus/x.jpg",
+        "preset:nope/x.jpg",
+        "exp:x/example.com/img.jpg",
+        "example.com/preset:thumb/img.jpg",
+    ];
+    for name in crabcrop_fuzz::presets().keys() {
+        for unit in [
+            format!("preset:{name}/"),
+            format!("preset:{name}/filters:invert/"),
+            format!("preset:{name}/exp:9/maxage:60/"),
+        ] {
+            for refs in [1, 33, 34, 50, 51, 99, 100, 101, 400] {
+                let ops = unit.repeat(refs);
+                for tail in tails {
+                    crabcrop_fuzz::check(&format!("/unsafe/{ops}{tail}"));
+                }
+            }
+        }
     }
 }
 
@@ -607,16 +642,26 @@ fn render_size_check_rejects_a_render_past_the_bound() {
 #[cfg(feature = "avif-decode")]
 fn the_decode_corpus_reaches_the_shipped_avif_decoder() {
     // Issue #476: with the avif-decode feature (the fuzz
-    // crate's default, as in every shipped build) the AVIF
-    // seed decodes through dav1d, so the decode target
-    // fuzzes the decoder the server runs.
-    let seed = byte_corpus_inputs("decode")
+    // crate's default, as in every shipped build) a valid
+    // AVIF seed decodes through dav1d, so the decode target
+    // fuzzes the decoder the server runs. The corpus also
+    // holds AVIF seeds the container screen refuses (issue
+    // #522), so this finds one that decodes rather than the
+    // first with an AVIF brand.
+    let avif_seeds: Vec<Vec<u8>> = byte_corpus_inputs("decode")
         .into_iter()
-        .find(|s| s.get(4..12) == Some(b"ftypavif".as_slice()))
-        .expect("an AVIF seed");
-    let img = crabcrop_fuzz::engine::decode_image(&seed).expect("the AVIF seed decodes");
-    assert!(img.width() > 0 && img.height() > 0);
-    crabcrop_fuzz::check_decode(&seed);
+        .filter(|s| s.get(4..12) == Some(b"ftypavif".as_slice()))
+        .collect();
+    let decoded = avif_seeds
+        .iter()
+        .find_map(|s| crabcrop_fuzz::engine::decode_image(s).ok())
+        .expect("a valid AVIF seed decodes");
+    assert!(decoded.width() > 0 && decoded.height() > 0);
+    // Every AVIF seed, decodable or refused, runs the decode
+    // path without a panic or a runaway allocation.
+    for seed in &avif_seeds {
+        crabcrop_fuzz::check_decode(seed);
+    }
 }
 
 #[test]

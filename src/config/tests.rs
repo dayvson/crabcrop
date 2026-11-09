@@ -707,7 +707,7 @@ fn presets_construction_reads_and_validates_the_file() {
         ("CRABCROP_ONLY_PRESETS", "1"),
     ]))
     .unwrap();
-    assert_eq!(presets["thumb"], "300x200");
+    assert_eq!(presets["thumb"].as_str(), "300x200");
     assert!(only);
     // ...but refused without one: it would reject every
     // transformed request.
@@ -1095,7 +1095,7 @@ fn parses_preset_files() {
         )
         .unwrap();
     assert_eq!(map.len(), 2);
-    assert_eq!(map["thumb"], "300x200");
+    assert_eq!(map["thumb"].as_str(), "300x200");
     for bad in [
         "no-equals-here",
         "bad name = 300x200",
@@ -1129,6 +1129,22 @@ fn parses_preset_files() {
         err,
         "preset big has 101 operations, over the 100 operation cap"
     );
+    // A body longer than a request may expand to refuses
+    // at boot too: one operation, but a long watermark URL.
+    let long = |len: usize| {
+        let (head, tail) = (
+            "filters:watermark(https%3A%2F%2Fexample.com%2F",
+            ".png,0,0,100)",
+        );
+        format!("{head}{}{tail}", "w".repeat(len - head.len() - tail.len()))
+    };
+    assert_eq!(long(MAX_PRESET_LEN).len(), MAX_PRESET_LEN);
+    let map = parse_presets(&format!("big = {}", long(MAX_PRESET_LEN))).unwrap();
+    assert_eq!(map["big"].as_str().len(), MAX_PRESET_LEN);
+    let err = parse_presets(&format!("big = {}", long(MAX_PRESET_LEN + 1)))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(err, "preset big is 262145 bytes, over the 262144 byte cap");
 }
 
 /// The secret every `Config::from_env` test boots with.
