@@ -943,7 +943,7 @@ impl Engine {
                 ctx.check_deadline()?;
             }
             let ctx = ProcessContext { dpr, ..ctx.clone() };
-            self.process_selected(bytes, ops, ctx, directives.clone(), video, pdf)
+            self.process_selected(bytes, ops, ctx, &directives, video, pdf)
         })
     }
 
@@ -952,12 +952,14 @@ impl Engine {
     /// sniffing, preflight, decode, the operation chain, the
     /// still encode, and metadata embedding. `video` and `pdf`
     /// are the selection's records, carried onto the result.
+    /// `directives` are the request's one analysis of `ops`,
+    /// which every stage below reads (issue #480).
     fn process_selected(
         &self,
         bytes: &[u8],
         ops: &[Operation],
         ctx: ProcessContext<'_>,
-        directives: crate::url::RequestDirectives,
+        directives: &crate::url::RequestDirectives,
         video: Option<VideoSourceMeta>,
         pdf: Option<PdfSourceMeta>,
     ) -> Result<ProcessedImage, EngineError> {
@@ -979,9 +981,9 @@ impl Engine {
             .unwrap_or(detected);
         let keep_profile = directives.keep_profile
             && matches!(resolved_output, ImageFormat::Jpeg | ImageFormat::Png);
-        Self::preflight(&directives, &ctx, detected)?;
+        Self::preflight(directives, &ctx, detected)?;
         let (img, source_meta) =
-            match Self::decode_source(&source, ops, &ctx, &directives, keep_profile)? {
+            match Self::decode_source(&source, ops, &ctx, directives, keep_profile)? {
                 Decoded::Still(img, source_meta) => (img, source_meta),
                 Decoded::Rendered(processed) => return Ok(*processed),
             };
@@ -1002,7 +1004,7 @@ impl Engine {
             cap,
             dpr_factor(directives.dpr, &ctx),
             &ctx,
-            &directives,
+            directives,
             None,
         )?;
         ctx.check_deadline()?;
@@ -1476,11 +1478,12 @@ impl Engine {
             let resolved =
                 animated_output_format(source.into(), directives.explicit_format, ctx.preferred);
             if let Some(format) = AnimatedFormat::of(resolved) {
-                let processed = Self::process_animated(frames, ops, ctx, format, loop_count)?;
+                let processed =
+                    Self::process_animated(frames, ops, ctx, directives, format, loop_count)?;
                 return Ok(Decoded::Rendered(Box::new(processed)));
             }
             if resolved.is_video() {
-                let processed = Self::process_video(frames, ops, ctx, resolved)?;
+                let processed = Self::process_video(frames, ops, ctx, directives, resolved)?;
                 return Ok(Decoded::Rendered(Box::new(processed)));
             }
         }
@@ -1694,11 +1697,11 @@ impl Engine {
         frames: Frames,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
+        directives: &crate::url::RequestDirectives,
         format: AnimatedFormat,
         loop_count: Option<u16>,
     ) -> Result<ProcessedImage, EngineError> {
-        let directives = crate::url::RequestDirectives::analyze(ops);
-        refuse_animated_ai(&directives)?;
+        refuse_animated_ai(directives)?;
         let (source_width, source_height) = frames.dimensions();
         let cap = if directives.no_upscale {
             Some(frames.dimensions())
@@ -1721,14 +1724,14 @@ impl Engine {
             smart_windows: Some(SmartWindows::default()),
             ..FrameShare::default()
         };
-        survey_trims(&frames, ops, cap, dpr, ctx, &directives, &mut share)?;
+        survey_trims(&frames, ops, cap, dpr, ctx, directives, &mut share)?;
         let frame_count = frames.len();
         for frame in frames {
             ctx.check_deadline()?;
             let delay = frame.delay();
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
             let (img, opts, _, _, _, _) =
-                apply_operations(img, ops, cap, dpr, ctx, &directives, Some(&mut share))?;
+                apply_operations(img, ops, cap, dpr, ctx, directives, Some(&mut share))?;
             if out_frames.is_empty() {
                 encode_opts = opts;
                 budget.check_frames(img.width(), img.height(), frame_count)?;
@@ -1859,6 +1862,7 @@ impl Engine {
         frames: Frames,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
+        directives: &crate::url::RequestDirectives,
         format: ImageFormat,
     ) -> Result<ProcessedImage, EngineError> {
         let encoder = ctx.video_encoder.ok_or_else(|| {
@@ -1867,8 +1871,7 @@ impl Engine {
                     .to_string(),
             )
         })?;
-        let directives = crate::url::RequestDirectives::analyze(ops);
-        refuse_animated_ai(&directives)?;
+        refuse_animated_ai(directives)?;
         let (source_width, source_height) = frames.dimensions();
         let cap = if directives.no_upscale {
             Some(frames.dimensions())
@@ -1882,14 +1885,14 @@ impl Engine {
         // as on the animated image paths: the encoder takes
         // one frame size.
         let mut share = FrameShare::default();
-        survey_trims(&frames, ops, cap, dpr, ctx, &directives, &mut share)?;
+        survey_trims(&frames, ops, cap, dpr, ctx, directives, &mut share)?;
         let frame_count = frames.len();
         for frame in frames {
             ctx.check_deadline()?;
             let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
             let img = DynamicImage::ImageRgba8(frame.into_buffer());
             let (img, _, _, _, _, _) =
-                apply_operations(img, ops, cap, dpr, ctx, &directives, Some(&mut share))?;
+                apply_operations(img, ops, cap, dpr, ctx, directives, Some(&mut share))?;
             if out_frames.is_empty() {
                 budget.check_frames(img.width(), img.height(), frame_count)?;
             }
@@ -2435,6 +2438,7 @@ fn hint_start(
     });
     Some(crate::explain::settle_hint(
         ops,
+        directives,
         &SourceProbe {
             dimensions,
             ..probe
