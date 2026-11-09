@@ -18,6 +18,7 @@ use image::{DynamicImage, GrayImage};
 
 mod checkpoint;
 mod clip;
+mod depth;
 mod detect;
 mod embedding;
 mod face;
