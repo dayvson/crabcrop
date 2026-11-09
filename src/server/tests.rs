@@ -8271,6 +8271,25 @@ async fn undecodable_watermark_fails_the_request() {
 
 /// An app with disk result storage rooted at `dir`.
 async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
+    spawn_app_on_store(test_store(dir)).await
+}
+
+/// The disk store the storage tests' apps run on, rooted
+/// at `dir`.
+fn test_store(dir: &std::path::Path) -> Arc<crate::storage::DiskStore> {
+    Arc::new(
+        crate::storage::DiskStore::open(
+            dir,
+            16 * 1024 * 1024,
+            crate::url::entry_key(b"disk-key-test"),
+        )
+        .unwrap(),
+    )
+}
+
+/// An app on the disk store `store`, which the test keeps a
+/// handle to.
+async fn spawn_app_on_store(store: Arc<crate::storage::DiskStore>) -> String {
     let state = AppState {
         keyring: crate::url::Keyring::single(SECRET.to_vec()),
         allow_unsafe: false,
@@ -8296,14 +8315,7 @@ async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
         focal: None,
         font: None,
         fallback: None,
-        store: Some(Arc::new(
-            crate::storage::DiskStore::open(
-                dir,
-                16 * 1024 * 1024,
-                crate::url::entry_key(b"disk-key-test"),
-            )
-            .unwrap(),
-        )),
+        store: Some(store),
         shared_store: None,
         upload: None,
         meta_enabled: true,
@@ -8589,165 +8601,96 @@ async fn disk_task_panic_degrades_and_counts_the_error() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Holds the server's read of a FIFO that stands in for a
-/// stored entry, and lets it go on every exit path once it
-/// has it (issue #543).
+/// Holds every entry read of one disk store, the way a slow
+/// disk holds a read, until the test lets them go or drops
+/// the gate (issues #543, #545). The test used to hold a
+/// read on a FIFO swapped in for an entry's file; the store
+/// no longer opens one.
 ///
-/// A thread of its own opens the FIFO's write end, so a read
-/// that wrongly blocks the runtime thread is still let go,
-/// and the test fails on its check instead of deadlocking.
-/// Every open it makes is non-blocking: an open for write
-/// fails at once while no reader has the FIFO open, so the
-/// thread never parks and can always be joined.
-///
-/// It lets readers go only while it lives. A read that first
-/// opens the FIFO after the gate's last open, and before the
-/// scratch directory unlinks it, still parks with no writer
-/// left, and the runtime's drop waits on it. Reaching that
-/// takes the request to miss the 30 s deadline for opening
-/// the entry and then arrive within microseconds of the
-/// gate's drop.
-///
-/// The test used to release the read with a detached thread
-/// that slept two seconds and then made one blocking open.
-/// When a check failed before then, the scratch directory's
-/// drop unlinked the FIFO, that open found no file, and the
-/// server's read stayed parked in open(2) on the orphaned
-/// FIFO. A `#[tokio::test]` runtime's drop waits for its
-/// blocking threads, so the test hung with its failure never
-/// printed.
-#[cfg(unix)]
-struct FifoGate {
-    release: Option<std::sync::mpsc::Sender<()>>,
-    released: Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+/// Each held read sends the instant it was held. A hold also
+/// ends on its own after [`DiskReadGate::BACKSTOP`], so a
+/// read that wrongly runs on the runtime thread cannot keep
+/// the test from reaching its checks, which then see that
+/// the backstop fired. Dropping the gate lets every hold go,
+/// so a failed check cannot leave a `#[tokio::test]`
+/// runtime's drop waiting for a held blocking thread.
+struct DiskReadGate {
+    store: Arc<crate::storage::DiskStore>,
+    shared: Arc<DiskReadGateShared>,
 }
 
-#[cfg(unix)]
-impl FifoGate {
-    /// How long the read is held when the test does not let
-    /// it go itself. A read that blocks the runtime thread
-    /// holds up /health until then, so the check fails within
-    /// this; a healthy /health answers far inside it, even on
-    /// a loaded runner.
+struct DiskReadGateShared {
+    released: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+    backstopped: std::sync::atomic::AtomicBool,
+}
+
+impl DiskReadGate {
+    /// How long a read is held when the test does not let it
+    /// go itself. A read that blocks the runtime thread holds
+    /// up /health until then, so the check fails within this;
+    /// a healthy /health answers far inside it, even on a
+    /// loaded runner.
     const BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
 
-    /// How often the thread looks for a reader.
-    const TICK: std::time::Duration = std::time::Duration::from_millis(5);
-
-    /// Starts watching the FIFO at `path`. The receiver gets
-    /// the instant the read was held: a reader had the FIFO
-    /// open, the gate opened its write end and writes
-    /// nothing, so the read waits.
+    /// Starts holding every entry read of `store`.
     fn hold(
-        path: std::path::PathBuf,
-    ) -> (Self, tokio::sync::oneshot::Receiver<std::time::Instant>) {
-        let (release, commands) = std::sync::mpsc::channel();
-        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = released.clone();
-        let thread = std::thread::spawn(move || {
-            Self::run(&path, &commands, held_tx, &flag);
+        store: &Arc<crate::storage::DiskStore>,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<std::time::Instant>,
+    ) {
+        let shared = Arc::new(DiskReadGateShared {
+            released: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+            backstopped: std::sync::atomic::AtomicBool::new(false),
         });
-        let gate = FifoGate {
-            release: Some(release),
-            released,
-            thread: Some(thread),
+        let (held_tx, held_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = shared.clone();
+        store.set_read_hold(Some(Arc::new(move || {
+            let _ = held_tx.send(std::time::Instant::now());
+            let released = hook.released.lock().unwrap();
+            let (_released, wait) = hook
+                .wake
+                .wait_timeout_while(released, Self::BACKSTOP, |released| !*released)
+                .unwrap();
+            if wait.timed_out() {
+                hook.backstopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        })));
+        let gate = DiskReadGate {
+            store: store.clone(),
+            shared,
         };
         (gate, held_rx)
     }
 
-    fn run(
-        path: &std::path::Path,
-        commands: &std::sync::mpsc::Receiver<()>,
-        held: tokio::sync::oneshot::Sender<std::time::Instant>,
-        released: &std::sync::atomic::AtomicBool,
-    ) {
-        use std::sync::mpsc::RecvTimeoutError;
-        // Wait for a reader. The write end, once open, is what
-        // keeps its read blocked: an empty pipe with a writer.
-        let writer = loop {
-            if let Some(writer) = Self::open_writer(path) {
-                break Some(writer);
-            }
-            match commands.recv_timeout(Self::TICK) {
-                Err(RecvTimeoutError::Timeout) => {}
-                // Let go, or the gate dropped, before any read came.
-                _ => break None,
-            }
-        };
-        if writer.is_some() {
-            let _ = held.send(std::time::Instant::now());
-            let _ = commands.recv_timeout(Self::BACKSTOP);
-        }
-        released.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Closing the only write end is the end of file the
-        // read sees.
-        drop(writer);
-        // A reader that opens the FIFO from now on is let go at
-        // once: the open for write ends its wait in open(2), the
-        // close is its end of file. This runs until the gate is
-        // dropped, which the test does before the scratch
-        // directory goes.
-        loop {
-            drop(Self::open_writer(path));
-            if let Err(RecvTimeoutError::Disconnected) = commands.recv_timeout(Self::TICK) {
-                break;
-            }
-        }
-        drop(Self::open_writer(path));
-    }
-
-    /// The FIFO's write end, opened without blocking, or
-    /// `None` while no reader has it open (ENXIO), or once
-    /// the path is no longer the FIFO: the server unlinks a
-    /// corrupt entry and stores a fresh one there.
-    fn open_writer(path: &std::path::Path) -> Option<std::os::fd::OwnedFd> {
-        use rustix::fs::{Mode, OFlags};
-        use std::os::unix::fs::FileTypeExt;
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        if !meta.file_type().is_fifo() {
-            return None;
-        }
-        rustix::fs::open(
-            path,
-            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .ok()
-    }
-
-    /// Lets the held read go: the write end closes and the
-    /// read sees end of file.
+    /// Lets every held read go, and every later one through.
     fn release(&self) {
-        if let Some(release) = &self.release {
-            let _ = release.send(());
-        }
+        *self.shared.released.lock().unwrap() = true;
+        self.shared.wake.notify_all();
     }
 
-    /// Whether the read has been let go, by the test or by
-    /// the backstop.
-    fn released(&self) -> bool {
-        self.released.load(std::sync::atomic::Ordering::SeqCst)
+    /// Whether a hold ended on its backstop instead of on the
+    /// test's release.
+    fn backstopped(&self) -> bool {
+        self.shared
+            .backstopped
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
-#[cfg(unix)]
-impl Drop for FifoGate {
+impl Drop for DiskReadGate {
     fn drop(&mut self) {
-        // Hanging up lets any held read go and stops the
-        // thread, which never blocks, so the join returns.
-        drop(self.release.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.store.set_read_hold(None);
+        self.release();
     }
 }
 
 /// Awaits `fut`, failing the test with `what` if it takes
 /// longer than `limit` (issue #543): a stuck step names
 /// itself instead of holding the suite.
-#[cfg(unix)]
 async fn within<F: std::future::Future>(
     limit: std::time::Duration,
     what: &str,
@@ -8760,17 +8703,17 @@ async fn within<F: std::future::Future>(
 }
 
 /// A disk read that blocks must not stall the runtime
-/// worker (issue #347): the stored entry's file is
-/// swapped for a FIFO whose read is held, and /health has
-/// to answer while it is. Every request and the wait for
-/// the read have a deadline, and the gate lets a held read
-/// go on every exit path, so a failure is reported rather
-/// than hanging the suite (issue #543).
-#[cfg(unix)]
+/// worker (issue #347): the second instance's entry reads
+/// are held, as a slow disk would hold them, and /health has
+/// to answer while the pending request's read is. Every
+/// request and the wait for the read have a deadline, and
+/// the gate lets a held read go on every exit path, so a
+/// failure is reported rather than hanging the suite (issue
+/// #543).
 #[tokio::test]
 async fn blocked_disk_read_leaves_health_responsive() {
     let limit = std::time::Duration::from_secs(30);
-    let dir = crate::test_support::scratch_dir("srv-fifo");
+    let dir = crate::test_support::scratch_dir("srv-held-read");
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let base = spawn_app_with_storage(&dir).await;
     let remainder = format!("25x25/{src}");
@@ -8786,28 +8729,12 @@ async fn blocked_disk_read_leaves_health_responsive() {
     // A second instance on the same directory: its
     // memory is cold, so its requests reach the disk
     // tier. Its index is built now, from the real file.
-    let base = spawn_app_with_storage(&dir).await;
-    let bins: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
-        .collect();
-    let [bin] = bins.as_slice() else {
-        panic!("expected the one stored entry file, found {bins:?}");
-    };
-    std::fs::remove_file(bin).unwrap();
-    assert!(
-        std::process::Command::new("mkfifo")
-            .arg(bin)
-            .status()
-            .unwrap()
-            .success()
-    );
+    let store = test_store(&dir);
+    let base = spawn_app_on_store(store.clone()).await;
     // Declared after `dir`, so a failed check drops it
-    // first: the read is let go before the FIFO is
-    // unlinked.
-    let (gate, held) = FifoGate::hold(bin.clone());
+    // first: the read is let go before the directory is
+    // removed.
+    let (gate, mut held) = DiskReadGate::hold(&store);
     let pending_base = base.clone();
     let pending_path = url_path.clone();
     let pending = tokio::spawn(async move {
@@ -8816,9 +8743,13 @@ async fn blocked_disk_read_leaves_health_responsive() {
             .send()
             .await
     });
-    let held_at = within(limit, "the pending request to open the stored entry", held)
-        .await
-        .expect("the FIFO gate stopped before any read came");
+    let held_at = within(
+        limit,
+        "the pending request to read the stored entry",
+        held.recv(),
+    )
+    .await
+    .expect("the gate stopped before any read came");
     let health = within(
         limit,
         "/health to answer while a disk read is held",
@@ -8828,12 +8759,12 @@ async fn blocked_disk_read_leaves_health_responsive() {
     .unwrap();
     assert_eq!(health.status(), 200);
     assert!(
-        !gate.released(),
+        !gate.backstopped(),
         "/health answered only after the gate's {:?} backstop let the \
          held read go ({:?} after it was held): the runtime thread was \
          blocked while the read was held, by the read itself (#347) or \
          by a starved runner",
-        FifoGate::BACKSTOP,
+        DiskReadGate::BACKSTOP,
         held_at.elapsed()
     );
     gate.release();
@@ -8846,6 +8777,11 @@ async fn blocked_disk_read_leaves_health_responsive() {
     .unwrap()
     .unwrap();
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "cache-status"),
+        "crabcrop; hit; detail=\"disk\"",
+        "the held read was the stored entry's, and it served"
+    );
     drop(gate);
     let _ = std::fs::remove_dir_all(&dir);
 }

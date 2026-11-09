@@ -8,6 +8,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - In the library, `crabcrop::url::Quality::resolved_for` returns `Option<ResolvedQuality>` instead of `Option<Quality>` (issue #480). `ResolvedQuality` is a new name for `QualityValue`, the two forms a resolved quality takes, so code that matched `Quality::Value` or `Quality::Auto` on the result matches `ResolvedQuality::Value` or `ResolvedQuality::Auto` instead and needs no arm for the per-format list, which the method never returned. Inside the engine, invariants it checked at run time are now carried by its types (the frame decoders return a list that cannot be empty, the still encoder takes a format with no video variant, and the request's operations are analyzed once), and the GIF and animated WebP decode branches, the animated and video frame loops, and the overlay and watermark compositing each share one implementation. Behavior and rendered bytes are unchanged.
 
+### Fixed
+
+- A FIFO, or anything else that is not a regular file, at an entry path in the disk tier's directory (`CRABCROP_RESULT_STORAGE_DIR`) no longer blocks boot or a lookup (issue #545). Entry files were opened with a plain open, which waits on a FIFO until a writer opens it. A FIFO named like an entry (`<64 hex digits>.bin`) held the boot scan, so the server never listened. One that took a stored entry's place held every lookup of that key, each holding one of the 32 disk operation slots. The boot scan now skips anything at an entry path that is not a regular file (a FIFO, a socket, a device, a directory or a symlink) without opening it, logs it, and leaves it in place. A lookup opens an entry without waiting, checks what it opened, and treats anything that is not a regular file as a corrupt entry: a miss, and the path is deleted unless it is a directory. Response bytes are unchanged.
+
 ## [0.10.1] - 2026-11-09
 
 ### Changed
