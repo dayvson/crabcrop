@@ -1243,9 +1243,16 @@ async fn end_purge(
 /// Load the shared bucket's purge tombstones before serving
 /// (issue #461), then keep them fresh every
 /// `TOMBSTONE_REFRESH` on one background task. Without a
-/// shared tier there is nothing to read. A failed boot read
-/// is counted and logged, and the refresher retries: the
-/// tier stays best-effort, like every other shared read.
+/// shared tier there is nothing to read. Each refresh, the
+/// boot one included, ends within
+/// [`crate::s3store::TOMBSTONE_REFRESH_DEADLINE`] (issue
+/// #549), so a slow or hanging store delays the first
+/// request by that much at most. A failed or unfinished
+/// boot read is counted and logged, and the refresher
+/// retries: the tier stays best-effort, like every other
+/// shared read. Serving does not start first: lookups
+/// consult the tombstones, so a request served before them
+/// could hand out a copy a purge removed.
 pub async fn start_purge_tombstones(state: &AppState) {
     let Some(shared) = state.shared_store.clone() else {
         return;
