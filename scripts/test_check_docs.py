@@ -111,22 +111,43 @@ impl ParseError {
 }
 
 fn parse_filters(rest: &str, seg: &str) -> Result<Operation, ParseError> {
-    for part in split(rest) {
-        let filter = match (name, params) {
-            ("grayscale", None) => Filter::Grayscale,
-            ("blur", Some(p)) => {
-                if p.is_empty() {
-                    return Err(invalid());
-                }
-                Filter::Blur(p.parse()?)
-            }
-            ("blur_region", Some(p))
-            | ("pixelate_region", Some(p)) => region(p)?,
-            ("watermark", Some(p)) => watermark(p)?,
-            ("quality", Some(p)) => quality(p)?,
-            _ => return Err(invalid()),
-        };
-    }
+    let filters = split(rest).map(|(name, params)| filters::read_filter(name, params, seg));
+    filters.collect::<Result<_, _>>().map(Operation::Filters)
+}
+"""
+
+FILTERS_RS = r"""
+//! - `"glow" => Glow;` in a doc comment is not a row.
+
+macro_rules! filter_specs {
+    ($($rows:tt)*) => {
+        filter_specs!(@rows [] [] [] [] $($rows)*);
+    };
+}
+
+filter_specs! {
+    "grayscale" => Grayscale;
+    "blur"(sigma: BLUR_SIGMA) => Blur(sigma);
+    "blur_region"(x: REGION_ORIGIN, y: REGION_ORIGIN, w: REGION_EXTENT, h: REGION_EXTENT)
+        => BlurRegion { x, y, w, h };
+    "pixelate_region"(
+        x: REGION_ORIGIN,
+        y: REGION_ORIGIN,
+        w: REGION_EXTENT,
+        h: REGION_EXTENT
+    ) => PixelateRegion { x, y, w, h };
+    "watermark"(custom read_watermark)
+        => Watermark { url, x, y, alpha } spelled watermark_args(url, *x, *y, *alpha);
+    "quality"(custom |p| parse_quality(p).map(Filter::Quality))
+        => Quality(quality) spelled quality_args(quality);
+}
+
+fn read_watermark(p: &str) -> Option<Filter> {
+    let url = match p {
+        "glow" => return None,
+        url => url,
+    };
+    Some(Filter::Watermark { url: url.into() })
 }
 """
 
@@ -202,6 +223,7 @@ TREE = {
     "src/server.rs": SERVER_RS,
     "src/server/tests.rs": SERVER_TESTS_RS,
     "src/url.rs": URL_RS,
+    "src/url/filters.rs": FILTERS_RS,
     "docs/configuration.md": CONFIGURATION_MD,
     "docs/responses.md": RESPONSES_MD,
     "docs/filters.md": FILTERS_MD,
@@ -560,13 +582,21 @@ class TreeChecks(unittest.TestCase):
 
     def test_filters_accepted_but_undocumented(self):
         self.edit(
-            "src/url.rs",
-            '("grayscale", None) => Filter::Grayscale,',
-            '("grayscale", None) => Filter::Grayscale,\n            ("sepia", None) => Filter::Sepia,',
+            "src/url/filters.rs",
+            '"grayscale" => Grayscale;',
+            '"grayscale" => Grayscale;\n    "sepia" => Sepia;',
         )
         self.assertOnly("filters", "filter sepia is accepted by parse_filters but has no row")
 
-    def test_filters_alternation_arm_counts(self):
+    def test_filters_shorthand_row_counts(self):
+        self.edit(
+            "src/url/filters.rs",
+            '"grayscale" => Grayscale;',
+            '"grayscale" => Grayscale;\n    shorthand "trim" => Trim(DEFAULT_TRIM_TOLERANCE);',
+        )
+        self.assertOnly("filters", "filter trim is accepted by parse_filters but has no row")
+
+    def test_filters_row_written_over_several_lines_counts(self):
         self.edit(
             "docs/filters.md",
             "| `pixelate_region` | `pixelate_region(x,y,w,h)` | Pixelate a box. | `filters:pixelate_region(1,2,3,4)` |\n",
@@ -577,6 +607,20 @@ class TreeChecks(unittest.TestCase):
     def test_filters_signature_line_documents_a_filter(self):
         self.edit("docs/filters.md", "filters:watermark(<url>", "watermark(<url>")
         self.assertOnly("filters", "filter watermark is accepted by parse_filters")
+
+    def test_filters_names_outside_the_table_do_not_count(self):
+        # read_watermark's match arm and the module doc hold a quoted name
+        # and an arrow, like a row, but sit outside the table.
+        text = (self.root / "src/url/filters.rs").read_text(encoding="utf-8")
+        self.assertIn('        "glow" => return None,', text)
+        self.assertEqual(self.problems(), [])
+        # The same line inside the table is a row.
+        self.edit("src/url/filters.rs", '    "grayscale" =>', '    "glow" => Glow;\n    "grayscale" =>')
+        self.assertOnly("filters", "filter glow is accepted by parse_filters but has no row")
+
+    def test_filters_without_the_table(self):
+        self.edit("src/url/filters.rs", "filter_specs! {", "filter_rows! {")
+        self.assertOnly("filters", "src/url/filters.rs has no filter_specs! table")
 
     def test_filters_row_for_a_filter_the_parser_rejects(self):
         self.edit(

@@ -72,6 +72,7 @@ jobs:
                 Cargo.lock|Cargo.toml|crates/*/Cargo.toml) tier=full ;;
                 src/*) tier=full ;;
                 tests/functional/*) tier=full ;;
+                src/url/*) tier=full ;;
               esac
             done <<< "$files"
           fi
