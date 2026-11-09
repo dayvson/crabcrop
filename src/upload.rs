@@ -136,8 +136,9 @@ enum Backend {
 
 /// The configured upload destination plus its bounds.
 /// Built at boot (`crate::build_upload_store`); `None`
-/// on the server state means uploads do not exist on
-/// this server and the route is never registered.
+/// on the server state means uploads are off: the route
+/// is still registered, and the handler answers
+/// `uploads_not_configured` (issue #467).
 #[derive(Debug)]
 pub struct UploadStore {
     backend: Backend,
@@ -233,10 +234,10 @@ impl UploadStore {
 
     /// The exact source reference a caller embeds in
     /// transform URLs for the object stored under `name`:
-    /// a `file://` path for a local destination (served
-    /// under the loader's file root, which boot points
-    /// at the upload directory), an `s3://` locator for a
-    /// bucket destination.
+    /// a `file://` path for a local destination (the
+    /// object's path under the loader's file root, see
+    /// `ref_prefix`), an `s3://` locator for a bucket
+    /// destination.
     pub fn source_ref(&self, name: &str) -> String {
         match &self.backend {
             Backend::Local(_) => format!("file:///{}{name}", self.ref_prefix),
