@@ -47,12 +47,20 @@ pub enum ConfigError {
     /// Variables refused together: a set configured half
     /// way, two settings that exclude each other, or one
     /// that needs another. `vars` are the variables the
-    /// message names; `reason` is the whole message.
+    /// message names; `reason` is the whole message. A set
+    /// configured half way (the C2PA identity, a credential
+    /// pair, the OCR models) reports here, not as
+    /// [`Missing`](ConfigError::Missing), even when `vars`
+    /// names only the one variable left to set: `Missing` is
+    /// for a variable the server needs on its own.
     Conflict {
         vars: Vec<&'static str>,
         reason: String,
     },
     /// The configuration file `var` names cannot be read.
+    /// `Display` ends with `source`'s message, which
+    /// `source()` also returns, so print the error with
+    /// `{}`, not with a reporter that appends each source.
     Io {
         var: &'static str,
         path: PathBuf,
@@ -106,16 +114,35 @@ const SECRET_VARIABLES: [&str; 6] = [
 
 impl ConfigError {
     /// `var`'s `value` refused, for `reason`. The value of a
-    /// variable that holds a secret is never kept.
+    /// variable that holds a secret is never kept, in the
+    /// error or in its message: a generic parser such as
+    /// [`parse_env_value`] quotes the value it refuses, so
+    /// for a secret every copy of it in `reason`, quoted or
+    /// bare, becomes `[redacted]`.
     fn invalid(var: &'static str, value: &str, reason: impl Into<String>) -> Self {
+        let mut reason = reason.into();
         let value = if SECRET_VARIABLES.contains(&var) {
+            if !value.is_empty() {
+                reason = reason
+                    .replace(&format!("{value:?}"), "[redacted]")
+                    .replace(value, "[redacted]");
+            }
             ConfigValue::Secret
         } else {
             ConfigValue::Text(value.to_string())
         };
+        ConfigError::Invalid { var, value, reason }
+    }
+
+    /// `var`'s value refused, for `reason`, keeping only the
+    /// fact that it was set: for a value that can carry a
+    /// credential although its variable is not a secret,
+    /// such as a store endpoint with a user and password.
+    /// `reason` must not quote the value.
+    fn invalid_redacted(var: &'static str, reason: impl Into<String>) -> Self {
         ConfigError::Invalid {
             var,
-            value,
+            value: ConfigValue::Secret,
             reason: reason.into(),
         }
     }
@@ -320,7 +347,7 @@ impl Config {
         if !(1..=600).contains(&process_timeout_secs) {
             return Err(ConfigError::invalid(
                 "CRABCROP_PROCESS_TIMEOUT_SECS",
-                &process_timeout_secs.to_string(),
+                &get("CRABCROP_PROCESS_TIMEOUT_SECS").unwrap_or_default(),
                 format!(
                     "CRABCROP_PROCESS_TIMEOUT_SECS must be between 1 and 600, got {process_timeout_secs}"
                 ),
@@ -340,7 +367,7 @@ impl Config {
         if !(1..=64).contains(&slow_lane_permits) {
             return Err(ConfigError::invalid(
                 "CRABCROP_SLOW_LANE_PERMITS",
-                &slow_lane_permits.to_string(),
+                &get("CRABCROP_SLOW_LANE_PERMITS").unwrap_or_default(),
                 format!(
                     "CRABCROP_SLOW_LANE_PERMITS must be between 1 and 64, got {slow_lane_permits}"
                 ),
@@ -365,7 +392,7 @@ impl Config {
         if !(1..=10).contains(&avif_speed) {
             return Err(ConfigError::invalid(
                 "CRABCROP_AVIF_SPEED",
-                &avif_speed.to_string(),
+                &get("CRABCROP_AVIF_SPEED").unwrap_or_default(),
                 format!("CRABCROP_AVIF_SPEED must be between 1 and 10, got {avif_speed}"),
             ));
         }
@@ -381,7 +408,7 @@ impl Config {
         if !(1..=2000).contains(&width_step) {
             return Err(ConfigError::invalid(
                 "CRABCROP_WIDTH_STEP",
-                &width_step.to_string(),
+                &get("CRABCROP_WIDTH_STEP").unwrap_or_default(),
                 format!("CRABCROP_WIDTH_STEP must be between 1 and 2000, got {width_step}"),
             ));
         }
@@ -390,7 +417,7 @@ impl Config {
         let cache_bytes = cache_mb.checked_mul(1024 * 1024).ok_or_else(|| {
             ConfigError::invalid(
                 "CRABCROP_CACHE_MAX_MB",
-                &cache_mb.to_string(),
+                &get("CRABCROP_CACHE_MAX_MB").unwrap_or_default(),
                 "CRABCROP_CACHE_MAX_MB is too large",
             )
         })?;
@@ -475,7 +502,7 @@ impl Config {
                 let max_bytes = max_mb.checked_mul(1024 * 1024).ok_or_else(|| {
                     ConfigError::invalid(
                         "CRABCROP_RESULT_STORAGE_MAX_MB",
-                        &max_mb.to_string(),
+                        &get("CRABCROP_RESULT_STORAGE_MAX_MB").unwrap_or_default(),
                         "CRABCROP_RESULT_STORAGE_MAX_MB is too large",
                     )
                 })?;
@@ -779,14 +806,21 @@ pub fn build_source_policy(
 /// scheme is a startup error, for the GCS endpoint as much
 /// as the S3 one (issue #455).
 pub fn store_endpoint(name: &'static str, endpoint: &str) -> Result<String, ConfigError> {
-    let parsed = reqwest::Url::parse(endpoint)
-        .map_err(|e| ConfigError::invalid(name, endpoint, format!("invalid {name}: {e}")))?;
+    // An endpoint can carry a user and password before its
+    // host (`https://key:secret@host`), so a refused one
+    // that holds an `@` is kept only as set; neither
+    // message quotes the endpoint.
+    let refuse = |reason: String| {
+        if endpoint.contains('@') {
+            ConfigError::invalid_redacted(name, reason)
+        } else {
+            ConfigError::invalid(name, endpoint, reason)
+        }
+    };
+    let parsed =
+        reqwest::Url::parse(endpoint).map_err(|e| refuse(format!("invalid {name}: {e}")))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(ConfigError::invalid(
-            name,
-            endpoint,
-            format!("{name} must be an http(s) URL"),
-        ));
+        return Err(refuse(format!("{name} must be an http(s) URL")));
     }
     Ok(endpoint.trim_end_matches('/').to_string())
 }
@@ -1061,7 +1095,7 @@ pub fn source_max_mb(get: &impl Fn(&str) -> Option<String>) -> Result<u64, Confi
     if !(1..=MAX_SOURCE_MAX_MB).contains(&mb) {
         return Err(ConfigError::invalid(
             "CRABCROP_SOURCE_MAX_MB",
-            &mb.to_string(),
+            &get("CRABCROP_SOURCE_MAX_MB").unwrap_or_default(),
             format!("CRABCROP_SOURCE_MAX_MB must be between 1 and {MAX_SOURCE_MAX_MB}, got {mb}"),
         ));
     }
@@ -1081,7 +1115,7 @@ pub fn source_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64,
     if !(1..=600).contains(&secs) {
         return Err(ConfigError::invalid(
             "CRABCROP_SOURCE_TIMEOUT_SECS",
-            &secs.to_string(),
+            &get("CRABCROP_SOURCE_TIMEOUT_SECS").unwrap_or_default(),
             format!("CRABCROP_SOURCE_TIMEOUT_SECS must be between 1 and 600, got {secs}"),
         ));
     }
@@ -1103,7 +1137,7 @@ pub fn shutdown_grace_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64,
     if !(1..=600).contains(&secs) {
         return Err(ConfigError::invalid(
             "CRABCROP_SHUTDOWN_GRACE_SECS",
-            &secs.to_string(),
+            &get("CRABCROP_SHUTDOWN_GRACE_SECS").unwrap_or_default(),
             format!("CRABCROP_SHUTDOWN_GRACE_SECS must be between 1 and 600, got {secs}"),
         ));
     }
@@ -1193,7 +1227,7 @@ pub fn source_buffer_budget(
     if !(cap_mb..=MAX_SOURCE_BUFFER_MB).contains(&mb) {
         return Err(ConfigError::invalid(
             "CRABCROP_SOURCE_BUFFER_MAX_MB",
-            &mb.to_string(),
+            &get("CRABCROP_SOURCE_BUFFER_MAX_MB").unwrap_or_default(),
             format!(
                 "CRABCROP_SOURCE_BUFFER_MAX_MB must be between {cap_mb} (the source fetch cap) \
                  and {MAX_SOURCE_BUFFER_MB}, got {mb}"
@@ -1243,7 +1277,7 @@ pub fn build_upload_store(
     if max_mb == 0 || max_mb > source_mb {
         return Err(ConfigError::invalid(
             "CRABCROP_UPLOAD_MAX_MB",
-            &max_mb.to_string(),
+            &get("CRABCROP_UPLOAD_MAX_MB").unwrap_or_default(),
             format!(
                 "CRABCROP_UPLOAD_MAX_MB must be between 1 and {source_mb} \
                  (the source fetch cap, CRABCROP_SOURCE_MAX_MB, an uploaded original \
@@ -1976,14 +2010,14 @@ pub fn video_config(get: impl Fn(&str) -> Option<String>) -> Result<VideoConfig,
     if !(1..=1024).contains(&max_mb) {
         return Err(ConfigError::invalid(
             "CRABCROP_VIDEO_MAX_MB",
-            &max_mb.to_string(),
+            &get("CRABCROP_VIDEO_MAX_MB").unwrap_or_default(),
             format!("CRABCROP_VIDEO_MAX_MB must be between 1 and 1024, got {max_mb}"),
         ));
     }
     let max_bytes = max_mb.checked_mul(1024 * 1024).ok_or_else(|| {
         ConfigError::invalid(
             "CRABCROP_VIDEO_MAX_MB",
-            &max_mb.to_string(),
+            &get("CRABCROP_VIDEO_MAX_MB").unwrap_or_default(),
             "CRABCROP_VIDEO_MAX_MB is too large",
         )
     })?;
@@ -2009,7 +2043,7 @@ fn video_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, Conf
     if !(1..=600).contains(&secs) {
         return Err(ConfigError::invalid(
             "CRABCROP_VIDEO_TIMEOUT_SECS",
-            &secs.to_string(),
+            &get("CRABCROP_VIDEO_TIMEOUT_SECS").unwrap_or_default(),
             format!("CRABCROP_VIDEO_TIMEOUT_SECS must be between 1 and 600, got {secs}"),
         ));
     }
@@ -2036,7 +2070,7 @@ pub fn pdf_config(get: impl Fn(&str) -> Option<String>) -> Result<PdfConfig, Con
     if !(1..=600).contains(&timeout_secs) {
         return Err(ConfigError::invalid(
             "CRABCROP_PDF_TIMEOUT_SECS",
-            &timeout_secs.to_string(),
+            &get("CRABCROP_PDF_TIMEOUT_SECS").unwrap_or_default(),
             format!("CRABCROP_PDF_TIMEOUT_SECS must be between 1 and 600, got {timeout_secs}"),
         ));
     }

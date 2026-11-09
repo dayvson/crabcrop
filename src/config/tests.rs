@@ -1505,20 +1505,71 @@ fn config_errors_never_carry_a_secret() {
         }
     }
     // Any refusal of a secret variable keeps no value, so a
-    // future check cannot leak one through `Debug`.
+    // future check cannot leak one: not in the value, and not
+    // in a message that quotes it, as the generic parsers'
+    // messages do, quoted (`{:?}`) or bare.
+    let value = "the-secret-value";
     for var in SECRET_VARIABLES {
-        let err = ConfigError::invalid(var, "the-secret-value", format!("{var} is refused"));
+        let refusals = [
+            ConfigError::invalid(var, value, format!("{var} is refused")),
+            ConfigError::invalid(var, value, format!("invalid {var}: {value:?}")),
+            ConfigError::invalid(var, value, format!("{var} {value} is refused")),
+            parse_env_value::<u16>(var, Some(value.to_string()), 0).unwrap_err(),
+            parse_bool_value(var, Some(value.to_string()), false).unwrap_err(),
+        ];
+        for err in refusals {
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Invalid {
+                        value: ConfigValue::Secret,
+                        ..
+                    }
+                ),
+                "{var}: {err:?}"
+            );
+            for rendered in [err.to_string(), format!("{err:?}"), format!("{err:#?}")] {
+                assert_no_secret(var, &rendered, value);
+            }
+        }
+    }
+    assert_eq!(
+        parse_env_value::<u16>("CRABCROP_METRICS_TOKEN", Some(value.to_string()), 0)
+            .unwrap_err()
+            .to_string(),
+        "invalid CRABCROP_METRICS_TOKEN: [redacted]"
+    );
+    // A store endpoint is not a secret, but it can carry a
+    // user and password: a refused one that does is kept only
+    // as set, and neither message quotes it.
+    for var in ["CRABCROP_S3_ENDPOINT", "CRABCROP_GCS_ENDPOINT"] {
+        for endpoint in [
+            "ftp://AKIAEXAMPLE:wJalrXUtnFEMIK7MDENG@minio.internal",
+            "0AKIAEXAMPLE:wJalrXUtnFEMIK7MDENG@minio.internal",
+        ] {
+            let err = refusal(&[(var, endpoint)]);
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Invalid {
+                        var: v,
+                        value: ConfigValue::Secret,
+                        ..
+                    } if *v == var
+                ),
+                "{err:?}"
+            );
+            for rendered in [err.to_string(), format!("{err:?}"), format!("{err:#?}")] {
+                assert_no_secret(var, &rendered, "wJalrXUtnFEMIK7MDENG");
+                assert_no_secret(var, &rendered, "AKIAEXAMPLE");
+            }
+        }
+        // One without an `@` is kept for the caller.
+        let err = refusal(&[(var, "ftp://minio.internal")]);
         assert!(
-            matches!(
-                &err,
-                ConfigError::Invalid {
-                    value: ConfigValue::Secret,
-                    ..
-                }
-            ),
-            "{var}"
+            format!("{err:?}").contains("\"ftp://minio.internal\""),
+            "{err:?}"
         );
-        assert_no_secret(var, &format!("{err:#?}"), "the-secret-value");
     }
     // A value that is not a secret is kept for the caller.
     let err = ConfigError::invalid("CRABCROP_WIDTH_STEP", "0", "refused");
@@ -1539,12 +1590,16 @@ fn config_debug_never_prints_a_secret() {
         ("CRABCROP_METRICS_TOKEN", "metrics-bearer-token-5f1c0e9a"),
     ];
     let mut pairs = secrets.to_vec();
+    // An upload bucket puts an S3 store, with the AWS
+    // credentials and the entry key, inside `Config`.
     pairs.extend([
         ("AWS_ACCESS_KEY_ID", "AKID"),
         ("CRABCROP_GCS_ACCESS_KEY", "GOOG1"),
         ("CRABCROP_ALLOWED_BUCKETS", "photos"),
+        ("CRABCROP_UPLOAD_BUCKET", "photos"),
     ]);
     let config = Config::from_env(env_of(&pairs)).unwrap();
+    assert!(config.upload.is_some());
     for rendered in [format!("{config:?}"), format!("{config:#?}")] {
         for (var, secret) in secrets {
             assert_no_secret(var, &rendered, secret);
