@@ -6202,6 +6202,139 @@ fn a_failing_encoder_is_a_video_error() {
     assert!(err.to_string().contains("no codec"), "{err}");
 }
 
+#[test]
+fn the_video_argv_is_the_pipe_contract_for_each_format() {
+    // Issue #568: the argv takes a video format instead of
+    // any output format. Each one's argv stays exactly what
+    // the encoder was run with before, end to end through the
+    // engine: the 40x20 frames at 100 ms each are 10 fps.
+    let (scripts, encoder) = video_test_encoder(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/argv.txt\"\ncat > /dev/null\nprintf 'ENGINE-VIDEO'\n",
+    );
+    let input = [
+        "-nostdin",
+        "-v",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-s",
+        "40x20",
+        "-r",
+        "10",
+        "-i",
+        "pipe:0",
+        "-an",
+        "-vf",
+        "format=yuv420p",
+    ];
+    let mp4 = [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+    ];
+    let webm = [
+        "-c:v",
+        "libvpx-vp9",
+        "-b:v",
+        "0",
+        "-crf",
+        "30",
+        "-f",
+        "webm",
+    ];
+    for (format, output) in [(ImageFormat::Mp4, &mp4[..]), (ImageFormat::WebM, &webm[..])] {
+        let out = Engine
+            .process_preferred(
+                &animated_gif_bytes(),
+                &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                    format,
+                ))])],
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (out.format, out.bytes.as_slice()),
+            (format, &b"ENGINE-VIDEO"[..])
+        );
+        let argv = std::fs::read_to_string(scripts.join("argv.txt")).unwrap();
+        let expected: Vec<&str> = input
+            .iter()
+            .chain(output)
+            .chain(&["pipe:1"])
+            .copied()
+            .collect();
+        assert_eq!(argv.lines().collect::<Vec<_>>(), expected, "{format:?}");
+    }
+}
+
+#[test]
+fn frame_renders_describe_their_first_processed_frame() {
+    // Issue #568: the animated and the video paths share one
+    // placeholder helper. Each render's placeholder is the
+    // first processed frame's (the red one; the second is
+    // blue), the one a still render of the first frame gets,
+    // and none is computed unless asked for. Every record
+    // only the still pipeline produces stays unset.
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let render = |format: ImageFormat, placeholders: bool| {
+        Engine
+            .process_preferred(
+                &animated_gif_bytes(),
+                &[
+                    size_op(Dimension::Pixels(20), Dimension::Pixels(10)),
+                    Operation::Filters(vec![Filter::Format(FormatSpec::plain(format))]),
+                ],
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    placeholders,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    let still = render(ImageFormat::Png, true).placeholder.unwrap();
+    assert_eq!(still.dominant_color, "#ff0000");
+    for format in [
+        ImageFormat::Gif,
+        ImageFormat::WebP,
+        ImageFormat::Mp4,
+        ImageFormat::WebM,
+    ] {
+        let out = render(format, true);
+        assert_eq!(out.format, format);
+        assert_eq!(out.placeholder.as_ref(), Some(&still), "{format:?}");
+        assert_eq!(
+            (out.width, out.height, out.source_width, out.source_height),
+            (20, 10, 40, 20),
+            "{format:?}"
+        );
+        assert!(
+            out.studio.is_none()
+                && out.inpaint.is_none()
+                && out.segments.is_none()
+                && out.objects_crop.is_none()
+                && out.ssimulacra2.is_none()
+                && out.video.is_none()
+                && out.pdf.is_none()
+                && out.provenance.is_none(),
+            "{format:?}"
+        );
+        assert_eq!(render(format, false).placeholder, None, "{format:?}");
+    }
+}
+
 /// Three 40x20 frames: red, green, blue, with delays of
 /// 100, 200, and 300 ms. Built with the oxideav encoder
 /// (the image crate's WebP encoder writes stills only);
@@ -10207,7 +10340,9 @@ fn avif_encode_bench() {
 fn the_format_types_cover_the_output_formats() {
     // Issue #480: the still encoder takes every output format
     // but the video ones, and the animated path takes GIF and
-    // WebP. Each type turns back into the format it came from.
+    // WebP. Issue #568: the video path takes MP4 and WebM, and
+    // `is_video` reads that list. Each type turns back into
+    // the format it came from.
     let all = [
         ImageFormat::Jpeg,
         ImageFormat::Png,
@@ -10227,6 +10362,19 @@ fn the_format_types_cover_the_output_formats() {
         assert_eq!(
             AnimatedFormat::of(format).map(ImageFormat::from),
             matches!(format, ImageFormat::Gif | ImageFormat::WebP).then_some(format),
+            "{format:?}"
+        );
+        let video = matches!(format, ImageFormat::Mp4 | ImageFormat::WebM);
+        assert_eq!(
+            crate::video::VideoFormat::of(format).map(ImageFormat::from),
+            video.then_some(format),
+            "{format:?}"
+        );
+        assert_eq!(format.is_video(), video, "{format:?}");
+        // Every format is either still or video, never both.
+        assert_ne!(
+            StillFormat::of(format).is_some(),
+            crate::video::VideoFormat::of(format).is_some(),
             "{format:?}"
         );
         assert_eq!(

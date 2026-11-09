@@ -1606,8 +1606,8 @@ impl Engine {
                     Self::process_animated(frames, ops, ctx, directives, format, loop_count)?;
                 return Ok(Decoded::Rendered(Box::new(processed)));
             }
-            if resolved.is_video() {
-                let processed = Self::process_video(frames, ops, ctx, directives, resolved)?;
+            if let Some(format) = crate::video::VideoFormat::of(resolved) {
+                let processed = Self::process_video(frames, ops, ctx, directives, format)?;
                 return Ok(Decoded::Rendered(Box::new(processed)));
             }
         }
@@ -1814,7 +1814,7 @@ impl Engine {
         format: AnimatedFormat,
         loop_count: Option<u16>,
     ) -> Result<ProcessedImage, EngineError> {
-        let (source_width, source_height) = frames.dimensions();
+        let source_size = frames.dimensions();
         // One smart crop window per crop for the whole
         // animation (issue #376): the first frame decides,
         // the rest replay. One trim window per trim (issue
@@ -1844,16 +1844,7 @@ impl Engine {
             }
             AnimatedFormat::Gif => QualityInForce::default(),
         };
-        let (width, height) = frames.dimensions();
-        // An animated output's placeholder comes from its first
-        // processed frame.
-        let placeholder = if ctx.placeholders {
-            Some(crate::placeholder::compute(&DynamicImage::ImageRgba8(
-                frames.first.buffer().clone(),
-            )))
-        } else {
-            None
-        };
+        let placeholder = first_frame_placeholder(&frames, ctx);
         let out = match format {
             AnimatedFormat::Gif => encode_animated_gif(&frames, ctx.deadline)?,
             AnimatedFormat::WebP => encode_animated_webp(
@@ -1864,24 +1855,14 @@ impl Engine {
                 ctx.deadline,
             )?,
         };
-        Ok(ProcessedImage {
-            bytes: out,
-            format: format.into(),
-            quality: quality.chosen,
-            width,
-            height,
-            source_width,
-            source_height,
+        Ok(ProcessedImage::from_frames(
+            out,
+            format.into(),
+            quality.chosen,
+            frames.dimensions(),
+            source_size,
             placeholder,
-            studio: None,
-            inpaint: None,
-            segments: None,
-            objects_crop: None,
-            ssimulacra2: None,
-            video: None,
-            pdf: None,
-            provenance: None,
-        })
+        ))
     }
 
     /// Process an animated source (GIF or WebP) into a
@@ -1900,7 +1881,7 @@ impl Engine {
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
         directives: &crate::url::RequestDirectives,
-        format: ImageFormat,
+        format: crate::video::VideoFormat,
     ) -> Result<ProcessedImage, EngineError> {
         let encoder = ctx.video_encoder.ok_or_else(|| {
             EngineError::NotConfigured(
@@ -1908,21 +1889,15 @@ impl Engine {
                     .to_string(),
             )
         })?;
-        let (source_width, source_height) = frames.dimensions();
+        let source_size = frames.dimensions();
         // The frames share their trim windows (issue #465),
         // as on the animated image paths: the encoder takes
         // one frame size.
         let (frames, _) = render_frames(frames, ops, ctx, directives, FrameShare::default())?;
-        // The placeholder (a meta-only surface; meta itself
-        // refuses video URLs in the server) describes the
-        // first processed frame, as the animated paths do.
-        let placeholder = if ctx.placeholders {
-            Some(crate::placeholder::compute(&DynamicImage::ImageRgba8(
-                frames.first.buffer().clone(),
-            )))
-        } else {
-            None
-        };
+        // The placeholder is a meta-only surface (meta itself
+        // refuses video URLs in the server). It is taken here,
+        // before the frames move into the encoder's.
+        let placeholder = first_frame_placeholder(&frames, ctx);
         let (width, height) = frames.dimensions();
         let out_frames: Vec<crate::video::VideoFrame> = frames
             .into_iter()
@@ -1935,25 +1910,30 @@ impl Engine {
             crate::video::VideoError::Unsupported(what) => EngineError::Unsupported(what),
             crate::video::VideoError::Failed(what) => EngineError::Video(what),
         })?;
-        Ok(ProcessedImage {
+        Ok(ProcessedImage::from_frames(
             bytes,
-            format,
-            quality: None,
-            width: crate::video::even_dimension(width),
-            height: crate::video::even_dimension(height),
-            source_width,
-            source_height,
+            format.into(),
+            None,
+            (
+                crate::video::even_dimension(width),
+                crate::video::even_dimension(height),
+            ),
+            source_size,
             placeholder,
-            studio: None,
-            inpaint: None,
-            segments: None,
-            objects_crop: None,
-            ssimulacra2: None,
-            video: None,
-            pdf: None,
-            provenance: None,
-        })
+        ))
     }
+}
+
+/// The placeholder of an animated or video render, when the
+/// caller asked for one: it describes the first processed
+/// frame.
+fn first_frame_placeholder(
+    frames: &Frames,
+    ctx: &ProcessContext<'_>,
+) -> Option<crate::placeholder::Placeholder> {
+    ctx.placeholders.then(|| {
+        crate::placeholder::compute(&DynamicImage::ImageRgba8(frames.first.buffer().clone()))
+    })
 }
 
 /// Run the operations over every frame of an animated render,
@@ -2220,9 +2200,10 @@ pub(crate) fn animated_output_format(
 
 /// The formats an animation keeps its frames in (issue #480):
 /// an animated source's own format, and the format its frames
-/// render to on the animated path. The video formats take the
-/// frames too, on the video path, and every other format takes
-/// the first frame as a still.
+/// render to on the animated path. The video formats
+/// ([`crate::video::VideoFormat`]) take the frames too, on the
+/// video path, and every other format takes the first frame as
+/// a still.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnimatedFormat {
     Gif,

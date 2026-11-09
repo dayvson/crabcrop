@@ -381,9 +381,10 @@ pub enum ImageFormat {
 impl ImageFormat {
     /// Whether this format is a video output (`mp4`,
     /// `webm`): animated sources only, an external encoder,
-    /// and no `Accept` negotiation.
+    /// and no `Accept` negotiation. It reads the list the
+    /// video path encodes from ([`crate::video::VideoFormat`]).
     pub fn is_video(self) -> bool {
-        matches!(self, ImageFormat::Mp4 | ImageFormat::WebM)
+        crate::video::VideoFormat::of(self).is_some()
     }
 }
 
