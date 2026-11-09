@@ -81,6 +81,15 @@ const VERBS: [&str; 9] = [
 /// message `crabcrop` prints on stderr after `crabcrop: `
 /// before it exits 1; a [`Usage`](CliError::Usage) error
 /// ends with the usage text.
+///
+/// [`Parse`](CliError::Parse) and [`Seal`](CliError::Seal)
+/// are transparent: they print as the error they hold and
+/// `source()` continues from that error's source. `Io`,
+/// `Client` and `Request` keep the old messages, which end
+/// with their cause's message, and `source()` still
+/// returns the cause so a caller can inspect it; print
+/// them with `{}`, not with a reporter that appends each
+/// source, which would repeat the cause.
 #[derive(Debug)]
 pub enum CliError {
     /// The arguments do not form a command: an unknown verb
@@ -140,8 +149,8 @@ impl std::fmt::Display for CliError {
 impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            CliError::Parse(e) => Some(e),
-            CliError::Seal(e) => Some(e),
+            CliError::Parse(e) => std::error::Error::source(e),
+            CliError::Seal(e) => std::error::Error::source(e),
             CliError::Io { source, .. } => Some(source),
             CliError::Client(e) | CliError::Request(e) => Some(e),
             _ => None,
@@ -2298,7 +2307,10 @@ mod tests {
             panic!("{err:?}");
         };
         assert_eq!(err.to_string(), parse.to_string());
-        assert!(std::error::Error::source(&err).is_some());
+        // Transparent: the chain goes on from the grammar
+        // error's own source (it has none), so a reporter
+        // that walks it does not print the message twice.
+        assert!(std::error::Error::source(&err).is_none());
         // Seal: a token that does not open under the secret.
         let sealed = crabcrop_url::seal(b"one secret", "300x200/https://e.com/a.jpg").unwrap();
         let err = exec(&args(&[
@@ -2311,6 +2323,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CliError::Seal(_)), "{err:?}");
         assert_eq!(err.to_string(), "the token did not open under this secret");
+        assert!(std::error::Error::source(&err).is_none());
         // Io: the file and the cause.
         let missing = std::env::temp_dir()
             .join(format!("crabcrop-cli-missing-{}", std::process::id()))
