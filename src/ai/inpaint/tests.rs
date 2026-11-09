@@ -1,6 +1,6 @@
 use super::*;
 use crate::ai::env_or_skip;
-use crate::ai::test_support::{expect_load, missing_path, solid};
+use crate::ai::test_support::{OPAQUE16, expect_load, missing_path, rgba_halves, solid};
 
 #[test]
 fn region_mask_marks_only_the_rectangle() {
@@ -46,7 +46,11 @@ fn composite_inpaint_takes_only_the_hole_from_the_fill() {
     let img = solid(200, 30, 30, 40, 30);
     let mask = region_mask(40, 30, 10, 10, 10, 10);
     let window = inpaint_window(40, 30, (10, 10, 10, 10));
-    let filled = image::RgbImage::from_pixel(window.2, window.3, image::Rgb([30, 30, 200]));
+    let filled = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        window.2,
+        window.3,
+        image::Rgb([30, 30, 200]),
+    ));
     let out = composite_inpaint(&img, &mask, window, &filled).to_rgb8();
     // Inside the hole: the fill.
     assert_eq!(*out.get_pixel(15, 15), image::Rgb([30, 30, 200]));
@@ -67,10 +71,176 @@ fn composite_inpaint_keeps_the_source_alpha() {
     let img = DynamicImage::ImageRgba8(rgba);
     let mask = region_mask(20, 20, 5, 5, 10, 10);
     let window = inpaint_window(20, 20, (5, 5, 10, 10));
-    let filled = image::RgbImage::from_pixel(window.2, window.3, image::Rgb([99, 99, 99]));
+    let filled = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        window.2,
+        window.3,
+        image::Rgb([99, 99, 99]),
+    ));
     let out = composite_inpaint(&img, &mask, window, &filled).to_rgba8();
     assert_eq!(*out.get_pixel(10, 10), image::Rgba([99, 99, 99, 200]));
     assert_eq!(*out.get_pixel(0, 0), image::Rgba([10, 20, 30, 200]));
+}
+
+/// A fake inpainting model standing in for the session: it
+/// answers with its own input image, scaled to the export's
+/// 0..255 output range, so the fill is the crop window's own
+/// color carried through the model's 512x512 working size and
+/// back.
+fn fake_lama(image: Vec<f32>, mask: Vec<f32>) -> Result<(Vec<i64>, Vec<f32>), AiError> {
+    let size = INPAINT_INPUT_SIZE as usize;
+    assert_eq!(image.len(), 3 * size * size, "the image input is 3x512x512");
+    assert_eq!(mask.len(), size * size, "the mask input is 512x512");
+    assert!(mask.iter().any(|&m| m > 0.0), "the hole reaches the model");
+    let out = image.into_iter().map(|v| v * 255.0).collect();
+    Ok((vec![1, 3, size as i64, size as i64], out))
+}
+
+/// Issue #551: an RGBA source at `depth` comes back from a
+/// removal with its alpha unchanged, sample for sample (inside
+/// the hole too: inpainting fills color, not transparency),
+/// every pixel outside the hole bit for bit, the fill at the
+/// source's depth, and the source's layout. The hole straddles
+/// the seam between the transparent and opaque halves.
+fn assert_remove_region_keeps_alpha_and_depth(depth: SampleDepth) {
+    let src = rgba_halves(depth, 40, 24);
+    let mask = region_mask(40, 24, 14, 8, 12, 8);
+    let out = inpaint_with(&src, &mask, fake_lama).unwrap();
+    assert_removal_keeps_alpha_and_depth(&src, &mask, &out);
+    // Inside the hole, away from the seam, the identity
+    // model's fill is the source's own color at the
+    // source's depth.
+    let (src16, out16) = (src.to_rgba16(), out.to_rgba16());
+    assert_eq!(out16.get_pixel(25, 12), src16.get_pixel(25, 12));
+}
+
+/// What any model's removal must keep, whatever color it
+/// fills the hole with: the source's size, layout and
+/// depth, its alpha sample for sample (inside the hole
+/// too: inpainting fills color, not transparency), and
+/// every pixel outside the hole bit for bit.
+fn assert_removal_keeps_alpha_and_depth(src: &DynamicImage, mask: &GrayImage, out: &DynamicImage) {
+    assert_eq!((out.width(), out.height()), (src.width(), src.height()));
+    assert_eq!(
+        out.color(),
+        src.color(),
+        "the result keeps the source's layout and sample depth"
+    );
+    let (src16, out16) = (src.to_rgba16(), out.to_rgba16());
+    for (x, y, px) in out16.enumerate_pixels() {
+        let s = src16.get_pixel(x, y);
+        assert_eq!(px[3], s[3], "alpha is the source's at ({x}, {y})");
+        if mask.get_pixel(x, y)[0] == 0 {
+            assert_eq!(
+                px, s,
+                "outside the hole, the source bit for bit at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn remove_region_keeps_alpha_for_an_8_bit_rgba_source() {
+    assert_remove_region_keeps_alpha_and_depth(SampleDepth::Eight);
+}
+
+#[test]
+fn remove_region_keeps_alpha_and_16_bits_for_a_16_bit_rgba_source() {
+    assert_remove_region_keeps_alpha_and_depth(SampleDepth::Sixteen);
+    let src = rgba_halves(SampleDepth::Sixteen, 40, 24);
+    let out = inpaint_with(&src, &region_mask(40, 24, 14, 8, 12, 8), fake_lama).unwrap();
+    // Samples off the 8-bit grid survive exactly, in the
+    // fill as well as around it.
+    let out = out.as_rgba16().unwrap();
+    for (x, y) in [(25, 12), (35, 2)] {
+        let px = out.get_pixel(x, y);
+        assert_eq!(px.0, [OPAQUE16[0], OPAQUE16[1], OPAQUE16[2], u16::MAX]);
+    }
+}
+
+#[test]
+fn remove_region_keeps_alpha_and_floats_for_a_float_rgba_source() {
+    assert_remove_region_keeps_alpha_and_depth(SampleDepth::Float);
+    let src = rgba_halves(SampleDepth::Float, 40, 24);
+    let out = inpaint_with(&src, &region_mask(40, 24, 14, 8, 12, 8), fake_lama).unwrap();
+    let (src, out) = (src.as_rgba32f().unwrap(), out.as_rgba32f().unwrap());
+    // Outside the hole the floats are the source's own.
+    assert_eq!(out.get_pixel(35, 2), src.get_pixel(35, 2));
+    // The fill went through two float resizes and the
+    // model's 0..255 range: equal to well under a 16-bit
+    // step.
+    let (fill, want) = (out.get_pixel(25, 12), src.get_pixel(25, 12));
+    for c in 0..3 {
+        assert!(
+            (fill[c] - want[c]).abs() < 1e-5,
+            "{fill:?} against {want:?}"
+        );
+    }
+    assert_eq!(fill[3], want[3]);
+}
+
+/// The 8-bit path is the arithmetic the provider always had:
+/// the export's 0..255 values round to 8 bits, clamped, a NaN
+/// read as 0, and an opaque source stays RGB.
+#[test]
+fn remove_region_of_an_8_bit_source_rounds_the_fill_to_8_bits() {
+    let src = solid(200, 30, 30, 16, 16);
+    let mask = region_mask(16, 16, 4, 4, 8, 8);
+    let size = INPAINT_INPUT_SIZE as usize;
+    let out = inpaint_with(&src, &mask, |_image, _mask| {
+        let plane = size * size;
+        let mut data = vec![0f32; 3 * plane];
+        data[..plane].fill(300.0);
+        data[plane..2 * plane].fill(f32::NAN);
+        data[2 * plane..].fill(99.5);
+        Ok((vec![1, 3, size as i64, size as i64], data))
+    })
+    .unwrap();
+    assert_eq!(out.color(), image::ColorType::Rgb8);
+    let rgb = out.as_rgb8().unwrap();
+    assert_eq!(rgb.get_pixel(8, 8).0, [255, 0, 100]);
+    assert_eq!(rgb.get_pixel(0, 0).0, [200, 30, 30]);
+}
+
+/// A removal over an empty mask runs no model at all and
+/// returns the source as it is, at any depth.
+#[test]
+fn remove_region_with_an_empty_mask_runs_no_model() {
+    for depth in [SampleDepth::Eight, SampleDepth::Sixteen, SampleDepth::Float] {
+        let src = rgba_halves(depth, 20, 10);
+        let out = inpaint_with(
+            &src,
+            &GrayImage::new(20, 10),
+            |_, _| -> Result<(Vec<i64>, Vec<f32>), AiError> {
+                panic!("the model must not run for an empty mask")
+            },
+        )
+        .unwrap();
+        assert_eq!(out, src);
+    }
+}
+
+/// An 8-bit fill composited over a 16-bit source is written
+/// at the source's depth: the composite converts the fill,
+/// never the source.
+#[test]
+fn composite_inpaint_writes_at_the_source_depth() {
+    let src = rgba_halves(SampleDepth::Sixteen, 20, 20);
+    let mask = region_mask(20, 20, 12, 5, 6, 6);
+    let window = inpaint_window(20, 20, (12, 5, 6, 6));
+    let filled = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        window.2,
+        window.3,
+        image::Rgb([0x80, 0x40, 0x20]),
+    ));
+    let out = composite_inpaint(&src, &mask, window, &filled);
+    assert_eq!(out.color(), image::ColorType::Rgba16);
+    let out = out.as_rgba16().unwrap();
+    assert_eq!(out.get_pixel(14, 7).0, [0x8080, 0x4040, 0x2020, u16::MAX]);
+    assert_eq!(
+        out.get_pixel(19, 19).0,
+        [OPAQUE16[0], OPAQUE16[1], OPAQUE16[2], u16::MAX]
+    );
+    assert_eq!(out.get_pixel(0, 0).0, [u16::MAX, 0, 0, 0]);
 }
 
 /// Real-model verification, run manually with the deployment
@@ -126,6 +296,30 @@ fn inpaint_with_the_real_model() {
         .unwrap()
         .to_rgb8();
     assert_eq!(*out.get_pixel(128, 128), image::Rgb([255, 0, 0]));
+}
+
+/// Issue #551 through the real session: a removal on a
+/// 16-bit or float RGBA source keeps its alpha and its
+/// depth. The fill's color is not checked, so any
+/// inpainting model will do.
+/// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_INPAINT_MODEL=...
+/// cargo test -- --ignored inpaint_keeps_alpha_and_depth_with_the_real_model
+#[test]
+#[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+fn inpaint_keeps_alpha_and_depth_with_the_real_model() {
+    let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+        return;
+    };
+    let Some(model) = env_or_skip("CRABCROP_TEST_INPAINT_MODEL") else {
+        return;
+    };
+    let provider = OnnxInpaintProvider::load(Some(&dylib), &model).unwrap();
+    for depth in [SampleDepth::Sixteen, SampleDepth::Float] {
+        let src = rgba_halves(depth, 40, 24);
+        let mask = region_mask(40, 24, 14, 8, 12, 8);
+        let out = provider.inpaint(&src, &mask).unwrap();
+        assert_removal_keeps_alpha_and_depth(&src, &mask, &out);
+    }
 }
 
 /// A one-input model is not an inpainting model: the

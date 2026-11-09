@@ -151,6 +151,44 @@ pub(super) fn collect_outputs(
     Ok(out)
 }
 
+/// A session's first output, owned: the single-output models
+/// (upscale, inpainting) read their result from it.
+pub(super) fn first_output(
+    outputs: ort::session::SessionOutputs<'_>,
+) -> Result<ort::value::DynValue, AiError> {
+    outputs
+        .into_iter()
+        .next()
+        .map(|(_, value)| value)
+        .ok_or_else(|| AiError::BadOutput("the model produced no outputs".to_string()))
+}
+
+/// A model run's result as the providers read it: one f32
+/// tensor, shape and data, borrowed in place. The session's
+/// output implements it; so does a test's fake model, which
+/// lets the pre- and post-processing around a run be tested
+/// without the runtime.
+pub(super) trait TensorOutput {
+    fn f32_tensor(&self) -> Result<(&[i64], &[f32]), AiError>;
+}
+
+impl TensorOutput for ort::value::DynValue {
+    fn f32_tensor(&self) -> Result<(&[i64], &[f32]), AiError> {
+        let (shape, data) = self
+            .try_extract_tensor::<f32>()
+            .map_err(|e| AiError::BadOutput(format!("cannot read the model output: {e}")))?;
+        Ok((shape, data))
+    }
+}
+
+/// A fake model's output: dims and data.
+#[cfg(test)]
+impl TensorOutput for (Vec<i64>, Vec<f32>) {
+    fn f32_tensor(&self) -> Result<(&[i64], &[f32]), AiError> {
+        Ok((&self.0, &self.1))
+    }
+}
+
 /// The name meta reports for a configured model file:
 /// the file name, never the operator's filesystem
 /// layout. The OCR providers have always reported it

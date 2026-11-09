@@ -7471,7 +7471,8 @@ async fn cli_purge_evicts_so_the_next_fetch_misses() {
         &signed,
     ]))
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("HTTP 403"), "{err}");
     let resp = client().get(&signed).send().await.unwrap();
     assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
@@ -7592,7 +7593,8 @@ async fn cli_purge_with_a_key_id_verifies_against_a_rotating_keyring() {
         &signed,
     ]))
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("HTTP 403"), "{err}");
     let resp = client().get(&signed).send().await.unwrap();
     assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
@@ -7638,7 +7640,8 @@ async fn cli_purge_with_a_key_id_verifies_against_a_rotating_keyring() {
         "small",
     ]))
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("HTTP 403"), "{err}");
 }
 
@@ -7664,7 +7667,8 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
             target,
         ]))
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("request failed"), "{verb}: {err}");
     }
     let err = crate::cli::exec(&cli(&[
@@ -7676,7 +7680,8 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
         "small",
     ]))
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("request failed"), "{err}");
 
     let src = spawn_image_server().await;
@@ -7693,7 +7698,8 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
         &format!("preset:nope/{src}"),
     ]))
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("HTTP 400"), "{err}");
     // Malformed operations fail in the CLI's grammar
     // check, before any request is made.
@@ -7706,7 +7712,8 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
         &format!("300x200/filters:bogus(1)/{src}"),
     ]))
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(
         err.contains("invalid filters segment: filters:bogus(1)"),
         "{err}"
@@ -7720,19 +7727,22 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
     );
     let err = crate::cli::exec(&cli(&["meta", &forged]))
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("HTTP 403"), "{err}");
     // No secret for a remainder target: refused locally.
     for verb in ["meta", "purge"] {
         let err = crate::cli::exec(&cli(&[verb, "--base", &base, &remainder]))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no secret"), "{verb}: {err}");
     }
     // Argument shape: missing and extra targets.
     let err = crate::cli::exec(&cli(&["meta", "--secret", "test-secret"]))
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("meta needs an argument"), "{err}");
     let err = crate::cli::exec(&cli(&[
         "purge",
@@ -7742,7 +7752,8 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
         &remainder,
     ]))
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("takes exactly one argument"), "{err}");
     // The meta opt-ins belong to the meta verb only.
     let err = crate::cli::exec(&cli(&[
@@ -7755,7 +7766,8 @@ async fn cli_verbs_fail_loudly_on_bad_targets_and_arguments() {
         &remainder,
     ]))
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("only apply to the meta verb"), "{err}");
 }
 
@@ -14857,7 +14869,8 @@ async fn cli_upload_stores_and_prints_the_source_reference() {
         "heroes/cat.png".to_string(),
     ])
     .await
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("409"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
