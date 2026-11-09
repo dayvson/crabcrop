@@ -3,7 +3,9 @@
 
 A stub `gh` on PATH records every call and plays a repository with no
 release for the tag, a published one, a draft, or a failing API, so each
-case asserts the exact commands the release job would run. Run directly:
+case asserts the exact commands the release job would run, and that a
+published release is refused unless the override is set (issue #552).
+Run directly:
 python3 scripts/test_publish_github_release.py
 """
 import json
@@ -31,7 +33,8 @@ if args[:2] == ["release", "view"]:
         sys.exit("release not found")
     if state == "error":
         sys.exit("HTTP 502: Bad Gateway")
-    print(json.dumps({{"tagName": args[-1], "isDraft": state == "draft"}}))
+    # The script asks for `--jq .isDraft`, which prints true or false.
+    print("null" if state == "garbled" else str(state == "draft").lower())
     sys.exit(0)
 if args[:2] == ["release", os.environ.get("STUB_FAIL", "")]:
     sys.exit(args[1] + " failed")
@@ -62,8 +65,11 @@ class PublishGithubRelease(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def publish(self, release, *args, fail=""):
-        """Run the script against a stub repository; returns (exit code, gh calls)."""
+    def publish(self, release, *args, fail="", adopt=None):
+        """Run the script against a stub repository; returns (exit code, gh calls).
+
+        `adopt` is the ADOPT_PUBLISHED_RELEASE value, or None to leave it
+        unset whatever the caller's environment holds."""
         if not args:
             args = ("v1.2.3", COMMIT, "1.2.3 - 2026-11-07", str(self.notes), "false", *self.assets)
         env = {
@@ -73,13 +79,16 @@ class PublishGithubRelease(unittest.TestCase):
             "STUB_RELEASE": release,
             "STUB_FAIL": fail,
         }
+        env.pop("ADOPT_PUBLISHED_RELEASE", None)
+        if adopt is not None:
+            env["ADOPT_PUBLISHED_RELEASE"] = adopt
         done = subprocess.run([BASH, str(SCRIPT), *args], env=env, capture_output=True, text=True)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         self.output = done.stdout + done.stderr
         return done.returncode, calls
 
     def view(self, tag="v1.2.3"):
-        return ["release", "view", "--json", "tagName,isDraft", "--", tag]
+        return ["release", "view", "--json", "isDraft", "--jq", ".isDraft", "--", tag]
 
     def create(self, tag="v1.2.3", title="1.2.3 - 2026-11-07", prerelease="false", assets=None):
         return [
@@ -107,12 +116,47 @@ class PublishGithubRelease(unittest.TestCase):
         self.assertEqual(code, 0, self.output)
         self.assertEqual(calls, [self.view("v0.10.0-rc.1"), self.create("v0.10.0-rc.1", "0.10.0-rc.1", "true")])
 
-    def test_updates_a_published_release_in_place(self):
-        # The first attempts of the v0.9.8 to v0.9.11 runs: the release
-        # was already there when host ran, and a plain create failed.
+    def test_refuses_a_published_release(self):
+        # v0.10.0: the release was published by hand, which created the
+        # tag, 37 minutes before the gated run attached its assets. The
+        # script adopted it silently; now it stops before any change and
+        # names the release and the fix.
         code, calls = self.publish("published")
+        self.assertEqual(code, 1, self.output)
+        self.assertEqual(calls, [self.view()])
+        self.assertIn("::error title=Release v1.2.3 is already published::", self.output)
+        self.assertIn("the release for v1.2.3 is already published; refusing to adopt it", self.output)
+        self.assertIn("gh release edit v1.2.3 --draft=true", self.output)
+        self.assertIn("re-run only the failed jobs", self.output)
+        self.assertIn("ADOPT_PUBLISHED_RELEASE", self.output)
+
+    def test_the_override_adopts_a_published_release_with_a_warning(self):
+        code, calls = self.publish("published", adopt="1")
         self.assertEqual(code, 0, self.output)
         self.assertEqual(calls, [self.view(), self.upload(), self.edit()])
+        self.assertIn("::warning title=Adopting published release v1.2.3::", self.output)
+
+    def test_only_1_is_the_override(self):
+        # An empty repository variable reaches the script as an empty
+        # string; anything but 1 refuses.
+        for value in ("", "0", "true", "yes", " 1"):
+            with self.subTest(value=value):
+                self.log.unlink(missing_ok=True)
+                code, calls = self.publish("published", adopt=value)
+                self.assertEqual(code, 1, self.output)
+                self.assertEqual(calls, [self.view()])
+
+    def test_a_draft_needs_no_override(self):
+        code, calls = self.publish("draft", adopt="")
+        self.assertEqual(code, 0, self.output)
+        self.assertEqual(calls, [self.view(), self.upload(), self.edit()])
+        self.assertNotIn("::warning", self.output)
+
+    def test_an_unreadable_draft_flag_stops(self):
+        code, calls = self.publish("garbled")
+        self.assertEqual(code, 1, self.output)
+        self.assertEqual(calls, [self.view()])
+        self.assertIn("cannot tell whether the release for v1.2.3 is a draft", self.output)
 
     def test_publishes_an_existing_draft(self):
         code, calls = self.publish("draft")
@@ -121,7 +165,7 @@ class PublishGithubRelease(unittest.TestCase):
 
     def test_update_keeps_the_prerelease_flag_explicit(self):
         args = ("v0.10.0-rc.1", COMMIT, "0.10.0-rc.1", str(self.notes), "true", *self.assets)
-        code, calls = self.publish("published", *args)
+        code, calls = self.publish("draft", *args)
         self.assertEqual(code, 0, self.output)
         self.assertEqual(calls[-1], self.edit("v0.10.0-rc.1", "0.10.0-rc.1", "true"))
 
@@ -147,10 +191,12 @@ class PublishGithubRelease(unittest.TestCase):
         asset = root / "-x.tar.xz"
         asset.write_text("x")
         tag, title = "-v1.2.3", "--draft"
-        for release in ("absent", "published"):
+        for release in ("absent", "draft", "published"):
             with self.subTest(release=release):
                 self.log.unlink(missing_ok=True)
-                code, calls = self.publish(release, tag, COMMIT, title, str(self.notes), "false", str(asset))
+                code, calls = self.publish(
+                    release, tag, COMMIT, title, str(self.notes), "false", str(asset), adopt="1"
+                )
                 self.assertEqual(code, 0, self.output)
                 self.assertEqual(calls[0], self.view(tag))
                 for call in calls[1:]:

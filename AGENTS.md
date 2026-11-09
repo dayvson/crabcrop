@@ -20,7 +20,9 @@ both SDKs must all pass.
 - `src/`: the server. `lib.rs` declares the modules as a library
   target, which the fuzz harness and the integration tests import;
   `main.rs` is the binary, reading configuration and booting the
-  server. The operation parser and canonical forms in `url.rs`,
+  server. The operation parser and canonical forms in `url.rs`
+  (a filter is one row of the table in `url/filters.rs`, which
+  generates both its parser and its canonical spelling),
   pipeline in `engine.rs` (encoders in `engine/encode.rs`, pipeline
   state in `engine/state.rs`), HTTP and caching in `server.rs`
   (request coalescing in `server/process.rs`, metadata responses in
@@ -30,6 +32,8 @@ both SDKs must all pass.
   `studio.rs`. A large module keeps its unit tests in
   `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
   `server.rs`, `engine.rs` and the files under `ai/` do.
+  `config.rs` belongs to the binary: it reads and validates the
+  configuration that `main.rs` builds the server from.
 - `crates/crabcrop-url`: the client-side library: signing, sealing,
   verification, and URL building. It does not parse operations; the
   server's parser is `src/url.rs`.
@@ -85,7 +89,12 @@ both SDKs must all pass.
   `fuzz/Cargo.lock` moves too: the fuzz package builds the server
   library, so a dependency change that the root lockfile records needs
   the refresh in `fuzz/README.md`, or the fuzz smoke's `--locked` build
-  in CI fails.
+  in CI fails. `scripts/check_locks.py` fails CI when the two lockfiles
+  disagree on a package both carry, or when either locks a decoder at
+  two versions: one decoder version is what ships, pre-checks and
+  fuzzes. A Dependabot cargo pull request moves the root lockfile only,
+  so one that moves a package both carry fails that check until the
+  refresh is pushed to its branch.
 - One binary, configuration-gated: AI and provenance features are enabled
   by environment configuration in the same binary, not by separate builds
   or cargo features. Never commit model files, certificates, or keys.

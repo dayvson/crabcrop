@@ -25,10 +25,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job's timeout-minutes is at least twice its longest
+# recent run (issue #543): a hung test fails the job in
+# minutes instead of holding it for GitHub's six-hour
+# default.
 jobs:
   build:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,6 +43,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check versions
         run: python3 scripts/check_versions.py
+      # One version of each decoder, and a fuzz lock that
+      # matches the root lock (issue #552).
+      - name: Check lockfiles
+        run: python3 scripts/check_locks.py
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Check doc links
@@ -61,6 +70,7 @@ jobs:
     # must build that feature set on macOS and pass the
     # library tests there as well.
     runs-on: macos-latest
+    timeout-minutes: 30
 
     env:
       # Vendored static dav1d, as the release builds it.
@@ -86,6 +96,7 @@ jobs:
   msrv:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -103,6 +114,7 @@ jobs:
   audit:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     # audit-check reports through the Checks API.
     permissions:
@@ -119,6 +131,7 @@ jobs:
   suites:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -10,7 +10,8 @@
 //! is what the server will do.
 
 use crate::url::{
-    Dimension, Filter, FlipDirection, ImageFormat, MaskShape, Operation, Quality, Signature,
+    Dimension, Filter, FlipDirection, ImageFormat, MaskShape, Operation, ParseError, Quality,
+    Signature,
 };
 
 const USAGE: &str = "\
@@ -76,6 +77,99 @@ const VERBS: [&str; 9] = [
     "convert-thumbor",
 ];
 
+/// Why a CLI verb failed (issue #477). `Display` is the
+/// message `crabcrop` prints on stderr after `crabcrop: `
+/// before it exits 1; a [`Usage`](CliError::Usage) error
+/// ends with the usage text.
+///
+/// [`Parse`](CliError::Parse) and [`Seal`](CliError::Seal)
+/// are transparent: they print as the error they hold and
+/// `source()` continues from that error's source. `Io`,
+/// `Client` and `Request` keep the old messages, which end
+/// with their cause's message, and `source()` still
+/// returns the cause so a caller can inspect it; print
+/// them with `{}`, not with a reporter that appends each
+/// source, which would repeat the cause.
+#[derive(Debug)]
+pub enum CliError {
+    /// The arguments do not form a command: an unknown verb
+    /// or flag, a missing or extra argument, or a flag the
+    /// verb does not take. Holds the reason; `Display`
+    /// appends the usage text.
+    Usage(String),
+    /// A flag value, a setting, or an argument is invalid:
+    /// a value flag with no value, an `--expires` that is
+    /// not a timestamp, a malformed key ID, an upload name
+    /// the server would refuse, a URL that is not sealed or
+    /// not a Thumbor URL.
+    Invalid(String),
+    /// The verb signs, seals, or opens, and no secret was
+    /// given.
+    NoSecret,
+    /// The remainder does not parse under the server's
+    /// grammar.
+    Parse(ParseError),
+    /// Sealing a remainder or opening a token failed.
+    Seal(crabcrop_url::SealError),
+    /// A local file cannot be read.
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
+    /// The HTTP client cannot be built.
+    Client(reqwest::Error),
+    /// The request to the server got no answer.
+    Request(reqwest::Error),
+    /// The server answered with a failure status: the
+    /// status and the trimmed body.
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    /// The server's answer is not what the verb expects.
+    Response(String),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliError::Usage(reason) => write!(f, "{reason}\n\n{USAGE}"),
+            CliError::Invalid(reason) | CliError::Response(reason) => f.write_str(reason),
+            CliError::NoSecret => f.write_str("no secret: pass --secret or set CRABCROP_SECRET"),
+            CliError::Parse(e) => write!(f, "{e}"),
+            CliError::Seal(e) => write!(f, "{e}"),
+            CliError::Io { path, source } => write!(f, "cannot read {path}: {source}"),
+            CliError::Client(e) => write!(f, "cannot build the HTTP client: {e}"),
+            CliError::Request(e) => write!(f, "request failed: {e}"),
+            CliError::Status { status, body } => write!(f, "HTTP {status}: {body}"),
+        }
+    }
+}
+
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CliError::Parse(e) => std::error::Error::source(e),
+            CliError::Seal(e) => std::error::Error::source(e),
+            CliError::Io { source, .. } => Some(source),
+            CliError::Client(e) | CliError::Request(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseError> for CliError {
+    fn from(e: ParseError) -> Self {
+        CliError::Parse(e)
+    }
+}
+
+impl From<crabcrop_url::SealError> for CliError {
+    fn from(e: crabcrop_url::SealError) -> Self {
+        CliError::Seal(e)
+    }
+}
+
 struct Config {
     base: String,
     secret: Option<Vec<u8>>,
@@ -93,7 +187,7 @@ struct Config {
     expires: Option<u64>,
 }
 
-fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
+fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), CliError> {
     let mut base: Option<String> = None;
     let mut secret: Option<String> = None;
     let mut key_id: Option<String> = None;
@@ -116,7 +210,7 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
                         i += 1;
                         args.get(i)
                             .cloned()
-                            .ok_or_else(|| format!("{flag} needs a value"))?
+                            .ok_or_else(|| CliError::Invalid(format!("{flag} needs a value")))?
                     }
                 };
                 match flag {
@@ -125,7 +219,9 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
                     "--key-id" => key_id = Some(value),
                     "--expires" => {
                         expires = Some(value.parse().map_err(|_| {
-                            format!("--expires needs a unix-seconds timestamp, got {value:?}")
+                            CliError::Invalid(format!(
+                                "--expires needs a unix-seconds timestamp, got {value:?}"
+                            ))
                         })?);
                     }
                     _ => unreachable!("{flag} is in VALUE_FLAGS without a handler"),
@@ -133,7 +229,7 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
             }
             _ if SWITCH_FLAGS.contains(&flag) => {
                 if inline_value.is_some() {
-                    return Err(format!("{flag} takes no value\n\n{USAGE}"));
+                    return Err(CliError::Usage(format!("{flag} takes no value")));
                 }
                 match flag {
                     "--placeholders" => placeholders = true,
@@ -141,7 +237,9 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
                     _ => unreachable!("{flag} is in SWITCH_FLAGS without a handler"),
                 }
             }
-            _ if arg.starts_with("--") => return Err(format!("unknown flag {arg:?}\n\n{USAGE}")),
+            _ if arg.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag {arg:?}")));
+            }
             _ => positional.push(arg.clone()),
         }
         i += 1;
@@ -158,9 +256,9 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
     if let Some(id) = &key_id
         && !crate::url::is_valid_key_id(id)
     {
-        return Err(format!(
+        return Err(CliError::Invalid(format!(
             "invalid key ID {id:?}: 1 to 32 characters of [A-Za-z0-9_-]"
-        ));
+        )));
     }
     Ok((
         Config {
@@ -175,11 +273,8 @@ fn parse_flags(args: &[String]) -> Result<(Config, Vec<String>), String> {
     ))
 }
 
-fn require_secret(config: &Config) -> Result<&[u8], String> {
-    config
-        .secret
-        .as_deref()
-        .ok_or_else(|| "no secret: pass --secret or set CRABCROP_SECRET".to_string())
+fn require_secret(config: &Config) -> Result<&[u8], CliError> {
+    config.secret.as_deref().ok_or(CliError::NoSecret)
 }
 
 /// Split a URL or path into (signature, remainder). A full
@@ -223,27 +318,28 @@ type PresetParse = (usize, Vec<Operation>, String, Option<u64>, Option<u32>);
 /// drop leading segments until the grammar accepts the
 /// rest, returning how many were dropped. Server presets
 /// expand before parsing, so the CLI cannot parse them
-/// itself; it can only step aside.
-fn parse_with_presets(rest: &str) -> Result<PresetParse, String> {
+/// itself; it can only step aside. A remainder that parses
+/// no way fails with the error of the whole remainder.
+fn parse_with_presets(rest: &str) -> Result<PresetParse, ParseError> {
+    let first_error = match crate::url::parse_operations_with_expiry(rest) {
+        Ok((ops, source, expiry, max_age)) => {
+            return Ok((0, ops, source.to_string(), expiry, max_age));
+        }
+        Err(e) => e,
+    };
     let segments: Vec<&str> = rest.split('/').collect();
-    let mut first_error = String::new();
-    for dropped in 0..segments.len() {
+    for dropped in 1..segments.len() {
         // Only `preset:` references may be stepped over: the
         // server expands them before parsing, and nothing
         // else is allowed to lead a remainder unparsed.
-        if dropped > 0 && !segments[dropped - 1].starts_with("preset:") {
+        if !segments[dropped - 1].starts_with("preset:") {
             break;
         }
         let candidate = segments[dropped..].join("/");
-        match crate::url::parse_operations_with_expiry(&candidate) {
-            Ok((ops, source, expiry, max_age)) => {
-                return Ok((dropped, ops, source.to_string(), expiry, max_age));
-            }
-            Err(e) => {
-                if dropped == 0 {
-                    first_error = e.to_string();
-                }
-            }
+        if let Ok((ops, source, expiry, max_age)) =
+            crate::url::parse_operations_with_expiry(&candidate)
+        {
+            return Ok((dropped, ops, source.to_string(), expiry, max_age));
         }
     }
     Err(first_error)
@@ -251,7 +347,7 @@ fn parse_with_presets(rest: &str) -> Result<PresetParse, String> {
 
 /// Run one CLI verb. `args` includes the verb itself.
 /// Returns what to print on stdout.
-pub async fn exec(args: &[String]) -> Result<String, String> {
+pub async fn exec(args: &[String]) -> Result<String, CliError> {
     let verb = args.first().map(String::as_str).unwrap_or("");
     if verb == "--help" || verb == "-h" || verb == "help" {
         return Ok(USAGE.to_string());
@@ -270,17 +366,17 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
     // is reported as what it is rather than as a complaint
     // about the flags that follow it.
     if !VERBS.contains(&verb) {
-        return Err(format!("unknown verb {verb:?}\n\n{USAGE}"));
+        return Err(CliError::Usage(format!("unknown verb {verb:?}")));
     }
     let (config, positional) = parse_flags(&args[1..])?;
     if verb != "meta" && (config.placeholders || config.detections) {
-        return Err(format!(
-            "--placeholders and --detections only apply to the meta verb\n\n{USAGE}"
+        return Err(CliError::Usage(
+            "--placeholders and --detections only apply to the meta verb".to_string(),
         ));
     }
     if verb != "upload" && config.expires.is_some() {
-        return Err(format!(
-            "--expires only applies to the upload verb\n\n{USAGE}"
+        return Err(CliError::Usage(
+            "--expires only applies to the upload verb".to_string(),
         ));
     }
     match verb {
@@ -297,15 +393,17 @@ pub async fn exec(args: &[String]) -> Result<String, String> {
     }
 }
 
-fn one_target(positional: &[String], verb: &str) -> Result<String, String> {
+fn one_target(positional: &[String], verb: &str) -> Result<String, CliError> {
     match positional {
         [only] => Ok(only.clone()),
-        [] => Err(format!("{verb} needs an argument\n\n{USAGE}")),
-        _ => Err(format!("{verb} takes exactly one argument\n\n{USAGE}")),
+        [] => Err(CliError::Usage(format!("{verb} needs an argument"))),
+        _ => Err(CliError::Usage(format!(
+            "{verb} takes exactly one argument"
+        ))),
     }
 }
 
-fn sign(config: &Config, positional: &[String]) -> Result<String, String> {
+fn sign(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let remainder = one_target(positional, "sign")?;
     let secret = require_secret(config)?;
     // Validate with the server's grammar before signing, so
@@ -326,14 +424,14 @@ fn sign(config: &Config, positional: &[String]) -> Result<String, String> {
 /// discipline as `sign`): a remainder that cannot parse is
 /// refused here rather than sealed into a token that can
 /// only fail at serve time.
-fn seal_cmd(config: &Config, positional: &[String]) -> Result<String, String> {
+fn seal_cmd(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let (remainder, name) = match positional {
         [only] => (only.clone(), None),
         [r, n] => (r.clone(), Some(n.clone())),
-        [] => return Err(format!("seal needs an argument\n\n{USAGE}")),
+        [] => return Err(CliError::Usage("seal needs an argument".to_string())),
         _ => {
-            return Err(format!(
-                "seal takes a remainder and an optional friendly name\n\n{USAGE}"
+            return Err(CliError::Usage(
+                "seal takes a remainder and an optional friendly name".to_string(),
             ));
         }
     };
@@ -342,8 +440,7 @@ fn seal_cmd(config: &Config, positional: &[String]) -> Result<String, String> {
     let segment = match &config.key_id {
         Some(kid) => crabcrop_url::seal_with_key_id(secret, kid, &remainder),
         None => crabcrop_url::seal(secret, &remainder),
-    }
-    .map_err(|e| e.to_string())?;
+    }?;
     // The friendly name is cosmetic: the server never
     // parses, validates, or authenticates it. Guide, do not
     // refuse (issue #255): one filename-like segment is the
@@ -371,7 +468,7 @@ fn seal_cmd(config: &Config, positional: &[String]) -> Result<String, String> {
 /// sealed spellings rather than acting as an unsealing
 /// oracle. Prints the remainder only; the friendly name is
 /// discarded, as it carries no meaning.
-fn unseal_cmd(config: &Config, positional: &[String]) -> Result<String, String> {
+fn unseal_cmd(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let input = one_target(positional, "unseal")?;
     let secret = require_secret(config)?;
     let input = input.trim();
@@ -386,12 +483,13 @@ fn unseal_cmd(config: &Config, positional: &[String]) -> Result<String, String> 
         },
     };
     let segment = path.split('/').next().unwrap_or("");
-    let (_, token) = crate::url::split_sealed_segment(segment)
-        .ok_or_else(|| "not a sealed URL: the first segment is not a sealed token".to_string())?;
-    crabcrop_url::open_token(secret, token).map_err(|e| e.to_string())
+    let (_, token) = crate::url::split_sealed_segment(segment).ok_or_else(|| {
+        CliError::Invalid("not a sealed URL: the first segment is not a sealed token".to_string())
+    })?;
+    Ok(crabcrop_url::open_token(secret, token)?)
 }
 
-fn explain(config: &Config, positional: &[String]) -> Result<String, String> {
+fn explain(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let input = one_target(positional, "explain")?;
     let (signature, key_id, rest) = split_signed(&input, &config.base);
     let mut lines: Vec<String> = Vec::new();
@@ -778,16 +876,16 @@ fn format_name(format: ImageFormat) -> &'static str {
     }
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
+fn http_client() -> Result<reqwest::Client, CliError> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("cannot build the HTTP client: {e}"))
+        .map_err(CliError::Client)
 }
 
 /// Resolve a verb target to a full URL: full URLs pass
 /// through; a remainder is signed first.
-fn target_url(config: &Config, input: &str) -> Result<String, String> {
+fn target_url(config: &Config, input: &str) -> Result<String, CliError> {
     if input.starts_with("http://") || input.starts_with("https://") {
         return Ok(input.to_string());
     }
@@ -798,7 +896,7 @@ fn target_url(config: &Config, input: &str) -> Result<String, String> {
     Ok(format!("{}/{sig}/{rest}", config.base))
 }
 
-async fn meta(config: &Config, positional: &[String]) -> Result<String, String> {
+async fn meta(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let input = one_target(positional, "meta")?;
     let url = target_url(config, &input)?;
     let mut accept = "application/json".to_string();
@@ -813,18 +911,21 @@ async fn meta(config: &Config, positional: &[String]) -> Result<String, String> 
         .header("accept", accept)
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(CliError::Request)?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", body.trim()));
+        return Err(CliError::Status {
+            status,
+            body: body.trim().to_string(),
+        });
     }
-    let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("the response was not JSON: {e}"))?;
-    serde_json::to_string_pretty(&json).map_err(|e| e.to_string())
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| CliError::Response(format!("the response was not JSON: {e}")))?;
+    serde_json::to_string_pretty(&json).map_err(|e| CliError::Response(e.to_string()))
 }
 
-async fn purge(config: &Config, positional: &[String]) -> Result<String, String> {
+async fn purge(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let input = one_target(positional, "purge")?;
     let secret = require_secret(config)?;
     let (_, _, rest) = split_signed(&input, &config.base);
@@ -836,7 +937,7 @@ async fn purge(config: &Config, positional: &[String]) -> Result<String, String>
     post_purge(config, &format!("{}/purge/{segment}/{rest}", config.base)).await
 }
 
-async fn purge_group(config: &Config, positional: &[String]) -> Result<String, String> {
+async fn purge_group(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let name = one_target(positional, "purge-group")?;
     let secret = require_secret(config)?;
     let sig = crate::url::purge_group_signature(secret, &name);
@@ -858,26 +959,31 @@ async fn purge_group(config: &Config, positional: &[String]) -> Result<String, S
 /// server's own rule before anything is sent, and the
 /// file's size is not pre-checked: the server's cap is
 /// the authority, and its 413 is a clean error here.
-async fn upload(config: &Config, positional: &[String]) -> Result<String, String> {
+async fn upload(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let (file, name) = match positional {
         [file] => {
             let name = std::path::Path::new(file)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
-                .ok_or_else(|| format!("cannot derive an upload name from {file:?}\n\n{USAGE}"))?;
+                .ok_or_else(|| {
+                    CliError::Usage(format!("cannot derive an upload name from {file:?}"))
+                })?;
             (file.clone(), name)
         }
         [file, name] => (file.clone(), name.clone()),
-        [] => return Err(format!("upload needs a file\n\n{USAGE}")),
+        [] => return Err(CliError::Usage("upload needs a file".to_string())),
         _ => {
-            return Err(format!(
-                "upload takes a file and an optional name\n\n{USAGE}"
+            return Err(CliError::Usage(
+                "upload takes a file and an optional name".to_string(),
             ));
         }
     };
-    crate::upload::validate_upload_name(&name)?;
+    crate::upload::validate_upload_name(&name).map_err(CliError::Invalid)?;
     let secret = require_secret(config)?;
-    let bytes = std::fs::read(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let bytes = std::fs::read(&file).map_err(|source| CliError::Io {
+        path: file.clone(),
+        source,
+    })?;
     // With --expires the token is the expiring form: the
     // signature covers `exp:<ts>/<name>` and the path
     // carries the segment, so the token dies at that
@@ -898,31 +1004,37 @@ async fn upload(config: &Config, positional: &[String]) -> Result<String, String
         .body(bytes)
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(CliError::Request)?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", body.trim()));
+        return Err(CliError::Status {
+            status,
+            body: body.trim().to_string(),
+        });
     }
     Ok(body.trim().to_string())
 }
 
-async fn post_purge(config: &Config, url: &str) -> Result<String, String> {
+async fn post_purge(config: &Config, url: &str) -> Result<String, CliError> {
     let _ = config;
     let response = http_client()?
         .post(url)
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(CliError::Request)?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", body.trim()));
+        return Err(CliError::Status {
+            status,
+            body: body.trim().to_string(),
+        });
     }
     Ok(body.trim().to_string())
 }
 
-fn convert_thumbor_cmd(config: &Config, positional: &[String]) -> Result<String, String> {
+fn convert_thumbor_cmd(config: &Config, positional: &[String]) -> Result<String, CliError> {
     let input = one_target(positional, "convert-thumbor")?;
     let (url, warnings) = convert_thumbor(&input, &config.base, config.secret.as_deref())?;
     for warning in &warnings {
@@ -1246,7 +1358,7 @@ pub fn convert_thumbor(
     input: &str,
     base: &str,
     secret: Option<&[u8]>,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, Vec<String>), CliError> {
     let mut warnings: Vec<String> = Vec::new();
     let input = input.trim();
     // A full URL loses its scheme and host; a bare path is
@@ -1263,15 +1375,15 @@ pub fn convert_thumbor(
         after
             .split_once('/')
             .map(|(_, p)| p)
-            .ok_or_else(|| format!("not a Thumbor URL: {input:?} has no path"))?
+            .ok_or_else(|| CliError::Invalid(format!("not a Thumbor URL: {input:?} has no path")))?
     } else {
         input.strip_prefix('/').unwrap_or(input)
     };
     let segments: Vec<&str> = path.split('/').collect();
     if segments.len() < 2 {
-        return Err(format!(
+        return Err(CliError::Invalid(format!(
             "not a Thumbor URL: expected /<signature>/<operations>/<source>, got {input:?}"
-        ));
+        )));
     }
     // Segment 0 is the signature: "unsafe", or a base64
     // HMAC-SHA1 that cannot be carried over. It is dropped
@@ -1370,7 +1482,9 @@ pub fn convert_thumbor(
     }
     let source = segments[idx..].join("/");
     if source.is_empty() {
-        return Err(format!("not a Thumbor URL: no source image in {input:?}"));
+        return Err(CliError::Invalid(format!(
+            "not a Thumbor URL: no source image in {input:?}"
+        )));
     }
 
     let align = if smart {
@@ -1493,8 +1607,11 @@ pub fn convert_thumbor(
 
     // The converter's own output must satisfy the server
     // grammar; a failure here is a converter bug, not input.
-    parse_with_presets(&remainder)
-        .map_err(|e| format!("converted URL failed validation ({e}): {remainder}"))?;
+    parse_with_presets(&remainder).map_err(|e| {
+        CliError::Invalid(format!(
+            "converted URL failed validation ({e}): {remainder}"
+        ))
+    })?;
 
     let url = match secret {
         Some(secret) => format!(
@@ -1594,7 +1711,8 @@ mod tests {
         // signed URL is not a sealed one.
         let err = exec(&args(&["unseal", "--secret", "other-secret", &sealed]))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("did not open"), "{err}");
         let plain = exec(&args(&[
             "sign",
@@ -1606,13 +1724,15 @@ mod tests {
         .unwrap();
         let err = exec(&args(&["unseal", "--secret", "test-secret", &plain]))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a sealed URL"), "{err}");
         // Sealing without a secret is an error: no unsafe
         // token exists.
         let err = exec(&args(&["seal", "300x200/https://example.com/photo.jpg"]))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no secret"), "{err}");
         // A remainder the grammar refuses is refused at
         // mint time, like sign.
@@ -1623,7 +1743,8 @@ mod tests {
             "filters:quality(abc)/https://example.com/photo.jpg",
         ]))
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(!err.is_empty());
     }
 
@@ -1634,7 +1755,8 @@ mod tests {
         // process ever reaching the server.
         let err = exec(&args(&["sgin", "300x200/https://e.com/a.jpg"]))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown verb \"sgin\""), "{err}");
     }
 
@@ -1663,13 +1785,13 @@ mod tests {
             &["sgin", "--detections", "--expires", "5"],
         ];
         for case in cases {
-            let err = exec(&args(case)).await.unwrap_err();
+            let err = exec(&args(case)).await.unwrap_err().to_string();
             let expected = format!("unknown verb {:?}\n\n", case[0]);
             assert!(err.starts_with(&expected), "{case:?}: {err}");
         }
         // No arguments at all never reaches exec from main;
         // called directly, it is still an error, not a panic.
-        let err = exec(&[]).await.unwrap_err();
+        let err = exec(&[]).await.unwrap_err().to_string();
         assert!(err.starts_with("unknown verb \"\""), "{err}");
     }
 
@@ -1701,10 +1823,13 @@ mod tests {
             parse_flags(&args(&[flag])).unwrap_or_else(|e| panic!("{flag}: {e}"));
         }
         for verb in VERBS {
-            let err = exec(&args(&[verb])).await.unwrap_err();
+            let err = exec(&args(&[verb])).await.unwrap_err().to_string();
             assert!(!err.contains("unknown verb"), "{verb}: {err}");
         }
-        let err = parse_flags(&args(&["--key-ids", "k2"])).err().unwrap();
+        let err = parse_flags(&args(&["--key-ids", "k2"]))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.starts_with("unknown flag \"--key-ids\""), "{err}");
     }
 
@@ -1780,7 +1905,8 @@ mod tests {
         // locally, before a secret or a server is needed.
         let err = exec(&args(&["upload", "whatever.png", "../secret.png"]))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("must not start with '.'"), "{err}");
         // No file argument is a usage error.
         assert!(exec(&args(&["upload"])).await.is_err());
@@ -2111,5 +2237,162 @@ mod tests {
         assert_eq!(config.base, "https://cdn.test");
         assert_eq!(config.secret.as_deref(), Some(b"flag-secret".as_slice()));
         assert_eq!(positional, ["300x200/https://e.com/a.jpg"]);
+    }
+
+    /// A configuration with no secret, built directly: the
+    /// flags fall back to `CRABCROP_SECRET`, which the test
+    /// process may have set.
+    fn unsigned_config(base: &str) -> Config {
+        Config {
+            base: base.to_string(),
+            secret: None,
+            key_id: None,
+            placeholders: false,
+            detections: false,
+            expires: None,
+        }
+    }
+
+    /// One HTTP exchange on a loopback port: the response
+    /// `status` with `body`, to whatever request arrives.
+    async fn answer_once(status: &str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let _ = stream.read(&mut request).await;
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn cli_errors_are_typed_and_keep_their_messages() {
+        // Usage: the reason, then the usage text, as before.
+        let err = exec(&args(&["sgin"])).await.unwrap_err();
+        assert!(matches!(&err, CliError::Usage(reason) if reason == "unknown verb \"sgin\""));
+        assert_eq!(err.to_string(), format!("unknown verb \"sgin\"\n\n{USAGE}"));
+        let err = exec(&args(&["sign", "--secret"])).await.unwrap_err();
+        assert!(matches!(&err, CliError::Invalid(_)), "{err:?}");
+        assert_eq!(err.to_string(), "--secret needs a value");
+        // No secret.
+        let err = sign(
+            &unsigned_config("http://localhost:3000"),
+            &args(&["300x200/a.jpg"]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::NoSecret));
+        assert_eq!(
+            err.to_string(),
+            "no secret: pass --secret or set CRABCROP_SECRET"
+        );
+        // Parse: the grammar's own error, with its code.
+        let err = exec(&args(&[
+            "sign",
+            "--secret",
+            "s",
+            "300x200/filters:nope(1)/a.jpg",
+        ]))
+        .await
+        .unwrap_err();
+        let CliError::Parse(parse) = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(err.to_string(), parse.to_string());
+        // Transparent: the chain goes on from the grammar
+        // error's own source (it has none), so a reporter
+        // that walks it does not print the message twice.
+        assert!(std::error::Error::source(&err).is_none());
+        // Seal: a token that does not open under the secret.
+        let sealed = crabcrop_url::seal(b"one secret", "300x200/https://e.com/a.jpg").unwrap();
+        let err = exec(&args(&[
+            "unseal",
+            "--secret",
+            "another secret",
+            &format!("/{sealed}"),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CliError::Seal(_)), "{err:?}");
+        assert_eq!(err.to_string(), "the token did not open under this secret");
+        assert!(std::error::Error::source(&err).is_none());
+        // Io: the file and the cause.
+        let missing = std::env::temp_dir()
+            .join(format!("crabcrop-cli-missing-{}", std::process::id()))
+            .join("a.png");
+        let missing = missing.to_string_lossy().into_owned();
+        let err = exec(&args(&["upload", "--secret", "s", &missing]))
+            .await
+            .unwrap_err();
+        let CliError::Io { path, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(path, &missing);
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string()
+                .starts_with(&format!("cannot read {missing}: ")),
+            "{err}"
+        );
+        // Request: no answer from the server.
+        let err = exec(&args(&[
+            "purge-group",
+            "--secret",
+            "s",
+            "--base",
+            "http://127.0.0.1:9",
+            "cards",
+        ]))
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CliError::Request(_)), "{err:?}");
+        assert!(err.to_string().starts_with("request failed: "), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cli_errors_carry_the_server_answer() {
+        // Status: the status and the trimmed body.
+        let base = answer_once("403 Forbidden", " not yours \n").await;
+        let err = exec(&args(&[
+            "purge-group",
+            "--secret",
+            "s",
+            "--base",
+            &base,
+            "cards",
+        ]))
+        .await
+        .unwrap_err();
+        match &err {
+            CliError::Status { status, body } => {
+                assert_eq!(*status, reqwest::StatusCode::FORBIDDEN);
+                assert_eq!(body, "not yours");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(err.to_string(), "HTTP 403 Forbidden: not yours");
+        // Response: an answer the verb cannot use.
+        let base = answer_once("200 OK", "not json").await;
+        let err = exec(&args(&[
+            "meta",
+            "--base",
+            &base,
+            &format!("{base}/unsafe/x.jpg"),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CliError::Response(_)), "{err:?}");
+        assert!(
+            err.to_string().starts_with("the response was not JSON: "),
+            "{err}"
+        );
     }
 }

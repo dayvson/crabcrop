@@ -426,6 +426,14 @@ class Workflow(unittest.TestCase):
     def test_host_creates_or_updates_through_the_script(self):
         host = self.job("host")
         self.assertTrue("bash scripts/publish_github_release.sh" in host, "host does not run the script")
+        # The script refuses a published release unless the override
+        # is 1 (issue #552). Only the repository variable sets it, so
+        # adopting one is a deliberate settings change, never a
+        # value committed to the workflow.
+        self.assertEqual(
+            re.findall(r"ADOPT_PUBLISHED_RELEASE:.*", host),
+            ['ADOPT_PUBLISHED_RELEASE: "${{ vars.ADOPT_PUBLISHED_RELEASE }}"'],
+        )
         for name in self.jobs:
             with self.subTest(job=name):
                 self.assertFalse("gh release create" in self.job(name), f"{name} runs gh release create")

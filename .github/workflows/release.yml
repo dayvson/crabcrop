@@ -415,7 +415,11 @@ jobs:
       # failed whenever a release for the tag already existed,
       # which every tag run from v0.9.8 to v0.9.11 hit on its
       # first attempt. The script creates the release, or
-      # uploads to and updates the one already there.
+      # uploads to and publishes a draft already there. It
+      # refuses a release that is already published (issue
+      # #552): this workflow is the only way to publish one.
+      # The ADOPT_PUBLISHED_RELEASE repository variable, set
+      # to 1 for one re-run, adopts it anyway.
       - name: Create or update GitHub Release
         env:
           PRERELEASE: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && 'true' || 'false' }}"
@@ -423,6 +427,7 @@ jobs:
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
           RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
+          ADOPT_PUBLISHED_RELEASE: "${{ vars.ADOPT_PUBLISHED_RELEASE }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
