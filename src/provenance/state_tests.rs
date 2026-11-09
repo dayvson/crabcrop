@@ -23,7 +23,7 @@ fn reader_trusting(signed: &[u8], anchors: &str) -> Reader {
         .with_settings(settings.as_str())
         .expect("the trust settings load");
     Reader::from_context(context)
-        .with_stream("image/png", &mut Cursor::new(signed))
+        .with_stream("image/png", Cursor::new(signed))
         .expect("the reader parses the output")
 }
 
