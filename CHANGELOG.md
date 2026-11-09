@@ -16,6 +16,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The boot line `crabcrop listening on port N` names the port the server bound (issue #536). It printed the configured port, so `PORT=0`, which binds a free port, printed port 0; it now prints the port the system picked. For a fixed port the line is unchanged.
 
+- Test and CI reliability. A failed check in the disk-read test that blocks on a FIFO no longer hangs the suite: the test lets the held read go on every exit path and puts a deadline on each request and on the wait for the read, and every job in `rust.yml` and `functional.yml` has a `timeout-minutes` (issue #543).
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
