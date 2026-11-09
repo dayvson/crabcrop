@@ -314,11 +314,14 @@ impl S3Store {
     /// streaming so an oversized object is refused as soon
     /// as it passes the cap instead of after it has been
     /// buffered whole, and within the transfer budget from
-    /// `started`, when its request began (issue #550).
-    /// `None` on a transport error, an oversized body, or a
-    /// body past its budget; all read as a cache miss
-    /// upstream.
-    async fn read_capped(&self, resp: reqwest::Response, started: Instant) -> Option<Vec<u8>> {
+    /// `started`, when its request began (issue #550). An
+    /// oversized body, one that breaks off, and one past its
+    /// budget all read as a cache miss upstream.
+    async fn read_capped(
+        &self,
+        resp: reqwest::Response,
+        started: Instant,
+    ) -> Result<Vec<u8>, BodyFailure> {
         read_capped_at(resp, self.max_entry_bytes, started).await
     }
 
@@ -507,7 +510,20 @@ impl S3Store {
             return None;
         }
         let etag = response_etag(&resp);
-        let data = self.read_capped(resp, started).await?;
+        let data = match self.read_capped(resp, started).await {
+            Ok(data) => data,
+            Err(BodyFailure::TooLarge) => return None,
+            // A body that broke off or ran past its budget is
+            // a store failure, counted like one that never
+            // answered (issues #367, #550), not a plain miss.
+            Err(BodyFailure::Failed) => {
+                self.note_error(
+                    "cannot read an entry",
+                    "transport error or past its time bound",
+                );
+                return None;
+            }
+        };
         let (stored_key, image) = parse_entry(&data, &self.entry_key)?;
         if stored_key != key {
             return None;
@@ -594,7 +610,7 @@ impl S3Store {
         }
         // Uncapped: an upload's own cap bounded what was
         // stored. The budget still applies (issue #550).
-        read_capped_at(resp, usize::MAX, started).await
+        read_capped_at(resp, usize::MAX, started).await.ok()
     }
 
     /// Whether a raw object exists under `name`, answered
@@ -750,7 +766,7 @@ impl S3Store {
         // not arrive whole is a transport failure. A store
         // that ignores the range sends the whole object, and
         // its budget follows that length (issue #550).
-        let Some(data) = self.read_capped(resp, started).await else {
+        let Ok(data) = self.read_capped(resp, started).await else {
             return HeaderRead::Failed;
         };
         let whole = |data: &[u8], etag: Option<String>| match parse_entry(data, &self.entry_key) {
@@ -783,8 +799,8 @@ impl S3Store {
                 }
                 let etag = response_etag(&resp);
                 match self.read_capped(resp, started).await {
-                    Some(data) => whole(&data, etag),
-                    None => HeaderRead::Failed,
+                    Ok(data) => whole(&data, etag),
+                    Err(_) => HeaderRead::Failed,
                 }
             }
         }
@@ -1205,7 +1221,9 @@ impl S3Store {
         if !resp.status().is_success() {
             return None;
         }
-        let data = read_capped_at(resp, MAX_TOMBSTONE_BYTES, started).await?;
+        let data = read_capped_at(resp, MAX_TOMBSTONE_BYTES, started)
+            .await
+            .ok()?;
         let tombstone = parse_tombstone(&data, &self.entry_key)?;
         (tombstone.cutoff.start_ms == start_ms && tombstone.cutoff.writer == writer)
             .then_some(tombstone)
@@ -1423,11 +1441,21 @@ struct ProbedEntry {
     etag: Option<String>,
 }
 
+/// Why [`read_capped_at`] returned no body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyFailure {
+    /// The body passed the cap: refused, not a store fault.
+    TooLarge,
+    /// The body broke off, or did not arrive whole within
+    /// its budget (issue #550): a store fault.
+    Failed,
+}
+
 /// Read a response body under `cap` bytes, streaming so an
 /// oversized object is refused as soon as it passes the cap
-/// instead of after it has been buffered whole. `None` on a
-/// transport error or an oversized body; both read as a
-/// miss upstream.
+/// instead of after it has been buffered whole. Both
+/// failures read as a miss upstream; a lookup also counts a
+/// [`BodyFailure::Failed`] as a tier error.
 ///
 /// The read is bounded too (issue #550): it must end within
 /// the [`transfer_budget`] of the length the store declared,
@@ -1441,10 +1469,10 @@ async fn read_capped_at(
     mut resp: reqwest::Response,
     cap: usize,
     started: Instant,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, BodyFailure> {
     let declared = resp.content_length();
     if declared.is_some_and(|n| n > cap as u64) {
-        return None;
+        return Err(BodyFailure::TooLarge);
     }
     let mut data = Vec::new();
     loop {
@@ -1452,17 +1480,21 @@ async fn read_capped_at(
         let deadline = tokio::time::Instant::from_std(started + transfer_budget(expected));
         let Some(chunk) = tokio::time::timeout_at(deadline, resp.chunk())
             .await
-            .ok()?
-            .ok()?
+            .map_err(|_| BodyFailure::Failed)?
+            .map_err(|_| BodyFailure::Failed)?
         else {
             break;
         };
-        if data.len().checked_add(chunk.len())? > cap {
-            return None;
+        if data
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|len| len > cap)
+        {
+            return Err(BodyFailure::TooLarge);
         }
         data.extend_from_slice(&chunk);
     }
-    Some(data)
+    Ok(data)
 }
 
 /// The ETag a store reported for an object, verbatim.
@@ -3037,6 +3069,9 @@ mod tests {
         /// Answers with this body, its length declared, sent
         /// at this many bytes a second.
         Serves(Arc<Vec<u8>>, u64),
+        /// Answers with this body's length declared, sends
+        /// this many bytes of it, then nothing more.
+        ServesThenStalls(Arc<Vec<u8>>, usize),
     }
 
     /// A store stub that handles one request per connection
@@ -3127,6 +3162,20 @@ mod tests {
                                 sent = end;
                                 tokio::time::sleep_until(due(sent, rate)).await;
                             }
+                        }
+                        Slow::ServesThenStalls(body, stall) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            if socket.write_all(head.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            let stall = stall.min(body.len());
+                            if socket.write_all(&body[..stall]).await.is_err() {
+                                return;
+                            }
+                            std::future::pending::<()>().await
                         }
                     }
                 });
@@ -3261,12 +3310,36 @@ mod tests {
         // 64 bytes at 2 bytes a second: a byte every half
         // second, so the read timeout never fires, but the
         // read's budget (10 s for 64 bytes) ends it long
-        // before the 32 s the body would take.
+        // before the 32 s the body would take. The lookup
+        // counts it as a tier failure, like a store that does
+        // not answer: it is not a plain miss.
         let (endpoint, _) = start_slow_store(Slow::Serves(Arc::new(vec![b'x'; 64]), 2)).await;
         let s = store(&endpoint);
         let started = Instant::now();
-        assert_eq!(s.get_raw("x").await, None);
+        let (raw, entry) = tokio::join!(s.get_raw("x"), s.get("x"));
         let took = started.elapsed();
+        assert_eq!(raw, None);
+        assert!(entry.is_none());
+        assert_eq!(s.errors(), 1, "the lookup that ran out is counted");
+        assert!(took >= STORE_TIMEOUT, "{took:?}");
+        assert!(took < STORE_TIMEOUT + SLACK, "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn an_entry_read_that_stalls_fails_at_the_idle_bound() {
+        // A 16 MiB entry whose body stops after 256 KiB: its
+        // budget is 26 s, but the body goes quiet, so the read
+        // timeout ends it 10 s after the last byte, and the
+        // lookup counts it as a tier failure.
+        let bytes = serialize_entry("big", &image(&vec![7u8; SLOW_BODY], &[]), &test_entry_key());
+        let (endpoint, _) =
+            start_slow_store(Slow::ServesThenStalls(Arc::new(bytes), 256 * 1024)).await;
+        let s = store(&endpoint);
+        let started = Instant::now();
+        let got = s.get("big").await;
+        let took = started.elapsed();
+        assert!(got.is_none());
+        assert_eq!(s.errors(), 1, "the stalled lookup is counted");
         assert!(took >= STORE_TIMEOUT, "{took:?}");
         assert!(took < STORE_TIMEOUT + SLACK, "{took:?}");
     }

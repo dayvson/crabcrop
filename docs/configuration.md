@@ -90,7 +90,7 @@ Requests to the upload bucket (`CRABCROP_UPLOAD_BUCKET`) and the shared result s
 - A read of an object (a shared-tier lookup, a purge's header read, a tombstone) must start to answer within 10 seconds, and no stretch of its body may go 10 seconds without a byte. The whole read must end within 10 seconds plus one second per MiB of the length the store declares, counted from the request; when the store declares no length, the bound grows with the bytes that have arrived, so the store must keep up 1 MiB a second.
 - Every other request (a `HEAD`, a `DELETE`, a listing page) must be done within 10 seconds.
 
-A request past its bound fails like any other store error. An upload answers `502 upload_store_unavailable`. The shared tier reads it as a miss or a dropped write, and counts it in `crabcrop_cache_tier_errors_total`.
+A request past its bound fails like any other store error. An upload answers `502 upload_store_unavailable`. A shared-tier lookup that runs out is a miss and a write that runs out is dropped, and both count in `crabcrop_cache_tier_errors_total`, as does a purge scan read that runs out, which keeps the purge's tombstone in force.
 
 ### Server-wide default operations
 
