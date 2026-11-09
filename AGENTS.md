@@ -31,7 +31,11 @@ both SDKs must all pass.
   provider family, all re-exported from `crate::ai`) and
   `studio.rs`. A large module keeps its unit tests in
   `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
-  `server.rs`, `engine.rs` and the files under `ai/` do.
+  `server.rs`, `engine.rs`, `url.rs`, `filters.rs`, `frames.rs`
+  and the files under `ai/` do; a second test module (the
+  identity proofs in `filters.rs`) is a sibling file there.
+  `main.rs` is a crate root, where `mod tests;` would load
+  `src/tests.rs`, so it names `main/tests.rs` with `#[path]`.
   `config.rs` belongs to the binary: it reads and validates the
   configuration that `main.rs` builds the server from.
 - `crates/crabcrop-url`: the client-side library: signing, sealing,
