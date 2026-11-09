@@ -2,8 +2,8 @@
 //!
 //! An AVIF source reaches mp4parse, the ISO-BMFF parser behind
 //! the image crate's AVIF decoder, before any decode limit
-//! applies: the dimension probe and the decode both start by
-//! parsing the container. mp4parse 0.17 sizes several reads by
+//! applies: the decode starts by parsing the container.
+//! mp4parse 0.17 sizes several reads by
 //! what the file declares instead of by the bytes it holds. A
 //! box it reads into memory (`hdlr`, `iloc`, `idat`, the item
 //! properties, `mdat`) reserves its declared size first, and two
@@ -13,10 +13,10 @@
 //! reserved all of it.
 //!
 //! [`screen`] runs first, on every path that hands AVIF bytes to
-//! the image crate: [`crate::engine::decode_image`] (which the
-//! render, upload, watermark, and metadata paths share) and the
-//! explain probe. It walks the boxes mp4parse reads, in one pass,
-//! and allocates nothing:
+//! the image crate: [`crate::engine::decode_image`], which the
+//! render, upload, watermark, and metadata paths share. It walks
+//! the boxes mp4parse reads, then the item table, and allocates
+//! nothing:
 //!
 //! - Every box must fit inside its parent (the file, for a
 //!   top-level box), whichever way its size is written: 32 bits, 64
@@ -27,11 +27,29 @@
 //! - A 32-bit entry count above the 16-bit range must be backed
 //!   by bytes: every `iinf` entry is a box (8 bytes at least),
 //!   every version 2 `iloc` item 10 bytes at least.
+//! - Every item in `iloc` (versions 0, 1, and 2, every field
+//!   size the format allows) has at most [`MAX_EXTENTS`]
+//!   extents, and its extent lengths add up to no more than the
+//!   bytes the item can come from: the top-level `mdat`
+//!   payloads for an item stored in the file (construction
+//!   method 0), the `idat` payload for one stored there (method
+//!   1). A length of 0 counts as the rest of the `mdat` that
+//!   holds the extent's offset, or of the `idat`. An item built
+//!   from other items (method 2) counts toward the cap only.
+//! - The primary item's `ispe` (found through `pitm`, its `ipma`
+//!   entry, and `ipco`) must declare a size within the engine's
+//!   decode limits: [`crate::engine::MAX_DECODE_DIMENSION`] a
+//!   side and [`crate::engine::MAX_DECODE_ALLOC`] at four bytes
+//!   a pixel. The decode checks the decoded picture against the
+//!   same limits; this check comes before any decoding. A
+//!   primary item without an `ispe` is left to the decoder, as
+//!   before.
 //!
 //! Every reservation the parser sizes from a declared box size or
-//! a 32-bit count is then bounded by the size of the file; the
-//! 16-bit counts stay as they are (about 5 MiB at most, for
-//! 65,535 `iloc` items). A refused source fails as any
+//! a 32-bit count is then bounded by the size of the file, and
+//! the data the parser assembles for an item by the bytes the
+//! file holds; the 16-bit counts stay as they are (about 5 MiB
+//! at most, for 65,535 `iloc` items). A refused source fails as any
 //! undecodable source does (`502 decode_failed`; `415` for an
 //! upload). The parser refuses a box that overruns its parent
 //! too, once it has made the reservation, so the walk mostly
@@ -45,18 +63,15 @@
 //! 0 box can ask for anyway) and only when the box could not hold
 //! that many entries.
 //!
-//! The walk bounds reservations, not copies: an item whose
-//! `iloc` lists the same bytes as many extents is still copied
-//! once per extent. That is a separate hazard, outside this
-//! screen.
-//!
 //! The walk follows mp4parse's own rules where they are lenient,
 //! in the default strictness the image crate uses, so it refuses
 //! nothing else the parser reads without such a reservation: a
 //! top-level box the parser only skips (anything after the first
 //! box but `meta` and `mdat`) may run past the end of the file,
 //! where the parser stops reading, and a run of boxes may end in
-//! fewer bytes than a box header.
+//! fewer bytes than a box header. An item table the parser
+//! refuses outright (a field size other than 0, 4, or 8 bytes,
+//! an item with no extents, a table cut short) is left to it.
 //!
 //! An image-sequence brand (`avis` or `msf1`) makes mp4parse
 //! parse the movie box (`moov`) as well, whose readers size reads
@@ -67,6 +82,9 @@
 //! those brands blanked: the parser skips the movie box, as it
 //! does any box it does not read, and the still decodes as
 //! before.
+//!
+//! [`declared_size`] reads the same `ispe` for the explain
+//! probe and the DPR hint, so sizing an AVIF takes no decode.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -87,6 +105,14 @@ const MIN_IINF_ENTRY: u64 = 8;
 /// extent count, with every offset and length field sized 0.
 const MIN_ILOC_V2_ITEM: u64 = 10;
 
+/// The most extents one item may list. A grid or overlay image
+/// reaches the primary image through many items, but each is one
+/// extent; a single image item stored in a handful of extents is
+/// the usual multi-extent case. The cap is generous for that and
+/// still bounds the per-item extent list, which mp4parse reads
+/// into a vector before it copies anything.
+const MAX_EXTENTS: u64 = 32;
+
 /// Screen source bytes before the image crate's AVIF decoder
 /// sees them. Bytes the image crate does not read as AVIF come
 /// back as they are, borrowed. An AVIF container that passes
@@ -99,6 +125,15 @@ pub(crate) fn screen(bytes: &[u8]) -> Result<Cow<'_, [u8]>, EngineError> {
     }
     walk(bytes, Level::File)
         .map_err(|refusal| EngineError::Decode(format!("AVIF container refused: {refusal}")))?;
+    let inspect = inspect(bytes)
+        .map_err(|refusal| EngineError::Decode(format!("AVIF container refused: {refusal}")))?;
+    if let Some((width, height)) = inspect.primary_size
+        && let Err(refusal) = within_decode_limits(width, height)
+    {
+        return Err(EngineError::Decode(format!(
+            "AVIF container refused: {refusal}"
+        )));
+    }
     if sequence_brands(bytes).next().is_none() {
         return Ok(Cow::Borrowed(bytes));
     }
@@ -148,6 +183,13 @@ enum Refusal {
         count: u32,
         room: u64,
     },
+    /// An item listing more extents than the cap allows.
+    Extents { item: u32, extents: u64 },
+    /// An item whose extent lengths sum past the data the file
+    /// holds for it.
+    Amplified { item: u32, needs: u64, holds: u64 },
+    /// The primary item declares a size past the decode limits.
+    Dimension { width: u32, height: u32 },
 }
 
 impl fmt::Display for Refusal {
@@ -172,6 +214,19 @@ impl fmt::Display for Refusal {
                 "box '{}' counts {count} entries in {room} bytes",
                 kind.escape_ascii()
             ),
+            Refusal::Extents { item, extents } => {
+                write!(f, "item {item} lists {extents} extents")
+            }
+            Refusal::Amplified { item, needs, holds } => write!(
+                f,
+                "item {item} sums {needs} extent bytes, more than the {holds} the file holds"
+            ),
+            Refusal::Dimension { width, height } => {
+                write!(
+                    f,
+                    "the primary item declares {width}x{height}, past the decode limits"
+                )
+            }
         }
     }
 }
@@ -310,6 +365,314 @@ fn check_count(kind: [u8; 4], count: u32, room: u64, min_entry: u64) -> Result<(
         return Ok(());
     }
     Err(Refusal::Count { kind, count, room })
+}
+
+/// What [`inspect`] reads from the item table ahead of the
+/// decode.
+struct Inspect {
+    /// The primary item's declared size, from its `ispe`
+    /// property, when the container names one.
+    primary_size: Option<(u32, u32)>,
+}
+
+/// A forward byte cursor that reads big-endian integers and
+/// returns `None` the moment the slice runs short, so a
+/// truncated box stops the read without a panic.
+struct Cur<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, at: 0 }
+    }
+
+    /// The next `n` bytes as a big-endian integer (`n` at most
+    /// 8); `n` of 0 reads nothing and is 0, the width the item
+    /// format gives an omitted field.
+    fn uint(&mut self, n: usize) -> Option<u64> {
+        let end = self.at.checked_add(n)?;
+        let slice = self.data.get(self.at..end)?;
+        self.at = end;
+        Some(slice.iter().fold(0u64, |v, &b| (v << 8) | u64::from(b)))
+    }
+
+    /// Advance past `n` bytes, or `None` past the end.
+    fn skip(&mut self, n: usize) -> Option<()> {
+        let end = self.at.checked_add(n)?;
+        if end > self.data.len() {
+            return None;
+        }
+        self.at = end;
+        Some(())
+    }
+}
+
+/// Call `f` with the kind and body of each box in `data`, in
+/// order, the way [`walk`] reads them: the body excludes the
+/// header, a size-0 box runs to the end of `data`, and the
+/// iteration stops at a header the remaining bytes cannot hold
+/// or a box that overruns `data` (which [`walk`] has already
+/// refused for the boxes the parser reads). Allocates nothing.
+fn each_box<'a>(data: &'a [u8], mut f: impl FnMut([u8; 4], &'a [u8])) {
+    let mut rest = data;
+    while let Ok(Some(header)) = Header::read(rest) {
+        let room = rest.len() as u64;
+        let size = header.size.unwrap_or(room);
+        if size > room {
+            break;
+        }
+        let (this, next) = rest.split_at(size as usize);
+        f(header.kind, &this[header.len..]);
+        rest = next;
+    }
+}
+
+/// Read the item table the decoder builds from: refuse an item
+/// whose extents overrun the cap or sum past the data the file
+/// holds for it, and report the primary item's declared size.
+/// Bounds-checked throughout, so a truncated or malformed table
+/// stops without a panic and is left to the parser.
+fn inspect(bytes: &[u8]) -> Result<Inspect, Refusal> {
+    // The top level holds the data an item is copied from (the
+    // `mdat` payloads) and the `meta` box that describes it.
+    let mut total_mdat: u64 = 0;
+    let mut meta_body: Option<&[u8]> = None;
+    each_box(bytes, |kind, body| match &kind {
+        b"mdat" => total_mdat = total_mdat.saturating_add(body.len() as u64),
+        b"meta" => meta_body = meta_body.or(Some(body)),
+        _ => {}
+    });
+    let Some(meta) = meta_body else {
+        return Ok(Inspect { primary_size: None });
+    };
+    // `meta` is a full box: version and flags before its
+    // children.
+    let meta = meta.get(4..).unwrap_or_default();
+    let mut idat_len: u64 = 0;
+    let mut iloc: Option<&[u8]> = None;
+    let mut iprp: Option<&[u8]> = None;
+    let mut pitm: Option<&[u8]> = None;
+    each_box(meta, |kind, body| match &kind {
+        b"idat" => idat_len = body.len() as u64,
+        b"iloc" => iloc = iloc.or(Some(body)),
+        b"iprp" => iprp = iprp.or(Some(body)),
+        b"pitm" => pitm = pitm.or(Some(body)),
+        _ => {}
+    });
+    if let Some(iloc) = iloc {
+        check_iloc(iloc, total_mdat, idat_len)?;
+    }
+    let primary_size = match (pitm.and_then(primary_item_id), iprp) {
+        (Some(id), Some(iprp)) => primary_ispe(iprp, id),
+        _ => None,
+    };
+    Ok(Inspect { primary_size })
+}
+
+/// Walk `iloc` (versions 0, 1, 2, every field-size variant),
+/// refusing an item with too many extents or whose extents sum
+/// past the bytes the file holds for its construction method.
+/// A table mp4parse refuses outright (a field size other than
+/// 0, 4, or 8 bytes, a truncated item) is left to it.
+fn check_iloc(body: &[u8], total_mdat: u64, idat_len: u64) -> Result<(), Refusal> {
+    let mut c = Cur::new(body);
+    let Some(version) = c.uint(1) else {
+        return Ok(());
+    };
+    if version > 2 || c.skip(3).is_none() {
+        return Ok(());
+    }
+    let (Some(sizes0), Some(sizes1)) = (c.uint(1), c.uint(1)) else {
+        return Ok(());
+    };
+    let offset_size = (sizes0 >> 4) as usize;
+    let length_size = (sizes0 & 0xf) as usize;
+    let base_offset_size = (sizes1 >> 4) as usize;
+    let index_size = (sizes1 & 0xf) as usize;
+    // Versions 0 and 1 carry 16-bit item IDs and counts, version
+    // 2 carries 32-bit. A size other than 0, 4, or 8 bytes, or a
+    // version 0 index nibble aside (reserved there), is a table
+    // the parser refuses before it copies anything.
+    let widths = if version == 0 {
+        &[offset_size, length_size, base_offset_size][..]
+    } else {
+        &[offset_size, length_size, base_offset_size, index_size][..]
+    };
+    if widths.iter().any(|&s| !matches!(s, 0 | 4 | 8)) {
+        return Ok(());
+    }
+    let id_bytes = if version == 2 { 4 } else { 2 };
+    let Some(item_count) = c.uint(id_bytes) else {
+        return Ok(());
+    };
+    for _ in 0..item_count {
+        let Some(item_id) = c.uint(id_bytes) else {
+            return Ok(());
+        };
+        let item_id = item_id as u32;
+        let method = if version == 0 {
+            0
+        } else {
+            match c.uint(2) {
+                Some(field) => (field & 0xf) as u8,
+                None => return Ok(()),
+            }
+        };
+        // Data reference index, then the base offset.
+        if c.skip(2).is_none() || c.skip(base_offset_size).is_none() {
+            return Ok(());
+        }
+        let Some(extent_count) = c.uint(2) else {
+            return Ok(());
+        };
+        if extent_count > MAX_EXTENTS {
+            return Err(Refusal::Extents {
+                item: item_id,
+                extents: extent_count,
+            });
+        }
+        // Explicit lengths sum directly; a length of 0 runs to
+        // the end of the data the extent sits in, which is at
+        // most all of it, so each counts as the whole.
+        let mut explicit: Option<u64> = Some(0);
+        let mut to_end: u64 = 0;
+        for _ in 0..extent_count {
+            if version != 0 && c.skip(index_size).is_none() {
+                return Ok(());
+            }
+            if c.skip(offset_size).is_none() {
+                return Ok(());
+            }
+            let Some(len) = c.uint(length_size) else {
+                return Ok(());
+            };
+            if len == 0 {
+                to_end += 1;
+            } else {
+                explicit = explicit.and_then(|s| s.checked_add(len));
+            }
+        }
+        // Construction method 2 builds the item from other
+        // items; the decoder refuses it, so only the cap applies.
+        if method == 2 {
+            continue;
+        }
+        let holds = if method == 1 { idat_len } else { total_mdat };
+        let needs = explicit.map_or(u64::MAX, |s| s.saturating_add(to_end.saturating_mul(holds)));
+        if needs > holds {
+            return Err(Refusal::Amplified {
+                item: item_id,
+                needs,
+                holds,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The primary item's id, from `pitm` (both id widths).
+fn primary_item_id(body: &[u8]) -> Option<u32> {
+    let mut c = Cur::new(body);
+    let version = c.uint(1)?;
+    c.skip(3)?;
+    if version == 0 {
+        c.uint(2).map(|id| id as u32)
+    } else {
+        c.uint(4).map(|id| id as u32)
+    }
+}
+
+/// The primary item's declared size, from the `ispe` property
+/// its `ipma` entry points at inside `ipco`. `None` when the
+/// container names none, which leaves the sizing to the decoder.
+fn primary_ispe(iprp: &[u8], primary: u32) -> Option<(u32, u32)> {
+    let mut ipco: Option<&[u8]> = None;
+    // The property indices (1-based) associated with the primary
+    // item, from every `ipma`. Bounded so a flood of
+    // associations cannot grow this without limit.
+    let mut indices: Vec<u16> = Vec::new();
+    each_box(iprp, |kind, body| match &kind {
+        b"ipco" => ipco = ipco.or(Some(body)),
+        b"ipma" => collect_ipma(body, primary, &mut indices),
+        _ => {}
+    });
+    let ipco = ipco?;
+    if indices.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    let mut index: u16 = 1;
+    each_box(ipco, |kind, body| {
+        if found.is_none() && &kind == b"ispe" && indices.contains(&index) {
+            found = read_ispe(body);
+        }
+        index = index.saturating_add(1);
+    });
+    found
+}
+
+/// Add the property indices `ipma` associates with the primary
+/// item to `out` (both property-index widths from the flags,
+/// both item-id widths from the version), up to a small cap.
+fn collect_ipma(body: &[u8], primary: u32, out: &mut Vec<u16>) {
+    let mut c = Cur::new(body);
+    let (Some(version), Some(flags)) = (c.uint(1), c.uint(3)) else {
+        return;
+    };
+    let assoc_bytes = if flags & 1 == 1 { 2 } else { 1 };
+    let index_bits = assoc_bytes * 8 - 1;
+    let Some(entry_count) = c.uint(4) else {
+        return;
+    };
+    for _ in 0..entry_count {
+        let id = if version == 0 { c.uint(2) } else { c.uint(4) };
+        let (Some(id), Some(assoc_count)) = (id, c.uint(1)) else {
+            return;
+        };
+        for _ in 0..assoc_count {
+            let Some(association) = c.uint(assoc_bytes) else {
+                return;
+            };
+            if id as u32 == primary && out.len() < 256 {
+                out.push((association & ((1u64 << index_bits) - 1)) as u16);
+            }
+        }
+    }
+}
+
+/// The width and height an `ispe` declares.
+fn read_ispe(body: &[u8]) -> Option<(u32, u32)> {
+    let mut c = Cur::new(body);
+    c.skip(4)?;
+    Some((c.uint(4)? as u32, c.uint(4)? as u32))
+}
+
+/// Refuse a declared size the decoder's own checks would refuse
+/// after it allocated the picture: past the per-axis cap, or
+/// past the decode allocation budget at four bytes a pixel.
+fn within_decode_limits(width: u32, height: u32) -> Result<(), Refusal> {
+    let (w, h) = (u64::from(width), u64::from(height));
+    if w > u64::from(crate::engine::MAX_DECODE_DIMENSION)
+        || h > u64::from(crate::engine::MAX_DECODE_DIMENSION)
+        || w.saturating_mul(h).saturating_mul(4) > crate::engine::MAX_DECODE_ALLOC
+    {
+        return Err(Refusal::Dimension { width, height });
+    }
+    Ok(())
+}
+
+/// The primary item's declared size from an AVIF container's
+/// `ispe`, or `None` when the bytes are not an AVIF the walk
+/// accepts or the container names no size. Reads headers only:
+/// sizing an AVIF no longer needs a decode (issue #522).
+pub(crate) fn declared_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !matches!(image::guess_format(bytes), Ok(image::ImageFormat::Avif)) {
+        return None;
+    }
+    walk(bytes, Level::File).ok()?;
+    inspect(bytes).ok()?.primary_size
 }
 
 #[cfg(test)]
@@ -677,6 +1040,171 @@ mod tests {
         // refuse.
         assert_eq!(refusal(&with(bx(b"iinf", &full(1, &[0xFF, 0xFF])))), None);
         assert_eq!(refusal(&with(bx(b"iloc", &full(2, &[0, 0, 0xFF])))), None);
+    }
+
+    /// An `iloc` item for the test builder: an id, a
+    /// construction method, and its `(offset, length)` extents.
+    type IlocItem<'a> = (u32, u8, &'a [(u32, u32)]);
+
+    /// A version 1 `iloc` with 4-byte offsets and lengths, no
+    /// base offset and no index, holding `items`.
+    fn iloc_v1(items: &[IlocItem]) -> Vec<u8> {
+        let mut body = vec![0x44, 0x00];
+        body.extend_from_slice(&(items.len() as u16).to_be_bytes());
+        for (id, method, extents) in items {
+            body.extend_from_slice(&(*id as u16).to_be_bytes());
+            body.extend_from_slice(&u16::from(*method).to_be_bytes());
+            body.extend_from_slice(&0u16.to_be_bytes());
+            body.extend_from_slice(&(extents.len() as u16).to_be_bytes());
+            for (offset, length) in *extents {
+                body.extend_from_slice(&offset.to_be_bytes());
+                body.extend_from_slice(&length.to_be_bytes());
+            }
+        }
+        bx(b"iloc", &full(1, &body))
+    }
+
+    /// `pitm` + `ipma` naming item 1's one property (index 1)
+    /// and an `iprp`/`ipco` whose first property is that `ispe`.
+    fn primary_with_ispe(width: u32, height: u32) -> Vec<Vec<u8>> {
+        let iprp = bx(
+            b"iprp",
+            &concat(&[
+                bx(b"ipco", &{
+                    let mut body = width.to_be_bytes().to_vec();
+                    body.extend_from_slice(&height.to_be_bytes());
+                    bx(b"ispe", &full(0, &body))
+                }),
+                bx(b"ipma", &full(0, &[0, 0, 0, 1, 0, 1, 1, 0x01])),
+            ]),
+        );
+        vec![bx(b"pitm", &full(0, &[0, 1])), iprp]
+    }
+
+    /// `meta` holding `hdlr` and then `children`.
+    fn meta_with(children: &[Vec<u8>]) -> Vec<u8> {
+        let mut inside = vec![hdlr()];
+        inside.extend_from_slice(children);
+        meta(&inside)
+    }
+
+    /// `ftyp` + `meta(children)` + an `mdat` of `mdat_len` bytes.
+    fn container(children: &[Vec<u8>], mdat_len: usize) -> Vec<u8> {
+        concat(&[
+            ftyp(b"mif1miaf"),
+            meta_with(children),
+            bx(b"mdat", &vec![0u8; mdat_len]),
+        ])
+    }
+
+    fn item_refusal(bytes: &[u8]) -> Option<Refusal> {
+        inspect(bytes).err()
+    }
+
+    #[test]
+    fn consistent_extents_pass() {
+        // One extent filling the mdat, and two partitioning it.
+        let single = container(&[iloc_v1(&[(1, 0, &[(0, 100)])])], 100);
+        assert_eq!(item_refusal(&single), None);
+        let multi = container(&[iloc_v1(&[(1, 0, &[(0, 60), (60, 40)])])], 100);
+        assert_eq!(item_refusal(&multi), None);
+        assert_eq!(screen(&single).map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn extents_summing_past_the_data_are_refused() {
+        // Two extents of 64 over the same 100-byte mdat: 128 > 100.
+        let bytes = container(&[iloc_v1(&[(1, 0, &[(0, 64), (0, 64)])])], 100);
+        assert_eq!(
+            item_refusal(&bytes),
+            Some(Refusal::Amplified {
+                item: 1,
+                needs: 128,
+                holds: 100,
+            })
+        );
+        // The amplification shape: one 64-byte range listed many
+        // times still sums past the mdat.
+        let extents: Vec<(u32, u32)> = (0..8).map(|_| (0, 64)).collect();
+        let many = container(&[iloc_v1(&[(1, 0, &extents)])], 100);
+        assert!(matches!(
+            item_refusal(&many),
+            Some(Refusal::Amplified { item: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_zero_length_extent_counts_as_the_rest_of_the_data() {
+        // A single length-0 extent runs to the end of the mdat:
+        // it needs exactly what the file holds, so it passes.
+        let to_end = container(&[iloc_v1(&[(1, 0, &[(0, 0)])])], 100);
+        assert_eq!(item_refusal(&to_end), None);
+        // A second length-0 extent means a second whole copy.
+        let twice = container(&[iloc_v1(&[(1, 0, &[(0, 0), (0, 0)])])], 100);
+        assert!(matches!(
+            item_refusal(&twice),
+            Some(Refusal::Amplified { item: 1, .. })
+        ));
+        // Method 1 counts against the idat, not the mdat.
+        let bytes = concat(&[
+            ftyp(b"mif1miaf"),
+            meta_with(&[bx(b"idat", &[0u8; 40]), iloc_v1(&[(1, 1, &[(0, 0)])])]),
+        ]);
+        assert_eq!(item_refusal(&bytes), None);
+        let bytes = concat(&[
+            ftyp(b"mif1miaf"),
+            meta_with(&[
+                bx(b"idat", &[0u8; 40]),
+                iloc_v1(&[(1, 1, &[(0, 0), (0, 0)])]),
+            ]),
+        ]);
+        assert!(matches!(
+            item_refusal(&bytes),
+            Some(Refusal::Amplified { item: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn the_extent_cap_applies() {
+        let under: Vec<(u32, u32)> = (0..MAX_EXTENTS).map(|i| (i as u32, 1)).collect();
+        let ok = container(&[iloc_v1(&[(1, 0, &under)])], MAX_EXTENTS as usize);
+        assert_eq!(item_refusal(&ok), None);
+        let over: Vec<(u32, u32)> = (0..=MAX_EXTENTS).map(|i| (i as u32, 1)).collect();
+        let bytes = container(&[iloc_v1(&[(1, 0, &over)])], MAX_EXTENTS as usize + 1);
+        assert_eq!(
+            item_refusal(&bytes),
+            Some(Refusal::Extents {
+                item: 1,
+                extents: MAX_EXTENTS + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn an_ispe_past_the_limits_is_refused() {
+        let within = container(&primary_with_ispe(8, 6), 16);
+        assert_eq!(inspect(&within).unwrap().primary_size, Some((8, 6)));
+        assert_eq!(screen(&within).map(|_| ()), Ok(()));
+        let huge = 20_000;
+        let bytes = container(&primary_with_ispe(huge, huge), 16);
+        assert_eq!(inspect(&bytes).unwrap().primary_size, Some((huge, huge)));
+        let Err(EngineError::Decode(message)) = screen(&bytes) else {
+            panic!("the oversized ispe was not refused");
+        };
+        assert!(message.contains("past the decode limits"), "{message}");
+        // The declared size is still reported for the probe, so
+        // explain can state it.
+        assert_eq!(declared_size(&bytes), Some((huge, huge)));
+    }
+
+    #[test]
+    fn a_missing_ispe_behaves_as_before() {
+        // No properties at all: nothing to size from, and the
+        // screen passes as it did before the ispe check.
+        let bytes = container(&[iloc_v1(&[(1, 0, &[(0, 16)])])], 16);
+        assert_eq!(inspect(&bytes).unwrap().primary_size, None);
+        assert_eq!(screen(&bytes).map(|_| ()), Ok(()));
+        assert_eq!(declared_size(&bytes), None);
     }
 
     #[test]

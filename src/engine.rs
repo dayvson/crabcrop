@@ -87,15 +87,25 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
     }
     let screened = crate::avif::screen(bytes)?;
     let bytes: &[u8] = &screened;
-    let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
-    if let Ok(probe) = probe
-        && let Ok((width, height)) = probe.into_dimensions()
-    {
-        check_decoded_dimensions(width as u64, height as u64)?;
-        if width as u64 * height as u64 * 4 > MAX_DECODE_ALLOC {
-            return Err(EngineError::Decode(format!(
-                "image dimensions {width}x{height} exceed the decode allocation limit"
-            )));
+    // An AVIF's declared size was checked against the decode
+    // limits in the screen, from its `ispe` property, so the
+    // dimension probe here would only re-run the decoder it
+    // bounds (issue #522). Every other format is probed first
+    // and checked in our own code, because decoder adherence to
+    // `max_alloc` varies by format; a probe failure is not fatal
+    // (some valid files have headers the probe cannot read), the
+    // limited decode behind it is the second line.
+    if !matches!(image::guess_format(bytes), Ok(image::ImageFormat::Avif)) {
+        let probe = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format();
+        if let Ok(probe) = probe
+            && let Ok((width, height)) = probe.into_dimensions()
+        {
+            check_decoded_dimensions(width as u64, height as u64)?;
+            if width as u64 * height as u64 * 4 > MAX_DECODE_ALLOC {
+                return Err(EngineError::Decode(format!(
+                    "image dimensions {width}x{height} exceed the decode allocation limit"
+                )));
+            }
         }
     }
     // Fast paths for the two hottest source formats, taken only
@@ -476,15 +486,20 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
         _ if crate::pdf::sniff_pdf(bytes) => "pdf",
         _ => "unknown",
     };
-    // The probe parses an AVIF container too, so it is
-    // screened first (issue #522); a refused one states no
-    // dimensions.
-    let dimensions = crate::avif::screen(bytes).ok().and_then(|bytes| {
-        image::ImageReader::new(Cursor::new(&*bytes))
+    // An AVIF's size is read from its container's `ispe`
+    // property (issue #522), not by decoding it: sizing an AVIF
+    // no longer runs the decoder. A container the walk refuses,
+    // or one that names no `ispe`, states no dimensions. Every
+    // other format reads its size from the image crate's header
+    // probe.
+    let dimensions = if kind == "avif" {
+        crate::avif::declared_size(bytes)
+    } else {
+        image::ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .ok()
             .and_then(|probe| probe.into_dimensions().ok())
-    });
+    };
     SourceProbe { kind, dimensions }
 }
 
