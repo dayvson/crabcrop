@@ -92,6 +92,13 @@ def rendering_history(rel, text, pos):
     return pos >= start and HISTORY_ENTRY.search(text[start:pos]) is not None
 
 
+# The Helm README's own-build snippet builds and pushes an image, then
+# installs it with `--set image.tag=`. A release that moves the first
+# two and not the third leaves the chart pulling a tag the snippet
+# never pushed (issue #565).
+HELM_README = "deploy/helm/crabcrop/README.md"
+
+
 def bumped(version, step):
     major, minor, patch = (int(part) for part in version.split("."))
     return f"{major}.{minor}.{patch + 1}" if step == "patch" else f"{major}.{minor + 1}.0"
@@ -180,6 +187,32 @@ class VersionToolsTest(unittest.TestCase):
     def requirement(self):
         text = (self.tree / "Cargo.toml").read_text(encoding="utf-8")
         return re.search(r'^crabcrop-url = \{[^}\n]*\bversion = "([^"]+)"', text, re.M).group(1)
+
+    def own_build_pins(self):
+        """Every X.Y.Z in the Helm README's own-build snippet, in order."""
+        text = (self.tree / HELM_README).read_text(encoding="utf-8")
+        blocks = [block for block in re.findall(r"(?ms)^```bash\n(.*?)^```$", text) if "docker build" in block]
+        self.assertEqual(len(blocks), 1, f"{HELM_README}: expected one bash block with `docker build`")
+        return re.findall(r"\d+\.\d+\.\d+", blocks[0])
+
+    def test_a_bump_moves_the_helm_own_build_snippet(self):
+        self.assertEqual(self.own_build_pins(), [self.version] * 3)
+        new = bumped(self.version, "patch")
+        self.bump(new)
+        self.assertEqual(self.own_build_pins(), [new] * 3)
+
+    def test_the_check_fails_on_a_stale_helm_image_tag(self):
+        # A pin that was stale before a bump is not the old version
+        # after it, so the leftover scan cannot see it: the check must.
+        new = bumped(self.version, "patch")
+        self.bump(new)
+        path = self.tree / HELM_README
+        text = path.read_text(encoding="utf-8")
+        path.write_text(re.sub(r"(?<=image\.tag=)\d+\.\d+\.\d+", self.version, text), encoding="utf-8")
+        self.assert_reported(
+            *self.run_tool("check_versions.py"),
+            [f"{HELM_README}: image pins is {self.version}, expected {new}"],
+        )
 
     def test_a_patch_bump_leaves_nothing_behind(self):
         new = bumped(self.version, "patch")

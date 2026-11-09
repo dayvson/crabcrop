@@ -4,7 +4,7 @@ A provider module for `@nuxt/image` that routes images through your crabcrop dep
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (0.9.12 or later, which exports the `MAX_DIMENSION` this file imports), with `@nuxt/image` 1.8 or later, on Nuxt 3 or 4.
+1. Install the builder: `npm install @crabcrop/url` (0.10.0 or later, which exports the `MAX_DIMENSION` this file imports), with `@nuxt/image` 1.8 or later, on Nuxt 3 or 4.
 2. Copy [`crabcrop.ts`](crabcrop.ts) into your project, for example as `providers/crabcrop.ts`.
 3. Register it in `nuxt.config`:
 
