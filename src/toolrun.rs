@@ -152,6 +152,45 @@ struct Stderr {
     tail: String,
 }
 
+/// What a pipe reader hands back when its pipe closes.
+enum Output {
+    Stdout(Result<Vec<u8>, ToolError>),
+    Stderr(Stderr),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How long the stdout and stderr readers of a run
+    /// started on this thread wait before they hand over
+    /// what they read.
+    static READER_HOLD: std::cell::Cell<(Duration, Duration)> =
+        const { std::cell::Cell::new((Duration::ZERO, Duration::ZERO)) };
+}
+
+/// Stand in for pipe readers the scheduler starves (issue
+/// #566): until the guard drops, the runs this thread
+/// starts hand over their stdout `stdout` after its pipe
+/// closes, and their stderr `stderr` after its pipe
+/// closes. Runs started on other threads, other tests'
+/// included, are not held.
+#[cfg(test)]
+pub(crate) fn hold_readers(stdout: Duration, stderr: Duration) -> ReaderHold {
+    READER_HOLD.with(|cell| cell.set((stdout, stderr)));
+    ReaderHold
+}
+
+/// Ends [`hold_readers`] when dropped.
+#[cfg(test)]
+#[must_use = "the hold ends when the guard drops"]
+pub(crate) struct ReaderHold;
+
+#[cfg(test)]
+impl Drop for ReaderHold {
+    fn drop(&mut self) {
+        READER_HOLD.with(|cell| cell.set((Duration::ZERO, Duration::ZERO)));
+    }
+}
+
 /// Why a run produced no [`ToolRun`]. Each tool module maps
 /// these to its own error type, in its own words.
 #[derive(Debug)]
@@ -163,7 +202,8 @@ pub(crate) enum ToolError {
     OutputCap(usize),
     /// Reading stdout failed; the process group was killed.
     Read(std::io::Error),
-    /// The deadline passed; the process group was killed.
+    /// The deadline passed before the tool exited and closed
+    /// its stdout and stderr; the process group was killed.
     TimedOut,
     /// Waiting on the program failed.
     Wait(std::io::Error),
@@ -175,7 +215,12 @@ pub(crate) enum ToolError {
 /// up to `max_stderr` while the rest is drained so the tool
 /// never blocks on a full pipe, an empty environment, the
 /// temporary directory as the working directory, its own
-/// process group, the kernel limits, and the deadline.
+/// process group, the kernel limits, and the deadline. The
+/// run ends when the tool has exited and its stdout and
+/// stderr have closed. A child the tool leaves holding
+/// either open keeps the run going until the deadline,
+/// which kills the group and so that child too, unless it
+/// left the group.
 pub(crate) fn run_tool(command: ToolCommand<'_>) -> Result<ToolRun, ToolError> {
     run_tool_in(command, &std::env::temp_dir())
 }
@@ -233,8 +278,14 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
         })
     });
 
+    // One channel for both readers, so the wait below
+    // blocks on one receive, whichever reader ends first.
+    let (out_tx, out_rx) = mpsc::channel::<Output>();
+    let err_tx = out_tx.clone();
+    #[cfg(test)]
+    let (stdout_hold, stderr_hold) = READER_HOLD.with(std::cell::Cell::get);
+
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-    let (out_tx, out_rx) = mpsc::channel::<Result<Vec<u8>, ToolError>>();
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 64 * 1024];
@@ -250,11 +301,12 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
                 Err(e) => break Err(ToolError::Read(e)),
             }
         };
-        let _ = out_tx.send(result);
+        #[cfg(test)]
+        std::thread::sleep(stdout_hold);
+        let _ = out_tx.send(Output::Stdout(result));
     });
 
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-    let (err_tx, err_rx) = mpsc::channel::<Stderr>();
     let stderr_thread = std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut truncated = false;
@@ -275,81 +327,73 @@ fn run_tool_in(command: ToolCommand<'_>, work_dir: &Path) -> Result<ToolRun, Too
             }
         }
         let tail = &tail[tail.len().saturating_sub(STDERR_TAIL_BYTES)..];
-        let _ = err_tx.send(Stderr {
+        #[cfg(test)]
+        std::thread::sleep(stderr_hold);
+        let _ = err_tx.send(Output::Stderr(Stderr {
             head: String::from_utf8_lossy(&kept).into_owned(),
             truncated,
             tail: String::from_utf8_lossy(tail).into_owned(),
-        });
+        }));
     });
 
-    // Wait for the exit status without ever blocking past
-    // the deadline: a tool that closed its stdout and then
-    // hung still gets killed on time.
-    let wait_status = |child: &mut Child| -> Result<ExitStatus, ToolError> {
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        kill_tool(child);
-                        return Err(ToolError::TimedOut);
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => return Err(ToolError::Wait(e)),
-            }
-        }
-    };
-    let (status, stdout) = loop {
-        match out_rx.try_recv() {
-            Ok(Ok(bytes)) => {
-                let status = wait_status(&mut child)?;
-                break (status, bytes);
-            }
-            Ok(Err(e)) => {
+    // The output is whole once both readers reach the end
+    // of their pipes, that is, once every process holding
+    // them has closed them: the tool and any child it left
+    // running. Wait for that until the deadline, not for a
+    // fixed grace after the tool's exit: a reader the
+    // scheduler held back past such a grace lost its
+    // output, and a password-protected PDF then read as no
+    // PDF at all (issue #566). The tool is reaped only after
+    // this wait. Until then no other process can take its
+    // ID, which is also its group's, so the group kill at
+    // the deadline reaches a child that holds a pipe after
+    // the tool has exited.
+    let (mut stdout, mut stderr) = (None, None);
+    while stdout.is_none() || stderr.is_none() {
+        match out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Output::Stdout(Ok(bytes))) => stdout = Some(bytes),
+            Ok(Output::Stdout(Err(e))) => {
                 kill_tool(&mut child);
                 return Err(e);
             }
-            Err(mpsc::TryRecvError::Empty) => {
+            Ok(Output::Stderr(report)) => stderr = Some(report),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                kill_tool(&mut child);
+                return Err(ToolError::TimedOut);
+            }
+            // A reader that died without a result: what it
+            // had is lost, and the run goes on without it.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // Then the exit status, under the same deadline: a tool
+    // that closed its output and then hung still gets killed
+    // on time.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
                 if Instant::now() >= deadline {
                     kill_tool(&mut child);
                     return Err(ToolError::TimedOut);
                 }
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        // The process is gone; its stdout
-                        // reader finishes at EOF. Give it
-                        // a moment, then take what arrived.
-                        match out_rx.recv_timeout(Duration::from_secs(2)) {
-                            Ok(Ok(bytes)) => break (status, bytes),
-                            Ok(Err(e)) => return Err(e),
-                            Err(_) => break (status, Vec::new()),
-                        }
-                    }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                    Err(e) => return Err(ToolError::Wait(e)),
-                }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                let status = wait_status(&mut child)?;
-                break (status, Vec::new());
-            }
+            Err(e) => return Err(ToolError::Wait(e)),
         }
     };
     if let Some(writer) = writer {
         let _ = writer.join();
     }
-    // The reader threads are deliberately never joined
-    // (issue #263): a grandchild that inherited the pipes
-    // and holds them open would block a join for its whole
-    // lifetime, defeating the deadline above. stderr is
-    // worth a short grace through its channel, no more; the
-    // stdout result already arrived through its own channel.
-    let stderr = err_rx
-        .recv_timeout(Duration::from_millis(200))
-        .unwrap_or_default();
+    // The reader threads are never joined (issue #263): a
+    // child that inherited the pipes and holds them open
+    // would block a join for its whole lifetime, past the
+    // deadline. Their results came through the channel
+    // above, which the deadline bounds.
     drop(stdout_thread);
     drop(stderr_thread);
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
     Ok(ToolRun {
         status,
         stdout,
@@ -840,6 +884,67 @@ mod tests {
                 pid.trim()
             );
             std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn late_readers_still_deliver_the_whole_output() {
+        // Issue #566: after the tool exited, the run waited
+        // 2 s for stdout and then 200 ms for stderr, and took
+        // what had not arrived as empty. Readers held past
+        // both still deliver, because the run waits for them
+        // until its deadline.
+        let hold = Duration::from_millis(2500);
+        let _hold = hold_readers(hold, hold);
+        let argv = ["-c", "printf out; printf err >&2; exit 3"];
+        let started = std::time::Instant::now();
+        let run = run_tool(shell(&argv, ToolInput::Bytes(b""))).unwrap();
+        assert_eq!(run.status.code(), Some(3));
+        assert_eq!(run.stdout, b"out");
+        assert_eq!(run.stderr, "err");
+        assert_eq!(run.stderr_excerpt(), "err");
+        // The readers really were held: a hook that held
+        // nothing would pass the checks above.
+        assert!(started.elapsed() >= hold, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_child_holding_a_pipe_ends_the_run_at_the_deadline() {
+        // Issue #263, with the wait of issue #566: the tool
+        // exits at once, but a child it left running holds
+        // stderr (then stdout) open. The run still ends at
+        // its deadline, and the group kill takes the child.
+        for (held, closed) in [("stderr", ">/dev/null"), ("stdout", "2>/dev/null")] {
+            let dir = crate::test_support::scratch_dir("toolrun-held-pipe");
+            let pid_file = dir.join("child.pid");
+            let script = format!(
+                "sleep 30 {closed} </dev/null & echo $! > '{}'; exit 0",
+                pid_file.display()
+            );
+            let argv = ["-c", script.as_str()];
+            let mut command = shell(&argv, ToolInput::Bytes(b""));
+            command.deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let started = std::time::Instant::now();
+            let err = run_tool(command).unwrap_err();
+            assert!(matches!(err, ToolError::TimedOut), "{held}: {err:?}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{held}");
+            let pid = std::fs::read_to_string(&pid_file).unwrap();
+            // Signal 0 finds nothing once the child is gone;
+            // give the kill a moment to land before concluding.
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "{held}: child {} survived the process-group kill",
+                    pid.trim()
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
     }
 

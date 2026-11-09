@@ -471,6 +471,24 @@ fn extract_runs_probe_then_extraction() {
 }
 
 #[test]
+fn the_probe_parses_a_report_that_arrives_late() {
+    // Issue #566: the probe reads its report from stderr,
+    // which the run gave up on 200 ms after the tool
+    // exited, and an empty report reads as no video
+    // stream. Held back past that, the report still
+    // arrives and parses.
+    let _hold = crate::toolrun::hold_readers(Duration::ZERO, Duration::from_millis(500));
+    let (_tool, program) = fake_tool("late-report", FAKE_OK);
+    let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
+    let frame = extractor
+        .extract_frame(b"video bytes", FrameSelection::Seconds(1.5))
+        .unwrap();
+    assert_eq!(frame.duration, Some(3.0));
+    assert_eq!((frame.width, frame.height), (64, 48));
+    assert!(frame.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+}
+
+#[test]
 fn runs_carry_the_input_whitelists() {
     // Issue #361: every run (the probe and the
     // extraction) restricts the tool to the fd protocol

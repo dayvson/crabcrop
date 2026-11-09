@@ -8,6 +8,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - In the library, `crabcrop::url::Quality::resolved_for` returns `Option<ResolvedQuality>` instead of `Option<Quality>` (issue #480). `ResolvedQuality` is a new name for `QualityValue`, the two forms a resolved quality takes, so code that matched `Quality::Value` or `Quality::Auto` on the result matches `ResolvedQuality::Value` or `ResolvedQuality::Auto` instead and needs no arm for the per-format list, which the method never returned. Inside the engine, invariants it checked at run time are now carried by its types (the frame decoders return a list that cannot be empty, the still encoder takes a format with no video variant, and the request's operations are analyzed once), and the GIF and animated WebP decode branches, the animated and video frame loops, and the overlay and watermark compositing each share one implementation. Behavior and rendered bytes are unchanged.
 
+### Fixed
+
+- On a loaded host, a password-protected PDF and a page past the end of a PDF could answer `502` as not a readable PDF instead of their `400` refusals, and a readable video could fail as having no video stream (issue #566). The PDF and frame tools report these on stderr, and once a tool had exited the server waited only 2 s for its stdout and then 200 ms for its stderr, and went on without whatever had not arrived. It now waits for both until the run's timeout. One case changes: a tool that exits while a process it started still holds its stdout or stderr open used to end 200 ms to 2.2 s after the exit, without that pipe's output. It now runs until the timeout, which kills that process with the tool's process group, and fails as timed out.
+
 ## [0.10.1] - 2026-11-09
 
 ### Changed
