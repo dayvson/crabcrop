@@ -6364,22 +6364,22 @@ fn animated_webp_encode_honors_a_passed_deadline() {
     // instead of feeding every frame to libwebp when
     // the deadline has already passed.
     let delay = image::Delay::from_numer_denom_ms(100, 1);
-    let frames = vec![
-        image::Frame::from_parts(
+    let frames = Frames {
+        first: image::Frame::from_parts(
             image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255])),
             0,
             0,
             delay,
         ),
-        image::Frame::from_parts(
+        rest: vec![image::Frame::from_parts(
             image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 0, 255, 255])),
             0,
             0,
             delay,
-        ),
-    ];
+        )],
+    };
     let err = encode_animated_webp(
-        frames,
+        &frames,
         0,
         None,
         FormatOptions::default(),

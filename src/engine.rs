@@ -1701,44 +1701,17 @@ impl Engine {
         format: AnimatedFormat,
         loop_count: Option<u16>,
     ) -> Result<ProcessedImage, EngineError> {
-        refuse_animated_ai(directives)?;
         let (source_width, source_height) = frames.dimensions();
-        let cap = if directives.no_upscale {
-            Some(frames.dimensions())
-        } else {
-            None
-        };
-        let dpr = dpr_factor(directives.dpr, ctx);
-        let mut budget = OutputBudget::new();
-        let mut out_frames = Vec::with_capacity(frames.len());
-        // The encoding directives are a property of the ops,
-        // not of a frame, so every frame reports the same ones;
-        // the first frame's copy is the request's.
-        let mut encode_opts = EncodeOptions::default();
         // One smart crop window per crop for the whole
         // animation (issue #376): the first frame decides,
         // the rest replay. One trim window per trim (issue
         // #465): the union over every frame, settled before
         // any frame renders, so the frames share one canvas.
-        let mut share = FrameShare {
+        let share = FrameShare {
             smart_windows: Some(SmartWindows::default()),
             ..FrameShare::default()
         };
-        survey_trims(&frames, ops, cap, dpr, ctx, directives, &mut share)?;
-        let frame_count = frames.len();
-        for frame in frames {
-            ctx.check_deadline()?;
-            let delay = frame.delay();
-            let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, opts, _, _, _, _) =
-                apply_operations(img, ops, cap, dpr, ctx, directives, Some(&mut share))?;
-            if out_frames.is_empty() {
-                encode_opts = opts;
-                budget.check_frames(img.width(), img.height(), frame_count)?;
-            }
-            budget.charge(img.width(), img.height())?;
-            out_frames.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
-        }
+        let (frames, encode_opts) = render_frames(frames, ops, ctx, directives, share)?;
         // Resolve the quality directive for a WebP output the
         // same way the still path does: an explicit value is
         // used as given, `quality(auto)` is picked from the
@@ -1746,81 +1719,32 @@ impl Engine {
         // describes) and reported back, and Save-Data steps an
         // unspecified quality down one notch. GIF output has no
         // quality lever, so nothing resolves for it.
-        let (encode_quality, chosen_quality) = if format == AnimatedFormat::WebP {
-            let resolved = encode_opts
-                .quality
-                .as_ref()
-                .and_then(|q| q.resolved_for(ImageFormat::WebP));
-            quality_in_force(resolved, ctx.save_data, || {
-                let first = out_frames
-                    .first()
-                    .expect("process_animated is called with at least one frame");
-                auto_quality(&DynamicImage::ImageRgba8(first.buffer().clone()))
-            })
-        } else {
-            (None, None)
+        let (encode_quality, chosen_quality) = match format {
+            AnimatedFormat::WebP => {
+                let resolved = encode_opts
+                    .quality
+                    .as_ref()
+                    .and_then(|q| q.resolved_for(ImageFormat::WebP));
+                quality_in_force(resolved, ctx.save_data, || {
+                    auto_quality(&DynamicImage::ImageRgba8(frames.first.buffer().clone()))
+                })
+            }
+            AnimatedFormat::Gif => (None, None),
         };
-        let (width, height) = out_frames
-            .first()
-            .map(|f| (f.buffer().width(), f.buffer().height()))
-            .unwrap_or((source_width, source_height));
+        let (width, height) = frames.dimensions();
         // An animated output's placeholder comes from its first
         // processed frame.
         let placeholder = if ctx.placeholders {
-            out_frames
-                .first()
-                .map(|f| crate::placeholder::compute(&DynamicImage::ImageRgba8(f.buffer().clone())))
+            Some(crate::placeholder::compute(&DynamicImage::ImageRgba8(
+                frames.first.buffer().clone(),
+            )))
         } else {
             None
         };
         let out = match format {
-            AnimatedFormat::Gif => {
-                let mut out = Vec::new();
-                let first = out_frames
-                    .first()
-                    .expect("process_animated is called with at least one frame");
-                let (canvas_w, canvas_h) = (first.buffer().width(), first.buffer().height());
-                let mut enc = gif::Encoder::new(
-                    &mut out,
-                    u16::try_from(canvas_w).map_err(|_| {
-                        EngineError::Encode("gif: width exceeds the 65535 format limit".to_string())
-                    })?,
-                    u16::try_from(canvas_h).map_err(|_| {
-                        EngineError::Encode(
-                            "gif: height exceeds the 65535 format limit".to_string(),
-                        )
-                    })?,
-                    &[],
-                )
-                .map_err(|e| EngineError::Encode(e.to_string()))?;
-                for f in &out_frames {
-                    // The deadline is checked per frame inside
-                    // the encode loop itself (issue #322): a
-                    // many-frame GIF encode is chunked work, so
-                    // it aborts at the deadline instead of
-                    // running every frame's quantization first
-                    // and being noticed only afterwards.
-                    ctx.check_deadline()?;
-                    // GIF delays are hundredths of a second; the
-                    // image crate saturated this conversion at
-                    // u16::MAX, and so does this.
-                    let (numer, denom) = f.delay().numer_denom_ms();
-                    let delay = u16::try_from(numer / denom / 10).unwrap_or(u16::MAX);
-                    let buffer = f.buffer();
-                    let frame = gif_frame_quantized(
-                        buffer.as_raw(),
-                        buffer.width(),
-                        buffer.height(),
-                        delay,
-                    )?;
-                    enc.write_frame(&frame)
-                        .map_err(|e| EngineError::Encode(e.to_string()))?;
-                }
-                drop(enc);
-                out
-            }
+            AnimatedFormat::Gif => encode_animated_gif(&frames, ctx)?,
             AnimatedFormat::WebP => encode_animated_webp(
-                out_frames,
+                &frames,
                 loop_count.unwrap_or(0),
                 encode_quality,
                 encode_opts.format_options,
@@ -1871,55 +1795,33 @@ impl Engine {
                     .to_string(),
             )
         })?;
-        refuse_animated_ai(directives)?;
         let (source_width, source_height) = frames.dimensions();
-        let cap = if directives.no_upscale {
-            Some(frames.dimensions())
-        } else {
-            None
-        };
-        let dpr = dpr_factor(directives.dpr, ctx);
-        let mut budget = OutputBudget::new();
-        let mut out_frames = Vec::with_capacity(frames.len());
         // The frames share their trim windows (issue #465),
         // as on the animated image paths: the encoder takes
         // one frame size.
-        let mut share = FrameShare::default();
-        survey_trims(&frames, ops, cap, dpr, ctx, directives, &mut share)?;
-        let frame_count = frames.len();
-        for frame in frames {
-            ctx.check_deadline()?;
-            let delay_ms = std::time::Duration::from(frame.delay()).as_millis() as u64;
-            let img = DynamicImage::ImageRgba8(frame.into_buffer());
-            let (img, _, _, _, _, _) =
-                apply_operations(img, ops, cap, dpr, ctx, directives, Some(&mut share))?;
-            if out_frames.is_empty() {
-                budget.check_frames(img.width(), img.height(), frame_count)?;
-            }
-            budget.charge(img.width(), img.height())?;
-            out_frames.push(crate::video::VideoFrame {
-                pixels: img.to_rgba8(),
-                delay_ms,
-            });
-        }
+        let (frames, _) = render_frames(frames, ops, ctx, directives, FrameShare::default())?;
         // The placeholder (a meta-only surface; meta itself
         // refuses video URLs in the server) describes the
         // first processed frame, as the animated paths do.
         let placeholder = if ctx.placeholders {
-            out_frames
-                .first()
-                .map(|f| crate::placeholder::compute(&DynamicImage::ImageRgba8(f.pixels.clone())))
+            Some(crate::placeholder::compute(&DynamicImage::ImageRgba8(
+                frames.first.buffer().clone(),
+            )))
         } else {
             None
         };
+        let (width, height) = frames.dimensions();
+        let out_frames: Vec<crate::video::VideoFrame> = frames
+            .into_iter()
+            .map(|frame| crate::video::VideoFrame {
+                delay_ms: std::time::Duration::from(frame.delay()).as_millis() as u64,
+                pixels: frame.into_buffer(),
+            })
+            .collect();
         let bytes = encoder.encode(&out_frames, format).map_err(|e| match e {
             crate::video::VideoError::Unsupported(what) => EngineError::Unsupported(what),
             crate::video::VideoError::Failed(what) => EngineError::Video(what),
         })?;
-        let (width, height) = out_frames
-            .first()
-            .map(|f| (f.pixels.width(), f.pixels.height()))
-            .unwrap_or((source_width, source_height));
         Ok(ProcessedImage {
             bytes,
             format,
@@ -1939,6 +1841,95 @@ impl Engine {
             provenance: None,
         })
     }
+}
+
+/// Run the operations over every frame of an animated render,
+/// for the animated image and the video paths alike: the
+/// inference-class operations refused first (see
+/// [`refuse_animated_ai`]), the frames' shared geometry in
+/// `share` settled before any frame renders (see
+/// [`survey_trims`]), and the run's pixels charged against one
+/// output budget, which the first frame's size settles up front
+/// (see [`OutputBudget::check_frames`]). The rendered frames
+/// keep their delays. The encoding directives are a property of
+/// the ops, not of a frame, so every frame reports the same
+/// ones; the first frame's copy is the request's and comes back
+/// with the frames.
+fn render_frames(
+    frames: Frames,
+    ops: &[Operation],
+    ctx: &ProcessContext<'_>,
+    directives: &crate::url::RequestDirectives,
+    mut share: FrameShare,
+) -> Result<(Frames, EncodeOptions), EngineError> {
+    refuse_animated_ai(directives)?;
+    let cap = if directives.no_upscale {
+        Some(frames.dimensions())
+    } else {
+        None
+    };
+    let dpr = dpr_factor(directives.dpr, ctx);
+    survey_trims(&frames, ops, cap, dpr, ctx, directives, &mut share)?;
+    let frame_count = frames.len();
+    let mut budget = OutputBudget::new();
+    let mut render = |frame: image::Frame| {
+        ctx.check_deadline()?;
+        let delay = frame.delay();
+        let img = DynamicImage::ImageRgba8(frame.into_buffer());
+        let outcome = apply_operations(img, ops, cap, dpr, ctx, directives, Some(&mut share))?;
+        Ok::<_, EngineError>((outcome, delay))
+    };
+    let ((img, encode_opts, ..), delay) = render(frames.first)?;
+    budget.check_frames(img.width(), img.height(), frame_count)?;
+    budget.charge(img.width(), img.height())?;
+    let first = image::Frame::from_parts(img.to_rgba8(), 0, 0, delay);
+    let mut rest = Vec::with_capacity(frames.rest.len());
+    for frame in frames.rest {
+        let ((img, ..), delay) = render(frame)?;
+        budget.charge(img.width(), img.height())?;
+        rest.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
+    }
+    Ok((Frames { first, rest }, encode_opts))
+}
+
+/// Encode rendered frames as an animated GIF: one screen the
+/// first frame's size, and each frame quantized onto a palette
+/// of its own (see [`gif_frame_quantized`]) with its delay in
+/// hundredths of a second. GIF output has no quality lever and
+/// keeps the GIF encoder's defaults otherwise, as it always has.
+fn encode_animated_gif(frames: &Frames, ctx: &ProcessContext<'_>) -> Result<Vec<u8>, EngineError> {
+    let mut out = Vec::new();
+    let (canvas_w, canvas_h) = frames.dimensions();
+    let mut enc = gif::Encoder::new(
+        &mut out,
+        u16::try_from(canvas_w).map_err(|_| {
+            EngineError::Encode("gif: width exceeds the 65535 format limit".to_string())
+        })?,
+        u16::try_from(canvas_h).map_err(|_| {
+            EngineError::Encode("gif: height exceeds the 65535 format limit".to_string())
+        })?,
+        &[],
+    )
+    .map_err(|e| EngineError::Encode(e.to_string()))?;
+    for f in frames.iter() {
+        // The deadline is checked per frame inside the encode
+        // loop itself (issue #322): a many-frame GIF encode is
+        // chunked work, so it aborts at the deadline instead of
+        // running every frame's quantization first and being
+        // noticed only afterwards.
+        ctx.check_deadline()?;
+        // GIF delays are hundredths of a second; the image
+        // crate saturated this conversion at u16::MAX, and so
+        // does this.
+        let (numer, denom) = f.delay().numer_denom_ms();
+        let delay = u16::try_from(numer / denom / 10).unwrap_or(u16::MAX);
+        let buffer = f.buffer();
+        let frame = gif_frame_quantized(buffer.as_raw(), buffer.width(), buffer.height(), delay)?;
+        enc.write_frame(&frame)
+            .map_err(|e| EngineError::Encode(e.to_string()))?;
+    }
+    drop(enc);
+    Ok(out)
 }
 
 /// Collect an animation decoder's frames under the shared
@@ -2211,16 +2202,13 @@ fn decode_webp_frames(bytes: &[u8]) -> Result<Frames, EngineError> {
 /// longer than about 24 days) falls back to a zero-based
 /// timeline and that average.
 fn encode_animated_webp(
-    frames: Vec<image::Frame>,
+    frames: &Frames,
     loop_count: u16,
     quality: Option<u8>,
     format_options: FormatOptions,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>, EngineError> {
-    let first = frames
-        .first()
-        .ok_or_else(|| EngineError::Encode("webp: animation has no frames".to_string()))?;
-    let (width, height) = (first.buffer().width(), first.buffer().height());
+    let (width, height) = frames.dimensions();
     // VP8 frames carry 14-bit dimensions, as on the still path.
     if width > 16383 || height > 16383 {
         return Err(EngineError::Encode(
