@@ -10,7 +10,7 @@ image:
   # digest takes precedence over the tag), or point the
   # repository at your own build of the repo Dockerfile.
   repository: ghcr.io/dayvson/crabcrop
-  tag: "0.9.11"
+  tag: "0.10.0"
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -34,6 +34,14 @@ metricsToken:
 
 # Port the server listens on (the PORT environment variable).
 containerPort: 3000
+
+# How long the server drains after SIGTERM before it exits
+# (CRABCROP_SHUTDOWN_GRACE_SECS): requests in flight finish,
+# then the shared-tier writes they left. The pod's
+# terminationGracePeriodSeconds is this plus 5, so set the
+# grace here: the chart refuses CRABCROP_SHUTDOWN_GRACE_SECS
+# in env.
+shutdownGraceSeconds: 8
 
 # Presets, name = operations, delivered as a ConfigMap and
 # wired through CRABCROP_PRESETS_FILE automatically.
@@ -95,7 +103,7 @@ ai:
   enabled: false
   image:
     repository: ghcr.io/dayvson/crabcrop-ai
-    tag: "0.9.11"
+    tag: "0.10.0"
     digest: ""
   models:
     existingClaim: ""

@@ -208,9 +208,23 @@ pub(crate) fn etag_for_bytes(bytes: &[u8]) -> String {
 /// contains a `#` (it is a URL remainder, where `#` would
 /// start a fragment), so the base is the key up to the
 /// first `#` and the source is its tail segment.
+///
+/// Matched in place, with no `/{source}` string built per
+/// call (issue #462): a running purge's tombstone runs this
+/// on every disk and shared hit.
 pub(crate) fn key_belongs_to_source(key: &str, source: &str) -> bool {
     let base = key.split('#').next().unwrap_or(key);
-    base == source || base.ends_with(&format!("/{source}"))
+    base.strip_suffix(source)
+        .is_some_and(|head| head.is_empty() || head.ends_with('/'))
+}
+
+/// Whether `key` is the base cache key `base` or one of its
+/// `#`-suffixed variants: the rule a per-URL purge removes
+/// by. Matched in place, with no `{base}#` prefix built per
+/// call (issue #462).
+fn key_has_base(key: &str, base: &str) -> bool {
+    key.strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('#'))
 }
 
 /// The union of two group sets, sorted so every tier
@@ -326,8 +340,11 @@ struct PurgeGuardInner {
 }
 
 /// What one purge removes: the matching rule the tiers
-/// remove by, kept for as long as the purge runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// remove by, kept for as long as the purge runs. Two
+/// purges with equal targets are identical apart from when
+/// they began, which is how the shared tier coalesces their
+/// walks (issue #462).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PurgeTarget {
     /// A base cache key: the bare key and its
     /// `#`-suffixed variants.
@@ -343,9 +360,7 @@ impl PurgeTarget {
     /// `key` with `groups`.
     pub(crate) fn covers(&self, key: &str, groups: &[String]) -> bool {
         match self {
-            PurgeTarget::Key(base) => key
-                .strip_prefix(base.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('#')),
+            PurgeTarget::Key(base) => key_has_base(key, base),
             PurgeTarget::Group(group) => groups.iter().any(|g| g == group),
             PurgeTarget::Source(source) => key_belongs_to_source(key, source),
         }
@@ -598,12 +613,13 @@ impl PurgeGuard {
     /// write began before the purge and must not stand.
     pub fn purge_covers(&self, snapshot: u64, key: &str, groups: &[String]) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.keys.iter().any(|(base, purge_gen)| {
-            *purge_gen > snapshot && (key == base || key.starts_with(&format!("{base}#")))
-        }) || inner
-            .groups
+        inner
+            .keys
             .iter()
-            .any(|(group, purge_gen)| *purge_gen > snapshot && groups.iter().any(|g| g == group))
+            .any(|(base, purge_gen)| *purge_gen > snapshot && key_has_base(key, base))
+            || inner.groups.iter().any(|(group, purge_gen)| {
+                *purge_gen > snapshot && groups.iter().any(|g| g == group)
+            })
             || inner.sources.iter().any(|(source, purge_gen)| {
                 *purge_gen > snapshot && key_belongs_to_source(key, source)
             })
@@ -973,6 +989,45 @@ mod tests {
         assert!(cache.get("a#avif").is_some());
         assert!(!cache.remove("a"));
         assert!(!cache.remove("missing"));
+    }
+
+    #[test]
+    fn purge_matchers_agree_with_the_spelled_out_rules() {
+        // Issue #462: the matchers run on every disk and
+        // shared hit while a tombstone lives, and now match
+        // in place instead of building a `{base}#` prefix or
+        // a `/{source}` suffix on each call. They must accept
+        // exactly what the spelled-out rules accept.
+        let keys = [
+            "",
+            "#",
+            "x.jpg",
+            "x.jpg#w2",
+            "/x.jpg",
+            "a/x.jpg",
+            "a/x.jpg#avif",
+            "a/x.jpg#cfg1#webp",
+            "a/x.jpg2",
+            "ba/x.jpg",
+            "a/b/x.jpg",
+            "a/x.jpg/x.jpg",
+        ];
+        let names = ["", "x.jpg", "a/x.jpg", "b/x.jpg", "a/x", "/x.jpg"];
+        for key in keys {
+            let base = key.split('#').next().unwrap();
+            for name in names {
+                assert_eq!(
+                    key_has_base(key, name),
+                    key == name || key.starts_with(&format!("{name}#")),
+                    "{key:?} under {name:?}"
+                );
+                assert_eq!(
+                    key_belongs_to_source(key, name),
+                    base == name || base.ends_with(&format!("/{name}")),
+                    "{key:?} from {name:?}"
+                );
+            }
+        }
     }
 
     #[test]

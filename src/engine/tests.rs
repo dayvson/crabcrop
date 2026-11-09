@@ -2891,7 +2891,7 @@ fn ai_filters_refuse_animated_sources() {
 #[test]
 fn debug_focal_with_a_video_format_is_a_specific_error() {
     let engine = Engine;
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let src = png_bytes(&DynamicImage::new_rgb8(20, 12));
     let err = engine
         .process_preferred(
@@ -3501,7 +3501,7 @@ fn video_output_budget_rejects_aggregate_overflow() {
     // The same aggregate budget guards the video path:
     // the request fails before the encoder ever runs.
     let engine = Engine;
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let mut ops = aggregate_overflow_ops();
     ops.push(Operation::Filters(vec![Filter::Format(FormatSpec::plain(
         ImageFormat::Mp4,
@@ -3554,6 +3554,530 @@ fn rotate_chains_inside_the_budget_still_work() {
         )
         .unwrap();
     assert_eq!(decode_dims(&out.bytes), (201, 201));
+}
+
+/// Run `remainder` (operations only) through the engine on
+/// `src`, as the server would for that URL.
+fn process_remainder(src: &[u8], remainder: &str) -> Result<ProcessedImage, EngineError> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    Engine.process(src, &ops)
+}
+
+#[test]
+fn computed_sizes_past_max_dimension_are_refused() {
+    // Issue #521: the parser holds every size a URL spells
+    // to 16383 per axis, but a size the engine works out
+    // was unchecked, so `16383x1/0x2` rendered 32766x2
+    // (inside the pixel budget, past what WebP encodes).
+    // Each step that resolves its own size now refuses one
+    // past the limit, as a written size is.
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, refused) in [
+        // The issue's URL: the second step keeps the 16383:1
+        // aspect ratio at height 2.
+        ("16383x1/0x2", "32766x2"),
+        // A later step that would bring the size back
+        // never runs: the refusal is at the step.
+        ("16383x1/0x2/100x100", "32766x2"),
+        ("16383x1/fit-in:0x2", "32766x2"),
+        ("16383x1/fit-in:0x2:adaptive", "32766x2"),
+        // A smart crop sizes its window to the target, and
+        // the resize after it scales on from there.
+        ("crop:16383x1:smart/0x2", "32766x2"),
+        ("crop:16383x1/0x2", "32766x2"),
+        // DPR scales a proportional chain, a written size,
+        // a crop target, and a pad canvas past the limit.
+        ("4096x1/0x2/filters:dpr(2)", "16384x4"),
+        ("12000x10/filters:dpr(2)", "24000x20"),
+        ("crop:12000x10/filters:dpr(2)", "24000x20"),
+        ("pad:9000x100/filters:dpr(2)", "18000x200"),
+    ] {
+        let err = match process_remainder(&src, remainder) {
+            Err(err) => err,
+            Ok(out) => panic!("{remainder} rendered {:?}", decode_dims(&out.bytes)),
+        };
+        assert!(
+            matches!(err, EngineError::Unsupported(_)),
+            "{remainder}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported operation: requested output {refused} exceeds the 16383 pixel limit per axis"
+            ),
+            "{remainder}"
+        );
+    }
+}
+
+#[test]
+fn computed_sizes_at_max_dimension_still_render() {
+    // The limit is inclusive, and a chain that stays inside
+    // it renders as before (issue #521).
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, dims) in [
+        // 5461 * 3 = 16383: a proportional side that lands
+        // exactly on the limit.
+        ("5461x1/0x3", (16383, 3)),
+        ("5461x1/fit-in:0x3", (16383, 3)),
+        ("16383x1/0x1", (16383, 1)),
+        ("4096x1/0x2", (8192, 2)),
+    ] {
+        let out =
+            process_remainder(&src, remainder).unwrap_or_else(|err| panic!("{remainder}: {err}"));
+        assert_eq!(decode_dims(&out.bytes), dims, "{remainder}");
+    }
+    // `no_upscale` caps the step at the source before the
+    // check, so a DPR-scaled crop target past the limit
+    // renders inside the source.
+    let out = process_remainder(&src, "crop:16383x10/filters:dpr(2):no_upscale").unwrap();
+    let (w, h) = decode_dims(&out.bytes);
+    assert!(w <= 64 && h <= 48, "{w}x{h}");
+}
+
+#[test]
+fn check_output_size_bounds_each_axis_then_the_budget() {
+    let max = crate::url::MAX_DIMENSION;
+    let input = (64, 48);
+    assert!(check_output_size(max, 1, input).is_ok());
+    assert!(check_output_size(1, max, input).is_ok());
+    for (w, h) in [(max + 1, 1), (1, max + 1), (u32::MAX, u32::MAX)] {
+        let err = check_output_size(w, h, input).unwrap_err();
+        assert!(err.to_string().contains("pixel limit per axis"), "{err}");
+    }
+    // Inside the per-axis limit, the pixel budget still
+    // applies: 16383 x 6104 is just past 100 million.
+    let err = check_output_size(max, 6104, input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 16383x6104 exceeds the 100000000 pixel limit"
+    );
+    // A step that keeps the size it started from works
+    // nothing out: a 16384 px side the decoder admitted
+    // passes the per-axis check, but never the budget.
+    assert!(check_output_size(max + 1, 2, (max + 1, 2)).is_ok());
+    assert!(check_output_size(2, max + 1, (max + 1, 2)).is_err());
+    let err = check_output_size(max + 1, 8000, (max + 1, 8000)).unwrap_err();
+    assert!(err.to_string().ends_with("100000000 pixel limit"), "{err}");
+}
+
+#[test]
+fn check_final_output_bounds_each_axis_with_no_exemption() {
+    // The image a chain hands its encoder has no later step
+    // to bring it within the limit, so the size it started
+    // from earns it nothing (issue #528).
+    let max = crate::url::MAX_DIMENSION;
+    assert!(check_final_output(max, 1).is_ok());
+    assert!(check_final_output(1, max).is_ok());
+    for (w, h) in [(max + 1, 1), (1, max + 1), (max + 1, max + 1)] {
+        let err = check_final_output(w, h).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported operation: requested output {w}x{h} exceeds the 16383 pixel limit per axis; \
+                 resize or crop it to fit"
+            )
+        );
+    }
+    let err = check_final_output(max, 6104).unwrap_err();
+    assert!(err.to_string().ends_with("100000000 pixel limit"), "{err}");
+}
+
+#[test]
+fn the_final_output_refusal_reads_as_an_output_size_refusal() {
+    // The final check refuses an output size, as the step
+    // checks do, only later: `8192x0` on a 16384x2 source
+    // scaled by a DPR factor of 2 asks for the source's own
+    // 16384x2, which the step lets through and this check
+    // refuses (issue #528). A DPR client hint steps down on
+    // an output-size refusal and tells one from other
+    // refusals by its wording (issue #529), so all three
+    // read `requested output WxH exceeds`.
+    let max = crate::url::MAX_DIMENSION;
+    for err in [
+        check_output_size(max + 1, 2, (8192, 1)).unwrap_err(),
+        check_output_pixels(max, 6104).unwrap_err(),
+        check_final_output(max + 1, 2).unwrap_err(),
+    ] {
+        assert!(
+            err.to_string()
+                .starts_with("unsupported operation: requested output "),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn rotate_canvas_is_checked_per_axis() {
+    // A 16383x1000 image rotated 3.5 degrees needs a canvas
+    // about 16413 px wide: about 33 million pixels, inside
+    // the budget, but past the per-axis limit (issue #521).
+    // The canvas check refuses it before the rotation
+    // allocates.
+    let img = DynamicImage::ImageLuma8(image::GrayImage::new(16_383, 1000));
+    let ops = [Operation::Filters(vec![Filter::Rotate(3.5)])];
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let ctx = ProcessContext::default();
+    let (cw, ch) = crate::filters::rotated_canvas(16_383, 1000, 3.5);
+    assert!(cw > crate::url::MAX_DIMENSION && (cw as u64 * ch as u64) < MAX_OUTPUT_PIXELS);
+    // A match, not unwrap_err: on a regression the Ok value
+    // is a 16414x1999 image, and its Debug form would flood
+    // the test log.
+    let err = match apply_operations(img, &ops, None, 1.0, &ctx, &directives, None) {
+        Err(err) => err,
+        Ok((out, ..)) => panic!("rotated to {}x{}", out.width(), out.height()),
+    };
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "unsupported operation: requested output {cw}x{ch} exceeds the 16383 pixel limit per axis"
+        )
+    );
+}
+
+/// Run `remainder` (operations only) over `img` through
+/// [`apply_operations`] with the `no_upscale` cap and DPR the
+/// request asks for, and report the output size or the
+/// refusal.
+fn chain_dims(img: DynamicImage, remainder: &str) -> Result<(u32, u32), EngineError> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let cap = directives.no_upscale.then_some((img.width(), img.height()));
+    let ctx = ProcessContext::default();
+    let dpr = directives.dpr.unwrap_or(1.0);
+    apply_operations(img, &ops, cap, dpr, &ctx, &directives, None)
+        .map(|(out, ..)| (out.width(), out.height()))
+}
+
+#[test]
+fn steps_that_keep_the_size_pass_a_decode_ceiling_source() {
+    // A source decodes at up to 16384 px per axis, one past
+    // the output limit. A step that keeps the size it starts
+    // from works nothing out and passes, so a later step can
+    // still bring the source within the limit; a step that
+    // changes the size is held to the limit (issue #521).
+    // Before #521, `0x0` and `rotate(180)` were refused
+    // while `fit-in:0x0` passed.
+    let ceiling = |w, h| DynamicImage::ImageLuma8(image::GrayImage::new(w, h));
+    for remainder in [
+        "0x0",
+        "origxorig",
+        "fit-in:0x0",
+        "filters:rotate(0)",
+        "filters:rotate(180)",
+        "filters:grayscale",
+        "0x4/filters:no_upscale",
+        "fit-in:0x4/filters:no_upscale",
+    ] {
+        assert_eq!(
+            chain_dims(ceiling(16_384, 2), &format!("{remainder}/8192x0"))
+                .map_err(|e| e.to_string()),
+            Ok((8192, 1)),
+            "{remainder}"
+        );
+        // Left at the ceiling, the output is refused whole
+        // (issue #528): the encoder never sees 16384 px.
+        assert_eq!(
+            chain_dims(ceiling(16_384, 2), remainder).map_err(|e| e.to_string()),
+            Err(
+                "unsupported operation: requested output 16384x2 exceeds the 16383 pixel limit per axis; \
+                 resize or crop it to fit"
+                    .to_string()
+            ),
+            "{remainder}"
+        );
+    }
+    // The crop's window is the whole image.
+    assert_eq!(
+        chain_dims(ceiling(16_384, 2), "crop:8192x1/4096x0/filters:dpr(2)")
+            .map_err(|e| e.to_string()),
+        Ok((8192, 1))
+    );
+    // The width hint's synthesized op on a tall source
+    // answers what the URL answers without it.
+    for remainder in ["400x0/filters:no_upscale", "filters:no_upscale"] {
+        assert_eq!(
+            chain_dims(ceiling(1, 16_384), remainder).map_err(|e| e.to_string()),
+            Err(
+                "unsupported operation: requested output 1x16384 exceeds the 16383 pixel limit per axis; \
+                 resize or crop it to fit"
+                    .to_string()
+            ),
+            "{remainder}"
+        );
+    }
+    for (img, remainder, refused) in [
+        (ceiling(16_384, 2), "origx1", "16384x1"),
+        (ceiling(16_384, 2), "filters:rotate(90)", "2x16384"),
+        (ceiling(16_384, 4), "crop:8192x1/filters:dpr(2)", "16384x2"),
+        (ceiling(8_192, 1), "0x2", "16384x2"),
+    ] {
+        let err = chain_dims(img, remainder).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported operation: requested output {refused} exceeds the 16383 pixel limit per axis"
+            ),
+            "{remainder}"
+        );
+    }
+}
+
+#[test]
+fn a_crop_past_the_limit_is_refused_before_detection() {
+    // The crop's target is checked before the crop analysis
+    // runs (issue #521): with no detection provider, an
+    // objects crop inside the limit fails on the missing
+    // provider, and one past it fails on its size first.
+    let img = || DynamicImage::ImageLuma8(image::GrayImage::new(64, 48));
+    let err = chain_dims(img(), "crop:100x10:objects(dog)").unwrap_err();
+    assert!(matches!(err, EngineError::NotConfigured(_)), "{err:?}");
+    let err = chain_dims(img(), "crop:12000x10:objects(dog)/filters:dpr(2)").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 24000x20 exceeds the 16383 pixel limit per axis"
+    );
+}
+
+/// An animated GIF of `frames` solid frames, each
+/// `width`x`height`, 100 ms apart.
+fn solid_animated_gif(width: u32, height: u32, frames: usize) -> Vec<u8> {
+    let delay = image::Delay::from_numer_denom_ms(100, 1);
+    let frames: Vec<image::Frame> = (0..frames)
+        .map(|i| {
+            let shade = (i * 80) as u8;
+            let pixels =
+                image::RgbaImage::from_pixel(width, height, image::Rgba([shade, 0, 0, 255]));
+            image::Frame::from_parts(pixels, 0, 0, delay)
+        })
+        .collect();
+    let mut out = Vec::new();
+    image::codecs::gif::GifEncoder::new(&mut out)
+        .encode_frames(frames)
+        .unwrap();
+    out
+}
+
+/// Render `remainder` (operations only; empty for none) over
+/// `src` with `preferred` standing in for the format the
+/// server negotiates from `Accept`.
+fn render_negotiated(
+    src: &[u8],
+    remainder: &str,
+    preferred: Option<ImageFormat>,
+) -> Result<ProcessedImage, EngineError> {
+    let ops = if remainder.is_empty() {
+        Vec::new()
+    } else {
+        crate::url::parse_operations(&format!("{remainder}/example.com/a.png"))
+            .unwrap()
+            .0
+    };
+    let ctx = ProcessContext {
+        preferred,
+        ..Default::default()
+    };
+    Engine.process_preferred(src, &ops, ctx)
+}
+
+#[test]
+fn a_decode_ceiling_source_is_refused_unless_a_step_brings_it_within_the_limit() {
+    // Issue #528: a source with a 16384 px side, one past
+    // the output limit, kept that side through a chain with
+    // no sizing step. WebP cannot encode it, so a WebP
+    // output, negotiated (most browsers) or named, failed
+    // with `500 image encoding failed`, still or animated;
+    // every other format served 16384 px. The output is now
+    // refused with the documented `400` before any encoder
+    // runs.
+    let wide = solid_png(16_384, 1, [200, 60, 30]);
+    let tall = solid_png(1, 16_384, [200, 60, 30]);
+    let animated = solid_animated_gif(16_384, 1, 3);
+    let webp = Some(ImageFormat::WebP);
+    for (src, remainder, preferred, refused) in [
+        (&wide, "", webp, "16384x1"),
+        (&wide, "filters:format(webp)", None, "16384x1"),
+        (&wide, "", None, "16384x1"),
+        (&wide, "filters:grayscale", None, "16384x1"),
+        (&wide, "filters:format(avif)", None, "16384x1"),
+        (&wide, "filters:format(jpeg)", None, "16384x1"),
+        (&wide, "filters:trim", None, "16384x1"),
+        (&wide, "filters:flip(h)", webp, "16384x1"),
+        (&wide, "fit-in:0x0", webp, "16384x1"),
+        (&tall, "", webp, "1x16384"),
+        (&tall, "filters:format(webp)", None, "1x16384"),
+        (&animated, "", webp, "16384x1"),
+        (&animated, "filters:format(webp)", None, "16384x1"),
+        (&animated, "", None, "16384x1"),
+        (&animated, "filters:format(gif)", webp, "16384x1"),
+    ] {
+        let err = match render_negotiated(src, remainder, preferred) {
+            Err(err) => err,
+            Ok(out) => panic!("{remainder:?} rendered {}x{}", out.width, out.height),
+        };
+        assert!(
+            matches!(err, EngineError::Unsupported(_)),
+            "{remainder:?} {preferred:?}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported operation: requested output {refused} exceeds the 16383 pixel limit per axis; \
+                 resize or crop it to fit"
+            ),
+            "{remainder:?} {preferred:?}"
+        );
+    }
+    // A step that brings the side within the limit renders,
+    // as WebP too, exactly at the limit included.
+    for (src, remainder, size) in [
+        (&wide, "8192x0", (8192, 1)),
+        (&wide, "16383x0", (16_383, 1)),
+        (&tall, "0x8192", (1, 8192)),
+    ] {
+        let out = render_negotiated(src, remainder, webp)
+            .unwrap_or_else(|err| panic!("{remainder}: {err}"));
+        assert_eq!(out.format, ImageFormat::WebP, "{remainder}");
+        assert_eq!((out.width, out.height), size, "{remainder}");
+        assert_eq!(decode_dims(&out.bytes), size, "{remainder}");
+    }
+    let out = render_negotiated(&animated, "8192x0", webp).unwrap();
+    assert_eq!(out.format, ImageFormat::WebP);
+    assert_eq!((out.width, out.height), (8192, 1));
+    let frames = decoded_webp_frames(&out.bytes);
+    assert_eq!(frames.len(), 3);
+    for frame in &frames {
+        assert_eq!(frame.buffer().dimensions(), (8192, 1));
+    }
+}
+
+#[test]
+fn no_output_passes_max_dimension_at_the_decode_ceiling() {
+    // The op_chain fuzz property (issue #476) on sources the
+    // harness's small stand-in image cannot express: every
+    // render has both sides in 1..=16383 and decodes at the
+    // size it reports, and every other answer is a refusal,
+    // never a failed encode (issue #528).
+    let max = crate::url::MAX_DIMENSION;
+    let sources = [
+        solid_png(16_384, 1, [9, 99, 199]),
+        solid_png(1, 16_384, [9, 99, 199]),
+        solid_png(16_384, 2, [9, 99, 199]),
+    ];
+    let chains = [
+        "",
+        "0x0",
+        "origxorig",
+        "fit-in:0x0",
+        "fit-in:16383x16383",
+        "16383x0",
+        "0x16383",
+        "8192x0",
+        "crop:16383x1",
+        "crop:1x16383",
+        "pad:16383x2",
+        "0x0:16384x1",
+        "filters:rotate(180)",
+        "filters:rotate(90)",
+        "filters:flip(h):flip(v)",
+        "filters:trim",
+        "filters:no_upscale",
+        "0x4/filters:no_upscale",
+        "filters:rotate(180)/8192x0",
+        "16383x0/filters:dpr(2)",
+        "fit-in:8000x8000/filters:dpr(2)",
+    ];
+    let mut renders = 0;
+    for src in &sources {
+        for remainder in chains {
+            for preferred in [None, Some(ImageFormat::WebP)] {
+                match render_negotiated(src, remainder, preferred) {
+                    Ok(out) => {
+                        renders += 1;
+                        assert!(
+                            (1..=max).contains(&out.width) && (1..=max).contains(&out.height),
+                            "{remainder:?} {preferred:?} rendered {}x{}",
+                            out.width,
+                            out.height
+                        );
+                        assert_eq!(
+                            decode_dims(&out.bytes),
+                            (out.width, out.height),
+                            "{remainder:?} {preferred:?}"
+                        );
+                    }
+                    Err(err) => assert!(
+                        !matches!(err, EngineError::Encode(_)),
+                        "{remainder:?} {preferred:?}: {err:?}"
+                    ),
+                }
+            }
+        }
+    }
+    // The sweep is not all refusals.
+    assert!(renders >= 20, "only {renders} renders");
+}
+
+#[test]
+fn video_output_crops_an_odd_side_at_the_limit_instead_of_padding_past_it() {
+    // Issue #528: H.264 and VP9 need even sides, and the
+    // video path padded an odd side up by one, so a 16383 px
+    // side reached the encoder as 16384, past the limit every
+    // output is held to. At the limit the odd side now crops
+    // down to 16382; below it, an odd side still pads up.
+    let engine = Engine;
+    let src = solid_animated_gif(2, 2, 3);
+    let record = crate::test_support::scratch_dir("engine-video-even");
+    let argv_file = record.join("argv.txt");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > /dev/null\nprintf 'ENGINE-VIDEO'\n",
+        argv_file.display()
+    );
+    let (_scripts, encoder) = video_test_encoder(&script);
+    for (remainder, format, size) in [
+        (
+            "5461x1/0x3/filters:format(mp4)",
+            ImageFormat::Mp4,
+            (16_382, 4),
+        ),
+        (
+            "5461x1/0x3/filters:format(webm)",
+            ImageFormat::WebM,
+            (16_382, 4),
+        ),
+        ("16383x1/filters:format(mp4)", ImageFormat::Mp4, (16_382, 2)),
+        (
+            "1x16383/filters:format(webm)",
+            ImageFormat::WebM,
+            (2, 16_382),
+        ),
+        ("16382x3/filters:format(mp4)", ImageFormat::Mp4, (16_382, 4)),
+        ("5x3/filters:format(mp4)", ImageFormat::Mp4, (6, 4)),
+    ] {
+        let (ops, _) =
+            crate::url::parse_operations(&format!("{remainder}/example.com/a.gif")).unwrap();
+        let out = engine
+            .process_preferred(
+                &src,
+                &ops,
+                ProcessContext {
+                    video_encoder: Some(&encoder),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|err| panic!("{remainder}: {err}"));
+        assert_eq!(out.format, format, "{remainder}");
+        assert_eq!(out.bytes, b"ENGINE-VIDEO", "{remainder}");
+        assert_eq!((out.width, out.height), size, "{remainder}");
+        // The encoder was told the same size.
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let geometry = format!("{}x{}", size.0, size.1);
+        assert!(
+            argv.lines().any(|arg| arg == geometry),
+            "{remainder}: {argv}"
+        );
+    }
 }
 
 #[test]
@@ -4632,7 +5156,7 @@ fn animated_trim_to_webp_and_video_shares_one_canvas() {
         // Lossy, so the squares are checked by band.
         assert!(luma_at(&frames[1], 20, 20) < 60);
         assert!(luma_at(&frames[1], 3, 3) > 200);
-        let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+        let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
         let out = engine
             .process_preferred(
                 &src,
@@ -4982,17 +5506,17 @@ fn animated_gif_probe_survives_hostile_input() {
 
 /// A fake video encoder for the video tests: drains
 /// stdin and answers with the script's canned behavior.
-fn video_test_encoder(script: &str) -> crate::video::VideoEncoder {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-engine-video-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// The script lives in the returned directory.
+fn video_test_encoder(
+    script: &str,
+) -> (crate::test_support::ScratchDir, crate::video::VideoEncoder) {
+    let dir = crate::test_support::scratch_dir("engine-video");
     let path = dir.join("encoder.sh");
     crate::test_support::write_script(&path, script);
-    crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
-        .unwrap()
+    let encoder =
+        crate::video::VideoEncoder::new(path, std::time::Duration::from_secs(30), 64 * 1024 * 1024)
+            .unwrap();
+    (dir, encoder)
 }
 
 const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDEO'\n";
@@ -5002,14 +5526,16 @@ const FAKE_VIDEO_SCRIPT: &str = "#!/bin/sh\ncat > /dev/null\nprintf 'ENGINE-VIDE
 /// `-dump_separator` after each stream's codec name as
 /// the reference tool prints it (issue #402), and its
 /// extraction prints a real 8x6 PNG. Returns the
-/// extractor (the script lives in a temp dir keyed by
-/// `name`).
-fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameExtractor {
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-engine-frame-{}-{name}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+/// extractor and the scratch directory its script
+/// lives in, keyed by `name`.
+fn frame_test_extractor(
+    name: &str,
+    report: &str,
+) -> (
+    crate::test_support::ScratchDir,
+    crate::frames::VideoFrameExtractor,
+) {
+    let dir = crate::test_support::scratch_dir(&format!("engine-frame-{name}"));
     std::fs::write(
         dir.join("frame.png"),
         png_bytes(&DynamicImage::new_rgb8(8, 6)),
@@ -5021,7 +5547,9 @@ fn frame_test_extractor(name: &str, report: &str) -> crate::frames::VideoFrameEx
     );
     let path = dir.join("decoder.sh");
     crate::test_support::write_script(&path, &script);
-    crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap()
+    let extractor =
+        crate::frames::VideoFrameExtractor::new(path, std::time::Duration::from_secs(30)).unwrap();
+    (dir, extractor)
 }
 
 /// Bytes that sniff as no image: an ISO-BMFF header
@@ -5049,7 +5577,7 @@ fn frame_segment_without_a_decoder_is_not_configured() {
 #[test]
 fn frame_segment_on_an_image_source_is_a_decode_failure() {
     let engine = Engine;
-    let extractor = frame_test_extractor("image-source", FAKE_PROBE_REPORT);
+    let (_scripts, extractor) = frame_test_extractor("image-source", FAKE_PROBE_REPORT);
     let ctx = ProcessContext {
         frame_extractor: Some(&extractor),
         ..Default::default()
@@ -5078,7 +5606,7 @@ fn frame_segment_on_an_image_source_is_a_decode_failure() {
 #[test]
 fn frame_segment_extracts_and_processes_the_frame() {
     let engine = Engine;
-    let extractor = frame_test_extractor("extract", FAKE_PROBE_REPORT);
+    let (_scripts, extractor) = frame_test_extractor("extract", FAKE_PROBE_REPORT);
     let out = engine
         .process_preferred(
             FAKE_VIDEO_BYTES,
@@ -5105,7 +5633,7 @@ fn frame_segment_extracts_and_processes_the_frame() {
 #[test]
 fn frame_segment_on_a_streamless_source_is_a_decode_failure() {
     let engine = Engine;
-    let extractor = frame_test_extractor("streamless", "'no streams in here at all'");
+    let (_scripts, extractor) = frame_test_extractor("streamless", "'no streams in here at all'");
     let err = engine
         .process_preferred(
             FAKE_VIDEO_BYTES,
@@ -5360,7 +5888,7 @@ fn tiff_hostile_inputs_fail_bounded_and_clean() {
 #[test]
 fn frame_percentage_without_a_duration_is_unsupported() {
     let engine = Engine;
-    let extractor = frame_test_extractor(
+    let (_scripts, extractor) = frame_test_extractor(
         "no-duration",
         "'  Duration: N/A, start: 0.000000' '  Stream #0:0: Video: h264, yuv420p, 8x6, 10 fps'",
     );
@@ -5380,12 +5908,14 @@ fn frame_percentage_without_a_duration_is_unsupported() {
 
 /// A fake PDF renderer pair (issue #215): the probe
 /// prints a report naming `pages` pages, the renderer
-/// prints a real 8x6 PNG. Returns the renderer (the
-/// scripts live in a temp dir keyed by `name`).
-fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-engine-pdf-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// prints a real 8x6 PNG. Returns the renderer and the
+/// scratch directory its scripts live in, keyed by
+/// `name`.
+fn pdf_test_renderer(
+    name: &str,
+    pages: u32,
+) -> (crate::test_support::ScratchDir, crate::pdf::PdfRenderer) {
+    let dir = crate::test_support::scratch_dir(&format!("engine-pdf-{name}"));
     std::fs::write(
         dir.join("page.png"),
         png_bytes(&DynamicImage::new_rgb8(8, 6)),
@@ -5407,7 +5937,9 @@ fn pdf_test_renderer(name: &str, pages: u32) -> crate::pdf::PdfRenderer {
         "pdftocairo",
         format!("#!/bin/sh\ncat > /dev/null\ncat \"{page_path}\"\nexit 0\n"),
     );
-    crate::pdf::PdfRenderer::new(renderer, std::time::Duration::from_secs(30)).unwrap()
+    let renderer =
+        crate::pdf::PdfRenderer::new(renderer, std::time::Duration::from_secs(30)).unwrap();
+    (dir, renderer)
 }
 
 /// Bytes that carry the PDF header and sniff as no
@@ -5432,7 +5964,7 @@ fn page_segment_without_a_renderer_is_not_configured() {
 #[test]
 fn page_segment_on_a_non_pdf_source_is_a_decode_failure() {
     let engine = Engine;
-    let renderer = pdf_test_renderer("non-pdf", 3);
+    let (_scripts, renderer) = pdf_test_renderer("non-pdf", 3);
     let ctx = ProcessContext {
         pdf_renderer: Some(&renderer),
         ..Default::default()
@@ -5456,7 +5988,7 @@ fn page_segment_on_a_non_pdf_source_is_a_decode_failure() {
 #[test]
 fn page_segment_renders_and_processes_the_page() {
     let engine = Engine;
-    let renderer = pdf_test_renderer("render", 3);
+    let (_scripts, renderer) = pdf_test_renderer("render", 3);
     let out = engine
         .process_preferred(
             FAKE_PDF_BYTES,
@@ -5499,7 +6031,7 @@ fn probe_source_labels_pdfs() {
 #[test]
 fn page_segment_out_of_range_is_unsupported() {
     let engine = Engine;
-    let renderer = pdf_test_renderer("range", 3);
+    let (_scripts, renderer) = pdf_test_renderer("range", 3);
     let err = engine
         .process_preferred(
             FAKE_PDF_BYTES,
@@ -5521,7 +6053,7 @@ fn page_segment_out_of_range_is_unsupported() {
 fn animated_gif_to_mp4_uses_the_configured_encoder() {
     let engine = Engine;
     let src = animated_gif_bytes();
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let out = engine
         .process_preferred(
             &src,
@@ -5544,7 +6076,7 @@ fn animated_gif_to_mp4_uses_the_configured_encoder() {
 fn animated_webp_to_webm_uses_the_configured_encoder() {
     let engine = Engine;
     let src = animated_webp_bytes();
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let out = engine
         .process_preferred(
             &src,
@@ -5565,7 +6097,7 @@ fn animated_webp_to_webm_uses_the_configured_encoder() {
 fn video_output_runs_the_operations_per_frame() {
     let engine = Engine;
     let src = animated_gif_bytes();
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let out = engine
         .process_preferred(
             &src,
@@ -5587,7 +6119,7 @@ fn video_output_runs_the_operations_per_frame() {
 #[test]
 fn video_format_on_a_still_source_is_a_specific_error() {
     let engine = Engine;
-    let encoder = video_test_encoder(FAKE_VIDEO_SCRIPT);
+    let (_scripts, encoder) = video_test_encoder(FAKE_VIDEO_SCRIPT);
     let ctx = ProcessContext {
         video_encoder: Some(&encoder),
         ..Default::default()
@@ -5646,7 +6178,8 @@ fn video_format_without_an_encoder_is_not_configured() {
 #[test]
 fn a_failing_encoder_is_a_video_error() {
     let engine = Engine;
-    let encoder = video_test_encoder("#!/bin/sh\ncat > /dev/null\necho 'no codec' >&2\nexit 3\n");
+    let (_scripts, encoder) =
+        video_test_encoder("#!/bin/sh\ncat > /dev/null\necho 'no codec' >&2\nexit 3\n");
     let err = engine
         .process_preferred(
             &animated_gif_bytes(),
@@ -9056,6 +9589,411 @@ fn dpr_hint_applies_without_a_directive_and_loses_to_one() {
         )
         .unwrap();
     assert_eq!((out.width, out.height), (60, 60));
+}
+
+/// Run `remainder` (operations only) through the engine on
+/// `src` with a DPR client hint of `hint`, as the server would
+/// for that URL and header.
+fn process_hinted(
+    src: &[u8],
+    remainder: &str,
+    hint: Option<f32>,
+) -> Result<ProcessedImage, EngineError> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    Engine.process_preferred(
+        src,
+        &ops,
+        ProcessContext {
+            dpr: hint,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn a_dpr_hint_past_the_per_axis_limit_steps_down() {
+    // Issue #529: a hint is advisory, so a factor that alone
+    // pushes a size past 16383 px per axis steps down to the
+    // largest factor that fits, instead of failing a URL that
+    // renders without the hint.
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, hint, dims) in [
+        // 18000x3 at 3 is refused; 2 fits.
+        ("6000x1", 3.0, (12000, 2)),
+        // 16384x2 at 2 is refused; 1.5 fits (one pixel
+        // rounds up to two).
+        ("8192x1", 2.0, (12288, 2)),
+        // A factor that fits is applied as hinted.
+        ("6000x1", 2.0, (12000, 2)),
+        ("5461x1", 3.0, (16383, 3)),
+    ] {
+        let out = process_hinted(&src, remainder, Some(hint))
+            .unwrap_or_else(|err| panic!("{remainder} at {hint}: {err}"));
+        assert_eq!(decode_dims(&out.bytes), dims, "{remainder} at {hint}");
+    }
+    // `0x1` on a 16383x1 source keeps the 16383:1 aspect: at
+    // 2 and at 1.5 the height rounds to 2 and the width to
+    // 32766, so the factor steps to 1, where the step keeps
+    // the size it started from.
+    let wide = solid_png(16383, 1, [30, 120, 200]);
+    let out = process_hinted(&wide, "0x1", Some(2.0)).unwrap();
+    assert_eq!(decode_dims(&out.bytes), (16383, 1));
+    // An animated source steps down the same way: every
+    // frame renders at the factor that fits.
+    let out = process_hinted(&animated_gif_bytes(), "6000x1", Some(3.0)).unwrap();
+    let frames = decoded_gif_frames(&out.bytes);
+    assert_eq!(frames.len(), 2);
+    for frame in &frames {
+        assert_eq!(frame.buffer().dimensions(), (12000, 2));
+    }
+}
+
+#[test]
+fn a_dpr_hint_past_the_pixel_budget_steps_down() {
+    // Issue #529: `8000x8000` at a hinted 1.5 asks for 144
+    // million pixels, past the 100 million budget; at 1 it
+    // fits. An 8000x8000 stand-in for the decoded source
+    // keeps the step at its own size at factor 1, so nothing
+    // resamples (or touches the zeroed pages). At a hinted 3
+    // the walk meets both bounds: 24000 px per axis, then
+    // 256 and 144 million pixels. With no source header to
+    // walk, the render finds each refusal itself, one try per
+    // factor (`hint_start` settles them before any render
+    // when it can; see the test after this one).
+    let (ops, _) = crate::url::parse_operations("8000x8000/example.com/a.png").unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    for hint in [1.5, 2.0, 3.0] {
+        let mut tried = Vec::new();
+        let (dims, factor) = step_down_hint(&[], &ops, &directives, Some(hint), |dpr| {
+            tried.push(dpr);
+            let ctx = ProcessContext {
+                dpr,
+                ..Default::default()
+            };
+            let img = DynamicImage::new_rgb8(8000, 8000);
+            let factor = dpr_factor(directives.dpr, &ctx);
+            let (out, ..) = apply_operations(img, &ops, None, factor, &ctx, &directives, None)?;
+            Ok(((out.width(), out.height()), factor))
+        })
+        .unwrap();
+        assert_eq!((dims, factor), ((8000, 8000), 1.0), "hint {hint}");
+        let expected: Vec<Option<f32>> = crate::url::DPR_FACTORS
+            .iter()
+            .rev()
+            .filter(|&&f| f <= hint)
+            .map(|&f| Some(f))
+            .collect();
+        assert_eq!(tried, expected, "hint {hint}");
+    }
+}
+
+#[test]
+fn an_explicit_dpr_or_an_over_limit_url_keeps_its_refusal() {
+    // Issue #529: only the hint is advisory. `dpr(3)` in the
+    // URL (or a preset, or the operator's defaults, which
+    // reach the engine in the same merged list) is the
+    // request's own factor, and its refusal stands, hint or
+    // no hint.
+    let src = solid_png(64, 48, [30, 120, 200]);
+    for hint in [None, Some(1.0), Some(2.0), Some(3.0)] {
+        let err = match process_hinted(&src, "6000x1/filters:dpr(3)", hint) {
+            Err(err) => err,
+            Ok(out) => panic!("rendered {:?} at {hint:?}", decode_dims(&out.bytes)),
+        };
+        assert_eq!(
+            err.to_string(),
+            "unsupported operation: requested output 18000x3 exceeds the 16383 pixel limit per axis",
+            "{hint:?}"
+        );
+    }
+    // A URL past the limit at factor 1 is over by itself: the
+    // hint steps all the way down and the refusal names the
+    // size the URL asks for at 1.
+    let err = match process_hinted(&src, "16383x1/0x2", Some(3.0)) {
+        Err(err) => err,
+        Ok(out) => panic!("rendered {:?}", decode_dims(&out.bytes)),
+    };
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 32766x2 exceeds the 16383 pixel limit per axis"
+    );
+}
+
+#[test]
+fn the_hint_steps_only_for_output_size_refusals() {
+    let ops_of = |remainder: &str| {
+        crate::url::parse_operations(&format!("{remainder}/example.com/a.png"))
+            .unwrap()
+            .0
+    };
+    // Hostile input (issue #529): a render that refuses its
+    // size at every factor is tried once per factor at or
+    // below the hint, never more, and its last refusal
+    // stands.
+    let ops = ops_of("6000x1");
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let mut tries = 0;
+    let err = step_down_hint(&[], &ops, &directives, Some(3.0), |_| -> Result<(), _> {
+        tries += 1;
+        check_output_size(u32::MAX, u32::MAX, (1, 1))
+    })
+    .unwrap_err();
+    assert_eq!(tries, 4);
+    assert!(err.to_string().contains("pixel limit per axis"), "{err}");
+    // Each size check's refusal is one the hint steps for.
+    for err in [
+        check_output_size(crate::url::MAX_DIMENSION + 1, 1, (1, 1)).unwrap_err(),
+        check_output_size(10_000, 10_001, (1, 1)).unwrap_err(),
+        check_output_pixels(10_000, 10_001).unwrap_err(),
+        check_hinted_output(crate::url::MAX_DIMENSION + 1, 4).unwrap_err(),
+        OutputBudget::with_limit(1).charge(2, 1).unwrap_err(),
+        OutputBudget::with_limit(1)
+            .check_frames(1, 1, 2)
+            .unwrap_err(),
+        // A later check of the output's size words its
+        // refusal as the steps do, so the hint steps for it.
+        EngineError::Unsupported(
+            "requested output 16384x4 exceeds the 16383 pixel limit per axis; \
+             resize or crop it to fit"
+                .to_string(),
+        ),
+    ] {
+        assert_eq!(
+            hint_step_down(&err, &ops, &directives, Some(3.0)),
+            Some(2.0),
+            "{err}"
+        );
+    }
+    // Any other refusal is not the factor's doing: one try.
+    let mut tries = 0;
+    let err = step_down_hint(&[], &ops, &directives, Some(3.0), |_| -> Result<(), _> {
+        tries += 1;
+        Err(EngineError::Unsupported(
+            "crop-rect 0x0:9x9 exceeds image bounds 4x4".to_string(),
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(tries, 1);
+    assert!(matches!(err, EngineError::Unsupported(_)));
+    let size = check_output_pixels(10_000, 10_001).unwrap_err();
+    assert_eq!(
+        hint_step_down(&EngineError::Timeout, &ops, &directives, Some(3.0)),
+        None
+    );
+    // No hint, a hint at 1, an explicit factor, or a chain
+    // with no pixel size for the factor to scale: no step.
+    assert_eq!(hint_step_down(&size, &ops, &directives, None), None);
+    assert_eq!(hint_step_down(&size, &ops, &directives, Some(1.0)), None);
+    let explicit = ops_of("6000x1/filters:dpr(3)");
+    let explicit_directives = crate::url::RequestDirectives::analyze(&explicit);
+    assert_eq!(
+        hint_step_down(&size, &explicit, &explicit_directives, Some(3.0)),
+        None
+    );
+    for remainder in ["filters:rotate(45)", "0x0", "origx0", "crop-rect:0x0:9x9"] {
+        let ops = ops_of(remainder);
+        let directives = crate::url::RequestDirectives::analyze(&ops);
+        assert_eq!(
+            hint_step_down(&size, &ops, &directives, Some(3.0)),
+            None,
+            "{remainder}"
+        );
+    }
+    for remainder in ["0x2", "fit-in:10x0", "crop:10x10", "pad:10x10", "origx2"] {
+        let ops = ops_of(remainder);
+        let directives = crate::url::RequestDirectives::analyze(&ops);
+        assert_eq!(
+            hint_step_down(&size, &ops, &directives, Some(3.0)),
+            Some(2.0),
+            "{remainder}"
+        );
+    }
+}
+
+#[test]
+fn dpr_steps_walk_the_factor_set_down() {
+    assert_eq!(dpr_step_below(3.0), Some(2.0));
+    assert_eq!(dpr_step_below(2.0), Some(1.5));
+    assert_eq!(dpr_step_below(1.5), Some(1.0));
+    assert_eq!(dpr_step_below(1.0), None);
+    // The grammar parses exactly the factor set the step walks
+    // (and the server's hint accepts).
+    for factor in crate::url::DPR_FACTORS {
+        let (ops, _) =
+            crate::url::parse_operations(&format!("filters:dpr({factor})/example.com/a.png"))
+                .unwrap();
+        assert_eq!(
+            crate::url::RequestDirectives::analyze(&ops).dpr,
+            Some(factor)
+        );
+    }
+    for factor in ["0.5", "1.25", "2.5", "4"] {
+        assert!(
+            crate::url::parse_operations(&format!("filters:dpr({factor})/example.com/a.png"))
+                .is_err(),
+            "{factor}"
+        );
+    }
+}
+
+/// The factors `step_down_hint` asks a stand-in render for,
+/// for `remainder` (operations only) over `src` with a DPR
+/// hint of `hint`, when the stand-in refuses its output size
+/// at every factor past `fits`.
+fn hint_tries(src: &[u8], remainder: &str, hint: f32, fits: f32) -> Vec<f32> {
+    let (ops, _) = crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let mut tried = Vec::new();
+    let _ = step_down_hint(src, &ops, &directives, Some(hint), |dpr| {
+        let dpr = dpr.unwrap();
+        tried.push(dpr);
+        if dpr > fits {
+            check_output_size(u32::MAX, 1, (1, 1))
+        } else {
+            Ok(())
+        }
+    });
+    tried
+}
+
+#[test]
+fn the_header_walk_settles_the_hint_before_any_render() {
+    // Issue #529: each try decodes the source, so a factor
+    // the source's header already shows past the limits is
+    // never tried. A hint costs one render where the walk
+    // can size the chain, not one per factor.
+    let small = solid_png(64, 48, [30, 120, 200]);
+    for (remainder, hint, start) in [
+        // 18000x3 at 3, past the per-axis limit.
+        ("6000x1", 3.0, 2.0),
+        // A factor that fits is the one tried.
+        ("6000x1", 2.0, 2.0),
+        // 144 million pixels at 1.5, past the budget.
+        ("8000x8000", 1.5, 1.0),
+        // A step past the budget anywhere in the chain.
+        ("8000x8000/100x100", 3.0, 1.0),
+        // Past the limit at every factor: one try, at 1,
+        // whose refusal stands.
+        ("16383x1/0x2", 3.0, 1.0),
+    ] {
+        assert_eq!(
+            hint_tries(&small, remainder, hint, 3.0),
+            [start],
+            "{remainder} at {hint}"
+        );
+    }
+    // A stepped factor never serves a side of 16384 px. At 2,
+    // these ask for a 16384 px source's own size, which no
+    // step refuses; 1.5 is the factor that fits.
+    let flat = solid_png(16_384, 2, [30, 120, 200]);
+    let wide = solid_png(16_384, 4, [30, 120, 200]);
+    assert_eq!(hint_tries(&flat, "8192x1", 3.0, 3.0), [1.5]);
+    assert_eq!(hint_tries(&wide, "0x2", 2.0, 3.0), [1.5]);
+    // The walk starts from the size the decode turns the
+    // source to: a 16383x1 JPEG stored on its side (EXIF
+    // orientation 6) decodes as 1x16383, where `0x2` at 2
+    // asks for 1x4. Upright, it asks for 32766x2 even at 1.
+    let line = DynamicImage::new_rgb8(16_383, 1);
+    assert_eq!(
+        hint_tries(&jpeg_with_orientation(&line, 6), "0x2", 2.0, 3.0),
+        [2.0]
+    );
+    assert_eq!(
+        hint_tries(&jpeg_with_orientation(&line, 1), "0x2", 2.0, 3.0),
+        [1.0]
+    );
+    // Where the walk cannot size the chain, the render's own
+    // refusals step the factor, one try each: the size after
+    // a `trim` hangs on the pixels, an SVG's intrinsic size
+    // takes a worker of its own, and bytes with no header
+    // state no size.
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="48"/>"#;
+    assert_eq!(
+        hint_tries(&small, "filters:trim/0x2", 3.0, 1.5),
+        [3.0, 2.0, 1.5]
+    );
+    assert_eq!(hint_tries(svg, "6000x1", 3.0, 2.0), [3.0, 2.0]);
+    assert_eq!(hint_tries(&[], "6000x1", 3.0, 1.0), [3.0, 2.0, 1.5, 1.0]);
+}
+
+#[test]
+fn a_stepped_hint_never_serves_a_side_past_the_limit() {
+    // Issue #529: at a hinted 2, `0x2` on a 16384x4 source
+    // asks for the source's own size, which the per-step
+    // check lets through as it lets any unchanged size
+    // through. Served, the output was one past the 16383 px
+    // limit, and as WebP it failed to encode with a `500`
+    // where main answered `400`. The factor steps to 1.5,
+    // the largest that fits, in every format, and so it does
+    // after a `trim`, where only the render finds the size.
+    let wide = solid_png(16_384, 4, [30, 120, 200]);
+    let flat = solid_png(16_384, 2, [30, 120, 200]);
+    for preferred in [None, Some(ImageFormat::WebP)] {
+        for (src, remainder, hint, dims) in [
+            (&wide, "0x2", 2.0, (12288, 3)),
+            (&flat, "8192x1", 3.0, (12288, 2)),
+            (&wide, "filters:trim/0x2", 2.0, (12288, 3)),
+        ] {
+            let (ops, _) =
+                crate::url::parse_operations(&format!("{remainder}/example.com/a.png")).unwrap();
+            let ctx = ProcessContext {
+                dpr: Some(hint),
+                preferred,
+                ..Default::default()
+            };
+            let out = Engine
+                .process_preferred(src, &ops, ctx)
+                .unwrap_or_else(|err| panic!("{remainder} at {hint} as {preferred:?}: {err}"));
+            assert_eq!(
+                decode_dims(&out.bytes),
+                dims,
+                "{remainder} at {hint} as {preferred:?}"
+            );
+        }
+    }
+    // The check behind the `trim` case: at a hinted factor
+    // past 1, the image the chain ends with is held to the
+    // limit even at the size a step started from, and the
+    // refusal is one the hint steps for.
+    let (ops, _) = crate::url::parse_operations("0x2/example.com/a.png").unwrap();
+    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let ctx = ProcessContext {
+        dpr: Some(2.0),
+        ..Default::default()
+    };
+    let img = DynamicImage::new_rgb8(16_384, 4);
+    let err = match apply_operations(img, &ops, None, 2.0, &ctx, &directives, None) {
+        Err(err) => err,
+        Ok((img, ..)) => panic!("rendered {}x{}", img.width(), img.height()),
+    };
+    assert_eq!(
+        err.to_string(),
+        "unsupported operation: requested output 16384x4 exceeds the 16383 pixel limit per axis; \
+         resize or crop it to fit"
+    );
+    assert_eq!(
+        hint_step_down(&err, &ops, &directives, Some(2.0)),
+        Some(1.5)
+    );
+}
+
+#[test]
+fn output_budget_refuses_a_run_from_its_first_frame() {
+    // Issue #529: every frame of an animation renders at one
+    // size, so the first frame settles the run. A run past
+    // the budget is refused after one frame, with the
+    // refusal the running charge gives where it passes.
+    let budget = OutputBudget::with_limit(250);
+    assert!(budget.check_frames(10, 10, 2).is_ok());
+    let early = budget.check_frames(10, 10, 3).unwrap_err();
+    let mut running = OutputBudget::with_limit(250);
+    running.charge(10, 10).unwrap();
+    running.charge(10, 10).unwrap();
+    assert_eq!(early, running.charge(10, 10).unwrap_err());
+    // Hostile sizes and counts saturate past the budget
+    // instead of wrapping under it.
+    assert!(budget.check_frames(u32::MAX, u32::MAX, usize::MAX).is_err());
+    assert!(budget.check_frames(1, 1, usize::MAX).is_err());
 }
 
 #[test]

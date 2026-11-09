@@ -103,7 +103,9 @@ candidate build before tagging. `scripts/test_all.sh` also runs it
 incompatibility shows up in the ordinary gate, not only at release
 time. The rendering version check runs early in the same gate and
 in the release steps; it needs the last release tag, so a shallow
-clone without tags reports it skipped.
+clone without tags reports it skipped. CI checks out the full
+history and runs it with `--strict`, which fails instead of
+skipping.
 
 ## Scope exclusions
 

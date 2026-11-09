@@ -1147,20 +1147,16 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'pipe:0':
         assert!(matches!(err, FrameError::Unsupported(_)), "{err}");
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "crabcrop-frames-test-{}-{name}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::ScratchDir {
+        crate::test_support::scratch_dir(&format!("frames-test-{name}"))
     }
 
-    fn fake_tool(name: &str, script: &str) -> PathBuf {
+    /// The fake tool's path, and the directory it lives in.
+    fn fake_tool(name: &str, script: &str) -> (crate::test_support::ScratchDir, PathBuf) {
         let dir = temp_dir(name);
         let path = dir.join("fake-decoder");
         crate::test_support::write_script(&path, script);
-        path
+        (dir, path)
     }
 
     /// A stand-in decoder with the reference tool's shape:
@@ -1196,7 +1192,7 @@ exit 1\n";
 
     #[test]
     fn extract_runs_probe_then_extraction() {
-        let program = fake_tool("ok", FAKE_OK);
+        let (_tool, program) = fake_tool("ok", FAKE_OK);
         let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
         let frame = extractor
             .extract_frame(b"video bytes", FrameSelection::Seconds(1.5))
@@ -1222,12 +1218,13 @@ exit 1\n";
         // it at inputs the loader never validated. The
         // stand-in tool records each invocation's argv, one
         // line per run, and otherwise behaves like FAKE_OK.
-        let record = temp_dir("whitelists").join("argv.log");
+        let records = temp_dir("whitelists");
+        let record = records.join("argv.log");
         let script = format!(
-            "#!/bin/sh\ncat > /dev/null\necho \"$@\" >> {}\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n",
+            "#!/bin/sh\ncat > /dev/null\necho \"$@\" >> '{}'\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n",
             record.display()
         );
-        let program = fake_tool("whitelists", &script);
+        let (_tool, program) = fake_tool("whitelists", &script);
         let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
         let frame = extractor
             .extract_frame(b"video bytes", FrameSelection::Poster)
@@ -1265,12 +1262,13 @@ exit 1\n";
         // descriptor points at. Its probe report carries
         // the run's dump separator the way the reference
         // tool prints it (issue #402).
-        let record = temp_dir("staged").join("stdin.log");
+        let records = temp_dir("staged");
+        let record = records.join("stdin.log");
         let script = format!(
             "#!/bin/sh\n\
 n=$(cat | wc -c)\n\
 if [ -f /dev/stdin ]; then kind=file; else kind=other; fi\n\
-echo \"$n $kind $(readlink /proc/self/fd/0)\" >> {}\n\
+echo \"$n $kind $(readlink /proc/self/fd/0)\" >> '{}'\n\
 sep=', '\n\
 prev=\n\
 for a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\n\
@@ -1278,7 +1276,7 @@ printf '%s\\n' 'Input #0, mov,mp4, from fd:' '  Duration: 00:00:03.00, start: 0.
 exit 1\n",
             record.display()
         );
-        let program = fake_tool("staged", &script);
+        let (_tool, program) = fake_tool("staged", &script);
         let extractor = VideoFrameExtractor::new(program, Duration::from_secs(10)).unwrap();
         let video = vec![7u8; 100_000];
         let frame = extractor
@@ -1304,7 +1302,7 @@ exit 1\n",
         // the input outright; that is the decoder's
         // shortcoming, not a bad source, and the error says
         // what is needed. Recorded from FFmpeg 5.1.
-        let program = fake_tool(
+        let (_tool, program) = fake_tool(
             "oldffmpeg",
             "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'fd:: Protocol not found' 'Did you mean file:fd:?' >&2\nexit 1\n",
         );
@@ -1318,7 +1316,7 @@ exit 1\n",
 
     #[test]
     fn extract_maps_a_streamless_probe_to_not_video() {
-        let program = fake_tool(
+        let (_tool, program) = fake_tool(
             "junk",
             "#!/bin/sh\ncat > /dev/null\nprintf 'not a video at all\\n' >&2\nexit 1\n",
         );
@@ -1332,7 +1330,7 @@ exit 1\n",
     #[test]
     fn extract_maps_tool_failure_and_empty_output() {
         // Nonzero exit on the extraction run.
-        let program = fake_tool(
+        let (_tool, program) = fake_tool(
             "failing",
             "#!/bin/sh\n\
 cat > /dev/null\n\
@@ -1355,7 +1353,7 @@ exit 1\n",
 
         // A clean run that yields no frame at any stepped
         // timestamp is a failure, not an empty image.
-        let program = fake_tool(
+        let (_tool, program) = fake_tool(
             "empty",
             "#!/bin/sh\n\
 cat > /dev/null\n\
@@ -1383,7 +1381,7 @@ exit 1\n",
         // push the real facts past the report cap, leaving
         // only planted lines in the kept part. A report that
         // passed the cap is refused instead of parsed.
-        let program = fake_tool(
+        let (_tool, program) = fake_tool(
             "longreport",
             &format!(
                 "#!/bin/sh\ncat > /dev/null\n\
@@ -1412,7 +1410,7 @@ exit 1\n",
         // cut off by the shared deadline, where a fresh
         // timeout per invocation would have let both run
         // (1.2s in total) and succeed.
-        let program = fake_tool(
+        let (_tool, program) = fake_tool(
             "slow",
             "#!/bin/sh\ncat > /dev/null\nsleep 0.6\nsep=', '\nprev=\nfor a in \"$@\"; do\n  if [ \"$a\" = \"image2pipe\" ]; then\n    printf '\\211PNG\\015\\012\\032\\012fakepng'\n    exit 0\n  fi\n  if [ \"$prev\" = -dump_separator ]; then sep=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s\\n' 'Input #0, mov,mp4, from pipe:0:' '  Duration: 00:00:03.00, start: 0.000000, bitrate: N/A' '  Stream #0:0: Video: h264, yuv420p, 64x48, 10 fps, 10 tbr' | sed \"/^  Stream #/s/, /$sep/\" >&2\nexit 1\n",
         );
@@ -1432,7 +1430,7 @@ exit 1\n",
 
     #[test]
     fn extract_times_out_on_a_hung_decoder() {
-        let program = fake_tool("sleeper", "#!/bin/sh\nsleep 30\n");
+        let (_tool, program) = fake_tool("sleeper", "#!/bin/sh\nsleep 30\n");
         let extractor = VideoFrameExtractor::new(program, Duration::from_secs(1)).unwrap();
         let started = Instant::now();
         let err = extractor

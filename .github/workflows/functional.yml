@@ -9,12 +9,13 @@
 # smoke tier runs on pull requests inside a hard budget of
 # about 4 minutes of harness wall clock (an overrun is a bug
 # in the suite: cut cells or shrink corpus images, never raise
-# the budget). The full tier runs nightly, on release tags,
-# and on pull requests whose diff touches the dependency
-# lockfile or the encode pipeline (the paths listed in the
-# tier step below). Results publish as the job summary and an
-# artifact beside the existing suite output. Timings are
-# trend data only; they never gate.
+# the budget). The full tier runs nightly, on pushes to main
+# and release tags, and on pull requests whose diff touches
+# the dependency lockfile, a manifest, any file under src/,
+# or this harness (the paths listed in the tier step below).
+# Results publish as the job summary and an artifact beside
+# the existing suite output. Timings are trend data only;
+# they never gate.
 name: Functional tests
 
 on:
@@ -61,17 +62,15 @@ jobs:
             tier="${{ inputs.tier }}"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
             # Full tier when the diff touches the lockfile, the
-            # manifests, the encode pipeline (decode, transform
-            # and encode modules under src/), or this harness.
+            # manifests, any file under src/ (a pattern rather
+            # than a module list, so a new module cannot fall
+            # outside it), or this harness.
             files=$(git diff --name-only \
               "origin/${{ github.base_ref }}...HEAD")
             while IFS= read -r f; do
               case "$f" in
                 Cargo.lock|Cargo.toml|crates/*/Cargo.toml) tier=full ;;
-                src/engine.rs|src/engine/*|src/filters.rs|src/quality.rs) tier=full ;;
-                src/color.rs|src/crop.rs|src/heic.rs|src/svg.rs) tier=full ;;
-                src/text.rs|src/video.rs|src/studio.rs|src/ai.rs) tier=full ;;
-                src/frames.rs|src/pdf.rs|src/loader.rs|src/url.rs) tier=full ;;
+                src/*) tier=full ;;
                 tests/functional/*) tier=full ;;
                 src/url/*) tier=full ;;
               esac

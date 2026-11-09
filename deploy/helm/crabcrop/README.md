@@ -66,8 +66,8 @@ helm install crabcrop deploy/helm/crabcrop \
 Release images are published to GHCR as `ghcr.io/dayvson/crabcrop`, tagged with the release version; the chart defaults point there. For a quick trial only, `--set secret=<value>` lets the chart create the Secret itself; do not use that route for anything real. To run your own build instead:
 
 ```bash
-docker build -t your-registry/crabcrop:0.9.11 .
-docker push your-registry/crabcrop:0.9.11
+docker build -t your-registry/crabcrop:0.10.0 .
+docker push your-registry/crabcrop:0.10.0
 helm install crabcrop deploy/helm/crabcrop \
   --set image.repository=your-registry/crabcrop \
   --set image.tag=0.9.10 \
@@ -114,7 +114,7 @@ env:
   CRABCROP_ALLOWED_SOURCES: "images.example.com,upload.wikimedia.org"
 ```
 
-The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer <redacted>, from an existing Secret), `resultStorage` (the disk tier and its claim), and `resultBucket` (the shared tier). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
+The structured values cover the common wiring beyond the signing secret: `metricsToken` (the `/metrics` bearer <redacted>, from an existing Secret), `resultStorage` (the disk tier and its claim), `resultBucket` (the shared tier), and `shutdownGraceSeconds` (how long a pod drains after `SIGTERM`, passed as `CRABCROP_SHUTDOWN_GRACE_SECS`, 8 by default; the pod's `terminationGracePeriodSeconds` is set to it plus 5, so set the grace here: the chart refuses to render with `CRABCROP_SHUTDOWN_GRACE_SECS` in `env`). See the Configuration table in the main README for the full list. An Ingress and an HPA are available behind `ingress.enabled` and `autoscaling.enabled`.
 
 ## Smoke checklist
 

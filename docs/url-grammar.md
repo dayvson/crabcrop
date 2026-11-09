@@ -83,6 +83,32 @@ Like `exp`, the segment sits inside the signed remainder and repeated segments r
 
 Every cacheable image response also carries a strong `ETag`: a digest of the response's exact bytes, computed when the render is produced and stored with its cache entry. If a re-render under the same URL produces different bytes (the source changed and the old entry was purged), the ETag changes with them. A client or CDN holding a copy can revalidate with `If-None-Match`: when the value matches (an exact match, a weak `W/` spelling, one entry of a comma list, or `*`), the answer is `304 Not Modified` with no body, on cache hits and fresh renders alike; anything else gets the full `200`. The validator applies only to public `200` image responses: meta responses (`private, no-store`), fallbacks, and errors carry no `ETag` and are never answered with a `304`. It pairs with `maxage:0` for URLs whose copies should be checked before every reuse.
 
+### Output size
+
+A size written in the URL is at most 16383 px per axis, the strictest encoder limit in the pipeline (WebP's): `16384x100` does not parse, and fails with `400` (`invalid_size`). The same limit holds for every size the server works out from the request rather than reads from it: a proportional or `orig` side, a `fit-in` scale, a `crop` or `pad` target, any of these scaled by `dpr(...)` or a DPR client hint, and the larger canvas a `rotate(...)` filter draws on. Each step's output is also held to 100 megapixels in total. A step whose size passes either bound fails the whole request with `400` (`unsupported_operation`) before the step allocates its image, wherever the step sits in the chain and whatever follows it; the size is never clamped. With `no_upscale`, the cap shrinks a resize, `fit-in`, or `crop` first, and the limit applies to what is left; a `pad` canvas is never shrunk, so a pad past the limit is refused with or without it.
+
+A factor that comes only from a DPR client hint (`DPR` or `Sec-CH-DPR`) is the exception, because a hint is advisory: when the hint alone pushes a size past either bound, the server steps the factor down to the largest of 1, 1.5, 2, and 3 whose sizes fit both, and answers `200` at that factor instead of `400`. `/unsafe/6000x1/<source>` with `DPR: 3` asks for 18000x3 and is served at factor 2, as 12000x2. A stepped factor past 1 also holds the output itself to 16383 px per axis, so it never serves a 16384 px source's side as decoded: `/unsafe/8192x1/<16384x2 source>` with `DPR: 3` asks for the source's own size at factor 2 and is served at 1.5, as 12288x2. Only when even factor 1 does not fit is the URL itself over, and it answers its `400` under any hint. A factor written as `dpr(...)`, in the URL, a preset, or the server's default operations, is never stepped down: `/unsafe/6000x1/filters:dpr(3)/<source>` answers `400` with or without the hint (see [Client hints](filters.md#client-hints)).
+
+```text
+/unsafe/16383x1/0x2/https://example.com/photo.jpg   400: the second step keeps the 16383:1 aspect ratio at height 2, so it asks for 32766x2
+/unsafe/5461x1/0x3/https://example.com/photo.jpg    200: 16383x3, exactly the limit
+```
+
+The refusal names the size it refused: `requested output 32766x2 exceeds the 16383 pixel limit per axis`.
+
+A source can decode at up to 16384 px per axis (see below), one past the limit. A step that ends at the size it started from works nothing out, so the per-axis limit does not refuse the step itself: `0x0`, `fit-in:0x0`, `rotate(180)`, and a resize that `no_upscale` or a width client hint holds at the source pass such a source on as decoded, and a later step can still bring it within the limit. A step that changes the size is held to the limit at the step, a quarter turn included: `origx1` on a 16384x2 source asks for 16384x1, and `rotate(90)` for 2x16384, so both are refused. An SVG source is rasterized before the chain runs, at the size its first resize, `fit-in`, or `crop` asks for and at most 4096 px per axis, and the chain's sizes resolve against that raster. A PDF page renders within 16383 px per axis, unless its media box is larger than its crop box (see [PDF pages](media.md#pdf-pages)).
+
+The image the server encodes is held to the limit too, whatever the chain did. A chain that leaves a side past 16383 px, such as a 16384 px source with no sizing step or no operations at all, fails with `400` (`unsupported_operation`) in every output format, including a WebP negotiated from `Accept`, and the `/explain` forecast reports it as `over_dimension: true`:
+
+```text
+/unsafe/https://example.com/16384x1.png          400: requested output 16384x1 exceeds the 16383 pixel limit per axis; resize or crop it to fit
+/unsafe/8192x0/https://example.com/16384x1.png   200: 8192x1
+```
+
+Video output needs even sides (H.264 and VP9 subsample color in 2x2 blocks). An odd side pads up by one pixel, except a side at the limit: 16383 px crops its last row or column to 16382 instead of padding past the limit (see [Video output](media.md#video-output)).
+
+The [`/explain`](endpoints.md#self-explaining-urls) forecast applies the same rule to resize, `fit-in`, `crop`, `pad`, and `rotate(...)` steps, and reports `over_dimension: true` for such a chain. It works from the source's stored size, the URL, and the DPR hint (stepped down as the image request steps it) alone, so it does not see an EXIF orientation turn the source, it reports no dimensions from a `trim` on (the trimmed size depends on the pixels), it does not count an animated source's frames (so it cannot see the budget they share, which the image request may step a hinted factor down for), and it leaves out the width and Save-Data hints.
+
 ### Source images
 
 The loader fetches the source under bounded limits, for every source kind:

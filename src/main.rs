@@ -41,11 +41,30 @@ fn main() {
     if crabcrop::svg::is_worker_invocation() {
         std::process::exit(crabcrop::svg::worker_main());
     }
-    start();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("crabcrop: cannot start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    // A server that has drained (issue #463) stops its
+    // runtime by the drain's deadline: blocking work nothing
+    // tracks, such as a disk write whose request went or a
+    // render past the grace, gets what is left of the grace
+    // and is then left behind. Dropping the runtime would
+    // wait for that work without bound, past the deadline.
+    if let Some(deadline) = runtime.block_on(start()) {
+        runtime.shutdown_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
 }
 
-#[tokio::main]
-async fn start() {
+/// Run a CLI verb, or the server. For the server, returns
+/// the deadline by which its runtime must stop.
+async fn start() -> Option<std::time::Instant> {
     // CLI verbs run instead of the server when the first
     // argument names one, and only a bare `crabcrop` starts
     // the server, which reads the environment and takes no
@@ -73,7 +92,7 @@ async fn start() {
                 std::process::exit(1);
             }
         }
-        return;
+        return None;
     }
     // The server parses and renders every SVG in a worker
     // started from its own binary (issue #447).
@@ -84,9 +103,12 @@ async fn start() {
             std::process::exit(1);
         }
     }
-    if let Err(e) = run().await {
-        eprintln!("crabcrop: {e}");
-        std::process::exit(1);
+    match run().await {
+        Ok(deadline) => Some(deadline),
+        Err(e) => {
+            eprintln!("crabcrop: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -565,6 +587,26 @@ fn source_timeout_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, Str
     Ok(secs)
 }
 
+/// How long a stopping server drains (issue #463):
+/// `CRABCROP_SHUTDOWN_GRACE_SECS`, 1 to 600 like the other
+/// wall-clock limits, defaulting to 8 s, under the 10 s
+/// `docker stop` and Cloud Run allow. It bounds the
+/// connection drain and the background write drain
+/// together, from the signal on.
+fn shutdown_grace_secs(get: &impl Fn(&str) -> Option<String>) -> Result<u64, String> {
+    let secs: u64 = parse_env_value(
+        "CRABCROP_SHUTDOWN_GRACE_SECS",
+        get("CRABCROP_SHUTDOWN_GRACE_SECS"),
+        crate::server::DEFAULT_SHUTDOWN_GRACE_SECS,
+    )?;
+    if !(1..=600).contains(&secs) {
+        return Err(format!(
+            "CRABCROP_SHUTDOWN_GRACE_SECS must be between 1 and 600, got {secs}"
+        ));
+    }
+    Ok(secs)
+}
+
 /// The proxy variables the HTTP client honours, as pairs
 /// it reads in order: the first of a pair that is set
 /// wins, even when it is empty.
@@ -780,7 +822,7 @@ fn build_upload_store(
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let keyring = build_keyring(|name| env::var(name).ok())?;
     let allow_unsafe = parse_bool("CRABCROP_ALLOW_UNSAFE", false)?;
     // CRABCROP_PORT is the namespaced alias for PORT and
@@ -835,6 +877,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the upload cap derive from the same cap.
     let fetch_cap_mb = source_max_mb(&|name: &str| env::var(name).ok())?;
     let fetch_timeout_secs = source_timeout_secs(&|name: &str| env::var(name).ok())?;
+    let shutdown_grace =
+        std::time::Duration::from_secs(shutdown_grace_secs(&|name: &str| env::var(name).ok())?);
     let source_buffer_bytes = source_buffer_budget(
         |name| env::var(name).ok(),
         process_permits + slow_lane_permits,
@@ -984,6 +1028,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    // The port the listener holds, which the listening line
+    // names: the configured one, or for PORT=0 the free port
+    // the kernel picked (issue #536).
+    let port = listener.local_addr()?.port();
 
     // AI models are configured, never downloaded, and preloaded
     // at boot: a model that is set but broken is a startup
@@ -1072,6 +1120,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         inflight: Arc::new(crate::server::Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: crate::server::Background::default(),
         config_fingerprint,
     };
     println!(
@@ -1083,31 +1132,95 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Purges recorded in the shared bucket hold here before
     // the first request (issue #461).
     crate::server::start_purge_tombstones(&state).await;
+    let background = state.background.clone();
+    let signalled = shutdown_signal();
     println!("crabcrop listening on port {port}");
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+    // Shutdown (issue #463): at SIGTERM or Ctrl-C the
+    // listener closes, idle connections close, and requests
+    // in flight finish; then the background writes they and
+    // earlier requests left (shared-tier write-throughs,
+    // purges whose caller left) finish. One deadline, the
+    // grace from the signal on, bounds both waits, and the
+    // process exits at it with whatever is still running.
+    // A second signal ends the drain at once.
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut serve = axum::serve(listener, app(state))
+        .with_graceful_shutdown(stop.clone().cancelled_owned())
+        .into_future();
+    tokio::select! {
+        served = &mut serve => {
+            served?;
+            return Ok(std::time::Instant::now());
+        }
+        () = signalled => stop.cancel(),
+    }
+    let deadline = tokio::time::Instant::now() + shutdown_grace;
+    let signalled_again = shutdown_signal();
+    println!(
+        "shutdown: draining requests and background writes for up to {}s",
+        shutdown_grace.as_secs()
+    );
+    let drain = async {
+        match tokio::time::timeout_at(deadline, serve).await {
+            Ok(served) => served?,
+            Err(_) => eprintln!("shutdown: requests still in flight at the deadline are cut off"),
+        }
+        Ok::<_, std::io::Error>(background.drain(deadline).await)
+    };
+    // The runtime stops by `stop_by`: the deadline after a
+    // drain, at once after a second signal.
+    let (left, when, stop_by) = tokio::select! {
+        left = drain => (left?, "at the deadline", deadline.into_std()),
+        () = signalled_again => {
+            eprintln!("shutdown: a second signal ends the drain; what is still running is cut off");
+            (background.running(), "at the second signal", std::time::Instant::now())
+        }
+    };
+    if left.writes > 0 {
+        eprintln!(
+            "shutdown: {} background writes still running {when} are dropped",
+            left.writes
+        );
+    }
+    if left.walks > 0 {
+        // A walk cut short leaves its purge's bucket
+        // tombstone in force (issue #461): copies it covers
+        // stay misses until a later purge of the target
+        // finishes its walk. A purge whose tombstone the
+        // bucket refused held in this process only.
+        println!(
+            "shutdown: stopping {} background purge walks; a purge whose tombstone reached the bucket stays in force",
+            left.walks
+        );
+    }
+    println!("shutdown: done");
+    Ok(stop_by)
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
+/// Resolves at the next SIGTERM or Ctrl-C. The handlers
+/// are installed when this is called, not when it is first
+/// polled, so a signal that arrives in between still counts;
+/// a signal from before the call does not.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt()).expect("install Ctrl-C handler");
+    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+}
+
+/// SIGTERM or Ctrl-C, as for unix; only Ctrl-C elsewhere.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
         tokio::signal::ctrl_c()
             .await
             .expect("install Ctrl-C handler");
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
     }
 }
 
@@ -1136,8 +1249,23 @@ async fn shutdown_signal() {
 /// source writes its samples big-endian instead of
 /// byte-swapped #464; focal forms carried through the
 /// geometry between their segment and the crop, and one
-/// trim window for every frame of an animation #465).
-const RENDERING_VERSION: u32 = 3;
+/// trim window for every frame of an animation #465; a
+/// step that works out a size past 16383 px on an axis,
+/// such as `16383x1/0x2`, refused instead of rendered
+/// #521).
+///
+/// 4: the first release after 0.10.0, which changes output
+/// for existing URLs (an output left past 16383 px on an
+/// axis, such as a 16384 px source with no sizing step,
+/// refused instead of rendered, a 16383 px video side
+/// cropped to 16382 instead of padded to 16384, and PDF
+/// pages near the raster cap rendered one DPI lower #528; a
+/// `DPR` or `Sec-CH-DPR` client hint past 1 that took a
+/// 16384 px source side through unchanged steps down to a
+/// factor whose output fits 16383 px, so `8192x1` on a
+/// 16384x2 source with `DPR: 2` serves 12288x2 instead of
+/// 16384x2 #529).
+const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered
 /// output (audit R2-08): the rendering version, the
@@ -2357,6 +2485,14 @@ fn build_ocr(
     Ok(Some(Arc::new(provider)))
 }
 
+// The library's test helpers are not visible to this
+// crate: its scratch directories come in by path, as in
+// the integration tests. Not every item is used here.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "test_support/scratch.rs"]
+mod test_support;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2634,25 +2770,64 @@ mod tests {
         }
     }
 
-    /// Write bytes to a fresh temp file and return its
-    /// path: construction tests need real files (a presets
-    /// file, a fallback image, an encoder program) without
-    /// committing fixtures. The tag keeps parallel tests
-    /// on distinct files.
-    fn temp_file(tag: &str, contents: &[u8]) -> String {
-        let path =
-            std::env::temp_dir().join(format!("crabcrop-boot-{tag}-{}.tmp", std::process::id()));
-        std::fs::write(&path, contents).unwrap();
-        path.to_string_lossy().into_owned()
+    /// A temp file with the bytes a construction test gave
+    /// it, in a scratch directory of its own that lives as
+    /// long as this does.
+    struct TempFile {
+        path: String,
+        _dir: crate::test_support::ScratchDir,
     }
 
-    /// A path inside the temp dir that is never created.
+    impl TempFile {
+        fn as_str(&self) -> &str {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempFile {
+        fn as_ref(&self) -> &std::path::Path {
+            self.path.as_ref()
+        }
+    }
+
+    /// Both formats print the path alone, as the `String`
+    /// this replaced did: the detector tests quote it into
+    /// JSON with `{file:?}` and splice it in with `{file}`.
+    impl std::fmt::Debug for TempFile {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(&self.path, f)
+        }
+    }
+
+    impl std::fmt::Display for TempFile {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.path)
+        }
+    }
+
+    /// Write bytes to a fresh temp file: construction tests
+    /// need real files (a presets file, a fallback image, an
+    /// encoder program) without committing fixtures. Each
+    /// starts in an empty directory, so no test sees a file
+    /// an earlier test process left (issue #526). The file
+    /// is named after its tag too, so two files that must
+    /// differ only in content (the fingerprint tests) differ
+    /// in more than their directory.
+    fn temp_file(tag: &str, contents: &[u8]) -> TempFile {
+        let dir = crate::test_support::scratch_dir(&format!("boot-{tag}"));
+        let path = dir
+            .join(format!("{tag}.tmp"))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&path, contents).unwrap();
+        TempFile { path, _dir: dir }
+    }
+
+    /// A path that does not exist: a name inside a scratch
+    /// directory that is removed again before this returns.
     fn missing_path(tag: &str) -> String {
-        std::env::temp_dir()
-            .join(format!(
-                "crabcrop-boot-missing-{tag}-{}.tmp",
-                std::process::id()
-            ))
+        crate::test_support::scratch_dir(&format!("boot-missing-{tag}"))
+            .join("missing.tmp")
             .to_string_lossy()
             .into_owned()
     }
@@ -3126,12 +3301,22 @@ mod tests {
     #[test]
     fn upload_store_construction_follows_the_destination_rules() {
         let plain = SourceConfig::default();
+        // Built where the temp dir is, never at a fixed
+        // /tmp: TMPDIR moves it (issue #526).
+        let scratch = crate::test_support::scratch_dir("boot-upload");
+        let root_dir = scratch.join("root");
+        std::fs::create_dir(&root_dir).unwrap();
+        let root = root_dir.to_string_lossy().into_owned();
+        let uploads = root_dir.join("uploads").to_string_lossy().into_owned();
+        // Its name starts with the root's, and it is not
+        // under the root.
+        let sibling = scratch.join("root-other").to_string_lossy().into_owned();
         // Neither destination: uploads are off, not an error.
         assert!(build_upload_store(env_of(&[]), &plain).unwrap().is_none());
         // Both destinations: a startup error.
         let err = expect_err(build_upload_store(
             env_of(&[
-                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_DIR", uploads.as_str()),
                 ("CRABCROP_UPLOAD_BUCKET", "uploads"),
             ]),
             &plain,
@@ -3139,16 +3324,17 @@ mod tests {
         assert!(err.contains("exactly one upload destination"), "{err}");
         // A local destination constructs with the defaults:
         // 10 MB cap (the source cap), overwrite off.
-        let store = build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", "/tmp")]), &plain)
-            .unwrap()
-            .unwrap();
+        let store =
+            build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", uploads.as_str())]), &plain)
+                .unwrap()
+                .unwrap();
         assert_eq!(store.max_bytes, 10 * 1024 * 1024);
         assert!(!store.allow_overwrite);
         assert!(store.local_dir().is_some());
         // The cap may only move down from the source cap.
         let err = expect_err(build_upload_store(
             env_of(&[
-                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_DIR", uploads.as_str()),
                 ("CRABCROP_UPLOAD_MAX_MB", "11"),
             ]),
             &plain,
@@ -3156,7 +3342,7 @@ mod tests {
         assert!(err.contains("CRABCROP_UPLOAD_MAX_MB"), "{err}");
         let store = build_upload_store(
             env_of(&[
-                ("CRABCROP_UPLOAD_DIR", "/tmp"),
+                ("CRABCROP_UPLOAD_DIR", uploads.as_str()),
                 ("CRABCROP_UPLOAD_MAX_MB", "2"),
                 ("CRABCROP_UPLOAD_ALLOW_OVERWRITE", "true"),
             ]),
@@ -3168,22 +3354,27 @@ mod tests {
         assert!(store.allow_overwrite);
         // A local destination outside a configured file
         // root is refused: its objects could never serve.
-        let rooted = build_source_config(env_of(&[(
-            "CRABCROP_FILE_ROOT",
-            std::env::temp_dir().to_string_lossy().as_ref(),
-        )]))
-        .unwrap();
-        // /tmp IS the temp dir here, so it is under the root.
-        assert!(
-            build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", "/tmp")]), &rooted)
+        let rooted = build_source_config(env_of(&[("CRABCROP_FILE_ROOT", root.as_str())])).unwrap();
+        // The root itself and a directory inside it are under
+        // it, and their objects are named from the root.
+        for (dir, object) in [
+            (root.as_str(), "file:///a.jpg"),
+            (uploads.as_str(), "file:///uploads/a.jpg"),
+        ] {
+            let store = build_upload_store(env_of(&[("CRABCROP_UPLOAD_DIR", dir)]), &rooted)
                 .unwrap()
-                .is_some()
-        );
-        let err = expect_err(build_upload_store(
-            env_of(&[("CRABCROP_UPLOAD_DIR", "/")]),
-            &rooted,
-        ));
-        assert!(err.contains("CRABCROP_FILE_ROOT"), "{err}");
+                .unwrap();
+            assert_eq!(store.source_ref("a.jpg"), object, "{dir}");
+        }
+        // The check compares path components, not strings:
+        // the sibling is refused like `/`.
+        for outside in ["/", sibling.as_str()] {
+            let err = expect_err(build_upload_store(
+                env_of(&[("CRABCROP_UPLOAD_DIR", outside)]),
+                &rooted,
+            ));
+            assert!(err.contains("CRABCROP_FILE_ROOT"), "{outside}: {err}");
+        }
         // A bucket destination with credentials must be in
         // the readable allowlist, or its objects could
         // never serve back.
@@ -3223,8 +3414,10 @@ mod tests {
     fn the_upload_cap_follows_the_source_fetch_cap() {
         const MB: u64 = 1024 * 1024;
         let plain = SourceConfig::default();
+        let scratch = crate::test_support::scratch_dir("boot-upload-cap");
+        let dir = scratch.to_string_lossy().into_owned();
         let upload = |pairs: &[(&str, &str)]| {
-            let mut all = vec![("CRABCROP_UPLOAD_DIR", "/tmp")];
+            let mut all = vec![("CRABCROP_UPLOAD_DIR", dir.as_str())];
             all.extend_from_slice(pairs);
             build_upload_store(env_of(&all), &plain)
         };
@@ -3458,6 +3651,25 @@ mod tests {
             let err = expect_err(timeout(bad));
             assert!(
                 err.contains("CRABCROP_SOURCE_TIMEOUT_SECS"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shutdown_grace_defaults_under_ten_seconds_and_checks_its_range() {
+        // Issue #463: unset, the drain ends before the 10 s
+        // `docker stop` and Cloud Run allow.
+        let grace = shutdown_grace_secs(&env_of(&[])).unwrap();
+        assert_eq!(grace, crate::server::DEFAULT_SHUTDOWN_GRACE_SECS);
+        assert!(grace < 10, "{grace}");
+        let set = |v: &str| shutdown_grace_secs(&env_of(&[("CRABCROP_SHUTDOWN_GRACE_SECS", v)]));
+        assert_eq!(set("1").unwrap(), 1);
+        assert_eq!(set("600").unwrap(), 600);
+        for bad in ["0", "601", "-1", "2.5", "8s", "", "never"] {
+            let err = expect_err(set(bad));
+            assert!(
+                err.contains("CRABCROP_SHUTDOWN_GRACE_SECS"),
                 "{bad:?}: {err}"
             );
         }
@@ -3708,8 +3920,7 @@ mod tests {
         // An executable renderer whose pdfinfo sibling is
         // missing is refused at boot too: the pair is the
         // contract.
-        let dir = std::env::temp_dir().join(format!("crabcrop-boot-pdf-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::scratch_dir("boot-pdf");
         let renderer_path = dir.join("pdftocairo");
         std::fs::write(&renderer_path, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&renderer_path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3730,6 +3941,74 @@ mod tests {
         ]))
         .unwrap();
         assert!(renderer.is_some());
+    }
+
+    /// Issue #526: these construction tests once named
+    /// their files after the process ID alone, and a later
+    /// test process that drew a recycled ID found what an
+    /// earlier one had left: a `pdfinfo` next to the
+    /// renderer, scripts already marked executable. Their
+    /// "missing" and "not executable" refusals then
+    /// constructed. Plant those leftovers under this
+    /// process's ID and run the three tests over them, each
+    /// twice: under a name built from the ID alone, however
+    /// spelled, the second run would meet what the first one
+    /// left.
+    #[cfg(unix)]
+    #[test]
+    fn construction_tests_ignore_files_left_under_a_reused_pid() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let pid = std::process::id();
+        let temp = std::env::temp_dir();
+        let pdf_dir = temp.join(format!("crabcrop-boot-pdf-{pid}"));
+        // Only what this test creates is removed afterwards:
+        // a file already under one of these names is the same
+        // kind of leftover, and not this test's to delete.
+        let made_pdf_dir = std::fs::create_dir(&pdf_dir).is_ok();
+        let mut planted = Vec::new();
+        for path in [
+            pdf_dir.join("pdfinfo"),
+            temp.join(format!("crabcrop-boot-encoder-plain-{pid}.tmp")),
+            temp.join(format!("crabcrop-boot-decoder-plain-{pid}.tmp")),
+        ] {
+            let Ok(mut file) = std::fs::File::create_new(&path) else {
+                continue;
+            };
+            file.write_all(b"#!/bin/sh\n").unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            planted.push(path);
+        }
+        let tests: [(&str, fn()); 3] = [
+            (
+                "pdf_renderer_construction_validates_both_programs",
+                pdf_renderer_construction_validates_both_programs,
+            ),
+            (
+                "video_construction_validates_the_encoder_program",
+                video_construction_validates_the_encoder_program,
+            ),
+            (
+                "video_decoder_construction_validates_the_program",
+                video_decoder_construction_validates_the_program,
+            ),
+        ];
+        let failed: Vec<&str> = tests
+            .into_iter()
+            .filter(|(_, test)| (0..2).any(|_| std::panic::catch_unwind(test).is_err()))
+            .map(|(name, _)| name)
+            .collect();
+        for path in &planted {
+            let _ = std::fs::remove_file(path);
+        }
+        if made_pdf_dir {
+            let _ = std::fs::remove_dir(&pdf_dir);
+        }
+        assert!(
+            failed.is_empty(),
+            "failed over the planted files: {failed:?}"
+        );
     }
 
     #[test]

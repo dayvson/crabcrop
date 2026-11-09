@@ -31,13 +31,16 @@ fi
 step() { printf '\n=== %s ===\n' "$1"; }
 
 step "Workflow mirrors (docs copies match the live workflows)"
-for pair in "changelog.yml changelog-workflow.yml" "functional.yml functional-workflow.yml" "perf.yml perf-workflow.yml" "release.yml release-workflow.yml" "rust.yml rust-workflow.yml"; do
+for pair in "changelog.yml changelog-workflow.yml" "functional.yml functional-workflow.yml" "fuzz.yml fuzz-workflow.yml" "perf.yml perf-workflow.yml" "release.yml release-workflow.yml" "rust.yml rust-workflow.yml"; do
   set -- $pair
   if ! cmp -s ".github/workflows/$1" "docs/$2"; then
     echo "workflow mirror drift: docs/$2 differs from .github/workflows/$1; sync the mirror to the live workflow" >&2
     exit 1
   fi
 done
+
+step "Functional tier (a pull request's diff picks smoke or full)"
+python3 scripts/test_functional_tier.py
 
 step "npm dist-tag (a prerelease publishes under next, never latest)"
 for pair in "0.10.0 latest" "0.10.0-rc.1 next" "1.2.3-beta.2+sha.5 next" "1.2.3+build-7 latest"; do
@@ -76,7 +79,9 @@ python3 scripts/check_versions.py
 python3 scripts/test_version_tools.py
 
 step "Rendering version (a corpus re-baseline since the last release tag raises it)"
-python3 scripts/check_rendering_version.py
+# CI checks out the full history, so there a skip means the checkout
+# lost the tags: --strict fails it instead.
+python3 scripts/check_rendering_version.py ${GITHUB_ACTIONS:+--strict}
 python3 scripts/test_check_rendering_version.py
 
 step "Release scripts (the preflight checks, and creating or updating the GitHub Release)"
@@ -130,6 +135,10 @@ step "Browser bundles (client builds of the integrations: Vite, and a full Nuxt 
 step "WordPress plugin"
 (cd plugins/wordpress && php tests/run.php)
 
+step "One JavaScript grammar (the playground serves the SDK's explainer build, and no second copy exists)"
+python3 scripts/sync_playground_sdk.py --check
+python3 scripts/test_sync_playground_sdk.py
+
 step "Playground (unit)"
 (cd playground && npm test)
 
@@ -161,6 +170,8 @@ done
 (cd playground && npm run test:integration)
 
 step "Fuzz smoke (parser invariants, corpus + mutations)"
-cargo test --locked --manifest-path fuzz/Cargo.toml --lib --test smoke
+# Without the fuzz crate's default avif-decode feature, so the
+# smoke needs no dav1d; the nightly fuzz workflow runs it with.
+cargo test --locked --manifest-path fuzz/Cargo.toml --no-default-features --lib --test smoke
 
 step "All suites passed"
