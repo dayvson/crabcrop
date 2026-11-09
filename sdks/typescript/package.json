@@ -29,7 +29,7 @@
     "test": "node --test && node --conditions=browser --test"
   },
   "type": "module",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "devDependencies": {
     "@types/node": "^26.6.5",
     "typescript": "^7.0.2"
