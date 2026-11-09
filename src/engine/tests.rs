@@ -6240,11 +6240,11 @@ fn animated_webp_fixture_decodes_to_its_frames() {
     let delays: Vec<u64> = frames.iter().map(frame_delay_ms).collect();
     assert_eq!(delays, [100, 200, 300]);
     assert_eq!(
-        frames[0].buffer().get_pixel(0, 0),
+        frames.first.buffer().get_pixel(0, 0),
         &image::Rgba([255, 0, 0, 255])
     );
     assert_eq!(
-        frames[2].buffer().get_pixel(0, 0),
+        frames.rest[1].buffer().get_pixel(0, 0),
         &image::Rgba([0, 0, 255, 255])
     );
 }

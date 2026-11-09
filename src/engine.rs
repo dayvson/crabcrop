@@ -1399,13 +1399,7 @@ impl Engine {
                     return Ok(Decoded::Rendered(Box::new(processed)));
                 }
             }
-            DynamicImage::ImageRgba8(
-                frames
-                    .into_iter()
-                    .next()
-                    .expect("decode_gif_frames returns at least one frame")
-                    .into_buffer(),
-            )
+            DynamicImage::ImageRgba8(frames.first.into_buffer())
         } else if let Some((loop_count, _)) = webp_anim {
             // Animated WebP sources decode frame by frame, like
             // GIFs: an animated output (WebP or GIF) keeps its
@@ -1436,13 +1430,7 @@ impl Engine {
                     return Ok(Decoded::Rendered(Box::new(processed)));
                 }
             }
-            DynamicImage::ImageRgba8(
-                frames
-                    .into_iter()
-                    .next()
-                    .expect("decode_webp_frames returns at least one frame")
-                    .into_buffer(),
-            )
+            DynamicImage::ImageRgba8(frames.first.into_buffer())
         } else if let Some(screened) = &source.svg {
             // Rasterize at the size the request is heading for
             // (or the intrinsic size when it asks for none), so
@@ -1710,7 +1698,7 @@ impl Engine {
     /// always has, and has no quality lever.
     fn process_animated(
         &self,
-        frames: Vec<image::Frame>,
+        frames: Frames,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
         format: ImageFormat,
@@ -1718,13 +1706,9 @@ impl Engine {
     ) -> Result<ProcessedImage, EngineError> {
         let directives = crate::url::RequestDirectives::analyze(ops);
         refuse_animated_ai(&directives)?;
-        let (source_width, source_height) = {
-            let b = frames[0].buffer();
-            (b.width(), b.height())
-        };
-        let first = frames[0].buffer();
+        let (source_width, source_height) = frames.dimensions();
         let cap = if directives.no_upscale {
-            Some((first.width(), first.height()))
+            Some(frames.dimensions())
         } else {
             None
         };
@@ -1881,7 +1865,7 @@ impl Engine {
     /// (see [`crate::video::even_dimension`]).
     fn process_video(
         &self,
-        frames: Vec<image::Frame>,
+        frames: Frames,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
         format: ImageFormat,
@@ -1894,13 +1878,9 @@ impl Engine {
         })?;
         let directives = crate::url::RequestDirectives::analyze(ops);
         refuse_animated_ai(&directives)?;
-        let (source_width, source_height) = {
-            let b = frames[0].buffer();
-            (b.width(), b.height())
-        };
-        let first = frames[0].buffer();
+        let (source_width, source_height) = frames.dimensions();
         let cap = if directives.no_upscale {
-            Some((first.width(), first.height()))
+            Some(frames.dimensions())
         } else {
             None
         };
@@ -1980,13 +1960,13 @@ impl Engine {
 fn collect_frames(
     frames: impl Iterator<Item = Result<image::Frame, image::ImageError>>,
     format: &str,
-) -> Result<Vec<image::Frame>, EngineError> {
-    let mut collected = Vec::new();
+) -> Result<Frames, EngineError> {
+    let mut collected: Option<Frames> = None;
     let mut total_pixels: u64 = 0;
     let mut total_bytes: u64 = 0;
     for frame in frames {
         let frame = frame.map_err(|e| EngineError::Decode(e.to_string()))?;
-        if collected.len() >= MAX_ANIMATED_FRAMES {
+        if collected.as_ref().map_or(0, Frames::len) >= MAX_ANIMATED_FRAMES {
             return Err(EngineError::Decode(format!(
                 "{format} has more than {MAX_ANIMATED_FRAMES} frames"
             )));
@@ -2004,19 +1984,58 @@ fn collect_frames(
                 "{format} frames exceed the {MAX_DECODE_ALLOC} byte decode allocation limit"
             )));
         }
-        collected.push(frame);
+        match &mut collected {
+            None => {
+                collected = Some(Frames {
+                    first: frame,
+                    rest: Vec::new(),
+                })
+            }
+            Some(frames) => frames.rest.push(frame),
+        }
     }
-    if collected.is_empty() {
-        return Err(EngineError::Decode(format!("{format} has no frames")));
+    collected.ok_or_else(|| EngineError::Decode(format!("{format} has no frames")))
+}
+
+/// The frames of an animated source (issue #480): never empty,
+/// so the first frame is always there to read, the one a still
+/// conversion keeps and whose size an animated render starts
+/// from.
+struct Frames {
+    first: image::Frame,
+    rest: Vec<image::Frame>,
+}
+
+impl Frames {
+    fn len(&self) -> usize {
+        1 + self.rest.len()
     }
-    Ok(collected)
+
+    fn iter(&self) -> impl Iterator<Item = &image::Frame> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    /// The first frame's width and height.
+    fn dimensions(&self) -> (u32, u32) {
+        self.first.buffer().dimensions()
+    }
+}
+
+impl IntoIterator for Frames {
+    type Item = image::Frame;
+    type IntoIter =
+        std::iter::Chain<std::iter::Once<image::Frame>, std::vec::IntoIter<image::Frame>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self.first).chain(self.rest)
+    }
 }
 
 /// Decode all frames of a GIF source, under the shared limits:
 /// the decoder gets explicit dimension/allocation limits (its
 /// defaults are none) and collection enforces the shared
 /// frame and pixel budgets (see [`collect_frames`]).
-fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
+fn decode_gif_frames(bytes: &[u8]) -> Result<Frames, EngineError> {
     use image::{AnimationDecoder, ImageDecoder};
     let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
@@ -2107,7 +2126,7 @@ pub(crate) fn animated_output_format(
 /// first (the decoder otherwise leaves the disposed rectangle
 /// in place), so the color is read from the container and set
 /// before iterating.
-fn decode_webp_frames(bytes: &[u8]) -> Result<Vec<image::Frame>, EngineError> {
+fn decode_webp_frames(bytes: &[u8]) -> Result<Frames, EngineError> {
     use image::{AnimationDecoder, ImageDecoder};
     let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
         .map_err(|e| EngineError::Decode(e.to_string()))?;
@@ -3092,7 +3111,7 @@ fn union_box(a: Option<Window>, b: Option<Window>) -> Option<Window> {
 /// the render's own deadline. A lone frame has nothing to
 /// share and trims for itself.
 fn survey_trims(
-    frames: &[image::Frame],
+    frames: &Frames,
     ops: &[Operation],
     cap: Option<(u32, u32)>,
     dpr: f32,
@@ -3116,7 +3135,7 @@ fn survey_trims(
             let key = (op_index, filter_index);
             // The first frame's dimensions and the union so far.
             let mut surveyed: Option<((u32, u32), Option<Window>)> = None;
-            for frame in frames {
+            for frame in frames.iter() {
                 ctx.check_deadline()?;
                 let img = DynamicImage::ImageRgba8(frame.buffer().clone());
                 let mut chain = ChainState::new(ops, cap, dpr, ctx, directives, Some(&mut *share));
