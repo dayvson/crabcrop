@@ -63,11 +63,43 @@ const NESTED_IMAGE_LEVELS: usize = 2;
 mod expansion;
 mod worker;
 
+// Used only by the AVIF worker decode default timeout.
+#[cfg(feature = "avif-decode")]
+pub(crate) use worker::WORKER_TIMEOUT;
 pub use worker::{
     RenderError, WORKER_ARG, WorkerCommand, is_worker_invocation, isolate_in_child, worker_main,
 };
 
 use image::DynamicImage;
+
+/// Decode an AVIF source in the capped worker when SVG work is
+/// isolated (issue #522): the dav1d decode that can spin on a
+/// crafted file (issue #447's hazard, now AVIF's too) runs in
+/// the worker, killed at `deadline`. `None` means no worker is
+/// configured (the library, the fuzz harness, the CLI), so the
+/// caller decodes in process. The limits are the engine's
+/// decode bounds, passed through to the worker.
+pub fn decode_avif_in_worker(
+    bytes: &[u8],
+    max_dimension: u32,
+    max_alloc: u64,
+    deadline: Instant,
+) -> Option<Result<DynamicImage, RenderError>> {
+    worker::configured()
+        .map(|command| worker::run_avif(command, bytes, max_dimension, max_alloc, deadline))
+}
+
+/// [`decode_avif_in_worker`] against a given worker command,
+/// for tests that drive a worker directly.
+pub fn decode_avif_in(
+    command: &WorkerCommand,
+    bytes: &[u8],
+    max_dimension: u32,
+    max_alloc: u64,
+    deadline: Instant,
+) -> Result<DynamicImage, RenderError> {
+    worker::run_avif(command, bytes, max_dimension, max_alloc, deadline)
+}
 use resvg::usvg;
 
 /// Sniff whether `bytes` are an SVG document. The declared

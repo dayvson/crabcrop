@@ -137,6 +137,46 @@ pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, EngineError> {
         .map_err(|e| EngineError::Decode(e.to_string()))
 }
 
+/// Decode an untrusted still source, routing an AVIF through
+/// the capped worker process with a deadline (issue #522): the
+/// dav1d decode can spin forever on a crafted AVIF, so the
+/// worker SVG rendering already uses (issue #447) takes the
+/// spin and the parent kills it at `deadline`. The container is
+/// screened in this process first (the cheap box and item
+/// checks), then the screened bytes are handed to the worker,
+/// which runs the same bounded image-crate decode the
+/// in-process path runs, so a valid file decodes to the same
+/// pixels either way. Non-AVIF sources, and builds or contexts
+/// with no worker (the library, the fuzz harness, the CLI),
+/// decode in process through [`decode_image`]. The server's own
+/// freshly encoded output is re-decoded in process through
+/// [`decode_image`], which keeps the quality search off the
+/// per-decode worker spawn.
+pub(crate) fn decode_source_image(
+    bytes: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> Result<DynamicImage, EngineError> {
+    #[cfg(feature = "avif-decode")]
+    if matches!(image::guess_format(bytes), Ok(image::ImageFormat::Avif)) {
+        let screened = crate::avif::screen(bytes)?;
+        let worker_deadline =
+            deadline.unwrap_or_else(|| std::time::Instant::now() + crate::svg::WORKER_TIMEOUT);
+        if let Some(result) = crate::svg::decode_avif_in_worker(
+            &screened,
+            MAX_DECODE_DIMENSION,
+            MAX_DECODE_ALLOC,
+            worker_deadline,
+        ) {
+            return result.map_err(|e| match e {
+                crate::svg::RenderError::TimedOut(_) if deadline.is_some() => EngineError::Timeout,
+                e => EngineError::Decode(e.to_string()),
+            });
+        }
+    }
+    let _ = deadline;
+    decode_image(bytes)
+}
+
 /// JPEG decode through zune-jpeg directly: the same decoder
 /// the image crate wraps, with the same options the wrapper
 /// uses, minus the wrapper's input copy, header pre-pass, and
@@ -313,7 +353,10 @@ pub(crate) fn prepare_upload(bytes: &[u8]) -> Result<PreparedUpload, EngineError
     if detected == ImageFormat::Jxl {
         check_jxl_dimensions(bytes)?;
     }
-    decode_image(bytes)?;
+    // Upload validation has no request deadline, so an AVIF
+    // upload decodes in the worker under its default timeout
+    // (issue #522); every other still decodes in process.
+    decode_source_image(bytes, None)?;
     // The generic decode accepted the bytes; name what it
     // accepted. The guess mirrors the decoder's own, with
     // JPEG XL (which the image crate does not know) taken
@@ -1470,7 +1513,10 @@ impl Engine {
             if detected == ImageFormat::Jxl {
                 check_jxl_dimensions(bytes)?;
             }
-            let mut img = decode_image(bytes)?;
+            // An AVIF source decodes in the capped worker, killed
+            // at the request deadline (issue #522); every other
+            // still decodes in process.
+            let mut img = decode_source_image(bytes, ctx.deadline)?;
             // Phone photos store rotation in the EXIF orientation
             // tag instead of the pixels. Honor it before any
             // operation, so sizes and crops see the image as the
