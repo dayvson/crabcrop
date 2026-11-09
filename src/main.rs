@@ -143,7 +143,9 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     );
     println!("configuration fingerprint: {}", state.config_fingerprint);
     // Purges recorded in the shared bucket hold here before
-    // the first request (issue #461).
+    // the first request (issue #461). A slow or hanging
+    // store holds the first request, and the listening line,
+    // for 10 s at most (issue #549).
     crate::server::start_purge_tombstones(&state).await;
     let background = state.background.clone();
     let signalled = shutdown_signal();
