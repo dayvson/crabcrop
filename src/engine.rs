@@ -2114,12 +2114,18 @@ enum AnimatedFormat {
 
 impl AnimatedFormat {
     /// The animated format `format` names, or `None` for one
-    /// that cannot keep frames.
+    /// that cannot keep frames. Every format is listed, so a
+    /// new one has to say which it is.
     fn of(format: ImageFormat) -> Option<Self> {
         match format {
             ImageFormat::Gif => Some(AnimatedFormat::Gif),
             ImageFormat::WebP => Some(AnimatedFormat::WebP),
-            _ => None,
+            ImageFormat::Jpeg
+            | ImageFormat::Png
+            | ImageFormat::Jxl
+            | ImageFormat::Avif
+            | ImageFormat::Mp4
+            | ImageFormat::WebM => None,
         }
     }
 }
