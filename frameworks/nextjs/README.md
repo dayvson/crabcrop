@@ -4,7 +4,7 @@ A custom loader for `next/image` that routes every image through your crabcrop d
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (0.9.12 or later, which exports the `MAX_DIMENSION` this file imports).
+1. Install the builder: `npm install @crabcrop/url` (0.10.0 or later, which exports the `MAX_DIMENSION` this file imports).
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project root.
 3. Point Next at it:
 

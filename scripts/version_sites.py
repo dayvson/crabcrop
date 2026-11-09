@@ -157,7 +157,12 @@ def linked(relative):
 
 
 FRAMEWORKS = ("nextjs", "nuxt", "hydrogen", "astro", "sveltekit")
-IMAGE_PIN = r"crabcrop(?:-ai)?:(\d+\.\d+\.\d+)"
+# A guide pins the release as an image (`crabcrop:X.Y.Z`,
+# `crabcrop-ai:X.Y.Z`) or as a chart override (`--set image.tag=X.Y.Z`
+# in the Helm README's own-build snippet). The override was missed for
+# three releases, so that snippet installed a tag it never pushed
+# (issue #565).
+IMAGE_PIN = r"(?:crabcrop(?:-ai)?:|\bimage\.tag=)(\d+\.\d+\.\d+)"
 
 # The first site is the reference: the server's own version is the
 # release version, and every other site must agree with it.

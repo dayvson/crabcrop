@@ -4,7 +4,7 @@ An [Astro image service](https://docs.astro.build/en/reference/image-service-ref
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (0.9.12 or later, which exports the `MAX_DIMENSION` this file imports).
+1. Install the builder: `npm install @crabcrop/url` (0.10.0 or later, which exports the `MAX_DIMENSION` this file imports).
 2. Copy [`crabcrop-service.ts`](crabcrop-service.ts) into your project.
 3. Register it as the image service in `astro.config`:
 

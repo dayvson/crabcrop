@@ -12,6 +12,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Documentation corrections for the upload endpoint in docs/endpoints.md (issue #562). With no upload destination configured, the upload route answers `404 uploads_not_configured`; the endpoint table said the route exists only when uploads are configured. The upload cap defaults to `CRABCROP_SOURCE_MAX_MB` and may not exceed it, where the docs gave 10 MB for both. The response body is the source reference followed by a newline, and the `X-Crabcrop-Source` header carries the reference without it. With a `CRABCROP_FILE_ROOT` above the upload directory, the reference includes the directory's path under the root. The Rust crate mints the expiring upload form with `upload_signature_with_expiry`, not an `expires` argument.
 
+- The five framework READMEs named a minimum `@crabcrop/url` version that was never released. They now ask for 0.10.0 or later, the first release that exports `MAX_DIMENSION` (issue #565). The Helm README's own-build snippet built and pushed `your-registry/crabcrop:0.10.1`, then installed the chart with `--set image.tag=0.9.10`, a tag it never pushed. It now installs the tag it builds, and `scripts/bump_version.py` and `scripts/check_versions.py` cover the `image.tag=` line, so a release moves it with the other image pins.
+
 ## [0.10.1] - 2026-11-09
 
 ### Changed
