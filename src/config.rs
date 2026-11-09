@@ -610,6 +610,13 @@ pub fn build_presets(
 /// it answer `400`.
 const MAX_PRESET_OPERATIONS: usize = crate::url::MAX_OPERATIONS;
 
+/// The longest preset body: the most text one request may
+/// expand to ([`crate::url::MAX_EXPANDED_LEN`]), applied at
+/// boot for the same reason as the operation cap above. A
+/// longer definition would boot fine and make every request
+/// that names it answer `400`.
+const MAX_PRESET_LEN: usize = crate::url::MAX_EXPANDED_LEN;
+
 /// Parse preset definitions: one `name = operations` entry
 /// per line, blank lines and `#` comments skipped. Names are
 /// letters, digits, `_`, and `-`; every operation string must
@@ -647,6 +654,12 @@ pub fn parse_presets(text: &str) -> Result<crate::url::Presets, ConfigError> {
         if count > MAX_PRESET_OPERATIONS {
             return Err(malformed(format!(
                 "preset {name} has {count} operations, over the {MAX_PRESET_OPERATIONS} operation cap"
+            )));
+        }
+        let len = preset.as_str().len();
+        if len > MAX_PRESET_LEN {
+            return Err(malformed(format!(
+                "preset {name} is {len} bytes, over the {MAX_PRESET_LEN} byte cap"
             )));
         }
         map.insert(name.to_string(), preset);

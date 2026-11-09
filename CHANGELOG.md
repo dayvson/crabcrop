@@ -24,7 +24,7 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Security
 
-- Preset expansion is bounded. A request's operations are counted before its `preset:` references expand, each reference by the operations its definition holds (counted once, when the presets load), so a request over the 100-operation cap answers its `400 unsupported_operation` without the expanded operations being built or parsed; the expanded text is also capped at 256 KiB. Requests within both caps expand and render as before. A request whose own operations pass the cap now names their count in the body, without the default operations.
+- Preset expansion is bounded. A request's operations are counted before its `preset:` references expand, each reference by the operations its definition holds (counted once, when the presets load), so a request over the 100-operation cap answers its `400 unsupported_operation` without the expanded operations being built or parsed; the expanded text is also capped at 256 KiB, and a preset definition longer than that refuses the boot. Requests within both caps expand and render as before. A request whose own operations pass the cap now names their count in the body, without the default operations.
 
 ## [0.10.0] - 2026-11-08
 
