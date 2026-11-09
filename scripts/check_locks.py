@@ -4,7 +4,8 @@
 Two rules (issue #552), both read from Cargo.lock and fuzz/Cargo.lock:
 
 1. No decoder in two versions. A crate in DECODERS, which parse request
-   or source-image bytes in the shipped binary, appears once per lockfile.
+   or source-image bytes in the shipped binary, appears once per lockfile:
+   one version from one source.
    A second version means some input reaches a decoder that the tests,
    the fuzzing and the pre-checks do not run: #494's lock refresh left
    oxideav-heif decoding HEVC with oxideav-h265 0.0.15, while the SPS
@@ -20,6 +21,13 @@ Two rules (issue #552), both read from Cargo.lock and fuzz/Cargo.lock:
    carries (libfuzzer-sys and its tree, the root's dev-dependencies) is
    not compared. fuzz/README.md has the refresh recipe.
 
+DECODERS covers the image decoders and the parsers crabcrop's own
+pre-checks share with them (oxideav-h265 for HEIC, roxmltree and
+simplecss for SVG). It leaves out the C2PA manifest reader (c2pa and
+its ASN.1, CBOR and XML tree), which reads a source's provenance but
+decodes no pixels and is not fuzzed; c2pa itself requires der 0.7
+(through pkcs8 0.10) and der 0.8, a split no lock change can remove.
+
 Run from anywhere: python3 scripts/check_locks.py [--root DIR]. CI runs
 it in rust.yml's build job and scripts/test_all.sh runs it with its
 tests (scripts/test_check_locks.py).
@@ -33,8 +41,8 @@ ROOT = Path(__file__).resolve().parent.parent
 LOCKS = ("Cargo.lock", "fuzz/Cargo.lock")
 
 # Crates that parse bytes a request or its source image supplies, by what
-# they decode. A name ending in "-" covers every crate with that prefix,
-# so a new oxideav codec is covered the day it enters the lock.
+# they decode. A name ending in "-" or "_" covers every crate with that
+# prefix, so a new oxideav codec is covered the day it enters the lock.
 DECODERS = {
     # HEIC: the container and every codec it can dispatch to.
     "oxideav-": "HEIC and HEVC",
@@ -53,6 +61,7 @@ DECODERS = {
     "libwebp-sys": "WebP, through libwebp",
     "tiff": "TIFF",
     "jxl": "JPEG XL",
+    "jxl_": "JPEG XL",
     "dav1d": "AVIF, with avif-decode",
     "dav1d-sys": "AVIF, with avif-decode",
     "mp4parse": "the AVIF container, with avif-decode",
@@ -60,6 +69,12 @@ DECODERS = {
     "resvg": "SVG rendering",
     "usvg": "SVG parsing",
     "roxmltree": "SVG XML",
+    # src/svg.rs's expansion pre-check reads a document's CSS with
+    # simplecss before usvg reads it again: both must be one version.
+    "simplecss": "SVG CSS",
+    "svgtypes": "SVG attribute values",
+    "data-url": "SVG data: URLs",
+    "imagesize": "the size of an image an SVG embeds",
     # Metadata and color.
     "kamadak-exif": "EXIF",
     "moxcms": "ICC profiles",
@@ -137,7 +152,7 @@ def compatible_line(version):
 
 def decoder_label(name):
     for key, label in DECODERS.items():
-        if name == key or (key.endswith("-") and name.startswith(key)):
+        if name == key or (key.endswith(("-", "_")) and name.startswith(key)):
             return label
     return None
 
@@ -151,6 +166,15 @@ def check_decoders(lock, found):
         versions = sorted({version for version, _ in found[name]}, key=version_key)
         lines = sorted({compatible_line(v) for v in versions}, key=version_key)
         listed = ", ".join(versions)
+        if len(found[name]) > len(versions):
+            # One version from two sources, such as crates.io and a git
+            # fork: two copies of the decoder all the same.
+            problems.append(
+                f"{lock}: {name} ({label}) is locked from {len(found[name])} sources "
+                f"({', '.join(f'{v} from {s}' for v, s in sorted(found[name]))}), "
+                "and only one may decode input: drop the patch or fork that adds the second"
+            )
+            continue
         if name not in SPLITS:
             if len(versions) > 1:
                 problems.append(

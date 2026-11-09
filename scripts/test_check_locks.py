@@ -125,6 +125,39 @@ class CheckLocks(unittest.TestCase):
             fuzz_packages=[*packages, *FUZZ_ONLY],
         )
 
+    def test_one_version_from_two_sources_fails(self):
+        # A git fork of a decoder at the version crates.io has is a
+        # second copy all the same.
+        fork = "git+https://example.invalid/png?rev=abc#abc"
+        packages = [*ROOT_PACKAGES, ("png", "0.18.1", REGISTRY), ("png", "0.18.1", fork)]
+        self.assert_fails(
+            ["Cargo.lock: png (PNG) is locked from 2 sources (0.18.1 from git+https://example.invalid/png"],
+            root_packages=packages,
+            fuzz_packages=[*packages, *FUZZ_ONLY],
+        )
+
+    def test_the_parsers_the_pre_checks_share_are_decoders(self):
+        # crabcrop's pre-checks parse request bytes with these crates
+        # before a decoder's own copy parses the same bytes again, so a
+        # second version would let a pre-check pass what the decoder
+        # reads differently: oxideav-h265 (src/heic.rs's SPS check ahead
+        # of oxideav-heif), roxmltree and simplecss (src/svg/expansion.rs
+        # ahead of usvg).
+        pre_checks = ["oxideav-h265", "roxmltree", "simplecss"]
+        # Parsers crabcrop calls itself (src/color.rs, src/engine.rs),
+        # jxl's own crates, and the parsers usvg runs on a document.
+        others = ["oxideav-heif", "moxcms", "kamadak-exif", "jxl_transforms", "jxl_simd"]
+        others += ["svgtypes", "data-url", "imagesize"]
+        for name in pre_checks + others:
+            with self.subTest(name=name):
+                self.assertTrue(check_locks.decoder_label(name), f"{name} is not in DECODERS")
+        packages = [*ROOT_PACKAGES, ("simplecss", "0.2.1", REGISTRY), ("simplecss", "0.2.2", REGISTRY)]
+        self.assert_fails(
+            ["simplecss (SVG CSS) is locked at 2 versions (0.2.1, 0.2.2)"],
+            root_packages=packages,
+            fuzz_packages=[*packages, *FUZZ_ONLY],
+        )
+
     def test_a_duplicate_that_decodes_nothing_passes(self):
         packages = [*ROOT_PACKAGES, ("thiserror", "1.0.69", REGISTRY), ("thiserror", "2.0.21", REGISTRY)]
         code, output = self.run_check(root_packages=packages)
