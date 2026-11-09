@@ -1738,7 +1738,7 @@ impl Engine {
             None
         };
         let out = match format {
-            AnimatedFormat::Gif => encode_animated_gif(&frames, ctx)?,
+            AnimatedFormat::Gif => encode_animated_gif(&frames, ctx.deadline)?,
             AnimatedFormat::WebP => encode_animated_webp(
                 &frames,
                 loop_count.unwrap_or(0),
@@ -1893,7 +1893,10 @@ fn render_frames(
 /// of its own (see [`gif_frame_quantized`]) with its delay in
 /// hundredths of a second. GIF output has no quality lever and
 /// keeps the GIF encoder's defaults otherwise, as it always has.
-fn encode_animated_gif(frames: &Frames, ctx: &ProcessContext<'_>) -> Result<Vec<u8>, EngineError> {
+fn encode_animated_gif(
+    frames: &Frames,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>, EngineError> {
     let mut out = Vec::new();
     let (canvas_w, canvas_h) = frames.dimensions();
     let mut enc = gif::Encoder::new(
@@ -1913,7 +1916,7 @@ fn encode_animated_gif(frames: &Frames, ctx: &ProcessContext<'_>) -> Result<Vec<
         // chunked work, so it aborts at the deadline instead of
         // running every frame's quantization first and being
         // noticed only afterwards.
-        ctx.check_deadline()?;
+        state::check_deadline(deadline)?;
         // GIF delays are hundredths of a second; the image
         // crate saturated this conversion at u16::MAX, and so
         // does this.
@@ -2246,11 +2249,7 @@ fn encode_animated_webp(
         // stage: it cannot be interrupted mid-call, and
         // the server side bounds what it can hold (see
         // `run_process` in server/process.rs).
-        if let Some(deadline) = deadline
-            && std::time::Instant::now() >= deadline
-        {
-            return Err(EngineError::Timeout);
-        }
+        state::check_deadline(deadline)?;
         let buffer = frame.buffer();
         if buffer.width() != width || buffer.height() != height {
             return Err(EngineError::Encode(

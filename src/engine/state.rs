@@ -286,11 +286,18 @@ impl ProcessContext<'_> {
     /// Fail with `EngineError::Timeout` when the request's
     /// processing deadline has passed.
     pub fn check_deadline(&self) -> Result<(), EngineError> {
-        if let Some(deadline) = self.deadline
-            && std::time::Instant::now() >= deadline
-        {
-            return Err(EngineError::Timeout);
-        }
-        Ok(())
+        check_deadline(self.deadline)
     }
+}
+
+/// Fail with `EngineError::Timeout` once `deadline` has passed;
+/// `None` (no deadline) never does. For a stage that takes the
+/// deadline alone rather than the whole [`ProcessContext`].
+pub(super) fn check_deadline(deadline: Option<std::time::Instant>) -> Result<(), EngineError> {
+    if let Some(deadline) = deadline
+        && std::time::Instant::now() >= deadline
+    {
+        return Err(EngineError::Timeout);
+    }
+    Ok(())
 }
