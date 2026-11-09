@@ -3305,8 +3305,9 @@ async fn serve_miss(
     // instead of each buffering a whole source first; a miss
     // whose wait for budget runs out sheds like a full gate.
     // Nothing is charged before an origin answers, and an
-    // origin that answers and then stalls holds only what it
-    // has delivered (see `SourceCharge`).
+    // origin that answers and then falls behind, stalling or
+    // trickling, holds only what it has delivered (see
+    // `SourceCharge`).
     let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
     let load_start = Instant::now();
     let mut used_fallback = false;
