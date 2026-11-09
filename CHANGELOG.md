@@ -10,6 +10,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 ### Fixed
 
+- Documentation corrections for the upload endpoint in docs/endpoints.md (issue #562). With no upload destination configured, the upload route answers `404 uploads_not_configured`; the endpoint table said the route exists only when uploads are configured. The upload cap defaults to `CRABCROP_SOURCE_MAX_MB` and may not exceed it, where the docs gave 10 MB for both. The response body is the source reference followed by a newline, and the `X-Crabcrop-Source` header carries the reference without it. With a `CRABCROP_FILE_ROOT` above the upload directory, the reference includes the directory's path under the root. The Rust crate mints the expiring upload form with `upload_signature_with_expiry`, not an `expires` argument.
+
 - On a loaded host, a password-protected PDF and a page past the end of a PDF could answer `502` as not a readable PDF instead of their `400` refusals, and a readable video could fail as having no video stream (issue #566). The PDF and frame tools report these on stderr, and once a tool had exited the server waited only 2 s for its stdout and then 200 ms for its stderr, and went on without whatever had not arrived. It now waits for both until the run's timeout. One case changes: a tool that exits while a process it started still holds its stdout or stderr open used to end 200 ms to 2.2 s after the exit, without that pipe's output. It now runs until the timeout, which kills that process with the tool's process group, and fails as timed out.
 
 ## [0.10.1] - 2026-11-09

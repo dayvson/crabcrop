@@ -188,9 +188,10 @@ pub struct AppState {
     /// and written through in the background, when configured.
     pub shared_store: Option<Arc<crate::s3store::S3Store>>,
     /// Upload destination (issue #168): where signed
-    /// `PUT /upload/...` originals land. `None` means the
-    /// endpoint does not exist on this server (the route is
-    /// never registered, so a PUT is a 404, not a refusal).
+    /// `PUT /upload/...` originals land. `None` means
+    /// uploads are off: the route is still registered, and
+    /// the handler answers `404 uploads_not_configured`
+    /// (issue #467).
     pub upload: Option<Arc<crate::upload::UploadStore>>,
     /// Whether meta mode is enabled (issue #390):
     /// `CRABCROP_META_MODE`, off by default (issue #453). A
@@ -1730,10 +1731,11 @@ async fn purge_source_everywhere(state: &AppState, source: &str) -> usize {
 /// the body validated as. With overwriting off, the
 /// final write is a conditional create, so the 409 the
 /// policy promises holds even against a racing upload.
-/// On success the body of the response is the exact
-/// source reference to embed in transform URLs: `201`
-/// for a new object, `200` when an allowed overwrite
-/// replaced one.
+/// On success the body of the response is the source
+/// reference to embed in transform URLs plus a newline,
+/// and the `X-Crabcrop-Source` header is the exact
+/// reference: `201` for a new object, `200` when an
+/// allowed overwrite replaced one.
 async fn upload_handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
     let accept = req
         .headers()
