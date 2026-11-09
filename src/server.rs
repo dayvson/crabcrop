@@ -629,7 +629,10 @@ fn tier_metrics(state: &AppState) -> String {
 
 /// The `DPR` client hint, when it names one of the settled
 /// factors. Anything else (absent, unparsable, out of set) is
-/// no hint: hints are advisory, never an error.
+/// no hint: hints are advisory, never an error. A factor
+/// that would push the output past its limits steps down
+/// in the engine rather than failing the request (issue
+/// #529).
 fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
     let raw = headers
         .get("Sec-CH-DPR")
@@ -638,7 +641,7 @@ fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
     raw.trim()
         .parse::<f32>()
         .ok()
-        .filter(|f| [1.0, 1.5, 2.0, 3.0].contains(f))
+        .filter(|f| crate::url::DPR_FACTORS.contains(f))
 }
 
 /// The width client hint: the display width the client
@@ -946,6 +949,10 @@ async fn explain_handle(
         source_url: source_url.to_string(),
         source_root: root_ref.map(|r| r.name),
         probe,
+        // The DPR hint is read as the image path reads it, so
+        // the forecast steps a hinted factor down as the image
+        // request does (issue #529).
+        dpr_hint: dpr_hint(&headers),
         source_bytes: fetched.total_bytes.map(|n| n as usize),
         ops,
         merged_ops: merged,
@@ -2326,7 +2333,11 @@ async fn serve(
     // The DPR client hint settles sizing when the URL has no
     // explicit `dpr` directive; the effective factor is part of
     // what the response is, so it joins the cache key whenever
-    // it changes the output.
+    // it changes the output. A hinted factor the output limits
+    // refuse steps down in the engine (issue #529), and that
+    // render is stored under the hinted factor's key: the hint
+    // and the URL settle the step together, so the entry
+    // answers that hint alone and never the hint-less URL's.
     let effective_dpr = directives.dpr.or(dpr_hint).unwrap_or(1.0);
 
     // The quantized width a width hint resolves to, when the

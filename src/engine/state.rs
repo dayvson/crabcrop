@@ -241,7 +241,9 @@ pub struct ProcessContext<'a> {
     /// through this (issue #215).
     pub pdf_renderer: Option<&'a crate::pdf::PdfRenderer>,
     /// DPR fallback from the request's client hint, used when
-    /// the URL carries no explicit `dpr` directive.
+    /// the URL carries no explicit `dpr` directive. Advisory:
+    /// a factor that pushes a size past the output limits
+    /// steps down to the largest one that fits (issue #529).
     pub dpr: Option<f32>,
     /// SSIMULACRA2 target for verified `quality(auto)` encodes,
     /// from `CRABCROP_SSIM_TARGET`.
