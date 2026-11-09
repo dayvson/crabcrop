@@ -4662,10 +4662,17 @@ fn detect_format(bytes: &[u8]) -> ImageFormat {
 /// JPEG XL detection: the bare codestream signature, or the first
 /// bytes of the ISO BMFF container signature.
 fn is_jxl(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xFF, 0x0A])
+    is_jxl_codestream(bytes)
         || bytes.starts_with(&[
             0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
         ])
+}
+
+/// Whether `bytes` are a bare JPEG XL codestream (the form the
+/// encoder writes) rather than the box container. Only the
+/// container has boxes for metadata, a C2PA manifest among them.
+pub(crate) fn is_jxl_codestream(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0x0A])
 }
 
 /// Whether `bytes` carry a HEIC/HEIF file type box: an ISO-BMFF

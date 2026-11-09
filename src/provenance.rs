@@ -21,6 +21,11 @@
 //!   list signs fine and validates, but public verifiers show
 //!   the output as valid-not-trusted; that is the operator's
 //!   choice to make, stated plainly in the README.
+//! - Verification here checks signatures, not trust lists
+//!   (issue #564): the reader loads no trust anchors, so a
+//!   manifest reads `valid` or `invalid`, never `trusted`,
+//!   whoever issued its certificate. Trust is for outside
+//!   verifiers to judge.
 //!
 //! Every contact with the `c2pa` crate lives in this
 //! module: the crate is pre-1.0 with breaking release
@@ -241,7 +246,9 @@ const SELF_TEST_PNG: &[u8] = &[
 /// responses report it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManifestSummary {
-    /// Validation state: `valid`, `trusted`, or `invalid`.
+    /// Validation state: `valid` or `invalid`. Signatures
+    /// and hashes are checked, trust lists are not, so
+    /// `trusted` is never reported (see [`read_manifest`]).
     pub state: &'static str,
     /// The active manifest's signer, as a validator would
     /// show it: the certificate's common name, or its
@@ -272,54 +279,76 @@ pub struct ProvenanceFacts {
 /// back with state `invalid`, never as absent. `format` is
 /// a MIME type hint: the reader detects the container from
 /// the bytes first and uses the hint only as a fallback.
+///
+/// The reader checks signatures and hashes, not trust
+/// lists: its context loads no trust anchors (the SDK's
+/// defaults carry none outside its own tests), so an
+/// intact manifest reads `valid` whoever issued its
+/// certificate.
 pub fn read_manifest(bytes: &[u8], format: &str) -> Option<ManifestSummary> {
     let mut cursor = Cursor::new(bytes);
     let reader = Reader::from_context(Context::new())
         .with_stream(format, &mut cursor)
         .ok()?;
+    Some(summarize(&reader))
+}
+
+/// The summary of the store `reader` read.
+fn summarize(reader: &Reader) -> ManifestSummary {
+    // With no trust anchors the SDK never reaches Trusted
+    // (an untrusted signer is tolerated and reads Valid),
+    // and a reader that did reach it would still be making
+    // a trust claim meta does not make (issue #564): meta
+    // reports whether a manifest validates, and nothing
+    // about the trust list.
     let state = match reader.validation_state() {
-        ValidationState::Valid => "valid",
-        ValidationState::Trusted => "trusted",
+        ValidationState::Valid | ValidationState::Trusted => "valid",
         ValidationState::Invalid => "invalid",
     };
     let active = reader.active_manifest();
     let signer = active
         .and_then(|m| m.signature_info())
         .and_then(|info| info.common_name.clone().or_else(|| info.issuer.clone()));
-    Some(ManifestSummary {
+    ManifestSummary {
         state,
         signer,
         manifests: reader.manifests().len(),
         ingredients: active.map(|m| m.ingredients().len()).unwrap_or(0),
-    })
+    }
 }
 
-/// Best-effort container sniff for reader and ingredient
-/// format hints. Content detection in the SDK does the
-/// real work; this only gives it a sensible fallback.
+/// The media type of an asset, for reader and ingredient
+/// format hints. An image is named by the engine's own
+/// sniff ([`crate::engine::sniff_content_type`]), so
+/// every source the engine decodes as an image is named as
+/// that image here too, with one detector for both (issue
+/// #564: this module's own sniff missed the JPEG XL
+/// container, most HEIF brands, SVG, TIFF, BMP and ICO).
+/// Any other ISO BMFF file is a video container, since the
+/// engine's sniff claims every still brand it reads, and
+/// anything else (a PDF, a Matroska video) is
+/// `application/octet-stream`. Content detection in the SDK
+/// does the real work when reading; this gives it a
+/// sensible fallback and decides which sources are
+/// ingredients (see [`is_image`]).
 pub fn sniff_format(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        "image/jpeg"
-    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        "image/png"
-    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        "image/webp"
+    if let Some(mime) = crate::engine::sniff_content_type(bytes) {
+        mime
     } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-        let brand = &bytes[8..12];
-        if brand == b"avif" || brand == b"avis" {
-            "image/avif"
-        } else if brand == b"heic" || brand == b"heix" {
-            "image/heic"
-        } else {
-            "video/mp4"
-        }
-    } else if bytes.starts_with(b"GIF8") {
-        "image/gif"
-    } else if bytes.starts_with(&[0xff, 0x0a]) || bytes.starts_with(b"\x00\x00\x00\x0c jxl") {
-        "image/jxl"
+        "video/mp4"
     } else {
         "application/octet-stream"
     }
+}
+
+/// Whether a [`sniff_format`] type names an image, still
+/// or animated: a source the output is transformed from,
+/// which signing records as the output's parent
+/// ingredient. The others are video and PDF sources, whose
+/// output is a frame or a page rendered from them and
+/// starts a fresh chain.
+pub fn is_image(mime: &str) -> bool {
+    mime.starts_with("image/")
 }
 
 /// Whether WebP bytes are an animated image (the VP8X
@@ -382,14 +411,14 @@ impl std::fmt::Debug for ProvenanceSigner {
 
 /// What one signing pass records.
 pub struct SignRequest<'a> {
-    /// The source asset, recorded as a parent
-    /// ingredient: its bytes are hashed into the output's
-    /// manifest, and when the source carries a manifest
-    /// store of its own, that store rides along so the
-    /// chain stays walkable. `None` when the source is
-    /// not an asset an ingredient can be taken from (a
-    /// video or PDF source, whose still was rendered
-    /// rather than transformed).
+    /// The source asset and its media type, recorded as a
+    /// parent ingredient: the ingredient names the source
+    /// by its format, and when the source carries a
+    /// manifest store of its own, that store rides along so
+    /// the chain stays walkable. `None` when the source is
+    /// not an image (see [`is_image`]): a video
+    /// or PDF source, whose still was rendered rather than
+    /// transformed.
     pub ingredient: Option<(&'a [u8], &'a str)>,
     /// The request ran an AI edit (removebg, studio,
     /// remove_region, upscale, class edits): the output's
@@ -576,13 +605,31 @@ impl ProvenanceSigner {
         if let Some((source_bytes, source_format)) = request.ingredient {
             let ingredient = serde_json::json!({
                 "title": "source",
+                "format": source_format,
                 "relationship": "parentOf",
                 "label": "source",
             })
             .to_string();
+            // The SDK reads the source for a manifest store
+            // as the type it is handed. A bare JPEG XL
+            // codestream has no box a manifest could live
+            // in, and the SDK's JPEG XL reader refuses one
+            // outright instead of finding no manifest, which
+            // failed the whole signing pass (issue #564). So
+            // it is handed over as a type no SDK reader
+            // claims, which is how a BMP or ICO source (no
+            // reader at all) goes in: nothing is read from
+            // it, and the ingredient still names its format
+            // from the definition above.
+            let read_as =
+                if source_format == "image/jxl" && crate::engine::is_jxl_codestream(source_bytes) {
+                    "application/octet-stream"
+                } else {
+                    source_format
+                };
             let mut cursor = Cursor::new(source_bytes);
             builder
-                .add_ingredient_from_stream(ingredient, source_format, &mut cursor)
+                .add_ingredient_from_stream(ingredient, read_as, &mut cursor)
                 .map_err(failed)?;
             builder
                 .add_action(serde_json::json!({
@@ -591,11 +638,12 @@ impl ProvenanceSigner {
                 }))
                 .map_err(failed)?;
         } else {
-            // No ingredient to open (the source was a
-            // video or a PDF, whose still this output was
-            // rendered from): the chain starts here, with
-            // the software-image source type. A created
-            // action must carry a digital source type (the
+            // No ingredient to open: the source was a video
+            // or a PDF, whose frame or page this output was
+            // rendered from (every image source is an
+            // ingredient). The chain starts here, with the
+            // software-image source type. A created action
+            // must carry a digital source type (the
             // post-sign validation enforces that too).
             builder
                 .add_action(serde_json::json!({
@@ -685,6 +733,9 @@ pub(crate) fn manifest_json(bytes: &[u8], format: &str) -> String {
         .map(|r| r.json())
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod state_tests;
 
 #[cfg(test)]
 mod tests {

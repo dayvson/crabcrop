@@ -1048,9 +1048,10 @@ fn manifest_json(summary: &crate::provenance::ManifestSummary) -> ManifestJson {
 /// embedded credentials, the same class as the tags,
 /// so a sealed request reports them too (never
 /// operation or source text). A valid credential
-/// proves origin, not untouched pixels: the states say
-/// exactly which of valid, trusted, or invalid each
-/// manifest earned.
+/// proves origin, not untouched pixels: the state says
+/// whether each manifest is valid or invalid. Meta
+/// checks signatures, not trust lists, so it never
+/// reports a manifest as trusted (issue #564).
 #[derive(serde::Serialize)]
 struct ProvenanceJson {
     signing_configured: bool,

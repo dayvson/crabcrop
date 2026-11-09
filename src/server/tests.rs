@@ -9855,6 +9855,220 @@ async fn signing_server_signs_image_responses() {
     assert!(meta["provenance"]["source"].is_null());
 }
 
+/// The orientation HEIC fixture with its major brand
+/// rewritten to `mif1`, a generic HEIF brand the engine
+/// decodes as HEIC like `heic` (issue #564). Its
+/// compatible brands still list `heic`.
+fn mif1_heic() -> Vec<u8> {
+    let mut heic = include_bytes!("../../tests/fixtures/orient6.heic").to_vec();
+    assert_eq!(&heic[4..12], b"ftypheic");
+    heic[8..12].copy_from_slice(b"mif1");
+    heic
+}
+
+/// A JPEG XL still as a bare codestream, the form the
+/// engine writes.
+fn bare_jxl() -> Vec<u8> {
+    use crate::url::{Filter, FormatSpec, Operation};
+    let jxl = Engine
+        .process(
+            &test_png(),
+            &[Operation::Filters(vec![Filter::Format(FormatSpec::plain(
+                ImageFormat::Jxl,
+            ))])],
+        )
+        .unwrap()
+        .bytes;
+    assert!(jxl.starts_with(&[0xFF, 0x0A]));
+    jxl
+}
+
+/// The same still in the JPEG XL box container: the
+/// signature box, an `ftyp` box, and the codestream in a
+/// `jxlc` box. The container is the only JPEG XL form that
+/// can carry a C2PA manifest.
+fn container_jxl() -> Vec<u8> {
+    let codestream = bare_jxl();
+    let mut jxl = vec![
+        0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
+    ];
+    jxl.extend_from_slice(&20u32.to_be_bytes());
+    jxl.extend_from_slice(b"ftypjxl \0\0\0\0jxl ");
+    jxl.extend_from_slice(&(8 + codestream.len() as u32).to_be_bytes());
+    jxl.extend_from_slice(b"jxlc");
+    jxl.extend_from_slice(&codestream);
+    jxl
+}
+
+/// A 16x16 still in one of the image crate's formats
+/// (RGBA: the ICO decoder refuses an embedded RGB PNG).
+fn encoded_still(format: image::ImageFormat) -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    DynamicImage::new_rgba8(16, 16)
+        .write_to(&mut buf, format)
+        .unwrap();
+    buf.into_inner()
+}
+
+/// The output half of the provenance a signing server's
+/// meta document reports for `source` rendered to PNG, a
+/// signed format whatever the source's own is.
+async fn signed_png_provenance(name: &str, source: Vec<u8>) -> serde_json::Value {
+    let base = spawn_app_with_signer().await;
+    let src = spawn_bytes_server(source).await;
+    let remainder = format!("40x24/filters:format(png)/{src}");
+    let resp = client()
+        .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "{name}: {body}");
+    let meta: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(meta["format"], "png", "{name}");
+    let output = meta["provenance"]["output"].clone();
+    assert_eq!(output["state"], "valid", "{name}: {output}");
+    output
+}
+
+#[tokio::test]
+async fn a_mif1_heic_source_is_the_signed_outputs_parent_ingredient() {
+    // Issue #564: the engine decodes every HEIF brand its
+    // HEIC sniff accepts, but the provenance sniff knew
+    // only `heic` and `heix` and took a `mif1` file for a
+    // video, so its output was signed as a fresh image
+    // with no parent.
+    let output = signed_png_provenance("mif1 heic", mif1_heic()).await;
+    assert_eq!(output["ingredients"], 1, "{output}");
+}
+
+#[tokio::test]
+async fn a_container_jxl_source_is_the_signed_outputs_parent_ingredient() {
+    // Issue #564: the provenance sniff checked a misspelled
+    // container signature, so a JPEG XL in its box
+    // container had no parent ingredient.
+    let output = signed_png_provenance("container jxl", container_jxl()).await;
+    assert_eq!(output["ingredients"], 1, "{output}");
+}
+
+#[tokio::test]
+async fn a_signed_container_jxl_sources_store_rides_into_the_output() {
+    // The container is the JPEG XL form that carries a
+    // manifest, and it was the one whose store was dropped
+    // (issue #564): now the source's own manifest rides
+    // into the output's store.
+    let signed_source = crate::provenance::test_signer()
+        .sign(
+            &container_jxl(),
+            "image/jxl",
+            &crate::provenance::SignRequest {
+                ingredient: None,
+                ai_edited: false,
+            },
+        )
+        .unwrap();
+    let output = signed_png_provenance("signed container jxl", signed_source).await;
+    assert_eq!(output["manifests"], 2, "the source's store rides: {output}");
+    assert_eq!(output["ingredients"], 1, "{output}");
+}
+
+#[tokio::test]
+async fn every_image_source_is_the_signed_outputs_parent_ingredient() {
+    // Issue #564: SVG, TIFF, BMP and ICO sources sniffed as
+    // application/octet-stream and were signed with no
+    // parent. A bare JPEG XL codestream, the form the
+    // engine writes, failed the request with 500 instead:
+    // the SDK's JPEG XL reader refuses a bare codestream
+    // outright. Each is now the parent ingredient; the
+    // SVG, TIFF and container JPEG XL readers would carry a
+    // manifest along, and the others cannot hold one.
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"><rect width="100" height="60" fill="#00ff00"/></svg>"##;
+    for (name, source) in [
+        ("svg", svg.to_vec()),
+        ("tiff", encoded_still(image::ImageFormat::Tiff)),
+        ("bmp", encoded_still(image::ImageFormat::Bmp)),
+        ("ico", encoded_still(image::ImageFormat::Ico)),
+        ("bare jxl", bare_jxl()),
+    ] {
+        let output = signed_png_provenance(name, source).await;
+        assert_eq!(output["ingredients"], 1, "{name}: {output}");
+    }
+}
+
+#[test]
+fn video_and_pdf_sources_start_a_fresh_chain() {
+    // The two sources that are not ingredients: the output
+    // is a frame or a page rendered from them, so its
+    // manifest opens with a created action and names no
+    // parent (issue #564 kept this boundary).
+    let job = provenance_job(Some(crate::provenance::test_signer()), false);
+    for (name, source) in [
+        (
+            "mp4",
+            b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp41".to_vec(),
+        ),
+        ("pdf", b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec()),
+    ] {
+        let mut processed = still_processed(test_png(), ImageFormat::Png);
+        apply_provenance(&job, &source, &mut processed).unwrap();
+        let output = processed.provenance.unwrap().output.expect("signed");
+        assert_eq!(output.ingredients, 0, "{name}");
+        let json = crate::provenance::manifest_json(&processed.bytes, "image/png");
+        assert!(json.contains("c2pa.created"), "{name}: {json}");
+    }
+}
+
+#[test]
+fn hostile_sources_in_the_newly_read_formats_do_not_take_the_job_down() {
+    // Issue #564 hands more source formats to the SDK's
+    // readers as ingredients. Malformed ones (truncated,
+    // with box and directory sizes past the end) either
+    // sign or fail the signing step; none panics or hangs.
+    let mut cut_heic = mif1_heic();
+    cut_heic.truncate(64);
+    let mut huge_box_jxl = container_jxl();
+    huge_box_jxl[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut cut_jxl = container_jxl();
+    cut_jxl.truncate(40);
+    let mut far_ifd_tiff = encoded_still(image::ImageFormat::Tiff);
+    far_ifd_tiff[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    let mut cut_tiff = encoded_still(image::ImageFormat::Tiff);
+    cut_tiff.truncate(12);
+    let mut cut_bmp = encoded_still(image::ImageFormat::Bmp);
+    cut_bmp.truncate(20);
+    let mut cut_ico = encoded_still(image::ImageFormat::Ico);
+    cut_ico.truncate(10);
+    let sources: [(&str, Vec<u8>); 9] = [
+        ("cut heic", cut_heic),
+        ("jxl box past the end", huge_box_jxl),
+        ("cut jxl", cut_jxl),
+        ("tiff directory past the end", far_ifd_tiff),
+        ("cut tiff", cut_tiff),
+        ("cut bmp", cut_bmp),
+        ("cut ico", cut_ico),
+        (
+            "unclosed svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"><metadata><c2pa:manifest>".to_vec(),
+        ),
+        ("cut codestream", vec![0xFF, 0x0A]),
+    ];
+    let job = provenance_job(Some(crate::provenance::test_signer()), false);
+    for (name, source) in sources {
+        let started = std::time::Instant::now();
+        let mut processed = still_processed(test_png(), ImageFormat::Png);
+        let result = apply_provenance(&job, &source, &mut processed);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{name}: {result:?}"
+        );
+        if let Err(e) = result {
+            assert!(matches!(e, EngineError::Encode(_)), "{name}: {e:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn processing_gate_bounds_concurrency() {
     // A state whose single process permit the test holds:

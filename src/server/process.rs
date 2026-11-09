@@ -724,17 +724,16 @@ pub(in crate::server) fn apply_provenance(
             && crate::provenance::webp_is_animated(&processed.bytes);
         if let (Some(mime), false) = (mime, animated_webp) {
             // The source asset rides as a parent
-            // ingredient whenever it is an image asset,
-            // manifest or not: the ingredient records its
-            // hash, and its manifest store when it has
-            // one. Video and PDF sources are not
-            // ingredient-shaped; their outputs start a
-            // fresh chain (see provenance::sign).
-            let ingredient = match source_format {
-                "image/jpeg" | "image/png" | "image/webp" | "image/avif" | "image/heic"
-                | "image/gif" | "image/jxl" => Some((source_bytes, source_format)),
-                _ => None,
-            };
+            // ingredient whenever it is an image (any
+            // format the engine's sniff names, which is the
+            // sniff it decodes by), manifest or not: the
+            // ingredient names its format, and carries its
+            // manifest store when it has one. Video and PDF
+            // sources are the only others: the output is a
+            // frame or page rendered from them, and starts
+            // a fresh chain (see provenance::sign).
+            let ingredient =
+                crate::provenance::is_image(source_format).then_some((source_bytes, source_format));
             let request = crate::provenance::SignRequest {
                 ingredient,
                 ai_edited: job.ai_edited,
