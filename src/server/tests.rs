@@ -9043,6 +9043,73 @@ async fn over_cap_counts_the_default_operations_before_any_fetch() {
     let resp = get_signed(&base, &own_format).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+    // A URL whose own operations already pass the cap is
+    // refused while its presets expand, before the defaults
+    // merge: the count names the URL's own operations.
+    let own_over = format!("{}/{src}", vec!["filters:invert"; 101].join("/"));
+    let fetched = hits.load(Ordering::SeqCst);
+    for route in ["", "explain/"] {
+        let (status, body) = get_signed_json(&base, route, &own_over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 101 operations, over the 100 operation limit",
+            "{route}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), fetched);
+}
+
+#[tokio::test]
+async fn repeated_preset_references_are_refused_before_expanding() {
+    // A short URL that repeats a long preset used to expand
+    // in full, then parse every operation it expanded to,
+    // before the cap refused it: 7,000 references to a
+    // 100-operation preset of 5x5 convolutions built and
+    // parsed 700,000 operations (about 80 MB of text) per
+    // request. Expansion now counts each reference by the
+    // count settled when the presets loaded and refuses
+    // before building anything, on the image and explain
+    // routes alike, with the same answer as before.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let kernel = format!("convolution({},1)", vec!["0.5"; 25].join(","));
+    let presets: crate::url::Presets = [
+        (
+            "c".to_string(),
+            format!("filters:{}", vec![kernel; 100].join(":"))
+                .parse()
+                .unwrap(),
+        ),
+        ("small".to_string(), "30x20".parse().unwrap()),
+    ]
+    .into_iter()
+    .collect();
+    let base = spawn_app_with_presets(presets, true).await;
+    let remainder = format!("{}{src}", "preset:c/".repeat(7_000));
+    for route in ["", "explain/"] {
+        let started = std::time::Instant::now();
+        let (status, body) = get_signed_json(&base, route, &remainder).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "/{route}");
+        assert_eq!(body["error"]["code"], "unsupported_operation", "/{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 700000 operations, over the 100 operation limit",
+            "/{route}"
+        );
+        // The refusal costs a pass over the URL's own text;
+        // expanding and parsing it took seconds.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "/{route} took {elapsed:?}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // A realistic reference still renders, and the
+    // 100-operation preset alone is within the cap.
+    let resp = get_signed(&base, &format!("preset:small/{src}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (status, body) = get_signed_json(&base, "explain/", &format!("preset:c/{src}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

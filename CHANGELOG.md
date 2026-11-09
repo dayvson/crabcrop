@@ -22,6 +22,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Test and CI reliability. A failed check in the disk-read test that blocks on a FIFO no longer hangs the suite: the test lets the held read go on every exit path and puts a deadline on each request and on the wait for the read, and every job in `rust.yml` and `functional.yml` has a `timeout-minutes` (issue #543).
 
+### Security
+
+- Preset expansion is bounded. A request's operations are counted before its `preset:` references expand, each reference by the operations its definition holds (counted once, when the presets load), so a request over the 100-operation cap answers its `400 unsupported_operation` without the expanded operations being built or parsed; the expanded text is also capped at 256 KiB. Requests within both caps expand and render as before. A request whose own operations pass the cap now names their count in the body, without the default operations.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added

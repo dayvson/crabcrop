@@ -127,8 +127,14 @@ pub enum ParseError {
     /// The operation list a request would execute, after
     /// preset expansion and with the server-wide defaults
     /// merged in, runs past [`MAX_OPERATIONS`] (see
-    /// [`check_operation_count`]). Carries the count.
+    /// [`check_operation_count`]), or the remainder's own
+    /// operations already do, counted before its presets
+    /// expand (see [`expand_presets`]). Carries the count.
     TooManyOperations(usize),
+    /// The remainder's preset references would expand past
+    /// [`MAX_EXPANDED_LEN`] bytes (see [`expand_presets`]).
+    /// Carries the expanded length.
+    ExpansionTooLong(usize),
 }
 
 impl ParseError {
@@ -167,6 +173,9 @@ impl ParseError {
             // time (issue #469): moving it earlier changed
             // when the 400 answers, not what it says.
             ParseError::TooManyOperations(_) => "unsupported_operation",
+            // An over-long expansion is refused for the same
+            // reason as an over-long chain, under the same code.
+            ParseError::ExpansionTooLong(_) => "unsupported_operation",
         }
     }
 }
@@ -219,6 +228,10 @@ impl std::fmt::Display for ParseError {
             ParseError::TooManyOperations(count) => write!(
                 f,
                 "request has {count} operations, over the {MAX_OPERATIONS} operation limit"
+            ),
+            ParseError::ExpansionTooLong(len) => write!(
+                f,
+                "request expands to {len} bytes, over the {MAX_EXPANDED_LEN} byte limit"
             ),
         }
     }
@@ -2111,7 +2124,9 @@ pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError
 /// [`parse_preset_operations`] validates it, and the number
 /// of operations it adds to a request that references it,
 /// counted the way [`operation_count`] counts a request.
-/// Both are settled once, when the presets load.
+/// Both are settled once, when the presets load, so
+/// [`expand_presets`] counts a reference with a lookup
+/// instead of a parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preset {
     text: String,
@@ -2336,21 +2351,42 @@ pub fn parse_default_ops(text: &str, presets: &Presets) -> Result<Vec<Operation>
 /// The walk stops expanding at the first segment that starts
 /// the source URL, using the same dispatch as
 /// [`parse_operations_with_expiry`]: a `preset:` segment inside
-/// the source path is URL text, not a reference. Expansion is
-/// single-pass: spliced text is not rescanned (and configured
-/// presets cannot contain `preset:` segments anyway; see
-/// [`parse_preset_operations`]).
+/// the source path is URL text, not a reference. Expansion
+/// does not recurse: spliced text is not rescanned (and
+/// configured presets cannot contain `preset:` segments
+/// anyway; see [`parse_preset_operations`]).
 ///
 /// With `only_presets`, any real operation segment in the
 /// request is an error: the operations must all arrive via
 /// presets. `exp:` and `maxage:` metadata stay allowed; neither
 /// is an operation.
+///
+/// The expansion is counted before it is built. A first walk
+/// adds up the operations each segment brings (a reference
+/// adds its preset's count, settled when the presets loaded)
+/// and the length of the text it would write, without copying
+/// anything. A remainder over [`MAX_OPERATIONS`] is refused
+/// with [`ParseError::TooManyOperations`], the refusal the
+/// parsed list would get (the server merges its default
+/// operations in later, which only ever adds to the count),
+/// and one over [`MAX_EXPANDED_LEN`] with
+/// [`ParseError::ExpansionTooLong`]. Only a remainder within
+/// both is built, so a short URL that repeats a long preset
+/// costs one pass over its own text, not the text its
+/// references would expand to. The walk still reads to the
+/// end of the operations, so an unknown preset or a
+/// presets-only refusal anywhere in them wins over the count,
+/// as it did when the count followed the expansion.
 pub fn expand_presets(
     rest: &str,
     presets: &Presets,
     only_presets: bool,
 ) -> Result<String, ParseError> {
-    let mut out = String::with_capacity(rest.len());
+    let mut operations: usize = 0;
+    let mut len: usize = 0;
+    // The length of the tail that starts the source, copied
+    // verbatim; `None` when the remainder is operations only.
+    let mut source_len = None;
     let mut tail = rest;
     loop {
         let (seg, remaining) = match tail.split_once('/') {
@@ -2361,29 +2397,74 @@ pub fn expand_presets(
             let preset = presets
                 .get(name)
                 .ok_or_else(|| ParseError::UnknownPreset(name.to_string()))?;
-            out.push_str(&preset.text);
-        } else if seg.starts_with("exp:")
-            || seg.starts_with("maxage:")
-            || parse_operation(seg).is_some_and(|r| r.is_ok())
-        {
-            if only_presets && !seg.starts_with("exp:") && !seg.starts_with("maxage:") {
+            operations = operations.saturating_add(preset.operations);
+            len = len.saturating_add(preset.text.len());
+        } else if seg.starts_with("exp:") || seg.starts_with("maxage:") {
+            len = len.saturating_add(seg.len());
+        } else if let Some(Ok(op)) = parse_operation(seg) {
+            if only_presets {
                 return Err(ParseError::PresetsOnly(seg.to_string()));
             }
-            out.push_str(seg);
+            operations = operations.saturating_add(operation_count(std::slice::from_ref(&op)));
+            len = len.saturating_add(seg.len());
         } else {
             // Source URL (or a malformed operation, whose error
-            // the real parse will produce): copy the rest of
-            // the path verbatim and stop.
-            out.push_str(tail);
-            return Ok(out);
+            // the real parse will produce): the rest of the
+            // path is copied verbatim.
+            len = len.saturating_add(tail.len());
+            source_len = Some(tail.len());
+            break;
         }
         if remaining.is_empty() {
-            return Ok(out);
+            break;
+        }
+        len = len.saturating_add(1);
+        tail = remaining;
+    }
+    if operations > MAX_OPERATIONS {
+        return Err(ParseError::TooManyOperations(operations));
+    }
+    if len > MAX_EXPANDED_LEN {
+        return Err(ParseError::ExpansionTooLong(len));
+    }
+    // The same walk again, now writing: every segment before
+    // the source is a known preset reference or text the
+    // first walk accepted as it stands.
+    let mut out = String::with_capacity(len);
+    let mut tail = rest;
+    loop {
+        if Some(tail.len()) == source_len {
+            out.push_str(tail);
+            break;
+        }
+        let (seg, remaining) = match tail.split_once('/') {
+            Some((s, r)) => (s, r),
+            None => (tail, ""),
+        };
+        match seg
+            .strip_prefix("preset:")
+            .and_then(|name| presets.get(name))
+        {
+            Some(preset) => out.push_str(&preset.text),
+            None => out.push_str(seg),
+        }
+        if remaining.is_empty() {
+            break;
         }
         out.push('/');
         tail = remaining;
     }
+    Ok(out)
 }
+
+/// The longest text [`expand_presets`] writes for one
+/// remainder: 256 KiB, four times the longest request target
+/// the HTTP layer accepts (64 KiB). Within the operation cap a
+/// realistic expansion is a few hundred bytes, and even a
+/// 100-operation preset of 5x5 convolutions is about 12 KB;
+/// the cap bounds what preset references can add when the
+/// definitions themselves are long.
+pub const MAX_EXPANDED_LEN: usize = 256 * 1024;
 
 /// A source root reference as written in a URL: the root
 /// name and the path after it, exactly as presented. The
@@ -3525,6 +3606,13 @@ mod tests {
             assert!(seen.insert(err.code()), "codes must be unique");
         }
         assert_eq!(seen.len(), cases.len());
+        // The one shared code: an expansion past its length
+        // cap is refused as the request over the operation cap
+        // is, so the set stays frozen.
+        assert_eq!(
+            ParseError::ExpansionTooLong(MAX_EXPANDED_LEN + 1).code(),
+            "unsupported_operation"
+        );
     }
 
     #[test]
