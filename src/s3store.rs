@@ -3083,13 +3083,20 @@ mod tests {
             .await
             .unwrap();
         *fake.name_hold.reads.lock().unwrap() = Some("cache/purges/".into());
+        // Both go once the first read reaches the store, so
+        // every read of them answers 404, held or not.
         let collect = async {
+            let waiting = Instant::now();
             while fake
                 .name_hold
                 .held
                 .load(std::sync::atomic::Ordering::SeqCst)
-                < 2
+                == 0
             {
+                assert!(
+                    waiting.elapsed() < Duration::from_secs(30),
+                    "no tombstone read reached the store"
+                );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert!(a.delete_object(&known).await);
