@@ -1,11 +1,9 @@
 //! AVIF decoding in the capped worker process (issue #522),
-//! end to end. The dav1d decode can loop forever on a crafted
-//! AVIF; before, that loop ran on a render thread and a few
-//! such requests exhausted the render lanes behind their
-//! deadlines. Now each AVIF decodes in a worker the server
-//! spawns from its own binary, killed at the request's
-//! deadline, so a decode that never finishes costs one worker
-//! and one response while the server carries on. A valid file
+//! end to end. Each AVIF source decodes in a worker the server
+//! spawns from its own binary, under the worker's caps and
+//! killed at the request's deadline, so a decode still running
+//! then costs one worker and one response while the server
+//! carries on, instead of a render thread. A valid file
 //! decodes to the same pixels in the worker as in process.
 #![cfg(feature = "avif-decode")]
 
@@ -94,22 +92,31 @@ fn the_worker_decodes_what_the_process_decodes() {
         args: vec![WORKER_ARG.into()],
     };
     let mut checked = 0;
+    let mut refused = Vec::new();
     for (name, avif) in valid_avifs() {
-        // A corpus file the in-process path does not decode (a
-        // color type this build's decoder does not surface) is
-        // not a parity case; skip it. The encoder output and the
-        // repo seed always decode, so enough cases remain.
-        let Ok(in_process) = decode_image(&avif) else {
-            continue;
-        };
         let in_worker = decode_avif_in(
             &worker,
             &avif,
             MAX_DIMENSION,
             MAX_ALLOC,
             Instant::now() + Duration::from_secs(60),
-        )
-        .unwrap_or_else(|e| panic!("{name}: in worker: {e}"));
+        );
+        // A corpus file the in-process path refuses (a layout
+        // this build's decoder does not take) must be refused in
+        // the worker too: parity covers refusals as well. The
+        // encoder output and the repo seed always decode.
+        let in_process = match decode_image(&avif) {
+            Ok(image) => image,
+            Err(e) => {
+                assert!(
+                    in_worker.is_err(),
+                    "{name}: refused in process ({e}) but decoded in the worker"
+                );
+                refused.push(name);
+                continue;
+            }
+        };
+        let in_worker = in_worker.unwrap_or_else(|e| panic!("{name}: in worker: {e}"));
         assert_eq!(in_worker.color(), in_process.color(), "{name}: color");
         assert_eq!(
             (in_worker.width(), in_worker.height()),
@@ -124,7 +131,11 @@ fn the_worker_decodes_what_the_process_decodes() {
         checked += 1;
     }
     // Visible under `--nocapture`; captured in the gate.
-    eprintln!("parity: {checked} AVIFs decoded in process and in the worker to the same pixels");
+    eprintln!(
+        "parity: {checked} AVIFs decoded in process and in the worker to the same pixels; \
+         {} refused by both: {refused:?}",
+        refused.len()
+    );
     assert!(checked >= 5, "too few AVIFs were checked: {checked}");
 }
 
@@ -208,6 +219,32 @@ fn a_hung_avif_decode_is_a_504_and_the_server_keeps_serving() {
     assert!(took < Duration::from_secs(15), "the 504 took {took:?}");
     assert!(served > 0, "nothing was served while the AVIF decode hung");
     assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
+    // The stalled worker was killed and reaped: the server has
+    // no child process left, not even a zombie.
+    #[cfg(target_os = "linux")]
+    {
+        let server_pid = server.0.id();
+        let children = || {
+            std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
+                .filter(|stat| {
+                    // The parent PID is the second field after
+                    // the parenthesized command name.
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                        .and_then(|ppid| ppid.parse::<u32>().ok())
+                        == Some(server_pid)
+                })
+                .count()
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while children() > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(children(), 0, "a worker outlived its deadline");
+    }
     assert_eq!(get(port, "/health").0, 200);
     assert_eq!(get(port, "/unsafe/8x8/file:///ok.png").0, 200);
 }

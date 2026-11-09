@@ -129,6 +129,25 @@ const TAG_REFUSED: u8 = 1;
 const JOB_SVG: u8 = 0;
 const JOB_AVIF: u8 = 1;
 
+/// The worker a failure names, by job, so an AVIF decode that
+/// fails is not reported as an SVG render.
+fn worker_name(job: u8) -> &'static str {
+    if job == JOB_AVIF {
+        "the AVIF decoder"
+    } else {
+        "the SVG renderer"
+    }
+}
+
+/// The work a timeout names, by job.
+fn work_name(job: u8) -> &'static str {
+    if job == JOB_AVIF {
+        "AVIF decoding"
+    } else {
+        "SVG rendering"
+    }
+}
+
 /// How many bytes the worker's answer may carry: an exact
 /// length the parent already knows (the SVG size frame, the
 /// SVG raster), or any length up to a cap (the AVIF pixels,
@@ -309,6 +328,8 @@ struct Session {
     stderr: mpsc::Receiver<String>,
     deadline: Instant,
     timeout: Duration,
+    /// The job byte, for the words a failure uses.
+    job: u8,
 }
 
 /// Why the session ended without a frame.
@@ -341,7 +362,8 @@ impl Session {
             Ended::TimedOut => {
                 worker.finish();
                 RenderError::TimedOut(format!(
-                    "SVG rendering ran past its {:.1}s deadline",
+                    "{} ran past its {:.1}s deadline",
+                    work_name(self.job),
                     self.timeout.as_secs_f64()
                 ))
             }
@@ -352,7 +374,7 @@ impl Session {
                     .stderr
                     .recv_timeout(Duration::from_millis(200))
                     .unwrap_or_default();
-                RenderError::Refused(diagnose(&e, status, &stderr))
+                RenderError::Refused(diagnose(&e, status, &stderr, self.job))
             }
         }
     }
@@ -361,10 +383,11 @@ impl Session {
 /// Name what happened to a worker whose answer never came:
 /// its own last words on stderr say whether an allocation
 /// failed or the stack overflowed.
-fn diagnose(error: &io::Error, status: Option<ExitStatus>, stderr: &str) -> String {
+fn diagnose(error: &io::Error, status: Option<ExitStatus>, stderr: &str, job: u8) -> String {
     let status = status.map_or_else(|| "no exit status".to_string(), |s| s.to_string());
+    let worker = worker_name(job);
     if error.kind() != io::ErrorKind::UnexpectedEof {
-        return format!("the SVG renderer sent a malformed answer ({error}; {status})");
+        return format!("{worker} sent a malformed answer ({error}; {status})");
     }
     let what = if stderr.contains("memory allocation of") {
         "ran out of memory"
@@ -373,7 +396,7 @@ fn diagnose(error: &io::Error, status: Option<ExitStatus>, stderr: &str) -> Stri
     } else {
         "crashed"
     };
-    format!("the SVG renderer {what} ({status})")
+    format!("{worker} {what} ({status})")
 }
 
 /// Build the request every job starts with: the magic, the
@@ -392,7 +415,7 @@ fn request_head(job: u8) -> Vec<u8> {
 /// whole group can be killed at the deadline. `timeout` sizes
 /// the CPU cap, the backstop for a worker the parent stops
 /// watching; the wall-clock kill is the primary bound.
-fn spawn(command: &WorkerCommand, timeout: Duration) -> Result<Worker, RenderError> {
+fn spawn(command: &WorkerCommand, timeout: Duration, job: u8) -> Result<Worker, RenderError> {
     let cpu_limit = crate::toolrun::cpu_limit_for(timeout, 1);
     let mut cmd = Command::new(&command.program);
     cmd.args(&command.args)
@@ -423,7 +446,7 @@ fn spawn(command: &WorkerCommand, timeout: Duration) -> Result<Worker, RenderErr
     }
     let child = cmd
         .spawn()
-        .map_err(|e| RenderError::Refused(format!("could not start the SVG renderer: {e}")))?;
+        .map_err(|e| RenderError::Refused(format!("could not start {}: {e}", worker_name(job))))?;
     Ok(Worker {
         child,
         reaped: None,
@@ -440,6 +463,7 @@ fn exchange(
     request: Vec<u8>,
     deadline: Instant,
     timeout: Duration,
+    job: u8,
 ) -> (Session, mpsc::Receiver<std::process::ChildStdin>) {
     let mut stdin = worker.child.stdin.take().expect("stdin was piped");
     let (stdin_tx, stdin_rx) = mpsc::channel();
@@ -489,6 +513,7 @@ fn exchange(
         stderr: err_rx,
         deadline,
         timeout,
+        job,
     };
     (session, stdin_rx)
 }
@@ -496,9 +521,9 @@ fn exchange(
 /// Decode `bytes` (an AVIF source the container screen has
 /// already passed) in a worker started from `command`, under
 /// `max_dimension` and `max_alloc`, killed at `deadline`. The
-/// dav1d decode is the one that can spin on a crafted file
-/// (issue #522); the worker takes the spin, the parent answers
-/// with the error at the deadline.
+/// AV1 decode runs here under the worker's caps (issue #522);
+/// one still running at the deadline is killed and the parent
+/// answers with the timeout.
 pub(super) fn run_avif(
     command: &WorkerCommand,
     bytes: &[u8],
@@ -512,7 +537,7 @@ pub(super) fn run_avif(
             "AVIF decoding was past its deadline before it started".to_string(),
         ));
     }
-    let mut worker = spawn(command, timeout)?;
+    let mut worker = spawn(command, timeout, JOB_AVIF)?;
     let mut request = request_head(JOB_AVIF);
     request.extend_from_slice(&max_dimension.to_le_bytes());
     request.extend_from_slice(&max_alloc.to_le_bytes());
@@ -521,9 +546,9 @@ pub(super) fn run_avif(
     // The answer carries a one-byte color tag, two u32 sizes,
     // and the pixels, which cannot exceed the decode budget.
     let cap = (max_alloc as usize).saturating_add(AVIF_HEADER);
-    let (session, _stdin) = exchange(&mut worker, request, deadline, timeout);
+    let (session, _stdin) = exchange(&mut worker, request, deadline, timeout, JOB_AVIF);
     match session.next(Want::UpTo(cap)) {
-        Ok(Frame::Ok(payload)) => decode_avif_payload(&payload).ok_or_else(|| {
+        Ok(Frame::Ok(payload)) => decode_avif_payload(payload).ok_or_else(|| {
             RenderError::Refused("the AVIF decoder sent a malformed image".to_string())
         }),
         Ok(Frame::Refused(why)) => Err(RenderError::Refused(why)),
@@ -543,19 +568,22 @@ const AVIF_DELAY_ENV: &str = "CRABCROP_TEST_AVIF_WORKER_DELAY_MS";
 
 /// Rebuild the decoded image from the worker's answer: a color
 /// tag, the width and height, then exactly the pixels the tag
-/// and size imply. `None` on any length or tag mismatch.
-fn decode_avif_payload(payload: &[u8]) -> Option<image::DynamicImage> {
-    let (header, pixels) = payload.split_at_checked(AVIF_HEADER)?;
+/// and size imply. `None` on any length or tag mismatch. The
+/// answer is taken by value and its header dropped in place, so
+/// an 8-bit image costs no second copy of its pixels.
+fn decode_avif_payload(mut payload: Vec<u8>) -> Option<image::DynamicImage> {
+    let header: [u8; AVIF_HEADER] = payload.get(..AVIF_HEADER)?.try_into().ok()?;
     let color = header[0];
     let width = u32::from_le_bytes(header[1..5].try_into().ok()?);
     let height = u32::from_le_bytes(header[5..9].try_into().ok()?);
     let count = (width as usize)
         .checked_mul(height as usize)?
         .checked_mul(avif_channels(color)? as usize)?;
-    if pixels.len() != count.checked_mul(avif_depth(color)?)? {
+    if payload.len() - AVIF_HEADER != count.checked_mul(avif_depth(color)?)? {
         return None;
     }
-    build_dynamic_image(color, width, height, pixels.to_vec())
+    payload.drain(..AVIF_HEADER);
+    build_dynamic_image(color, width, height, payload)
 }
 
 /// Parse `document` (sanitized) in a worker started from
@@ -574,11 +602,11 @@ pub(super) fn run(
             "SVG rendering was past its deadline before it started".to_string(),
         ));
     }
-    let mut worker = spawn(command, timeout)?;
+    let mut worker = spawn(command, timeout, JOB_SVG)?;
     let mut request = request_head(JOB_SVG);
     request.extend_from_slice(&(document.len() as u64).to_le_bytes());
     request.extend_from_slice(document.as_bytes());
-    let (session, stdin_rx) = exchange(&mut worker, request, deadline, timeout);
+    let (session, stdin_rx) = exchange(&mut worker, request, deadline, timeout, JOB_SVG);
     let size = match session.next(Want::Exact(8)) {
         Ok(Frame::Ok(bytes)) => (
             f32::from_le_bytes(bytes[..4].try_into().expect("four bytes")),
@@ -759,9 +787,15 @@ fn serve_avif(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> 
     let mut len = [0u8; 8];
     input.read_exact(&mut len)?;
     let len = u64::from_le_bytes(len);
-    // The parent only sends sources inside the decode budget.
-    if len > max_alloc.saturating_add(MAX_DOCUMENT) {
-        return Err(io::ErrorKind::InvalidData.into());
+    // The parent only sends sources the fetch and upload caps
+    // admitted, far below this; past it, say so rather than
+    // leave the parent to diagnose a crash.
+    let most = max_alloc.saturating_add(MAX_DOCUMENT);
+    if len > most {
+        return refuse(
+            output,
+            &format!("the AVIF source is larger than {most} bytes"),
+        );
     }
     let mut bytes = Vec::with_capacity(len.min(1 << 20) as usize);
     input.take(len).read_to_end(&mut bytes)?;
@@ -1059,17 +1093,28 @@ mod tests {
     #[test]
     fn a_dead_worker_is_diagnosed_from_its_last_words() {
         let eof = io::Error::from(io::ErrorKind::UnexpectedEof);
-        let oom = diagnose(&eof, None, "memory allocation of 3758096384 bytes failed\n");
+        let oom = diagnose(
+            &eof,
+            None,
+            "memory allocation of 3758096384 bytes failed\n",
+            JOB_SVG,
+        );
         assert!(oom.contains("ran out of memory"), "{oom}");
         let stack = diagnose(
             &eof,
             None,
             "\nthread 'svg-worker' has overflowed its stack\nfatal runtime error: stack overflow",
+            JOB_SVG,
         );
         assert!(stack.contains("overflowed its stack"), "{stack}");
-        assert!(diagnose(&eof, None, "").contains("crashed"));
+        assert!(diagnose(&eof, None, "", JOB_SVG).contains("crashed"));
         let bad = io::Error::new(io::ErrorKind::InvalidData, "frame tag 7");
-        assert!(diagnose(&bad, None, "").contains("malformed answer"));
+        assert!(diagnose(&bad, None, "", JOB_SVG).contains("malformed answer"));
+        // An AVIF job's failure names the AVIF decoder.
+        assert_eq!(
+            diagnose(&eof, None, "", JOB_AVIF),
+            "the AVIF decoder crashed (no exit status)"
+        );
     }
 
     /// A stand-in worker: a shell script, so a test can make
@@ -1218,39 +1263,72 @@ mod tests {
         use image::DynamicImage;
         let images = [
             DynamicImage::ImageLuma8(image::GrayImage::from_raw(2, 2, vec![1, 2, 3, 4]).unwrap()),
+            DynamicImage::ImageLumaA8(
+                image::ImageBuffer::from_raw(1, 2, vec![1, 2, 3, 4]).unwrap(),
+            ),
             DynamicImage::ImageRgb8(
                 image::RgbImage::from_raw(1, 2, vec![1, 2, 3, 4, 5, 6]).unwrap(),
             ),
             DynamicImage::ImageRgba8(image::RgbaImage::from_raw(1, 1, vec![9, 8, 7, 6]).unwrap()),
-            DynamicImage::ImageRgba16(
-                image::ImageBuffer::from_raw(1, 1, vec![300u16, 1, 2, 65000]).unwrap(),
-            ),
             DynamicImage::ImageLuma16(
                 image::ImageBuffer::from_raw(2, 1, vec![40000u16, 7]).unwrap(),
             ),
+            DynamicImage::ImageLumaA16(
+                image::ImageBuffer::from_raw(1, 1, vec![40000u16, 9]).unwrap(),
+            ),
+            DynamicImage::ImageRgb16(
+                image::ImageBuffer::from_raw(1, 1, vec![1u16, 2, 65535]).unwrap(),
+            ),
+            DynamicImage::ImageRgba16(
+                image::ImageBuffer::from_raw(1, 1, vec![300u16, 1, 2, 65000]).unwrap(),
+            ),
         ];
+        let mut tags = Vec::new();
         for image in images {
             let (color, pixels) = encode_avif(&image).expect("a supported color type");
+            tags.push(color);
             let mut payload = vec![color];
             payload.extend_from_slice(&image.width().to_le_bytes());
             payload.extend_from_slice(&image.height().to_le_bytes());
             payload.extend_from_slice(pixels);
-            let rebuilt = decode_avif_payload(&payload).expect("a whole image");
+            let rebuilt = decode_avif_payload(payload.clone()).expect("a whole image");
+            assert_eq!(rebuilt.color(), image.color());
             assert_eq!(rebuilt.as_bytes(), image.as_bytes());
-            // A payload one byte short of the pixels is refused.
-            assert!(decode_avif_payload(&payload[..payload.len() - 1]).is_none());
+            // A payload a byte short of the pixels, or a byte
+            // over, is refused, and so is one that names more
+            // pixels than it carries.
+            assert!(decode_avif_payload(payload[..payload.len() - 1].to_vec()).is_none());
+            let mut over = payload.clone();
+            over.push(0);
+            assert!(decode_avif_payload(over).is_none());
+            let mut taller = payload.clone();
+            taller[5..9].copy_from_slice(&(image.height() + 1).to_le_bytes());
+            assert!(decode_avif_payload(taller).is_none());
+            // A size whose pixel count overflows is refused, not
+            // wrapped.
+            let mut vast = payload;
+            vast[1..9].copy_from_slice(&[0xFF; 8]);
+            assert!(decode_avif_payload(vast).is_none());
         }
+        assert_eq!(tags, (0..8).collect::<Vec<u8>>(), "a closed set of tags");
+        // An unknown tag, and an answer shorter than its header.
+        assert!(decode_avif_payload(vec![8, 1, 0, 0, 0, 1, 0, 0, 0, 0]).is_none());
+        assert!(decode_avif_payload(vec![3, 0, 0]).is_none());
     }
 
     #[cfg(unix)]
     #[test]
     fn a_hung_avif_worker_is_killed_at_the_deadline() {
-        // The AVIF job runs the decode that can spin; a worker
-        // that never answers is killed at the deadline and the
-        // parent reports a timeout, well before the CPU cap.
+        // A worker that never answers its AVIF job is killed at
+        // the deadline, its process group gone, and the parent
+        // reports a timeout that names the AVIF decode, well
+        // before the CPU cap.
+        let dir = crate::test_support::scratch_dir("avif-worker-test");
+        let pid_file = dir.join("worker.pid");
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
         let started = Instant::now();
         let result = run_avif(
-            &shell_worker("exec sleep 30"),
+            &shell_worker(&script),
             b"\x00\x00\x00\x18ftypavif",
             crate::engine::MAX_DECODE_DIMENSION,
             crate::engine::MAX_DECODE_ALLOC,
@@ -1258,11 +1336,55 @@ mod tests {
         );
         let took = started.elapsed();
         assert!(
-            matches!(result, Err(RenderError::TimedOut(_))),
+            matches!(&result, Err(RenderError::TimedOut(why)) if why.starts_with("AVIF decoding")),
             "{result:?}"
         );
         assert!(took >= Duration::from_millis(500), "{took:?}");
         assert!(took < Duration::from_secs(10), "{took:?}");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "the worker outlived its deadline"
+        );
+        // A worker that crashes, and one that cannot start, are
+        // refusals that name the AVIF decoder, not a timeout.
+        let result = run_avif(
+            &shell_worker("kill -ABRT $$"),
+            b"",
+            1,
+            1,
+            Instant::now() + Duration::from_secs(20),
+        );
+        assert!(
+            matches!(&result, Err(RenderError::Refused(why)) if why.starts_with("the AVIF decoder crashed")),
+            "{result:?}"
+        );
+        let missing = WorkerCommand {
+            program: PathBuf::from("/nonexistent/crabcrop"),
+            args: Vec::new(),
+        };
+        let result = run_avif(&missing, b"", 1, 1, Instant::now() + Duration::from_secs(5));
+        assert!(
+            matches!(&result, Err(RenderError::Refused(why)) if why.starts_with("could not start the AVIF decoder")),
+            "{result:?}"
+        );
+        // An answer past the decode budget is refused unread.
+        let result = run_avif(
+            &shell_worker(r"printf '\000\377\377\377\377\000\000\000\000'; exec sleep 30"),
+            b"",
+            1,
+            1 << 20,
+            Instant::now() + Duration::from_secs(20),
+        );
+        assert!(
+            matches!(&result, Err(RenderError::Refused(why)) if why.contains("past the")),
+            "{result:?}"
+        );
     }
 
     #[cfg(feature = "avif-decode")]
@@ -1289,7 +1411,7 @@ mod tests {
         else {
             panic!("the AVIF was refused");
         };
-        let decoded = decode_avif_payload(&payload).expect("a decoded image");
+        let decoded = decode_avif_payload(payload).expect("a decoded image");
         let in_process = crate::engine::decode_image(&avif).unwrap();
         assert_eq!(
             (decoded.width(), decoded.height()),
