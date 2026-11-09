@@ -62,29 +62,45 @@ fn fake_sr_x2(input: Vec<f32>, dims: [usize; 4]) -> Result<(Vec<i64>, Vec<f32>),
 fn assert_upscale_keeps_alpha_and_depth(depth: SampleDepth) {
     let src = rgba_halves(depth, 20, 12);
     let out = upscale_with(&src, fake_sr_x2).unwrap();
-    assert_eq!((out.width(), out.height()), (40, 24));
+    assert_upscaled_halves_keep_alpha_and_depth(&src, &out, 2);
     let (src16, out16) = (src.to_rgba16(), out.to_rgba16());
     for (x, y, px) in out16.enumerate_pixels() {
-        // The alpha plane is enlarged with a Triangle
-        // resize, which blends the two columns either
-        // side of the seam at x = 20; every other column
-        // keeps its half's alpha exactly.
-        if x < 18 {
-            assert_eq!(px[3], 0, "transparent stays transparent at ({x}, {y})");
-        }
         if x >= 22 {
             assert_eq!(
                 *px,
                 *src16.get_pixel(x / 2, y / 2),
-                "the opaque half keeps its color and alpha at ({x}, {y})"
+                "the opaque half keeps its color at ({x}, {y})"
             );
         }
     }
+}
+
+/// What any model's upscale of an [`rgba_halves`] source
+/// must keep, whatever color the model paints: the factor
+/// times the source size, the source's layout and depth,
+/// and each half's alpha. The alpha plane is enlarged with
+/// a Triangle resize, which blends the output columns
+/// within one source pixel of the seam; every other column
+/// keeps its half's alpha exactly.
+fn assert_upscaled_halves_keep_alpha_and_depth(src: &DynamicImage, out: &DynamicImage, f: u32) {
+    assert_eq!(
+        (out.width(), out.height()),
+        (src.width() * f, src.height() * f)
+    );
     assert_eq!(
         out.color(),
         src.color(),
         "the result keeps the source's layout and sample depth"
     );
+    let seam = src.width() / 2 * f;
+    for (x, y, px) in out.to_rgba16().enumerate_pixels() {
+        if x + f < seam {
+            assert_eq!(px[3], 0, "transparent stays transparent at ({x}, {y})");
+        }
+        if x >= seam + f {
+            assert_eq!(px[3], u16::MAX, "opaque stays opaque at ({x}, {y})");
+        }
+    }
 }
 
 #[test]
@@ -180,6 +196,26 @@ fn upscale_odd_dimensions_with_the_real_model() {
     assert_eq!((out.width(), out.height()), (101 * f, 53 * f));
     let out = provider.upscale(&out).unwrap();
     assert_eq!((out.width(), out.height()), (101 * f * f, 53 * f * f));
+}
+
+/// Issue #551 through the real session: a 16-bit or float
+/// RGBA source keeps its alpha and its depth. Only alpha,
+/// layout and size are checked, never color, so any
+/// super-resolution model will do (the authored CI fixture
+/// has random weights).
+/// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_UPSCALE_MODEL=...
+/// cargo test -- --ignored upscale_keeps_alpha_and_depth_with_the_real_model
+#[test]
+#[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+fn upscale_keeps_alpha_and_depth_with_the_real_model() {
+    let dylib = std::env::var("CRABCROP_TEST_ORT_DYLIB").unwrap();
+    let model = std::env::var("CRABCROP_TEST_UPSCALE_MODEL").unwrap();
+    let provider = OnnxUpscaleProvider::load(Some(&dylib), &model).unwrap();
+    for depth in [SampleDepth::Sixteen, SampleDepth::Float] {
+        let src = rgba_halves(depth, 20, 12);
+        let out = provider.upscale(&src).unwrap();
+        assert_upscaled_halves_keep_alpha_and_depth(&src, &out, provider.factor());
+    }
 }
 
 /// The upscale provider's missing-file failure is Load,

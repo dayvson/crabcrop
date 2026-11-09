@@ -105,7 +105,26 @@ fn assert_remove_region_keeps_alpha_and_depth(depth: SampleDepth) {
     let src = rgba_halves(depth, 40, 24);
     let mask = region_mask(40, 24, 14, 8, 12, 8);
     let out = inpaint_with(&src, &mask, fake_lama).unwrap();
-    assert_eq!((out.width(), out.height()), (40, 24));
+    assert_removal_keeps_alpha_and_depth(&src, &mask, &out);
+    // Inside the hole, away from the seam, the identity
+    // model's fill is the source's own color at the
+    // source's depth.
+    let (src16, out16) = (src.to_rgba16(), out.to_rgba16());
+    assert_eq!(out16.get_pixel(25, 12), src16.get_pixel(25, 12));
+}
+
+/// What any model's removal must keep, whatever color it
+/// fills the hole with: the source's size, layout and
+/// depth, its alpha sample for sample (inside the hole
+/// too: inpainting fills color, not transparency), and
+/// every pixel outside the hole bit for bit.
+fn assert_removal_keeps_alpha_and_depth(src: &DynamicImage, mask: &GrayImage, out: &DynamicImage) {
+    assert_eq!((out.width(), out.height()), (src.width(), src.height()));
+    assert_eq!(
+        out.color(),
+        src.color(),
+        "the result keeps the source's layout and sample depth"
+    );
     let (src16, out16) = (src.to_rgba16(), out.to_rgba16());
     for (x, y, px) in out16.enumerate_pixels() {
         let s = src16.get_pixel(x, y);
@@ -117,15 +136,6 @@ fn assert_remove_region_keeps_alpha_and_depth(depth: SampleDepth) {
             );
         }
     }
-    // Inside the hole, away from the seam, the identity
-    // model's fill is the source's own color at the
-    // source's depth.
-    assert_eq!(out16.get_pixel(25, 12), src16.get_pixel(25, 12));
-    assert_eq!(
-        out.color(),
-        src.color(),
-        "the result keeps the source's layout and sample depth"
-    );
 }
 
 #[test]
@@ -286,6 +296,30 @@ fn inpaint_with_the_real_model() {
         .unwrap()
         .to_rgb8();
     assert_eq!(*out.get_pixel(128, 128), image::Rgb([255, 0, 0]));
+}
+
+/// Issue #551 through the real session: a removal on a
+/// 16-bit or float RGBA source keeps its alpha and its
+/// depth. The fill's color is not checked, so any
+/// inpainting model will do.
+/// CRABCROP_TEST_ORT_DYLIB=... CRABCROP_TEST_INPAINT_MODEL=...
+/// cargo test -- --ignored inpaint_keeps_alpha_and_depth_with_the_real_model
+#[test]
+#[ignore = "needs the ONNX runtime and a model file (env-configured)"]
+fn inpaint_keeps_alpha_and_depth_with_the_real_model() {
+    let Some(dylib) = env_or_skip("CRABCROP_TEST_ORT_DYLIB") else {
+        return;
+    };
+    let Some(model) = env_or_skip("CRABCROP_TEST_INPAINT_MODEL") else {
+        return;
+    };
+    let provider = OnnxInpaintProvider::load(Some(&dylib), &model).unwrap();
+    for depth in [SampleDepth::Sixteen, SampleDepth::Float] {
+        let src = rgba_halves(depth, 40, 24);
+        let mask = region_mask(40, 24, 14, 8, 12, 8);
+        let out = provider.inpaint(&src, &mask).unwrap();
+        assert_removal_keeps_alpha_and_depth(&src, &mask, &out);
+    }
 }
 
 /// A one-input model is not an inpainting model: the
