@@ -146,6 +146,13 @@ rustix = { version = "1", features = ["process"] }
 # it never enters a normal build.
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 
+# The disk-read test opens its FIFO's write end without blocking
+# (issue #543): with no reader the open fails at once instead of
+# parking a thread the test could never join. Test-only: the `fs`
+# feature never enters a normal build.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [features]
 # AVIF source decoding, through the image crate's avif-native
 # decoder (mp4parse + dav1d). Off by default (issue #141,

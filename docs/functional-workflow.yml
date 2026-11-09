@@ -40,10 +40,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# About three times the full tier's longest recent run
+# (issue #543): a hung server fails the job in minutes
+# instead of holding it for GitHub's six-hour default.
 jobs:
   functional:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
