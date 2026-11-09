@@ -105,9 +105,9 @@
    "path": "/e7b6578bbb85df9bcbe0ba403c1267584ae4411b22929bbb0e8260fe8af7fc4a/300x0/filters:format(jxl)/http://127.0.0.1:8991/crab-photo.jpg",
    "status": 200,
    "content_type": "image/jxl",
-   "bytes": 8815,
-   "sha256": "42ca768141c7c873cba25d055bfe49bab09c20eb4d3f60c6b47e392dc68a8a54",
-   "note": ""
+   "bytes": 7805,
+   "sha256": "316c0142c0278b0163d47fb4ebdb45506cebc6571729731238b9d2cc547af901",
+   "note": "Re-baselined 2026-11-08 against the current build: the JPEG XL encoder jixel changed deliberately (PR #493), moving from 0.5.2 to 0.5.5, whose output at the same quality setting runs 11 to 19 percent smaller at slightly lower fidelity, so format(jxl) renders differ from the baseline bytes."
   },
   {
    "id": "format-png",
