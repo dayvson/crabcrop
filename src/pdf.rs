@@ -1178,6 +1178,52 @@ exit 0\n";
     }
 
     #[test]
+    fn refusals_keep_their_class_when_stderr_arrives_late() {
+        // Issue #566: these classes come from the tools'
+        // stderr, which the run gave up on 200 ms after the
+        // tool exited. Held back past that, stderr still
+        // arrives, and no refusal reads as `NotPdf`.
+        let _hold = crate::toolrun::hold_readers(Duration::ZERO, Duration::from_millis(500));
+        let password = "#!/bin/sh\ncat > /dev/null\nprintf 'Command Line Error: Incorrect password\\n' >&2\nexit 1\n";
+
+        // A password refusal from the probe.
+        let (_tools, program) = fake_pair("late-password", password, RENDER_OK);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
+        assert!(matches!(err, PdfError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("password-protected"), "{err}");
+
+        // The probe's page-range refusal, which the
+        // whole-document probe confirms.
+        let info = "#!/bin/sh\ncat > /dev/null\nif [ \"$1\" = \"-f\" ]; then\n  printf '%s\\n' 'Command Line Error: Wrong page range given: the first page (9) can not be after the last page (3).' >&2\n  exit 99\nfi\nprintf '%s\\n' 'Pages:           3' 'Encrypted:       no' 'Page size:       612 x 792 pts (letter)'\nexit 0\n";
+        let (_tools, program) = fake_pair("late-range", info, RENDER_OK);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let err = renderer.render_page(b"%PDF- fake", 9).unwrap_err();
+        assert!(matches!(err, PdfError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("page 9"), "{err}");
+        assert!(err.to_string().contains("3 pages"), "{err}");
+
+        // A password refusal from the renderer.
+        let (_tools, program) = fake_pair("late-render-password", INFO_OK, password);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
+        assert!(matches!(err, PdfError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("password-protected"), "{err}");
+
+        // Any other renderer failure quotes the end of
+        // stderr.
+        let (_tools, program) = fake_pair(
+            "late-failing",
+            INFO_OK,
+            "#!/bin/sh\ncat > /dev/null\necho 'boom on stderr' >&2\nexit 3\n",
+        );
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
+        assert!(matches!(err, PdfError::Failed(_)), "{err}");
+        assert!(err.to_string().contains("boom on stderr"), "{err}");
+    }
+
+    #[test]
     fn run_caps_tool_output() {
         let (_tools, program) = fake_pair(
             "chatty",
@@ -1289,7 +1335,12 @@ exit 0\n";
     }
 
     /// End to end against the real Poppler when it is on
-    /// PATH (CI installs it; a machine without it skips).
+    /// PATH. A machine without it skips this test and the
+    /// other `real_tools_` tests. rust.yml, which runs the
+    /// unit tests, does not install Poppler, so CI skips
+    /// them unless the runner image ships it. functional.yml
+    /// installs it for the HTTP suite, which runs no unit
+    /// tests.
     /// The fixture's pages are solid colors, so the
     /// selected page is provable from its pixels.
     #[test]

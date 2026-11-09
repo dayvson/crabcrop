@@ -14,6 +14,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The five framework READMEs named a minimum `@crabcrop/url` version that was never released. They now ask for 0.10.0 or later, the first release that exports `MAX_DIMENSION` (issue #565). The Helm README's own-build snippet built and pushed `your-registry/crabcrop:0.10.1`, then installed the chart with `--set image.tag=0.9.10`, a tag it never pushed. It now installs the tag it builds, and `scripts/bump_version.py` and `scripts/check_versions.py` cover the `image.tag=` line, so a release moves it with the other image pins.
 
+- On a loaded host, a password-protected PDF and a page past the end of a PDF could answer `502` as not a readable PDF instead of their `400` refusals, and a readable video could fail as having no video stream (issue #566). The PDF and frame tools report these on stderr, and once a tool had exited the server waited only 2 s for its stdout and then 200 ms for its stderr, and went on without whatever had not arrived. It now waits for both until the run's timeout. One case changes: a tool that exits while a process it started still holds its stdout or stderr open used to end 200 ms to 2.2 s after the exit, without that pipe's output. It now runs until the timeout, which kills that process with the tool's process group, and fails as timed out.
+
 ## [0.10.1] - 2026-11-09
 
 ### Changed
