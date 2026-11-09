@@ -22,6 +22,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - Test and CI reliability. A failed check in the disk-read test that blocks on a FIFO no longer hangs the suite: the test lets the held read go on every exit path and puts a deadline on each request and on the wait for the read, and every job in `rust.yml` and `functional.yml` has a `timeout-minutes` (issue #543).
 
+### Security
+
+- The source buffer budget is held only by source bodies that keep arriving. A body reserves at most 1 MiB ahead of the bytes it has received (its declared length, when that is smaller), reserves the rest of its length only once it has received that much, and keeps budget past its received bytes only while each second brings at least 64 KiB and enough to fill what it holds before the fetch timeout; a body that falls behind holds only the bytes it has sent. Before, a body kept its whole declared length while any byte arrived each second, so slow origins could hold the budget and make other cache misses and uploads shed with `503 server_busy`; the 0.10.0 note that an origin that stalls holds only what it sent did not cover an origin that keeps sending slowly. Bodies still on their read-ahead share at most the budget less one fetch cap, so a burst of large sources still finishes a few at a time instead of waiting on each other. Rendered bytes are unchanged.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
