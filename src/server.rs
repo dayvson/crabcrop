@@ -1742,22 +1742,174 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let (parts, body) = req.into_parts();
+    // A buffered upload is a source like a fetched one
+    // (issue #403): its body is charged to the source buffer
+    // budget as it arrives and the charge is held until the
+    // handler is done with the bytes, so a burst of uploads
+    // waits at the budget instead of buffering past it, and
+    // a client that stalls mid-body holds only what it sent.
+    let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
+    let outcome = match receive_upload(&state, parts.uri.path(), body, &charge).await {
+        Ok(outcome) | Err(outcome) => outcome,
+    };
+    finish_upload(&state, outcome, accept.as_deref()).await
+}
+
+/// How an upload request ended (issue #479). The stages of
+/// [`receive_upload`] return every refusal as one of these,
+/// and [`finish_upload`] answers it, so the count on
+/// `/metrics`, the audit line (audit PL-8), and the answer
+/// are made in one place.
+enum UploadOutcome {
+    /// Refused before the signature check (no destination,
+    /// a bad path, a sealed spelling, an unparsable
+    /// signature), or for a verified remainder that does
+    /// not split into an expiry and a name: answered, and
+    /// neither counted nor logged.
+    Unaudited(ErrorParts),
+    /// Refused from the signature check on: counted, and
+    /// logged under `target` (the remainder as presented
+    /// for a bad signature, the name after it) with its
+    /// `rejected:` outcome.
+    Rejected {
+        target: String,
+        outcome: &'static str,
+        answer: ErrorParts,
+    },
+    /// Shed because the source buffer budget or the process
+    /// gate stayed full past its wait: counted and logged as
+    /// `rejected:busy`, and answered with a 503 carrying
+    /// `message`.
+    Busy {
+        target: String,
+        message: &'static str,
+    },
+    /// Stored under `name`, at the source reference
+    /// `source`; `replaced` when an allowed overwrite
+    /// replaced an object.
+    Stored {
+        name: String,
+        source: String,
+        replaced: bool,
+    },
+}
+
+impl UploadOutcome {
+    fn rejected(target: &str, outcome: &'static str, answer: ErrorParts) -> Self {
+        UploadOutcome::Rejected {
+            target: target.to_string(),
+            outcome,
+            answer,
+        }
+    }
+}
+
+/// Count and log an upload's outcome (audit PL-8), then
+/// answer it. A stored upload that replaced an object
+/// purges the old one's derivatives before it answers.
+async fn finish_upload(state: &AppState, outcome: UploadOutcome, accept: Option<&str>) -> Response {
+    match outcome {
+        UploadOutcome::Unaudited((status, code, message)) => {
+            error_response(status, code, message, accept)
+        }
+        UploadOutcome::Rejected {
+            target,
+            outcome,
+            answer: (status, code, message),
+        } => {
+            state.metrics.record_upload();
+            upload_log(&target, outcome);
+            error_response(status, code, message, accept)
+        }
+        UploadOutcome::Busy { target, message } => {
+            state.metrics.record_upload();
+            upload_log(&target, "rejected:busy");
+            busy_response(message, 1, accept)
+        }
+        UploadOutcome::Stored {
+            name,
+            source,
+            replaced,
+        } => {
+            state.metrics.record_upload();
+            upload_log(&name, if replaced { "replaced" } else { "stored" });
+            if replaced {
+                // An overwrite replaces the source every
+                // cached derivative was rendered from: purge
+                // them all, in every tier, so the next
+                // request re-renders from the new original
+                // instead of serving the stale transform
+                // (audit R2-07). A first store has no
+                // derivatives to invalidate.
+                // Logged inside the purge itself, so the
+                // line lands even if this request is dropped
+                // while the purge runs (issue #347).
+                let _removed = purge_source_everywhere(state, &source).await;
+            }
+            let status = if replaced {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            let mut response = (status, format!("{source}\n")).into_response();
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-crabcrop-source"),
+                axum::http::HeaderValue::from_str(&source).unwrap(),
+            );
+            response
+        }
+    }
+}
+
+/// The stages of an upload (issue #479), cheapest first:
+/// [`authorize_upload`], [`read_upload`], the overwrite
+/// policy (so a refused duplicate never pays a decode),
+/// [`validate_upload`], and [`store_upload`]. A refusal
+/// ends the chain as its [`UploadOutcome`].
+async fn receive_upload(
+    state: &AppState,
+    path: &str,
+    body: axum::body::Body,
+    charge: &crate::loader::SourceCharge,
+) -> Result<UploadOutcome, UploadOutcome> {
+    let (upload, name) = authorize_upload(state, path)?;
+    let name = name.as_str();
+    let bytes = read_upload(body, upload.max_bytes, charge, name).await?;
+    // The existence check runs before validation, so an
+    // upload that will be refused as a duplicate never
+    // pays a full decode first (audit R2-06). The value
+    // is reused after the store to pick 200 vs 201 and
+    // the log outcome.
+    let existed = upload.exists(name).await;
+    if existed && !upload.allow_overwrite {
+        return Err(upload_exists(name));
+    }
+    let prepared = validate_upload(state, bytes, name).await?;
+    Ok(store_upload(upload, name, prepared, existed).await)
+}
+
+/// The upload's first stage: a configured destination, a
+/// well-formed path, a verified signature, an unexpired
+/// token, and a well-formed name. Returns the destination
+/// and the name.
+fn authorize_upload<'s>(
+    state: &'s AppState,
+    path: &str,
+) -> Result<(&'s crate::upload::UploadStore, String), UploadOutcome> {
     let Some(upload) = &state.upload else {
-        return error_response(
+        return Err(UploadOutcome::Unaudited((
             StatusCode::NOT_FOUND,
             "uploads_not_configured",
             "uploads are not configured".to_string(),
-            accept.as_deref(),
-        );
+        )));
     };
-    let (parts, body) = req.into_parts();
-    let Some(tail) = parts.uri.path().strip_prefix("/upload/") else {
-        return error_response(
+    let Some(tail) = path.strip_prefix("/upload/") else {
+        return Err(UploadOutcome::Unaudited((
             StatusCode::BAD_REQUEST,
             "invalid_path",
             "expected /upload/<signature>/<name>".to_string(),
-            accept.as_deref(),
-        );
+        )));
     };
     let full = format!("/{tail}");
     // A sealed spelling is refused wholesale (issue #255):
@@ -1770,22 +1922,20 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // fetch happens for it.
     let first_segment = tail.split('/').next().unwrap_or("");
     if crate::url::looks_sealed(first_segment) {
-        return error_response(
+        return Err(UploadOutcome::Unaudited((
             StatusCode::FORBIDDEN,
             "bad_signature",
             "bad signature".to_string(),
-            accept.as_deref(),
-        );
+        )));
     }
     let (signature, key_id, rest) = match parse_signature(&full) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(
+            return Err(UploadOutcome::Unaudited((
                 StatusCode::BAD_REQUEST,
                 e.code(),
                 e.to_string(),
-                accept.as_deref(),
-            );
+            )));
         }
     };
     // Verification runs over the remainder exactly as
@@ -1797,24 +1947,24 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         .keyring
         .verify_upload(key_id.as_deref(), &signature, rest)
     {
-        state.metrics.record_upload();
-        upload_log(rest, "rejected:bad-signature");
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "bad signature".to_string(),
-            accept.as_deref(),
-        );
+        return Err(UploadOutcome::rejected(
+            rest,
+            "rejected:bad-signature",
+            (
+                StatusCode::FORBIDDEN,
+                "bad_signature",
+                "bad signature".to_string(),
+            ),
+        ));
     }
     let (expiry, name) = match crate::url::split_upload_remainder(rest) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(
+            return Err(UploadOutcome::Unaudited((
                 StatusCode::BAD_REQUEST,
                 e.code(),
                 e.to_string(),
-                accept.as_deref(),
-            );
+            )));
         }
     };
     // Expiry is enforced after verification and before
@@ -1826,134 +1976,149 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if now >= exp {
-            state.metrics.record_upload();
-            upload_log(name, "rejected:expired");
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "signature_expired",
-                "signature expired".to_string(),
-                accept.as_deref(),
-            );
+            return Err(UploadOutcome::rejected(
+                name,
+                "rejected:expired",
+                (
+                    StatusCode::FORBIDDEN,
+                    "signature_expired",
+                    "signature expired".to_string(),
+                ),
+            ));
         }
     }
     if let Err(e) = crate::upload::validate_upload_name(name) {
-        state.metrics.record_upload();
-        upload_log(name, "rejected:bad-name");
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_upload_name",
-            e,
-            accept.as_deref(),
-        );
+        return Err(UploadOutcome::rejected(
+            name,
+            "rejected:bad-name",
+            (StatusCode::BAD_REQUEST, "invalid_upload_name", e),
+        ));
     }
-    // A buffered upload is a source like a fetched one
-    // (issue #403): its body is charged to the source buffer
-    // budget as it arrives and the charge is held until the
-    // handler is done with the bytes, so a burst of uploads
-    // waits at the budget instead of buffering past it, and
-    // a client that stalls mid-body holds only what it sent.
+    Ok((upload, name.to_string()))
+}
+
+/// Read the upload's body, charged to `charge` as it
+/// arrives (issue #403). An empty body is refused here: an
+/// image is required.
+async fn read_upload(
+    body: axum::body::Body,
+    max_bytes: u64,
+    charge: &crate::loader::SourceCharge,
+    name: &str,
+) -> Result<Vec<u8>, UploadOutcome> {
     // The read is bounded by the cap itself: it fails the
     // moment the body passes it, which is the oversize
     // answer (413) without ever holding more than the cap in
     // memory. A body that cannot be read to its end (the
     // client aborted it, or framed it badly) is the
     // client's fault but not a size one: a 400 (issue #467).
-    let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
-    let cap = usize::try_from(upload.max_bytes).unwrap_or(usize::MAX);
-    let bytes = match read_upload_body(body, cap, &charge).await {
+    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let bytes = match read_upload_body(body, cap, charge).await {
         Ok(bytes) => bytes,
         Err(LoadError::Busy) => {
-            state.metrics.record_upload();
-            upload_log(name, "rejected:busy");
-            return source_budget_busy(accept.as_deref());
+            return Err(UploadOutcome::Busy {
+                target: name.to_string(),
+                message: SOURCE_BUDGET_BUSY,
+            });
         }
         Err(LoadError::TooLarge { .. }) => {
-            state.metrics.record_upload();
-            upload_log(name, "rejected:oversize");
-            return error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "upload_too_large",
-                format!("upload exceeds the {}-byte limit", upload.max_bytes),
-                accept.as_deref(),
-            );
+            return Err(UploadOutcome::rejected(
+                name,
+                "rejected:oversize",
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "upload_too_large",
+                    format!("upload exceeds the {max_bytes}-byte limit"),
+                ),
+            ));
         }
         Err(e) => {
             eprintln!("upload body read failed: {e}");
-            state.metrics.record_upload();
-            upload_log(name, "rejected:unreadable");
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "upload_unreadable",
-                "upload body could not be read".to_string(),
-                accept.as_deref(),
-            );
+            return Err(UploadOutcome::rejected(
+                name,
+                "rejected:unreadable",
+                (
+                    StatusCode::BAD_REQUEST,
+                    "upload_unreadable",
+                    "upload body could not be read".to_string(),
+                ),
+            ));
         }
     };
     if bytes.is_empty() {
-        state.metrics.record_upload();
-        upload_log(name, "rejected:not-an-image");
-        return error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "upload_not_an_image",
-            "upload body is empty: an image is required".to_string(),
-            accept.as_deref(),
-        );
+        return Err(UploadOutcome::rejected(
+            name,
+            "rejected:not-an-image",
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "upload_not_an_image",
+                "upload body is empty: an image is required".to_string(),
+            ),
+        ));
     }
-    // The existence check runs before validation, so an
-    // upload that will be refused as a duplicate never
-    // pays a full decode first (audit R2-06). The value
-    // is reused after the store to pick 200 vs 201 and
-    // the log outcome.
-    let existed = upload.exists(name).await;
-    if existed && !upload.allow_overwrite {
-        state.metrics.record_upload();
-        upload_log(name, "rejected:exists");
-        return error_response(
+    Ok(bytes)
+}
+
+/// The 409 for a name already taken while overwriting is
+/// off: from the cheap existence check, or from the
+/// conditional create that settles a race (audit R2-21).
+fn upload_exists(name: &str) -> UploadOutcome {
+    UploadOutcome::rejected(
+        name,
+        "rejected:exists",
+        (
             StatusCode::CONFLICT,
             "upload_already_exists",
             "an object with this name already exists".to_string(),
-            accept.as_deref(),
-        );
-    }
-    // The bytes must decode as an image this server can
-    // serve, through the pipeline's own decode branches:
-    // anything else is refused before it is stored, so
-    // the destination never holds an unservable object.
-    // The decode runs under the process gate, like every
-    // transform (see `run_upload_validation`).
+        ),
+    )
+}
+
+/// The bytes must decode as an image this server can
+/// serve, through the pipeline's own decode branches:
+/// anything else is refused before it is stored, so the
+/// destination never holds an unservable object. The
+/// decode runs under the process gate, like every
+/// transform (see `run_upload_validation`). Then the name
+/// must present the body as what it is. Returns the
+/// prepared form to store.
+async fn validate_upload(
+    state: &AppState,
+    bytes: Vec<u8>,
+    name: &str,
+) -> Result<crate::engine::PreparedUpload, UploadOutcome> {
     // The body moves into validation rather than being
     // copied for it, so the charge covers what is held.
-    let prepared = match run_upload_validation(&state, bytes).await {
+    let prepared = match run_upload_validation(state, bytes).await {
         UploadValidation::Valid(prepared) => prepared,
         UploadValidation::Invalid(e) => {
             eprintln!("upload rejected: {e}");
-            state.metrics.record_upload();
-            upload_log(name, "rejected:not-an-image");
-            return error_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "upload_not_an_image",
-                "upload is not an image this server can decode".to_string(),
-                accept.as_deref(),
-            );
+            return Err(UploadOutcome::rejected(
+                name,
+                "rejected:not-an-image",
+                (
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "upload_not_an_image",
+                    "upload is not an image this server can decode".to_string(),
+                ),
+            ));
         }
         UploadValidation::Busy => {
-            state.metrics.record_upload();
-            upload_log(name, "rejected:busy");
-            return busy_response(
-                "server busy: too many images processing at once",
-                1,
-                accept.as_deref(),
-            );
+            return Err(UploadOutcome::Busy {
+                target: name.to_string(),
+                message: "server busy: too many images processing at once",
+            });
         }
         UploadValidation::Panicked => {
-            state.metrics.record_upload();
-            upload_log(name, "rejected:validation-failed");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "validation_failed",
-                "image validation failed".to_string(),
-                accept.as_deref(),
-            );
+            return Err(UploadOutcome::rejected(
+                name,
+                "rejected:validation-failed",
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "validation_failed",
+                    "image validation failed".to_string(),
+                ),
+            ));
         }
     };
     // The name must present the body as what it is: a
@@ -1962,15 +2127,26 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
     // content), because the destination may be served
     // directly (audit R2-22).
     if let Err(e) = crate::upload::check_upload_media(name, prepared.media) {
-        state.metrics.record_upload();
-        upload_log(name, "rejected:media-mismatch");
-        return error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "upload_media_mismatch",
-            e,
-            accept.as_deref(),
-        );
+        return Err(UploadOutcome::rejected(
+            name,
+            "rejected:media-mismatch",
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "upload_media_mismatch",
+                e,
+            ),
+        ));
     }
+    Ok(prepared)
+}
+
+/// Write the prepared upload to the destination.
+async fn store_upload(
+    upload: &crate::upload::UploadStore,
+    name: &str,
+    prepared: crate::engine::PreparedUpload,
+    existed: bool,
+) -> UploadOutcome {
     // What lands is the prepared form, and with
     // overwriting off the write is a conditional create:
     // the exists check above is the cheap refusal, this
@@ -1983,65 +2159,34 @@ async fn upload_handle(State(state): State<AppState>, req: axum::extract::Reques
         upload.put_new(name, &prepared.stored).await
     };
     match stored {
-        Ok(()) => {
-            state.metrics.record_upload();
-            upload_log(name, if existed { "replaced" } else { "stored" });
-            if existed {
-                // An overwrite replaces the source every
-                // cached derivative was rendered from: purge
-                // them all, in every tier, so the next
-                // request re-renders from the new original
-                // instead of serving the stale transform
-                // (audit R2-07). A first store has no
-                // derivatives to invalidate.
-                let source = upload.source_ref(name);
-                // Logged inside the purge itself, so the
-                // line lands even if this request is dropped
-                // while the purge runs (issue #347).
-                let _removed = purge_source_everywhere(&state, &source).await;
-            }
-            let status = if existed {
-                StatusCode::OK
-            } else {
-                StatusCode::CREATED
-            };
-            let mut response = (status, format!("{}\n", upload.source_ref(name))).into_response();
-            response.headers_mut().insert(
-                axum::http::HeaderName::from_static("x-crabcrop-source"),
-                axum::http::HeaderValue::from_str(&upload.source_ref(name)).unwrap(),
-            );
-            response
-        }
-        Err(crate::upload::UploadError::AlreadyExists) => {
-            state.metrics.record_upload();
-            upload_log(name, "rejected:exists");
-            error_response(
-                StatusCode::CONFLICT,
-                "upload_already_exists",
-                "an object with this name already exists".to_string(),
-                accept.as_deref(),
-            )
-        }
+        Ok(()) => UploadOutcome::Stored {
+            name: name.to_string(),
+            source: upload.source_ref(name),
+            replaced: existed,
+        },
+        Err(crate::upload::UploadError::AlreadyExists) => upload_exists(name),
         Err(crate::upload::UploadError::Backend(cause)) => {
             eprintln!("upload failed: {cause}");
-            state.metrics.record_upload();
-            upload_log(name, "rejected:store-failed");
-            error_response(
-                StatusCode::BAD_GATEWAY,
-                "upload_store_unavailable",
-                "the upload store is unavailable".to_string(),
-                accept.as_deref(),
+            UploadOutcome::rejected(
+                name,
+                "rejected:store-failed",
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "upload_store_unavailable",
+                    "the upload store is unavailable".to_string(),
+                ),
             )
         }
         Err(crate::upload::UploadError::Io(cause)) => {
             eprintln!("upload failed: {cause}");
-            state.metrics.record_upload();
-            upload_log(name, "rejected:store-failed");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "upload_store_failed",
-                "the upload could not be stored".to_string(),
-                accept.as_deref(),
+            UploadOutcome::rejected(
+                name,
+                "rejected:store-failed",
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "upload_store_failed",
+                    "the upload could not be stored".to_string(),
+                ),
             )
         }
     }
@@ -2169,7 +2314,56 @@ async fn handle(
     response
 }
 
+/// Why the image path refused a request before its cache
+/// lookup (issue #479). The stages of [`serve`] return
+/// every refusal as one of these, and `serve` answers it
+/// in one place, [`Refusal::answer`], so a refusal added to
+/// any stage keeps the sealed spelling's uniform 403
+/// (issues #255, #259) without a branch of its own.
+enum Refusal {
+    /// A segment in the sealed spelling that does not
+    /// open: the uniform refusal, whatever the request.
+    Unopened,
+    /// A failure of what the remainder asks for: its own
+    /// answer for a plain request, the uniform refusal for
+    /// a sealed one, so an opened token is never a
+    /// validity oracle.
+    Payload(ErrorParts),
+    /// A request for meta with meta mode off (issues #390,
+    /// #453): a payload refusal whose answer, either one,
+    /// carries the meta document's caching headers.
+    MetaDisabled(ErrorParts),
+    /// An answer both spellings give as is: the plain
+    /// spelling's own signature failures, which a sealed
+    /// request never reaches, and an expired URL, which an
+    /// opened token answers exactly as the plain form does
+    /// (`signature_expired`).
+    AsIs(ErrorParts),
+}
+
+impl Refusal {
+    /// The answer to this refusal, for a request in the
+    /// sealed spelling or not.
+    fn answer(self, sealed: bool, accept: Option<&str>) -> Response {
+        let own =
+            |(status, code, message): ErrorParts| error_response(status, code, message, accept);
+        match self {
+            Refusal::Unopened => sealed_refusal_response(),
+            Refusal::Payload(parts) => sealed_or(sealed, own(parts)),
+            Refusal::MetaDisabled(parts) => meta_cache_headers(sealed_or(sealed, own(parts))),
+            Refusal::AsIs(parts) => own(parts),
+        }
+    }
+}
+
 /// Run one image request, timing each stage into the returned record.
+///
+/// The request runs in stages (issue #479):
+/// [`authenticate`], [`resolve_request`] and [`negotiate`]
+/// admit it, each returning a [`Refusal`] that is answered
+/// here, the one place that knows the request's spelling;
+/// [`cache_key_for`] keys it; and [`run_flight`] serves it
+/// from the tiers or the miss path.
 async fn serve(
     state: &AppState,
     path: &str,
@@ -2181,95 +2375,169 @@ async fn serve(
 ) -> (Response, RequestRecord) {
     let mut record = RequestRecord::default();
     let full = format!("/{path}");
-
-    // A sealed spelling (issue #255) is intercepted before
-    // the plain parse: the token sits in the signature slot,
-    // and everything about it (an oversized segment, a
-    // failed open, and every payload failure after a
-    // successful open) answers with the one uniform refusal,
-    // so a token is never a validity oracle. On a successful
-    // open the decrypted remainder takes the place of `rest`
-    // and flows through the exact pipeline a verified plain
-    // remainder flows through: because decryption produces
-    // the pre-expansion string the HMAC form carries, the
-    // two spellings share one cache entry, one ETag, one
-    // purge target by construction.
-    let sealed_refusal = |record: RequestRecord| {
-        (
-            (StatusCode::FORBIDDEN, "bad signature").into_response(),
-            record,
-        )
+    let opened = authenticate(state, &full, &mut record);
+    let sealed = opened.as_ref().is_ok_and(|opened| opened.sealed);
+    let admitted = opened.and_then(|opened| {
+        let resolved = resolve_request(state, &opened.remainder, &mut record)?;
+        let negotiated = negotiate(
+            state,
+            &resolved.ops,
+            accept,
+            dpr_hint,
+            width_hint,
+            save_data,
+        )?;
+        Ok((resolved, negotiated))
+    });
+    let (resolved, negotiated) = match admitted {
+        Ok(admitted) => admitted,
+        Err(refusal) => return (refusal.answer(sealed, accept), record),
     };
-    let mut sealed = false;
-    let mut sealed_remainder: Option<String> = None;
-    let nolead = full.strip_prefix('/').unwrap_or(&full);
+    let cache_key = cache_key_for(
+        &state.config_fingerprint,
+        &resolved.ops,
+        &resolved.source_url,
+        &negotiated,
+    );
+    // The key fully determines the lookup: a stored response can
+    // be served without touching the loader or the engine. Meta
+    // requests bypass the cache in both directions: they must
+    // never be answered with image bytes, and their JSON is never
+    // stored as an image entry. Debug requests bypass it too:
+    // the diagnostic must never be served from, or stored into,
+    // any tier (its key differs from the plain URL's anyway, but
+    // the bypass is the rule, not the key's accident).
+    let bypass = negotiated.meta || negotiated.debug;
+    if !bypass {
+        record.cache_looked_up = true;
+    }
+    let work = MissWork {
+        ops: resolved.ops,
+        source_url: resolved.source_url,
+        directives: negotiated.directives,
+        preferred: negotiated.preferred,
+        meta: negotiated.meta,
+        debug: negotiated.debug,
+        placeholders: negotiated.placeholders,
+        hinted_width: negotiated.hinted_width,
+        dpr_hint,
+        save_data,
+        accept: accept.map(str::to_string),
+        groups: resolved.groups,
+        cache_key,
+        max_age: resolved.max_age,
+        sealed,
+    };
+    run_flight(state, path, work, if_none_match, record).await
+}
+
+/// A remainder the request may run.
+struct Opened<'a> {
+    /// The remainder as presented, or as its sealed token
+    /// decrypts.
+    remainder: std::borrow::Cow<'a, str>,
+    /// Whether the request arrived in the sealed spelling
+    /// (issue #255).
+    sealed: bool,
+}
+
+/// The first stage of [`serve`]: verify the signature over
+/// the remainder, or open the sealed token in its slot,
+/// timing either into `record.verify`.
+///
+/// A sealed spelling (issue #255) is intercepted before
+/// the plain parse: the token sits in the signature slot,
+/// and everything about it (an oversized segment, a
+/// failed open, and every payload failure after a
+/// successful open) answers with the one uniform refusal,
+/// so a token is never a validity oracle. On a successful
+/// open the decrypted remainder takes the place of the
+/// presented one and flows through the exact pipeline a
+/// verified plain remainder flows through: because
+/// decryption produces the pre-expansion string the HMAC
+/// form carries, the two spellings share one cache entry,
+/// one ETag, one purge target by construction.
+fn authenticate<'a>(
+    state: &AppState,
+    full: &'a str,
+    record: &mut RequestRecord,
+) -> Result<Opened<'a>, Refusal> {
+    let nolead = full.strip_prefix('/').unwrap_or(full);
     let first_segment = nolead.split('/').next().unwrap_or("");
-    // Grammar failures answer 400 with the parser's own
-    // message as the body: it names only what the caller
-    // sent, and it is the difference between a debuggable
-    // rejection and an empty one.
-    let (signature, key_id, rest) = if crate::url::looks_sealed(first_segment)
+    if crate::url::looks_sealed(first_segment)
         && crate::url::split_sealed_segment(first_segment).is_none()
     {
         // Marker-shaped but not a token this scheme opens
         // (an unknown version): the uniform refusal, never
         // the grammar's 400, so the answer cannot announce
         // that the segment was not a token at all.
-        return sealed_refusal(record);
-    } else if let Some((kid, token)) = crate::url::split_sealed_segment(first_segment) {
-        if first_segment.len() > crabcrop_url::MAX_SEALED_SEGMENT {
-            return sealed_refusal(record);
-        }
-        let key_id = kid.map(str::to_string);
-        let verify_start = Instant::now();
-        let opened = state.keyring.open_sealed(key_id.as_deref(), token);
-        record.verify = verify_start.elapsed();
-        match opened {
-            Some(text) => {
-                sealed = true;
-                sealed_remainder = Some(text);
-                // The placeholder signature is never read:
-                // for a sealed request the open above was
-                // the verification the branch below runs
-                // for plain spellings.
-                (crate::url::Signature::Unsafe, key_id, "")
-            }
-            None => return sealed_refusal(record),
-        }
-    } else {
-        match parse_signature(&full) {
-            Ok(v) => v,
-            Err(e) => {
-                return (parse_failure(&e, accept), record);
-            }
-        }
-    };
-    let rest: &str = if sealed {
-        sealed_remainder
-            .as_deref()
-            .expect("set when the open succeeds")
-    } else {
-        rest
-    };
-    if !sealed {
-        let verify_start = Instant::now();
-        let verified =
-            state
-                .keyring
-                .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe);
-        record.verify = verify_start.elapsed();
-        if !verified {
-            return (
-                error_response(
-                    StatusCode::FORBIDDEN,
-                    "bad_signature",
-                    "bad signature".to_string(),
-                    accept,
-                ),
-                record,
-            );
-        }
+        return Err(Refusal::Unopened);
     }
+    if let Some((key_id, token)) = crate::url::split_sealed_segment(first_segment) {
+        if first_segment.len() > crabcrop_url::MAX_SEALED_SEGMENT {
+            return Err(Refusal::Unopened);
+        }
+        let verify_start = Instant::now();
+        let opened = state.keyring.open_sealed(key_id, token);
+        record.verify = verify_start.elapsed();
+        // For a sealed request the open is the
+        // verification the plain spelling runs below.
+        return match opened {
+            Some(text) => Ok(Opened {
+                remainder: std::borrow::Cow::Owned(text),
+                sealed: true,
+            }),
+            None => Err(Refusal::Unopened),
+        };
+    }
+    // Grammar failures answer 400 with the parser's own
+    // message as the body: it names only what the caller
+    // sent, and it is the difference between a debuggable
+    // rejection and an empty one.
+    let (signature, key_id, rest) =
+        parse_signature(full).map_err(|e| Refusal::AsIs(parse_failure_parts(&e)))?;
+    let verify_start = Instant::now();
+    let verified = state
+        .keyring
+        .verify(key_id.as_deref(), &signature, rest, state.allow_unsafe);
+    record.verify = verify_start.elapsed();
+    if !verified {
+        return Err(Refusal::AsIs((
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "bad signature".to_string(),
+        )));
+    }
+    Ok(Opened {
+        remainder: std::borrow::Cow::Borrowed(rest),
+        sealed: false,
+    })
+}
+
+/// What a verified remainder resolves to.
+struct Resolved {
+    /// The operations the engine runs: the remainder's
+    /// own, with the server-wide defaults merged in.
+    ops: Vec<crate::url::Operation>,
+    /// The source to fetch, a root source expanded.
+    source_url: String,
+    /// The cache groups (RFC 9875).
+    groups: Vec<String>,
+    /// The `maxage:` cache lifetime (issue #159).
+    max_age: Option<u32>,
+}
+
+/// The second stage of [`serve`]: expand and parse the
+/// remainder, recording its operation summary, and refuse
+/// what it may not ask for: a reserved segment, a preset
+/// or grammar failure, too many operations, an unknown
+/// source root, or an expired URL, in that order.
+fn resolve_request(
+    state: &AppState,
+    rest: &str,
+    record: &mut RequestRecord,
+) -> Result<Resolved, Refusal> {
+    let grammar = |e: crate::url::ParseError| Refusal::Payload(parse_failure_parts(&e));
     // Defense in depth for the purge domain separation (audit
     // P-1): an image remainder may not begin with the `purge`
     // segment, so the two URL shapes can never be confused.
@@ -2279,18 +2547,11 @@ async fn serve(
         rest.split('/').next(),
         Some("purge" | "purge-group" | "upload")
     ) {
-        if sealed {
-            return sealed_refusal(record);
-        }
-        return (
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "reserved_segment",
-                "an image URL may not begin with a purge or upload segment".to_string(),
-                accept,
-            ),
-            record,
-        );
+        return Err(Refusal::Payload((
+            StatusCode::BAD_REQUEST,
+            "reserved_segment",
+            "an image URL may not begin with a purge or upload segment".to_string(),
+        )));
     }
     // The cache groups (RFC 9875) are the presets the signed
     // remainder references, read before expansion rewrites it.
@@ -2303,28 +2564,10 @@ async fn serve(
     // Expansion always runs, even with no presets loaded:
     // a `preset:` segment is a grammar error
     // (`unknown_preset`) on every server, never source text.
-    let expanded;
-    let rest = match crate::url::expand_presets(rest, &state.presets, state.only_presets) {
-        Ok(text) => {
-            expanded = text;
-            &expanded
-        }
-        Err(e) => {
-            if sealed {
-                return sealed_refusal(record);
-            }
-            return (parse_failure(&e, accept), record);
-        }
-    };
-    let (ops, source_url, expiry, max_age) = match parse_operations_with_expiry(rest) {
-        Ok(v) => v,
-        Err(e) => {
-            if sealed {
-                return sealed_refusal(record);
-            }
-            return (parse_failure(&e, accept), record);
-        }
-    };
+    let rest =
+        crate::url::expand_presets(rest, &state.presets, state.only_presets).map_err(grammar)?;
+    let (ops, source_url, expiry, max_age) =
+        parse_operations_with_expiry(&rest).map_err(grammar)?;
     // The operation summary is everything before the source URL.
     record.ops = rest[..rest.len() - source_url.len()]
         .trim_end_matches('/')
@@ -2342,12 +2585,7 @@ async fn serve(
     // cache, the gates, and the source fetch, so an over-cap
     // URL (a short one repeating a preset included) costs a
     // parse and nothing more.
-    if let Err(e) = crate::url::check_operation_count(&ops) {
-        if sealed {
-            return sealed_refusal(record);
-        }
-        return (parse_failure(&e, accept), record);
-    }
+    crate::url::check_operation_count(&ops).map_err(grammar)?;
     // A root source expands here (issue #248): after
     // verification and the ops summary (which reads the
     // source as written), before the cache key and the
@@ -2355,19 +2593,8 @@ async fn serve(
     // are one render, sharing a cache entry and a purge
     // target. The loader's checks evaluate the expanded
     // URL unchanged, the allowlist included.
-    let expanded_url;
-    let source_url = match crate::url::expand_source_root(source_url, &state.source_roots) {
-        Ok((expanded, _)) => {
-            expanded_url = expanded;
-            expanded_url.as_str()
-        }
-        Err(e) => {
-            if sealed {
-                return sealed_refusal(record);
-            }
-            return (parse_failure(&e, accept), record);
-        }
-    };
+    let (source_url, _) =
+        crate::url::expand_source_root(source_url, &state.source_roots).map_err(grammar)?;
     // Expiry is enforced after signature verification (the
     // segment is inside the signed remainder, so a tampered
     // expiry already failed as a bad signature) and before the
@@ -2380,21 +2607,54 @@ async fn serve(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if now >= exp {
-            return (
-                error_response(
-                    StatusCode::FORBIDDEN,
-                    "signature_expired",
-                    "signature expired".to_string(),
-                    accept,
-                ),
-                record,
-            );
+            return Err(Refusal::AsIs((
+                StatusCode::FORBIDDEN,
+                "signature_expired",
+                "signature expired".to_string(),
+            )));
         }
     }
+    Ok(Resolved {
+        ops,
+        source_url,
+        groups,
+        max_age,
+    })
+}
 
+/// How the request's directives and headers shape its
+/// response.
+struct Negotiated {
+    directives: crate::url::RequestDirectives,
+    /// The format negotiated from `Accept`, when the URL
+    /// names none.
+    preferred: Option<ImageFormat>,
+    /// The DPR factor the response is rendered at.
+    effective_dpr: f32,
+    /// The quantized width a width hint resolves to.
+    hinted_width: Option<u32>,
+    /// Whether `Save-Data` changes the bytes.
+    save_data_applies: bool,
+    meta: bool,
+    debug: bool,
+    placeholders: bool,
+}
+
+/// The third stage of [`serve`]: settle the directives,
+/// the client hints, and the negotiated format, and refuse
+/// a meta request this server or this output cannot
+/// answer.
+fn negotiate(
+    state: &AppState,
+    ops: &[crate::url::Operation],
+    accept: Option<&str>,
+    dpr_hint: Option<f32>,
+    width_hint: Option<u32>,
+    save_data: bool,
+) -> Result<Negotiated, Refusal> {
     // One pass over the ops list settles every directive
     // the handler reads (issue #136).
-    let directives = crate::url::RequestDirectives::analyze(&ops);
+    let directives = crate::url::RequestDirectives::analyze(ops);
 
     // The DPR client hint settles sizing when the URL has no
     // explicit `dpr` directive; the effective factor is part of
@@ -2419,14 +2679,6 @@ async fn serve(
     // the key separates those entries under the same rule.
     let save_data_applies = save_data && !directives.quality_directive;
 
-    // Without an explicit format in the URL, the response depends
-    // on the Accept class as well as the path, so the cache key
-    // carries the class. Explicit-format URLs key on the path alone.
-    // The key is the request's canonical form (Q1): the
-    // parsed operations re-serialized in their one
-    // spelling, so equivalent requests share an entry.
-    // Expiry and the cache lifetime are not operations,
-    // so neither ever enters it.
     let preferred = negotiate_format(accept);
     let meta = wants_meta(accept);
     if meta && !state.meta_enabled {
@@ -2438,47 +2690,30 @@ async fn serve(
         // representation, so it carries the meta document's
         // caching headers: a cache that stored it under the
         // bare URL would serve it to every image viewer.
-        let (response, record) = if sealed {
-            sealed_refusal(record)
-        } else {
-            (
-                error_response(
-                    StatusCode::FORBIDDEN,
-                    "meta_disabled",
-                    "meta mode is disabled on this server: set CRABCROP_META_MODE=1 to enable it"
-                        .to_string(),
-                    accept,
-                ),
-                record,
-            )
-        };
-        return (meta_cache_headers(response), record);
+        return Err(Refusal::MetaDisabled((
+            StatusCode::FORBIDDEN,
+            "meta_disabled",
+            "meta mode is disabled on this server: set CRABCROP_META_MODE=1 to enable it"
+                .to_string(),
+        )));
     }
     let placeholders = meta && wants_placeholders(accept);
     let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
     // Meta describes an image; a video result is not one.
     // Refuse specifically rather than describing encoded
-    // video bytes as if they were a still image.
+    // video bytes as if they were a still image. The
+    // message echoes the payload's own format argument, so
+    // a sealed request answers the uniform refusal instead
+    // (issue #255).
     if meta && wants_video {
-        if sealed {
-            // The plain form's message echoes the payload's
-            // own format argument; a sealed payload failure
-            // answers the uniform refusal instead (issue
-            // #255).
-            return sealed_refusal(record);
-        }
-        return (
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "meta_not_available",
-                format!(
-                    "meta is not available for video output: format({}) serves encoded video, not an image",
-                    crate::url::format_text(directives.explicit_format.unwrap())
-                ),
-                accept,
+        return Err(Refusal::Payload((
+            StatusCode::BAD_REQUEST,
+            "meta_not_available",
+            format!(
+                "meta is not available for video output: format({}) serves encoded video, not an image",
+                crate::url::format_text(directives.explicit_format.unwrap())
             ),
-            record,
-        );
+        )));
     }
     // The debug view (issue #164) is a diagnostic computed
     // from this request's own processing: it bypasses the
@@ -2488,21 +2723,42 @@ async fn serve(
     // the meta document reports on.
     let debug = directives.debug_focal;
     if meta && debug {
-        if sealed {
-            return sealed_refusal(record);
-        }
-        return (
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "meta_not_available",
-                "meta is not available for debug output: debug:focal serves a diagnostic image, not a transform result"
-                    .to_string(),
-                accept,
-            ),
-            record,
-        );
+        return Err(Refusal::Payload((
+            StatusCode::BAD_REQUEST,
+            "meta_not_available",
+            "meta is not available for debug output: debug:focal serves a diagnostic image, not a transform result"
+                .to_string(),
+        )));
     }
-    let key_base = crate::url::canonical_form(&ops, source_url);
+    Ok(Negotiated {
+        directives,
+        preferred,
+        effective_dpr,
+        hinted_width,
+        save_data_applies,
+        meta,
+        debug,
+        placeholders,
+    })
+}
+
+/// The fourth stage of [`serve`]: the request's cache key.
+///
+/// Without an explicit format in the URL, the response depends
+/// on the Accept class as well as the path, so the cache key
+/// carries the class. Explicit-format URLs key on the path alone.
+/// The key is the request's canonical form (Q1): the
+/// parsed operations re-serialized in their one
+/// spelling, so equivalent requests share an entry.
+/// Expiry and the cache lifetime are not operations,
+/// so neither ever enters it.
+fn cache_key_for(
+    config_fingerprint: &str,
+    ops: &[crate::url::Operation],
+    source_url: &str,
+    negotiated: &Negotiated,
+) -> String {
+    let key_base = crate::url::canonical_form(ops, source_url);
     // The key also carries the configuration fingerprint
     // (audit R2-08): entries in the persistent tiers are
     // keyed under the configuration that produced them, so
@@ -2512,11 +2768,11 @@ async fn serve(
     // instead of serving the old configuration's renders.
     // The fingerprint sits inside the base, ahead of the
     // negotiated-class and hint suffixes.
-    let key_base = format!("{key_base}#cfg{}", state.config_fingerprint);
-    let mut cache_key = if directives.explicit_format.is_some() {
-        key_base.clone()
+    let key_base = format!("{key_base}#cfg{config_fingerprint}");
+    let mut cache_key = if negotiated.directives.explicit_format.is_some() {
+        key_base
     } else {
-        let class = match preferred {
+        let class = match negotiated.preferred {
             Some(ImageFormat::Avif) => "avif",
             Some(ImageFormat::Jxl) => "jxl",
             Some(ImageFormat::WebP) => "webp",
@@ -2524,67 +2780,60 @@ async fn serve(
         };
         format!("{key_base}#{class}")
     };
-    if let Some(w) = hinted_width {
+    if let Some(w) = negotiated.hinted_width {
         cache_key = format!("{cache_key}#w{w}");
     }
-    if save_data_applies {
+    if negotiated.save_data_applies {
         cache_key = format!("{cache_key}#sd");
     }
+    let effective_dpr = negotiated.effective_dpr;
     if effective_dpr != 1.0 {
         cache_key = format!("{cache_key}#dpr{effective_dpr}");
     }
-    // The key fully determines the lookup: a stored response can
-    // be served without touching the loader or the engine. Meta
-    // requests bypass the cache in both directions: they must
-    // never be answered with image bytes, and their JSON is never
-    // stored as an image entry. Debug requests bypass it too:
-    // the diagnostic must never be served from, or stored into,
-    // any tier (its key differs from the plain URL's anyway, but
-    // the bypass is the rule, not the key's accident).
-    let bypass = meta || debug;
-    if !bypass {
-        record.cache_looked_up = true;
-    }
-    let work = MissWork {
-        ops,
-        source_url: source_url.to_string(),
-        directives,
-        preferred,
-        meta,
-        debug,
-        placeholders,
-        hinted_width,
-        dpr_hint,
-        save_data,
-        accept: accept.map(str::to_string),
-        groups: groups.clone(),
-        cache_key: cache_key.clone(),
-        max_age,
-        sealed,
-    };
+    cache_key
+}
+
+/// The flight key of a meta request (issue #295): the
+/// cache key plus every fact the document depends on
+/// beyond it (the sealed spelling, which redacts the
+/// document, the placeholder fields, and the Accept
+/// opt-ins), each computed by the same helpers the miss
+/// path branches on, so the key can never disagree with
+/// the document a flight shares.
+fn meta_flight_key(work: &MissWork) -> String {
+    let cache_key = &work.cache_key;
+    let accept = work.accept.as_deref();
+    format!(
+        "{cache_key}\u{1}meta\u{1}{}{}{}{}{}{}",
+        work.sealed as u8,
+        work.placeholders as u8,
+        wants_detections(accept) as u8,
+        wants_moderation(accept) as u8,
+        wants_embeddings(accept) as u8,
+        wants_ocr(accept) as u8,
+    )
+}
+
+/// The last stage of [`serve`]: serve the keyed request.
+/// A debug request runs the miss path on its own, a meta
+/// request coalesces through its own flights, and an image
+/// request reads the tiers and coalesces its miss.
+async fn run_flight(
+    state: &AppState,
+    path: &str,
+    work: MissWork,
+    if_none_match: Option<&str>,
+    mut record: RequestRecord,
+) -> (Response, RequestRecord) {
     // Debug requests bypass everything, per request.
-    if debug {
+    if work.debug {
         let (response, record, _) = serve_miss(state, work, record).await;
         return (response, record);
     }
     // Meta requests coalesce through their own flights
-    // (issue #295): the flight key is the cache key plus
-    // every fact the document depends on beyond it (the
-    // sealed spelling, which redacts the document, the
-    // placeholder fields, and the Accept opt-ins), each
-    // computed by the same helpers the miss path branches
-    // on, so the key can never disagree with the document
-    // a flight shares.
-    if meta {
-        let flight_key = format!(
-            "{cache_key}\u{1}meta\u{1}{}{}{}{}{}{}",
-            sealed as u8,
-            placeholders as u8,
-            wants_detections(accept) as u8,
-            wants_moderation(accept) as u8,
-            wants_embeddings(accept) as u8,
-            wants_ocr(accept) as u8,
-        );
+    // (issue #295), keyed by [`meta_flight_key`].
+    if work.meta {
+        let flight_key = meta_flight_key(&work);
         return serve_meta_flight(state, work, record, &flight_key).await;
     }
     // Singleflight (audit R2-09): the first miss for a key
@@ -2616,7 +2865,15 @@ async fn serve(
     // and runs the miss path itself (issue #375), so it
     // ends with the origin's real answer instead of a busy
     // response masking it.
+    let (preferred, dpr_hint, hinted_width, save_data) = (
+        work.preferred,
+        work.dpr_hint,
+        work.hinted_width,
+        work.save_data,
+    );
     let flight_request = format!("{path:?}{preferred:?}{dpr_hint:?}{hinted_width:?}{save_data}");
+    let (cache_key, groups) = (work.cache_key.clone(), work.groups.clone());
+    let (max_age, sealed) = (work.max_age, work.sealed);
     let mut waits = 0;
     let mut followed: Option<Arc<FlightSlot>> = None;
     loop {
@@ -2746,7 +3003,7 @@ const META_SHARE_CAP: usize = 4 * 1024 * 1024;
 /// process times), and a follower's response headers are
 /// the leader's, which is sound because the flight key
 /// pins every input the headers and the document were
-/// computed from (see `serve`).
+/// computed from (see [`meta_flight_key`]).
 async fn serve_meta_flight(
     state: &AppState,
     work: MissWork,
@@ -3201,8 +3458,8 @@ async fn lookup_disk_tier(
 }
 
 /// Everything the cache-miss path needs, bundled so the
-/// singleflight loop in `serve` can hand it to whichever
-/// request leads the miss.
+/// singleflight loop in `run_flight` can hand it to
+/// whichever request leads the miss.
 struct MissWork {
     ops: Vec<crate::url::Operation>,
     source_url: String,
@@ -3246,16 +3503,150 @@ fn ai_gate_applies(
         || (directives.smart_crop && (face_provider || focal_provider))
 }
 
+/// The gates a miss's engine run takes beyond its lane
+/// permit (issue #357).
+#[derive(Clone, Copy)]
+struct GateNeeds {
+    /// The AI gate: the request runs inference (see
+    /// [`ai_gate_applies`]).
+    ai: bool,
+    /// The video gate: a video encode, a `frame:`
+    /// extraction, or a `page:` render.
+    video: bool,
+    /// The animation gate: an animated WebP encode (see
+    /// [`wants_animation_gate`]).
+    anim: bool,
+}
+
+/// The gate a run found still full when its wait ran out.
+#[derive(Clone, Copy)]
+enum Busy {
+    Ai,
+    Video,
+    Anim,
+}
+
+impl Busy {
+    /// The first run's 503 for the full gate. A fallback
+    /// retry that meets one leaves the original engine
+    /// error standing instead.
+    fn response(self, accept: Option<&str>) -> Response {
+        let message = match self {
+            Busy::Ai => "server busy: AI processing queue is full",
+            Busy::Video => "server busy: video processing queue is full",
+            Busy::Anim => "server busy: animation encoding queue is full",
+        };
+        busy_response(message, 5, accept)
+    }
+}
+
+/// One permit from `gate`, waiting at most `wait` for it.
+async fn acquire_gate(
+    gate: &Arc<tokio::sync::Semaphore>,
+    wait: std::time::Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match tokio::time::timeout(wait, gate.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Some(permit),
+        _ => None,
+    }
+}
+
+/// Take the permits a miss's run needs beyond its lane
+/// permit, AI then video then animation: the one
+/// acquisition the first run and the fallback retry share
+/// (issue #479). Each wait is bounded (audit PL-14): a
+/// burst sheds with a 503 instead of parking unbounded
+/// tasks on a gate. The permits travel with the process
+/// job, and `run_process` holds them until the job
+/// actually finishes (issue #357). A gate still full when
+/// its wait runs out is the [`Busy`] it names, and the
+/// permits already taken drop with it.
+async fn acquire_job_permits(state: &AppState, needs: GateNeeds) -> Result<JobPermits, Busy> {
+    let mut permits = JobPermits::default();
+    // AI inference is gated process-wide: a burst of removebg
+    // requests must not starve the transform pipeline.
+    if needs.ai {
+        permits.ai = Some(
+            acquire_gate(&state.ai_gate, AI_GATE_WAIT)
+                .await
+                .ok_or(Busy::Ai)?,
+        );
+    }
+    // Video work sits behind its own gate, on top of the
+    // slow lane inside `run_process` (issue #324): the
+    // external encoder is the server's most expensive and
+    // least predictable work (seconds per job, a
+    // subprocess), so a burst of video requests sheds here
+    // instead of queueing unboundedly behind the transform
+    // pipeline, and its lane permit comes from the slow
+    // lane, never from the stills pool.
+    // Frame extraction (issue #214) takes the same gate:
+    // it runs the same class of subprocess. Page
+    // rendering (issue #215) takes it too: it is the
+    // external-tool gate in everything but name, and a
+    // second gate for the same class of work would only
+    // split the protection.
+    if needs.video {
+        permits.video = Some(
+            acquire_gate(&state.video_gate, VIDEO_GATE_WAIT)
+                .await
+                .ok_or(Busy::Video)?,
+        );
+    }
+    // Animated WebP encodes sit behind a single-permit
+    // gate of their own (issue #231): one encode can run
+    // for minutes, so without this gate duplicate or
+    // distinct animated renders stack encodes until the
+    // stills pool is drained. Behind the gate, a second
+    // animated request sheds here with an explanation
+    // instead of stacking, and the encode's lane permit
+    // comes from the slow lane (issue #324), so the still
+    // pool keeps every permit throughout.
+    if needs.anim {
+        permits.anim = Some(
+            acquire_gate(&state.anim_gate, ANIM_GATE_WAIT)
+                .await
+                .ok_or(Busy::Anim)?,
+        );
+    }
+    Ok(permits)
+}
+
+/// How a miss's engine runs go, decided once per miss so
+/// the first run and a fallback retry agree: the lane each
+/// takes its permit from (issue #324), the gates each takes
+/// beyond it, and when the process phase began, which
+/// starts the request's one deadline.
+#[derive(Clone, Copy)]
+struct RunPlan {
+    lane: Lane,
+    needs: GateNeeds,
+    start: Instant,
+}
+
+/// What a miss rendered.
+struct Rendered {
+    processed: crate::engine::ProcessedImage,
+    /// Whether it was rendered from the configured
+    /// fallback rather than the source.
+    used_fallback: bool,
+}
+
 /// The cache-miss path: load the source, resolve
 /// watermarks, run the engine under the gates, populate
 /// the tiers, and respond (a meta document when asked).
 /// Runs at most once per key at a time, led by one
-/// request while its duplicates wait (see `serve`).
+/// request while its duplicates wait (see `run_flight`).
 /// The third return value is the ETag of the rendered
 /// bytes when the response serves a render, so the
 /// caller can answer conditional requests against the
 /// bytes themselves; it is `None` for a meta document
 /// and for every error.
+///
+/// Every stage that can fail runs in [`render_miss`], and
+/// its failure is answered here, the one place on the
+/// miss path that knows the request's spelling (issue
+/// #479).
 async fn serve_miss(
     state: &AppState,
     work: MissWork,
@@ -3272,469 +3663,29 @@ async fn serve_miss(
     // source), and one that began before it does not, so
     // they outlive that purge's walk.
     let write_stamp = state.purge_guard.stamp();
+    let rendered = render_miss(state, &work, &mut record).await;
     let MissWork {
-        ops,
-        source_url,
-        directives,
-        preferred,
         meta,
         debug,
-        placeholders,
-        hinted_width,
-        dpr_hint,
-        save_data,
         accept,
         groups,
         cache_key,
         max_age,
         sealed,
+        ..
     } = work;
+    let Rendered {
+        processed,
+        used_fallback,
+    } = match rendered {
+        Ok(rendered) => rendered,
+        // Once a token has opened, every failure answers
+        // the uniform refusal (issues #255, #259); a plain
+        // request gets the failure's own answer.
+        Err(refusal) => return (sealed_or(sealed, refusal), record, None),
+    };
     let accept = accept.as_deref();
     let cache_status = "crabcrop; fwd=uri-miss";
-    let source_url = source_url.as_str();
-    let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
-    // A `frame:` segment makes the source a video (issue
-    // #214): only then may the loader accept a `video/*`
-    // Content-Type for it. A `page:` segment does the
-    // same for `application/pdf` (issue #215).
-    let wants_frame = directives.frame.is_some();
-    let wants_page = directives.page.is_some();
-    record.load_ran = true;
-    // Every byte this miss buffers, the source, its
-    // watermarks, a fallback, is charged to the source
-    // buffer budget as it arrives (issue #403), and the
-    // charge travels with the bytes into the render job,
-    // which returns it when it finishes. A burst of distinct
-    // misses therefore waits here, before the gates below,
-    // instead of each buffering a whole source first; a miss
-    // whose wait for budget runs out sheds like a full gate.
-    // Nothing is charged before an origin answers, and an
-    // origin that answers and then falls behind, stalling or
-    // trickling, holds only what it has delivered (see
-    // `SourceCharge`).
-    let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
-    let load_start = Instant::now();
-    let mut used_fallback = false;
-    let admission = crate::loader::MediaAdmission {
-        video: wants_frame,
-        pdf: wants_page,
-    };
-    let bytes = match state
-        .loader
-        .load_media_charged(source_url, admission, &charge)
-        .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            record.load = load_start.elapsed();
-            // A policy refusal (Forbidden) is a decision, not a
-            // failure: it never falls back. Neither does an
-            // exhausted budget (issue #403): that is overload,
-            // and the fallback would need budget too. Nor does
-            // source text that does not parse (issue #467): a
-            // 400 stays honest, like a grammar failure. Any
-            // other load failure degrades to the configured
-            // fallback when there is one.
-            let fb = if matches!(
-                e,
-                LoadError::Forbidden(_) | LoadError::Busy | LoadError::InvalidSource(_)
-            ) {
-                None
-            } else {
-                fallback_source_bytes(state, &charge).await
-            };
-            match fb {
-                Some(b) => {
-                    used_fallback = true;
-                    b
-                }
-                None => {
-                    // A budget shed is overload, like a full
-                    // gate, not a loader error (issue #403).
-                    if e != LoadError::Busy {
-                        record.fail = FailStage::Load;
-                    }
-                    return (
-                        sealed_or(sealed, load_error_response(e, accept)),
-                        record,
-                        None,
-                    );
-                }
-            }
-        }
-    };
-    record.load = load_start.elapsed();
-    record.bytes_in = bytes.len();
-
-    // Watermarks are fetched here, before the engine runs:
-    // each referenced image goes through the same loader (and
-    // its bounds and source policy) as sources, and a
-    // watermark that fails to load fails the request rather
-    // than being silently skipped. Only the bytes travel
-    // with the job: the decode happens inside the gated
-    // blocking job with the rest of the engine work, so a
-    // watermark that does not decode fails the request from
-    // there with the same engine error (audit R2-16).
-    // Watermark loads charge the same budget, against the
-    // request's one wait (issue #403); their share is split
-    // off to travel with the watermark bytes.
-    let mut watermark_images: Vec<(String, Vec<u8>)> = Vec::new();
-    for wm_url in &directives.watermark_urls {
-        record.load_ran = true;
-        let wm_bytes = match state
-            .loader
-            .load_media_charged(wm_url, crate::loader::MediaAdmission::default(), &charge)
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                if e != LoadError::Busy {
-                    record.fail = FailStage::Load;
-                }
-                return (
-                    sealed_or(sealed, load_error_response(e, accept)),
-                    record,
-                    None,
-                );
-            }
-        };
-        watermark_images.push((wm_url.to_string(), wm_bytes));
-    }
-    let watermark_bytes: usize = watermark_images.iter().map(|(_, b)| b.len()).sum();
-    let watermark_sources = Arc::new(WatermarkSources {
-        images: watermark_images,
-        share: Some(charge.split_off(watermark_bytes)),
-    });
-
-    record.process_ran = true;
-    let process_start = Instant::now();
-    let ai_gate_applies = ai_gate_applies(&directives, state.face.is_some(), state.focal.is_some());
-    // The request's one process deadline starts here, so
-    // the gate waits below and the run itself share a
-    // single budget (run_process takes it as a parameter).
-    let process_deadline = process_start + state.process_timeout;
-    // AI inference is gated process-wide: a burst of removebg
-    // requests must not starve the transform pipeline. The
-    // permit travels with the process job (run_process
-    // holds it until the job actually finishes).
-    let ai_permit = if ai_gate_applies {
-        // The wait is bounded (audit PL-14): a burst of AI
-        // requests sheds with a 503 instead of parking
-        // unbounded tasks on the gate.
-        match tokio::time::timeout(AI_GATE_WAIT, state.ai_gate.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Some(permit),
-            _ => {
-                return (
-                    sealed_or(
-                        sealed,
-                        busy_response("server busy: AI processing queue is full", 5, accept),
-                    ),
-                    record,
-                    None,
-                );
-            }
-        }
-    } else {
-        None
-    };
-    // Video work sits behind its own gate, on top of the
-    // slow lane inside `run_process` (issue #324): the
-    // external encoder is the server's most expensive and
-    // least predictable work (seconds per job, a
-    // subprocess), so a burst of video requests sheds here
-    // instead of queueing unboundedly behind the transform
-    // pipeline, and its lane permit comes from the slow
-    // lane, never from the stills pool.
-    // Frame extraction (issue #214) takes the same gate:
-    // it runs the same class of subprocess. Page
-    // rendering (issue #215) takes it too: it is the
-    // external-tool gate in everything but name, and a
-    // second gate for the same class of work would only
-    // split the protection. Like the AI permit, it
-    // travels with the process job and drains with it
-    // (issue #357).
-    let video_permit = if wants_video || wants_frame || wants_page {
-        match tokio::time::timeout(VIDEO_GATE_WAIT, state.video_gate.clone().acquire_owned()).await
-        {
-            Ok(Ok(permit)) => Some(permit),
-            _ => {
-                return (
-                    sealed_or(
-                        sealed,
-                        busy_response("server busy: video processing queue is full", 5, accept),
-                    ),
-                    record,
-                    None,
-                );
-            }
-        }
-    } else {
-        None
-    };
-    // Animated WebP encodes sit behind a single-permit
-    // gate of their own (issue #231): one encode can run
-    // for minutes, so without this gate duplicate or
-    // distinct animated renders stack encodes until the
-    // stills pool is drained. Behind the gate, a second
-    // animated request sheds here with an explanation
-    // instead of stacking, and the encode's lane permit
-    // comes from the slow lane (issue #324), so the still
-    // pool keeps every permit throughout. Like the AI
-    // permit, it travels with the process job and drains
-    // with it (issue #357). The decision covers animated
-    // GIF sources rendered to WebP as well as animated
-    // WebP sources, and counts the negotiated format, not
-    // only an explicit one (issue #405); it is made once,
-    // so the gate, the lane, and a fallback retry agree.
-    let animated_webp = wants_animation_gate(&bytes, &directives, preferred);
-    let anim_permit = if animated_webp {
-        match tokio::time::timeout(ANIM_GATE_WAIT, state.anim_gate.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Some(permit),
-            _ => {
-                return (
-                    sealed_or(
-                        sealed,
-                        busy_response("server busy: animation encoding queue is full", 5, accept),
-                    ),
-                    record,
-                    None,
-                );
-            }
-        }
-    } else {
-        None
-    };
-    // A width hint applies only when the URL sizes nothing
-    // itself: it synthesizes the width-only size op a client
-    // URL would have carried, ahead of the URL's own ops.
-    // The op carries `no_upscale` semantics (issue #403): a
-    // hint says how wide the client displays the image, not
-    // that the server should invent pixels, so a hint past
-    // the source returns the source width, and the DPR hint
-    // runs into the same cap. The directive is request-wide,
-    // but the URL has no size op of its own here, so the
-    // synthesized op is the only resize it can bound.
-    let job_ops = match hinted_width {
-        Some(w) => {
-            let mut combined = vec![crate::url::Operation::Size(crate::url::ImageSize {
-                width: crate::url::Dimension::Pixels(w),
-                height: crate::url::Dimension::Proportional,
-                flip_horizontal: false,
-                flip_vertical: false,
-            })];
-            if !directives.no_upscale {
-                combined.push(crate::url::Operation::Filters(vec![
-                    crate::url::Filter::NoUpscale,
-                ]));
-            }
-            combined.extend(ops.iter().cloned());
-            combined
-        }
-        None => ops.clone(),
-    };
-    let job = ProcessJob {
-        save_data,
-        preserve_metadata: state.preserve_metadata,
-        ops: job_ops,
-        preferred,
-        watermark_sources,
-        placeholders,
-        mask_provider: state.removebg.clone(),
-        upscale_provider: state.upscale.clone(),
-        inpaint_provider: state.inpaint.clone(),
-        segment_provider: state.segment.clone(),
-        face_provider: state.face.clone(),
-        detect_provider: state.detect.clone(),
-        declared_detect_providers: state.detectors.iter().map(|d| d.provider.clone()).collect(),
-        focal_provider: state.focal.clone(),
-        text_renderer: state.font.clone(),
-        video_encoder: state.video_encoder.clone(),
-        frame_extractor: state.frame_extractor.clone(),
-        pdf_renderer: state.pdf_renderer.clone(),
-        provenance_signer: state.provenance_signer.clone(),
-        ai_edited: directives.removebg
-            || directives.studio
-            || directives.remove_region
-            || directives.upscale
-            || directives.needs_face_model
-            || directives.has_class_redaction(),
-        want_provenance: meta,
-        dpr: dpr_hint,
-        ssim_target: state.ssim_target,
-        brand_color: state.brand_color,
-        avif_speed: state.avif_speed,
-        jxl_speed: state.jxl_speed,
-    };
-    // The lane this run draws its permit from (issue
-    // #324): long-running work goes to the slow lane, so
-    // its saturation sheds slow requests only and stills
-    // keep their full capacity; everything else takes
-    // the stills lane.
-    let lane = if wants_slow_lane(animated_webp, wants_video, wants_frame, wants_page) {
-        Lane::Slow
-    } else {
-        Lane::Process
-    };
-    let permits = JobPermits {
-        ai: ai_permit,
-        video: video_permit,
-        anim: anim_permit,
-    };
-    let source = JobSource {
-        bytes,
-        share: Some(charge),
-    };
-    let processed = match run_process(state, &job, source, lane, process_deadline, permits).await {
-        Ok(p) => p,
-        Err(ProcessFailure::Busy) => {
-            return (
-                sealed_or(
-                    sealed,
-                    match lane {
-                        Lane::Slow => busy_response(
-                            "server busy: long-running processing lane is full",
-                            5,
-                            accept,
-                        ),
-                        Lane::Process => busy_response(
-                            "server busy: too many images processing at once",
-                            1,
-                            accept,
-                        ),
-                    },
-                ),
-                record,
-                None,
-            );
-        }
-        Err(ProcessFailure::Panicked) => {
-            record.fail = FailStage::Engine;
-            return (
-                sealed_or(
-                    sealed,
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "processing_failed",
-                        "image processing failed".to_string(),
-                        accept,
-                    ),
-                ),
-                record,
-                None,
-            );
-        }
-        Err(ProcessFailure::TimedOut) => {
-            record.fail = FailStage::Engine;
-            return (
-                sealed_or(
-                    sealed,
-                    error_response(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "processing_timeout",
-                        "processing timed out".to_string(),
-                        accept,
-                    ),
-                ),
-                record,
-                None,
-            );
-        }
-        Err(ProcessFailure::Engine(e)) => {
-            record.process = process_start.elapsed();
-            // A source that loads but does not decode is the
-            // other fallback case. Other engine errors are
-            // properties of the request or the configuration,
-            // not of the source, and stay honest.
-            // The first run's source share drained with its
-            // job, so the fallback is charged afresh (issue
-            // #403), with a wait of its own like each gate
-            // below; the watermarks keep the share they
-            // travel with. No budget leaves the original
-            // engine error standing, like a full gate.
-            let retry_charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
-            let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
-                match fallback_source_bytes(state, &retry_charge).await {
-                    Some(fb) => {
-                        // The fallback run draws on the same
-                        // gates as the first: each kind of
-                        // work re-acquires its permit (the
-                        // first run's permits drained with
-                        // its job), and a full gate leaves
-                        // the original engine error standing.
-                        let mut retry_permits = JobPermits::default();
-                        let mut may_retry = true;
-                        if ai_gate_applies {
-                            match tokio::time::timeout(
-                                AI_GATE_WAIT,
-                                state.ai_gate.clone().acquire_owned(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(p)) => retry_permits.ai = Some(p),
-                                _ => may_retry = false,
-                            }
-                        }
-                        if may_retry && (wants_video || wants_frame || wants_page) {
-                            match tokio::time::timeout(
-                                VIDEO_GATE_WAIT,
-                                state.video_gate.clone().acquire_owned(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(p)) => retry_permits.video = Some(p),
-                                _ => may_retry = false,
-                            }
-                        }
-                        if may_retry && animated_webp {
-                            match tokio::time::timeout(
-                                ANIM_GATE_WAIT,
-                                state.anim_gate.clone().acquire_owned(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(p)) => retry_permits.anim = Some(p),
-                                _ => may_retry = false,
-                            }
-                        }
-                        if may_retry {
-                            let source = JobSource {
-                                bytes: fb,
-                                share: Some(retry_charge),
-                            };
-                            run_process(state, &job, source, lane, process_deadline, retry_permits)
-                                .await
-                                .ok()
-                        } else {
-                            None
-                        }
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            };
-            match retry {
-                Some(p) => {
-                    used_fallback = true;
-                    record.process = process_start.elapsed();
-                    p
-                }
-                None => {
-                    record.fail = FailStage::Engine;
-                    return (
-                        sealed_or(sealed, engine_error_response(e, accept)),
-                        record,
-                        None,
-                    );
-                }
-            }
-        }
-    };
-    record.process = process_start.elapsed();
-    // The source's budget share drained with its run; the
-    // watermarks go now with theirs (issue #403), not after
-    // the population writes and meta annotations.
-    drop(job);
     // The validator for this render is a digest of its
     // bytes, computed once here: it is stored with the
     // cache entry and returned to the caller, so a hit and
@@ -3761,27 +3712,454 @@ async fn serve_miss(
             etag: render_etag.clone(),
             written: Some(write_stamp),
         };
-        // Population runs under the purge guard (issue
-        // #350): a purge that landed while this render was
-        // running keeps the entry out of every tier, while
-        // the response below still serves the render
-        // itself. The shared tier's write stays off the
-        // response path.
-        put_memory_tier(state, write_snapshot, &cache_key, &entry);
-        // The shared write is spawned before the disk
-        // write waits (issue #347): it is already off the
-        // response path, and the order means a request
-        // dropped during the disk write cannot strand it.
-        spawn_shared_put(
-            state,
-            write_snapshot,
-            &cache_key,
-            entry.clone(),
-            SharedWrite::Render,
-        );
-        put_disk_tier(state, write_snapshot, &cache_key, &entry).await;
+        populate_tiers(state, write_snapshot, &cache_key, entry).await;
     }
     record.bytes_out = processed.bytes.len();
+    let mut response = if meta {
+        meta_document(state, &processed, sealed, accept).await
+    } else {
+        respond(
+            processed.format,
+            processed.quality,
+            bytes::Bytes::from(processed.bytes),
+            max_age,
+        )
+    };
+    if !meta {
+        attach_cache_headers(&mut response, cache_status, &groups, sealed);
+    }
+    if used_fallback {
+        record.fallback = true;
+        response.headers_mut().insert(
+            "x-crabcrop-fallback",
+            axum::http::HeaderValue::from_static("1"),
+        );
+        // A fallback is a placeholder for a transient failure:
+        // it must never be pinned downstream for the immutable
+        // year (audit PL-2).
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    if debug {
+        // A diagnostic is computed for this request only: no
+        // downstream cache may pin it.
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    // A meta response serves a document about the render,
+    // not the render: it carries no validator for the
+    // image bytes (and is no-store besides).
+    let render_etag = if meta { None } else { Some(render_etag) };
+    (response, record, render_etag)
+}
+
+/// The stages of the miss path that can fail (issue #479):
+/// [`load_source`], [`load_watermarks`], [`build_job`], and
+/// [`render_with_fallback`], which takes the gates through
+/// [`acquire_job_permits`]. A failure is the plain
+/// request's answer, which [`serve_miss`] maps for a sealed
+/// one.
+async fn render_miss(
+    state: &AppState,
+    work: &MissWork,
+    record: &mut RequestRecord,
+) -> Result<Rendered, Response> {
+    let accept = work.accept.as_deref();
+    let directives = &work.directives;
+    let wants_video = directives.explicit_format.is_some_and(|f| f.is_video());
+    // A `frame:` segment makes the source a video (issue
+    // #214): only then may the loader accept a `video/*`
+    // Content-Type for it. A `page:` segment does the
+    // same for `application/pdf` (issue #215).
+    let wants_frame = directives.frame.is_some();
+    let wants_page = directives.page.is_some();
+    record.load_ran = true;
+    // Every byte this miss buffers, the source, its
+    // watermarks, a fallback, is charged to the source
+    // buffer budget as it arrives (issue #403), and the
+    // charge travels with the bytes into the render job,
+    // which returns it when it finishes. A burst of distinct
+    // misses therefore waits here, before the gates below,
+    // instead of each buffering a whole source first; a miss
+    // whose wait for budget runs out sheds like a full gate.
+    // Nothing is charged before an origin answers, and an
+    // origin that answers and then falls behind, stalling or
+    // trickling, holds only what it has delivered (see
+    // `SourceCharge`).
+    let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
+    let admission = crate::loader::MediaAdmission {
+        video: wants_frame,
+        pdf: wants_page,
+    };
+    let (bytes, used_fallback) =
+        load_source(state, &work.source_url, admission, &charge, accept, record).await?;
+    let watermark_sources =
+        load_watermarks(state, &directives.watermark_urls, &charge, accept, record).await?;
+
+    record.process_ran = true;
+    let process_start = Instant::now();
+    let needs = GateNeeds {
+        ai: ai_gate_applies(directives, state.face.is_some(), state.focal.is_some()),
+        video: wants_video || wants_frame || wants_page,
+        // The animation decision covers animated GIF
+        // sources rendered to WebP as well as animated WebP
+        // sources, and counts the negotiated format, not
+        // only an explicit one (issue #405); it is made
+        // once, so the gate, the lane, and a fallback retry
+        // agree.
+        anim: wants_animation_gate(&bytes, directives, work.preferred),
+    };
+    // The lane this run draws its permit from (issue
+    // #324): long-running work goes to the slow lane, so
+    // its saturation sheds slow requests only and stills
+    // keep their full capacity; everything else takes
+    // the stills lane.
+    let lane = if wants_slow_lane(needs.anim, wants_video, wants_frame, wants_page) {
+        Lane::Slow
+    } else {
+        Lane::Process
+    };
+    let plan = RunPlan {
+        lane,
+        needs,
+        start: process_start,
+    };
+    let job = build_job(state, work, watermark_sources);
+    let source = JobSource {
+        bytes,
+        share: Some(charge),
+    };
+    let rendered =
+        render_with_fallback(state, &job, source, used_fallback, plan, accept, record).await;
+    // The source's budget share drained with its run; the
+    // watermarks go now with theirs (issue #403), not after
+    // the population writes and meta annotations.
+    drop(job);
+    rendered
+}
+
+/// Load the miss's source, charged to `charge` (issue
+/// #403), timing the load into the record. Returns the
+/// bytes and whether they are the configured fallback's,
+/// which stands in for a source that failed to load.
+async fn load_source(
+    state: &AppState,
+    source_url: &str,
+    admission: crate::loader::MediaAdmission,
+    charge: &crate::loader::SourceCharge,
+    accept: Option<&str>,
+    record: &mut RequestRecord,
+) -> Result<(Vec<u8>, bool), Response> {
+    let load_start = Instant::now();
+    let loaded = match state
+        .loader
+        .load_media_charged(source_url, admission, charge)
+        .await
+    {
+        Ok(b) => (b, false),
+        Err(e) => {
+            record.load = load_start.elapsed();
+            // A policy refusal (Forbidden) is a decision, not a
+            // failure: it never falls back. Neither does an
+            // exhausted budget (issue #403): that is overload,
+            // and the fallback would need budget too. Nor does
+            // source text that does not parse (issue #467): a
+            // 400 stays honest, like a grammar failure. Any
+            // other load failure degrades to the configured
+            // fallback when there is one.
+            let fb = if matches!(
+                e,
+                LoadError::Forbidden(_) | LoadError::Busy | LoadError::InvalidSource(_)
+            ) {
+                None
+            } else {
+                fallback_source_bytes(state, charge).await
+            };
+            match fb {
+                Some(b) => (b, true),
+                None => {
+                    // A budget shed is overload, like a full
+                    // gate, not a loader error (issue #403).
+                    if e != LoadError::Busy {
+                        record.fail = FailStage::Load;
+                    }
+                    return Err(load_error_response(e, accept));
+                }
+            }
+        }
+    };
+    record.load = load_start.elapsed();
+    record.bytes_in = loaded.0.len();
+    Ok(loaded)
+}
+
+/// Load the miss's watermark images.
+///
+/// Watermarks are fetched here, before the engine runs:
+/// each referenced image goes through the same loader (and
+/// its bounds and source policy) as sources, and a
+/// watermark that fails to load fails the request rather
+/// than being silently skipped. Only the bytes travel
+/// with the job: the decode happens inside the gated
+/// blocking job with the rest of the engine work, so a
+/// watermark that does not decode fails the request from
+/// there with the same engine error (audit R2-16).
+/// Watermark loads charge the same budget, against the
+/// request's one wait (issue #403); their share is split
+/// off to travel with the watermark bytes.
+async fn load_watermarks(
+    state: &AppState,
+    urls: &[String],
+    charge: &crate::loader::SourceCharge,
+    accept: Option<&str>,
+    record: &mut RequestRecord,
+) -> Result<Arc<WatermarkSources>, Response> {
+    let mut watermark_images: Vec<(String, Vec<u8>)> = Vec::new();
+    for wm_url in urls {
+        record.load_ran = true;
+        let wm_bytes = match state
+            .loader
+            .load_media_charged(wm_url, crate::loader::MediaAdmission::default(), charge)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                if e != LoadError::Busy {
+                    record.fail = FailStage::Load;
+                }
+                return Err(load_error_response(e, accept));
+            }
+        };
+        watermark_images.push((wm_url.to_string(), wm_bytes));
+    }
+    let watermark_bytes: usize = watermark_images.iter().map(|(_, b)| b.len()).sum();
+    Ok(Arc::new(WatermarkSources {
+        images: watermark_images,
+        share: Some(charge.split_off(watermark_bytes)),
+    }))
+}
+
+/// The engine job for a miss: the request's operations and
+/// directives with the server's providers and settings.
+fn build_job(
+    state: &AppState,
+    work: &MissWork,
+    watermark_sources: Arc<WatermarkSources>,
+) -> ProcessJob {
+    let directives = &work.directives;
+    // A width hint applies only when the URL sizes nothing
+    // itself: it synthesizes the width-only size op a client
+    // URL would have carried, ahead of the URL's own ops.
+    // The op carries `no_upscale` semantics (issue #403): a
+    // hint says how wide the client displays the image, not
+    // that the server should invent pixels, so a hint past
+    // the source returns the source width, and the DPR hint
+    // runs into the same cap. The directive is request-wide,
+    // but the URL has no size op of its own here, so the
+    // synthesized op is the only resize it can bound.
+    let job_ops = match work.hinted_width {
+        Some(w) => {
+            let mut combined = vec![crate::url::Operation::Size(crate::url::ImageSize {
+                width: crate::url::Dimension::Pixels(w),
+                height: crate::url::Dimension::Proportional,
+                flip_horizontal: false,
+                flip_vertical: false,
+            })];
+            if !directives.no_upscale {
+                combined.push(crate::url::Operation::Filters(vec![
+                    crate::url::Filter::NoUpscale,
+                ]));
+            }
+            combined.extend(work.ops.iter().cloned());
+            combined
+        }
+        None => work.ops.clone(),
+    };
+    ProcessJob {
+        save_data: work.save_data,
+        preserve_metadata: state.preserve_metadata,
+        ops: job_ops,
+        preferred: work.preferred,
+        watermark_sources,
+        placeholders: work.placeholders,
+        mask_provider: state.removebg.clone(),
+        upscale_provider: state.upscale.clone(),
+        inpaint_provider: state.inpaint.clone(),
+        segment_provider: state.segment.clone(),
+        face_provider: state.face.clone(),
+        detect_provider: state.detect.clone(),
+        declared_detect_providers: state.detectors.iter().map(|d| d.provider.clone()).collect(),
+        focal_provider: state.focal.clone(),
+        text_renderer: state.font.clone(),
+        video_encoder: state.video_encoder.clone(),
+        frame_extractor: state.frame_extractor.clone(),
+        pdf_renderer: state.pdf_renderer.clone(),
+        provenance_signer: state.provenance_signer.clone(),
+        ai_edited: directives.removebg
+            || directives.studio
+            || directives.remove_region
+            || directives.upscale
+            || directives.needs_face_model
+            || directives.has_class_redaction(),
+        want_provenance: work.meta,
+        dpr: work.dpr_hint,
+        ssim_target: state.ssim_target,
+        brand_color: state.brand_color,
+        avif_speed: state.avif_speed,
+        jxl_speed: state.jxl_speed,
+    }
+}
+
+/// Run the miss's job under its gates, and once more on the
+/// configured fallback when the source loaded but did not
+/// decode ([`retry_on_fallback`]). Times the process phase
+/// into the record.
+async fn render_with_fallback(
+    state: &AppState,
+    job: &ProcessJob,
+    source: JobSource,
+    mut used_fallback: bool,
+    plan: RunPlan,
+    accept: Option<&str>,
+    record: &mut RequestRecord,
+) -> Result<Rendered, Response> {
+    // The request's one process deadline starts with the
+    // process phase, so the gate waits and the run itself
+    // share a single budget (run_process takes it as a
+    // parameter).
+    let deadline = plan.start + state.process_timeout;
+    let permits = acquire_job_permits(state, plan.needs)
+        .await
+        .map_err(|busy| busy.response(accept))?;
+    let processed = match run_process(state, job, source, plan.lane, deadline, permits).await {
+        Ok(p) => p,
+        Err(ProcessFailure::Busy) => {
+            return Err(match plan.lane {
+                Lane::Slow => busy_response(
+                    "server busy: long-running processing lane is full",
+                    5,
+                    accept,
+                ),
+                Lane::Process => {
+                    busy_response("server busy: too many images processing at once", 1, accept)
+                }
+            });
+        }
+        Err(ProcessFailure::Panicked) => {
+            record.fail = FailStage::Engine;
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "processing_failed",
+                "image processing failed".to_string(),
+                accept,
+            ));
+        }
+        Err(ProcessFailure::TimedOut) => {
+            record.fail = FailStage::Engine;
+            return Err(error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "processing_timeout",
+                "processing timed out".to_string(),
+                accept,
+            ));
+        }
+        Err(ProcessFailure::Engine(e)) => {
+            record.process = plan.start.elapsed();
+            // A source that loads but does not decode is the
+            // other fallback case. Other engine errors are
+            // properties of the request or the configuration,
+            // not of the source, and stay honest.
+            let retry = if !used_fallback && matches!(e, EngineError::Decode(_)) {
+                retry_on_fallback(state, job, plan, deadline).await
+            } else {
+                None
+            };
+            match retry {
+                Some(p) => {
+                    used_fallback = true;
+                    record.process = plan.start.elapsed();
+                    p
+                }
+                None => {
+                    record.fail = FailStage::Engine;
+                    return Err(engine_error_response(e, accept));
+                }
+            }
+        }
+    };
+    record.process = plan.start.elapsed();
+    Ok(Rendered {
+        processed,
+        used_fallback,
+    })
+}
+
+/// The fallback run for a source that loaded but did not
+/// decode: the same job on the configured fallback's bytes,
+/// under the same deadline. `None` leaves the original
+/// engine error standing: no fallback, no budget for it, a
+/// full gate, or a failed run.
+async fn retry_on_fallback(
+    state: &AppState,
+    job: &ProcessJob,
+    plan: RunPlan,
+    deadline: Instant,
+) -> Option<crate::engine::ProcessedImage> {
+    // The first run's source share drained with its job, so
+    // the fallback is charged afresh (issue #403), with a
+    // wait of its own like each gate below; the watermarks
+    // keep the share they travel with. No budget leaves the
+    // original engine error standing, like a full gate.
+    let charge = state.loader.source_budget().charge(SOURCE_BUDGET_WAIT);
+    let bytes = fallback_source_bytes(state, &charge).await?;
+    // The fallback run draws on the same gates as the first:
+    // each kind of work re-acquires its permit (the first
+    // run's permits drained with its job), and a full gate
+    // leaves the original engine error standing.
+    let permits = acquire_job_permits(state, plan.needs).await.ok()?;
+    let source = JobSource {
+        bytes,
+        share: Some(charge),
+    };
+    run_process(state, job, source, plan.lane, deadline, permits)
+        .await
+        .ok()
+}
+
+/// Store a fresh render in every tier under the purge
+/// guard (issue #350), at the generation the render
+/// started under: a purge that landed while this render
+/// was running keeps the entry out of every tier, while
+/// the response still serves the render itself. The shared
+/// tier's write stays off the response path.
+async fn populate_tiers(state: &AppState, snapshot: u64, cache_key: &str, entry: CachedImage) {
+    put_memory_tier(state, snapshot, cache_key, &entry);
+    // The shared write is spawned before the disk
+    // write waits (issue #347): it is already off the
+    // response path, and the order means a request
+    // dropped during the disk write cannot strand it.
+    spawn_shared_put(
+        state,
+        snapshot,
+        cache_key,
+        entry.clone(),
+        SharedWrite::Render,
+    );
+    put_disk_tier(state, snapshot, cache_key, &entry).await;
+}
+
+/// The meta document for a render: the annotation sections
+/// the request opts into, then the document itself.
+async fn meta_document(
+    state: &AppState,
+    processed: &crate::engine::ProcessedImage,
+    sealed: bool,
+    accept: Option<&str>,
+) -> Response {
     // The annotation sections share one deadline, the
     // same process budget the render ran under: a
     // section that has not answered when it passes is
@@ -3793,10 +4171,17 @@ async fn serve_miss(
     // recognition stops gathering instead of only being
     // cut off at the response.
     let annotation_deadline = Instant::now() + state.process_timeout;
-    let annotation = if meta {
+    let annotation = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(annotation_deadline),
+        annotate_meta(state, processed),
+    )
+    .await
+    .ok()
+    .flatten();
+    let detections = if wants_detections(accept) {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(annotation_deadline),
-            annotate_meta(state, &processed),
+            detect_meta(state, processed),
         )
         .await
         .ok()
@@ -3804,22 +4189,11 @@ async fn serve_miss(
     } else {
         None
     };
-    let detections = if meta && wants_detections(accept) {
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(annotation_deadline),
-            detect_meta(state, &processed),
-        )
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
-    let moderation = if meta && wants_moderation(accept) {
+    let moderation = if wants_moderation(accept) {
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                moderate_meta(state, &processed),
+                moderate_meta(state, processed),
             )
             .await
             {
@@ -3834,12 +4208,12 @@ async fn serve_miss(
     // fields: the embedding itself, when the client
     // opted in, and the aesthetic score, whenever a
     // head is configured. One run feeds both.
-    let want_embedding = meta && wants_embeddings(accept);
-    let embedding_run = if meta && (want_embedding || state.aesthetic.is_some()) {
+    let want_embedding = wants_embeddings(accept);
+    let embedding_run = if want_embedding || state.aesthetic.is_some() {
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                embed_meta(state, &processed),
+                embed_meta(state, processed),
             )
             .await
             {
@@ -3851,11 +4225,11 @@ async fn serve_miss(
         None
     };
     let aesthetic = compose_aesthetic(state, embedding_run.as_ref());
-    let ocr = if meta && wants_ocr(accept) {
+    let ocr = if wants_ocr(accept) {
         Some(
             match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(annotation_deadline),
-                ocr_meta(state, &processed, annotation_deadline),
+                ocr_meta(state, processed, annotation_deadline),
             )
             .await
             {
@@ -3866,56 +4240,20 @@ async fn serve_miss(
     } else {
         None
     };
-    let mut response = if meta {
-        meta_response(
-            &processed,
-            sealed,
-            annotation.as_ref(),
-            detections.as_deref(),
-            moderation.as_ref(),
-            if want_embedding {
-                embedding_run.as_ref()
-            } else {
-                None
-            },
-            aesthetic.as_ref(),
-            ocr.as_ref(),
-        )
-    } else {
-        respond(
-            processed.format,
-            processed.quality,
-            bytes::Bytes::from(processed.bytes),
-            max_age,
-        )
-    };
-    if !meta {
-        attach_cache_headers(&mut response, cache_status, &groups, sealed);
-    }
-    if used_fallback {
-        record.fallback = true;
-        response
-            .headers_mut()
-            .insert("x-crabcrop-fallback", "1".parse().unwrap());
-        // A fallback is a placeholder for a transient failure:
-        // it must never be pinned downstream for the immutable
-        // year (audit PL-2).
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    }
-    if debug {
-        // A diagnostic is computed for this request only: no
-        // downstream cache may pin it.
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    }
-    // A meta response serves a document about the render,
-    // not the render: it carries no validator for the
-    // image bytes (and is no-store besides).
-    let render_etag = if meta { None } else { Some(render_etag) };
-    (response, record, render_etag)
+    meta_response(
+        processed,
+        sealed,
+        annotation.as_ref(),
+        detections.as_deref(),
+        moderation.as_ref(),
+        if want_embedding {
+            embedding_run.as_ref()
+        } else {
+            None
+        },
+        aesthetic.as_ref(),
+        ocr.as_ref(),
+    )
 }
 
 /// Pick a format from the client's `Accept` header. Among
@@ -4021,19 +4359,25 @@ fn respond(
         Some(n) => format!("public, max-age={n}, immutable"),
     };
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(content_type),
+    );
     headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
     // The format may have been negotiated from the request's Accept.
-    headers.insert(header::VARY, "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data".parse().unwrap());
+    headers.insert(
+        header::VARY,
+        axum::http::HeaderValue::from_static(
+            "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data",
+        ),
+    );
     // Advertise the client hints the server reads, so
     // browsers send them on later requests; without the
     // advertisement only proxies and clients that set the
     // hints manually ever benefit from them.
     headers.insert(
         axum::http::HeaderName::from_static("accept-ch"),
-        "Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width"
-            .parse()
-            .unwrap(),
+        axum::http::HeaderValue::from_static("Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width"),
     );
     if let Some(q) = quality {
         headers.insert(
@@ -4247,16 +4591,29 @@ fn truncate_echo(message: &str) -> String {
     format!("{}...", &message[..end])
 }
 
+/// The parts of an error answer before [`error_response`]
+/// shapes them for the client's `Accept`: the status, the
+/// stable code, and the message. A refusal that carries
+/// them leaves the answer to the one place that knows how
+/// the request may be answered (see [`Refusal::answer`]).
+type ErrorParts = (StatusCode, &'static str, String);
+
+/// A grammar failure's parts: the parser's code and its
+/// (truncated) message.
+fn parse_failure_parts(e: &crate::url::ParseError) -> ErrorParts {
+    (
+        StatusCode::BAD_REQUEST,
+        e.code(),
+        truncate_echo(&e.to_string()),
+    )
+}
+
 /// A grammar failure's response: the parser's code and
 /// its (truncated) message, as plain text or the v2
 /// envelope per the client's Accept.
 fn parse_failure(e: &crate::url::ParseError, accept: Option<&str>) -> Response {
-    error_response(
-        StatusCode::BAD_REQUEST,
-        e.code(),
-        truncate_echo(&e.to_string()),
-        accept,
-    )
+    let (status, code, message) = parse_failure_parts(e);
+    error_response(status, code, message, accept)
 }
 
 /// The engine failure classes: status, stable code, and

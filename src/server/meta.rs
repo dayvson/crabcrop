@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use super::AppState;
@@ -1572,7 +1572,10 @@ pub(in crate::server) fn meta_response(
     };
     let body = serde_json::to_string(&meta).unwrap_or_default();
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     meta_cache_headers((StatusCode::OK, headers, body).into_response())
 }
 
@@ -1584,7 +1587,15 @@ pub(in crate::server) fn meta_response(
 /// representation and carries the same headers.
 pub(in crate::server) fn meta_cache_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
-    headers.insert(header::VARY, "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data".parse().unwrap());
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    headers.insert(
+        header::VARY,
+        HeaderValue::from_static(
+            "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data",
+        ),
+    );
     response
 }
