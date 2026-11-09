@@ -10281,17 +10281,18 @@ fn quality_in_force_resolves_each_form() {
     // reported, auto is picked and reported, and Save-Data steps
     // only a quality nobody set.
     let never = || -> u8 { panic!("only quality(auto) picks") };
+    let in_force = |encode, chosen| QualityInForce { encode, chosen };
     assert_eq!(
         quality_in_force(Some(ResolvedQuality::Value(55)), true, never),
-        (Some(55), None)
+        in_force(Some(55), None)
     );
     assert_eq!(
         quality_in_force(Some(ResolvedQuality::Auto), true, || 63),
-        (Some(63), Some(63))
+        in_force(Some(63), Some(63))
     );
     assert_eq!(
         quality_in_force(None, true, never),
-        (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY))
+        in_force(Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY))
     );
-    assert_eq!(quality_in_force(None, false, never), (None, None));
+    assert_eq!(quality_in_force(None, false, never), in_force(None, None));
 }

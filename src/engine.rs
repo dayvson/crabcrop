@@ -851,27 +851,40 @@ struct StillEncode {
     ssim: Option<f64>,
 }
 
-/// A resolved quality directive as an encode runs it: the
-/// quality the encode uses (`None` keeps the encoder default)
-/// and the quality reported back, set when the service chose
-/// it. `quality(auto)` is chosen by `pick` and reported. With
-/// no directive in force, `save_data` steps the default down
-/// one notch and reports the step like an auto pick; an
-/// explicit `quality(...)` of either kind stands. The still
-/// and the animated WebP encodes both resolve through here.
+/// A resolved quality directive as an encode runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct QualityInForce {
+    /// The quality the encode uses; `None` keeps the encoder
+    /// default.
+    encode: Option<u8>,
+    /// The quality reported back, set when the service chose
+    /// it rather than the caller.
+    chosen: Option<u8>,
+}
+
+/// Resolve a quality directive for an encode. `quality(auto)`
+/// is chosen by `pick` and reported. With no directive in
+/// force, `save_data` steps the default down one notch and
+/// reports the step like an auto pick; an explicit
+/// `quality(...)` of either kind stands. The still and the
+/// animated WebP encodes both resolve through here.
 fn quality_in_force(
     resolved: Option<ResolvedQuality>,
     save_data: bool,
     pick: impl FnOnce() -> u8,
-) -> (Option<u8>, Option<u8>) {
+) -> QualityInForce {
+    let chosen = |q| QualityInForce {
+        encode: Some(q),
+        chosen: Some(q),
+    };
     match resolved {
-        Some(ResolvedQuality::Value(q)) => (Some(q), None),
-        Some(ResolvedQuality::Auto) => {
-            let q = pick();
-            (Some(q), Some(q))
-        }
-        None if save_data => (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY)),
-        None => (None, None),
+        Some(ResolvedQuality::Value(q)) => QualityInForce {
+            encode: Some(q),
+            chosen: None,
+        },
+        Some(ResolvedQuality::Auto) => chosen(pick()),
+        None if save_data => chosen(SAVE_DATA_QUALITY),
+        None => QualityInForce::default(),
     }
 }
 
@@ -1522,8 +1535,10 @@ impl Engine {
         // Save-Data steps the default quality down one notch
         // (80 to 70) on the formats that carry a quality.
         let save_data = ctx.save_data && format.carries_quality();
-        let (encode_quality, chosen_quality) =
-            quality_in_force(resolved_quality, save_data, || auto_quality(img));
+        let QualityInForce {
+            encode: encode_quality,
+            chosen: chosen_quality,
+        } = quality_in_force(resolved_quality, save_data, || auto_quality(img));
         // `quality(auto)` on a format with a decoder to verify
         // against (JPEG, JXL) closes the loop: encode, decode,
         // score with SSIMULACRA2, and bisect on quality until the
@@ -1715,7 +1730,7 @@ impl Engine {
         // describes) and reported back, and Save-Data steps an
         // unspecified quality down one notch. GIF output has no
         // quality lever, so nothing resolves for it.
-        let (encode_quality, chosen_quality) = match format {
+        let quality = match format {
             AnimatedFormat::WebP => {
                 let resolved = encode_opts
                     .quality
@@ -1725,7 +1740,7 @@ impl Engine {
                     auto_quality(&DynamicImage::ImageRgba8(frames.first.buffer().clone()))
                 })
             }
-            AnimatedFormat::Gif => (None, None),
+            AnimatedFormat::Gif => QualityInForce::default(),
         };
         let (width, height) = frames.dimensions();
         // An animated output's placeholder comes from its first
@@ -1742,7 +1757,7 @@ impl Engine {
             AnimatedFormat::WebP => encode_animated_webp(
                 &frames,
                 loop_count.unwrap_or(0),
-                encode_quality,
+                quality.encode,
                 encode_opts.format_options,
                 ctx.deadline,
             )?,
@@ -1750,7 +1765,7 @@ impl Engine {
         Ok(ProcessedImage {
             bytes: out,
             format: format.into(),
-            quality: chosen_quality,
+            quality: quality.chosen,
             width,
             height,
             source_width,
