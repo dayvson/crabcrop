@@ -25,17 +25,27 @@
 //! limit.
 //!
 //! The walk is linear in the document because every step it
-//! takes spends a unit of fuel: every evaluation of an element
-//! in a role, a memoized result reused included, and every
-//! declared value examined for a reference, a value shared by
-//! many elements through an id or an `inherit`, `context-*`, or
-//! `<use>` list included. The fuel is a small multiple of the
-//! node limit, so the total work the walk does is bounded by it
+//! takes spends fuel: every evaluation of an element in a
+//! role, a memoized result reused included; every declared
+//! value examined for a reference, in proportion to its length
+//! ([`scan_units`]), a value shared by many elements through an
+//! id or an `inherit`, `context-*`, or `<use>` list included;
+//! every node a text element reads, the text a `tref` copies
+//! included; every child of a filter examined for an
+//! `feImage`; and the path data a marked shape's vertices are
+//! counted from. The fuel is a small multiple of the node
+//! limit, so the total work the walk does is bounded by it
 //! however the references fan out, and a document that would
 //! make the walk do more is refused (as `Nodes`) instead. The
 //! facts the walk reads are gathered once, under the same kind
-//! of bound: matching the style sheet's kept rules against the
-//! elements is capped at [`MAX_STYLE_MATCHES`] comparisons.
+//! of bound: each element's declarations are grouped by
+//! property, so reading one property's values up the ancestors
+//! costs those values and not every declaration on the way,
+//! the style sheet's declarations are checked against a set of
+//! the ids that name a costly element, the nodes inside
+//! `<use>` targets are marked once each, and matching the kept
+//! rules against the elements is capped at
+//! [`MAX_STYLE_MATCHES`] comparisons.
 //!
 //! It never undercounts those conversions. A reference whose
 //! source is ambiguous without usvg's full style resolution
@@ -53,7 +63,7 @@
 //! itself (a marker never draws inside its own content) and
 //! which therefore cost nothing here either.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roxmltree::Node;
 
@@ -143,6 +153,19 @@ pub(super) enum Refusal {
 /// stays under it) and refuses the quadratic case before it
 /// runs.
 const MAX_STYLE_MATCHES: u64 = 4_000_000;
+
+/// The bytes of a value that one unit of the walk's fuel pays
+/// to scan. A value of a property the walk follows is a few
+/// dozen bytes in a real drawing, one unit; a longer one costs
+/// in proportion, so a value examined from many sites (through
+/// an `inherit` or a shared id) spends fuel for the bytes read,
+/// not only for the times it is read.
+const SCAN_BYTES_PER_UNIT: usize = 64;
+
+/// The fuel scanning `len` bytes of a value spends.
+fn scan_units(len: usize) -> u64 {
+    1 + (len / SCAN_BYTES_PER_UNIT) as u64
+}
 
 /// The segments usvg may cut one elliptical arc into. kurbo
 /// subdivides an arc into up to `(11.163 * r)^(1/6)` cubics per
@@ -371,8 +394,19 @@ pub(super) fn bound(doc: &roxmltree::Document, limits: Limits) -> Result<Cost, R
         .nodes
         .saturating_mul(4)
         .saturating_add(4 * doc.descendants().len() as u64);
+    run_walk(doc, &facts, limits, fuel)
+}
+
+/// The expansion walk from the document's root, with `fuel`
+/// units of work to spend (see the module docs).
+fn run_walk<'a, 'input>(
+    doc: &'a roxmltree::Document<'input>,
+    facts: &Facts<'a, 'input>,
+    limits: Limits,
+    fuel: u64,
+) -> Result<Cost, Refusal> {
     let mut walk = Walk {
-        facts: &facts,
+        facts,
         limits,
         memo: HashMap::new(),
         depth: 0,
@@ -391,7 +425,9 @@ struct Facts<'a, 'input> {
     /// The values each element declares for each property, by
     /// node index: attributes, matching style sheet rules, and
     /// the `style` attribute. usvg's cascade keeps one of them;
-    /// the walk charges the costliest.
+    /// the walk charges the costliest. Each element's list is
+    /// grouped by property, in declaration order within each,
+    /// so [`Facts::values`] reads one property as a slice.
     decls: Vec<Vec<(Prop, &'a str)>>,
     /// Whether a node sits inside the target of some `<use>`,
     /// where it inherits from the `<use>` site too.
@@ -455,6 +491,10 @@ impl<'a, 'input> Facts<'a, 'input> {
                     }
                 }
             }
+            // A stable sort keeps each property's values in
+            // declaration order, which is all any reader of
+            // them sees.
+            decls.sort_by_key(|&(prop, _)| prop.index());
             for &(prop, value) in &decls {
                 if !is_inherit(value) {
                     facts.anywhere[prop.index()].push(value);
@@ -468,8 +508,18 @@ impl<'a, 'input> Facts<'a, 'input> {
             .collect();
         for &use_node in &uses {
             for target in facts.href_targets(use_node) {
-                for node in target.descendants() {
-                    facts.in_use[node.id().get_usize()] = true;
+                // A node already marked was marked with its whole
+                // subtree, so the marking stops there: each node
+                // is marked once, however many `<use>` elements
+                // reach it or however its targets nest.
+                let mut stack = vec![target];
+                while let Some(node) = stack.pop() {
+                    let index = node.id().get_usize();
+                    if facts.in_use[index] {
+                        continue;
+                    }
+                    facts.in_use[index] = true;
+                    stack.extend(node.children());
                 }
             }
         }
@@ -482,11 +532,15 @@ impl<'a, 'input> Facts<'a, 'input> {
         Ok(facts)
     }
 
+    /// The values `node` declares for `prop`. They are one run
+    /// of the node's grouped list, found by binary search, so
+    /// [`Facts::declared_up`] pays for the values it reads at
+    /// each ancestor, not for every other declaration there.
     fn values(&self, node: Node<'a, 'input>, prop: Prop) -> impl Iterator<Item = &'a str> + '_ {
-        self.decls[node.id().get_usize()]
-            .iter()
-            .filter(move |(p, _)| *p == prop)
-            .map(|(_, v)| *v)
+        let decls = &self.decls[node.id().get_usize()];
+        let start = decls.partition_point(|(p, _)| p.index() < prop.index());
+        let len = decls[start..].partition_point(|(p, _)| *p == prop);
+        decls[start..start + len].iter().map(|(_, v)| *v)
     }
 
     /// The values `prop` can take at `node` from the node and
@@ -585,19 +639,30 @@ impl<'a, 'input> Facts<'a, 'input> {
                 sheet.parse_more(text);
             }
         }
+        if sheet.rules.is_empty() {
+            return Vec::new();
+        }
+        // The ids naming at least one element of a kind that
+        // converts content, gathered once: checking each
+        // declaration against every element sharing its id
+        // would cost the declarations times the elements.
+        let costly_ids: HashSet<&str> = self
+            .ids
+            .iter()
+            .filter(|(_, nodes)| {
+                nodes.iter().any(|n| {
+                    matches!(
+                        n.tag_name().name(),
+                        "filter" | "mask" | "clipPath" | "marker" | "pattern"
+                    )
+                })
+            })
+            .map(|(&id, _)| id)
+            .collect();
         let costly = |value: &str| {
             is_inherit(value)
                 || starts_with_ci(value.trim_start(), "context-")
-                || url_ids(value).into_iter().any(|id| {
-                    self.ids.get(id).is_some_and(|nodes| {
-                        nodes.iter().any(|n| {
-                            matches!(
-                                n.tag_name().name(),
-                                "filter" | "mask" | "clipPath" | "marker" | "pattern"
-                            )
-                        })
-                    })
-                })
+                || url_ids(value).into_iter().any(|id| costly_ids.contains(id))
         };
         let mut rules = sheet.rules;
         for rule in &mut rules {
@@ -624,8 +689,10 @@ struct Walk<'f, 'a, 'input> {
     /// Frames above it computed a cost that holds only inside
     /// that marker, so they are not memoized.
     guard: usize,
-    /// Evaluations left: a backstop for the frames the marker
-    /// guard keeps out of the memo.
+    /// Work left: every evaluation, value examined, and text
+    /// or path data read spends from it (see the module docs).
+    /// It also backstops the frames the marker guard keeps out
+    /// of the memo.
     fuel: u64,
 }
 
@@ -635,7 +702,7 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
         // included, so the number of visits across the whole
         // walk is bounded however references fan out onto an
         // element shared by many sites (issue #443).
-        self.fuel = self.fuel.checked_sub(1).ok_or(Refusal::Nodes)?;
+        self.spend(1)?;
         let key = (node.id().get_usize(), role);
         match self.memo.get(&key) {
             // A memoized conversion repeats its whole recursion
@@ -670,6 +737,12 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
         Ok(cost)
     }
 
+    /// Spend `units` of fuel, refusing once it runs out.
+    fn spend(&mut self, units: u64) -> Result<(), Refusal> {
+        self.fuel = self.fuel.checked_sub(units).ok_or(Refusal::Nodes)?;
+        Ok(())
+    }
+
     /// Add `more` to `sum`, refusing as soon as a limit is
     /// passed: a partial sum past it means the whole is too.
     fn add(&self, sum: Cost, more: Cost) -> Result<Cost, Refusal> {
@@ -697,12 +770,13 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
     fn refs(&mut self, values: &[&str], role: Role, sum: bool) -> Result<Cost, Refusal> {
         let mut best = Cost::ZERO;
         for value in values {
-            // Every value examined spends a unit, so a list
-            // grown by an `inherit`, `context-*`, or `<use>`
-            // fan-out (which can repeat a value once per
+            // Every value examined spends fuel for its length,
+            // so a list grown by an `inherit`, `context-*`, or
+            // `<use>` fan-out (which can repeat a value once per
             // declaration) cannot make the walk do unbounded
-            // work before it finds the references in it.
-            self.fuel = self.fuel.checked_sub(1).ok_or(Refusal::Nodes)?;
+            // work before it finds the references in it, however
+            // long the repeated value is.
+            self.spend(scan_units(value.len()))?;
             let mut total = Cost::ZERO;
             for targets in self.facts.url_targets(value) {
                 let mut cost = Cost::ZERO;
@@ -768,7 +842,13 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
             return self.linked(node, Role::Filter);
         }
         let mut sum = Cost::ZERO;
-        for primitive in node.children().filter(|c| c.tag_name().name() == "feImage") {
+        for primitive in node.children() {
+            // Every child examined spends a unit, so a filter
+            // evaluated again reads its children within the fuel.
+            self.spend(1)?;
+            if primitive.tag_name().name() != "feImage" {
+                continue;
+            }
             // An feImage naming an element converts it into a
             // fresh group; one holding a data: payload decodes
             // it. With both href spellings present, usvg uses
@@ -879,6 +959,16 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
         let start = self.refs(&start, Role::Marker, false)?;
         let end = self.refs(&end, Role::Marker, false)?;
         let mid = self.refs(&mid, Role::Marker, false)?;
+        // Counting the vertices reads the path data: it spends
+        // fuel for its length, as a value examined does.
+        let data: usize = node
+            .attributes()
+            .filter(|a| {
+                a.name().eq_ignore_ascii_case("d") || a.name().eq_ignore_ascii_case("points")
+            })
+            .map(|a| a.value().len())
+            .sum();
+        self.spend(scan_units(data))?;
         let sum = self.add(start, end)?;
         self.add(sum, mid.times(segments(node)))
     }
@@ -890,7 +980,12 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
         let facts = self.facts;
         let mut units = 1u64;
         let mut paint = Cost::ZERO;
+        // Every node read spends fuel (a text node for its
+        // length), and the count stops as soon as it passes the
+        // node limit, so neither a text evaluated again nor many
+        // `tref` copies of one text read more than the bound.
         for d in node.descendants() {
+            self.spend(text_units(d))?;
             if d.is_text() {
                 units = units.saturating_add(char_count(d));
             } else if d.is_element() {
@@ -898,16 +993,35 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
                 paint = paint.max(self.paint(d)?);
                 if d.tag_name().name() == "tref" {
                     for target in facts.href_targets(d) {
-                        for t in target.descendants().filter(Node::is_text) {
-                            units = units.saturating_add(char_count(t));
+                        for t in target.descendants() {
+                            self.spend(text_units(t))?;
+                            if t.is_text() {
+                                units = units.saturating_add(char_count(t));
+                                if units > self.limits.nodes {
+                                    return Err(Refusal::Nodes);
+                                }
+                            }
                         }
                     }
                 }
+            }
+            if units > self.limits.nodes {
+                return Err(Refusal::Nodes);
             }
         }
         // Each span's fill and stroke are processed for the
         // span, its layout, and its flattened path.
         self.add(Cost::nodes(units), paint.times(units.saturating_mul(4)))
+    }
+}
+
+/// The fuel reading `node` inside a text spends: a unit, or a
+/// text node's length in [`scan_units`].
+fn text_units(node: Node) -> u64 {
+    if node.is_text() {
+        scan_units(node.text().map_or(0, str::len))
+    } else {
+        1
     }
 }
 
@@ -1109,6 +1223,24 @@ mod tests {
                 bytes: 1 << 28,
                 depth: 128,
             },
+        )
+    }
+
+    /// The walk alone, with `fuel` units to spend: shows which
+    /// steps spend fuel without a document big enough to run
+    /// out of the real budget.
+    fn walk_with_fuel(svg: &str, fuel: u64) -> Result<Cost, Refusal> {
+        let doc = roxmltree::Document::parse(svg).unwrap();
+        let facts = Facts::gather(&doc).unwrap();
+        run_walk(
+            &doc,
+            &facts,
+            Limits {
+                nodes: 100_000,
+                bytes: 1 << 28,
+                depth: 128,
+            },
+            fuel,
         )
     }
 
@@ -1442,5 +1574,65 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "checking a {N}-element ring took {elapsed:?}; the check is not linear"
         );
+    }
+
+    /// A value examined from many sites spends fuel for its
+    /// length each time, so the bytes the walk scans stay within
+    /// the fuel: the structure with a short value is bounded, and
+    /// with a long one it is refused. One unit per value,
+    /// whatever its length, let the scanning grow as the value's
+    /// length times the sites examining it.
+    #[test]
+    fn a_long_value_examined_from_many_sites_spends_fuel_for_its_length() {
+        let sites = "<rect width=\"1\" height=\"1\" filter=\"inherit\"/>".repeat(500);
+        let short = svg(&format!(
+            "<rect width=\"1\" height=\"1\" filter=\"none\"/>{sites}"
+        ));
+        assert!(bound_of(&short).is_ok());
+        let padding = " ".repeat(64 * 1024);
+        let long = svg(&format!(
+            "<rect width=\"1\" height=\"1\" filter=\"none{padding}\"/>{sites}"
+        ));
+        assert_eq!(bound_of(&long), Err(Refusal::Nodes));
+    }
+
+    /// A text element spends fuel for every node it reads, the
+    /// text each `tref` copies included, so a text evaluated
+    /// again, or copying one text many times, reads no more
+    /// than the fuel allows. With the real budget a text of many
+    /// `tref` copies is bounded as before; with little fuel it
+    /// is refused, which it was not while the text loop spent
+    /// nothing.
+    #[test]
+    fn text_content_spends_fuel_for_what_it_reads() {
+        let trefs = "<tref href=\"#t\"/>".repeat(200);
+        let doc = svg(&format!(
+            "<defs><text id=\"t\">abc</text></defs><text>{trefs}</text>"
+        ));
+        assert!(bound_of(&doc).is_ok());
+        assert_eq!(walk_with_fuel(&doc, 100), Err(Refusal::Nodes));
+    }
+
+    /// A style rule is kept when any element its `url()` names
+    /// is of a kind that costs, not only the first carrying the
+    /// id: a rule naming an id that a rect carries first and a
+    /// filter after it is charged like the same attribute.
+    #[test]
+    fn a_style_rule_naming_a_shared_id_is_kept_for_any_costly_element() {
+        let defs = "<rect id=\"x\" width=\"1\" height=\"1\"/>\
+             <defs><filter id=\"x\"><feImage href=\"#y\"/></filter>\
+             <g id=\"y\"><rect width=\"1\" height=\"1\"/></g></defs>";
+        let by_rule = bound_of(&svg(&format!(
+            "<style>.c {{ filter: url(#x) }}</style>{defs}\
+             <rect class=\"c\" width=\"1\" height=\"1\"/>"
+        )))
+        .unwrap();
+        let by_attr = bound_of(&svg(&format!(
+            "{defs}<rect filter=\"url(#x)\" width=\"1\" height=\"1\"/>"
+        )))
+        .unwrap();
+        let plain = bound_of(&svg(&format!("{defs}<rect width=\"1\" height=\"1\"/>"))).unwrap();
+        assert_eq!(by_rule, by_attr);
+        assert!(by_rule.nodes > plain.nodes);
     }
 }
