@@ -23,16 +23,22 @@
 //!   renderer, in the same directory. Run as
 //!   `-f <n> -l <n> -` over the source on stdin, it
 //!   prints the document's page count, its encryption
-//!   state, and the selected page's size in points.
+//!   state, and the selected page's size in points: the
+//!   size of its crop box (clipped to its media box).
 //!   Facts the design needs before rendering are probe
 //!   facts, so the probe runs first, every time.
 //! - Render: the configured program (Poppler's
 //!   `pdftocairo` is the reference), run as
-//!   `-png -singlefile -f <n> -l <n> -r <dpi> - -`: the
-//!   PDF on stdin, one PNG on stdout, at a fixed scale
-//!   of 2.0 (144 DPI) clamped so neither raster axis
-//!   exceeds the 16383 px output limit at the probed
-//!   page size.
+//!   `-png -singlefile -cropbox -f <n> -l <n> -r <dpi> - -`:
+//!   the PDF on stdin, one PNG on stdout, at a fixed
+//!   scale of 2.0 (144 DPI) clamped so neither raster
+//!   axis exceeds the 16383 px output limit, and the
+//!   raster area stays within 64 Mpx, at the probed page
+//!   size. `-cropbox` makes the renderer draw the crop
+//!   box, the box the probe measured, so the clamp is
+//!   computed from the box that is drawn. Without it the
+//!   renderer draws the media box, which a page may
+//!   declare far larger than its crop box.
 //!
 //! The rendered PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
@@ -121,9 +127,11 @@ pub struct PdfProbe {
     /// only a document that actually needs a password
     /// fails, and it fails at the probe.
     pub encrypted: bool,
-    /// The selected page's width in points.
+    /// The selected page's width in points: its crop
+    /// box, the area the renderer draws.
     pub page_width: f64,
-    /// The selected page's height in points.
+    /// The selected page's height in points: its crop
+    /// box, the area the renderer draws.
     pub page_height: f64,
 }
 
@@ -311,7 +319,8 @@ impl PdfRenderer {
     /// first: the page count cap and the page range are
     /// enforced against the probe before the renderer
     /// runs, and the render scale is computed from the
-    /// probed page size.
+    /// probed page size, the crop box the renderer then
+    /// draws.
     pub fn render_page(&self, pdf: &[u8], page: u32) -> Result<RenderedPage, PdfError> {
         // One deadline for the probe and the render
         // together (issue #362).
@@ -337,12 +346,16 @@ impl PdfRenderer {
         let dpi = (scale * 72.0).floor().max(1.0);
         let dpi_arg = format!("{dpi}");
         let page_arg = page.to_string();
+        // `-cropbox`: draw the crop box, the size the probe
+        // reported and the scale was clamped for, not the
+        // media box, which can be larger.
         let run = self.run(
             &self.program,
             "renderer",
             &[
                 "-png",
                 "-singlefile",
+                "-cropbox",
                 "-f",
                 &page_arg,
                 "-l",
@@ -863,6 +876,42 @@ exit 0\n";
     }
 
     #[test]
+    fn render_asks_the_renderer_for_the_crop_box() {
+        // The probe reports the crop box as the page size
+        // and the scale is clamped for that size, so the
+        // renderer is asked to draw the crop box too: its
+        // default, the media box, can be larger. The fake
+        // renderer records its argv, one argument per line.
+        let dir = temp_dir("argv");
+        let argv = dir.join("argv");
+        write_tool(&dir, "pdfinfo", INFO_OK);
+        let render = format!(
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' \"$@\" > '{}'\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
+            argv.display()
+        );
+        let program = write_tool(&dir, "pdftocairo", &render);
+        let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+        renderer.render_page(b"%PDF- fake", 2).unwrap();
+        let recorded = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            [
+                "-png",
+                "-singlefile",
+                "-cropbox",
+                "-f",
+                "2",
+                "-l",
+                "2",
+                "-r",
+                "144",
+                "-",
+                "-"
+            ]
+        );
+    }
+
+    #[test]
     fn render_refuses_a_password_document_from_the_probe() {
         let (_tools, program) = fake_pair(
             "password",
@@ -1044,24 +1093,37 @@ exit 0\n";
     /// so the real-tool test needs no generator.
     fn two_page_pdf() -> Vec<u8> {
         let content = |color: &str| format!("{color} rg\n0 0 612 792 re\nf\n");
-        let objects: Vec<String> = vec![
+        pdf_document(&[
+            ("/MediaBox [0 0 612 792]", content("1 0 0")),
+            ("/MediaBox [0 0 612 792]", content("0 0 1")),
+        ])
+    }
+
+    /// A PDF written by hand, one page per entry: the
+    /// page dictionary's box (and rotation) entries, and
+    /// its uncompressed content stream.
+    fn pdf_document(pages: &[(&str, String)]) -> Vec<u8> {
+        let kids: Vec<String> = (0..pages.len())
+            .map(|i| format!("{} 0 R", 3 + 2 * i))
+            .collect();
+        let mut objects: Vec<String> = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-            "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".to_string(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>"
-                .to_string(),
             format!(
-                "<< /Length {} >>\nstream\n{}endstream",
-                content("1 0 0").len(),
-                content("1 0 0")
-            ),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << >> >>"
-                .to_string(),
-            format!(
-                "<< /Length {} >>\nstream\n{}endstream",
-                content("0 0 1").len(),
-                content("0 0 1")
+                "<< /Type /Pages /Kids [{}] /Count {} >>",
+                kids.join(" "),
+                pages.len()
             ),
         ];
+        for (i, (boxes, content)) in pages.iter().enumerate() {
+            objects.push(format!(
+                "<< /Type /Page /Parent 2 0 R {boxes} /Contents {} 0 R /Resources << >> >>",
+                4 + 2 * i
+            ));
+            objects.push(format!(
+                "<< /Length {} >>\nstream\n{content}endstream",
+                content.len()
+            ));
+        }
         let mut out = Vec::new();
         out.extend_from_slice(b"%PDF-1.4\n");
         let mut offsets = Vec::new();
@@ -1083,6 +1145,14 @@ exit 0\n";
             .as_bytes(),
         );
         out
+    }
+
+    /// A PNG's width and height from its header, without
+    /// decoding the raster.
+    fn png_size(png: &[u8]) -> (u32, u32) {
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n") && png.len() >= 24);
+        let be = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+        (be(16), be(20))
     }
 
     /// The reference tools' directory, resolved from
@@ -1140,5 +1210,104 @@ exit 0\n";
         // Junk bytes are not a PDF, from the real probe.
         let err = renderer.render_page(b"not a pdf at all", 1).unwrap_err();
         assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+    }
+
+    /// End to end against the real Poppler: a page whose
+    /// media box is ten times its crop box on each side.
+    /// The probe reports the crop box, the clamp is sized
+    /// from it, and the raster is that same box. Drawn
+    /// whole at the scale the crop box allows, the 4100 pt
+    /// media box would be 8200 px square, 67.24 Mpx, past
+    /// the 64 Mpx area clamp.
+    #[test]
+    fn real_tools_draw_the_crop_box_the_clamp_is_sized_from() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program, Duration::from_secs(60)).unwrap();
+        // The media box is blue and the crop box, at the
+        // origin, red: a raster with any blue in it drew
+        // past the crop box.
+        let bytes = pdf_document(&[(
+            "/MediaBox [0 0 4100 4100] /CropBox [0 0 410 410]",
+            "0 0 1 rg\n0 0 4100 4100 re\nf\n1 0 0 rg\n0 0 410 410 re\nf\n".to_string(),
+        )]);
+        let probe = renderer.probe(&bytes, 1).unwrap();
+        assert_eq!((probe.page_width, probe.page_height), (410.0, 410.0));
+        assert_eq!(render_scale(410.0, 410.0), RENDER_SCALE);
+
+        let page = renderer.render_page(&bytes, 1).unwrap();
+        let (width, height) = png_size(&page.png);
+        assert_eq!(
+            (width, height),
+            (820, 820),
+            "the raster is the crop box at the clamped scale"
+        );
+        assert!(f64::from(width) * f64::from(height) <= MAX_RASTER_PIXELS);
+        assert_eq!((page.page_width, page.page_height), (410.0, 410.0));
+        let img = image::load_from_memory(&page.png).unwrap().to_rgb8();
+        for (x, y) in [(0, 0), (819, 0), (0, 819), (819, 819), (410, 410)] {
+            let p = img.get_pixel(x, y);
+            assert!(
+                p[0] > 200 && p[1] < 60 && p[2] < 60,
+                "({x}, {y}) is inside the crop box: {p:?}"
+            );
+        }
+    }
+
+    /// End to end against the real Poppler: a page whose
+    /// crop box is its media box, stated or by default, and
+    /// a rotated one, render the same bytes as the renderer
+    /// run without `-cropbox`, the invocation before the
+    /// renderer was asked for the crop box.
+    #[test]
+    fn real_tools_render_pages_with_matching_boxes_as_before() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program.clone(), Duration::from_secs(30)).unwrap();
+        let fill = |color: &str, w: u32, h: u32| format!("{color} rg\n0 0 {w} {h} re\nf\n");
+        let stated = pdf_document(&[
+            (
+                "/MediaBox [0 0 612 792] /CropBox [0 0 612 792]",
+                fill("0 1 0", 300, 400),
+            ),
+            (
+                "/MediaBox [0 0 595 842] /Rotate 90",
+                fill("1 0 1", 200, 600),
+            ),
+        ]);
+        for bytes in [two_page_pdf(), stated] {
+            for page in 1..=2u32 {
+                let rendered = renderer.render_page(&bytes, page).unwrap();
+                let page_arg = page.to_string();
+                let before = renderer
+                    .run(
+                        &program,
+                        "renderer",
+                        &[
+                            "-png",
+                            "-singlefile",
+                            "-f",
+                            &page_arg,
+                            "-l",
+                            &page_arg,
+                            "-r",
+                            "144",
+                            "-",
+                            "-",
+                        ],
+                        &bytes,
+                        MAX_PAGE_PNG_BYTES,
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .unwrap();
+                assert!(before.status.success(), "{}", before.stderr_excerpt());
+                assert!(
+                    rendered.png == before.stdout,
+                    "page {page} renders the bytes it rendered before"
+                );
+            }
+        }
     }
 }
