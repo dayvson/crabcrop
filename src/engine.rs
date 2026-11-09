@@ -981,7 +981,7 @@ impl Engine {
             && matches!(resolved_output, ImageFormat::Jpeg | ImageFormat::Png);
         Self::preflight(&directives, &ctx, detected)?;
         let (img, source_meta) =
-            match self.decode_source(&source, ops, &ctx, &directives, keep_profile)? {
+            match Self::decode_source(&source, ops, &ctx, &directives, keep_profile)? {
                 Decoded::Still(img, source_meta) => (img, source_meta),
                 Decoded::Rendered(processed) => return Ok(*processed),
             };
@@ -1343,7 +1343,6 @@ impl Engine {
     /// rendered whole by the animated or video path instead,
     /// and comes back as [`Decoded::Rendered`].
     fn decode_source(
-        &self,
         source: &SniffedSource<'_>,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
@@ -1363,75 +1362,27 @@ impl Engine {
         // chain, whose metadata comes from the decoder rather
         // than the container bytes.
         let mut source_meta = crate::color::extract_source_meta(bytes, ctx.preserve_metadata);
-        // An animated WebP source (one carrying an ANIM chunk)
-        // gets the GIF treatment below; the probe also yields
-        // the loop count the animated path carries over.
-        let webp_anim = if detected == ImageFormat::WebP {
-            webp_animation_params(bytes)
-        } else {
-            None
+        // GIF sources, and WebP sources carrying an ANIM chunk
+        // (whose probe also yields the loop count the animated
+        // path carries over), decode frame by frame.
+        let animated = match detected {
+            ImageFormat::Gif => Some((AnimatedFormat::Gif, None)),
+            ImageFormat::WebP => webp_animation_params(bytes)
+                .map(|(loop_count, _)| (AnimatedFormat::WebP, Some(loop_count))),
+            _ => None,
         };
-        let img = if detected == ImageFormat::Gif {
-            // GIF sources decode frame by frame: an animated source
-            // whose output stays GIF keeps its frames (each runs the
-            // operations, delays preserved); anything else continues
-            // with the first frame, which is also what converting an
-            // animated GIF to a still format means.
-            let frames = decode_gif_frames(bytes)?;
-            if frames.len() > 1 && directives.debug_focal {
-                return Err(EngineError::Unsupported(
-                    "debug:focal renders a diagnostic image and cannot annotate an animated source"
-                        .to_string(),
-                ));
-            }
-            if frames.len() > 1 {
-                let resolved = animated_output_format(
-                    ImageFormat::Gif,
-                    directives.explicit_format,
-                    ctx.preferred,
-                );
-                if matches!(resolved, ImageFormat::Gif | ImageFormat::WebP) {
-                    let processed = self.process_animated(frames, ops, ctx, resolved, None)?;
-                    return Ok(Decoded::Rendered(Box::new(processed)));
-                }
-                if resolved.is_video() {
-                    let processed = self.process_video(frames, ops, ctx, resolved)?;
-                    return Ok(Decoded::Rendered(Box::new(processed)));
-                }
-            }
-            DynamicImage::ImageRgba8(frames.first.into_buffer())
-        } else if let Some((loop_count, _)) = webp_anim {
-            // Animated WebP sources decode frame by frame, like
-            // GIFs: an animated output (WebP or GIF) keeps its
-            // frames (each runs the operations, delays preserved);
-            // anything else continues with the first frame, which
-            // is also what converting an animated WebP to a still
-            // format means.
-            let frames = decode_webp_frames(bytes)?;
-            if frames.len() > 1 && directives.debug_focal {
-                return Err(EngineError::Unsupported(
-                    "debug:focal renders a diagnostic image and cannot annotate an animated source"
-                        .to_string(),
-                ));
-            }
-            if frames.len() > 1 {
-                let resolved = animated_output_format(
-                    ImageFormat::WebP,
-                    directives.explicit_format,
-                    ctx.preferred,
-                );
-                if matches!(resolved, ImageFormat::WebP | ImageFormat::Gif) {
-                    let processed =
-                        self.process_animated(frames, ops, ctx, resolved, Some(loop_count))?;
-                    return Ok(Decoded::Rendered(Box::new(processed)));
-                }
-                if resolved.is_video() {
-                    let processed = self.process_video(frames, ops, ctx, resolved)?;
-                    return Ok(Decoded::Rendered(Box::new(processed)));
-                }
-            }
-            DynamicImage::ImageRgba8(frames.first.into_buffer())
-        } else if let Some(screened) = &source.svg {
+        if let Some((format, loop_count)) = animated {
+            return Self::decode_animated(
+                bytes,
+                format,
+                loop_count,
+                ops,
+                ctx,
+                directives,
+                source_meta,
+            );
+        }
+        let img = if let Some(screened) = &source.svg {
             // Rasterize at the size the request is heading for
             // (or the intrinsic size when it asks for none), so
             // vectors stay crisp; the normal pipeline runs on
@@ -1492,6 +1443,49 @@ impl Engine {
             img
         };
         Ok(Decoded::Still(img, source_meta))
+    }
+
+    /// Decode an animated GIF or WebP source frame by frame. An
+    /// animated source whose output stays animated (GIF or
+    /// WebP) keeps its frames, each running the operations with
+    /// its delay preserved, and one whose output is a video
+    /// encodes them: either render is the request's result.
+    /// Anything else continues with the first frame, which is
+    /// also what converting an animation to a still format
+    /// means, as does a source with one frame.
+    fn decode_animated(
+        bytes: &[u8],
+        source: AnimatedFormat,
+        loop_count: Option<u16>,
+        ops: &[Operation],
+        ctx: &ProcessContext<'_>,
+        directives: &crate::url::RequestDirectives,
+        source_meta: crate::color::SourceMeta,
+    ) -> Result<Decoded, EngineError> {
+        let frames = match source {
+            AnimatedFormat::Gif => decode_gif_frames(bytes)?,
+            AnimatedFormat::WebP => decode_webp_frames(bytes)?,
+        };
+        if frames.len() > 1 {
+            if directives.debug_focal {
+                return Err(EngineError::Unsupported(
+                    "debug:focal renders a diagnostic image and cannot annotate an animated source"
+                        .to_string(),
+                ));
+            }
+            let resolved =
+                animated_output_format(source.into(), directives.explicit_format, ctx.preferred);
+            if let Some(format) = AnimatedFormat::of(resolved) {
+                let processed = Self::process_animated(frames, ops, ctx, format, loop_count)?;
+                return Ok(Decoded::Rendered(Box::new(processed)));
+            }
+            if resolved.is_video() {
+                let processed = Self::process_video(frames, ops, ctx, resolved)?;
+                return Ok(Decoded::Rendered(Box::new(processed)));
+            }
+        }
+        let first = DynamicImage::ImageRgba8(frames.first.into_buffer());
+        Ok(Decoded::Still(first, source_meta))
     }
 
     /// Resolve the quality directive against the final image
@@ -1697,11 +1691,10 @@ impl Engine {
     /// #323); GIF output keeps the GIF encoder's default, as it
     /// always has, and has no quality lever.
     fn process_animated(
-        &self,
         frames: Frames,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
-        format: ImageFormat,
+        format: AnimatedFormat,
         loop_count: Option<u16>,
     ) -> Result<ProcessedImage, EngineError> {
         let directives = crate::url::RequestDirectives::analyze(ops);
@@ -1750,11 +1743,11 @@ impl Engine {
         // describes) and reported back, and Save-Data steps an
         // unspecified quality down one notch. GIF output has no
         // quality lever, so nothing resolves for it.
-        let (encode_quality, chosen_quality) = if format == ImageFormat::WebP {
+        let (encode_quality, chosen_quality) = if format == AnimatedFormat::WebP {
             let resolved = encode_opts
                 .quality
                 .as_ref()
-                .and_then(|q| q.resolved_for(format));
+                .and_then(|q| q.resolved_for(ImageFormat::WebP));
             quality_in_force(resolved, ctx.save_data, || {
                 let first = out_frames
                     .first()
@@ -1778,7 +1771,7 @@ impl Engine {
             None
         };
         let out = match format {
-            ImageFormat::Gif => {
+            AnimatedFormat::Gif => {
                 let mut out = Vec::new();
                 let first = out_frames
                     .first()
@@ -1823,18 +1816,17 @@ impl Engine {
                 drop(enc);
                 out
             }
-            ImageFormat::WebP => encode_animated_webp(
+            AnimatedFormat::WebP => encode_animated_webp(
                 out_frames,
                 loop_count.unwrap_or(0),
                 encode_quality,
                 encode_opts.format_options,
                 ctx.deadline,
             )?,
-            _ => unreachable!("process_animated is only called for GIF and WebP"),
         };
         Ok(ProcessedImage {
             bytes: out,
-            format,
+            format: format.into(),
             quality: chosen_quality,
             width,
             height,
@@ -1864,7 +1856,6 @@ impl Engine {
     /// even for 4:2:0, or crops down at the per-axis limit
     /// (see [`crate::video::even_dimension`]).
     fn process_video(
-        &self,
         frames: Frames,
         ops: &[Operation],
         ctx: &ProcessContext<'_>,
@@ -2114,6 +2105,38 @@ pub(crate) fn animated_output_format(
         (Some(format), _) => format,
         (None, Some(format @ (ImageFormat::Gif | ImageFormat::WebP))) => format,
         (None, _) => source,
+    }
+}
+
+/// The formats an animation keeps its frames in (issue #480):
+/// an animated source's own format, and the format its frames
+/// render to on the animated path. The video formats take the
+/// frames too, on the video path, and every other format takes
+/// the first frame as a still.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimatedFormat {
+    Gif,
+    WebP,
+}
+
+impl AnimatedFormat {
+    /// The animated format `format` names, or `None` for one
+    /// that cannot keep frames.
+    fn of(format: ImageFormat) -> Option<Self> {
+        match format {
+            ImageFormat::Gif => Some(AnimatedFormat::Gif),
+            ImageFormat::WebP => Some(AnimatedFormat::WebP),
+            _ => None,
+        }
+    }
+}
+
+impl From<AnimatedFormat> for ImageFormat {
+    fn from(format: AnimatedFormat) -> Self {
+        match format {
+            AnimatedFormat::Gif => ImageFormat::Gif,
+            AnimatedFormat::WebP => ImageFormat::WebP,
+        }
     }
 }
 
