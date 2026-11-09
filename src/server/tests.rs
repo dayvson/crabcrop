@@ -3022,19 +3022,16 @@ async fn unconfigured_features_answer_501_not_400() {
     );
 }
 
-fn preset_test_map() -> std::collections::HashMap<String, String> {
+fn preset_test_map() -> crate::url::Presets {
     [
-        ("small".to_string(), "30x20".to_string()),
-        ("gray".to_string(), "filters:grayscale".to_string()),
+        ("small".to_string(), "30x20".parse().unwrap()),
+        ("gray".to_string(), "filters:grayscale".parse().unwrap()),
     ]
     .into_iter()
     .collect()
 }
 
-async fn spawn_app_with_presets(
-    presets: std::collections::HashMap<String, String>,
-    only_presets: bool,
-) -> String {
+async fn spawn_app_with_presets(presets: crate::url::Presets, only_presets: bool) -> String {
     spawn_app_with_presets_and_roots(presets, only_presets, std::collections::HashMap::new()).await
 }
 
@@ -3050,7 +3047,7 @@ fn root_test_map(origin: &str) -> std::collections::HashMap<String, String> {
 }
 
 async fn spawn_app_with_presets_and_roots(
-    presets: std::collections::HashMap<String, String>,
+    presets: crate::url::Presets,
     only_presets: bool,
     source_roots: std::collections::HashMap<String, String>,
 ) -> String {
@@ -3146,7 +3143,7 @@ async fn preset_urls_and_explicit_chains_serve_identical_bytes() {
     let mut presets = preset_test_map();
     presets.insert(
         "card".to_string(),
-        "crop:40x30:smart/filters:quality(80)".to_string(),
+        "crop:40x30:smart/filters:quality(80)".parse().unwrap(),
     );
     let base = spawn_app_with_presets(presets, false).await;
     let chains = [
@@ -3456,12 +3453,12 @@ fn preset_spellings_and_their_expansions_share_one_cache_key() {
     // expands to are one request: the server expands
     // before keying, so both spellings canonicalize to
     // the same cache key form.
-    let presets: std::collections::HashMap<String, String> = [
-        ("small".to_string(), "30x20".to_string()),
-        ("gray".to_string(), "filters:grayscale".to_string()),
+    let presets: crate::url::Presets = [
+        ("small".to_string(), "30x20".parse().unwrap()),
+        ("gray".to_string(), "filters:grayscale".parse().unwrap()),
         (
             "card".to_string(),
-            "crop:1200x630:smart/filters:quality(80)".to_string(),
+            "crop:1200x630:smart/filters:quality(80)".parse().unwrap(),
         ),
     ]
     .into_iter()
@@ -3470,7 +3467,7 @@ fn preset_spellings_and_their_expansions_share_one_cache_key() {
     for (name, definition) in &presets {
         let spelled = format!("preset:{name}/{src}");
         let expanded = crate::url::expand_presets(&spelled, &presets, false).unwrap();
-        assert_eq!(expanded, format!("{definition}/{src}"));
+        assert_eq!(expanded, format!("{}/{src}", definition.as_str()));
     }
     // A preset followed by more chain composes with it,
     // and the composed spelling keys like the fully
@@ -6762,7 +6759,7 @@ async fn spawn_app_with_providers(
 /// caller-chosen memory cache size (0 disables the
 /// memory tier so disk behavior is observable).
 async fn spawn_app_full(
-    presets: std::collections::HashMap<String, String>,
+    presets: crate::url::Presets,
     dir: Option<&std::path::Path>,
     cache_bytes: usize,
 ) -> String {
@@ -9069,6 +9066,73 @@ async fn over_cap_counts_the_default_operations_before_any_fetch() {
     let resp = get_signed(&base, &own_format).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+    // A URL whose own operations already pass the cap is
+    // refused while its presets expand, before the defaults
+    // merge: the count names the URL's own operations.
+    let own_over = format!("{}/{src}", vec!["filters:invert"; 101].join("/"));
+    let fetched = hits.load(Ordering::SeqCst);
+    for route in ["", "explain/"] {
+        let (status, body) = get_signed_json(&base, route, &own_over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 101 operations, over the 100 operation limit",
+            "{route}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), fetched);
+}
+
+#[tokio::test]
+async fn repeated_preset_references_are_refused_before_expanding() {
+    // A short URL that repeats a long preset used to expand
+    // in full, then parse every operation it expanded to,
+    // before the cap refused it: 7,000 references to a
+    // 100-operation preset of 5x5 convolutions built and
+    // parsed 700,000 operations (about 80 MB of text) per
+    // request. Expansion now counts each reference by the
+    // count settled when the presets loaded and refuses
+    // before building anything, on the image and explain
+    // routes alike, with the same answer as before.
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let kernel = format!("convolution({},1)", vec!["0.5"; 25].join(","));
+    let presets: crate::url::Presets = [
+        (
+            "c".to_string(),
+            format!("filters:{}", vec![kernel; 100].join(":"))
+                .parse()
+                .unwrap(),
+        ),
+        ("small".to_string(), "30x20".parse().unwrap()),
+    ]
+    .into_iter()
+    .collect();
+    let base = spawn_app_with_presets(presets, true).await;
+    let remainder = format!("{}{src}", "preset:c/".repeat(7_000));
+    for route in ["", "explain/"] {
+        let started = std::time::Instant::now();
+        let (status, body) = get_signed_json(&base, route, &remainder).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "/{route}");
+        assert_eq!(body["error"]["code"], "unsupported_operation", "/{route}");
+        assert_eq!(
+            body["error"]["message"], "request has 700000 operations, over the 100 operation limit",
+            "/{route}"
+        );
+        // The refusal costs a pass over the URL's own text;
+        // expanding and parsing it took seconds.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "/{route} took {elapsed:?}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // A realistic reference still renders, and the
+    // 100-operation preset alone is within the cap.
+    let resp = get_signed(&base, &format!("preset:small/{src}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (status, body) = get_signed_json(&base, "explain/", &format!("preset:c/{src}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
@@ -15639,15 +15703,12 @@ fn sign_with(secret: &[u8], remainder: &str) -> String {
 /// An app with presets and a caller-built loader, for
 /// the explain tests (preset expansion, object-store
 /// sources).
-async fn spawn_explain_app(
-    presets: std::collections::HashMap<String, String>,
-    loader: Loader,
-) -> String {
+async fn spawn_explain_app(presets: crate::url::Presets, loader: Loader) -> String {
     spawn_explain_app_with_roots(presets, loader, std::collections::HashMap::new()).await
 }
 
 async fn spawn_explain_app_with_roots(
-    presets: std::collections::HashMap<String, String>,
+    presets: crate::url::Presets,
     loader: Loader,
     source_roots: std::collections::HashMap<String, String>,
 ) -> String {
@@ -15893,7 +15954,10 @@ async fn explain_unsafe_form_honors_the_policy() {
 async fn explain_lists_preset_expansions_and_the_group() {
     let src = spawn_image_server().await;
     let mut presets = std::collections::HashMap::new();
-    presets.insert("small".to_string(), "100x50/filters:grayscale".to_string());
+    presets.insert(
+        "small".to_string(),
+        "100x50/filters:grayscale".parse().unwrap(),
+    );
     let base = spawn_explain_app(presets, Loader::with_defaults().unwrap()).await;
     let remainder = format!("preset:small/{src}");
     let sig = sign(&remainder);
@@ -15967,7 +16031,7 @@ async fn explain_escapes_markup_bearing_strings() {
     let raw = spawn_bytes_server(test_png()).await;
     let src = raw.replace("src.png", "a&lt;b.png");
     let mut presets = std::collections::HashMap::new();
-    presets.insert("a&b".to_string(), "100x50".to_string());
+    presets.insert("a&b".to_string(), "100x50".parse().unwrap());
     let base = spawn_explain_app(presets, Loader::with_defaults().unwrap()).await;
     let remainder = format!("preset:a&b/{src}");
     let sig = sign(&remainder);

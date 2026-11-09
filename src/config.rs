@@ -252,7 +252,7 @@ pub struct Config {
     pub sources: SourceConfig,
     /// The upload destination (issue #168).
     pub upload: Option<Arc<crate::upload::UploadStore>>,
-    pub presets: HashMap<String, String>,
+    pub presets: crate::url::Presets,
     pub only_presets: bool,
     pub source_roots: HashMap<String, String>,
     /// Server-wide default operations (issue #145).
@@ -578,7 +578,7 @@ impl Config {
 /// request, so it is a startup error rather than a policy.
 pub fn build_presets(
     get: impl Fn(&str) -> Option<String>,
-) -> Result<(HashMap<String, String>, bool), ConfigError> {
+) -> Result<(crate::url::Presets, bool), ConfigError> {
     let only_presets =
         parse_bool_value("CRABCROP_ONLY_PRESETS", get("CRABCROP_ONLY_PRESETS"), false)?;
     let presets = match get("CRABCROP_PRESETS_FILE") {
@@ -590,7 +590,7 @@ pub fn build_presets(
             })?;
             parse_presets(&text)?
         }
-        _ => HashMap::new(),
+        _ => crate::url::Presets::new(),
     };
     if only_presets && presets.is_empty() {
         return Err(ConfigError::conflict(
@@ -610,14 +610,21 @@ pub fn build_presets(
 /// it answer `400`.
 const MAX_PRESET_OPERATIONS: usize = crate::url::MAX_OPERATIONS;
 
+/// The longest preset body: the most text one request may
+/// expand to ([`crate::url::MAX_EXPANDED_LEN`]), applied at
+/// boot for the same reason as the operation cap above. A
+/// longer definition would boot fine and make every request
+/// that names it answer `400`.
+const MAX_PRESET_LEN: usize = crate::url::MAX_EXPANDED_LEN;
+
 /// Parse preset definitions: one `name = operations` entry
 /// per line, blank lines and `#` comments skipped. Names are
 /// letters, digits, `_`, and `-`; every operation string must
 /// validate as a preset body (operations only: no source, no
 /// `exp:`, no nested `preset:`).
-pub fn parse_presets(text: &str) -> Result<HashMap<String, String>, ConfigError> {
+pub fn parse_presets(text: &str) -> Result<crate::url::Presets, ConfigError> {
     let malformed = |reason: String| ConfigError::malformed("CRABCROP_PRESETS_FILE", reason);
-    let mut map = HashMap::new();
+    let mut map = crate::url::Presets::new();
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -641,15 +648,21 @@ pub fn parse_presets(text: &str) -> Result<HashMap<String, String>, ConfigError>
         if map.contains_key(name) {
             return Err(malformed(format!("duplicate preset name: {name}")));
         }
-        let parsed = crate::url::parse_preset_operations(ops)
+        let preset = crate::url::Preset::parse(ops)
             .map_err(|e| malformed(format!("invalid operations for preset {name}: {e}")))?;
-        let count = crate::url::operation_count(&parsed);
+        let count = preset.operations();
         if count > MAX_PRESET_OPERATIONS {
             return Err(malformed(format!(
                 "preset {name} has {count} operations, over the {MAX_PRESET_OPERATIONS} operation cap"
             )));
         }
-        map.insert(name.to_string(), ops.to_string());
+        let len = preset.as_str().len();
+        if len > MAX_PRESET_LEN {
+            return Err(malformed(format!(
+                "preset {name} is {len} bytes, over the {MAX_PRESET_LEN} byte cap"
+            )));
+        }
+        map.insert(name.to_string(), preset);
     }
     Ok(map)
 }

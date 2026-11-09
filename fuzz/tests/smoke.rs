@@ -268,6 +268,7 @@ fn the_preset_map_holds_definitions_the_server_accepts() {
     // real operations: each definition passes the boot-time
     // validation, and a request naming one expands and parses.
     for (name, definition) in crabcrop_fuzz::presets() {
+        let definition = definition.as_str();
         assert!(
             url::parse_preset_operations(definition).is_ok(),
             "preset {name} = {definition} would be refused at boot"
@@ -281,6 +282,40 @@ fn the_preset_map_holds_definitions_the_server_accepts() {
             "{name} expands to {expanded}, which does not parse"
         );
         crabcrop_fuzz::check(&request);
+    }
+}
+
+#[test]
+fn repeated_references_satisfy_the_counted_expansion_invariants() {
+    // Expansion counts before it builds. Around and far past
+    // the operation cap, by references alone, interleaved with
+    // free-form operations or metadata, and followed by every
+    // kind of tail (a source, none, an empty segment, a
+    // malformed operation, an unknown name, a bad expiry, a
+    // source holding `preset:` text), its answer must match
+    // splicing every reference and parsing the result.
+    let tails = [
+        "example.com/img.jpg",
+        "",
+        "/example.com/img.jpg",
+        "filters:bogus/x.jpg",
+        "preset:nope/x.jpg",
+        "exp:x/example.com/img.jpg",
+        "example.com/preset:thumb/img.jpg",
+    ];
+    for name in crabcrop_fuzz::presets().keys() {
+        for unit in [
+            format!("preset:{name}/"),
+            format!("preset:{name}/filters:invert/"),
+            format!("preset:{name}/exp:9/maxage:60/"),
+        ] {
+            for refs in [1, 33, 34, 50, 51, 99, 100, 101, 400] {
+                let ops = unit.repeat(refs);
+                for tail in tails {
+                    crabcrop_fuzz::check(&format!("/unsafe/{ops}{tail}"));
+                }
+            }
+        }
     }
 }
 

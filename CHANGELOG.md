@@ -36,6 +36,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The source buffer budget is held only by source bodies that keep arriving. A body reserves at most 1 MiB ahead of the bytes it has received (its declared length, when that is smaller), reserves the rest of its length only once it has received that much, and keeps budget past its received bytes only while each second brings at least 64 KiB and enough to fill what it holds before the fetch timeout; a body that falls behind holds only the bytes it has sent. Before, a body kept its whole declared length while any byte arrived each second, so slow origins could hold the budget and make other cache misses and uploads shed with `503 server_busy`; the 0.10.0 note that an origin that stalls holds only what it sent did not cover an origin that keeps sending slowly. Bodies still on their read-ahead share at most the budget less one fetch cap, so a burst of large sources still finishes a few at a time instead of waiting on each other. Rendered bytes are unchanged.
 
+- Preset expansion is bounded. A request's operations are counted before its `preset:` references expand, each reference by the operations its definition holds (counted once, when the presets load), so a request over the 100-operation cap answers its `400 unsupported_operation` without the expanded operations being built or parsed; the expanded text is also capped at 256 KiB, and a preset definition longer than that refuses the boot. Requests within both caps expand and render as before. A request whose own operations pass the cap now names their count in the body, without the default operations.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
