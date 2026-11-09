@@ -68,6 +68,9 @@ moxcms = "0.9"
 # codecs; src/heic.rs refuses any coded item that is not HEVC
 # before the decoder runs (issue #466), so only oxideav-h265
 # ever sees source bytes.
+# The HEVC decoder src/heic.rs pre-checks with must be the
+# one oxideav-heif decodes with: scripts/check_locks.py fails
+# CI if Cargo.lock or fuzz/Cargo.lock carries two (issue #552).
 oxideav-heif = { version = "=0.0.13", default-features = false, features = ["registry"] }
 oxideav-h265 = "=0.0.16"
 oxideav-webp = { version = "0.3.1", default-features = false }

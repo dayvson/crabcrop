@@ -129,8 +129,14 @@ leave it stale (a release version bump does not:
 `scripts/bump_version.py` moves this lockfile's
 `crabcrop` and `crabcrop-url` entries), and the
 smoke's `--locked` build (in `scripts/test_all.sh` and
-CI) then fails until it is refreshed. Refresh it from
-the root lockfile:
+CI) then fails until it is refreshed. A root lock
+refresh can also leave it behind while that build still
+passes, so the fuzzer runs decoder versions the server
+does not ship: `scripts/check_locks.py` (CI's build job
+and `scripts/test_all.sh`) fails whenever the two
+lockfiles disagree on a package both carry, or either
+locks a decoder at two versions (issue #552). Refresh
+it from the root lockfile:
 
 ```sh
 cp Cargo.lock fuzz/Cargo.lock

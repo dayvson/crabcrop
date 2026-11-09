@@ -16,6 +16,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The boot line `crabcrop listening on port N` names the port the server bound (issue #536). It printed the configured port, so `PORT=0`, which binds a free port, printed port 0; it now prints the port the system picked. For a fixed port the line is unchanged.
 
+- HEIC sources decode with oxideav-h265 0.0.16, the version the SPS pre-check in `src/heic.rs` and the fuzz harness already ran. The lockfile also carried 0.0.15, which oxideav-heif decoded with, and `fuzz/Cargo.lock` had drifted from the root lock; now one version decodes, pre-checks and fuzzes. The decoded pixels of every HEIC test fixture are unchanged, and some HEIF stills that 0.0.15 refused now decode. `scripts/check_locks.py`, run in CI, fails when a decoder is locked at two versions or when the two lockfiles disagree on a package both carry. The release workflow no longer adopts a GitHub Release that is already published, as it silently adopted v0.10.0's, published by hand before the gates ran: the job stops and says how to recover, RELEASING.md names the workflow as the only way to publish, and the `ADOPT_PUBLISHED_RELEASE` repository variable set to 1 overrides the refusal for one re-run (issue #552).
+
 - Test and CI reliability. A failed check in the disk-read test that blocks on a FIFO no longer hangs the suite: the test lets the held read go on every exit path and puts a deadline on each request and on the wait for the read, and every job in `rust.yml` and `functional.yml` has a `timeout-minutes` (issue #543).
 
 ## [0.10.0] - 2026-11-08

@@ -87,7 +87,10 @@ both SDKs must all pass.
   `fuzz/Cargo.lock` moves too: the fuzz package builds the server
   library, so a dependency change that the root lockfile records needs
   the refresh in `fuzz/README.md`, or the fuzz smoke's `--locked` build
-  in CI fails.
+  in CI fails. `scripts/check_locks.py` fails CI when the two lockfiles
+  disagree on a package both carry, or when either locks a decoder at
+  two versions: one decoder version is what ships, pre-checks and
+  fuzzes.
 - One binary, configuration-gated: AI and provenance features are enabled
   by environment configuration in the same binary, not by separate builds
   or cargo features. Never commit model files, certificates, or keys.

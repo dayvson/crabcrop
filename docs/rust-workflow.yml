@@ -43,6 +43,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check versions
         run: python3 scripts/check_versions.py
+      # One version of each decoder, and a fuzz lock that
+      # matches the root lock (issue #552).
+      - name: Check lockfiles
+        run: python3 scripts/check_locks.py
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Check doc links
