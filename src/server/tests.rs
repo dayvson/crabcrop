@@ -8484,21 +8484,68 @@ async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
-async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
-    let fake = crate::s3store::test_support::start_fake().await;
-    let dir = crate::test_support::scratch_dir("srv-drop4");
-    let state = tier_test_state(Some(&dir), &fake.endpoint);
-    let shared = state.shared_store.clone().unwrap();
-    let key = "40x24/example.com/i.png";
-    state.cache.put(key.to_string(), tier_test_entry());
-    shared.put(key, &tier_test_entry()).await;
-    // The memory hit's shared propagation is owed
-    // before any wait (issue #347): one poll and a
-    // drop cannot strand it.
-    poll_lookup_once(&state, key, &["thumb".to_string()]);
-    shared_learns_group(&shared, key, "thumb").await;
-    let _ = std::fs::remove_dir_all(&dir);
+/// Holds the only blocking thread of a runtime built with
+/// `max_blocking_threads(1)` until it is dropped (issue
+/// #546). The pool queues every task past its thread cap
+/// until a busy thread is free, so a disk operation the
+/// code under test hands to the pool meanwhile waits
+/// behind the gate, however the threads are scheduled.
+/// Dropping the gate lets the thread go on every exit
+/// path, so a failed check cannot leave the runtime's
+/// drop waiting for it.
+struct BlockingThreadGate {
+    /// Never sent on: dropping it ends the held task.
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+impl BlockingThreadGate {
+    /// Takes the pool's thread, and returns once the
+    /// thread is held.
+    async fn hold() -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        // Detached: the task holds the thread until the
+        // gate drops `release`, waited on or not.
+        drop(tokio::task::spawn_blocking(move || {
+            let _ = held_tx.send(());
+            let _ = released.recv();
+        }));
+        held_rx.await.expect("the gate takes the blocking thread");
+        BlockingThreadGate { _release: release }
+    }
+}
+
+#[test]
+fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
+    // One blocking thread, for the gate below to hold
+    // (issue #546).
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let fake = crate::s3store::test_support::start_fake().await;
+        let dir = crate::test_support::scratch_dir("srv-drop4");
+        let state = tier_test_state(Some(&dir), &fake.endpoint);
+        let shared = state.shared_store.clone().unwrap();
+        let key = "40x24/example.com/i.png";
+        state.cache.put(key.to_string(), tier_test_entry());
+        shared.put(key, &tier_test_entry()).await;
+        // The memory hit's shared propagation is owed
+        // before any wait (issue #347): one poll and a
+        // drop cannot strand it. The disk merge the hit
+        // then waits on queues behind the gate, so the
+        // one poll finds the lookup waiting on it
+        // (issue #546). Unheld, the merge could finish
+        // on the blocking pool before the poll looked,
+        // and the lookup returned instead of waiting.
+        let gate = BlockingThreadGate::hold().await;
+        poll_lookup_once(&state, key, &["thumb".to_string()]);
+        drop(gate);
+        shared_learns_group(&shared, key, "thumb").await;
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 #[tokio::test]
