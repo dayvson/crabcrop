@@ -865,3 +865,119 @@ fn a_second_signal_ends_the_drain_at_once() {
     assert_eq!(bucket.answered.load(std::sync::atomic::Ordering::SeqCst), 0);
     bucket.let_puts_through();
 }
+
+/// A shared bucket that lists `count` purge tombstones and
+/// never answers a read of one (issue #549): such a read
+/// waits until the server gives up on it. A listing answers
+/// at once, every other read is a 404, and every other
+/// request succeeds with an empty body.
+#[cfg(unix)]
+fn bucket_with_hanging_tombstones(count: u64) -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut listing = String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");
+    for i in 0..count {
+        listing += &format!(
+            "<Contents><Key>purges/{}-{:016x}-{i}</Key><ETag>&quot;{i}&quot;</ETag></Contents>",
+            1_762_000_000_000 + i,
+            0xabc
+        );
+    }
+    listing += "</ListBucketResult>";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let listing = listing.clone();
+            std::thread::spawn(move || {
+                let Some((method, target)) = read_request(&mut stream) else {
+                    return;
+                };
+                if method == "GET" && target.starts_with("/results/purges/") {
+                    let mut rest = [0u8; 64];
+                    while matches!(stream.read(&mut rest), Ok(n) if n > 0) {}
+                    return;
+                }
+                let (status, body) = if target.contains("list-type=2") {
+                    ("200 OK", listing.as_bytes())
+                } else if method == "GET" {
+                    ("404 Not Found", &b""[..])
+                } else {
+                    ("200 OK", &b""[..])
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(body));
+            });
+        }
+    });
+    endpoint
+}
+
+#[test]
+#[cfg(unix)]
+fn boot_serves_within_its_deadline_while_tombstone_reads_hang() {
+    // Issue #549: boot read the shared bucket's purge
+    // tombstones one at a time before it served, each up to
+    // the store's 10 s request bound. With five tombstones and
+    // hanging reads, the listening line came after 50 s, past
+    // the Helm liveness probe's restart at about 45 s, and
+    // nothing was counted or logged. The read now ends within
+    // 10 s whatever the bucket does. These 40 would take 30 s
+    // even at the 16 reads at a time it now keeps in flight.
+    let endpoint = bucket_with_hanging_tombstones(40);
+    let token = format!("boot-tombstones-{}", std::process::id());
+    let began = Instant::now();
+    let (mut server, port, _) = common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", "boot-smoke-secret-0123456789")
+            .env("CRABCROP_RESULT_BUCKET", "results")
+            .env("CRABCROP_S3_ENDPOINT", &endpoint)
+            .env("CRABCROP_METRICS_TOKEN", &token),
+    );
+    let took = began.elapsed();
+    // Boot waits for the refresh, as the docs say, and for
+    // its 10 s deadline at most.
+    assert!(took >= Duration::from_secs(9), "listened after {took:?}");
+    assert!(took < Duration::from_secs(20), "listened after {took:?}");
+    assert!(status_line(port, "/health", "").contains("200"));
+    // The reads the deadline left count once together on
+    // /metrics, not once per tombstone: a read that failed
+    // before it (the client's own 10 s bound can win the
+    // race) counts on its own, and at most 16 run at once.
+    // The refresh logs them on one line.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\r\n"
+    )
+    .unwrap();
+    let mut metrics = String::new();
+    let _ = stream.read_to_string(&mut metrics);
+    let errors: u64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("crabcrop_cache_tier_errors_total{tier=\"shared\"} "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no shared tier error count: {metrics}"));
+    assert!((1..=17).contains(&errors), "{metrics}");
+    let _ = server.0.kill();
+    let _ = server.0.wait();
+    let stderr = server.stderr();
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("shared storage: cannot read purge tombstones: "))
+        .unwrap_or_else(|| panic!("no tombstone read line: {stderr}"));
+    assert!(
+        line.contains(
+            "of 40 not done within 10s; kept as last read: 0; not in force until read: 40"
+        ),
+        "{line}"
+    );
+}
