@@ -485,7 +485,15 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// setting, PR #493; `upscale` and `remove_region` on a
 /// 16-bit or float source keep its alpha and its depth
 /// instead of serving opaque 8-bit RGB, which showed the
-/// color stored under transparent pixels #551).
+/// color stored under transparent pixels #551; and SVG
+/// sources whose reference fan-out (an id carried by many
+/// elements, an `inherit`, `context-*`, or `<use>` value
+/// list, or a memoized subtree reached from many sites) or
+/// whose stylesheet matching made the in-process pre-parse
+/// bound take time more than linear in the document, which
+/// usvg would render but are now refused with `502`
+/// instead, so the bound stays within the linear work its
+/// documentation promises).
 const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered

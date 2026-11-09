@@ -21,8 +21,21 @@
 //! it: one node per element instance and per character of text,
 //! plus the `data:` payload bytes of every image instance, and
 //! the depth of the recursion. Results are memoized per element
-//! and role, so the walk is linear in the document, and it stops
-//! as soon as a partial sum passes a limit.
+//! and role, and it stops as soon as a partial sum passes a
+//! limit.
+//!
+//! The walk is linear in the document because every step it
+//! takes spends a unit of fuel: every evaluation of an element
+//! in a role, a memoized result reused included, and every
+//! declared value examined for a reference, a value shared by
+//! many elements through an id or an `inherit`, `context-*`, or
+//! `<use>` list included. The fuel is a small multiple of the
+//! node limit, so the total work the walk does is bounded by it
+//! however the references fan out, and a document that would
+//! make the walk do more is refused (as `Nodes`) instead. The
+//! facts the walk reads are gathered once, under the same kind
+//! of bound: matching the style sheet's kept rules against the
+//! elements is capped at [`MAX_STYLE_MATCHES`] comparisons.
 //!
 //! It never undercounts those conversions. A reference whose
 //! source is ambiguous without usvg's full style resolution
@@ -113,7 +126,23 @@ pub(super) enum Refusal {
     Bytes,
     Cycle,
     Depth,
+    /// Bounding the document needs more pre-parse work than
+    /// its structure is allowed: the style sheet's kept rules
+    /// against the elements passed [`MAX_STYLE_MATCHES`]. Kept
+    /// separate from `Nodes` so the message names the cause.
+    Work,
 }
+
+/// The most element-by-rule comparisons [`Facts::gather`] makes
+/// when it matches the kept style rules against the elements. A
+/// document with `R` kept rules and `E` elements costs `R * E`
+/// comparisons; both are bounded only by the node cap, so their
+/// product is quadratic, and a crafted document reaches it in a
+/// few kilobytes. The cap is well above any real style sheet
+/// (even a few hundred rules against the whole 10,000-node cap
+/// stays under it) and refuses the quadratic case before it
+/// runs.
+const MAX_STYLE_MATCHES: u64 = 4_000_000;
 
 /// The segments usvg may cut one elliptical arc into. kurbo
 /// subdivides an arc into up to `(11.163 * r)^(1/6)` cubics per
@@ -331,7 +360,7 @@ fn check_href_cycles<'a, 'input>(
 
 /// Bound what usvg builds for `doc`, or say why it is refused.
 pub(super) fn bound(doc: &roxmltree::Document, limits: Limits) -> Result<Cost, Refusal> {
-    let facts = Facts::gather(doc);
+    let facts = Facts::gather(doc)?;
     // usvg follows `href` on gradients, patterns, and filters
     // with a guard that misses cycles not passing through the
     // element it started from, so such a cycle hangs it before
@@ -377,7 +406,7 @@ struct Facts<'a, 'input> {
 }
 
 impl<'a, 'input> Facts<'a, 'input> {
-    fn gather(doc: &'a roxmltree::Document<'input>) -> Self {
+    fn gather(doc: &'a roxmltree::Document<'input>) -> Result<Self, Refusal> {
         let count = doc.descendants().len() + 1;
         let mut facts = Facts {
             ids: HashMap::new(),
@@ -394,6 +423,12 @@ impl<'a, 'input> Facts<'a, 'input> {
             }
         }
         let rules = facts.style_rules(doc);
+        // Matching every kept rule against every element is
+        // quadratic in the document, so it is capped: a
+        // document whose rules and elements together would make
+        // more than `MAX_STYLE_MATCHES` comparisons is refused
+        // here, before the matching runs long.
+        let mut matches_left = MAX_STYLE_MATCHES;
         for node in doc.descendants().filter(Node::is_element) {
             let mut decls = Vec::new();
             for attr in node.attributes() {
@@ -402,6 +437,7 @@ impl<'a, 'input> Facts<'a, 'input> {
                 }
             }
             for rule in &rules {
+                matches_left = matches_left.checked_sub(1).ok_or(Refusal::Work)?;
                 if rule.selector.matches(&XmlNode(node)) {
                     for decl in &rule.declarations {
                         for &prop in Prop::named(decl.name) {
@@ -443,7 +479,7 @@ impl<'a, 'input> Facts<'a, 'input> {
                 facts.at_use[prop.index()].extend(values);
             }
         }
-        facts
+        Ok(facts)
     }
 
     fn values(&self, node: Node<'a, 'input>, prop: Prop) -> impl Iterator<Item = &'a str> + '_ {
@@ -595,6 +631,11 @@ struct Walk<'f, 'a, 'input> {
 
 impl<'a, 'input> Walk<'_, 'a, 'input> {
     fn eval(&mut self, node: Node<'a, 'input>, role: Role) -> Result<Cost, Refusal> {
+        // Every visit spends a unit, a memoized result reused
+        // included, so the number of visits across the whole
+        // walk is bounded however references fan out onto an
+        // element shared by many sites (issue #443).
+        self.fuel = self.fuel.checked_sub(1).ok_or(Refusal::Nodes)?;
         let key = (node.id().get_usize(), role);
         match self.memo.get(&key) {
             // A memoized conversion repeats its whole recursion
@@ -613,7 +654,6 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
         if self.depth >= self.limits.depth {
             return Err(Refusal::Depth);
         }
-        self.fuel = self.fuel.checked_sub(1).ok_or(Refusal::Nodes)?;
         let depth = self.depth;
         self.memo.insert(key, Slot::Active(depth));
         self.depth += 1;
@@ -657,6 +697,12 @@ impl<'a, 'input> Walk<'_, 'a, 'input> {
     fn refs(&mut self, values: &[&str], role: Role, sum: bool) -> Result<Cost, Refusal> {
         let mut best = Cost::ZERO;
         for value in values {
+            // Every value examined spends a unit, so a list
+            // grown by an `inherit`, `context-*`, or `<use>`
+            // fan-out (which can repeat a value once per
+            // declaration) cannot make the walk do unbounded
+            // work before it finds the references in it.
+            self.fuel = self.fuel.checked_sub(1).ok_or(Refusal::Nodes)?;
             let mut total = Cost::ZERO;
             for targets in self.facts.url_targets(value) {
                 let mut cost = Cost::ZERO;
@@ -1235,5 +1281,166 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(cost.bytes, 2 * payload.len() as u64);
+    }
+
+    /// An id carried by many elements, each referenced from
+    /// many sites, makes the walk re-reach every one of them
+    /// from every site. Each visit (a memoized one included)
+    /// spends fuel, so the document is refused instead of
+    /// walked a quadratic number of times. Without the fuel
+    /// charge on memoized visits, the walk runs
+    /// `gradients * fills` times and is not refused at all.
+    #[test]
+    fn a_shared_id_referenced_many_times_is_refused_not_walked() {
+        let mut body = String::from("<defs>");
+        for _ in 0..500 {
+            // All share one id, so each `url(#g)` resolves to
+            // every one of them.
+            body.push_str("<linearGradient id=\"g\"/>");
+        }
+        body.push_str("</defs>");
+        for _ in 0..1000 {
+            body.push_str("<rect width=\"1\" height=\"1\" fill=\"url(#g)\"/>");
+        }
+        assert_eq!(bound_of(&svg(&body)), Err(Refusal::Nodes));
+        // A handful of the same references is walked and
+        // accepted, so it is the fan-out, not the shape, that
+        // is refused.
+        let mut small = String::from("<defs><linearGradient id=\"g\"/></defs>");
+        for _ in 0..4 {
+            small.push_str("<rect width=\"1\" height=\"1\" fill=\"url(#g)\"/>");
+        }
+        assert!(bound_of(&svg(&small)).is_ok());
+    }
+
+    /// An `inherit` pulls every value a property takes anywhere
+    /// in the document into the list examined for references.
+    /// With one such list per element, the lists examined grow
+    /// to the square of the document. Each value examined
+    /// spends fuel, so the document is refused; without that
+    /// charge the walk examines `declarations * inheritors`
+    /// values and is not refused.
+    #[test]
+    fn an_inherit_value_list_fanned_out_is_refused() {
+        let mut body = String::new();
+        // Each contributes a `filter` value to what an
+        // `inherit` resolves to.
+        for _ in 0..750 {
+            body.push_str("<rect width=\"1\" height=\"1\" filter=\"none\"/>");
+        }
+        // Each examines all of them.
+        for _ in 0..750 {
+            body.push_str("<rect width=\"1\" height=\"1\" filter=\"inherit\"/>");
+        }
+        assert_eq!(bound_of(&svg(&body)), Err(Refusal::Nodes));
+    }
+
+    /// Matching the kept style rules against the elements is
+    /// capped: a `<style>` with many referencing rules and many
+    /// elements for them to match is refused before the
+    /// quadratic matching runs. Without the cap it runs
+    /// `rules * elements` comparisons and is accepted.
+    #[test]
+    fn style_rules_matching_is_capped() {
+        let mut style = String::from("<style>");
+        for i in 0..2100 {
+            // Each rule references a filter, so it is kept, and
+            // each is a distinct selector.
+            style.push_str(&format!(".c{i} {{ filter: url(#f) }}"));
+        }
+        style.push_str("</style>");
+        let mut body = format!("<defs><filter id=\"f\"><feFlood/></filter></defs>{style}");
+        for _ in 0..2100 {
+            body.push_str("<rect width=\"1\" height=\"1\"/>");
+        }
+        assert_eq!(bound_of(&svg(&body)), Err(Refusal::Work));
+        // A small style sheet matched against few elements is
+        // under the cap and is bounded as before.
+        let ok = svg("<style>.c { filter: url(#f) }</style>\
+             <defs><filter id=\"f\"><feFlood/></filter></defs>\
+             <rect class=\"c\" width=\"1\" height=\"1\"/>");
+        assert!(bound_of(&ok).is_ok());
+    }
+
+    /// The fuel and the style cap do not refuse a document
+    /// whose reuse is ordinary: an element reused a modest
+    /// number of times, with an `inherit`, is bounded, and to
+    /// the same cost as the reuse written out by hand.
+    #[test]
+    fn ordinary_reuse_is_bounded_unchanged() {
+        let reused = bound_of(&svg(
+            "<defs><g id=\"t\"><rect width=\"1\" height=\"1\"/><rect width=\"1\" height=\"1\"/></g></defs>\
+             <use href=\"#t\"/><use href=\"#t\"/><use href=\"#t\"/>",
+        ))
+        .unwrap();
+        // svg + 3 * (use + its group node + (g + 2 rects)).
+        assert_eq!(reused.nodes, 1 + 3 * (1 + 1 + (1 + 2)));
+        // An `inherit` on a non-inherited property still lands
+        // under the caps for a normal document.
+        assert!(
+            bound_of(&svg("<defs><filter id=\"f\"><feFlood/></filter></defs>\
+             <rect width=\"1\" height=\"1\" filter=\"url(#f)\"/>\
+             <rect width=\"1\" height=\"1\" filter=\"inherit\"/>",))
+            .is_ok()
+        );
+    }
+
+    /// A ring of same-kind `href` links, a tail leading into a
+    /// ring, and a chain that ends keep the results they had
+    /// before the check was made linear: usvg terminates on a
+    /// pure ring (every member returns to where it began) and
+    /// on a chain that ends, and loops when a chain leads into
+    /// a ring it is not part of, so the first two are accepted
+    /// and the third is refused.
+    #[test]
+    fn rings_and_chains_keep_their_results() {
+        // A pure ring: a0 -> a1 -> a2 -> a0.
+        let pure_ring = "<defs><filter id=\"a0\" href=\"#a1\"/><filter id=\"a1\" href=\"#a2\"/>\
+             <filter id=\"a2\" href=\"#a0\"/></defs><rect width=\"1\" height=\"1\"/>";
+        assert!(bound_of(&svg(pure_ring)).is_ok());
+        // A tail into a ring: t -> a0, and a0 -> a1 -> a2 -> a0.
+        let tail = "<defs><filter id=\"t\" href=\"#a0\"/>\
+             <filter id=\"a0\" href=\"#a1\"/><filter id=\"a1\" href=\"#a2\"/>\
+             <filter id=\"a2\" href=\"#a0\"/></defs><rect width=\"1\" height=\"1\"/>";
+        assert_eq!(bound_of(&svg(tail)), Err(Refusal::Cycle));
+        // A chain that ends at a missing id.
+        let chain = "<defs><filter id=\"a0\" href=\"#a1\"/><filter id=\"a1\" href=\"#a2\"/>\
+             <filter id=\"a2\" href=\"#end\"/></defs><rect width=\"1\" height=\"1\"/>";
+        assert!(bound_of(&svg(chain)).is_ok());
+    }
+
+    /// A pure ring of 10,000 same-kind `href` links is checked
+    /// in linear time: before the check was made linear it
+    /// walked the ring from every member, so a ring this size
+    /// took seconds. The bound here is far above the linear
+    /// cost and far below the quadratic one.
+    #[test]
+    fn a_large_href_ring_is_checked_quickly() {
+        // svg + defs + 9997 filters + rect = the 10,000-node
+        // document cap.
+        const N: usize = 9997;
+        let mut body = String::from("<defs>");
+        for i in 0..N {
+            body.push_str(&format!("<filter id=\"a{i}\" href=\"#a{}\"/>", (i + 1) % N));
+        }
+        body.push_str("</defs><rect width=\"1\" height=\"1\"/>");
+        let text = svg(&body);
+        let doc = roxmltree::Document::parse(&text).unwrap();
+        let start = std::time::Instant::now();
+        let result = bound(
+            &doc,
+            Limits {
+                nodes: 100_000,
+                bytes: 1 << 28,
+                depth: 128,
+            },
+        );
+        let elapsed = start.elapsed();
+        // A pure ring is accepted, as it was before.
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "checking a {N}-element ring took {elapsed:?}; the check is not linear"
+        );
     }
 }

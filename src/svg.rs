@@ -546,6 +546,9 @@ fn check_expansion(doc: &roxmltree::Document, depth: usize) -> Result<expansion:
         expansion::Refusal::Depth => format!(
             "SVG nests deeper than {MAX_CONVERSION_DEPTH} levels once references are followed"
         ),
+        expansion::Refusal::Work => {
+            "SVG style rules match too many elements to bound before rendering".to_string()
+        }
     })
 }
 
