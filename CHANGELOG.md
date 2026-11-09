@@ -8,6 +8,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - In the library, `crabcrop::url::Quality::resolved_for` returns `Option<ResolvedQuality>` instead of `Option<Quality>` (issue #480). `ResolvedQuality` is a new name for `QualityValue`, the two forms a resolved quality takes, so code that matched `Quality::Value` or `Quality::Auto` on the result matches `ResolvedQuality::Value` or `ResolvedQuality::Auto` instead and needs no arm for the per-format list, which the method never returned. Inside the engine, invariants it checked at run time are now carried by its types (the frame decoders return a list that cannot be empty, the still encoder takes a format with no video variant, and the request's operations are analyzed once), and the GIF and animated WebP decode branches, the animated and video frame loops, and the overlay and watermark compositing each share one implementation. Behavior and rendered bytes are unchanged.
 
+### Fixed
+
+- The five framework READMEs named a minimum `@crabcrop/url` version that was never released. They now ask for 0.10.0 or later, the first release that exports `MAX_DIMENSION` (issue #565). The Helm README's own-build snippet built and pushed `your-registry/crabcrop:0.10.1`, then installed the chart with `--set image.tag=0.9.10`, a tag it never pushed. It now installs the tag it builds, and `scripts/bump_version.py` and `scripts/check_versions.py` cover the `image.tag=` line, so a release moves it with the other image pins.
+
 ## [0.10.1] - 2026-11-09
 
 ### Changed

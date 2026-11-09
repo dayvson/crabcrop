@@ -70,7 +70,7 @@ docker build -t your-registry/crabcrop:0.10.1 .
 docker push your-registry/crabcrop:0.10.1
 helm install crabcrop deploy/helm/crabcrop \
   --set image.repository=your-registry/crabcrop \
-  --set image.tag=0.9.10 \
+  --set image.tag=0.10.1 \
   --set existingSecret=crabcrop-secret
 ```
 

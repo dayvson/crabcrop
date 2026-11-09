@@ -4,7 +4,7 @@ A loader factory for SvelteKit apps that routes image URLs through your crabcrop
 
 ## Setup
 
-1. Install the builder: `npm install @crabcrop/url` (0.9.12 or later, which exports the `MAX_DIMENSION` this file imports).
+1. Install the builder: `npm install @crabcrop/url` (0.10.0 or later, which exports the `MAX_DIMENSION` this file imports).
 2. Copy [`crabcrop-loader.ts`](crabcrop-loader.ts) into your project, for example under `src/lib/`.
 3. Create the loader in a shared module:
 
