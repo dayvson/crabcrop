@@ -376,6 +376,16 @@ class TreeChecks(unittest.TestCase):
         self.edit("docs/configuration.md", "Credentials come from `AWS_ACCESS_KEY_ID`. ", "")
         self.assertOnly("env", "AWS_ACCESS_KEY_ID is read by the server but named nowhere")
 
+    def test_env_variable_read_through_the_injected_lookup_is_read(self):
+        # Issue #477: the boot configuration reads PORT through its `get`.
+        self.edit("src/main.rs", 'env::var("PORT").ok()', 'get("PORT")')
+        self.assertEqual(self.problems(), [])
+
+    def test_env_map_or_header_lookup_is_not_a_variable(self):
+        # `.get("PORT")` on a map is no read of the variable PORT.
+        self.edit("src/main.rs", 'env::var("PORT").ok()', 'headers.get("PORT")')
+        self.assertOnly("env", "documents PORT, which no server code reads")
+
     # defaults
 
     def test_defaults_literal_disagrees(self):
