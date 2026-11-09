@@ -100,8 +100,8 @@ const TOMBSTONE_READS_AT_ONCE: usize = 16;
 /// [`TOMBSTONE_READS_AT_ONCE`]), and 10 s is
 /// [`STORE_TIMEOUT`], so a single hung request fails at
 /// about the deadline anyway. What a refresh did not read by
-/// then is handled as a failed read (see
-/// [`S3Store::refresh_tombstones_within`]).
+/// then is handled like a failed read, but counted once per
+/// refresh (see [`S3Store::refresh_tombstones_within`]).
 pub const TOMBSTONE_REFRESH_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How many entry headers one purge walk reads at once
@@ -1297,19 +1297,25 @@ impl S3Store {
     /// every replica collects them, so no single process has
     /// to outlive its grace period.
     ///
-    /// The whole refresh ends within `limit` (issue #549). A
-    /// listing that fails or runs out of time keeps the
-    /// previous set, so a flaky store cannot make a purge
-    /// lapse. A tombstone read before whose read fails or
-    /// does not finish in time keeps the version read before,
-    /// under the ETag it was read with, so the next refresh
-    /// reads it again. One never read before stays out of
-    /// the set, as it always has, and every refresh retries
-    /// it. Each such read counts as one tier error, and a
-    /// refresh that has any logs one line for them. A read
-    /// that finds the object gone is no failure: another
-    /// replica collected it. Deletes still running at the
-    /// deadline are dropped, and a later refresh lists those
+    /// The whole refresh ends within `limit` (issue #549):
+    /// one deadline covers the listing, the reads and the
+    /// deletes. A listing that fails or runs out of time
+    /// keeps the previous set, so a flaky store cannot make
+    /// a purge lapse. The reads that finish by the deadline
+    /// apply, and their ETags spare the next refresh from
+    /// reading them again, so a slow store that keeps
+    /// answering catches up, newest first. A tombstone read
+    /// before whose read fails or does not finish in time
+    /// keeps the version read before, under the ETag it was
+    /// read with, so the next refresh reads it again. One
+    /// never read before stays out of the set, as it always
+    /// has, and every refresh retries it. Each read the
+    /// store fails counts as one tier error, the reads left
+    /// at the deadline count as one together, and a refresh
+    /// that has either logs one line for them. A read that
+    /// finds the object gone is no failure: another replica
+    /// collected it. Deletes still running at the deadline
+    /// are dropped, and a later refresh lists those
     /// tombstones again. Returns whether the refresh listed
     /// and read everything.
     pub async fn refresh_tombstones_within(&self, guard: &PurgeGuard, limit: Duration) -> bool {
@@ -1366,38 +1372,51 @@ impl S3Store {
             }
         })
         .await;
-        let (mut failed, mut kept) = (0u64, 0u64);
+        // `failed` counts the reads the store answered with a
+        // failure, one error each, as every other store
+        // request counts. The reads the deadline cut off or
+        // kept from starting count one error together: their
+        // number grows with the tombstones listed, not with
+        // the requests the store failed.
+        let (mut failed, mut unfinished, mut kept) = (0u64, 0u64, 0u64);
         let mut first_failure = None;
         for (_, _, object, etag) in &to_read {
-            let read = done
-                .remove(object)
-                .unwrap_or_else(|| TombstoneRead::Failed(late()));
-            match read {
-                TombstoneRead::Read(tombstone) => {
+            match done.remove(object) {
+                Some(TombstoneRead::Read(tombstone)) => {
                     fresh.insert(object.clone(), (etag.clone(), tombstone));
+                    continue;
                 }
-                TombstoneRead::Ignored => {}
-                TombstoneRead::Failed(why) => {
+                Some(TombstoneRead::Ignored) => continue,
+                Some(TombstoneRead::Failed(why)) => {
                     failed += 1;
                     first_failure.get_or_insert(why);
-                    // The version read before stays in force,
-                    // under its own ETag, so the next refresh
-                    // reads the object again.
-                    if let Some(known) = previous.get(object) {
-                        fresh.insert(object.clone(), known.clone());
-                        kept += 1;
-                    }
                 }
+                None => unfinished += 1,
+            }
+            // The version read before stays in force, under
+            // its own ETag, so the next refresh reads the
+            // object again.
+            if let Some(known) = previous.get(object) {
+                fresh.insert(object.clone(), known.clone());
+                kept += 1;
             }
         }
-        if let Some(why) = first_failure {
+        if failed + unfinished > 0 {
+            let total = to_read.len();
+            let mut what = Vec::new();
+            if let Some(why) = &first_failure {
+                what.push(format!("{failed} of {total} reads failed (first: {why})"));
+            }
+            if unfinished > 0 {
+                what.push(format!("{unfinished} of {total} {}", late()));
+            }
             self.note_errors(
-                failed,
+                failed + u64::from(unfinished > 0),
                 "cannot read purge tombstones",
                 &format!(
-                    "{failed} of {} reads failed (first: {why}); kept as last read: {kept}; never read, not applied until read: {}",
-                    to_read.len(),
-                    failed - kept
+                    "{}; kept as last read: {kept}; not in force until read: {}",
+                    what.join(", "),
+                    failed + unfinished - kept
                 ),
             );
         }
@@ -1435,7 +1454,7 @@ impl S3Store {
             ),
         )
         .await;
-        failed == 0
+        failed + unfinished == 0
     }
 }
 
@@ -1784,6 +1803,20 @@ pub(crate) mod test_support {
         }
     }
 
+    /// The fake's instrument for breaking whole-object GETs
+    /// by name (issue #549), the store failures that are not
+    /// an answer: while one of the prefixes is set, a GET of
+    /// a name that starts with it fails that way.
+    #[derive(Default)]
+    pub struct NameBreak {
+        /// The connection closes before any answer.
+        pub unanswered: StdMutex<Option<String>>,
+        /// The answer is a 200 whose body breaks off: half
+        /// of it is sent under a content-length for all of
+        /// it, and the connection closes.
+        pub cut: StdMutex<Option<String>>,
+    }
+
     /// Injectable failure switches for the error-path
     /// tests: while a flag is set, the matching operation
     /// answers 500 instead of doing its work.
@@ -1841,6 +1874,8 @@ pub(crate) mod test_support {
         pub walk: Arc<WalkProbe>,
         /// Requests held by name (issue #549).
         pub name_hold: Arc<NameHold>,
+        /// Whole-object GETs broken by name (issue #549).
+        pub name_break: Arc<NameBreak>,
         pub endpoint: String,
     }
 
@@ -1865,6 +1900,7 @@ pub(crate) mod test_support {
         let held_puts = Arc::new(AtomicUsize::new(0));
         let walk = Arc::new(WalkProbe::default());
         let name_hold = Arc::new(NameHold::default());
+        let name_break = Arc::new(NameBreak::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = objects.clone();
@@ -1880,6 +1916,7 @@ pub(crate) mod test_support {
         let shared_held_puts = held_puts.clone();
         let shared_walk = walk.clone();
         let shared_name_hold = name_hold.clone();
+        let shared_name_break = name_break.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let objects = shared.clone();
@@ -1895,6 +1932,7 @@ pub(crate) mod test_support {
                 let held_puts = shared_held_puts.clone();
                 let walk = shared_walk.clone();
                 let name_hold = shared_name_hold.clone();
+                let name_break = shared_name_break.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -1988,6 +2026,7 @@ pub(crate) mod test_support {
                     if let Some(prefix) = &listed {
                         walk.lists.lock().unwrap().push(prefix.clone());
                     }
+                    let mut cut = false;
                     {
                         let (path, _) = match target.split_once('?') {
                             Some((p, q)) => (p, q),
@@ -2011,6 +2050,10 @@ pub(crate) mod test_support {
                             name_hold.wait(&name_hold.lists, prefix).await;
                         } else if method == "GET" && range_end.is_none() {
                             name_hold.wait(&name_hold.reads, &key).await;
+                            if NameHold::holds(&name_break.unanswered, &key) {
+                                return;
+                            }
+                            cut = NameHold::holds(&name_break.cut, &key);
                         } else if method == "DELETE" {
                             name_hold.wait(&name_hold.deletes, &key).await;
                         }
@@ -2043,6 +2086,10 @@ pub(crate) mod test_support {
                         payload.len()
                     );
                     let _ = socket.write_all(resp.as_bytes()).await;
+                    if cut {
+                        let _ = socket.write_all(&payload[..payload.len() / 2]).await;
+                        return;
+                    }
                     // A HEAD response advertises the object's
                     // length but carries no body.
                     if method != "HEAD" {
@@ -2065,6 +2112,7 @@ pub(crate) mod test_support {
             held_puts,
             walk,
             name_hold,
+            name_break,
             endpoint: format!("http://127.0.0.1:{port}"),
         }
     }
@@ -3018,13 +3066,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_known_tombstone_whose_read_breaks_off_stays_in_force_and_is_counted() {
+        // Issue #549: a store fails a read without an error
+        // status too. A connection that closes before any
+        // answer, and a body that breaks off, fail the read
+        // like a 500: the version read before stays in force,
+        // each refresh counts one error and reads it again.
+        let hero = ["hero".to_string()];
+        for how in ["no answer", "a body that breaks off"] {
+            let fake = start_fake().await;
+            let a = store(&fake.endpoint);
+            let b = store(&fake.endpoint);
+            let cutoff = PurgeCutoff {
+                start_ms: now_ms(),
+                writer: 0xa,
+            };
+            let name = a
+                .put_tombstone(&tombstone_for("hero", cutoff, None), 1)
+                .await
+                .unwrap();
+            let guard = PurgeGuard::new();
+            assert!(b.refresh_tombstones(&guard).await, "{how}");
+            let ended = tombstone_for("hero", cutoff, Some(now_ms()));
+            assert!(a.write_tombstone(&name, &ended).await);
+            let switch = match how {
+                "no answer" => &fake.name_break.unanswered,
+                _ => &fake.name_break.cut,
+            };
+            *switch.lock().unwrap() = Some("cache/purges/".into());
+            let gets = count_gets(&fake, &name);
+            let later = now_ms() + 2 * crate::cache::TOMBSTONE_GRACE_MS;
+            for round in 1..=2 {
+                assert!(!b.refresh_tombstones(&guard).await, "{how}");
+                assert_eq!(count_gets(&fake, &name), gets + round, "{how}");
+                assert!(
+                    guard.running_covers_at(later, "k", &hero, None),
+                    "{how}: the purge lapsed"
+                );
+                assert_eq!(
+                    b.errors(),
+                    round as u64,
+                    "{how}: the failed read was not counted"
+                );
+            }
+            *switch.lock().unwrap() = None;
+            assert!(b.refresh_tombstones(&guard).await, "{how}");
+            assert!(guard.running_covers("k", &hero, None), "{how}");
+            assert!(!guard.running_covers_at(later, "k", &hero, None), "{how}");
+            assert_eq!(b.errors(), 2, "{how}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_tombstone_never_read_is_retried_and_counted_until_a_refresh_reads_it() {
         // Issue #549: a failed read was neither counted nor
         // logged. A tombstone this replica has never read
-        // still does not apply until a refresh reads it (a
-        // follow-up issue covers what it should do
-        // meanwhile), but every refresh retries it and counts
-        // the failure.
+        // still does not apply until a refresh reads it (what
+        // it should do meanwhile is left open), but every
+        // refresh retries it and counts the failure.
         let fake = start_fake().await;
         let a = store(&fake.endpoint);
         let b = store(&fake.endpoint);
@@ -3165,9 +3264,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             TOMBSTONE_READS_AT_ONCE
         );
-        // Every read that did not finish counts, the ones the
-        // deadline kept from starting too.
-        assert_eq!(b.errors(), count as u64);
+        // The reads the deadline left, held or never started,
+        // count one error together: their number grows with
+        // the tombstones, not with requests the store failed.
+        assert_eq!(b.errors(), 1);
         // The version read before still applies; the ones
         // never read do not.
         let later = now_ms() + 2 * crate::cache::TOMBSTONE_GRACE_MS;
@@ -3183,7 +3283,7 @@ mod tests {
             assert!(guard.running_covers("k", &[format!("g{i}")], None));
         }
         assert!(!guard.running_covers_at(later, "k", &["g0".to_string()], None));
-        assert_eq!(b.errors(), count as u64);
+        assert_eq!(b.errors(), 1);
     }
 
     #[tokio::test]
@@ -3305,6 +3405,170 @@ mod tests {
         }
         assert!(b.refresh_tombstones(&guard).await);
         assert_eq!(tombstones(), 0);
+    }
+
+    /// Run one refresh of `b` with a 3 s limit while the fake
+    /// holds its tombstone listing for the first 2 s (issue
+    /// #549). Returns how long the refresh took and what it
+    /// returned.
+    async fn refresh_after_a_slow_listing(
+        fake: &super::test_support::FakeS3,
+        b: &S3Store,
+        guard: &PurgeGuard,
+    ) -> (Duration, bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        *fake.name_hold.lists.lock().unwrap() = Some("cache/purges/".into());
+        let began = Instant::now();
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(fake.name_hold.held.load(SeqCst), 1, "no listing held");
+            *fake.name_hold.lists.lock().unwrap() = None;
+        };
+        // The outer bound only keeps a refresh with no limit
+        // at all from hanging the test.
+        let (refreshed, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                b.refresh_tombstones_within(guard, Duration::from_secs(3)),
+            ),
+            release
+        );
+        let refreshed = refreshed.expect("the refresh ignored its limit");
+        (began.elapsed(), refreshed)
+    }
+
+    #[tokio::test]
+    async fn one_deadline_covers_the_tombstone_listing_and_reads_together() {
+        // Issue #549: the limit bounds the whole refresh, not
+        // each part of it. A listing that takes 2 s of a 3 s
+        // limit leaves the hanging reads 1 s, not 3: with a
+        // limit per part, a store slow in every part would
+        // hold boot for the limit several times over.
+        use std::sync::atomic::Ordering::SeqCst;
+        let fake = start_fake().await;
+        let a = store(&fake.endpoint);
+        let b = store(&fake.endpoint);
+        let now = now_ms();
+        for i in 0..4 {
+            let cutoff = PurgeCutoff {
+                start_ms: now - i,
+                writer: 0xa,
+            };
+            a.put_tombstone(&tombstone_for(&format!("g{i}"), cutoff, None), i)
+                .await
+                .unwrap();
+        }
+        *fake.name_hold.reads.lock().unwrap() = Some("cache/purges/".into());
+        let guard = PurgeGuard::new();
+        let (took, refreshed) = refresh_after_a_slow_listing(&fake, &b, &guard).await;
+        assert!(
+            took < Duration::from_secs(4),
+            "the reads got a limit of their own: the refresh took {took:?}"
+        );
+        assert!(!refreshed);
+        assert_eq!(fake.name_hold.held.load(SeqCst), 4, "no reads held");
+        assert_eq!(b.errors(), 1);
+        *fake.name_hold.reads.lock().unwrap() = None;
+    }
+
+    #[tokio::test]
+    async fn one_deadline_covers_the_tombstone_listing_and_deletes_together() {
+        // Issue #549: as above, for the deletes of spent
+        // tombstones. A listing that takes 2 s of a 3 s limit
+        // leaves the hanging deletes what remains of it.
+        use std::sync::atomic::Ordering::SeqCst;
+        let fake = start_fake().await;
+        let a = store(&fake.endpoint);
+        let b = store(&fake.endpoint);
+        let long_ago = now_ms() - crate::cache::TOMBSTONE_GRACE_MS - 60_000;
+        let count = TOMBSTONE_READS_AT_ONCE + 4;
+        for i in 0..count {
+            let cutoff = PurgeCutoff {
+                start_ms: long_ago + i as u64,
+                writer: 0xa,
+            };
+            let spent = tombstone_for(&format!("g{i}"), cutoff, Some(long_ago + 1_000));
+            a.put_tombstone(&spent, i as u64).await.unwrap();
+        }
+        *fake.name_hold.deletes.lock().unwrap() = Some("cache/purges/".into());
+        let guard = PurgeGuard::new();
+        let (took, refreshed) = refresh_after_a_slow_listing(&fake, &b, &guard).await;
+        assert!(
+            took < Duration::from_secs(4),
+            "the deletes got a limit of their own: the refresh took {took:?}"
+        );
+        assert!(refreshed, "an unfinished collection fails nothing");
+        assert_eq!(
+            fake.name_hold.held.load(SeqCst),
+            TOMBSTONE_READS_AT_ONCE,
+            "no deletes held"
+        );
+        assert_eq!(b.errors(), 0);
+        *fake.name_hold.deletes.lock().unwrap() = None;
+    }
+
+    #[tokio::test]
+    async fn tombstone_reads_done_by_the_deadline_apply_and_are_not_read_again() {
+        // Issue #549: a refresh cut off at its limit keeps the
+        // reads that finished by then, under their ETags, so
+        // the next refresh reads only what is left. A slow
+        // store that keeps answering catches up over several
+        // refreshes instead of starting over on each, and the
+        // newest tombstones, read first, apply first: here
+        // the older ones' reads hang, more of them than the
+        // refresh reads at once.
+        let fake = start_fake().await;
+        let a = store(&fake.endpoint);
+        let b = store(&fake.endpoint);
+        let now = now_ms();
+        let mut new = Vec::new();
+        for i in 0..4 {
+            let cutoff = PurgeCutoff {
+                start_ms: now - i,
+                writer: 0xa,
+            };
+            let tombstone = tombstone_for(&format!("new{i}"), cutoff, None);
+            new.push(a.put_tombstone(&tombstone, i).await.unwrap());
+        }
+        let old = TOMBSTONE_READS_AT_ONCE as u64 + 4;
+        for i in 0..old {
+            let cutoff = PurgeCutoff {
+                start_ms: 1_000_000_000_000 + i,
+                writer: 0xa,
+            };
+            a.put_tombstone(&tombstone_for(&format!("old{i}"), cutoff, None), i)
+                .await
+                .unwrap();
+        }
+        *fake.name_hold.reads.lock().unwrap() = Some("cache/purges/1000".into());
+        let guard = PurgeGuard::new();
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(8),
+            b.refresh_tombstones_within(&guard, Duration::from_secs(2)),
+        )
+        .await
+        .expect("the refresh outlived its limit");
+        assert!(!refreshed);
+        for i in 0..4 {
+            assert!(
+                guard.running_covers("k", &[format!("new{i}")], None),
+                "a read done by the deadline did not apply"
+            );
+        }
+        assert!(!guard.running_covers("k", &["old0".to_string()], None));
+        assert_eq!(b.errors(), 1);
+        // Once the store answers, the next refresh reads the
+        // rest, and only the rest.
+        *fake.name_hold.reads.lock().unwrap() = None;
+        let gets: Vec<usize> = new.iter().map(|name| count_gets(&fake, name)).collect();
+        assert_eq!(gets, vec![1; 4]);
+        assert!(b.refresh_tombstones(&guard).await);
+        let again: Vec<usize> = new.iter().map(|name| count_gets(&fake, name)).collect();
+        assert_eq!(again, gets, "a read done by the deadline was not kept");
+        for i in 0..old {
+            assert!(guard.running_covers("k", &[format!("old{i}")], None));
+        }
+        assert_eq!(b.errors(), 1);
     }
 
     #[test]

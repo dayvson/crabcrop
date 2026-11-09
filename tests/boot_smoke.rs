@@ -945,8 +945,11 @@ fn boot_serves_within_its_deadline_while_tombstone_reads_hang() {
     assert!(took >= Duration::from_secs(9), "listened after {took:?}");
     assert!(took < Duration::from_secs(20), "listened after {took:?}");
     assert!(status_line(port, "/health", "").contains("200"));
-    // Every unfinished read is counted on /metrics, and the
-    // refresh logs them on one line.
+    // The reads the deadline left count once together on
+    // /metrics, not once per tombstone: a read that failed
+    // before it (the client's own 10 s bound can win the
+    // race) counts on its own, and at most 16 run at once.
+    // The refresh logs them on one line.
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -963,12 +966,18 @@ fn boot_serves_within_its_deadline_while_tombstone_reads_hang() {
         .find_map(|l| l.strip_prefix("crabcrop_cache_tier_errors_total{tier=\"shared\"} "))
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or_else(|| panic!("no shared tier error count: {metrics}"));
-    assert!(errors >= 40, "{metrics}");
+    assert!((1..=17).contains(&errors), "{metrics}");
     let _ = server.0.kill();
     let _ = server.0.wait();
     let stderr = server.stderr();
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("shared storage: cannot read purge tombstones: "))
+        .unwrap_or_else(|| panic!("no tombstone read line: {stderr}"));
     assert!(
-        stderr.contains("shared storage: cannot read purge tombstones: 40 of 40 reads failed"),
-        "{stderr}"
+        line.contains(
+            "of 40 not done within 10s; kept as last read: 0; not in force until read: 40"
+        ),
+        "{line}"
     );
 }
