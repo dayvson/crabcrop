@@ -619,10 +619,12 @@ pub struct Loader {
     /// a read-ahead short of their length may reserve
     /// together (see [`BodyCharge`]). It is the budget less
     /// what one body can still need past its read-ahead, so
-    /// the budget the read-aheads leave always covers the
-    /// rest of a body that is keeping up: loads already
+    /// read-aheads alone cannot take the budget the rest of
+    /// a body that is keeping up needs: loads already
     /// arriving finish one after another instead of all
-    /// waiting on each other until they shed. Rebuilt with
+    /// waiting on each other until they shed. Other holders
+    /// (bodies at their full length, small bodies, uploads)
+    /// still compete for that room. Rebuilt with
     /// the budget; shared by loader clones.
     read_ahead_pool: std::sync::Arc<tokio::sync::Semaphore>,
 }

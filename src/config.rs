@@ -1195,8 +1195,10 @@ pub fn proxy_bypass_warning(
 /// source buffer budget (issue #403): for each permit, room
 /// for one source rendering, one loaded and queued behind
 /// it, and two loading, all at the cap. A load is charged
-/// its declared length, then what it received, so typical
-/// sources, far under the cap, fit many more at once.
+/// what it has received plus a bounded read-ahead, and its
+/// declared length only while it keeps arriving (see
+/// `loader::BODY_GRANT`), so typical sources, far under the
+/// cap, fit many more at once.
 const SOURCE_BUFFER_CAPS_PER_PERMIT: u64 = 4;
 
 /// The upper bound on `CRABCROP_SOURCE_BUFFER_MAX_MB`,
