@@ -835,9 +835,11 @@ struct StillQuality {
     /// The quality reported back, set when the service
     /// picked it (`quality(auto)`, the Save-Data step).
     chosen_quality: Option<u8>,
-    /// Whether `quality(auto)` verifies its pick through
-    /// SSIMULACRA2 (JPEG and JPEG XL outputs).
-    perceptual: bool,
+    /// The first guess of the SSIMULACRA2 loop, set when
+    /// `quality(auto)` verifies its pick through it (JPEG and
+    /// JPEG XL outputs): the heuristic pick, which is also
+    /// `encode_quality`.
+    perceptual: Option<u8>,
 }
 
 /// The still encode's result: the bytes, the quality the
@@ -1527,8 +1529,10 @@ impl Engine {
         // score with SSIMULACRA2, and bisect on quality until the
         // score lands in the target band. The heuristic pick is
         // the first guess. Other formats keep the one-shot pick.
-        let perceptual = matches!(resolved_quality, Some(ResolvedQuality::Auto))
-            && matches!(format, StillFormat::Jpeg | StillFormat::Jxl);
+        let perceptual = encode_quality.filter(|_| {
+            matches!(resolved_quality, Some(ResolvedQuality::Auto))
+                && matches!(format, StillFormat::Jpeg | StillFormat::Jxl)
+        });
         StillQuality {
             encode_quality,
             chosen_quality,
@@ -1553,9 +1557,21 @@ impl Engine {
         } = Self::resolve_still_quality(img, format, encode_opts, ctx);
         let mut ssim: Option<f64> = None;
         let enc_src = EncodeBuffers::new(img);
+        // Every encode of this image differs only in its quality.
+        let encode_at = |quality: Option<u8>| {
+            encode(
+                &enc_src,
+                format,
+                quality,
+                encode_opts.fill,
+                encode_opts.palette,
+                encode_opts.format_options,
+                ctx.avif_speed,
+                ctx.jxl_speed,
+            )
+        };
         let mut encode_budget = MAX_REQUEST_ENCODES;
-        let mut bytes = if perceptual {
-            let first_guess = encode_quality.expect("auto quality resolves a value");
+        let mut bytes = if let Some(first_guess) = perceptual {
             let scored = crate::quality::encode_to_target(
                 first_guess,
                 ctx.ssim_target,
@@ -1566,16 +1582,7 @@ impl Engine {
                     // ignores the deadline would keep
                     // encoding long past it.
                     ctx.check_deadline()?;
-                    let candidate = encode(
-                        &enc_src,
-                        format,
-                        Some(q),
-                        encode_opts.fill,
-                        encode_opts.palette,
-                        encode_opts.format_options,
-                        ctx.avif_speed,
-                        ctx.jxl_speed,
-                    )?;
+                    let candidate = encode_at(Some(q))?;
                     let score = decode_image(&candidate)
                         .ok()
                         .and_then(|decoded| crate::quality::ssimulacra2(img, &decoded));
@@ -1587,16 +1594,7 @@ impl Engine {
             scored.bytes
         } else {
             let t_timing = std::time::Instant::now();
-            let bytes = encode(
-                &enc_src,
-                format,
-                encode_quality,
-                encode_opts.fill,
-                encode_opts.palette,
-                encode_opts.format_options,
-                ctx.avif_speed,
-                ctx.jxl_speed,
-            )?;
+            let bytes = encode_at(encode_quality)?;
             crate::studio::timing_mark("encode", t_timing);
             encode_budget -= 1;
             bytes
@@ -1630,16 +1628,7 @@ impl Engine {
                 let steps_remaining =
                     (max_quality_attempts(format) - attempts).min(encode_budget as u32);
                 current = next_quality(current, steps_remaining);
-                bytes = encode(
-                    &enc_src,
-                    format,
-                    Some(current),
-                    encode_opts.fill,
-                    encode_opts.palette,
-                    encode_opts.format_options,
-                    ctx.avif_speed,
-                    ctx.jxl_speed,
-                )?;
+                bytes = encode_at(Some(current))?;
                 encode_budget -= 1;
                 chosen_quality = Some(current);
                 attempts += 1;
