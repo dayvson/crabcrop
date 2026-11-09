@@ -78,6 +78,10 @@ step "Version consistency (every artifact and deploy pin agrees, and a bump move
 python3 scripts/check_versions.py
 python3 scripts/test_version_tools.py
 
+step "Lockfiles (one version of each decoder, and the fuzz lock matches the root lock)"
+python3 scripts/check_locks.py
+python3 scripts/test_check_locks.py
+
 step "Rendering version (a corpus re-baseline since the last release tag raises it)"
 # CI checks out the full history, so there a skip means the checkout
 # lost the tags: --strict fails it instead.

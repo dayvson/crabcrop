@@ -9,11 +9,22 @@ updates:
       cargo:
         patterns: ["*"]
 
+  # fuzz/Cargo.lock mirrors the root lock (scripts/check_locks.py fails
+  # CI when a shared package differs, issue #552), and the root entry's
+  # pull requests move the shared packages; fuzz/README.md refreshes this
+  # lock from the root one. An update here bumped crabcrop's own
+  # dependencies, through the path dependency, in the root Cargo.toml and
+  # this lock alone: that is how the two locks drifted, and the root lock
+  # refresh that followed left oxideav-h265 at two versions. So this
+  # entry updates only libfuzzer-sys, the fuzz package's one registry
+  # dependency that the root lock does not carry.
   - package-ecosystem: cargo
     directory: "/fuzz"
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    allow:
+      - dependency-name: "libfuzzer-sys"
     groups:
       cargo-fuzz:
         patterns: ["*"]
