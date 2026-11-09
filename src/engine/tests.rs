@@ -2175,7 +2175,7 @@ fn run_chain(img: &DynamicImage, ops: &[Operation]) -> DynamicImage {
     let ctx = ProcessContext::default();
     apply_operations(img.clone(), ops, None, 1.0, &ctx, &directives, None)
         .unwrap()
-        .0
+        .img
 }
 
 #[test]
@@ -2662,7 +2662,9 @@ fn focal_forms_survive_hostile_geometry() {
                 // A crop-rect past a frame an earlier step
                 // shrank is the usual 400, never a panic.
                 match apply_operations(src.clone(), &ops, None, 1.0, &ctx, &directives, None) {
-                    Ok((out, ..)) => assert_eq!((out.width(), out.height()), (7, 3), "{ops:?}"),
+                    Ok(ApplyOutcome { img: out, .. }) => {
+                        assert_eq!((out.width(), out.height()), (7, 3), "{ops:?}")
+                    }
                     Err(err) => assert!(
                         matches!(&err, EngineError::Unsupported(msg) if msg.contains("crop-rect")),
                         "{ops:?}: {err:?}"
@@ -3536,8 +3538,9 @@ fn rotate_canvas_is_checked_before_it_allocates() {
     // A quarter turn keeps the pixel count and passes.
     let ops = [Operation::Filters(vec![Filter::Rotate(90.0)])];
     let directives = crate::url::RequestDirectives::analyze(&ops);
-    let (out, _, _, _, _, _) =
-        apply_operations(img, &ops, None, 1.0, &ctx, &directives, None).unwrap();
+    let out = apply_operations(img, &ops, None, 1.0, &ctx, &directives, None)
+        .unwrap()
+        .img;
     assert_eq!((out.width(), out.height()), (8000, 8000));
 }
 
@@ -3726,7 +3729,9 @@ fn rotate_canvas_is_checked_per_axis() {
     // the test log.
     let err = match apply_operations(img, &ops, None, 1.0, &ctx, &directives, None) {
         Err(err) => err,
-        Ok((out, ..)) => panic!("rotated to {}x{}", out.width(), out.height()),
+        Ok(ApplyOutcome { img: out, .. }) => {
+            panic!("rotated to {}x{}", out.width(), out.height())
+        }
     };
     assert_eq!(
         err.to_string(),
@@ -3747,7 +3752,7 @@ fn chain_dims(img: DynamicImage, remainder: &str) -> Result<(u32, u32), EngineEr
     let ctx = ProcessContext::default();
     let dpr = directives.dpr.unwrap_or(1.0);
     apply_operations(img, &ops, cap, dpr, &ctx, &directives, None)
-        .map(|(out, ..)| (out.width(), out.height()))
+        .map(|outcome| (outcome.img.width(), outcome.img.height()))
 }
 
 #[test]
@@ -9672,7 +9677,7 @@ fn a_dpr_hint_past_the_pixel_budget_steps_down() {
             };
             let img = DynamicImage::new_rgb8(8000, 8000);
             let factor = dpr_factor(directives.dpr, &ctx);
-            let (out, ..) = apply_operations(img, &ops, None, factor, &ctx, &directives, None)?;
+            let out = apply_operations(img, &ops, None, factor, &ctx, &directives, None)?.img;
             Ok(((out.width(), out.height()), factor))
         })
         .unwrap();
@@ -9964,7 +9969,7 @@ fn a_stepped_hint_never_serves_a_side_past_the_limit() {
     let img = DynamicImage::new_rgb8(16_384, 4);
     let err = match apply_operations(img, &ops, None, 2.0, &ctx, &directives, None) {
         Err(err) => err,
-        Ok((img, ..)) => panic!("rendered {}x{}", img.width(), img.height()),
+        Ok(ApplyOutcome { img, .. }) => panic!("rendered {}x{}", img.width(), img.height()),
     };
     assert_eq!(
         err.to_string(),

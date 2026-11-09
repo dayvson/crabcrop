@@ -998,7 +998,14 @@ impl Engine {
             None
         };
         ctx.check_deadline()?;
-        let (img, encode_opts, studio, inpaint, segments, objects_crop) = apply_operations(
+        let ApplyOutcome {
+            img,
+            encode_opts,
+            studio,
+            inpaint,
+            segments,
+            objects_crop,
+        } = apply_operations(
             img,
             ops,
             cap,
@@ -1879,13 +1886,18 @@ fn render_frames(
         let outcome = apply_operations(img, ops, cap, dpr, ctx, directives, Some(&mut share))?;
         Ok::<_, EngineError>((outcome, delay))
     };
-    let ((img, encode_opts, ..), delay) = render(frames.first)?;
+    let (
+        ApplyOutcome {
+            img, encode_opts, ..
+        },
+        delay,
+    ) = render(frames.first)?;
     budget.check_frames(img.width(), img.height(), frame_count)?;
     budget.charge(img.width(), img.height())?;
     let first = image::Frame::from_parts(img.to_rgba8(), 0, 0, delay);
     let mut rest = Vec::with_capacity(frames.rest.len());
     for frame in frames.rest {
-        let ((img, ..), delay) = render(frame)?;
+        let (ApplyOutcome { img, .. }, delay) = render(frame)?;
         budget.charge(img.width(), img.height())?;
         rest.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
     }
@@ -2862,16 +2874,20 @@ fn check_region(
 
 /// What [`apply_operations`] hands back: the rendered
 /// image, its encode options, and the records the
-/// operations produced (studio, inpaint, segments) for
-/// the meta response.
-type ApplyOutcome = (
-    DynamicImage,
-    EncodeOptions,
-    Option<crate::studio::StudioRecord>,
-    Option<InpaintRecord>,
-    Option<SegmentRecord>,
-    Option<ObjectsCropRecord>,
-);
+/// operations produced for the meta response.
+#[derive(Debug)]
+struct ApplyOutcome {
+    img: DynamicImage,
+    encode_opts: EncodeOptions,
+    /// The studio record (issue #197).
+    studio: Option<crate::studio::StudioRecord>,
+    /// The region-removal record (issue #176).
+    inpaint: Option<InpaintRecord>,
+    /// The segmentation record (issue #175).
+    segments: Option<SegmentRecord>,
+    /// The objects-crop record (issue #318).
+    objects_crop: Option<ObjectsCropRecord>,
+}
 
 /// A crop+resize fusion the chain qualifies for (issue
 /// #287): the rectangle a `crop-rect` cuts, resampled to the
@@ -3194,7 +3210,7 @@ fn apply_operations(
     }
     let outcome = chain.finish(img)?;
     if directives.dpr.is_none() && dpr > 1.0 && scales_with_dpr(ops) {
-        check_hinted_output(outcome.0.width(), outcome.0.height())?;
+        check_hinted_output(outcome.img.width(), outcome.img.height())?;
     }
     Ok(outcome)
 }
@@ -4364,14 +4380,14 @@ impl<'r, 'a> ChainState<'r, 'a> {
                 objects: self.segment_objects,
             })
         };
-        Ok((
+        Ok(ApplyOutcome {
             img,
-            self.encode_opts,
-            self.studio_record,
-            inpaint_record,
-            segment_record,
-            self.objects_crop_record,
-        ))
+            encode_opts: self.encode_opts,
+            studio: self.studio_record,
+            inpaint: inpaint_record,
+            segments: segment_record,
+            objects_crop: self.objects_crop_record,
+        })
     }
 }
 
