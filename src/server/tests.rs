@@ -207,6 +207,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -350,6 +351,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate,
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -412,6 +414,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -474,6 +477,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -546,6 +550,7 @@ async fn spawn_app_with_video(script: &str) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -628,6 +633,7 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -911,6 +917,7 @@ async fn spawn_app_with_pdf_renderer() -> String {
         pdf_renderer: Some(Arc::new(renderer)),
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -1270,6 +1277,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -1338,6 +1346,7 @@ async fn spawn_app_rotating() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -1410,6 +1419,7 @@ async fn spawn_app_with_fallback() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -3090,6 +3100,7 @@ async fn spawn_app_with_presets_and_roots(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -4326,6 +4337,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -4507,6 +4519,7 @@ async fn spawn_app_with_moderation(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -4840,6 +4853,7 @@ async fn spawn_app_with_ocr_timeout(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -5262,6 +5276,7 @@ async fn spawn_app_with_embeddings(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6007,6 +6022,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6071,6 +6087,7 @@ async fn spawn_app_with_studio() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6135,6 +6152,7 @@ async fn spawn_app_with_inpaint() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6231,6 +6249,7 @@ async fn spawn_app_with_segment() -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6723,6 +6742,7 @@ async fn spawn_app_with_providers(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -6801,6 +6821,7 @@ async fn spawn_app_full(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -8306,6 +8327,7 @@ async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -8392,6 +8414,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -9705,6 +9728,7 @@ async fn spawn_app_with_provenance_signer(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -9835,6 +9859,7 @@ async fn processing_gate_bounds_concurrency() {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -9964,6 +9989,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -10700,6 +10726,7 @@ fn lane_test_state(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(slow_permits)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -10985,6 +11012,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate,
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -11141,6 +11169,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -12089,6 +12118,7 @@ async fn spawn_app_with_upload_gate(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -14307,6 +14337,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -15666,6 +15697,7 @@ async fn spawn_explain_app_with_roots(
         pdf_renderer: None,
         video_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         anim_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        probe_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
@@ -16329,4 +16361,163 @@ async fn a_render_write_a_purge_covers_is_dropped_but_not_counted_as_skipped() {
     let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     assert_eq!(state.background.drain(far).await.writes, 0);
     assert_eq!(entry_objects(&fake), SHARED_PUTS_AT_ONCE);
+}
+
+/// A minimal, valid SVG that sizes instantly but carries
+/// [`crate::engine::SVG_PROBE_SLOW_MARKER`], so the probe's
+/// test hook sleeps while sizing it: a stand-in for an SVG
+/// whose parse is slow, without crafting a slow document.
+const SLOW_PROBE_SVG: &[u8] = b"<!--crabcrop-slow-probe--><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
+
+/// A blocking HTTP origin on its own OS thread (not the
+/// server's runtime), so serving the source never competes
+/// with the server for a request thread: the only thing
+/// that holds a request thread in these tests is the probe.
+fn spawn_blocking_svg_origin() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    SLOW_PROBE_SVG.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(SLOW_PROBE_SVG);
+                let _ = stream.flush();
+            });
+        }
+    });
+    format!("http://{addr}/slow.svg")
+}
+
+/// Fetch `url` over a plain blocking socket, off the tokio
+/// runtime, and return its status and how long it took. Used
+/// to time /health while the server's request threads may be
+/// blocked: a measurement on the runtime could not run then.
+fn blocking_get(url: &str) -> (u16, std::time::Duration) {
+    use std::io::{Read, Write};
+    let rest = url.strip_prefix("http://").expect("http url");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let addr: std::net::SocketAddr = authority.parse().expect("host:port");
+    let start = std::time::Instant::now();
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(20)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let elapsed = start.elapsed();
+    let status = std::str::from_utf8(&buf)
+        .ok()
+        .and_then(|t| t.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, elapsed)
+}
+
+/// Fire several concurrent /explain requests for a
+/// slow-to-size SVG (the `urls` are distinct, so the loader
+/// does not coalesce them into one probe) and, from off the
+/// runtime, time /health while they run. The probes run off
+/// the request threads (issue #447), so /health answers
+/// promptly; on a server that sizes SVG on the request
+/// threads, the probes hold every request thread and /health
+/// waits for one to finish. More requests than the two
+/// request threads keeps them held for the whole window.
+async fn health_stays_responsive_during_slow_explains(urls: Vec<String>, base: &str) {
+    let health_url = format!("{base}/health");
+    let prober = std::thread::spawn(move || {
+        // Let the explains seize the request threads first.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        blocking_get(&health_url)
+    });
+    let mut tasks = Vec::new();
+    for url in urls {
+        tasks.push(tokio::spawn(async move {
+            client()
+                .get(url)
+                .timeout(std::time::Duration::from_secs(20))
+                .send()
+                .await
+        }));
+    }
+    let (status, elapsed) = tokio::task::spawn_blocking(move || prober.join().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "/health did not answer 200");
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "/health took {elapsed:?} while slow SVG explains ran: the probes held the request threads"
+    );
+    for task in tasks {
+        let _ = within(
+            std::time::Duration::from_secs(20),
+            "a slow explain to finish",
+            task,
+        )
+        .await;
+    }
+}
+
+/// A burst of /explain probes for a slow-to-size SVG file
+/// source leaves /health responsive: the probes run off the
+/// request threads (issue #447). On a server that sized SVG
+/// on the request threads, these would hold /health until a
+/// probe finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_slow_svg_file_explains_leave_health_responsive() {
+    let dir = crate::test_support::scratch_dir("explain-slow-svg-file");
+    let root = std::fs::canonicalize(&dir).unwrap();
+    std::fs::write(root.join("slow.svg"), SLOW_PROBE_SVG).unwrap();
+    let loader = Loader::with_defaults()
+        .unwrap()
+        .with_sources(crate::loader::SourceConfig {
+            file_root: Some(root),
+            ..Default::default()
+        });
+    let base = spawn_explain_app_with_roots(Default::default(), loader, Default::default()).await;
+    // Distinct output sizes, so the requests are distinct and
+    // each runs its own probe.
+    let urls = (0..6)
+        .map(|i| {
+            let remainder = format!("64x{}/file:///slow.svg", 60 + i);
+            format!("{base}/explain/{}/{remainder}", sign(&remainder))
+        })
+        .collect();
+    health_stays_responsive_during_slow_explains(urls, &base).await;
+    drop(dir);
+}
+
+/// The same as [`concurrent_slow_svg_file_explains_leave_health_responsive`]
+/// over HTTP, where a probe runs for both the per-chunk
+/// settle check and the handler on a server that sizes SVG
+/// on the request threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_slow_svg_http_explains_leave_health_responsive() {
+    let origin = spawn_blocking_svg_origin();
+    let base = spawn_explain_app_with_roots(
+        Default::default(),
+        Loader::with_defaults().unwrap(),
+        Default::default(),
+    )
+    .await;
+    let urls = (0..6)
+        .map(|i| {
+            let remainder = format!("64x{}/{origin}", 60 + i);
+            format!("{base}/explain/{}/{remainder}", sign(&remainder))
+        })
+        .collect();
+    health_stays_responsive_during_slow_explains(urls, &base).await;
 }

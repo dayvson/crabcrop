@@ -420,39 +420,19 @@ pub struct SourceProbe {
 /// for any document within the bounds.
 const SVG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Probe source bytes for the explain report: kind and
-/// dimensions, headers only (see [`SourceProbe`]).
-pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
+/// The media kind [`probe_source`] reports for `bytes`, from
+/// their signatures alone: no header is parsed for it.
+pub(crate) fn probe_kind(bytes: &[u8]) -> &'static str {
     if crate::svg::is_svg(bytes) {
-        // The intrinsic size takes a parse, which runs in the
-        // SVG worker (issue #447) under the probe's own short
-        // deadline: the explain handler waits on it.
-        let deadline = std::time::Instant::now() + SVG_PROBE_TIMEOUT;
-        let dimensions = crate::svg::screen(bytes)
-            .ok()
-            .and_then(|screened| screened.intrinsic_size(Some(deadline)).ok())
-            .and_then(|(w, h)| {
-                let (w, h) = (w.round() as u32, h.round() as u32);
-                if w >= 1 && h >= 1 { Some((w, h)) } else { None }
-            });
-        return SourceProbe {
-            kind: "svg",
-            dimensions,
-        };
+        return "svg";
     }
     if is_heic(bytes) {
-        return SourceProbe {
-            kind: "heic",
-            dimensions: crate::heic::probe_dimensions(bytes),
-        };
+        return "heic";
     }
     if is_jxl(bytes) {
-        return SourceProbe {
-            kind: "jxl",
-            dimensions: jxl_dimensions(bytes),
-        };
+        return "jxl";
     }
-    let kind = match image::guess_format(bytes) {
+    match image::guess_format(bytes) {
         Ok(image::ImageFormat::Jpeg) => "jpeg",
         Ok(image::ImageFormat::Png) => "png",
         Ok(image::ImageFormat::Gif) => "gif",
@@ -475,16 +455,74 @@ pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
         // explain never runs, so they stay unknown.
         _ if crate::pdf::sniff_pdf(bytes) => "pdf",
         _ => "unknown",
+    }
+}
+
+/// Whether sizing a source of `kind` is more than a header
+/// read: an SVG's intrinsic size takes a parse of the whole
+/// document in the SVG worker (up to [`SVG_PROBE_TIMEOUT`]),
+/// and an AVIF's goes through the decoder. A caller on an
+/// async runtime runs [`probe_source`] for these on a
+/// blocking thread.
+pub(crate) fn probe_is_heavy(kind: &str) -> bool {
+    matches!(kind, "svg" | "avif")
+}
+
+/// A test hook standing in for an SVG whose size probe is
+/// slow (a document whose usvg parse runs near the probe's
+/// deadline), without relying on usvg's timing or crafting
+/// such a document: an SVG source whose bytes contain this
+/// marker makes [`probe_source`] sleep [`SVG_PROBE_TEST_DELAY`]
+/// while it sizes it. The sleep runs wherever `probe_source`
+/// runs, so it blocks a request thread when the probe is on
+/// one and a blocking thread when it is not.
+#[cfg(test)]
+pub(crate) const SVG_PROBE_SLOW_MARKER: &[u8] = b"crabcrop-slow-probe";
+
+/// How long the [`SVG_PROBE_SLOW_MARKER`] hook sleeps.
+#[cfg(test)]
+pub(crate) const SVG_PROBE_TEST_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Probe source bytes for the explain report: kind and
+/// dimensions, headers only (see [`SourceProbe`]). For the
+/// kinds [`probe_is_heavy`] names, this blocks for as long as
+/// the parse or the decode takes.
+pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
+    let kind = probe_kind(bytes);
+    #[cfg(test)]
+    if kind == "svg"
+        && bytes
+            .windows(SVG_PROBE_SLOW_MARKER.len())
+            .any(|w| w == SVG_PROBE_SLOW_MARKER)
+    {
+        std::thread::sleep(SVG_PROBE_TEST_DELAY);
+    }
+    let dimensions = match kind {
+        // The intrinsic size takes a parse, which runs in the
+        // SVG worker (issue #447) under the probe's own short
+        // deadline: the explain handler waits on it.
+        "svg" => {
+            let deadline = std::time::Instant::now() + SVG_PROBE_TIMEOUT;
+            crate::svg::screen(bytes)
+                .ok()
+                .and_then(|screened| screened.intrinsic_size(Some(deadline)).ok())
+                .and_then(|(w, h)| {
+                    let (w, h) = (w.round() as u32, h.round() as u32);
+                    if w >= 1 && h >= 1 { Some((w, h)) } else { None }
+                })
+        }
+        "heic" => crate::heic::probe_dimensions(bytes),
+        "jxl" => jxl_dimensions(bytes),
+        // The probe parses an AVIF container too, so it is
+        // screened first (issue #522); a refused one states no
+        // dimensions.
+        _ => crate::avif::screen(bytes).ok().and_then(|bytes| {
+            image::ImageReader::new(Cursor::new(&*bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|probe| probe.into_dimensions().ok())
+        }),
     };
-    // The probe parses an AVIF container too, so it is
-    // screened first (issue #522); a refused one states no
-    // dimensions.
-    let dimensions = crate::avif::screen(bytes).ok().and_then(|bytes| {
-        image::ImageReader::new(Cursor::new(&*bytes))
-            .with_guessed_format()
-            .ok()
-            .and_then(|probe| probe.into_dimensions().ok())
-    });
     SourceProbe { kind, dimensions }
 }
 
@@ -909,14 +947,9 @@ impl Engine {
         // runs again for a lower factor. A retry does run the
         // stages after it again (the decode, and for an SVG
         // the rasterizing worker), but only for a refusal the
-        // header walk could not foresee.
-        let mut retry = false;
+        // header walk could not foresee; like the first run,
+        // it starts only before the deadline.
         step_down_hint(bytes, ops, &directives, ctx.dpr, |dpr| {
-            // A retry decodes again: none starts past the
-            // deadline.
-            if std::mem::replace(&mut retry, true) {
-                ctx.check_deadline()?;
-            }
             let ctx = ProcessContext { dpr, ..ctx.clone() };
             self.process_selected(bytes, ops, ctx, directives.clone(), video, pdf)
         })
@@ -936,6 +969,11 @@ impl Engine {
         video: Option<VideoSourceMeta>,
         pdf: Option<PdfSourceMeta>,
     ) -> Result<ProcessedImage, EngineError> {
+        // Sniffing screens an SVG in this process, and the
+        // stages before it (frame or page selection, a run at
+        // a higher factor) may have used the whole budget:
+        // nothing here starts past the deadline.
+        ctx.check_deadline()?;
         let source = Self::sniff_source(bytes)?;
         let detected = source.detected;
         // keep_profile is convert-or-tag (issue #374): the
