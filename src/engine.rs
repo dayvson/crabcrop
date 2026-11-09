@@ -4666,43 +4666,17 @@ fn blend_overlay(
         }
         None => ov,
     };
-    let mut out = base.to_rgba8();
-    let ov = ov.to_rgba8();
-    let left = if x >= 0 {
-        x as i64
-    } else {
-        out.width() as i64 - ov.width() as i64 + x as i64
-    };
-    let top = if y >= 0 {
-        y as i64
-    } else {
-        out.height() as i64 - ov.height() as i64 + y as i64
-    };
-    let opacity = alpha as f32 / 100.0;
-    let (bw, bh) = (out.width() as i64, out.height() as i64);
-    for oy in 0..ov.height() as i64 {
-        // The blend walks every overlay pixel; a large
-        // legal pair still runs long, so the deadline is
-        // honored per row (issue #358).
-        ctx.check_deadline()?;
-        for ox in 0..ov.width() as i64 {
-            let (bx, by) = (left + ox, top + oy);
-            if bx < 0 || by < 0 || bx >= bw || by >= bh {
-                continue;
-            }
-            let top_px = ov.get_pixel(ox as u32, oy as u32);
-            let a = opacity * (top_px[3] as f32 / 255.0);
-            if a <= 0.0 {
-                continue;
-            }
-            let bot = out.get_pixel_mut(bx as u32, by as u32);
-            for c in 0..3 {
-                let blended = blend_channel(mode, bot[c] as f32, top_px[c] as f32);
-                bot[c] = (bot[c] as f32 * (1.0 - a) + blended * a).round() as u8;
-            }
-        }
-    }
-    Ok(DynamicImage::ImageRgba8(out))
+    // The blend walks every overlay pixel; a large legal pair
+    // still runs long, so the deadline is honored per row
+    // (issue #358).
+    composite(
+        base,
+        &ov.to_rgba8(),
+        (x, y),
+        alpha,
+        || ctx.check_deadline(),
+        |b, o| blend_channel(mode, b, o),
+    )
 }
 
 /// Overlay `wm` onto `base` at (x, y) with `alpha` percent
@@ -4718,38 +4692,62 @@ fn overlay_watermark(
     y: i32,
     alpha: u8,
 ) -> DynamicImage {
+    let no_check = || Ok::<(), std::convert::Infallible>(());
+    let Ok(out) = composite(base, &wm.to_rgba8(), (x, y), alpha, no_check, |_, o| o);
+    out
+}
+
+/// The anchor, clip, and alpha loop the overlay and the
+/// watermark share (issue #480). `top` sits on `base` at
+/// `(x, y)`, a negative coordinate anchoring from the right or
+/// bottom edge, and whatever falls outside `base` is clipped.
+/// Each covered pixel's effective alpha is the top pixel's own
+/// alpha times `alpha` percent, and each color channel moves
+/// that far toward `blend(base, top)`, the per-pixel blend of
+/// the base channel and the top one; the base alpha channel is
+/// kept. `each_row` runs before each row of `top`, where the
+/// overlay checks its deadline.
+fn composite<E>(
+    base: &DynamicImage,
+    top: &image::RgbaImage,
+    (x, y): (i32, i32),
+    alpha: u8,
+    mut each_row: impl FnMut() -> Result<(), E>,
+    blend: impl Fn(f32, f32) -> f32,
+) -> Result<DynamicImage, E> {
     let mut out = base.to_rgba8();
-    let wm = wm.to_rgba8();
     let left = if x >= 0 {
         x as i64
     } else {
-        out.width() as i64 - wm.width() as i64 + x as i64
+        out.width() as i64 - top.width() as i64 + x as i64
     };
-    let top = if y >= 0 {
+    let upper = if y >= 0 {
         y as i64
     } else {
-        out.height() as i64 - wm.height() as i64 + y as i64
+        out.height() as i64 - top.height() as i64 + y as i64
     };
     let opacity = alpha as f32 / 100.0;
     let (bw, bh) = (out.width() as i64, out.height() as i64);
-    for wy in 0..wm.height() as i64 {
-        for wx in 0..wm.width() as i64 {
-            let (bx, by) = (left + wx, top + wy);
+    for ty in 0..top.height() as i64 {
+        each_row()?;
+        for tx in 0..top.width() as i64 {
+            let (bx, by) = (left + tx, upper + ty);
             if bx < 0 || by < 0 || bx >= bw || by >= bh {
                 continue;
             }
-            let top_px = wm.get_pixel(wx as u32, wy as u32);
+            let top_px = top.get_pixel(tx as u32, ty as u32);
             let a = opacity * (top_px[3] as f32 / 255.0);
             if a <= 0.0 {
                 continue;
             }
             let bot = out.get_pixel_mut(bx as u32, by as u32);
             for c in 0..3 {
-                bot[c] = (bot[c] as f32 * (1.0 - a) + top_px[c] as f32 * a).round() as u8;
+                let blended = blend(bot[c] as f32, top_px[c] as f32);
+                bot[c] = (bot[c] as f32 * (1.0 - a) + blended * a).round() as u8;
             }
         }
     }
-    DynamicImage::ImageRgba8(out)
+    Ok(DynamicImage::ImageRgba8(out))
 }
 
 /// Composite an image over a solid background color, dropping the
