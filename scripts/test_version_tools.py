@@ -34,6 +34,7 @@ EXAMPLES = {
     "sdks/mcp/test/pack.test.mjs": "a consumer package's own version",
     ".github/workflows/release.yml": "cargo-dist's comment on tag formats",
     "docs/release-workflow.yml": "the mirror of release.yml",
+    "scripts/test_check_locks.py": "made-up lockfile entries, third-party crates included",
 }
 
 
