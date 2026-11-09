@@ -9910,15 +9910,37 @@ fn encoded_still(format: image::ImageFormat) -> Vec<u8> {
     buf.into_inner()
 }
 
+/// A 100x60 SVG still.
+const SVG_SOURCE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"><rect width="100" height="60" fill="#00ff00"/></svg>"##;
+
+/// `source` with a manifest of its own, signed with the
+/// test identity as a `format` asset.
+fn signed_source(source: &[u8], format: &str) -> Vec<u8> {
+    crate::provenance::test_signer()
+        .sign(
+            source,
+            format,
+            &crate::provenance::SignRequest {
+                ingredient: None,
+                ai_edited: false,
+            },
+        )
+        .unwrap()
+}
+
 /// The output half of the provenance a signing server's
 /// meta document reports for `source` rendered to PNG, a
-/// signed format whatever the source's own is.
-async fn signed_png_provenance(name: &str, source: Vec<u8>) -> serde_json::Value {
+/// signed format whatever the source's own is. The image
+/// response for the same URL is read back too: its active
+/// manifest must name one ingredient, the parent, in
+/// `format`, the source's media type.
+async fn signed_png_provenance(name: &str, source: Vec<u8>, format: &str) -> serde_json::Value {
     let base = spawn_app_with_signer().await;
     let src = spawn_bytes_server(source).await;
     let remainder = format!("40x24/filters:format(png)/{src}");
+    let url = format!("{base}/{}/{remainder}", sign(&remainder));
     let resp = client()
-        .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+        .get(&url)
         .header("Accept", "application/json")
         .send()
         .await
@@ -9930,6 +9952,20 @@ async fn signed_png_provenance(name: &str, source: Vec<u8>) -> serde_json::Value
     assert_eq!(meta["format"], "png", "{name}");
     let output = meta["provenance"]["output"].clone();
     assert_eq!(output["state"], "valid", "{name}: {output}");
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "{name}");
+    let png = resp.bytes().await.unwrap();
+    let store: serde_json::Value =
+        serde_json::from_str(&crate::provenance::manifest_json(&png, "image/png")).unwrap();
+    let active = store["active_manifest"].as_str().unwrap();
+    let ingredients = &store["manifests"][active]["ingredients"];
+    assert_eq!(
+        ingredients.as_array().map(Vec::len),
+        Some(1),
+        "{name}: one parent ingredient: {ingredients} (meta's output: {output})"
+    );
+    assert_eq!(ingredients[0]["relationship"], "parentOf", "{name}");
+    assert_eq!(ingredients[0]["format"], format, "{name}");
     output
 }
 
@@ -9940,7 +9976,7 @@ async fn a_mif1_heic_source_is_the_signed_outputs_parent_ingredient() {
     // only `heic` and `heix` and took a `mif1` file for a
     // video, so its output was signed as a fresh image
     // with no parent.
-    let output = signed_png_provenance("mif1 heic", mif1_heic()).await;
+    let output = signed_png_provenance("mif1 heic", mif1_heic(), "image/heic").await;
     assert_eq!(output["ingredients"], 1, "{output}");
 }
 
@@ -9949,7 +9985,7 @@ async fn a_container_jxl_source_is_the_signed_outputs_parent_ingredient() {
     // Issue #564: the provenance sniff checked a misspelled
     // container signature, so a JPEG XL in its box
     // container had no parent ingredient.
-    let output = signed_png_provenance("container jxl", container_jxl()).await;
+    let output = signed_png_provenance("container jxl", container_jxl(), "image/jxl").await;
     assert_eq!(output["ingredients"], 1, "{output}");
 }
 
@@ -9959,19 +9995,35 @@ async fn a_signed_container_jxl_sources_store_rides_into_the_output() {
     // manifest, and it was the one whose store was dropped
     // (issue #564): now the source's own manifest rides
     // into the output's store.
-    let signed_source = crate::provenance::test_signer()
-        .sign(
-            &container_jxl(),
-            "image/jxl",
-            &crate::provenance::SignRequest {
-                ingredient: None,
-                ai_edited: false,
-            },
-        )
-        .unwrap();
-    let output = signed_png_provenance("signed container jxl", signed_source).await;
+    let source = signed_source(&container_jxl(), "image/jxl");
+    let output = signed_png_provenance("signed container jxl", source, "image/jxl").await;
     assert_eq!(output["manifests"], 2, "the source's store rides: {output}");
     assert_eq!(output["ingredients"], 1, "{output}");
+}
+
+#[tokio::test]
+async fn a_signed_svg_or_tiff_sources_store_rides_into_the_output() {
+    // The SDK reads a manifest from an SVG and from a TIFF,
+    // but both were signed with no parent (issue #564), so
+    // the store a signed one carried was dropped. Now each
+    // is the parent ingredient, and its store rides into
+    // the output's.
+    for (name, source, format) in [
+        ("signed svg", SVG_SOURCE.to_vec(), "image/svg+xml"),
+        (
+            "signed tiff",
+            encoded_still(image::ImageFormat::Tiff),
+            "image/tiff",
+        ),
+    ] {
+        let source = signed_source(&source, format);
+        let output = signed_png_provenance(name, source, format).await;
+        assert_eq!(
+            output["manifests"], 2,
+            "{name}: the source's store rides: {output}"
+        );
+        assert_eq!(output["ingredients"], 1, "{name}: {output}");
+    }
 }
 
 #[tokio::test]
@@ -9983,16 +10035,26 @@ async fn every_image_source_is_the_signed_outputs_parent_ingredient() {
     // the SDK's JPEG XL reader refuses a bare codestream
     // outright. Each is now the parent ingredient; the
     // SVG, TIFF and container JPEG XL readers would carry a
-    // manifest along, and the others cannot hold one.
-    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"><rect width="100" height="60" fill="#00ff00"/></svg>"##;
-    for (name, source) in [
-        ("svg", svg.to_vec()),
-        ("tiff", encoded_still(image::ImageFormat::Tiff)),
-        ("bmp", encoded_still(image::ImageFormat::Bmp)),
-        ("ico", encoded_still(image::ImageFormat::Ico)),
-        ("bare jxl", bare_jxl()),
+    // manifest along, and the others cannot hold one. The
+    // ingredient names the source's media type, the bare
+    // codestream's included, though the SDK is handed it as
+    // a type no reader claims.
+    for (name, source, format) in [
+        ("svg", SVG_SOURCE.to_vec(), "image/svg+xml"),
+        (
+            "tiff",
+            encoded_still(image::ImageFormat::Tiff),
+            "image/tiff",
+        ),
+        ("bmp", encoded_still(image::ImageFormat::Bmp), "image/bmp"),
+        (
+            "ico",
+            encoded_still(image::ImageFormat::Ico),
+            "image/x-icon",
+        ),
+        ("bare jxl", bare_jxl(), "image/jxl"),
     ] {
-        let output = signed_png_provenance(name, source).await;
+        let output = signed_png_provenance(name, source, format).await;
         assert_eq!(output["ingredients"], 1, "{name}: {output}");
     }
 }
