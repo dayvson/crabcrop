@@ -46,10 +46,14 @@
 //! startup (no credential chain is consulted). With no
 //! credentials the requests go unsigned, for local
 //! S3-compatible development stores.
+//!
+//! Every request is bounded (issue #550), by a rule that
+//! scales with the bytes it moves instead of one fixed
+//! total: see [`transfer_budget`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -104,6 +108,61 @@ pub const PURGE_WALKS_AT_ONCE: usize = 2;
 /// for each of the [`PURGE_WALKS_AT_ONCE`] walks.
 pub const PURGE_INLINE_READS_AT_ONCE: usize = 2 * PURGE_READS_AT_ONCE;
 
+/// The short bound on a store exchange (issue #550). A
+/// request with no body must have its answer begin within
+/// it, and no response body may go this long without a
+/// byte. A request that moves no body (a HEAD, a DELETE, a
+/// listing page) is done within it, as every request was
+/// before, and so, give or take its size, is a small object
+/// read. It is also the base of every [`transfer_budget`].
+const STORE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long connecting to the store may take, inside the
+/// request's own bound.
+const STORE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The slowest transfer a store body is allowed (issue
+/// #550), in bytes a second: one MiB, so a body of N MiB
+/// gets N seconds on top of [`STORE_TIMEOUT`].
+const STORE_MIN_RATE: u64 = 1024 * 1024;
+
+/// How long moving `bytes` to or from the store may take
+/// (issue #550): [`STORE_TIMEOUT`], plus the bytes at
+/// [`STORE_MIN_RATE`]. A write gets it for its body from
+/// the moment it starts, answer included; an object read
+/// gets it for the length the store declares, counted from
+/// the request, or, when none is declared, for what has
+/// arrived so far. Bodies are capped (an entry at
+/// [`MAX_ENTRY_BYTES`], 512 MiB; an upload at the source
+/// fetch cap, at most 1 GiB), so the budget is too: 8 min
+/// 42 s for the largest entry, 17 min 14 s for the largest
+/// upload. A store that stops reading or sending fails the
+/// request at that budget; one that answers nothing to a
+/// request with no body fails it at [`STORE_TIMEOUT`].
+///
+/// Before, every request had one 10 s total, so any body
+/// that took longer to move failed however steadily it
+/// went, although the caps allow up to 1 GiB.
+fn transfer_budget(bytes: u64) -> Duration {
+    STORE_TIMEOUT + Duration::from_millis(bytes.saturating_mul(1000) / STORE_MIN_RATE)
+}
+
+/// How [`S3Store::send`] bounds one request (issue #550).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    /// The whole exchange, response body included, within
+    /// the [`transfer_budget`] of the request body: a write
+    /// scales with what it sends, and a request with no
+    /// body keeps [`STORE_TIMEOUT`].
+    Exchange,
+    /// An object read, whose body may be anything up to the
+    /// entry cap: the answer must begin within
+    /// [`STORE_TIMEOUT`] (the client's read timeout), and
+    /// the caller reads the body under the budget of its
+    /// declared length ([`read_capped_at`]).
+    ObjectRead,
+}
+
 /// The outcome of a conditional raw write
 /// ([`S3Store::put_raw_if_absent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +177,16 @@ pub enum RawPut {
 }
 
 pub struct S3Store {
+    /// The client for requests with no body: a read timeout
+    /// of [`STORE_TIMEOUT`] bounds the wait for an answer
+    /// and every stall in a response body (issue #550).
     client: reqwest::Client,
+    /// The client for writes, with no read timeout: reqwest
+    /// starts that timeout with the request and does not
+    /// reset it while the body goes out, so it would fail a
+    /// write that takes longer however steadily it moved.
+    /// Each write runs under its [`transfer_budget`].
+    put_client: reqwest::Client,
     bucket: String,
     /// Normalized object prefix: empty, or ending in `/`.
     prefix: String,
@@ -168,6 +236,7 @@ impl std::fmt::Debug for S3Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Store")
             .field("client", &self.client)
+            .field("put_client", &self.put_client)
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
             .field("endpoint", &self.endpoint)
@@ -201,8 +270,15 @@ impl S3Store {
             format!("{trimmed}/")
         };
         Ok(Self {
+            // No client-wide total (issue #550): every request
+            // gets its own bound, sized to what it moves (see
+            // `send`).
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(STORE_CONNECT_TIMEOUT)
+                .read_timeout(STORE_TIMEOUT)
+                .build()?,
+            put_client: reqwest::Client::builder()
+                .connect_timeout(STORE_CONNECT_TIMEOUT)
                 .build()?,
             bucket,
             prefix,
@@ -237,10 +313,13 @@ impl S3Store {
     /// Read a response body under the entry size ceiling,
     /// streaming so an oversized object is refused as soon
     /// as it passes the cap instead of after it has been
-    /// buffered whole. `None` on a transport error or an
-    /// oversized body; both read as a cache miss upstream.
-    async fn read_capped(&self, resp: reqwest::Response) -> Option<Vec<u8>> {
-        read_capped_at(resp, self.max_entry_bytes).await
+    /// buffered whole, and within the transfer budget from
+    /// `started`, when its request began (issue #550).
+    /// `None` on a transport error, an oversized body, or a
+    /// body past its budget; all read as a cache miss
+    /// upstream.
+    async fn read_capped(&self, resp: reqwest::Response, started: Instant) -> Option<Vec<u8>> {
+        read_capped_at(resp, self.max_entry_bytes, started).await
     }
 
     fn object_key(&self, stem: &str) -> String {
@@ -261,8 +340,9 @@ impl S3Store {
         self.request_h(method, object_key, query, body, &[]).await
     }
 
-    /// [`S3Store::request`] with extra request headers
-    /// (the purge walk's `Range`).
+    /// [`S3Store::request`] with extra request headers (a
+    /// write's precondition and content type, a delete's
+    /// `If-Match`).
     async fn request_h(
         &self,
         method: &str,
@@ -270,6 +350,49 @@ impl S3Store {
         query: &[(&str, &str)],
         body: Vec<u8>,
         extra_headers: &[(&str, &str)],
+    ) -> Option<reqwest::Response> {
+        self.send(
+            method,
+            object_key,
+            query,
+            body,
+            extra_headers,
+            Bound::Exchange,
+        )
+        .await
+    }
+
+    /// A GET of one object whose body the caller reads with
+    /// [`read_capped_at`], under the budget of the length
+    /// the store declares (issue #550), from the `Instant`
+    /// it took before calling: an entry, a header probe
+    /// (with its `Range`), a tombstone, a raw object.
+    async fn request_object(
+        &self,
+        object_key: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Option<reqwest::Response> {
+        self.send(
+            "GET",
+            object_key,
+            &[],
+            Vec::new(),
+            extra_headers,
+            Bound::ObjectRead,
+        )
+        .await
+    }
+
+    /// Sign (when there are credentials) and send one
+    /// request, bounded as `bound` says (issue #550).
+    async fn send(
+        &self,
+        method: &str,
+        object_key: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+        extra_headers: &[(&str, &str)],
+        bound: Bound,
     ) -> Option<reqwest::Response> {
         let path_part = if object_key.is_empty() {
             String::new()
@@ -299,11 +422,20 @@ impl S3Store {
                 .collect::<String>()
         };
         let verb = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
-        let mut request = self
-            .client
+        // A body goes out on the client without a read
+        // timeout, under its own budget (issue #550).
+        let (client, budget) = if body.is_empty() {
+            (&self.client, transfer_budget(0))
+        } else {
+            (&self.put_client, transfer_budget(body.len() as u64))
+        };
+        let mut request = client
             .request(verb, url.clone())
             .header("x-amz-content-sha256", payload_hash.clone())
             .body(body);
+        if bound == Bound::Exchange {
+            request = request.timeout(budget);
+        }
         for (name, value) in extra_headers {
             request = request.header(*name, *value);
         }
@@ -363,7 +495,8 @@ impl S3Store {
     /// #446) with [`S3Store::remove_if_match`].
     pub async fn get_tagged(&self, key: &str) -> Option<(CachedImage, Option<String>)> {
         let object = self.object_key(&key_stem(key));
-        let resp = match self.request("GET", &object, &[], Vec::new()).await {
+        let started = Instant::now();
+        let resp = match self.request_object(&object, &[]).await {
             Some(resp) => resp,
             None => {
                 self.note_error("cannot reach the store for a lookup", "transport error");
@@ -374,7 +507,7 @@ impl S3Store {
             return None;
         }
         let etag = response_etag(&resp);
-        let data = self.read_capped(resp).await?;
+        let data = self.read_capped(resp, started).await?;
         let (stored_key, image) = parse_entry(&data, &self.entry_key)?;
         if stored_key != key {
             return None;
@@ -454,11 +587,14 @@ impl S3Store {
     #[allow(dead_code)]
     pub async fn get_raw(&self, name: &str) -> Option<Vec<u8>> {
         let object = format!("{}{name}", self.prefix);
-        let resp = self.request("GET", &object, &[], Vec::new()).await?;
+        let started = Instant::now();
+        let resp = self.request_object(&object, &[]).await?;
         if !resp.status().is_success() {
             return None;
         }
-        resp.bytes().await.ok().map(|b| b.to_vec())
+        // Uncapped: an upload's own cap bounded what was
+        // stored. The budget still applies (issue #550).
+        read_capped_at(resp, usize::MAX, started).await
     }
 
     /// Whether a raw object exists under `name`, answered
@@ -582,8 +718,9 @@ impl S3Store {
     /// walk that meets one has not judged that object.
     async fn read_entry_header(&self, object: &str) -> HeaderRead {
         let range = format!("bytes=0-{}", Self::HEADER_PROBE_BYTES - 1);
+        let started = Instant::now();
         let Some(resp) = self
-            .request_h("GET", object, &[], Vec::new(), &[("range", range.as_str())])
+            .request_object(object, &[("range", range.as_str())])
             .await
         else {
             return HeaderRead::Failed;
@@ -610,8 +747,10 @@ impl S3Store {
             return HeaderRead::Nothing;
         }
         // The length was checked above, so a body that does
-        // not arrive whole is a transport failure.
-        let Some(data) = self.read_capped(resp).await else {
+        // not arrive whole is a transport failure. A store
+        // that ignores the range sends the whole object, and
+        // its budget follows that length (issue #550).
+        let Some(data) = self.read_capped(resp, started).await else {
             return HeaderRead::Failed;
         };
         let whole = |data: &[u8], etag: Option<String>| match parse_entry(data, &self.entry_key) {
@@ -635,14 +774,15 @@ impl S3Store {
             None => {
                 // The header outgrew the probe: one full
                 // read of this object settles it.
-                let Some(resp) = self.request("GET", object, &[], Vec::new()).await else {
+                let started = Instant::now();
+                let Some(resp) = self.request_object(object, &[]).await else {
                     return HeaderRead::Failed;
                 };
                 if !resp.status().is_success() {
                     return HeaderRead::unanswered(resp.status());
                 }
                 let etag = response_etag(&resp);
-                match self.read_capped(resp).await {
+                match self.read_capped(resp, started).await {
                     Some(data) => whole(&data, etag),
                     None => HeaderRead::Failed,
                 }
@@ -1060,11 +1200,12 @@ impl S3Store {
     /// else (a plant, another deployment's record, a copy
     /// moved to another name) is ignored, never trusted.
     async fn read_tombstone(&self, object: &str, start_ms: u64, writer: u64) -> Option<Tombstone> {
-        let resp = self.request("GET", object, &[], Vec::new()).await?;
+        let started = Instant::now();
+        let resp = self.request_object(object, &[]).await?;
         if !resp.status().is_success() {
             return None;
         }
-        let data = read_capped_at(resp, MAX_TOMBSTONE_BYTES).await?;
+        let data = read_capped_at(resp, MAX_TOMBSTONE_BYTES, started).await?;
         let tombstone = parse_tombstone(&data, &self.entry_key)?;
         (tombstone.cutoff.start_ms == start_ms && tombstone.cutoff.writer == writer)
             .then_some(tombstone)
@@ -1287,12 +1428,35 @@ struct ProbedEntry {
 /// instead of after it has been buffered whole. `None` on a
 /// transport error or an oversized body; both read as a
 /// miss upstream.
-async fn read_capped_at(mut resp: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
-    if resp.content_length().is_some_and(|n| n > cap as u64) {
+///
+/// The read is bounded too (issue #550): it must end within
+/// the [`transfer_budget`] of the length the store declared,
+/// counted from `started`, when the request began, so a
+/// small object keeps the short bound and a large one gets
+/// time in proportion. A store that declares no length gets
+/// the budget of what it has sent so far, so it must keep
+/// up the minimum rate. The client's read timeout ends a
+/// body that stalls outright sooner.
+async fn read_capped_at(
+    mut resp: reqwest::Response,
+    cap: usize,
+    started: Instant,
+) -> Option<Vec<u8>> {
+    let declared = resp.content_length();
+    if declared.is_some_and(|n| n > cap as u64) {
         return None;
     }
     let mut data = Vec::new();
-    while let Some(chunk) = resp.chunk().await.ok()? {
+    loop {
+        let expected = declared.unwrap_or(0).max(data.len() as u64);
+        let deadline = tokio::time::Instant::from_std(started + transfer_budget(expected));
+        let Some(chunk) = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .ok()?
+            .ok()?
+        else {
+            break;
+        };
         if data.len().checked_add(chunk.len())? > cap {
             return None;
         }
@@ -2855,5 +3019,255 @@ mod tests {
             s.put_raw_if_absent("heroes/eel.jpg", b"x".to_vec()).await,
             RawPut::Failed
         );
+    }
+
+    // Store timeouts (issue #550).
+
+    /// How the slow store stub treats each connection.
+    #[derive(Clone)]
+    enum Slow {
+        /// Reads request bodies at this many bytes a second,
+        /// then answers 200.
+        Reads(u64),
+        /// Reads this many request body bytes, then neither
+        /// reads nor answers again.
+        StallsAfter(usize),
+        /// Reads the request head, then never answers.
+        Hangs,
+        /// Answers with this body, its length declared, sent
+        /// at this many bytes a second.
+        Serves(Arc<Vec<u8>>, u64),
+    }
+
+    /// A store stub that handles one request per connection
+    /// the way `mode` says. Returns its endpoint and the
+    /// request body bytes it has read, all connections
+    /// together.
+    async fn start_slow_store(mode: Slow) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = received.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mode = mode.clone();
+                let received = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = vec![0u8; 16 * 1024];
+                    let head_end = loop {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let mut got = buf.len() - head_end;
+                    received.fetch_add(got, Ordering::SeqCst);
+                    let started = tokio::time::Instant::now();
+                    let due = |bytes: usize, rate: u64| {
+                        started + Duration::from_secs_f64(bytes as f64 / rate as f64)
+                    };
+                    match mode {
+                        Slow::Hangs => std::future::pending::<()>().await,
+                        Slow::StallsAfter(stall) => {
+                            while got < stall.min(length) {
+                                let n = socket.read(&mut chunk).await.unwrap_or(0);
+                                if n == 0 {
+                                    return;
+                                }
+                                got += n;
+                                received.fetch_add(n, Ordering::SeqCst);
+                            }
+                            std::future::pending::<()>().await
+                        }
+                        Slow::Reads(rate) => {
+                            while got < length {
+                                let want = (length - got).min(chunk.len());
+                                let n = socket.read(&mut chunk[..want]).await.unwrap_or(0);
+                                if n == 0 {
+                                    return;
+                                }
+                                got += n;
+                                received.fetch_add(n, Ordering::SeqCst);
+                                tokio::time::sleep_until(due(got, rate)).await;
+                            }
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                                )
+                                .await;
+                        }
+                        Slow::Serves(body, rate) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            if socket.write_all(head.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            let step = (rate as usize / 8).clamp(1, chunk.len());
+                            let mut sent = 0;
+                            while sent < body.len() {
+                                let end = (sent + step).min(body.len());
+                                if socket.write_all(&body[sent..end]).await.is_err() {
+                                    return;
+                                }
+                                sent = end;
+                                tokio::time::sleep_until(due(sent, rate)).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (endpoint, received)
+    }
+
+    /// The body the slow transfer tests move: 16 MiB, which
+    /// takes 12.8 s at [`SLOW_RATE`], past the old 10 s total
+    /// and well inside its 26 s budget.
+    const SLOW_BODY: usize = 16 * 1024 * 1024;
+
+    /// A store that keeps moving, above the minimum rate:
+    /// 1.25 MiB a second.
+    const SLOW_RATE: u64 = 5 * 1024 * 1024 / 4;
+
+    /// How late past its bound a request may end in these
+    /// tests, for a loaded test host.
+    const SLACK: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn the_transfer_budget_scales_with_the_body_and_stays_bounded() {
+        assert_eq!(transfer_budget(0), STORE_TIMEOUT);
+        assert_eq!(transfer_budget(1024 * 1024), Duration::from_secs(11));
+        assert_eq!(
+            transfer_budget(SLOW_BODY as u64),
+            Duration::from_secs(10 + 16)
+        );
+        // The repro in issue #550: 18 MB, which a store reading
+        // 1 MB a second took 18 s over, against 27.2 s.
+        assert_eq!(
+            transfer_budget(18_000_000),
+            Duration::from_millis(10_000 + 17_166)
+        );
+        // The largest entry and the largest upload.
+        assert_eq!(
+            transfer_budget(MAX_ENTRY_BYTES as u64),
+            Duration::from_secs(10 + 512)
+        );
+        assert_eq!(
+            transfer_budget(1024 * 1024 * 1024),
+            Duration::from_secs(10 + 1024)
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_that_keep_moving_outlast_the_short_bound() {
+        // Issue #550: every store request had one 10 s total,
+        // so an upload or a shared-tier write the store took
+        // in steadily, but over more than 10 s, failed. Each
+        // write now gets 10 s plus a second per MiB.
+        let (endpoint, received) = start_slow_store(Slow::Reads(SLOW_RATE)).await;
+        let s = store(&endpoint);
+        let entry = image(&vec![2u8; SLOW_BODY], &[]);
+        let started = Instant::now();
+        let (stored, ()) = tokio::join!(
+            s.put_raw("big.bin", vec![1u8; SLOW_BODY]),
+            s.put("big", &entry)
+        );
+        let took = started.elapsed();
+        assert!(stored, "the upload failed after {took:?}");
+        assert_eq!(s.errors(), 0, "the shared-tier write failed after {took:?}");
+        let read = received.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(read > 2 * SLOW_BODY, "the store read {read} bytes");
+        assert!(took > STORE_TIMEOUT, "the stub paced too fast: {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_write_the_store_stops_reading_fails_at_its_budget() {
+        // A store that takes part of a body, then neither
+        // reads nor answers: the write fails at its body's
+        // budget (12 s for 2 MiB), not before and not much
+        // after; the upload reports it and the shared-tier
+        // write is counted.
+        let body = 2 * 1024 * 1024;
+        let (endpoint, received) = start_slow_store(Slow::StallsAfter(256 * 1024)).await;
+        let s = store(&endpoint);
+        let entry = image(&vec![2u8; body], &[]);
+        let started = Instant::now();
+        let (stored, ()) = tokio::join!(
+            s.put_raw("stalled.bin", vec![1u8; body]),
+            s.put("stalled", &entry)
+        );
+        let took = started.elapsed();
+        assert!(!stored);
+        assert_eq!(s.errors(), 1);
+        assert!(received.load(std::sync::atomic::Ordering::SeqCst) >= 256 * 1024);
+        let budget = transfer_budget(body as u64);
+        assert!(took >= budget, "{took:?} against {budget:?}");
+        assert!(took < budget + SLACK, "{took:?} against {budget:?}");
+    }
+
+    #[tokio::test]
+    async fn an_entry_read_that_keeps_moving_outlasts_the_short_bound() {
+        // A large entry served steadily over more than 10 s
+        // is read whole: its budget follows the length the
+        // store declares.
+        let bytes = serialize_entry("big", &image(&vec![7u8; SLOW_BODY], &[]), &test_entry_key());
+        let (endpoint, _) = start_slow_store(Slow::Serves(Arc::new(bytes), SLOW_RATE)).await;
+        let s = store(&endpoint);
+        let started = Instant::now();
+        let got = s.get("big").await;
+        let took = started.elapsed();
+        assert_eq!(
+            got.map(|image| image.bytes.len()),
+            Some(SLOW_BODY),
+            "after {took:?}"
+        );
+        assert!(took > STORE_TIMEOUT, "the stub paced too fast: {took:?}");
+    }
+
+    #[tokio::test]
+    async fn reads_still_fail_fast_on_a_hung_store() {
+        // A store that never answers fails a lookup, a HEAD
+        // and a raw read at the short bound, as before.
+        let (endpoint, _) = start_slow_store(Slow::Hangs).await;
+        let s = store(&endpoint);
+        let started = Instant::now();
+        let (entry, exists, raw) = tokio::join!(s.get("key"), s.exists_raw("x"), s.get_raw("x"));
+        let took = started.elapsed();
+        assert!(entry.is_none());
+        assert!(!exists);
+        assert_eq!(raw, None);
+        assert_eq!(s.errors(), 1, "the lookup's transport error is counted");
+        assert!(took >= STORE_TIMEOUT, "{took:?}");
+        assert!(took < STORE_TIMEOUT + SLACK, "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_small_read_that_trickles_keeps_the_short_bound() {
+        // 64 bytes at 2 bytes a second: a byte every half
+        // second, so the read timeout never fires, but the
+        // read's budget (10 s for 64 bytes) ends it long
+        // before the 32 s the body would take.
+        let (endpoint, _) = start_slow_store(Slow::Serves(Arc::new(vec![b'x'; 64]), 2)).await;
+        let s = store(&endpoint);
+        let started = Instant::now();
+        assert_eq!(s.get_raw("x").await, None);
+        let took = started.elapsed();
+        assert!(took >= STORE_TIMEOUT, "{took:?}");
+        assert!(took < STORE_TIMEOUT + SLACK, "{took:?}");
     }
 }

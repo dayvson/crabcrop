@@ -14,6 +14,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The boot line `crabcrop listening on port N` names the port the server bound (issue #536). It printed the configured port, so `PORT=0`, which binds a free port, printed port 0; it now prints the port the system picked. For a fixed port the line is unchanged.
 
+### Fixed
+
+- Uploads to `CRABCROP_UPLOAD_BUCKET` and shared-tier writes no longer fail when the store takes more than 10 seconds to receive them (issue #550). Every request to either bucket had a fixed 10-second limit, so with `CRABCROP_SOURCE_MAX_MB` raised, or over a slow link to the store, a large upload answered `502 upload_store_unavailable` even while the store kept receiving it: an 18 MB upload to a store reading 1 MB a second failed at 11 s. A write now gets 10 seconds plus one second per MiB of its body, 17 minutes 14 seconds at the largest upload cap. A shared-tier lookup gets the same for the length the store declares, so large entries are read back too; it must still start answering within 10 seconds, and a body that goes 10 seconds without a byte fails sooner. Every other request keeps its 10-second limit. `CRABCROP_SOURCE_TIMEOUT_SECS` still bounds source fetches only, and no setting changes the bucket limits; docs/configuration.md describes them under Bucket request timeouts.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
