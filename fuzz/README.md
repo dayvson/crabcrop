@@ -230,8 +230,9 @@ decoder is not compiled in, and an AV1 still under a
 generic HEIF brand, which the HEIC path refuses before
 decoding (issue #466); and AVIF containers the item-table
 screen refuses before decoding (issue #522): one whose
-`iloc` extents sum past the data the file holds, one with
-more extents than the cap, and one whose primary `ispe`
+`iloc` extents sum past the data the file holds, one whose
+two length-0 extents each run to the end of the same `mdat`,
+one with more extents than the cap, and one whose primary `ispe`
 declares a size past the decode limits. `corpus/op_chain/` seeds filter-chain
 remainders: plain, face-shaped, quarter and arbitrary-angle
 rotations (`rotate(91)`, `rotate(45)`, negative and
