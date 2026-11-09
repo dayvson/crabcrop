@@ -40,6 +40,8 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - PDF pages render their crop box, the area a PDF viewer shows and the page size the probe reports, so the raster limits computed from that size (16383 px per axis and 64 megapixels) hold for the raster that is drawn. The renderer used to draw the media box, which a page can declare much larger than its crop box, and such a page rendered past those limits. A page too large to fit those limits even at 1 dpi, the lowest resolution the renderer is asked for (over 16382 inches on a side, or over 64 million square inches), used to render past them and is now refused before the renderer runs, as is a page size the probe reports as a number that is not finite. The renderer is now run with `-cropbox`, so a program configured in place of `pdftocairo` must accept that flag. Pages whose crop box is their media box render the same bytes as before.
 
+- AVIF sources are checked for consistent container sizes before decoding, and decoding runs in the capped worker process with a deadline (issue #522). An AVIF whose item table does not agree with the data the file holds, or whose declared image size is past the decode limits, fails with `502` (`415` as an upload) before any decoding; the explain report reads an AVIF's size from the container without decoding it; and an AVIF still decoding at the processing deadline fails with `504` while the server carries on. Valid files decode to the same pixels as before.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added

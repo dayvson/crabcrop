@@ -642,16 +642,26 @@ fn render_size_check_rejects_a_render_past_the_bound() {
 #[cfg(feature = "avif-decode")]
 fn the_decode_corpus_reaches_the_shipped_avif_decoder() {
     // Issue #476: with the avif-decode feature (the fuzz
-    // crate's default, as in every shipped build) the AVIF
-    // seed decodes through dav1d, so the decode target
-    // fuzzes the decoder the server runs.
-    let seed = byte_corpus_inputs("decode")
+    // crate's default, as in every shipped build) a valid
+    // AVIF seed decodes through dav1d, so the decode target
+    // fuzzes the decoder the server runs. The corpus also
+    // holds AVIF seeds the container screen refuses (issue
+    // #522), so this finds one that decodes rather than the
+    // first with an AVIF brand.
+    let avif_seeds: Vec<Vec<u8>> = byte_corpus_inputs("decode")
         .into_iter()
-        .find(|s| s.get(4..12) == Some(b"ftypavif".as_slice()))
-        .expect("an AVIF seed");
-    let img = crabcrop_fuzz::engine::decode_image(&seed).expect("the AVIF seed decodes");
-    assert!(img.width() > 0 && img.height() > 0);
-    crabcrop_fuzz::check_decode(&seed);
+        .filter(|s| s.get(4..12) == Some(b"ftypavif".as_slice()))
+        .collect();
+    let decoded = avif_seeds
+        .iter()
+        .find_map(|s| crabcrop_fuzz::engine::decode_image(s).ok())
+        .expect("a valid AVIF seed decodes");
+    assert!(decoded.width() > 0 && decoded.height() > 0);
+    // Every AVIF seed, decodable or refused, runs the decode
+    // path without a panic or a runaway allocation.
+    for seed in &avif_seeds {
+        crabcrop_fuzz::check_decode(seed);
+    }
 }
 
 #[test]

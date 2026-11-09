@@ -614,7 +614,10 @@ pub(in crate::server) async fn run_process(
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut watermarks = crate::filters::WatermarkImages::new();
             for (url, wm_bytes) in &job.watermark_sources.images {
-                let img = crate::engine::decode_image(wm_bytes)?;
+                // An AVIF watermark decodes in the capped worker
+                // under the request deadline, like the source
+                // (issue #522).
+                let img = crate::engine::decode_source_image(wm_bytes, Some(deadline))?;
                 watermarks.insert(url.clone(), img);
             }
             let ctx = crate::engine::ProcessContext {
