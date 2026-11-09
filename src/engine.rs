@@ -468,12 +468,35 @@ pub(crate) fn probe_is_heavy(kind: &str) -> bool {
     matches!(kind, "svg" | "avif")
 }
 
+/// A test hook standing in for an SVG whose size probe is
+/// slow (a document whose usvg parse runs near the probe's
+/// deadline), without relying on usvg's timing or crafting
+/// such a document: an SVG source whose bytes contain this
+/// marker makes [`probe_source`] sleep [`SVG_PROBE_TEST_DELAY`]
+/// while it sizes it. The sleep runs wherever `probe_source`
+/// runs, so it blocks a request thread when the probe is on
+/// one and a blocking thread when it is not.
+#[cfg(test)]
+pub(crate) const SVG_PROBE_SLOW_MARKER: &[u8] = b"crabcrop-slow-probe";
+
+/// How long the [`SVG_PROBE_SLOW_MARKER`] hook sleeps.
+#[cfg(test)]
+pub(crate) const SVG_PROBE_TEST_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Probe source bytes for the explain report: kind and
 /// dimensions, headers only (see [`SourceProbe`]). For the
 /// kinds [`probe_is_heavy`] names, this blocks for as long as
 /// the parse or the decode takes.
 pub(crate) fn probe_source(bytes: &[u8]) -> SourceProbe {
     let kind = probe_kind(bytes);
+    #[cfg(test)]
+    if kind == "svg"
+        && bytes
+            .windows(SVG_PROBE_SLOW_MARKER.len())
+            .any(|w| w == SVG_PROBE_SLOW_MARKER)
+    {
+        std::thread::sleep(SVG_PROBE_TEST_DELAY);
+    }
     let dimensions = match kind {
         // The intrinsic size takes a parse, which runs in the
         // SVG worker (issue #447) under the probe's own short
