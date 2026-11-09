@@ -1927,4 +1927,37 @@ mod tests {
         assert!(target.is_file(), "the link's target is left alone");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_boot_scan_leaves_a_symlink_or_directory_at_an_entry_path_unindexed() {
+        // Issue #545: the scan skips anything that is not a
+        // regular file, not only a FIFO. A symlink, even to a
+        // valid entry, is not followed, indexed or deleted, and
+        // neither is a directory. Only the symlink pins the
+        // skip: a directory that reached the read would be
+        // refused there, and `remove_file` cannot delete it.
+        let dir = temp_dir("symlink-dir-scan");
+        let (link, target) = {
+            let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+            store.put("good", &image(b"payload"));
+            store.put("linked", &image(b"payload"));
+            let link = store.file_for(&key_stem("linked"));
+            let target = dir.join("moved-entry");
+            std::fs::rename(&link, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (link, target)
+        };
+        let planted = dir.join(format!("{}.bin", key_stem("planted")));
+        std::fs::create_dir(&planted).unwrap();
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        assert!(!store.contains("linked"), "a symlink is never indexed");
+        let meta = std::fs::symlink_metadata(&link).expect("the symlink is left in place");
+        assert!(meta.file_type().is_symlink());
+        assert!(target.is_file(), "the link's target is left alone");
+        assert!(planted.is_dir(), "the directory is left in place");
+        assert_eq!(store.stats().0, 1, "only the real entry is indexed");
+        assert_eq!(store.get("good").unwrap().bytes.as_ref(), b"payload");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
