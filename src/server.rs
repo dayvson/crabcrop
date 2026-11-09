@@ -239,7 +239,7 @@ pub struct AppState {
     pub brand_color: Option<[u8; 3]>,
     /// Named operation presets from `CRABCROP_PRESETS_FILE`:
     /// name to operation string, validated at boot.
-    pub presets: std::collections::HashMap<String, String>,
+    pub presets: crate::url::Presets,
     /// Presets-only mode, from `CRABCROP_ONLY_PRESETS`: reject
     /// free-form operations in requests.
     pub only_presets: bool,
@@ -928,7 +928,9 @@ async fn explain_handle(
         let entry_ops = state
             .presets
             .get(name)
-            .and_then(|definition| crate::url::parse_default_ops(definition, &state.presets).ok())
+            .and_then(|definition| {
+                crate::url::parse_default_ops(definition.as_str(), &state.presets).ok()
+            })
             .unwrap_or_default();
         presets.push(crate::explain::preset_entry(name, &entry_ops));
     }

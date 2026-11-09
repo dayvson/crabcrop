@@ -2107,6 +2107,50 @@ pub fn parse_preset_operations(input: &str) -> Result<Vec<Operation>, ParseError
     Ok(operations)
 }
 
+/// A configured preset: its definition, validated as
+/// [`parse_preset_operations`] validates it, and the number
+/// of operations it adds to a request that references it,
+/// counted the way [`operation_count`] counts a request.
+/// Both are settled once, when the presets load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preset {
+    text: String,
+    operations: usize,
+}
+
+impl Preset {
+    /// Validate a definition and count its operations.
+    pub fn parse(text: &str) -> Result<Self, ParseError> {
+        let operations = operation_count(&parse_preset_operations(text)?);
+        Ok(Preset {
+            text: text.to_string(),
+            operations,
+        })
+    }
+
+    /// The definition, as configured.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// The operations the definition runs, each filter in a
+    /// `filters:` segment counted once.
+    pub fn operations(&self) -> usize {
+        self.operations
+    }
+}
+
+impl std::str::FromStr for Preset {
+    type Err = ParseError;
+
+    fn from_str(text: &str) -> Result<Self, ParseError> {
+        Preset::parse(text)
+    }
+}
+
+/// The preset table: each name with its validated definition.
+pub type Presets = std::collections::HashMap<String, Preset>;
+
 /// The preset names a remainder references, in order,
 /// deduplicated: the cache groups (RFC 9875) the response
 /// belongs to. Scans the same leading segment run
@@ -2247,10 +2291,7 @@ pub fn merge_default_ops(defaults: &[Operation], url_ops: Vec<Operation>) -> Vec
 /// and never apply. A string that alone runs past
 /// [`MAX_OPERATIONS`] is refused too: every request under it
 /// would answer `400`.
-pub fn parse_default_ops(
-    text: &str,
-    presets: &std::collections::HashMap<String, String>,
-) -> Result<Vec<Operation>, ParseError> {
+pub fn parse_default_ops(text: &str, presets: &Presets) -> Result<Vec<Operation>, ParseError> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -2306,7 +2347,7 @@ pub fn parse_default_ops(
 /// is an operation.
 pub fn expand_presets(
     rest: &str,
-    presets: &std::collections::HashMap<String, String>,
+    presets: &Presets,
     only_presets: bool,
 ) -> Result<String, ParseError> {
     let mut out = String::with_capacity(rest.len());
@@ -2317,10 +2358,10 @@ pub fn expand_presets(
             None => (tail, ""),
         };
         if let Some(name) = seg.strip_prefix("preset:") {
-            let definition = presets
+            let preset = presets
                 .get(name)
                 .ok_or_else(|| ParseError::UnknownPreset(name.to_string()))?;
-            out.push_str(definition);
+            out.push_str(&preset.text);
         } else if seg.starts_with("exp:")
             || seg.starts_with("maxage:")
             || parse_operation(seg).is_some_and(|r| r.is_ok())
@@ -6260,12 +6301,12 @@ mod tests {
         assert!(!RequestDirectives::analyze(&ops).uses_ai());
     }
 
-    fn preset_map() -> std::collections::HashMap<String, String> {
+    fn preset_map() -> Presets {
         [
-            ("thumb".to_string(), "300x200".to_string()),
+            ("thumb".to_string(), "300x200".parse().unwrap()),
             (
                 "og".to_string(),
-                "crop:1200x630:smart/filters:format(webp)".to_string(),
+                "crop:1200x630:smart/filters:format(webp)".parse().unwrap(),
             ),
         ]
         .into_iter()
@@ -6800,7 +6841,7 @@ mod tests {
         let mut presets = std::collections::HashMap::new();
         presets.insert(
             "thumb".to_string(),
-            "200x200/filters:format(webp)".to_string(),
+            "200x200/filters:format(webp)".parse().unwrap(),
         );
         // Plain operations.
         let ops = parse_default_ops("filters:quality(80)", &presets).unwrap();
@@ -6856,7 +6897,7 @@ mod tests {
         // booted cleanly and never applied. Both are refused
         // now, naming the segment, wherever they sit.
         let mut presets = std::collections::HashMap::new();
-        presets.insert("thumb".to_string(), "100x0".to_string());
+        presets.insert("thumb".to_string(), "100x0".parse().unwrap());
         for (text, want) in [
             (
                 "filters:format(webp)/maxage:60",
@@ -6947,7 +6988,9 @@ mod tests {
         let mut presets = std::collections::HashMap::new();
         presets.insert(
             "ten".to_string(),
-            format!("filters:{}", ["invert"; 10].join(":")),
+            format!("filters:{}", ["invert"; 10].join(":"))
+                .parse()
+                .unwrap(),
         );
         let at_cap = format!("filters:{}", vec!["invert"; MAX_OPERATIONS].join(":"));
         assert_eq!(

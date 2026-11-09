@@ -27,11 +27,11 @@ use url::{Dimension, Filter, Operation, Signature};
 /// fixed stand-in for operator configuration (issue
 /// #476), the way the root map below stands in for
 /// `CRABCROP_SOURCE_ROOTS`. Every definition is one the
-/// server would accept at boot (`parse_preset_operations`;
-/// the smoke checks that), so expansion splices real
-/// operation text into the request.
-pub fn presets() -> &'static HashMap<String, String> {
-    static PRESETS: OnceLock<HashMap<String, String>> = OnceLock::new();
+/// server would accept at boot (`Preset::parse` runs the
+/// boot-time validation; the smoke checks it too), so
+/// expansion splices real operation text into the request.
+pub fn presets() -> &'static url::Presets {
+    static PRESETS: OnceLock<url::Presets> = OnceLock::new();
     PRESETS.get_or_init(|| {
         [
             ("thumb", "300x200/filters:quality(80)"),
@@ -43,7 +43,7 @@ pub fn presets() -> &'static HashMap<String, String> {
             ("avatar", "crop:96x96:face/filters:mask(circle)"),
         ]
         .into_iter()
-        .map(|(name, ops)| (name.to_string(), ops.to_string()))
+        .map(|(name, ops)| (name.to_string(), ops.parse().expect("a valid preset")))
         .collect()
     })
 }
@@ -103,7 +103,7 @@ pub fn check(input: &str) {
     // The remaining entry points over untrusted text: total
     // by assertion (a panic fails the run).
     let _ = url::parse_signature(input);
-    let _ = url::expand_presets(input, &HashMap::new(), false);
+    let _ = url::expand_presets(input, &url::Presets::new(), false);
     let _ = url::preset_names(input);
     if let Ok((signature, key_id, rest)) = url::parse_signature(input) {
         let segment = signature_segment(&signature, key_id.as_deref());

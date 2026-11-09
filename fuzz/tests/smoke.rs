@@ -268,6 +268,7 @@ fn the_preset_map_holds_definitions_the_server_accepts() {
     // real operations: each definition passes the boot-time
     // validation, and a request naming one expands and parses.
     for (name, definition) in crabcrop_fuzz::presets() {
+        let definition = definition.as_str();
         assert!(
             url::parse_preset_operations(definition).is_ok(),
             "preset {name} = {definition} would be refused at boot"

@@ -707,7 +707,7 @@ fn presets_construction_reads_and_validates_the_file() {
         ("CRABCROP_ONLY_PRESETS", "1"),
     ]))
     .unwrap();
-    assert_eq!(presets["thumb"], "300x200");
+    assert_eq!(presets["thumb"].as_str(), "300x200");
     assert!(only);
     // ...but refused without one: it would reject every
     // transformed request.
@@ -1095,7 +1095,7 @@ fn parses_preset_files() {
         )
         .unwrap();
     assert_eq!(map.len(), 2);
-    assert_eq!(map["thumb"], "300x200");
+    assert_eq!(map["thumb"].as_str(), "300x200");
     for bad in [
         "no-equals-here",
         "bad name = 300x200",
