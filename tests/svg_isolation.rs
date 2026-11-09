@@ -83,19 +83,21 @@ fn boot(root: &Path, extra_env: &[(&str, &str)]) -> (common::ServerGuard, u16) {
 
 const METRICS_TOKEN: &str = "svg-isolation-metrics-token";
 
-/// The process lane permits in use, from `/metrics`.
-fn process_lane_in_use(port: u16) -> u32 {
+/// One process lane gauge from `/metrics`: `in_use` or
+/// `capacity`.
+fn process_lane(port: u16, gauge: &str) -> u32 {
     let (status, body, _) = get_with(
         port,
         "/metrics",
         &format!("Authorization: Bearer {METRICS_TOKEN}\r\n"),
     );
     assert_eq!(status, 200);
+    let series = format!("crabcrop_lane_{gauge}{{lane=\"process\"}} ");
     String::from_utf8_lossy(&body)
         .lines()
-        .find_map(|line| line.strip_prefix("crabcrop_lane_in_use{lane=\"process\"} "))
+        .find_map(|line| line.strip_prefix(series.as_str()))
         .and_then(|n| n.trim().parse().ok())
-        .expect("a process lane gauge")
+        .unwrap_or_else(|| panic!("no process lane {gauge} gauge"))
 }
 
 const OK_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#336699"/><circle cx="100" cy="50" r="30" fill="#ffcc00"/></svg>"##;
@@ -175,38 +177,66 @@ fn slow_svg() -> String {
 fn hostile_svgs_fail_alone_while_the_server_keeps_serving() {
     let dir = source_dir("hostile");
     let (mut server, port) = boot(&dir, &[]);
-    let arc = std::thread::spawn(move || get(port, "/unsafe/64x64/file:///arc.svg"));
-    let nested = std::thread::spawn(move || get(port, "/unsafe/64x64/file:///nested.svg"));
-    // While the hostile renders run, the server answers
-    // health checks and renders an ordinary SVG.
-    let mut served = 0;
-    while !(arc.is_finished() && nested.is_finished()) {
-        assert_eq!(get(port, "/health").0, 200);
-        let (status, body, _) = get(port, "/unsafe/32x32/file:///ok.svg");
-        assert_eq!(status, 200);
-        assert!(body.starts_with(b"\x89PNG"), "an SVG renders to PNG");
-        served += 1;
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let (status, body, took) = arc.join().unwrap();
-    assert_eq!(status, 502, "{}", String::from_utf8_lossy(&body));
-    assert!(took < Duration::from_secs(60), "the arc took {took:?}");
-    let (status, _, took) = nested.join().unwrap();
+    // The nested chain is refused inside its worker in
+    // milliseconds. It runs alone, so it never waits for a
+    // stills permit behind the arc.
+    let (status, _, took) = get(port, "/unsafe/64x64/file:///nested.svg");
     assert_eq!(status, 502);
     assert!(
         took < Duration::from_secs(30),
         "the nested chain took {took:?}"
     );
-    assert!(served > 0, "nothing was served while the arc rendered");
+    assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
+    // The arc's render holds a stills lane permit for
+    // seconds, as any long render does. The lane has one
+    // permit per core, so a render beside it is served only
+    // when the lane has a second permit. On a one-core host
+    // it waits the lane's 5 s and is shed with 503, as it
+    // would be behind a slow raster render (issue #547).
+    let spare_permit = process_lane(port, "capacity") > 1;
+    let arc = std::thread::spawn(move || get(port, "/unsafe/64x64/file:///arc.svg"));
+    let (mut rendered, mut explained) = (0, 0);
+    while !arc.is_finished() {
+        assert_eq!(get(port, "/health").0, 200);
+        // The explain report parses an ordinary SVG in a
+        // worker of its own, under the probe gate, which no
+        // render holds: this works on every host.
+        let (status, body, _) = get(port, "/explain/unsafe/64x64/file:///ok.svg");
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains("svg, 200x100"));
+        explained += 1;
+        let (status, body, _) = get(port, "/unsafe/32x32/file:///ok.svg");
+        if status == 200 {
+            assert!(body.starts_with(b"\x89PNG"), "an SVG renders to PNG");
+            rendered += 1;
+        } else {
+            assert!(
+                !spare_permit,
+                "a render was shed with a stills permit free: {status}"
+            );
+            assert_eq!(status, 503);
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                "server busy: too many images processing at once"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (status, body, took) = arc.join().unwrap();
+    assert_eq!(status, 502, "{}", String::from_utf8_lossy(&body));
+    assert!(took < Duration::from_secs(60), "the arc took {took:?}");
+    assert!(
+        explained > 0,
+        "nothing was explained while the arc rendered"
+    );
+    if spare_permit {
+        assert!(rendered > 0, "nothing was rendered while the arc rendered");
+    }
     // The server is the same process, still serving.
     assert!(server.0.try_wait().unwrap().is_none(), "the server exited");
     assert_eq!(get(port, "/health").0, 200);
     assert_eq!(get(port, "/unsafe/32x32/file:///ok.svg").0, 200);
-    // The explain report reads an SVG's size through a
-    // worker too, and a hostile one costs it only the size.
-    let (status, body, _) = get(port, "/explain/unsafe/64x64/file:///ok.svg");
-    assert_eq!(status, 200);
-    assert!(String::from_utf8_lossy(&body).contains("svg, 200x100"));
+    // A hostile SVG costs the explain report only the size.
     let (status, body, took) = get(port, "/explain/unsafe/64x64/file:///arc.svg");
     assert_eq!(status, 200);
     let report = String::from_utf8_lossy(&body);
@@ -248,7 +278,7 @@ fn a_render_past_the_deadline_is_a_504_and_its_worker_dies() {
     // at its 504 would hold it until it finished, minutes
     // from now.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while process_lane_in_use(port) != 0 {
+    while process_lane(port, "in_use") != 0 {
         assert!(
             Instant::now() < deadline,
             "the render still holds its lane after the 504"
