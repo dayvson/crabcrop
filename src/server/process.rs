@@ -73,7 +73,7 @@ pub(in crate::server) struct SharedFlight {
     /// Every input `serve` shaped the response from
     /// besides the conditional headers, as the miss path
     /// sees it (the raw path, the negotiated format, the
-    /// hints; see `serve`): a follower takes the response
+    /// hints; see `run_flight`): a follower takes the response
     /// only when its own request carries the same, since
     /// one cache key can serve spellings that answer
     /// differently (a sealed one answers errors with the
@@ -566,7 +566,7 @@ pub(in crate::server) async fn run_process(
     let job = job.clone();
     let engine = state.engine;
     // The processing deadline (issue #260) is the
-    // caller's: serve_miss stamps it when the process
+    // caller's: the miss path stamps it when the process
     // phase starts, so the gate waits above share the
     // request's one process budget instead of the run
     // starting a fresh timeout after them. The engine
