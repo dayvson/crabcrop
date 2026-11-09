@@ -14,6 +14,10 @@ All notable changes to crabcrop are recorded here. The format follows [Keep a Ch
 
 - The cargo group bump moves the JPEG XL encoder `jixel` from 0.5.2 to 0.5.5, `fast-ssim2` from 0.9.0 to 0.9.1, and `ureq` from 3.5.0 to 3.5.1 (PR #493; `c2pa` 0.91.11 from the same group already landed). At the default quality the new encoder writes JPEG XL files 11 to 19 percent smaller at slightly lower fidelity: across a seven image sample, PSNR moves down 0.02 to 0.55 dB and SSIMULACRA2 down 3.3 to 5.7 points on the photographic images, while quality 90 stays close to neutral. The tradeoff was measured before landing and is taken deliberately. This changes the bytes served for existing `format(jxl)` URLs, and the upgrade corpus entry `format-jxl` is re-baselined for this reason.
 
+- In the library target, `cli::exec` and `cli::convert_thumbor` return a typed `cli::CliError` instead of a `String` (issue #477). Its `Display` is the old message.
+
+- Boot checks every setting before it opens a result store, binds the port, or loads a model (issue #477). One bad setting is reported exactly as before. When a setting and something else are both wrong, the setting is now the one reported: ahead of a model, font, fallback image, video or PDF tool, signing identity, or store that would also fail, and ahead of a port that is taken. A boot refused for a setting no longer prints the lines of the components it had built, and no longer creates the `CRABCROP_RESULT_STORAGE_DIR` directory.
+
 - The boot line `crabcrop listening on port N` names the port the server bound (issue #536). It printed the configured port, so `PORT=0`, which binds a free port, printed port 0; it now prints the port the system picked. For a fixed port the line is unchanged.
 
 - Test and CI reliability. A failed check in the disk-read test that blocks on a FIFO no longer hangs the suite: the test lets the held read go on every exit path and puts a deadline on each request and on the wait for the read, and every job in `rust.yml` and `functional.yml` has a `timeout-minutes` (issue #543).
