@@ -471,7 +471,10 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// 16384 px source side through unchanged steps down to a
 /// factor whose output fits 16383 px, so `8192x1` on a
 /// 16384x2 source with `DPR: 2` serves 12288x2 instead of
-/// 16384x2 #529).
+/// 16384x2 #529; JPEG XL output written by the jixel 0.5.5
+/// encoder, whose files run 11 to 19 percent smaller at
+/// slightly lower fidelity than 0.5.2 at the same quality
+/// setting, PR #493).
 const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered
