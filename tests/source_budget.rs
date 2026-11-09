@@ -3,11 +3,13 @@
 //! buffered its whole source before any gate was consulted,
 //! so the sources in memory grew with the number of
 //! requests. Now a miss charges its body to the budget as
-//! the bytes arrive: an origin that answers and then stalls
-//! holds only what it delivered, so stalled origins cannot
-//! starve other requests, while a budget genuinely full of
-//! buffered bytes makes new misses wait, then shed with the
-//! documented `503 server_busy`.
+//! the bytes arrive, with a bounded read-ahead kept only
+//! while the body keeps up: an origin that answers and then
+//! stalls, or sends a byte at a time, holds only what it
+//! delivered, so slow origins cannot starve other requests,
+//! while a budget genuinely full of buffered bytes makes new
+//! misses wait, then shed with the documented
+//! `503 server_busy`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -102,8 +104,10 @@ fn tiny_png() -> Vec<u8> {
 /// A local origin. A path containing `stall` answers with
 /// a declared length of `declared` bytes, sends `sent` of
 /// them, then holds the connection until `release` is set
-/// (or 9 s pass); every other path gets the tiny PNG. It
-/// records every path it is asked for.
+/// (or 9 s pass). A path containing `trickle` answers with
+/// the same declared length, then sends one byte every
+/// half second until then. Every other path gets the tiny
+/// PNG. It records every path it is asked for.
 struct Origin {
     port: u16,
     paths: Arc<Mutex<Vec<String>>>,
@@ -146,6 +150,20 @@ fn spawn_origin(declared: usize, sent: usize) -> Origin {
                         let until = Instant::now() + Duration::from_secs(9);
                         while !release.load(Ordering::SeqCst) && Instant::now() < until {
                             std::thread::sleep(Duration::from_millis(20));
+                        }
+                        return;
+                    }
+                    if path.contains("trickle") {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let until = Instant::now() + Duration::from_secs(9);
+                        while !release.load(Ordering::SeqCst) && Instant::now() < until {
+                            if stream.write_all(&[0]).is_err() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(500));
                         }
                         return;
                     }
@@ -201,8 +219,9 @@ fn stalled_origins_do_not_block_a_normal_request() {
     // front would let two of them hold the whole budget for
     // the fetch timeout, and the normal request below would
     // shed after its 5 s wait. Charged as bytes arrive, a
-    // stall holds its declared length only for the one-second
-    // grant, then only what it delivered: nothing.
+    // stall holds a 1 MiB read-ahead only for its first
+    // one-second window, then only what it delivered:
+    // nothing.
     let origin = spawn_origin(10 * 1024 * 1024, 0);
     let uploads = scratch_dir("stall");
     let (_server, port) = boot(20, &uploads);
@@ -259,6 +278,56 @@ fn stalled_origins_do_not_block_a_normal_request() {
         "{body}"
     );
     assert!(!uploads.join("stall.png").exists());
+}
+
+#[test]
+fn trickling_origins_do_not_block_a_normal_request() {
+    // Twenty-two misses whose origin answers with a 10 MB
+    // Content-Length and then sends one byte every half
+    // second, under a budget of two fetch caps (20 MB). Had
+    // each body kept its declared length while any byte
+    // arrived, two of them would hold the whole budget until
+    // the fetch timeout and the normal request below would
+    // shed after its 5 s wait. Each reserves only a 1 MiB
+    // read-ahead, given back once a window shows the body
+    // far too slow, so the normal request is served at once
+    // and the trickles, still open, hold only what they
+    // sent.
+    let origin = spawn_origin(10 * 1024 * 1024, 0);
+    let uploads = scratch_dir("trickle");
+    let (_server, port) = boot(20, &uploads);
+    let trickles: Vec<_> = (0..22)
+        .map(|i| {
+            let path = format!(
+                "/unsafe/20x20/http://127.0.0.1:{}/trickle{i}.png",
+                origin.port
+            );
+            std::thread::spawn(move || get(port, &path, "").0)
+        })
+        .collect();
+    wait_for_requests(&origin, 22);
+    let start = Instant::now();
+    let path = format!("/unsafe/20x20/http://127.0.0.1:{}/normal.png", origin.port);
+    let (status, head, _) = get(port, &path, "");
+    let waited = start.elapsed();
+    assert_eq!(status, 200, "{head}");
+    assert!(waited < Duration::from_secs(2), "served after {waited:?}");
+    // Their first window over, the 22 trickles hold a few
+    // bytes each: what they sent, never a read-ahead.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while held_bytes(port) > 1024 {
+        assert!(
+            Instant::now() < deadline,
+            "trickles still hold {} bytes",
+            held_bytes(port)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    origin.release.store(true, Ordering::SeqCst);
+    for t in trickles {
+        assert_ne!(t.join().unwrap(), 200, "a trickling source never renders");
+    }
+    assert_eq!(held_bytes(port), 0, "every charge came back");
 }
 
 #[test]
