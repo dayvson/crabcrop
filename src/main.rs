@@ -476,7 +476,9 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// slightly lower fidelity than 0.5.2 at the same quality
 /// setting, PR #493; a PDF page whose crop box is smaller
 /// than its media box rendered as its crop box, the size
-/// the probe measures, instead of its media box).
+/// the probe measures, instead of its media box; a PDF
+/// page too large to fit the raster limits at 1 dpi
+/// refused instead of rendered past them).
 const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered

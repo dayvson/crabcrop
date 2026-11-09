@@ -101,6 +101,15 @@ const MAX_RASTER_AXIS: f64 = (crate::url::MAX_DIMENSION - 1) as f64;
 /// reaches trivially (issue #262).
 const MAX_RASTER_PIXELS: f64 = 64_000_000.0;
 
+/// The lowest resolution the renderer is asked for, in
+/// dots per inch. The clamped scale's DPI is floored to a
+/// whole number, and this is the smallest one above zero,
+/// so a page that does not fit [`MAX_RASTER_AXIS`] and
+/// [`MAX_RASTER_PIXELS`] at this resolution cannot be
+/// clamped into them: it is refused before the renderer
+/// runs (see [`fits_at_min_dpi`]).
+const MIN_RENDER_DPI: f64 = 1.0;
+
 /// How much of a probe report the parser keeps. The
 /// report is a few hundred bytes; this is generous
 /// headroom for chatty builds.
@@ -339,11 +348,22 @@ impl PdfRenderer {
                 if probe.pages == 1 { "page" } else { "pages" }
             )));
         }
+        if !fits_at_min_dpi(probe.page_width, probe.page_height) {
+            return Err(PdfError::NotPdf(format!(
+                "page {page} is {} x {} pts, too large to render within the raster limits ({MAX_RASTER_AXIS} px per axis, {} megapixels) at {MIN_RENDER_DPI} dpi, the lowest resolution the renderer is asked for",
+                probe.page_width,
+                probe.page_height,
+                MAX_RASTER_PIXELS / 1_000_000.0
+            )));
+        }
         let scale = render_scale(probe.page_width, probe.page_height);
         // Floor the DPI so the clamped scale can never
         // round a raster axis past the axis cap; at the
-        // fixed scale this is exactly 144.
-        let dpi = (scale * 72.0).floor().max(1.0);
+        // fixed scale this is exactly 144. The page fits the
+        // limits at the minimum DPI (checked above), so
+        // raising a smaller DPI to the minimum keeps the
+        // raster within them.
+        let dpi = (scale * 72.0).floor().max(MIN_RENDER_DPI);
         let dpi_arg = format!("{dpi}");
         let page_arg = page.to_string();
         // `-cropbox`: draw the crop box, the size the probe
@@ -502,6 +522,20 @@ pub fn render_scale(page_width: f64, page_height: f64) -> f64 {
     scale
 }
 
+/// Whether a page of the given size in points renders
+/// within [`MAX_RASTER_AXIS`] and [`MAX_RASTER_PIXELS`] at
+/// [`MIN_RENDER_DPI`]. [`render_scale`] can clamp any
+/// smaller page into the limits, but the DPI it becomes
+/// does not go below the minimum, so a page past it (over
+/// 16382 inches on a side, or 64 million square inches)
+/// would render past the limits at the minimum DPI. A
+/// size that is not a finite number never fits.
+fn fits_at_min_dpi(page_width: f64, page_height: f64) -> bool {
+    let per_point = MIN_RENDER_DPI / 72.0;
+    let (width, height) = (page_width * per_point, page_height * per_point);
+    width <= MAX_RASTER_AXIS && height <= MAX_RASTER_AXIS && width * height <= MAX_RASTER_PIXELS
+}
+
 /// Parse the probe facts out of a `pdfinfo` report: the
 /// `Pages:` and `Encrypted:` lines and the selected
 /// page's size (printed as `Page size:` for a whole-
@@ -561,7 +595,12 @@ fn parse_page_size(line: &str, page: u32) -> Option<(f64, f64)> {
     };
     let width: f64 = w.parse().ok()?;
     let height: f64 = h.parse().ok()?;
-    if width <= 0.0 || height <= 0.0 {
+    // A size must be a positive, finite number. The probe
+    // prints a box with an overflowing coordinate as `inf`
+    // or `-nan`, which `f64` parses, and a NaN side passes
+    // a plain `<= 0.0` test and skips the raster clamp.
+    let usable = |side: f64| side.is_finite() && side > 0.0;
+    if !usable(width) || !usable(height) {
         return None;
     }
     Some((width, height))
@@ -670,6 +709,19 @@ Page size:       792 x 612 pts (letter)
         assert!(parse_probe("", 1).is_none());
         // A degenerate size is not a size.
         assert!(parse_probe("Pages: 1\nEncrypted: no\nPage size: 0 x 792 pts\n", 1).is_none());
+        // Nor is one that is not a finite number: the probe
+        // prints a box with an overflowing coordinate this
+        // way, and f64 parses every one of these spellings.
+        for size in [
+            "-nan x -nan",
+            "nan x 792",
+            "612 x inf",
+            "inf x inf",
+            "-inf x 792",
+        ] {
+            let report = format!("Pages: 1\nEncrypted: no\nPage    1 size:  {size} pts\n");
+            assert!(parse_probe(&report, 1).is_none(), "{size}");
+        }
     }
 
     #[test]
@@ -702,6 +754,46 @@ Page size:       792 x 612 pts (letter)
         // A degenerate size keeps the fixed scale; the
         // renderer run is where that document fails.
         assert_eq!(render_scale(0.0, 0.0), 2.0);
+    }
+
+    #[test]
+    fn pages_past_the_raster_limits_at_the_minimum_dpi_do_not_fit() {
+        // Ordinary and poster pages fit.
+        assert!(fits_at_min_dpi(612.0, 792.0));
+        assert!(fits_at_min_dpi(14_400.0, 14_400.0));
+        // The axis limit at 1 dpi: 16382 px is 1179504 pt.
+        assert!(fits_at_min_dpi(1_179_504.0, 10.0));
+        assert!(fits_at_min_dpi(10.0, 1_179_504.0));
+        assert!(!fits_at_min_dpi(1_179_600.0, 10.0));
+        assert!(!fits_at_min_dpi(10.0, 1_179_600.0));
+        // The area limit at 1 dpi: 64 Mpx is 576000 pt
+        // square.
+        assert!(fits_at_min_dpi(570_000.0, 570_000.0));
+        assert!(!fits_at_min_dpi(580_000.0, 580_000.0));
+        assert!(!fits_at_min_dpi(2_000_000.0, 2_000_000.0));
+        // A size that is not a finite number never fits.
+        assert!(!fits_at_min_dpi(f64::NAN, 100.0));
+        assert!(!fits_at_min_dpi(100.0, f64::NAN));
+        assert!(!fits_at_min_dpi(f64::INFINITY, 100.0));
+        // Every page that fits renders within both limits at
+        // the DPI the clamp gives it.
+        for (w, h) in [
+            (1_179_504.0, 10.0),
+            (570_000.0, 570_000.0),
+            (300_000.0, 1_000.0),
+            (14_400.0, 14_400.0),
+        ] {
+            let dpi = (render_scale(w, h) * 72.0).floor().max(MIN_RENDER_DPI);
+            let (rw, rh) = (raster_side(w, dpi), raster_side(h, dpi));
+            assert!(
+                rw <= MAX_RASTER_AXIS && rh <= MAX_RASTER_AXIS,
+                "{w}x{h} at {dpi}"
+            );
+            assert!(
+                rw * rh <= MAX_RASTER_PIXELS + rw + rh + 1.0,
+                "{w}x{h} at {dpi}"
+            );
+        }
     }
 
     /// The raster side the reference renderer draws for a
@@ -934,6 +1026,37 @@ exit 0\n";
         let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
         let err = renderer.render_page(b"junk", 1).unwrap_err();
         assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+    }
+
+    #[test]
+    fn render_refuses_a_page_too_large_for_the_minimum_dpi_before_rendering() {
+        // A page past the raster limits even at 1 dpi, the
+        // lowest resolution the renderer is asked for, is
+        // refused from the probe's size: the renderer never
+        // runs (its marker file stays absent).
+        for size in [
+            "2e+06 x 2e+06",
+            "1.5e+06 x 10",
+            "10 x 1.5e+06",
+            "580000 x 580000",
+        ] {
+            let dir = temp_dir("too-large");
+            let marker = dir.join("rendered");
+            let info = format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Pages:           1' 'Encrypted:       no' 'Page    1 size:  {size} pts'\nexit 0\n"
+            );
+            let render = format!(
+                "#!/bin/sh\ncat > /dev/null\ntouch \"{}\"\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
+                marker.display()
+            );
+            write_tool(&dir, "pdfinfo", &info);
+            let program = write_tool(&dir, "pdftocairo", &render);
+            let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
+            let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
+            assert!(matches!(err, PdfError::NotPdf(_)), "{size}: {err}");
+            assert!(err.to_string().contains("too large"), "{size}: {err}");
+            assert!(!marker.exists(), "{size}: the renderer must not run");
+        }
     }
 
     #[test]
@@ -1253,6 +1376,27 @@ exit 0\n";
                 "({x}, {y}) is inside the crop box: {p:?}"
             );
         }
+    }
+
+    /// End to end against the real Poppler: a page whose
+    /// crop box is its media box but too long to fit 16382
+    /// px even at 1 dpi is refused from the probe's size,
+    /// before the renderer draws it past the axis limit.
+    #[test]
+    fn real_tools_refuse_a_page_too_large_for_the_minimum_dpi() {
+        let Some(program) = poppler_renderer() else {
+            return;
+        };
+        let renderer = PdfRenderer::new(program, Duration::from_secs(30)).unwrap();
+        let bytes = pdf_document(&[(
+            "/MediaBox [0 0 1500000 10]",
+            "0 0 1 rg\n0 0 1500000 10 re\nf\n".to_string(),
+        )]);
+        let probe = renderer.probe(&bytes, 1).unwrap();
+        assert_eq!((probe.page_width, probe.page_height), (1_500_000.0, 10.0));
+        let err = renderer.render_page(&bytes, 1).unwrap_err();
+        assert!(matches!(err, PdfError::NotPdf(_)), "{err}");
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 
     /// End to end against the real Poppler: a page whose
