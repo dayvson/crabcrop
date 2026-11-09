@@ -8605,7 +8605,7 @@ async fn disk_task_panic_degrades_and_counts_the_error() {
 /// disk holds a read, until the test lets them go or drops
 /// the gate (issues #543, #545). The test used to hold a
 /// read on a FIFO swapped in for an entry's file; the store
-/// no longer opens one.
+/// now refuses one.
 ///
 /// Each held read sends the instant it was held. A hold also
 /// ends on its own after [`DiskReadGate::BACKSTOP`], so a
