@@ -136,9 +136,12 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # Safe process-group signalling for the video encoder's
 # timeout kill (issue #194, audit R2-31): the crate forbids
 # unsafe code, so the kill goes through rustix rather than
-# a raw libc call.
+# a raw libc call. `fs` is for the disk tier's entry open
+# (issue #545), which must not wait on a FIFO at an entry
+# path, and for the tests that open such a FIFO's write end
+# without blocking. It adds no crate.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 
 [dev-dependencies]
 # Property tests (issue #478): tests/proptest_url.rs and
@@ -148,13 +151,6 @@ rustix = { version = "1", features = ["process"] }
 # PROPTEST_* environment overrides. A test-only dependency:
 # it never enters a normal build.
 proptest = { version = "1.12", default-features = false, features = ["std"] }
-
-# The disk-read test opens its FIFO's write end without blocking
-# (issue #543): with no reader the open fails at once instead of
-# parking a thread the test could never join. Test-only: the `fs`
-# feature never enters a normal build.
-[target.'cfg(unix)'.dev-dependencies]
-rustix = { version = "1", features = ["fs"] }
 
 [features]
 # AVIF source decoding, through the image crate's avif-native
