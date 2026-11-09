@@ -8,7 +8,7 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` are clean
+- [ ] `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` are clean
 - [ ] Tests pass (`cargo test`, and `scripts/test_all.sh` if the change spans languages)
 - [ ] Added or updated tests for the change
 - [ ] Updated the README or other docs if behavior changed

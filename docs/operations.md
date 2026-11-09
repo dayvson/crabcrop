@@ -1,6 +1,8 @@
 # Operations
 
-Operations run in the order they appear in the path. Requested outputs are capped at 16383 px per axis and 100 megapixels in total; a request past either bound fails with `400` before anything is allocated.
+Operations run in the order they appear in the path. Requested outputs are capped at 16383 px per axis and 100 megapixels in total, and so is every size a step works out along the way (a proportional side, a `fit-in` scale, a `dpr` factor): `16383x1/0x2` asks for 32766x2. A request past either bound fails with `400` before anything is allocated. The image the server encodes is held to the same cap, so a source with a 16384 px side needs a step that brings it within; see [Output size](url-grammar.md#output-size).
+
+A factor from the `DPR` client hint is the exception: it steps down to the largest factor whose sizes fit, instead of failing (see [Client hints](filters.md#client-hints)).
 
 ### Resize
 
@@ -77,7 +79,7 @@ Crops the image to the width:height aspect ratio, then resizes to exactly that w
 curl "http://localhost:3000/unsafe/crop:1200x630:top/https://example.com/photo.jpg"
 ```
 
-The objects form names one or more detection classes (the class filters' vocabulary, matched case-insensitively, duplicates folded), up to 32 distinct classes. A repeat counts once, and a list that names a 33rd distinct class is a `400 invalid_crop`, never a crop to the first 32:
+The objects form names one or more detection classes (the class filters' vocabulary, matched ASCII case-insensitively, duplicates folded: `Person` repeats `person`, but `É` and `é` are two classes), up to 32 distinct classes. A repeat counts once, and a list that names a 33rd distinct class is a `400 invalid_crop`, never a crop to the first 32:
 
 ```text
 crop:800x800:objects(dog)

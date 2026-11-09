@@ -39,9 +39,31 @@ async fn spawn_watermark_server() -> String {
     spawn_bytes_server(png).await.replace("src.png", "wm.png")
 }
 
+/// Answer one HTTP/1.1 request the way a real origin does:
+/// read the request head, write the response, then close the
+/// write side. Writing and dropping the socket with the
+/// request still unread makes the kernel answer with a reset
+/// instead of a clean close, and on macOS that reset can reach
+/// the client before it has read the whole response ("error
+/// decoding response body", "error sending request").
+async fn reply_and_close(socket: &mut tokio::net::TcpStream, head: &[u8], body: &[u8]) {
+    let mut buf = [0u8; 1024];
+    let mut seen = Vec::new();
+    while !seen.windows(4).any(|w| w == b"\r\n\r\n") && seen.len() < 64 * 1024 {
+        match socket.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+    }
+    let _ = socket.write_all(head).await;
+    let _ = socket.write_all(body).await;
+    let _ = socket.shutdown().await;
+}
+
 async fn spawn_bytes_server(png: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let png = Arc::new(png);
     tokio::spawn(async move {
         // Serves every connection: cache-bypassing requests
         // (meta mode) fetch the source more than once.
@@ -49,12 +71,14 @@ async fn spawn_bytes_server(png: Vec<u8>) -> String {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                png.len()
-            );
-            let _ = socket.write_all(head.as_bytes()).await;
-            let _ = socket.write_all(&png).await;
+            let png = png.clone();
+            tokio::spawn(async move {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                );
+                reply_and_close(&mut socket, head.as_bytes(), &png).await;
+            });
         }
     });
     format!("http://{addr}/src.png")
@@ -186,6 +210,7 @@ async fn spawn_app_with_metrics(allow_unsafe: bool, metrics_token: Option<String
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -328,6 +353,7 @@ async fn spawn_app_with_anim_gate(anim_gate: Arc<tokio::sync::Semaphore>) -> Str
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -389,6 +415,7 @@ async fn spawn_app_with_ai_gate(ai_gate: Arc<tokio::sync::Semaphore>) -> String 
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -450,6 +477,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -466,12 +494,7 @@ async fn spawn_app_with_meta_enabled(meta_enabled: bool) -> String {
 /// canned behavior, so the whole video path runs without
 /// a real encoder.
 async fn spawn_app_with_video(script: &str) -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-video-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-video");
     let path = dir.join("encoder.sh");
     crate::test_support::write_script(&path, script);
     let encoder =
@@ -526,12 +549,16 @@ async fn spawn_app_with_video(script: &str) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        // The scripts last as long as the server: the
+        // test's runtime drops this task when it ends.
+        let _scripts = dir;
         axum::serve(listener, app(state)).await.unwrap();
     });
     format!("http://{addr}")
@@ -545,12 +572,7 @@ async fn spawn_app_with_video(script: &str) -> String {
 /// and its extraction answers with the test PNG, so the
 /// whole frame path runs without a real decoder.
 async fn spawn_app_with_frame_decoder(report: &str) -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-frames-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-frames");
     std::fs::write(dir.join("frame.png"), test_png()).unwrap();
     let frame_path = dir.join("frame.png").display().to_string();
     let script = format!(
@@ -609,12 +631,16 @@ async fn spawn_app_with_frame_decoder(report: &str) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        // The scripts last as long as the server: the
+        // test's runtime drops this task when it ends.
+        let _scripts = dir;
         axum::serve(listener, app(state)).await.unwrap();
     });
     format!("http://{addr}")
@@ -684,7 +710,8 @@ async fn missing_sources_answer_404_and_transport_failures_502() {
     // A symlink out of the root: the canonicalized path
     // escapes, and the answer must be indistinguishable
     // from the missing file above.
-    let outside = std::env::temp_dir().join(format!("crabcrop-srv-outside-{}", std::process::id()));
+    let outside_dir = crate::test_support::scratch_dir("srv-outside");
+    let outside = outside_dir.join("secret.jpg");
     std::fs::write(&outside, b"secret").unwrap();
     std::os::unix::fs::symlink(&outside, dir.join("link.jpg")).unwrap();
     let remainder = "50x30/file:///link.jpg";
@@ -820,12 +847,7 @@ async fn explain_labels_a_video_source() {
 /// the bytes is a password refusal, CORRUPT is
 /// unreadable.
 async fn spawn_app_with_pdf_renderer() -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-pages-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-pages");
     std::fs::write(dir.join("page.png"), test_png()).unwrap();
     let page_path = dir.join("page.png").display().to_string();
     let write_tool = |name: &str, script: String| {
@@ -892,12 +914,16 @@ async fn spawn_app_with_pdf_renderer() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        // The scripts last as long as the server: the
+        // test's runtime drops this task when it ends.
+        let _scripts = dir;
         axum::serve(listener, app(state)).await.unwrap();
     });
     format!("http://{addr}")
@@ -1247,6 +1273,7 @@ async fn spawn_app_with_defaults(defaults: &str, only_presets: bool) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -1314,6 +1341,7 @@ async fn spawn_app_rotating() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -1385,6 +1413,7 @@ async fn spawn_app_with_fallback() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -3064,6 +3093,7 @@ async fn spawn_app_with_presets_and_roots(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -3177,8 +3207,8 @@ async fn generated_corpus_error_codes_match_the_http_envelope() {
 /// `spec/explain-verdicts.json` and the generated
 /// combinations in `spec/operation-vectors.json`. Every
 /// surface that reads a remainder (the Rust parser, the
-/// TypeScript explainer, the playground's copy) runs the
-/// same files in its own suite; a disagreement anywhere
+/// TypeScript explainer, the playground's build of it) runs
+/// the same files in its own suite; a disagreement anywhere
 /// fails the gate here or there, and the mismatch list is
 /// printed whole so one run shows every divergence.
 /// These tests were put here rather than in url.rs while
@@ -3928,7 +3958,6 @@ async fn explain_reports_the_root_name_and_never_the_base() {
 /// how cache behavior becomes observable from outside.
 async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncWriteExt;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
@@ -3946,8 +3975,7 @@ async fn spawn_counting_image_server() -> (String, Arc<std::sync::atomic::Atomic
                     "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(&body).await;
+                reply_and_close(&mut socket, head.as_bytes(), &body).await;
             });
         }
     });
@@ -4301,6 +4329,7 @@ async fn spawn_app_with_tagger(tagger: Arc<dyn crate::ai::TagProvider>) -> Strin
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -4481,6 +4510,7 @@ async fn spawn_app_with_moderation(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -4813,6 +4843,7 @@ async fn spawn_app_with_ocr_timeout(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -5234,6 +5265,7 @@ async fn spawn_app_with_embeddings(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -5978,6 +6010,7 @@ async fn spawn_app_with_ai_and_meta() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6041,6 +6074,7 @@ async fn spawn_app_with_studio() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6104,6 +6138,7 @@ async fn spawn_app_with_inpaint() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6199,6 +6234,7 @@ async fn spawn_app_with_segment() -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6690,6 +6726,7 @@ async fn spawn_app_with_providers(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -6767,6 +6804,7 @@ async fn spawn_app_full(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -7738,8 +7776,7 @@ async fn cache_status_reports_miss_then_memory_hit() {
 
 #[tokio::test]
 async fn cache_status_reports_a_disk_hit_with_its_tier() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-tier-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-tier");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     // Memory tier disabled: the repeat must come from disk.
     let base = spawn_app_full(preset_test_map(), Some(&dir), 0).await;
@@ -7878,8 +7915,7 @@ async fn purge_group_refuses_transplanted_purge_signatures() {
 
 #[tokio::test]
 async fn group_purge_reaches_the_disk_tier() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-gdisk-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-gdisk");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let base = spawn_app_full(preset_test_map(), Some(&dir), 0).await;
     let remainder = format!("preset:small/{src}");
@@ -8261,6 +8297,7 @@ async fn spawn_app_with_storage(dir: &std::path::Path) -> String {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -8346,6 +8383,7 @@ fn tier_test_state(dir: Option<&std::path::Path>, endpoint: &str) -> AppState {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     }
@@ -8415,8 +8453,7 @@ async fn shared_learns_group(shared: &crate::s3store::S3Store, key: &str, group:
 #[tokio::test]
 async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-drop3-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-drop3");
     let state = tier_test_state(Some(&dir), &fake.endpoint);
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
@@ -8438,8 +8475,7 @@ async fn dropped_lookup_still_propagates_a_disk_hit_group_merge() {
 #[tokio::test]
 async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-drop4-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-drop4");
     let state = tier_test_state(Some(&dir), &fake.endpoint);
     let shared = state.shared_store.clone().unwrap();
     let key = "40x24/example.com/i.png";
@@ -8455,8 +8491,7 @@ async fn dropped_lookup_still_propagates_a_memory_hit_group_merge() {
 
 #[tokio::test]
 async fn disk_task_panic_degrades_and_counts_the_error() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-panic-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-panic");
     let store = std::sync::Arc::new(
         crate::storage::DiskStore::open(
             &dir,
@@ -8483,8 +8518,7 @@ async fn disk_task_panic_degrades_and_counts_the_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn blocked_disk_read_leaves_health_responsive() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-fifo-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-fifo");
     let (src, _hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let base = spawn_app_with_storage(&dir).await;
     let remainder = format!("25x25/{src}");
@@ -8545,8 +8579,7 @@ async fn blocked_disk_read_leaves_health_responsive() {
 
 #[tokio::test]
 async fn disk_results_survive_a_fresh_instance_and_purge_invalidates() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-store-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-store");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let remainder = format!("25x25/{src}");
     let sig = sign(&remainder);
@@ -8973,8 +9006,7 @@ async fn rotation_window_verifies_both_keys_and_routes_by_key_id() {
 #[tokio::test]
 async fn shared_results_serve_a_second_replica_and_promote_to_disk() {
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-shared-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-shared");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let remainder = format!("25x25/{src}");
     let sig = sign(&remainder);
@@ -9058,8 +9090,7 @@ async fn a_purge_reaches_the_shared_stores_but_not_another_process_memory() {
     // resurrect it; it does not reach into another
     // process's memory, whose copy keeps serving.
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-p351-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-p351");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let remainder = format!("25x25/{src}");
     let sig = sign(&remainder);
@@ -9471,6 +9502,7 @@ async fn spawn_app_with_provenance_signer(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: Some(signer),
         config_fingerprint: "test".to_string(),
     };
@@ -9600,6 +9632,7 @@ async fn processing_gate_bounds_concurrency() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -9667,11 +9700,7 @@ async fn timed_out_encode_releases_the_process_gate() {
     // get a genuine encode attempt on the freed gate
     // instead of the gate-held 503 (Busy) the soak's
     // follow-up requests got.
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-server-stuck-encode-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-stuck-encode");
     let script_path = dir.join("encoder.sh");
     crate::test_support::write_script(
         &script_path,
@@ -9732,6 +9761,7 @@ async fn timed_out_encode_releases_the_process_gate() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -9991,10 +10021,7 @@ async fn video_and_animation_permits_are_held_until_the_job_finishes() {
     // its deadline leaves them held while the detached
     // encode drains instead of freeing them for a
     // second encode to stack onto.
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-server-held-permits-{}",
-        std::process::id()
-    ));
+    let dir = crate::test_support::scratch_dir("server-held-permits");
     let encoder = fake_long_encoder(&dir, 9);
     let state = lane_test_state(std::time::Duration::from_millis(300), 2, 1);
     let job = lane_test_job(
@@ -10064,15 +10091,13 @@ async fn repeated_timeouts_never_stack_jobs_beyond_the_lane() {
     // budget, still has budget left when the lane
     // drains at 6 s, so it enters its own encode
     // instead of aborting at its first checkpoint.
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-lane-bound-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_support::scratch_dir("server-lane-bound");
     let log_path = dir.join("runs.log");
     let script_path = dir.join("encoder.sh");
     crate::test_support::write_script(
         &script_path,
         &format!(
-            "#!/bin/sh\ncat > /dev/null\necho S >> {}\nsleep 6\necho E >> {}\nprintf 'x'\n",
+            "#!/bin/sh\ncat > /dev/null\necho S >> '{}'\nsleep 6\necho E >> '{}'\nprintf 'x'\n",
             log_path.display(),
             log_path.display()
         ),
@@ -10472,6 +10497,7 @@ fn lane_test_state(
         slow_gate: Arc::new(Gate::new(slow_permits)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     }
@@ -10590,8 +10616,7 @@ async fn slow_lane_saturation_leaves_stills_at_full_capacity() {
     // promptly on the untouched stills lane, where
     // before this issue the encode's process permit
     // was one of the stills pool's own.
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-server-slow-lane-{}", std::process::id()));
+    let dir = crate::test_support::scratch_dir("server-slow-lane");
     let encoder = fake_long_encoder(&dir, 9);
     let state = lane_test_state(std::time::Duration::from_millis(300), 2, 1);
     let stuck_job = lane_test_job(
@@ -10757,6 +10782,7 @@ async fn spawn_app_with_lane_gates(process_gate: Arc<Gate>, slow_gate: Arc<Gate>
         slow_gate,
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -10912,6 +10938,7 @@ async fn watermark_decode_waits_for_the_process_gate() {
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -11351,6 +11378,265 @@ async fn dpr_header_scales_and_caches_separately() {
     assert_eq!(dims(&bogus), (20, 20));
 }
 
+/// The status and, on a 200, the decoded dimensions of `resp`.
+async fn status_and_dims(resp: reqwest::Response) -> (StatusCode, Option<(u32, u32)>) {
+    let status = resp.status();
+    let bytes = resp.bytes().await.unwrap();
+    let dims = (status == StatusCode::OK).then(|| {
+        let img = image::load_from_memory(&bytes).unwrap();
+        (img.width(), img.height())
+    });
+    (status, dims)
+}
+
+/// A DPR hint is advisory (issue #529): when the hint alone
+/// pushes a size past the per-axis limit or the pixel budget,
+/// the request answers 200 at the largest factor that fits,
+/// where it used to answer 400 on high-density screens only.
+#[tokio::test]
+async fn a_dpr_hint_past_the_limits_steps_down() {
+    let src = spawn_image_server().await;
+    let wide = spawn_bytes_server(png_of(16383, 1)).await;
+    let base = spawn_app(false).await;
+    for (ops, source, hint, dims) in [
+        // 18000x3 at 3 is past the per-axis limit; 2 fits.
+        ("6000x1", &src, ("DPR", "3"), (12000, 2)),
+        // 16384x2 at 2 is past it; 1.5 fits.
+        ("8192x1", &src, ("Sec-CH-DPR", "2"), (12288, 2)),
+        // 32766x2 at 2 and at 1.5; 1 keeps the source size.
+        ("0x1", &wide, ("DPR", "2"), (16383, 1)),
+        // The budget: a 12000x12000 canvas at 1.5 is 144
+        // million pixels, past the 100 million budget; at 1
+        // the 8000x8000 canvas fits, and the crop-rect after
+        // it keeps the response small.
+        (
+            "pad:8000x8000/crop-rect:0x0:8000x1/filters:no_upscale:format(png)",
+            &src,
+            ("DPR", "1.5"),
+            (8000, 1),
+        ),
+    ] {
+        let remainder = format!("{ops}/{source}");
+        let resp = get_with_headers(&base, &remainder, &[hint]).await;
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some(dims)),
+            "{ops} with {hint:?}"
+        );
+    }
+    // A stepped factor never serves a side past the limit. At
+    // 2, `8192x1` on a 16384x2 source asks for the source's own
+    // size, which no step refuses: served, it was one past the
+    // limit, and a WebP negotiated from Accept failed to encode
+    // it with a 500. The factor steps to 1.5 in every format.
+    let ceiling = spawn_bytes_server(png_of(16384, 2)).await;
+    let remainder = format!("8192x1/{ceiling}");
+    for (accept, format) in [("image/png", "image/png"), ("image/webp,*/*", "image/webp")] {
+        let resp = get_with_headers(&base, &remainder, &[("DPR", "3"), ("Accept", accept)]).await;
+        assert_eq!(header(&resp, "content-type"), format);
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some((12288, 2))),
+            "{accept}"
+        );
+    }
+}
+
+/// A stepped-down render keeps the cache entry of the hint
+/// that asked for it (issue #529): repeats of that hint hit
+/// it, and neither the hint-less URL nor another factor is
+/// ever answered from it. The response varies on both DPR
+/// headers.
+#[tokio::test]
+async fn a_stepped_down_hint_render_keys_under_its_hint() {
+    let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
+    let base = spawn_app(false).await;
+    let remainder = format!("6000x1/{src}");
+    let resp = get_with_headers(&base, &remainder, &[("DPR", "3")]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    let vary = header(&resp, "vary");
+    assert!(
+        vary.split(", ").any(|h| h == "DPR") && vary.split(", ").any(|h| h == "Sec-CH-DPR"),
+        "{vary}"
+    );
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((12000, 2)))
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // The same factor from either header is the same entry.
+    for hints in [&[("DPR", "3")][..], &[("Sec-CH-DPR", "3")][..]] {
+        let resp = get_with_headers(&base, &remainder, hints).await;
+        assert_eq!(header(&resp, "cache-status"), "crabcrop; hit", "{hints:?}");
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some((12000, 2)))
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // The hint-less URL renders 6000x1 under its own key.
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((6000, 1)))
+    );
+    // A hint of 2 renders the same size, under its own key.
+    let resp = get_with_headers(&base, &remainder, &[("DPR", "2")]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((12000, 2)))
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    // And the hint-less entry still answers 6000x1.
+    let resp = get_with_headers(&base, &remainder, &[]).await;
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; hit");
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((6000, 1)))
+    );
+}
+
+/// Only the hint is advisory (issue #529): `dpr(...)` in the
+/// URL or in the operator's default operations is the
+/// request's own factor and keeps its 400, and a URL past the
+/// limit at factor 1 keeps its 400 under any hint.
+#[tokio::test]
+async fn an_explicit_dpr_past_the_limit_still_answers_400() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(false).await;
+    let refused =
+        |size: &str| format!("requested output {size} exceeds the 16383 pixel limit per axis");
+    let expect_400 = |resp: reqwest::Response, size: &'static str| {
+        let message = refused(size);
+        async move {
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(resp.text().await.unwrap(), message);
+        }
+    };
+    let remainder = format!("6000x1/filters:dpr(3)/{src}");
+    for hints in [&[][..], &[("DPR", "3")][..], &[("Sec-CH-DPR", "1")][..]] {
+        expect_400(get_with_headers(&base, &remainder, hints).await, "18000x3").await;
+    }
+    let remainder = format!("16383x1/0x2/{src}");
+    expect_400(
+        get_with_headers(&base, &remainder, &[("DPR", "3")]).await,
+        "32766x2",
+    )
+    .await;
+    // A default `dpr(3)` is the operator's explicit factor.
+    let base = spawn_app_with_defaults("filters:dpr(3)", false).await;
+    let remainder = format!("6000x1/{src}");
+    expect_400(
+        get_with_headers(&base, &remainder, &[("DPR", "2")]).await,
+        "18000x3",
+    )
+    .await;
+}
+
+/// Hostile DPR headers (issue #529): a value outside the
+/// factor set, or not a number at all, is no hint and the URL
+/// renders as written; a value in the set that the limits
+/// refuse steps down. Every one answers 200.
+#[tokio::test]
+async fn hostile_dpr_hints_render_or_step_down() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(false).await;
+    let remainder = format!("6000x1/{src}");
+    for (value, dims) in [
+        ("NaN", (6000, 1)),
+        ("inf", (6000, 1)),
+        ("-3", (6000, 1)),
+        ("0", (6000, 1)),
+        ("1e30", (6000, 1)),
+        ("2.5", (6000, 1)),
+        ("3,2", (6000, 1)),
+        ("", (6000, 1)),
+        ("3e0", (12000, 2)),
+        (" 3 ", (12000, 2)),
+    ] {
+        let resp = get_with_headers(&base, &remainder, &[("DPR", value)]).await;
+        assert_eq!(
+            status_and_dims(resp).await,
+            (StatusCode::OK, Some(dims)),
+            "DPR: {value:?}"
+        );
+    }
+    let resp = client()
+        .get(format!("{base}/{}/{remainder}", sign(&remainder)))
+        .header(
+            "Sec-CH-DPR",
+            reqwest::header::HeaderValue::from_bytes(b"3\xff").unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((6000, 1)))
+    );
+}
+
+/// `/explain` reads the DPR hint as the image path does and
+/// forecasts the factor the image request applies (issue
+/// #529), stepped down like the render.
+#[tokio::test]
+async fn explain_forecasts_the_stepped_down_hint() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(true).await;
+    let explain = |ops: &'static str, hint: Option<&'static str>| {
+        let (base, src) = (base.clone(), src.clone());
+        async move {
+            let mut req = client()
+                .get(format!("{base}/explain/unsafe/{ops}/{src}"))
+                .header("accept", "application/json");
+            if let Some(hint) = hint {
+                req = req.header("DPR", hint);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{ops}");
+            let report: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            report["forecast"].clone()
+        }
+    };
+    let forecast = explain("6000x1", Some("3")).await;
+    assert_eq!(forecast["width"], 12000);
+    assert_eq!(forecast["height"], 2);
+    assert_eq!(forecast["over_dimension"], false);
+    assert_eq!(forecast["dpr"], 2.0);
+    assert_eq!(forecast["dpr_from"], "hint");
+    assert_eq!(forecast["dpr_hint"], 3.0);
+    // The image request agrees.
+    let resp = client()
+        .get(format!("{base}/unsafe/6000x1/{src}"))
+        .header("DPR", "3")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status_and_dims(resp).await,
+        (StatusCode::OK, Some((12000, 2)))
+    );
+    // Without the hint, factor 1.
+    let forecast = explain("6000x1", None).await;
+    assert_eq!(forecast["width"], 6000);
+    assert_eq!(forecast["height"], 1);
+    assert_eq!(forecast["dpr"], 1.0);
+    assert_eq!(forecast["dpr_from"], "none");
+    assert!(forecast["dpr_hint"].is_null());
+    // An explicit factor does not step: the forecast flags
+    // the refusal the image request answers.
+    let forecast = explain("6000x1/filters:dpr(3)", Some("2")).await;
+    assert_eq!(forecast["over_dimension"], true);
+    assert_eq!(forecast["width"], 18000);
+    assert_eq!(forecast["height"], 3);
+    assert_eq!(forecast["dpr"], 3.0);
+    assert_eq!(forecast["dpr_from"], "operation");
+    assert_eq!(forecast["dpr_hint"], 2.0);
+}
+
 #[tokio::test]
 async fn text_without_a_font_is_501() {
     let src = spawn_image_server().await;
@@ -11600,6 +11886,7 @@ async fn spawn_app_with_upload_gate(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -11611,11 +11898,8 @@ async fn spawn_app_with_upload_gate(
     format!("http://{addr}")
 }
 
-fn upload_dir(tag: &str) -> std::path::PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("crabcrop-srv-upload-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+fn upload_dir(tag: &str) -> crate::test_support::ScratchDir {
+    crate::test_support::scratch_dir(&format!("srv-upload-{tag}"))
 }
 
 #[tokio::test]
@@ -12593,8 +12877,7 @@ async fn group_membership_learned_on_a_hit_survives_a_restart() {
     // purge after a restart still finds the entry.
     // Before the fix the union lived only in the first
     // instance's memory and the purge below removed 0.
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-gprop-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-gprop");
     let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
     let base = spawn_app_full(preset_test_map(), Some(&dir), 16 * 1024 * 1024).await;
     // The plain spelling stores the entry group-free
@@ -12646,8 +12929,7 @@ async fn purge_during_a_render_keeps_the_entry_out_of_every_tier() {
     // so the finished render cannot restore the entry
     // to any tier.
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-pdr-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-pdr");
     let (src, hits) = spawn_slow_counting_server(test_png(), 1200).await;
     let base = spawn_app_with_shared(Some(&dir), &fake.endpoint).await;
     let remainder = format!("25x25/{src}");
@@ -12710,8 +12992,7 @@ async fn group_purge_during_a_render_keeps_the_entry_out() {
     // Issue #350, the group form: a group purge that
     // lands while a grouped render is in flight keeps
     // the finished render out of the tiers.
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-gpdr-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-gpdr");
     let (src, hits) = spawn_slow_counting_server(test_png(), 1200).await;
     let base = spawn_app_full(preset_test_map(), Some(&dir), 16 * 1024 * 1024).await;
     let preset = format!("preset:small/{src}");
@@ -12767,7 +13048,7 @@ async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 /// its walk reaches the entry.
 struct WalkFixture {
     fake: crate::s3store::test_support::FakeS3,
-    dir: std::path::PathBuf,
+    dir: crate::test_support::ScratchDir,
     hits: Arc<AtomicUsize>,
     probe: AppState,
     server: tokio::task::JoinHandle<()>,
@@ -12781,8 +13062,7 @@ struct WalkFixture {
 impl WalkFixture {
     async fn new(name: &str) -> Self {
         let fake = crate::s3store::test_support::start_fake().await;
-        let dir = std::env::temp_dir().join(format!("crabcrop-srv-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_support::scratch_dir(&format!("srv-{name}"));
         let (src, hits) = spawn_counting_server(200, "image/png", test_png()).await;
         let mut state = tier_test_state(Some(&dir), &fake.endpoint);
         state.presets = preset_test_map();
@@ -12928,12 +13208,6 @@ impl WalkFixture {
     }
 }
 
-impl Drop for WalkFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
 #[tokio::test]
 async fn lookups_during_a_background_purge_walk_do_not_resurrect_the_entry() {
     // Issue #400: a shared purge walk that outgrows the
@@ -13012,8 +13286,7 @@ async fn copies_a_running_purge_covers_miss_in_every_persistent_tier() {
     // still serve, and once the purge ends a fresh copy
     // serves again.
     let fake = crate::s3store::test_support::start_fake().await;
-    let dir = std::env::temp_dir().join(format!("crabcrop-srv-active-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::scratch_dir("srv-active");
     let state = tier_test_state(Some(&dir), &fake.endpoint);
     let store = state.store.clone().unwrap();
     let shared = state.shared_store.clone().unwrap();
@@ -13185,8 +13458,7 @@ async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
     // A replica that boots after the purge, with a disk of
     // its own that kept a pre-purge copy, misses on both.
     fx.restore_stale_bucket_copy().await;
-    let other_dir = fx.dir.with_extension("other");
-    let _ = std::fs::remove_dir_all(&other_dir);
+    let other_dir = crate::test_support::scratch_dir("srv-walk-other");
     let booted = fx.other_replica(Some(&other_dir));
     let booted_disk = booted.store.clone().unwrap();
     booted_disk.put(&fx.key, &fx.stale);
@@ -13194,7 +13466,6 @@ async fn a_restart_mid_walk_cannot_undo_the_purge_on_any_replica() {
     assert!(lookup_tiers(&booted, &fx.key, &[]).await.is_none());
     assert!(booted_disk.get(&fx.key).is_none(), "the disk copy survived");
     assert!(!fx.bucket_holds_stale(), "the bucket copy survived");
-    let _ = std::fs::remove_dir_all(&other_dir);
     // The restarted receiving server, over the same disk
     // and bucket with fresh memory, misses on the purged
     // URL and renders it again from the origin.
@@ -13249,6 +13520,533 @@ async fn a_replica_does_not_write_back_a_copy_older_than_a_purge_it_learned() {
         "the pre-purge copy was written back"
     );
     drop(active);
+}
+
+/// A served app over a shared tier alone for the purge
+/// walk pacing tests (issue #462), its bucket filled to
+/// `objects` objects that are not cache entries: the first
+/// [`SHARED_PURGE_INLINE_SCAN`], named `0-head-NNNN`, list
+/// ahead of every entry object, so a purge's inline scan
+/// reads exactly those; the rest, named `z-tail-NNNN`, list
+/// after every entry object and are left to the background
+/// walk, which a test parks on them with the fake's
+/// `hold_prefix`.
+async fn spawn_walk_app(
+    fake: &crate::s3store::test_support::FakeS3,
+    objects: usize,
+) -> (String, AppState) {
+    let state = tier_test_state(None, &fake.endpoint);
+    let probe = state.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app(state)).await.unwrap();
+    });
+    let mut bucket = fake.objects.lock().unwrap();
+    let before = bucket.len();
+    for i in 0..objects {
+        let name = if i < SHARED_PURGE_INLINE_SCAN {
+            format!("0-head-{i:04}")
+        } else {
+            format!("z-tail-{i:04}")
+        };
+        bucket.insert(name, b"not a cache entry".to_vec());
+    }
+    assert_eq!(bucket.len(), before + objects);
+    drop(bucket);
+    (base, probe)
+}
+
+/// Send a signed group purge and return its body.
+async fn purge_group_call(base: &str, group: &str) -> String {
+    let sig = crate::url::purge_group_signature(SECRET, group);
+    let resp = client()
+        .post(format!("{base}/purge-group/{sig}/{group}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.text().await.unwrap()
+}
+
+/// Wait until every purge `state` started has ended, its
+/// walks and re-lists included, or fail. Walks over a few
+/// thousand objects can take seconds on a loaded machine,
+/// so the limit is generous.
+async fn wait_for_purges_to_end(state: &AppState) {
+    for _ in 0..3000 {
+        if state.purge_guard.active_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the purges never ended");
+}
+
+/// The purge tombstones in the fake bucket, parsed.
+fn bucket_tombstones(fake: &crate::s3store::test_support::FakeS3) -> Vec<crate::cache::Tombstone> {
+    let mut tombstones: Vec<crate::cache::Tombstone> = fake
+        .objects
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name.starts_with("purges/"))
+        .map(|(_, data)| {
+            crate::storage::parse_tombstone(data, &crate::url::entry_key(b"disk-key-test")).unwrap()
+        })
+        .collect();
+    tombstones.sort_by_key(|tombstone| tombstone.cutoff.start_ms);
+    tombstones
+}
+
+#[tokio::test]
+async fn identical_group_purges_share_one_walk_and_one_relist() {
+    // Issue #462: five purge-group calls in a row on a
+    // 1,000-object bucket each listed the bucket and walked
+    // it, all five walks at once. Now the four that arrive
+    // while the first one's walk runs join it, and one
+    // re-list after it serves all four. That re-list is
+    // still needed with tombstones (#461): a copy rendered
+    // between the first and the last call is newer than the
+    // first purge, so the first walk spares it, and the
+    // later purges' tombstones hide it only until they
+    // expire; it has to leave the bucket.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    const OBJECTS: usize = 1000;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, OBJECTS - 1).await;
+    let shared = probe.shared_store.clone().unwrap();
+    // One member of `small` from before every purge.
+    let stale_key = "40x24/example.com/stale.png#cfgtest";
+    let groups = vec!["small".to_string()];
+    let member = CachedImage {
+        groups: groups.clone(),
+        ..tier_test_entry()
+    };
+    shared.put(stale_key, &member).await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    wait_until("the first walk parks", || {
+        fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    assert_eq!(fake.walk.lists_of(""), 1);
+    // Another replica writes back a render that began after
+    // the first purge: the first walk has already listed the
+    // bucket, and would spare the copy anyway.
+    let fresh_key = "40x24/example.com/fresh.png#cfgtest";
+    let fresh = CachedImage {
+        written: Some(probe.purge_guard.stamp()),
+        ..member.clone()
+    };
+    shared.put(fresh_key, &fresh).await;
+    // Four more identical purges join the parked walk: none
+    // of them lists the bucket or reads a header.
+    let reads = fake.ranged_gets.load(Ordering::SeqCst);
+    for _ in 0..4 {
+        assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    }
+    assert_eq!(fake.walk.lists_of(""), 1);
+    assert_eq!(fake.ranged_gets.load(Ordering::SeqCst), reads);
+    assert_eq!(probe.purge_guard.active_count(), 5);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    // One walk and one re-list: each object's header read
+    // once per pass, where five walks read it five times.
+    assert_eq!(fake.walk.lists_of(""), 2);
+    assert_eq!(fake.ranged_gets.load(Ordering::SeqCst), 2 * OBJECTS);
+    assert!(shared.get(stale_key).await.is_none());
+    // The copy written between the first and the last call
+    // is gone from the bucket, where nothing else would have
+    // removed it: once the grace has passed, no tombstone
+    // covers it any more.
+    assert!(shared.get(fresh_key).await.is_none());
+    let past_grace = crate::cache::now_ms() + crate::cache::TOMBSTONE_GRACE_MS + 1;
+    assert!(
+        !probe
+            .purge_guard
+            .running_covers_at(past_grace, fresh_key, &groups, fresh.written)
+    );
+    // Every purge's bucket tombstone was marked ended.
+    let tombstones = bucket_tombstones(&fake);
+    assert_eq!(tombstones.len(), 5);
+    assert!(tombstones.iter().all(|t| t.ended_ms.is_some()));
+}
+
+#[tokio::test]
+async fn background_purge_walks_take_turns_two_at_a_time() {
+    // Issue #462: every purge that outgrew its inline scan
+    // walked the rest of the bucket on its own unbounded
+    // task, so N different purges ran N walks at once. Now
+    // background walks wait for one of PURGE_WALKS_AT_ONCE
+    // turns: with every walk's reads parked, exactly two
+    // walks' worth arrive, and the other three walks wait.
+    use crate::s3store::{PURGE_READS_AT_ONCE, PURGE_WALKS_AT_ONCE};
+    const OBJECTS: usize = SHARED_PURGE_INLINE_SCAN + 100;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, OBJECTS).await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    let calls: Vec<_> = (0..5)
+        .map(|i| {
+            let base = base.clone();
+            tokio::spawn(async move { purge_group_call(&base, &format!("g{i}")).await })
+        })
+        .collect();
+    for call in calls {
+        assert_eq!(call.await.unwrap(), "purged 0\n");
+    }
+    let parked = PURGE_WALKS_AT_ONCE * PURGE_READS_AT_ONCE;
+    wait_until("two walks park", || {
+        fake.walk.held.load(Ordering::SeqCst) >= parked
+    })
+    .await;
+    // The other walks wait for a turn: no read of theirs
+    // arrives while the first two are parked.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(fake.walk.held.load(Ordering::SeqCst), parked);
+    assert_eq!(probe.purge_guard.active_count(), 5);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    assert_eq!(fake.walk.held_peak.load(Ordering::SeqCst), parked);
+    // Each purge still listed and walked the whole bucket.
+    assert_eq!(fake.walk.lists_of(""), 5);
+    assert_eq!(fake.ranged_gets.load(Ordering::SeqCst), 5 * OBJECTS);
+}
+
+#[tokio::test]
+async fn an_identical_url_purge_joins_the_walk_and_purges_its_variants_inline() {
+    // Issue #462: a per-URL purge whose target is already
+    // being walked joins that walk, but the current epoch's
+    // variants are reached by name, five reads, so it still
+    // deletes them itself: a copy re-rendered after the
+    // first purge is gone from the bucket when the second
+    // purge answers, while the first walk is still parked.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    let fx = WalkFixture::new("walk-join-url").await;
+    {
+        let mut objects = fx.fake.objects.lock().unwrap();
+        for i in 0..64 {
+            objects.insert(format!("z-tail-{i:04}"), b"not a cache entry".to_vec());
+        }
+    }
+    *fx.fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    let path = fx.url.strip_prefix(&fx.base).unwrap();
+    let (_, remainder) = path[1..].split_once('/').unwrap();
+    let purge_url = format!(
+        "{}/purge/{}/{remainder}",
+        fx.base,
+        crate::url::purge_signature(SECRET, remainder)
+    );
+    let resp = client().post(&purge_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    wait_until("the first walk parks", || {
+        fx.fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    assert!(!fx.bucket_holds_stale());
+    // A render after the first purge began writes its copy
+    // through to the bucket.
+    let resp = client().get(&fx.url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "cache-status"), "crabcrop; fwd=uri-miss");
+    wait_until("the re-render lands in the bucket", || {
+        fx.fake.objects.lock().unwrap().contains_key(&fx.object)
+    })
+    .await;
+    let lists = fx.fake.walk.lists_of("");
+    let resp = client().post(&purge_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Memory, disk, and the bucket copy, by name...
+    assert_eq!(resp.text().await.unwrap(), "purged 3\n");
+    assert!(!fx.fake.objects.lock().unwrap().contains_key(&fx.object));
+    // ...with no walk of its own: it joined the parked one.
+    assert_eq!(fx.fake.walk.lists_of(""), lists);
+    assert_eq!(
+        fx.fake.walk.held.load(Ordering::SeqCst),
+        PURGE_READS_AT_ONCE
+    );
+    assert_eq!(fx.probe.purge_guard.active_count(), 2);
+    *fx.fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&fx.probe).await;
+    // One re-list served the joined purge.
+    assert_eq!(fx.fake.walk.lists_of(""), lists + 1);
+    fx.assert_no_tier_serves_the_stale_copy().await;
+}
+
+#[tokio::test]
+async fn a_purge_joining_an_inline_walk_still_gets_its_relist() {
+    // Issue #462 review: the leader's walk ends inline, with
+    // no background remainder, and an identical purge joins
+    // while that inline scan runs. The joined purge must
+    // still get its re-list, or a copy rendered between the
+    // two purges stays in the bucket and serves again once
+    // the joined purge's tombstone expires.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, 40).await;
+    let shared = probe.shared_store.clone().unwrap();
+    let groups = vec!["small".to_string()];
+    let member = CachedImage {
+        groups: groups.clone(),
+        ..tier_test_entry()
+    };
+    shared
+        .put("40x24/example.com/stale.png#cfgtest", &member)
+        .await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("0-head-".into());
+    let leader_base = base.clone();
+    let leader = tokio::spawn(async move { purge_group_call(&leader_base, "small").await });
+    wait_until("the leader's inline scan parks", || {
+        fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    let fresh_key = "40x24/example.com/fresh.png#cfgtest";
+    let fresh = CachedImage {
+        written: Some(probe.purge_guard.stamp()),
+        ..member.clone()
+    };
+    shared.put(fresh_key, &fresh).await;
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    assert_eq!(fake.walk.lists_of(""), 1);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    assert_eq!(leader.await.unwrap(), "purged 1\n");
+    wait_for_purges_to_end(&probe).await;
+    assert_eq!(fake.walk.lists_of(""), 2);
+    assert!(shared.get(fresh_key).await.is_none());
+}
+
+#[tokio::test]
+async fn the_relist_judges_copies_by_the_latest_joined_purge() {
+    // Issue #462 review: two purges join a parked walk, one
+    // before and one after a copy is rendered. The shared
+    // re-list must judge copies by the later purge's start,
+    // or that copy stays in the bucket and serves again once
+    // the later purge's tombstone expires.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN + 50).await;
+    let shared = probe.shared_store.clone().unwrap();
+    let member = CachedImage {
+        groups: vec!["small".to_string()],
+        ..tier_test_entry()
+    };
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    wait_until("the leader's walk parks", || {
+        fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    let fresh_key = "40x24/example.com/fresh.png#cfgtest";
+    let fresh = CachedImage {
+        written: Some(probe.purge_guard.stamp()),
+        ..member.clone()
+    };
+    shared.put(fresh_key, &fresh).await;
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    assert_eq!(fake.walk.lists_of(""), 2);
+    assert!(shared.get(fresh_key).await.is_none());
+}
+
+#[tokio::test]
+async fn inline_scans_of_different_purges_share_one_read_budget() {
+    // Issue #462 review: walk turns bound the background
+    // walks only, and each purge's inline scan read 16
+    // headers at a time on its own, so six concurrent purges
+    // of different groups put 96 reads on the store at once.
+    // Every inline read now holds one of the process's
+    // PURGE_INLINE_READS_AT_ONCE: with every inline read
+    // parked, exactly that many arrive, and the rest wait.
+    use crate::s3store::PURGE_INLINE_READS_AT_ONCE;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN).await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("0-head-".into());
+    let calls: Vec<_> = (0..6)
+        .map(|i| {
+            let base = base.clone();
+            tokio::spawn(async move { purge_group_call(&base, &format!("g{i}")).await })
+        })
+        .collect();
+    wait_until("the inline scans park their reads", || {
+        fake.walk.held.load(Ordering::SeqCst) >= PURGE_INLINE_READS_AT_ONCE
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        fake.walk.held.load(Ordering::SeqCst),
+        PURGE_INLINE_READS_AT_ONCE
+    );
+    assert_eq!(fake.walk.lists_of(""), 6);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    for call in calls {
+        assert_eq!(call.await.unwrap(), "purged 0\n");
+    }
+    assert_eq!(
+        fake.walk.held_peak.load(Ordering::SeqCst),
+        PURGE_INLINE_READS_AT_ONCE
+    );
+    assert_eq!(
+        fake.ranged_gets.load(Ordering::SeqCst),
+        6 * SHARED_PURGE_INLINE_SCAN
+    );
+    wait_for_purges_to_end(&probe).await;
+}
+
+#[tokio::test]
+async fn a_purge_request_scan_does_not_wait_behind_background_walks() {
+    // Issue #462 review: the inline read budget is the
+    // requests' own. With both background turns taken by
+    // walks whose reads are parked, a purge of another group
+    // still scans its inline part and answers; only its own
+    // background walk waits for a turn.
+    use crate::s3store::{PURGE_READS_AT_ONCE, PURGE_WALKS_AT_ONCE};
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN + 20).await;
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    for i in 0..PURGE_WALKS_AT_ONCE {
+        assert_eq!(
+            purge_group_call(&base, &format!("g{i}")).await,
+            "purged 0\n"
+        );
+    }
+    let parked = PURGE_WALKS_AT_ONCE * PURGE_READS_AT_ONCE;
+    wait_until("the background walks park", || {
+        fake.walk.held.load(Ordering::SeqCst) == parked
+    })
+    .await;
+    let reads = fake.ranged_gets.load(Ordering::SeqCst);
+    // Well inside the store client's 10 s request timeout,
+    // which would otherwise free a stuck budget by failing
+    // the parked reads.
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        purge_group_call(&base, "other"),
+    )
+    .await
+    .expect("the purge request waited behind the parked walks");
+    assert_eq!(answer, "purged 0\n");
+    assert_eq!(
+        fake.ranged_gets.load(Ordering::SeqCst),
+        reads + SHARED_PURGE_INLINE_SCAN
+    );
+    assert_eq!(fake.walk.held.load(Ordering::SeqCst), parked);
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    assert_eq!(fake.walk.lists_of(""), PURGE_WALKS_AT_ONCE + 1);
+}
+
+/// Issue #462 review: purge a group while `fail` makes the
+/// store fail part of the walk, and check that the purge
+/// stays in force. The walk could not reach the group's
+/// copy, so marking the purge ended would let that copy
+/// serve again once the tombstone expires; it is left
+/// running in the bucket instead, as when the process stops
+/// mid-walk, until a later purge of the group completes.
+async fn assert_a_failed_walk_leaves_its_purge_in_force(
+    fail: fn(&mut crate::s3store::test_support::FailFlags, bool),
+) {
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, 0).await;
+    let shared = probe.shared_store.clone().unwrap();
+    let stale_key = "40x24/example.com/stale.png#cfgtest";
+    let groups = vec!["small".to_string()];
+    let member = CachedImage {
+        groups: groups.clone(),
+        ..tier_test_entry()
+    };
+    shared.put(stale_key, &member).await;
+    let errors = shared.errors();
+    fail(&mut fake.fail.lock().unwrap(), true);
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    wait_for_purges_to_end(&probe).await;
+    fail(&mut fake.fail.lock().unwrap(), false);
+    // Counted for /metrics, and the copy is still there.
+    assert!(shared.errors() > errors);
+    assert!(shared.get(stale_key).await.is_some());
+    let tombstones = bucket_tombstones(&fake);
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].ended_ms, None);
+    // A replica that reads the tombstone keeps the copy a
+    // miss past any grace period.
+    assert!(shared.refresh_tombstones(&probe.purge_guard).await);
+    let past_grace = crate::cache::now_ms() + crate::cache::TOMBSTONE_GRACE_MS + 1;
+    assert!(
+        probe
+            .purge_guard
+            .running_covers_at(past_grace, stale_key, &groups, None)
+    );
+    // A later purge whose walk completes removes the copy,
+    // and its ended tombstone supersedes the one left open.
+    assert_eq!(purge_group_call(&base, "small").await, "purged 1\n");
+    wait_for_purges_to_end(&probe).await;
+    assert!(shared.get(stale_key).await.is_none());
+    assert!(shared.refresh_tombstones(&probe.purge_guard).await);
+    let tombstones = bucket_tombstones(&fake);
+    assert_eq!(tombstones.len(), 1);
+    assert!(tombstones[0].ended_ms.is_some());
+}
+
+#[tokio::test]
+async fn a_purge_whose_walk_cannot_list_the_bucket_stays_in_force() {
+    assert_a_failed_walk_leaves_its_purge_in_force(|fail, on| fail.list = on).await;
+}
+
+#[tokio::test]
+async fn a_purge_whose_header_reads_fail_stays_in_force() {
+    assert_a_failed_walk_leaves_its_purge_in_force(|fail, on| fail.get_object = on).await;
+}
+
+#[tokio::test]
+async fn a_purge_whose_deletes_fail_stays_in_force() {
+    assert_a_failed_walk_leaves_its_purge_in_force(|fail, on| fail.delete = on).await;
+}
+
+#[tokio::test]
+async fn a_failed_relist_leaves_the_joined_purges_in_force() {
+    // Issue #462 review: one re-list serves every purge that
+    // joined a walk. When the store cannot list the bucket
+    // for it, none of those purges may be marked ended: the
+    // copy rendered between the purges is still there.
+    use crate::s3store::PURGE_READS_AT_ONCE;
+    let fake = crate::s3store::test_support::start_fake().await;
+    let (base, probe) = spawn_walk_app(&fake, SHARED_PURGE_INLINE_SCAN + 50).await;
+    let shared = probe.shared_store.clone().unwrap();
+    let groups = vec!["small".to_string()];
+    *fake.walk.hold_prefix.lock().unwrap() = Some("z-tail-".into());
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    wait_until("the first walk parks", || {
+        fake.walk.held.load(Ordering::SeqCst) == PURGE_READS_AT_ONCE
+    })
+    .await;
+    let fresh_key = "40x24/example.com/fresh.png#cfgtest";
+    let fresh = CachedImage {
+        groups: groups.clone(),
+        written: Some(probe.purge_guard.stamp()),
+        ..tier_test_entry()
+    };
+    shared.put(fresh_key, &fresh).await;
+    assert_eq!(purge_group_call(&base, "small").await, "purged 0\n");
+    assert_eq!(probe.purge_guard.active_count(), 2);
+    fake.fail.lock().unwrap().list = true;
+    *fake.walk.hold_prefix.lock().unwrap() = None;
+    wait_for_purges_to_end(&probe).await;
+    fake.fail.lock().unwrap().list = false;
+    assert!(shared.get(fresh_key).await.is_some());
+    // The first purge's own walk completed, so it ended; the
+    // joined one did not.
+    let tombstones = bucket_tombstones(&fake);
+    assert_eq!(tombstones.len(), 2);
+    assert!(tombstones[0].ended_ms.is_some());
+    assert_eq!(tombstones[1].ended_ms, None);
+    assert!(shared.refresh_tombstones(&probe.purge_guard).await);
+    let past_grace = crate::cache::now_ms() + crate::cache::TOMBSTONE_GRACE_MS + 1;
+    assert!(
+        probe
+            .purge_guard
+            .running_covers_at(past_grace, fresh_key, &groups, fresh.written)
+    );
 }
 
 /// An app over a disk tier under a chosen
@@ -13306,6 +14104,7 @@ async fn spawn_app_with_store_fingerprint(dir: &std::path::Path, fingerprint: &s
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: fingerprint.to_string(),
     };
@@ -13519,7 +14318,10 @@ async fn upload_rejects_names_that_misstate_the_media() {
         ("photo.jpg", StatusCode::UNSUPPORTED_MEDIA_TYPE),
         ("promo.html", StatusCode::UNSUPPORTED_MEDIA_TYPE),
         ("photo.png", StatusCode::CREATED),
-        ("photo.PNG", StatusCode::CREATED),
+        // Its own stem: on a case-insensitive file system
+        // (the macOS default) photo.PNG is the same file as
+        // photo.png and would be refused as existing.
+        ("upper.PNG", StatusCode::CREATED),
         ("photo", StatusCode::CREATED),
     ] {
         let sig = crate::url::upload_signature(SECRET, name);
@@ -14016,6 +14818,181 @@ async fn zero_pixel_sides_answer_400() {
     }
 }
 
+/// A size the engine works out past the per-axis limit is
+/// refused like a size written past it (issue #521):
+/// `/unsafe/16383x1/0x2/...` rendered 32766x2, wider than
+/// WebP encodes. `/explain` forecasts the same refusal.
+#[tokio::test]
+async fn computed_sizes_past_max_dimension_answer_400() {
+    let src = spawn_image_server().await;
+    let base = spawn_app(true).await;
+    for (ops, refused) in [
+        ("16383x1/0x2", "32766x2"),
+        ("16383x1/fit-in:0x2", "32766x2"),
+        ("crop:16383x1:smart/0x2", "32766x2"),
+        ("4096x1/0x2/filters:dpr(2)", "16384x4"),
+    ] {
+        let url = format!("{base}/unsafe/{ops}/{src}");
+        let plain = client().get(&url).send().await.unwrap();
+        let json = client()
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_error_modes(
+            plain,
+            json,
+            StatusCode::BAD_REQUEST,
+            "unsupported_operation",
+            &format!("requested output {refused} exceeds the 16383 pixel limit per axis"),
+        )
+        .await;
+        let resp = client()
+            .get(format!("{base}/explain/unsafe/{ops}/{src}"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{ops}");
+        let report: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(report["forecast"]["over_dimension"], true, "{ops}");
+    }
+    // A chain that lands exactly on the limit renders.
+    let resp = client()
+        .get(format!("{base}/unsafe/5461x1/0x3/{src}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!((img.width(), img.height()), (16383, 3));
+}
+
+/// A width hint on a source at the 16384 px decode ceiling
+/// answers what the URL answers without it (issue #521):
+/// the hint's `Wx0` op is held at the source by its
+/// `no_upscale`, so it keeps the size it started from and
+/// works nothing out. The first cut of the per-axis check
+/// refused it at the step, turning an advisory hint into a
+/// 400 for a URL that rendered. Since issue #528 the output
+/// itself is held to the limit: a URL that leaves the source
+/// at the ceiling answers 400 with and without a hint, and
+/// one that brings it within the limit renders with and
+/// without one.
+#[tokio::test]
+async fn a_width_hint_answers_a_decode_ceiling_source_as_the_url_does() {
+    let src = spawn_bytes_server(png_of(1, 16384)).await;
+    let base = spawn_app(false).await;
+    let left = format!("filters:format(png)/{src}");
+    let resized = format!("0x8192/filters:format(png)/{src}");
+    for hints in [
+        &[][..],
+        &[("Sec-CH-Width", "400")][..],
+        &[("Width", "3840"), ("Sec-CH-DPR", "2")][..],
+    ] {
+        let resp = get_with_headers(&base, &left, hints).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{hints:?}");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "requested output 1x16384 exceeds the 16383 pixel limit per axis; \
+             resize or crop it to fit",
+            "{hints:?}"
+        );
+    }
+    for hints in [
+        &[][..],
+        &[("Sec-CH-Width", "400")][..],
+        &[("Width", "3840")][..],
+    ] {
+        let resp = get_with_headers(&base, &resized, hints).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{hints:?}");
+        let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!((img.width(), img.height()), (1, 8192), "{hints:?}");
+    }
+}
+
+/// A source at the 16384 px decode ceiling, one past the
+/// output limit, rendered through a chain that keeps that
+/// side (issue #528). WebP cannot encode it: a negotiated
+/// or named WebP answered `500 image encoding failed`,
+/// still or animated, and other formats served 16384 px.
+/// Every such request now answers the documented `400`,
+/// and a resize within the limit renders, as WebP too.
+#[tokio::test]
+async fn a_decode_ceiling_source_answers_400_never_500() {
+    let still = spawn_bytes_server(png_of(16384, 1)).await;
+    let delay = image::Delay::from_numer_denom_ms(100, 1);
+    let frames: Vec<image::Frame> = [[255, 0, 0, 255], [0, 0, 255, 255]]
+        .into_iter()
+        .map(|rgba| {
+            let pixels = image::RgbaImage::from_pixel(16384, 1, image::Rgba(rgba));
+            image::Frame::from_parts(pixels, 0, 0, delay)
+        })
+        .collect();
+    let mut gif = Vec::new();
+    image::codecs::gif::GifEncoder::new(&mut gif)
+        .encode_frames(frames)
+        .unwrap();
+    let animated = spawn_bytes_server(gif).await;
+    let base = spawn_app(true).await;
+    let browser = "image/avif;q=0,image/webp,image/apng,image/*,*/*;q=0.8";
+    let refused =
+        "requested output 16384x1 exceeds the 16383 pixel limit per axis; resize or crop it to fit";
+    for src in [&still, &animated] {
+        for (ops, accept) in [
+            ("", browser),
+            ("filters:format(webp)/", "*/*"),
+            ("", "*/*"),
+            ("filters:grayscale()/", browser),
+        ] {
+            let url = format!("{base}/unsafe/{ops}{src}");
+            let plain = client()
+                .get(&url)
+                .header("accept", accept)
+                .send()
+                .await
+                .unwrap();
+            let json = client()
+                .get(&url)
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            assert_error_modes(
+                plain,
+                json,
+                StatusCode::BAD_REQUEST,
+                "unsupported_operation",
+                refused,
+            )
+            .await;
+        }
+        // `/explain` forecasts the same refusal.
+        let resp = client()
+            .get(format!("{base}/explain/unsafe/{src}"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let report: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(report["forecast"]["over_dimension"], true, "{src}");
+        // A resize within the limit renders as the
+        // negotiated WebP.
+        let resp = client()
+            .get(format!("{base}/unsafe/8192x0/{src}"))
+            .header("accept", browser)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{src}");
+        assert_eq!(resp.headers()["content-type"], "image/webp", "{src}");
+        let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!((img.width(), img.height()), (8192, 1), "{src}");
+    }
+}
+
 #[test]
 fn negotiation_honors_q_values() {
     use crate::url::ImageFormat::{Avif, Jxl, WebP};
@@ -14485,6 +15462,7 @@ async fn spawn_explain_app_with_roots(
         slow_gate: Arc::new(Gate::new(2)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(crate::cache::PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "test".to_string(),
     };
@@ -14778,4 +15756,370 @@ async fn explain_escapes_markup_bearing_strings() {
     let json: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(json["source"]["url"], src);
     assert_eq!(json["presets"][0]["name"], "a&b");
+}
+
+/// Serve `state` on an ephemeral port: the tests that read
+/// `/metrics` while they drive the state directly.
+async fn serve_state(state: &AppState) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = state.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app(state)).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The `/metrics` exposition, read with `token`.
+async fn scrape(base: &str, token: &str) -> String {
+    let resp = client()
+        .get(format!("{base}/metrics"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn shared_write_throughs_past_the_bound_are_skipped_and_counted() {
+    // Issue #463: every shared write-through was a bare
+    // spawn, so a stalled bucket let them pile up, one per
+    // miss, each holding a whole entry. Now at most
+    // SHARED_PUTS_AT_ONCE are in flight, and one that finds
+    // every slot taken is skipped and counted, not queued.
+    let fake = crate::s3store::test_support::start_fake().await;
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let mut state = tier_test_state(None, &fake.endpoint);
+    state.metrics_token = Some("metrics-token".to_string());
+    let shared = state.shared_store.clone().unwrap();
+    let base = serve_state(&state).await;
+    let snapshot = state.purge_guard.snapshot();
+    let key = |i: usize| format!("{i}/example.com/a.png");
+    for i in 0..SHARED_PUTS_AT_ONCE {
+        spawn_shared_put(
+            &state,
+            snapshot,
+            &key(i),
+            tier_test_entry(),
+            SharedWrite::Render,
+        );
+    }
+    wait_until("every slot's write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == SHARED_PUTS_AT_ONCE
+    })
+    .await;
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains(&format!(
+            "crabcrop_cache_shared_puts_in_flight {SHARED_PUTS_AT_ONCE}\n"
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(&format!(
+            "crabcrop_cache_shared_puts_capacity {SHARED_PUTS_AT_ONCE}\n"
+        )),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_skipped_total 0\n"),
+        "{metrics}"
+    );
+
+    // Every slot is taken: the next write is skipped on the
+    // spot and counted, and nothing more reaches the bucket.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        &key(1000),
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 1);
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_skipped_total 1\n"),
+        "{metrics}"
+    );
+    assert_eq!(fake.held_puts.load(Ordering::SeqCst), SHARED_PUTS_AT_ONCE);
+
+    // The bucket answers: the held writes land, tracked to
+    // the end, and give their slots back.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let left = state.background.drain(deadline).await;
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 0
+        }
+    );
+    assert_eq!(state.background.puts_in_flight(), 0);
+    assert_eq!(entry_objects(&fake), SHARED_PUTS_AT_ONCE);
+    assert!(shared.get(&key(0)).await.is_some());
+    assert!(shared.get(&key(1000)).await.is_none());
+
+    // With a slot free again, a write goes through.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        &key(1001),
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    state.background.drain(deadline).await;
+    assert!(shared.get(&key(1001)).await.is_some());
+    assert_eq!(state.background.puts_skipped(), 1);
+    let metrics = scrape(&base, "metrics-token").await;
+    assert!(
+        metrics.contains("crabcrop_cache_shared_puts_in_flight 0\n"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_waits_for_a_write_through_until_its_deadline() {
+    // Issue #463: at shutdown the detached writes died with
+    // the runtime once the connections drained. The drain
+    // now waits for them, and stops waiting at its deadline.
+    let fake = crate::s3store::test_support::start_fake().await;
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let state = tier_test_state(None, &fake.endpoint);
+    let shared = state.shared_store.clone().unwrap();
+    let key = "40x24/example.com/i.png";
+    spawn_shared_put(
+        &state,
+        state.purge_guard.snapshot(),
+        key,
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    wait_until("the write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // The bucket holds the write past the deadline: the
+    // drain gives up at it and reports the write.
+    let grace = std::time::Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let left = state.background.drain(started + grace).await;
+    assert!(started.elapsed() >= grace);
+    assert_eq!(
+        left,
+        Drained {
+            writes: 1,
+            walks: 0
+        }
+    );
+    assert_eq!(entry_objects(&fake), 0);
+    // Answered in time, the write lands before the drain
+    // returns.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let left = state.background.drain(deadline).await;
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 0
+        }
+    );
+    assert!(shared.get(key).await.is_some());
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_counts_purge_walks_but_never_waits_for_them() {
+    // Issue #463: a purge's background walk is tracked, but
+    // a shutdown does not wait for it. Cut short, it leaves
+    // the purge's tombstone unended, which keeps the purge
+    // in force (issue #461).
+    let fake = crate::s3store::test_support::start_fake().await;
+    {
+        let mut objects = fake.objects.lock().unwrap();
+        for i in 0..SHARED_PURGE_INLINE_SCAN + 8 {
+            objects.insert(format!("0-filler-{i:04}"), b"not a cache entry".to_vec());
+        }
+    }
+    // The request scans the inline budget itself; the
+    // background walk parks on its first read past it.
+    *fake.hold_ranged_after.lock().unwrap() = Some(SHARED_PURGE_INLINE_SCAN);
+    let state = tier_test_state(None, &fake.endpoint);
+    purge_source_everywhere(&state, "example.com/i.png").await;
+    wait_until("the background walk parks", || {
+        fake.ranged_gets.load(Ordering::SeqCst) > SHARED_PURGE_INLINE_SCAN
+    })
+    .await;
+    assert_eq!(state.purge_guard.active_count(), 1);
+    // A deadline far off: the drain returns as soon as the
+    // writes are done, with the parked walk still running.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let left = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        state.background.drain(deadline),
+    )
+    .await
+    .expect("the drain must not wait for the walk");
+    assert_eq!(
+        left,
+        Drained {
+            writes: 0,
+            walks: 1
+        }
+    );
+    assert_eq!(state.purge_guard.active_count(), 1);
+    // Released, the walk ends the purge as before.
+    *fake.hold_ranged_after.lock().unwrap() = None;
+    wait_until("the purge walk ends", || {
+        state.purge_guard.active_count() == 0
+    })
+    .await;
+}
+
+/// Fill every shared write slot against a stalled bucket:
+/// `SHARED_PUTS_AT_ONCE` render write-throughs, each held.
+async fn hold_every_shared_write_slot(
+    state: &AppState,
+    fake: &crate::s3store::test_support::FakeS3,
+) {
+    fake.hold_puts.store(true, Ordering::SeqCst);
+    let snapshot = state.purge_guard.snapshot();
+    for i in 0..SHARED_PUTS_AT_ONCE {
+        spawn_shared_put(
+            state,
+            snapshot,
+            &format!("{i}/example.com/filler.png"),
+            tier_test_entry(),
+            SharedWrite::Render,
+        );
+    }
+    wait_until("every slot's write reaches the stalled bucket", || {
+        fake.held_puts.load(Ordering::SeqCst) == SHARED_PUTS_AT_ONCE
+    })
+    .await;
+}
+
+/// A group-free copy is served to a grouped request while
+/// every shared write slot is taken, from memory or from the
+/// bucket; then the bucket recovers and the group is purged.
+/// The purge must reach the bucket copy, on this replica and
+/// on any other.
+async fn group_purge_after_a_hit_with_every_write_slot_taken(from_memory: bool) {
+    // Issue #463 review: the bound skipped a tier hit's
+    // group write-back like a render write-through. The
+    // local merge had already recorded the group, so nothing
+    // sent it again; the bucket copy never learned it, the
+    // group purge left it, and every replica served it.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let state = tier_test_state(None, &fake.endpoint);
+    let shared = state.shared_store.clone().unwrap();
+    let key = "40x24/example.com/hero.png";
+    let entry = tier_test_entry();
+    shared.put(key, &entry).await;
+    if from_memory {
+        put_memory_tier(&state, state.purge_guard.snapshot(), key, &entry);
+    }
+    hold_every_shared_write_slot(&state, &fake).await;
+
+    let groups = vec!["hero".to_string()];
+    let (_, status) = lookup_tiers(&state, key, &groups).await.unwrap();
+    let expected = if from_memory {
+        "crabcrop; hit"
+    } else {
+        "crabcrop; hit; detail=\"shared\""
+    };
+    assert_eq!(status, expected);
+    // The write-back waits for a slot rather than take a
+    // sixty-fifth: the bound on writes in flight holds.
+    assert_eq!(state.background.puts_in_flight(), SHARED_PUTS_AT_ONCE);
+    assert_eq!(fake.held_puts.load(Ordering::SeqCst), SHARED_PUTS_AT_ONCE);
+    // The next hit is a memory hit that already carries the
+    // group: it sends nothing.
+    let (_, status) = lookup_tiers(&state, key, &groups).await.unwrap();
+    assert_eq!(status, "crabcrop; hit");
+
+    // The bucket recovers: the held writes land, then the
+    // write-back takes a freed slot and lands too.
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(state.background.drain(far).await.writes, 0);
+    assert_eq!(
+        shared.get(key).await.unwrap().groups,
+        groups,
+        "the bucket copy never learned the group"
+    );
+    assert_eq!(state.background.puts_skipped(), 0);
+
+    let base = serve_state(&state).await;
+    let sig = crate::url::purge_group_signature(SECRET, "hero");
+    let resp = client()
+        .post(format!("{base}/purge-group/{sig}/hero"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    wait_until("the group purge ends", || {
+        state.purge_guard.active_count() == 0
+    })
+    .await;
+    assert!(
+        shared.get(key).await.is_none(),
+        "the purge answered {body:?}, yet the bucket copy survived it"
+    );
+    assert!(lookup_tiers(&state, key, &groups).await.is_none());
+    // Another replica, with the bucket's tombstones read,
+    // misses as well.
+    let other = tier_test_state(None, &fake.endpoint);
+    shared.refresh_tombstones(&other.purge_guard).await;
+    assert!(lookup_tiers(&other, key, &groups).await.is_none());
+}
+
+#[tokio::test]
+async fn a_memory_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
+    group_purge_after_a_hit_with_every_write_slot_taken(true).await;
+}
+
+#[tokio::test]
+async fn a_shared_hit_group_write_back_waits_for_a_write_slot_and_is_purged() {
+    group_purge_after_a_hit_with_every_write_slot_taken(false).await;
+}
+
+#[tokio::test]
+async fn a_render_write_a_purge_covers_is_dropped_but_not_counted_as_skipped() {
+    // Issue #463 review: the skip counter is for renders the
+    // bucket missed because every slot was taken. A write a
+    // running purge already covers would never land, so it
+    // is not one of them.
+    let fake = crate::s3store::test_support::start_fake().await;
+    let state = tier_test_state(None, &fake.endpoint);
+    let snapshot = state.purge_guard.snapshot();
+    hold_every_shared_write_slot(&state, &fake).await;
+    let covered = "40x24/example.com/covered.png";
+    let _purge = state
+        .purge_guard
+        .begin(crate::cache::PurgeTarget::Key(covered.to_string()));
+    spawn_shared_put(
+        &state,
+        snapshot,
+        covered,
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 0);
+    // One the purge does not cover is skipped and counted.
+    spawn_shared_put(
+        &state,
+        snapshot,
+        "40x24/example.com/other.png",
+        tier_test_entry(),
+        SharedWrite::Render,
+    );
+    assert_eq!(state.background.puts_skipped(), 1);
+    fake.hold_puts.store(false, Ordering::SeqCst);
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(state.background.drain(far).await.writes, 0);
+    assert_eq!(entry_objects(&fake), SHARED_PUTS_AT_ONCE);
 }

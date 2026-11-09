@@ -1,0 +1,3 @@
+# The TypeScript SDK's build of its explainer, copied by
+# scripts/sync_playground_sdk.py (issue #482).
+playground/sdk/** linguist-generated=true

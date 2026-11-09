@@ -25,17 +25,22 @@ both SDKs must all pass.
   state in `engine/state.rs`), HTTP and caching in `server.rs`
   (request coalescing in `server/process.rs`, metadata responses in
   `server/meta.rs`), source fetching policy in `loader.rs`, AI
-  features in `ai.rs` and `studio.rs`. A large module keeps its unit
-  tests in `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
-  `server.rs` and `engine.rs` do.
+  features in `ai/` (provider traits in `ai/mod.rs`, one file per
+  provider family, all re-exported from `crate::ai`) and
+  `studio.rs`. A large module keeps its unit tests in
+  `<module>/tests.rs` behind `#[cfg(test)] mod tests;`, as
+  `server.rs`, `engine.rs` and the files under `ai/` do.
 - `crates/crabcrop-url`: the client-side library: signing, sealing,
   verification, and URL building. It does not parse operations; the
   server's parser is `src/url.rs`.
 - `sdks/`: TypeScript and Python SDKs, plus the MCP server (`sdks/mcp`).
 - `frameworks/`, `playground/`: integration starters and the live playground.
 - `fuzz/`: cargo-fuzz targets for the URL parser, the token
-  opener, image decode, metadata, and filter chains, built on the
-  server library and `crabcrop-url` (the opener's home).
+  opener, image decode (AVIF through dav1d included), metadata,
+  and operation chains through the engine, built on the server
+  library and `crabcrop-url` (the opener's home). The smoke runs
+  in `scripts/test_all.sh`; `.github/workflows/fuzz.yml` fuzzes
+  every target nightly.
 - `tests/functional/`: the HTTP functional suite, tiered; the local tier
   runs without network or model files.
 
@@ -46,14 +51,14 @@ both SDKs must all pass.
   MCP, frameworks, playground, fuzz). Everything must pass before a change
   lands.
 - CI also enforces `cargo fmt --check` and
-  `cargo clippy --locked --all-targets -- -D warnings`, which test_all.sh
-  does not run. Run both locally before pushing or the first CI run fails
-  on style alone.
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`,
+  which test_all.sh does not run. Run both locally before pushing or
+  the first CI run fails on style alone.
 - The real-model AI tests are `#[ignore]`d in the normal gate: they need
   model files and an ONNX Runtime library, which are deployment artifacts,
   never repo content. `.github/workflows/ai-models.yml` downloads the
   pinned artifacts and runs them (`cargo test -- --ignored`) on pull
-  requests and main pushes that touch `src/ai.rs`, `src/tokenizer.rs`,
+  requests and main pushes that touch `src/ai/`, `src/tokenizer.rs`,
   `tests/fixtures/portrait.jpg` or the workflow itself, on every release
   tag before anything publishes, weekly, and by hand. When you cannot run
   them locally, that pull-request run is where an AI change is verified.

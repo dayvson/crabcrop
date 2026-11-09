@@ -10,7 +10,8 @@ All configuration comes from environment variables. Invalid values are startup e
 | `CRABCROP_SECRET_PREVIOUS_KEY_ID` | `previous` | The previous secret's key ID. Must differ from the current one. |
 | `CRABCROP_METRICS_TOKEN` | unset | Bearer token for `GET /metrics`. Unset, `/metrics` answers `403` to everyone; set, the request must carry `Authorization: Bearer <token>` (the scheme name in any letter case, as HTTP allows), and a missing or wrong token answers `401`. |
 | `CRABCROP_DEFAULT_OPS` | unset | Operations prepended to every request (a house format, quality, or watermark), validated at boot. See [Server-wide default operations](#server-wide-default-operations). |
-| `PORT` | `3000` | Listen port. `CRABCROP_PORT` is the namespaced alias and wins when both are set. |
+| `PORT` | `3000` | Listen port. `CRABCROP_PORT` is the namespaced alias and wins when both are set. `0` binds a free port, which the boot output's `crabcrop listening on port N` line names. |
+| `CRABCROP_SHUTDOWN_GRACE_SECS` | `8` | How long the server drains after `SIGTERM` or Ctrl-C before it exits, 1 to 600 seconds, counted from the signal. It stops accepting connections, lets the requests in flight finish, then waits for the background writes they left (shared-tier write-throughs, purges whose caller disconnected); at the deadline, or at a second signal, it exits with whatever is still running. The default stays under the 10 seconds `docker stop` and Cloud Run allow; keep the platform's stop timeout above the grace. See [Shutting down](deployment.md#shutting-down). |
 | `CRABCROP_ALLOW_UNSAFE` | off | Honors `unsafe` URLs (for the boolean spellings, see above). |
 | `CRABCROP_CACHE_MAX_MB` | `256` | Result cache budget in megabytes. `0` disables the cache. |
 | `CRABCROP_SSIM_TARGET` | `75` | SSIMULACRA2 target (0 to 100) that `quality(auto)` verifies against for JPEG and JPEG XL output. |
@@ -92,6 +93,7 @@ Pinned fetches connect directly and never go through a proxy: a proxy resolves t
 - **Presets-only mode is unaffected in what it rejects** (the URL's own operations), and the defaults still apply: they are not URL content.
 - Cache groups stay the URL's own presets; a preset referenced only by the defaults does not join entries to its group.
 - [`/explain`](endpoints.md#self-explaining-urls) forecasts from the merged operations, so its forecast matches what the image request serves; its operation list stays the URL's own, and the defaults appear in its canonical form.
+- **A default `dpr(...)` is an explicit factor, not a hint.** It beats the `DPR` client hint, as a URL's own `dpr(...)` does, and it is never stepped down: a size it pushes past the [output limits](url-grammar.md#output-size) answers `400`, where a factor from the hint alone steps down to the largest one that fits (see [Client hints](filters.md#client-hints)).
 
 ### Rotating the secret
 
@@ -102,3 +104,7 @@ Rotation never invalidates a URL that is already in the wild, in three steps:
 3. **Close the window.** When the old key's URLs have aged out of your caches and pages (the result cache's `max-age` is one year, but in practice your own TTLs and page lifetimes govern), remove `CRABCROP_SECRET_PREVIOUS` and restart. From that moment the old secret verifies nothing: its remaining URLs answer `403`, which is the point of rotating.
 
 An unknown key ID is indistinguishable from a bad signature, by design: `403`, no hint about which IDs exist.
+
+### Diagnostics
+
+`CRABCROP_STUDIO_TIMING`, set to any value, prints the elapsed time of each `studio(...)` pipeline stage to stderr, one `[studio-timing] <stage>: <ms> ms` line per stage. It is a profiling aid, read once per process: responses, cache keys, and the configuration fingerprint are unchanged. Leave it unset in production.

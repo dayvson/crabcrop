@@ -11,29 +11,14 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Kill the child on drop, so a failed assert cannot
-/// leak a listening server into later runs.
-struct ServerGuard(Child);
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+// Not every shared item is used here.
+#[allow(dead_code)]
+mod common;
 
 const SECRET: &str = "source-budget-secret-0123456789";
 
@@ -85,45 +70,26 @@ fn exchange(
 /// allowlist that admits the local origin, uploads to
 /// `upload_dir`, and meta mode on (off by default, issue
 /// #453), so a meta request reaches the budget.
-fn boot(budget_mb: u32, upload_dir: &std::path::Path) -> (ServerGuard, u16) {
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_crabcrop"))
-        .env_clear()
-        .env("CRABCROP_SECRET", SECRET)
-        .env("CRABCROP_UPLOAD_DIR", upload_dir)
-        .env("PORT", port.to_string())
-        .env("CRABCROP_ALLOW_UNSAFE", "1")
-        .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
-        .env("CRABCROP_METRICS_TOKEN", "budget-token")
-        .env("CRABCROP_SOURCE_BUFFER_MAX_MB", budget_mb.to_string())
-        .env("CRABCROP_META_MODE", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = ServerGuard(child);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if let Some(status) = server.0.try_wait().unwrap() {
-            panic!("the binary exited before serving: {status}");
-        }
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() && get(port, "/health", "").0 == 200 {
-            return (server, port);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("no /health before the deadline");
+fn boot(budget_mb: u32, upload_dir: &std::path::Path) -> (common::ServerGuard, u16) {
+    let (server, port, _) = common::serve(
+        Command::new(env!("CARGO_BIN_EXE_crabcrop"))
+            .env_clear()
+            .env("CRABCROP_SECRET", SECRET)
+            .env("CRABCROP_UPLOAD_DIR", upload_dir)
+            .env("CRABCROP_ALLOW_UNSAFE", "1")
+            .env("CRABCROP_ALLOWED_SOURCES", "127.0.0.1")
+            .env("CRABCROP_METRICS_TOKEN", "budget-token")
+            .env("CRABCROP_SOURCE_BUFFER_MAX_MB", budget_mb.to_string())
+            .env("CRABCROP_META_MODE", "1"),
+    );
+    (server, port)
 }
 
-/// A fresh per-test, per-process directory.
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "crabcrop-source-budget-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh per-test directory. Bound before the server's
+/// guard, it is removed after the server exits (locals drop
+/// in reverse).
+fn scratch_dir(tag: &str) -> common::ScratchDir {
+    common::scratch_dir(&format!("source-budget-{tag}"))
 }
 
 fn tiny_png() -> Vec<u8> {
@@ -293,7 +259,6 @@ fn stalled_origins_do_not_block_a_normal_request() {
         "{body}"
     );
     assert!(!uploads.join("stall.png").exists());
-    let _ = std::fs::remove_dir_all(&uploads);
 }
 
 #[test]
@@ -365,5 +330,4 @@ fn a_budget_full_of_buffered_bytes_sheds_new_misses_with_server_busy() {
     origin.release.store(true, Ordering::SeqCst);
     assert_ne!(stalled.join().unwrap(), 200);
     assert_eq!(held_bytes(port), 0, "the stalled charge came back");
-    let _ = std::fs::remove_dir_all(&uploads);
 }

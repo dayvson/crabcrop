@@ -24,6 +24,10 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # The server drains for shutdownGraceSeconds after
+      # SIGTERM and then exits; the pod's grace adds a margin
+      # so the kubelet never kills it mid-drain.
+      terminationGracePeriodSeconds: {{ add .Values.shutdownGraceSeconds 5 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -43,6 +47,8 @@ spec:
           env:
             - name: PORT
               value: {{ .Values.containerPort | quote }}
+            - name: CRABCROP_SHUTDOWN_GRACE_SECS
+              value: {{ .Values.shutdownGraceSeconds | quote }}
             {{- if or .Values.existingSecret .Values.secret }}
             - name: CRABCROP_SECRET
               valueFrom:
@@ -95,6 +101,11 @@ spec:
             {{- range $k, $v := .Values.ai.env }}
             {{- $_ := set $allEnv $k $v }}
             {{- end }}
+            {{- end }}
+            {{- /* A second CRABCROP_SHUTDOWN_GRACE_SECS would win over the
+                 one above and leave terminationGracePeriodSeconds short. */}}
+            {{- if hasKey $allEnv "CRABCROP_SHUTDOWN_GRACE_SECS" }}
+            {{- fail "set shutdownGraceSeconds, not CRABCROP_SHUTDOWN_GRACE_SECS in env or ai.env: the pod's terminationGracePeriodSeconds follows shutdownGraceSeconds" }}
             {{- end }}
             {{- range $k := keys $allEnv | sortAlpha }}
             - name: {{ $k }}

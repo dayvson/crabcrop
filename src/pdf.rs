@@ -31,7 +31,8 @@
 //!   `-png -singlefile -f <n> -l <n> -r <dpi> - -`: the
 //!   PDF on stdin, one PNG on stdout, at a fixed scale
 //!   of 2.0 (144 DPI) clamped so neither raster axis
-//!   exceeds the decode cap.
+//!   exceeds the 16383 px output limit at the probed
+//!   page size.
 //!
 //! The rendered PNG re-enters the image pipeline as
 //! the source, so every downstream budget (decode
@@ -67,17 +68,29 @@ pub const MAX_PAGE_PNG_BYTES: usize = 256 * 1024 * 1024;
 /// knob.
 pub const RENDER_SCALE: f64 = 2.0;
 
-/// The decode cap a rendered raster axis may not
-/// exceed, in pixels: the same 16384 the decode chain
-/// enforces, applied before the tool runs so a poster
-/// page renders at a clamped scale instead of asking
-/// for a raster the pipeline would refuse.
-const MAX_RASTER_AXIS: f64 = 16_384.0;
+/// The size a rendered raster axis may not exceed at the
+/// probed page size, in pixels: one under the 16383 px
+/// output limit, itself one under the decode chain's 16384
+/// (issue #528), applied before the tool runs so a poster
+/// page renders at a clamped scale instead of asking for a
+/// raster the pipeline would refuse. A page rendered at the
+/// decode cap that no step resized would end past the output
+/// limit, which the engine refuses.
+///
+/// The pixel of margin is for the probe's rounding: it
+/// prints the page size to six significant digits (an
+/// 8191.5004 pt side prints as 8191.5), and the renderer
+/// rounds the raster up, so a scale that put the printed
+/// size at exactly 16383 px could render the true size at
+/// 16384. Six digits are off by at most a part in 200,000,
+/// under a tenth of a pixel at this size, which the margin
+/// absorbs.
+const MAX_RASTER_AXIS: f64 = (crate::url::MAX_DIMENSION - 1) as f64;
 
 /// The total raster area a render may not exceed, in
 /// pixels: 64 Mpx, the raster the 256 MB decode budget
 /// holds at 4 bytes per pixel. The per-axis clamp alone
-/// allows 16384 squared (about 268 Mpx, over 1 GB of
+/// allows 16383 squared (about 268 Mpx, over 1 GB of
 /// renderer memory), which a tiny hostile MediaBox
 /// reaches trivially (issue #262).
 const MAX_RASTER_PIXELS: f64 = 64_000_000.0;
@@ -319,7 +332,7 @@ impl PdfRenderer {
         }
         let scale = render_scale(probe.page_width, probe.page_height);
         // Floor the DPI so the clamped scale can never
-        // round a raster axis past the decode cap; at the
+        // round a raster axis past the axis cap; at the
         // fixed scale this is exactly 144.
         let dpi = (scale * 72.0).floor().max(1.0);
         let dpi_arg = format!("{dpi}");
@@ -461,7 +474,7 @@ fn validate_program(path: &Path, what: &str) -> Result<(), PdfError> {
 
 /// The render scale for a page of the given size in
 /// points: the fixed [`RENDER_SCALE`], clamped down so
-/// neither raster axis exceeds the decode cap and the
+/// neither raster axis exceeds [`MAX_RASTER_AXIS`] and the
 /// raster area stays within [`MAX_RASTER_PIXELS`].
 pub fn render_scale(page_width: f64, page_height: f64) -> f64 {
     let longest = page_width.max(page_height);
@@ -647,7 +660,7 @@ Page size:       792 x 612 pts (letter)
     }
 
     #[test]
-    fn scale_is_two_until_the_decode_cap_bites() {
+    fn scale_is_two_until_the_raster_cap_bites() {
         assert_eq!(render_scale(612.0, 792.0), 2.0);
         assert_eq!(render_scale(595.28, 841.89), 2.0);
         // A 200-inch poster page (14400 pt per axis): the
@@ -658,17 +671,81 @@ Page size:       792 x 612 pts (letter)
         assert!((scale - expected).abs() < 1e-9, "{scale}");
         let axis = 14_400.0 * scale;
         assert!(axis * axis <= 64_000_001.0, "{axis}");
-        // A wide-but-short page still clamps by axis.
+        // A wide-but-short page still clamps by axis, to
+        // the output limit rather than the decode cap
+        // (issue #528), less the probe's rounding margin: an
+        // 8192 pt page at the fixed scale would render 16384
+        // px wide.
         let scale = render_scale(20_000.0, 100.0);
-        assert!((scale - 16_384.0 / 20_000.0).abs() < 1e-9, "{scale}");
+        assert!((scale - 16_382.0 / 20_000.0).abs() < 1e-9, "{scale}");
+        let scale = render_scale(8_192.0, 100.0);
+        assert!((scale - 16_382.0 / 8_192.0).abs() < 1e-9, "{scale}");
+        assert!((8_192.0 * (scale * 72.0).floor() / 72.0) <= 16_383.0);
         // The hostile MediaBox from the finding: a
         // 100000 pt square page renders at 8000 px per
-        // axis (64 Mpx), not 16384 (268 Mpx).
+        // axis (64 Mpx), not 16383 (268 Mpx).
         let scale = render_scale(100_000.0, 100_000.0);
         assert!((100_000.0 * scale - 8_000.0).abs() < 1e-6, "{scale}");
         // A degenerate size keeps the fixed scale; the
         // renderer run is where that document fails.
         assert_eq!(render_scale(0.0, 0.0), 2.0);
+    }
+
+    /// The raster side the reference renderer draws for a
+    /// page side of `points` at `dpi`: the scaled size,
+    /// rounded up.
+    fn raster_side(points: f64, dpi: f64) -> f64 {
+        (points * dpi / 72.0).ceil()
+    }
+
+    #[test]
+    fn a_page_the_probe_rounds_down_stays_within_the_output_limit() {
+        // The probe prints a page side to six significant
+        // digits, and the renderer rounds the raster up
+        // (issue #528). An 8191.5004 pt side printed as
+        // 8191.5, which at the old 16383 px cap kept the
+        // scale at 2: the page rendered 16384 px wide and the
+        // output check refused it. Every printed size within
+        // a pixel or two of a DPI step, short side or long,
+        // renders within the limit at the largest true size
+        // that prints that way.
+        let max = f64::from(crate::url::MAX_DIMENSION);
+        let dpi_at = |w: f64, h: f64| (render_scale(w, h) * 72.0).floor().max(1.0);
+        assert_eq!(dpi_at(8_191.5, 100.0), 143.0);
+        assert_eq!(raster_side(8_191.500_4, 143.0), 16_270.0);
+        assert_eq!(raster_side(8_191.500_4, 144.0), 16_384.0);
+        // The sides that render at exactly the limit at each
+        // DPI the clamp can pick, and two points either way.
+        for step in 72..=144u32 {
+            let edge = max * 72.0 / f64::from(step);
+            for tenths in -20..=20 {
+                let printed = sig6(edge + f64::from(tenths) / 10.0);
+                let truth = printed + half_unit_of_six_digits(printed);
+                for (w, h, tw, th) in [
+                    (printed, 100.0, truth, 100.0),
+                    (100.0, printed, 100.0, truth),
+                ] {
+                    let dpi = dpi_at(w, h);
+                    assert!(
+                        raster_side(tw, dpi) <= max && raster_side(th, dpi) <= max,
+                        "{w}x{h} pt printed, {tw}x{th} pt true, at {dpi} dpi"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `value` rounded to six significant digits, as the
+    /// probe's `%g` prints it.
+    fn sig6(value: f64) -> f64 {
+        format!("{value:.5e}").parse().unwrap()
+    }
+
+    /// Half a unit in the sixth significant digit of
+    /// `value`: how far the true size can sit from the
+    /// printed one.
+    fn half_unit_of_six_digits(value: f64) -> f64 {
+        0.5 * 10f64.powi(value.abs().log10().floor() as i32 - 5)
     }
 
     #[test]
@@ -704,11 +781,8 @@ Page size:       792 x 612 pts (letter)
         );
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("crabcrop-pdf-test-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::ScratchDir {
+        crate::test_support::scratch_dir(&format!("pdf-test-{name}"))
     }
 
     fn write_tool(dir: &Path, name: &str, script: &str) -> PathBuf {
@@ -719,12 +793,17 @@ Page size:       792 x 612 pts (letter)
 
     /// A fake tool pair in one directory: the probe
     /// prints a recorded-shape report, the renderer
-    /// prints a PNG. Returns the renderer path to build
-    /// the extractor with.
-    fn fake_pair(name: &str, info_script: &str, render_script: &str) -> PathBuf {
+    /// prints a PNG. Returns the directory and the
+    /// renderer path to build the extractor with.
+    fn fake_pair(
+        name: &str,
+        info_script: &str,
+        render_script: &str,
+    ) -> (crate::test_support::ScratchDir, PathBuf) {
         let dir = temp_dir(name);
         write_tool(&dir, "pdfinfo", info_script);
-        write_tool(&dir, "pdftocairo", render_script)
+        let renderer = write_tool(&dir, "pdftocairo", render_script);
+        (dir, renderer)
     }
 
     const INFO_OK: &str = "#!/bin/sh\n\
@@ -770,7 +849,7 @@ exit 0\n";
 
     #[test]
     fn render_runs_probe_then_renderer() {
-        let program = fake_pair("ok", INFO_OK, RENDER_OK);
+        let (_tools, program) = fake_pair("ok", INFO_OK, RENDER_OK);
         let renderer = PdfRenderer::new(program.clone(), Duration::from_secs(10)).unwrap();
         assert_eq!(
             renderer.probe_program,
@@ -785,7 +864,7 @@ exit 0\n";
 
     #[test]
     fn render_refuses_a_password_document_from_the_probe() {
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "password",
             "#!/bin/sh\ncat > /dev/null\nprintf 'Command Line Error: Incorrect password\\n' >&2\nexit 1\n",
             RENDER_OK,
@@ -798,7 +877,7 @@ exit 0\n";
 
     #[test]
     fn render_maps_an_unreadable_probe_to_not_pdf() {
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "junk",
             "#!/bin/sh\ncat > /dev/null\nprintf 'Syntax Error: Couldn't find trailer dictionary\\n' >&2\nexit 1\n",
             RENDER_OK,
@@ -816,7 +895,7 @@ exit 0\n";
         let marker = dir.join("rendered");
         write_tool(&dir, "pdfinfo", INFO_OK);
         let render = format!(
-            "#!/bin/sh\ncat > /dev/null\ntouch {}\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
+            "#!/bin/sh\ncat > /dev/null\ntouch '{}'\nprintf '\\211PNG\\015\\012\\032\\012fakepng'\nexit 0\n",
             marker.display()
         );
         let program = write_tool(&dir, "pdftocairo", &render);
@@ -829,7 +908,7 @@ exit 0\n";
 
         // Over the page cap: the probe answers, the
         // document is refused as a bad source.
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "overcap",
             "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Pages:           5000' 'Encrypted:       no' 'Page size:       612 x 792 pts'\nexit 0\n",
             RENDER_OK,
@@ -856,7 +935,7 @@ exit 0\n";
             "#!/bin/sh\ncat > /dev/null\ntouch \"{}\"\nprintf '\\211PNG\\r\\n\\032\\n'\nexit 0\n",
             marker.display()
         );
-        let program = fake_pair("range-fallback", &info, &render);
+        let (_tools, program) = fake_pair("range-fallback", &info, &render);
         let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
         let err = renderer.render_page(b"%PDF- fake", 9).unwrap_err();
         assert!(matches!(err, PdfError::Unsupported(_)), "{err}");
@@ -874,7 +953,7 @@ exit 0\n";
         // Exit 99 is the reference renderer's own
         // out-of-range answer: the same class as the
         // pre-check, should the two ever disagree.
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "exit99",
             "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' 'Pages:           100' 'Encrypted:       no' 'Page size:       612 x 792 pts'\nexit 0\n",
             "#!/bin/sh\ncat > /dev/null\nprintf 'Wrong page range given\\n' >&2\nexit 99\n",
@@ -885,7 +964,7 @@ exit 0\n";
 
         // A password refusal at render time lands in the
         // password class too.
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "render-password",
             INFO_OK,
             "#!/bin/sh\ncat > /dev/null\nprintf 'Command Line Error: Incorrect password\\n' >&2\nexit 1\n",
@@ -897,7 +976,7 @@ exit 0\n";
 
         // Any other nonzero exit is a tool failure, with
         // the stderr excerpt in the cause.
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "failing",
             INFO_OK,
             "#!/bin/sh\ncat > /dev/null\necho 'boom on stderr' >&2\nexit 3\n",
@@ -909,13 +988,13 @@ exit 0\n";
 
         // A clean run with no output, and one whose
         // output is not a PNG, are tool failures.
-        let program = fake_pair("empty", INFO_OK, "#!/bin/sh\ncat > /dev/null\nexit 0\n");
+        let (_tools, program) = fake_pair("empty", INFO_OK, "#!/bin/sh\ncat > /dev/null\nexit 0\n");
         let renderer = PdfRenderer::new(program, Duration::from_secs(10)).unwrap();
         let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();
         assert!(matches!(err, PdfError::Failed(_)), "{err}");
         assert!(err.to_string().contains("no output"), "{err}");
 
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "notpng",
             INFO_OK,
             "#!/bin/sh\ncat > /dev/null\nprintf 'definitely not a png'\nexit 0\n",
@@ -928,7 +1007,7 @@ exit 0\n";
 
     #[test]
     fn run_caps_tool_output() {
-        let program = fake_pair(
+        let (_tools, program) = fake_pair(
             "chatty",
             INFO_OK,
             "#!/bin/sh\ncat > /dev/null\ndd if=/dev/zero bs=1024 count=4 2>/dev/null\nexit 0\n",
@@ -950,7 +1029,7 @@ exit 0\n";
 
     #[test]
     fn render_times_out_on_a_hung_renderer() {
-        let program = fake_pair("sleeper", INFO_OK, "#!/bin/sh\nsleep 30\n");
+        let (_tools, program) = fake_pair("sleeper", INFO_OK, "#!/bin/sh\nsleep 30\n");
         let renderer = PdfRenderer::new(program, Duration::from_secs(1)).unwrap();
         let started = Instant::now();
         let err = renderer.render_page(b"%PDF- fake", 1).unwrap_err();

@@ -2529,15 +2529,8 @@ mod tests {
 
     /// A scratch tree: `root/` holds the servable files, a
     /// secret sits next to it outside the root.
-    fn make_file_tree() -> (PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!(
-            "crabcrop-loader-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn make_file_tree() -> (crate::test_support::ScratchDir, PathBuf) {
+        let base = crate::test_support::scratch_dir("loader-test");
         let root = base.join("root");
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("pic.jpg"), b"rootpic").unwrap();

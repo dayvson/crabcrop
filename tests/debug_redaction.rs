@@ -20,6 +20,10 @@ use crabcrop::storage::DiskStore;
 use crabcrop::upload::UploadStore;
 use crabcrop::url::{Keyring, entry_key};
 
+// Not every shared item is used here.
+#[allow(dead_code)]
+mod common;
+
 const CURRENT_KEY: &str = "current-signing-key-0123456789";
 const PREVIOUS_KEY: &str = "previous-signing-key-9876543210";
 const AWS_SECRET: &str = "aws-secret-key-wJalrXUtnFEMI/K7MDENG";
@@ -196,6 +200,7 @@ fn state(dir: &std::path::Path) -> AppState {
         slow_gate: Arc::new(Gate::new(1)),
         inflight: Arc::new(Inflight::default()),
         purge_guard: Arc::new(PurgeGuard::new()),
+        background: Default::default(),
         provenance_signer: None,
         config_fingerprint: "debug-redaction".to_string(),
     }
@@ -203,8 +208,7 @@ fn state(dir: &std::path::Path) -> AppState {
 
 #[test]
 fn debug_output_names_each_secret_holder_without_its_secrets() {
-    let dir = std::env::temp_dir().join(format!("crabcrop-debug-redaction-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::scratch_dir("debug-redaction");
 
     // The detector itself: what a derived `Debug` prints
     // for each secret, compact or pretty, is caught.

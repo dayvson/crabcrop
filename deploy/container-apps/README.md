@@ -19,7 +19,7 @@ Release images are published to GHCR as
 version. Replace the `REPLACE_ME` values in
 `containerapp.yaml` (location, environment resource ID,
 image, and the placeholder secret value), pointing the
-image at `ghcr.io/dayvson/crabcrop:0.9.11` or at your own
+image at `ghcr.io/dayvson/crabcrop:0.10.0` or at your own
 build of the repo Dockerfile pushed to your Azure
 Container Registry.
 
