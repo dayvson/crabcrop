@@ -10202,3 +10202,96 @@ fn avif_encode_bench() {
         out.bytes.len()
     );
 }
+
+#[test]
+fn the_format_types_cover_the_output_formats() {
+    // Issue #480: the still encoder takes every output format
+    // but the video ones, and the animated path takes GIF and
+    // WebP. Each type turns back into the format it came from.
+    let all = [
+        ImageFormat::Jpeg,
+        ImageFormat::Png,
+        ImageFormat::WebP,
+        ImageFormat::Jxl,
+        ImageFormat::Avif,
+        ImageFormat::Gif,
+        ImageFormat::Mp4,
+        ImageFormat::WebM,
+    ];
+    for format in all {
+        assert_eq!(
+            StillFormat::of(format).map(ImageFormat::from),
+            (!format.is_video()).then_some(format),
+            "{format:?}"
+        );
+        assert_eq!(
+            AnimatedFormat::of(format).map(ImageFormat::from),
+            matches!(format, ImageFormat::Gif | ImageFormat::WebP).then_some(format),
+            "{format:?}"
+        );
+        assert_eq!(
+            StillFormat::of(format).is_some_and(StillFormat::carries_quality),
+            matches!(
+                format,
+                ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
+            ),
+            "{format:?}"
+        );
+    }
+}
+
+#[test]
+fn collected_frames_keep_their_order_and_refuse_none() {
+    // Issue #480: the frame decoders hand back the first frame
+    // and the rest, in order, and a source with no frames is
+    // refused rather than handed on empty.
+    let frame = |shade: u8, delay_ms: u32| {
+        Ok::<image::Frame, image::ImageError>(image::Frame::from_parts(
+            image::RgbaImage::from_pixel(4, 3, image::Rgba([shade, 0, 0, 255])),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(delay_ms, 1),
+        ))
+    };
+    let frames = collect_frames(
+        [frame(10, 100), frame(20, 200), frame(30, 300)].into_iter(),
+        "GIF",
+    )
+    .unwrap();
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames.dimensions(), (4, 3));
+    let shades: Vec<u8> = frames
+        .iter()
+        .map(|f| f.buffer().get_pixel(0, 0)[0])
+        .collect();
+    assert_eq!(shades, [10, 20, 30]);
+    let delays: Vec<u64> = frames.into_iter().map(|f| frame_delay_ms(&f)).collect();
+    assert_eq!(delays, [100, 200, 300]);
+    let err = match collect_frames(std::iter::empty(), "GIF") {
+        Ok(_) => panic!("an empty animation must be refused"),
+        Err(e) => e,
+    };
+    assert_eq!(err, EngineError::Decode("GIF has no frames".to_string()));
+}
+
+#[test]
+fn quality_in_force_resolves_each_form() {
+    // Issue #480: the still and the animated WebP encodes share
+    // this resolution. An explicit value stands and is not
+    // reported, auto is picked and reported, and Save-Data steps
+    // only a quality nobody set.
+    let never = || -> u8 { panic!("only quality(auto) picks") };
+    assert_eq!(
+        quality_in_force(Some(ResolvedQuality::Value(55)), true, never),
+        (Some(55), None)
+    );
+    assert_eq!(
+        quality_in_force(Some(ResolvedQuality::Auto), true, || 63),
+        (Some(63), Some(63))
+    );
+    assert_eq!(
+        quality_in_force(None, true, never),
+        (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY))
+    );
+    assert_eq!(quality_in_force(None, false, never), (None, None));
+}
