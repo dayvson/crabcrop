@@ -1378,7 +1378,8 @@ impl S3Store {
         // kept from starting count one error together: their
         // number grows with the tombstones listed, not with
         // the requests the store failed.
-        let (mut failed, mut unfinished, mut kept) = (0u64, 0u64, 0u64);
+        let (mut failed, mut unfinished) = (0u64, 0u64);
+        let mut kept = Vec::new();
         let mut first_failure = None;
         for (_, _, object, etag) in &to_read {
             match done.remove(object) {
@@ -1398,27 +1399,8 @@ impl S3Store {
             // object again.
             if let Some(known) = previous.get(object) {
                 fresh.insert(object.clone(), known.clone());
-                kept += 1;
+                kept.push(object.clone());
             }
-        }
-        if failed + unfinished > 0 {
-            let total = to_read.len();
-            let mut what = Vec::new();
-            if let Some(why) = &first_failure {
-                what.push(format!("{failed} of {total} reads failed (first: {why})"));
-            }
-            if unfinished > 0 {
-                what.push(format!("{unfinished} of {total} {}", late()));
-            }
-            self.note_errors(
-                failed + u64::from(unfinished > 0),
-                "cannot read purge tombstones",
-                &format!(
-                    "{}; kept as last read: {kept}; not in force until read: {}",
-                    what.join(", "),
-                    failed + unfinished - kept
-                ),
-            );
         }
         let now = now_ms();
         let spent: Vec<String> = fresh
@@ -1433,6 +1415,29 @@ impl S3Store {
             .collect();
         for object in &spent {
             fresh.remove(object);
+        }
+        if failed + unfinished > 0 {
+            // A kept version that turned out spent was just
+            // dropped above and is collected below, so only the
+            // kept versions still in force count as kept.
+            let kept_in_force = kept.iter().filter(|o| fresh.contains_key(*o)).count();
+            let total = to_read.len();
+            let mut what = Vec::new();
+            if let Some(why) = &first_failure {
+                what.push(format!("{failed} of {total} reads failed (first: {why})"));
+            }
+            if unfinished > 0 {
+                what.push(format!("{unfinished} of {total} {}", late()));
+            }
+            self.note_errors(
+                failed + u64::from(unfinished > 0),
+                "cannot read purge tombstones",
+                &format!(
+                    "{}; kept as last read: {kept_in_force}; not in force until read: {}",
+                    what.join(", "),
+                    failed + unfinished - kept.len() as u64
+                ),
+            );
         }
         guard.replace_shared(
             fresh
@@ -3123,33 +3128,49 @@ mod tests {
         // Issue #549: a failed read was neither counted nor
         // logged. A tombstone this replica has never read
         // still does not apply until a refresh reads it (what
-        // it should do meanwhile is left open), but every
-        // refresh retries it and counts the failure.
+        // it should do meanwhile is left open, issue #577),
+        // but every refresh retries it and counts the
+        // failure. Two tombstones fail in each refresh, so the
+        // count shows that every failed read counts on its
+        // own, not once per refresh.
         let fake = start_fake().await;
         let a = store(&fake.endpoint);
         let b = store(&fake.endpoint);
         let hero = ["hero".to_string()];
+        let logo = ["logo".to_string()];
         let cutoff = PurgeCutoff {
             start_ms: now_ms(),
             writer: 0xa,
         };
-        let name = a
-            .put_tombstone(&tombstone_for("hero", cutoff, None), 1)
-            .await
-            .unwrap();
+        let names = [
+            a.put_tombstone(&tombstone_for("hero", cutoff, None), 1)
+                .await
+                .unwrap(),
+            a.put_tombstone(&tombstone_for("logo", cutoff, None), 2)
+                .await
+                .unwrap(),
+        ];
         fake.fail.lock().unwrap().get_object = true;
         let guard = PurgeGuard::new();
         for round in 1..=2 {
             let refreshed = b.refresh_tombstones(&guard).await;
-            assert_eq!(count_gets(&fake, &name), round);
-            assert_eq!(b.errors(), round as u64, "the failed read was not counted");
+            for name in &names {
+                assert_eq!(count_gets(&fake, name), round);
+            }
+            assert_eq!(
+                b.errors(),
+                2 * round as u64,
+                "each failed read counts once on its own"
+            );
             assert!(!refreshed);
             assert!(!guard.running_covers("k", &hero, None));
+            assert!(!guard.running_covers("k", &logo, None));
         }
         fake.fail.lock().unwrap().get_object = false;
         assert!(b.refresh_tombstones(&guard).await);
         assert!(guard.running_covers("k", &hero, None));
-        assert_eq!(b.errors(), 2);
+        assert!(guard.running_covers("k", &logo, None));
+        assert_eq!(b.errors(), 4);
     }
 
     #[tokio::test]
