@@ -72,6 +72,12 @@ pub struct DiskStore {
     /// one hold no thread, and a slow disk cannot crowd
     /// out the other work the pool carries.
     permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Test-only: run ahead of every entry read in `get`, so
+    /// a test can hold a read the way a slow disk would. The
+    /// store refuses FIFOs (issue #545), so a test cannot
+    /// hold a read on one.
+    #[cfg(test)]
+    read_hold: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for DiskStore {
@@ -137,11 +143,12 @@ pub(crate) const MAX_ENTRY_BYTES: usize = 512 * 1024 * 1024;
 /// Cache entries are operator-adjacent data, not fully
 /// trusted input: a planted or corrupted oversized file
 /// must not turn a lookup or the boot scan into an
-/// unbounded allocation. `None` on IO error or an
-/// oversized file; both read as a corrupt entry upstream.
+/// unbounded allocation. `None` on IO error, an oversized
+/// file, or a path that is not a regular file; all read as
+/// a corrupt entry upstream.
 fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = open_regular(path)?;
     let mut data = Vec::new();
     file.by_ref()
         .take(cap.saturating_add(1) as u64)
@@ -151,6 +158,45 @@ fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
         return None;
     }
     Some(data)
+}
+
+/// Open `path` for reading if it is a regular file (issue
+/// #545). Only `put` writes entries, and it writes regular
+/// files, so anything else at an entry path was put there by
+/// someone else. A FIFO is the dangerous case: a plain open
+/// for reading waits in open(2) until a writer appears, which
+/// may be never, and holds a blocking thread and a disk
+/// permit all that time. So the open does not wait, and the
+/// type is checked on the open file rather than on the path,
+/// so a swap between the check and the open cannot slip one
+/// through. The flag is cleared before returning, so reads
+/// of a regular file behave as they always did. The open
+/// does not follow a symlink either: the check would then
+/// see the target, and the boot scan skips symlinks.
+#[cfg(unix)]
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let file = std::fs::File::from(fd);
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let flags = rustix::fs::fcntl_getfl(&file).ok()?;
+    rustix::fs::fcntl_setfl(&file, flags - OFlags::NONBLOCK).ok()?;
+    Some(file)
+}
+
+/// Elsewhere there are no FIFOs whose open waits; the type
+/// check still keeps reads to regular files.
+#[cfg(not(unix))]
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    let file = std::fs::File::open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
 }
 
 /// The temp file a `put` writes before renaming into place.
@@ -202,6 +248,8 @@ impl DiskStore {
             inner: Mutex::new(Inner::default()),
             errors: std::sync::atomic::AtomicU64::new(0),
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(DISK_OP_PERMITS)),
+            #[cfg(test)]
+            read_hold: Mutex::new(None),
         };
         store.scan()?;
         Ok(store)
@@ -299,6 +347,24 @@ impl DiskStore {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
+            // Only `put` writes entries, and it writes regular
+            // files (issue #545). Anything else here (a FIFO, a
+            // socket, a device, a directory, a symlink) was put
+            // there by someone else, and opening it can wait: a
+            // FIFO holds open(2) until a writer appears, and its
+            // length of 0 passes the size check below, so one
+            // held the boot before the server listened. The
+            // metadata comes from the directory entry and does
+            // not follow a symlink, so nothing is opened. The
+            // file is left in place, since the store did not
+            // make it, and logged so the operator sees it.
+            if !meta.is_file() {
+                eprintln!(
+                    "result storage: skipping {}: not a regular file",
+                    path.display()
+                );
+                continue;
+            }
             // `put` never writes an entry larger than the
             // budget, so a bigger file was not written by
             // this build: delete it on sight instead of
@@ -337,6 +403,23 @@ impl DiskStore {
         Ok(())
     }
 
+    /// Run `hold` ahead of every entry read from now on, or
+    /// stop with `None`.
+    #[cfg(test)]
+    pub(crate) fn set_read_hold(&self, hold: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        *self.read_hold.lock().unwrap() = hold;
+    }
+
+    #[cfg(test)]
+    fn run_read_hold(&self) {
+        // Cloned out first: the hook blocks, and the lock
+        // must stay free for `set_read_hold`.
+        let hold = self.read_hold.lock().unwrap().clone();
+        if let Some(hold) = hold {
+            hold();
+        }
+    }
+
     fn file_for(&self, stem: &str) -> PathBuf {
         self.dir.join(format!("{stem}.bin"))
     }
@@ -352,6 +435,8 @@ impl DiskStore {
             inner.entries.get(key)?.0.clone()
         };
         let path = self.file_for(&stem);
+        #[cfg(test)]
+        self.run_read_hold();
         let parsed =
             read_capped(&path, self.max_bytes).and_then(|data| parse_entry(&data, &self.entry_key));
         match parsed {
@@ -1664,6 +1749,215 @@ mod tests {
         assert!(store.get("300x200/file:///heroes/cat.jpg2").is_some());
         assert!(store.get("300x200/file:///heroes/dog.jpg").is_some());
         assert_eq!(store.purge_source("file:///heroes/cat.jpg"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Replaces whatever is at `path` with a FIFO.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo {}: {status}", path.display());
+    }
+
+    /// Runs `f` on a thread of its own and returns its result,
+    /// failing the test if `f` is still running after a while
+    /// (issue #545). A plain open of a FIFO for reading waits
+    /// until a writer appears, so a store that opens the FIFO
+    /// at `fifo` that way never returns. A read of a FIFO
+    /// whose `writer` stays open waits for its data, so a
+    /// store that reads one never returns either. Past the
+    /// limit, this closes `writer` and opens the FIFO's write
+    /// end until the thread finishes, so the test fails naming
+    /// `what` instead of hanging.
+    #[cfg(unix)]
+    fn unparked<T: Send>(
+        fifo: &Path,
+        mut writer: Option<rustix::fd::OwnedFd>,
+        what: &str,
+        f: impl FnOnce() -> T + Send,
+    ) -> T {
+        use std::sync::mpsc::RecvTimeoutError;
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = scope.spawn(move || {
+                let out = f();
+                let _ = done_tx.send(());
+                out
+            });
+            if let Err(RecvTimeoutError::Timeout) = done_rx.recv_timeout(LIMIT) {
+                // With its only writer gone, a read of the FIFO
+                // sees the end of file.
+                drop(writer.take());
+                while !worker.is_finished() {
+                    // Opening the write end lets a reader waiting
+                    // in open(2) go, and closing it is the end of
+                    // file that reader sees. With no reader the
+                    // open fails at once (ENXIO), so this never
+                    // waits itself.
+                    use rustix::fs::{Mode, OFlags};
+                    drop(rustix::fs::open(
+                        fifo,
+                        OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                panic!("{what} was still blocked on the FIFO after {LIMIT:?}");
+            }
+            worker.join().unwrap()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_an_entry_path_is_a_miss_and_is_removed() {
+        // Issue #545: a lookup must not open a FIFO that took
+        // an entry's place and wait for a writer. It is a
+        // corrupt entry: a miss, never served, and deleted.
+        let dir = temp_dir("fifo-get");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.put("k", &image(b"payload"));
+        let path = store.file_for(&key_stem("k"));
+        make_fifo(&path);
+        let got = unparked(&path, None, "a lookup", || store.get("k"));
+        assert!(got.is_none(), "a FIFO is never served");
+        assert!(!store.contains("k"), "the key leaves the index");
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the FIFO is deleted like a corrupt entry"
+        );
+        // The key stores and serves again.
+        store.put("k", &image(b"payload"));
+        assert_eq!(store.get("k").unwrap().bytes.as_ref(), b"payload");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_boot_scan_skips_a_fifo_at_an_entry_path_unopened() {
+        // Issue #545: a FIFO named like an entry held the boot
+        // scan in open(2), so the server never listened. The
+        // scan skips anything that is not a regular file
+        // without opening it, and leaves it in place.
+        let dir = temp_dir("fifo-scan");
+        {
+            let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+            store.put("good", &image(b"payload"));
+        }
+        let fifo = dir.join(format!("{}.bin", key_stem("planted")));
+        make_fifo(&fifo);
+        let store = unparked(&fifo, None, "the boot scan", || {
+            DiskStore::open(&dir, 1_000_000, test_entry_key())
+        })
+        .unwrap();
+        assert_eq!(store.stats().0, 1, "only the real entry is indexed");
+        assert_eq!(store.get("good").unwrap().bytes.as_ref(), b"payload");
+        let meta = std::fs::symlink_metadata(&fifo).expect("the FIFO is left in place");
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()));
+        // A write of that key replaces the FIFO with an entry.
+        store.put("planted", &image(b"fresh"));
+        assert_eq!(store.get("planted").unwrap().bytes.as_ref(), b"fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_with_a_writer_at_an_entry_path_is_a_miss() {
+        // Issue #545: while a writer holds the FIFO open, the
+        // open does not wait but a read does, for data that
+        // may never come. The type check on the open file is
+        // what keeps a lookup from reading it.
+        use rustix::fs::{Mode, OFlags};
+        let dir = temp_dir("fifo-writer-get");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.put("k", &image(b"payload"));
+        let path = store.file_for(&key_stem("k"));
+        make_fifo(&path);
+        // A write end opens without waiting only while the
+        // FIFO has a reader, so a reader opens first and goes
+        // once the writer is in.
+        let reader = rustix::fs::open(
+            &path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open the FIFO's read end");
+        let writer = rustix::fs::open(
+            &path,
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open the FIFO's write end");
+        drop(reader);
+        let got = unparked(&path, Some(writer), "a lookup", || store.get("k"));
+        assert!(got.is_none(), "a FIFO is never served");
+        assert!(!store.contains("k"), "the key leaves the index");
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the FIFO is deleted like a corrupt entry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_an_entry_path_is_a_miss_and_is_removed() {
+        // Issue #545: the boot scan skips a symlink, and a
+        // lookup does not follow one either, even to a valid
+        // entry. It is a corrupt entry: a miss, never served,
+        // and the link is deleted while its target stays.
+        let dir = temp_dir("symlink-get");
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        store.put("k", &image(b"payload"));
+        let path = store.file_for(&key_stem("k"));
+        let target = dir.join("moved-entry");
+        std::fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(store.get("k").is_none(), "a symlink is never followed");
+        assert!(!store.contains("k"), "the key leaves the index");
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the link is deleted like a corrupt entry"
+        );
+        assert!(target.is_file(), "the link's target is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_boot_scan_leaves_a_symlink_or_directory_at_an_entry_path_unindexed() {
+        // Issue #545: the scan skips anything that is not a
+        // regular file, not only a FIFO. A symlink, even to a
+        // valid entry, is not followed, indexed or deleted, and
+        // neither is a directory. Only the symlink pins the
+        // skip: a directory that reached the read would be
+        // refused there, and `remove_file` cannot delete it.
+        let dir = temp_dir("symlink-dir-scan");
+        let (link, target) = {
+            let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+            store.put("good", &image(b"payload"));
+            store.put("linked", &image(b"payload"));
+            let link = store.file_for(&key_stem("linked"));
+            let target = dir.join("moved-entry");
+            std::fs::rename(&link, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (link, target)
+        };
+        let planted = dir.join(format!("{}.bin", key_stem("planted")));
+        std::fs::create_dir(&planted).unwrap();
+        let store = DiskStore::open(&dir, 1_000_000, test_entry_key()).unwrap();
+        assert!(!store.contains("linked"), "a symlink is never indexed");
+        let meta = std::fs::symlink_metadata(&link).expect("the symlink is left in place");
+        assert!(meta.file_type().is_symlink());
+        assert!(target.is_file(), "the link's target is left alone");
+        assert!(planted.is_dir(), "the directory is left in place");
+        assert_eq!(store.stats().0, 1, "only the real entry is indexed");
+        assert_eq!(store.get("good").unwrap().bytes.as_ref(), b"payload");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
