@@ -1023,7 +1023,7 @@ impl Engine {
         // returned through `process_video` at decode. There is
         // no first-frame fallback: the request named a video
         // and this source cannot become one.
-        if format.is_video() {
+        let Some(still) = StillFormat::of(format) else {
             if directives.debug_focal {
                 return Err(EngineError::Unsupported(format!(
                     "debug:focal renders a diagnostic image and cannot be served as \
@@ -1036,11 +1036,11 @@ impl Engine {
                  (an animated GIF or WebP); this source is a still image",
                 crate::url::format_text(format)
             )));
-        }
-        let encoded = Self::encode_still(&img, format, &encode_opts, &ctx)?;
+        };
+        let encoded = Self::encode_still(&img, still, &encode_opts, &ctx)?;
         let bytes = Self::embed_source_meta(
             encoded.bytes,
-            format,
+            still,
             encode_opts.keep_profile,
             &source_meta,
             &ctx,
@@ -1510,7 +1510,7 @@ impl Engine {
     /// and the settled output format, for the still encode.
     fn resolve_still_quality(
         img: &DynamicImage,
-        format: ImageFormat,
+        format: StillFormat,
         encode_opts: &EncodeOptions,
         ctx: &ProcessContext<'_>,
     ) -> StillQuality {
@@ -1524,14 +1524,10 @@ impl Engine {
         let resolved_quality = encode_opts
             .quality
             .as_ref()
-            .and_then(|q| q.resolved_for(format));
+            .and_then(|q| q.resolved_for(format.into()));
         // Save-Data steps the default quality down one notch
         // (80 to 70) on the formats that carry a quality.
-        let save_data = ctx.save_data
-            && matches!(
-                format,
-                ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
-            );
+        let save_data = ctx.save_data && format.carries_quality();
         let (encode_quality, chosen_quality) =
             quality_in_force(resolved_quality, save_data, || auto_quality(img));
         // `quality(auto)` on a format with a decoder to verify
@@ -1540,7 +1536,7 @@ impl Engine {
         // score lands in the target band. The heuristic pick is
         // the first guess. Other formats keep the one-shot pick.
         let perceptual = matches!(resolved_quality, Some(ResolvedQuality::Auto))
-            && matches!(format, ImageFormat::Jpeg | ImageFormat::Jxl);
+            && matches!(format, StillFormat::Jpeg | StillFormat::Jxl);
         StillQuality {
             encode_quality,
             chosen_quality,
@@ -1554,7 +1550,7 @@ impl Engine {
     /// ladder, all drawing on one per-request encode budget.
     fn encode_still(
         img: &DynamicImage,
-        format: ImageFormat,
+        format: StillFormat,
         encode_opts: &EncodeOptions,
         ctx: &ProcessContext<'_>,
     ) -> Result<StillEncode, EngineError> {
@@ -1626,12 +1622,8 @@ impl Engine {
         // instead of wherever the encode pool runs out, and a
         // tight budget is never left silently unchased (issue
         // #229).
-        let quality_bearing = matches!(
-            format,
-            ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
-        );
         let mut ladder_ran = false;
-        if let Some(budget) = encode_opts.max_bytes.filter(|_| quality_bearing) {
+        if let Some(budget) = encode_opts.max_bytes.filter(|_| format.carries_quality()) {
             let mut current = chosen_quality.or(encode_quality).unwrap_or(80);
             let mut attempts = 0;
             while bytes.len() as u64 > budget
@@ -1684,7 +1676,7 @@ impl Engine {
     /// JPEG and PNG outputs carry either in this pass.
     fn embed_source_meta(
         bytes: Vec<u8>,
-        format: ImageFormat,
+        format: StillFormat,
         keep_profile: bool,
         source_meta: &crate::color::SourceMeta,
         ctx: &ProcessContext<'_>,
@@ -1696,10 +1688,10 @@ impl Engine {
                 None
             };
             match format {
-                ImageFormat::Jpeg => {
+                StillFormat::Jpeg => {
                     crate::color::inject_jpeg(&bytes, embed_icc, source_meta, ctx.preserve_metadata)
                 }
-                ImageFormat::Png => {
+                StillFormat::Png => {
                     crate::color::inject_png(&bytes, embed_icc, source_meta, ctx.preserve_metadata)
                 }
                 _ => bytes,
@@ -4568,7 +4560,7 @@ mod encode;
 #[cfg(test)]
 pub(in crate::engine) use encode::encode_png_indexed;
 pub(in crate::engine) use encode::{
-    EncodeBuffers, encode, gif_frame_quantized, max_quality_attempts, next_quality,
+    EncodeBuffers, StillFormat, encode, gif_frame_quantized, max_quality_attempts, next_quality,
 };
 
 /// One channel of a blend mode: the CSS formulas on the

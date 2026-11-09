@@ -33,10 +33,63 @@ pub(in crate::engine) fn next_quality(current: u8, steps_remaining: u32) -> u8 {
 
 /// How many re-encodes `max_bytes` may attempt per format before
 /// returning the smallest result it has.
-pub(in crate::engine) fn max_quality_attempts(format: ImageFormat) -> u32 {
+pub(in crate::engine) fn max_quality_attempts(format: StillFormat) -> u32 {
     match format {
-        ImageFormat::Avif => 4,
+        StillFormat::Avif => 4,
         _ => 12,
+    }
+}
+
+/// The formats a still image encodes to (issue #480): every
+/// output format but the video ones, which only the video path
+/// encodes. [`encode`] takes this, so its match has one arm per
+/// format and none it cannot reach; the still pipeline turns a
+/// video format away before it encodes anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::engine) enum StillFormat {
+    Jpeg,
+    Png,
+    WebP,
+    Avif,
+    Gif,
+    Jxl,
+}
+
+impl StillFormat {
+    /// The still format `format` names, or `None` for a video
+    /// format.
+    pub(in crate::engine) fn of(format: ImageFormat) -> Option<Self> {
+        match format {
+            ImageFormat::Jpeg => Some(StillFormat::Jpeg),
+            ImageFormat::Png => Some(StillFormat::Png),
+            ImageFormat::WebP => Some(StillFormat::WebP),
+            ImageFormat::Avif => Some(StillFormat::Avif),
+            ImageFormat::Gif => Some(StillFormat::Gif),
+            ImageFormat::Jxl => Some(StillFormat::Jxl),
+            ImageFormat::Mp4 | ImageFormat::WebM => None,
+        }
+    }
+
+    /// Whether the encoder takes a quality: the formats the
+    /// Save-Data step and the `max_bytes` ladder can move.
+    pub(in crate::engine) fn carries_quality(self) -> bool {
+        matches!(
+            self,
+            StillFormat::Jpeg | StillFormat::Jxl | StillFormat::Avif | StillFormat::WebP
+        )
+    }
+}
+
+impl From<StillFormat> for ImageFormat {
+    fn from(format: StillFormat) -> Self {
+        match format {
+            StillFormat::Jpeg => ImageFormat::Jpeg,
+            StillFormat::Png => ImageFormat::Png,
+            StillFormat::WebP => ImageFormat::WebP,
+            StillFormat::Avif => ImageFormat::Avif,
+            StillFormat::Gif => ImageFormat::Gif,
+            StillFormat::Jxl => ImageFormat::Jxl,
+        }
     }
 }
 
@@ -191,7 +244,7 @@ pub(in crate::engine) fn gif_frame_quantized(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine) fn encode(
     src: &EncodeBuffers<'_>,
-    format: ImageFormat,
+    format: StillFormat,
     quality: Option<u8>,
     fill: Option<[u8; 3]>,
     palette: Option<u16>,
@@ -201,25 +254,9 @@ pub(in crate::engine) fn encode(
 ) -> Result<Vec<u8>, EngineError> {
     let img = src.img;
     let (w, h) = (img.width(), img.height());
-    if format == ImageFormat::Jxl {
-        // Pure-Rust encoder (jixel). Its quality is a libjpeg-like
-        // 0-100 scale, matching the quality filter's semantics.
-        let config = jixel::EncodeConfig::default()
-            .with_quality(quality.unwrap_or(80) as f32)
-            .with_speed(jxl_speed);
-        let encoded = if img.color().has_alpha() {
-            jixel::encode_image_with_alpha(src.rgba().as_raw(), w as usize, h as usize, &config)
-        } else {
-            jixel::encode_image(src.rgb().as_raw(), w as usize, h as usize, &config)
-        };
-        return encoded.map_err(|e| EngineError::Encode(e.to_string()));
-    }
-    if format == ImageFormat::WebP {
-        return encode_webp(src, quality, format_options);
-    }
     let mut buf = Vec::new();
     match format {
-        ImageFormat::Jpeg => {
+        StillFormat::Jpeg => {
             // JPEG has no alpha channel. A fill color composites
             // transparency over that background; without one, the
             // stored RGB values are used as-is. Encoding uses the
@@ -262,7 +299,7 @@ pub(in crate::engine) fn encode(
             )
             .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
-        ImageFormat::Png => {
+        StillFormat::Png => {
             if let Some(max_colors) = palette {
                 return encode_png_indexed(src, max_colors, format_options.png_interlace);
             }
@@ -274,8 +311,8 @@ pub(in crate::engine) fn encode(
                 .write_image(img.as_bytes(), w, h, img.color().into())
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
-        ImageFormat::WebP => unreachable!("WebP returns early in encode"),
-        ImageFormat::Avif => {
+        StillFormat::WebP => return encode_webp(src, quality, format_options),
+        StillFormat::Avif => {
             // Pure-Rust ravif encoder via the image crate. The
             // speed tier is operator configuration; AVIF encoding
             // is the expensive step in the pipeline by a wide
@@ -289,16 +326,25 @@ pub(in crate::engine) fn encode(
             .write_image(img.as_bytes(), w, h, img.color().into())
             .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
-        ImageFormat::Gif => {
+        StillFormat::Gif => {
             let frame = gif_frame_quantized(src.rgba().as_raw(), w, h, 0)?;
             let mut enc = gif::Encoder::new(&mut buf, frame.width, frame.height, &[])
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
             enc.write_frame(&frame)
                 .map_err(|e| EngineError::Encode(e.to_string()))?;
         }
-        ImageFormat::Jxl => unreachable!("JPEG XL returns early in encode"),
-        ImageFormat::Mp4 | ImageFormat::WebM => {
-            unreachable!("video formats are encoded by process_video, never here")
+        StillFormat::Jxl => {
+            // Pure-Rust encoder (jixel). Its quality is a libjpeg-like
+            // 0-100 scale, matching the quality filter's semantics.
+            let config = jixel::EncodeConfig::default()
+                .with_quality(quality.unwrap_or(80) as f32)
+                .with_speed(jxl_speed);
+            let encoded = if img.color().has_alpha() {
+                jixel::encode_image_with_alpha(src.rgba().as_raw(), w as usize, h as usize, &config)
+            } else {
+                jixel::encode_image(src.rgb().as_raw(), w as usize, h as usize, &config)
+            };
+            return encoded.map_err(|e| EngineError::Encode(e.to_string()));
         }
     }
     Ok(buf)

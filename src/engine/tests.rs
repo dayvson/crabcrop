@@ -4143,7 +4143,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         .unwrap();
     let now = encode(
         &src,
-        ImageFormat::Jpeg,
+        StillFormat::Jpeg,
         Some(80),
         None,
         None,
@@ -4165,7 +4165,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         .to_vec();
     let now = encode(
         &src,
-        ImageFormat::WebP,
+        StillFormat::WebP,
         Some(80),
         None,
         None,
@@ -4183,7 +4183,7 @@ fn default_format_options_reproduce_the_standing_encoders() {
         .unwrap();
     let now = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4202,7 +4202,7 @@ fn jpeg_options_change_the_encode() {
     let encode_with = |options: FormatOptions| {
         encode(
             &src,
-            ImageFormat::Jpeg,
+            StillFormat::Jpeg,
             Some(80),
             None,
             None,
@@ -4247,7 +4247,7 @@ fn png_interlace_marks_the_file_and_round_trips() {
     let src = EncodeBuffers::new(&img);
     let plain = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4261,7 +4261,7 @@ fn png_interlace_marks_the_file_and_round_trips() {
     assert_eq!(plain[28], 0);
     let interlaced = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4299,7 +4299,7 @@ fn png_interlace_writes_16_bit_samples_big_endian() {
     let src = EncodeBuffers::new(&deep);
     let interlaced = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4481,7 +4481,7 @@ fn webp_options_change_the_encode() {
     let encode_with = |options: FormatOptions| {
         encode(
             &src,
-            ImageFormat::WebP,
+            StillFormat::WebP,
             Some(80),
             None,
             None,
@@ -4516,7 +4516,7 @@ fn webp_options_change_the_encode() {
     // and still decodes to the same pixels.
     let lossless = encode(
         &src,
-        ImageFormat::WebP,
+        StillFormat::WebP,
         Some(100),
         None,
         None,
@@ -4540,7 +4540,7 @@ fn format_options_do_not_leak_across_formats() {
     // JPEG encode must be the default one.
     let jpeg = encode(
         &src,
-        ImageFormat::Jpeg,
+        StillFormat::Jpeg,
         Some(80),
         None,
         None,
@@ -4556,7 +4556,7 @@ fn format_options_do_not_leak_across_formats() {
     .unwrap();
     let jpeg_default = encode(
         &src,
-        ImageFormat::Jpeg,
+        StillFormat::Jpeg,
         Some(80),
         None,
         None,
@@ -4569,7 +4569,7 @@ fn format_options_do_not_leak_across_formats() {
     // JPEG fields set while encoding a PNG.
     let png = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4584,7 +4584,7 @@ fn format_options_do_not_leak_across_formats() {
     .unwrap();
     let png_default = encode(
         &src,
-        ImageFormat::Png,
+        StillFormat::Png,
         None,
         None,
         None,
@@ -4654,7 +4654,7 @@ fn jxl_dimension_probe_accepts_small_and_rejects_huge() {
     let img = DynamicImage::ImageRgb8(image::RgbImage::new(24, 16));
     let bytes = encode(
         &EncodeBuffers::new(&img),
-        ImageFormat::Jxl,
+        StillFormat::Jxl,
         Some(80),
         None,
         None,
@@ -10093,8 +10093,8 @@ fn quality_ladder_steps_by_format() {
         q = next_quality(q, steps_left);
     }
     assert_eq!(q, 1, "four planned steps from 95 reach the floor");
-    assert_eq!(max_quality_attempts(ImageFormat::Avif), 4);
-    assert!(max_quality_attempts(ImageFormat::Jpeg) > 4);
+    assert_eq!(max_quality_attempts(StillFormat::Avif), 4);
+    assert!(max_quality_attempts(StillFormat::Jpeg) > 4);
 }
 
 #[test]
