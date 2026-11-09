@@ -1873,20 +1873,15 @@ fn render_frames(
         let delay = frame.delay();
         let img = DynamicImage::ImageRgba8(frame.into_buffer());
         let outcome = apply_operations(img, ops, cap, dpr, ctx, directives, Some(&mut share))?;
-        Ok::<_, EngineError>((outcome, delay))
+        Ok::<_, EngineError>((outcome.img, outcome.encode_opts, delay))
     };
-    let (
-        ApplyOutcome {
-            img, encode_opts, ..
-        },
-        delay,
-    ) = render(frames.first)?;
+    let (img, encode_opts, delay) = render(frames.first)?;
     budget.check_frames(img.width(), img.height(), frame_count)?;
     budget.charge(img.width(), img.height())?;
     let first = image::Frame::from_parts(img.to_rgba8(), 0, 0, delay);
     let mut rest = Vec::with_capacity(frames.rest.len());
     for frame in frames.rest {
-        let (ApplyOutcome { img, .. }, delay) = render(frame)?;
+        let (img, _, delay) = render(frame)?;
         budget.charge(img.width(), img.height())?;
         rest.push(image::Frame::from_parts(img.to_rgba8(), 0, 0, delay));
     }
