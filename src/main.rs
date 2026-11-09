@@ -1264,7 +1264,10 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// 16384 px source side through unchanged steps down to a
 /// factor whose output fits 16383 px, so `8192x1` on a
 /// 16384x2 source with `DPR: 2` serves 12288x2 instead of
-/// 16384x2 #529).
+/// 16384x2 #529; `upscale` and `remove_region` on a 16-bit
+/// or float source keep its alpha and its depth instead of
+/// serving opaque 8-bit RGB, which showed the color stored
+/// under transparent pixels #551).
 const RENDERING_VERSION: u32 = 4;
 
 /// Fingerprint the configuration that shapes rendered
