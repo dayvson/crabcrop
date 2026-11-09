@@ -2778,11 +2778,10 @@ fn segment_detection(
     det: &crate::ai::Detection,
 ) -> Result<image::GrayImage, EngineError> {
     let dims = (img.width(), img.height());
-    let stale = !matches!(memo, Some((w, h, _)) if (*w, *h) == dims);
-    if stale {
-        *memo = Some((dims.0, dims.1, provider.encode(img)));
+    if memo.as_ref().is_some_and(|(w, h, _)| (*w, *h) != dims) {
+        *memo = None;
     }
-    let (_, _, cached) = memo.as_ref().expect("memo just populated");
+    let (_, _, cached) = memo.get_or_insert_with(|| (dims.0, dims.1, provider.encode(img)));
     let embedding = cached
         .as_ref()
         .map_err(|e| EngineError::Inference(e.clone()))?;
@@ -3026,6 +3025,40 @@ impl SmartWindows {
             .iter()
             .find(|e| (e.op_index, e.width, e.height) == key)
             .map(|e| e.window)
+    }
+
+    /// A smart crop in an animated render sharing windows
+    /// across frames (issue #376): the first frame decides
+    /// through the traced crop (the trace reports the very
+    /// window the crop used) and later frames replay that
+    /// window verbatim, so the analysis runs once and the
+    /// framing cannot jitter. `op_index` is the crop's
+    /// position in the chain.
+    fn crop(
+        &mut self,
+        img: DynamicImage,
+        (tw, th): (u32, u32),
+        op_index: usize,
+        align: &Align,
+        ctx: &ProcessContext<'_>,
+    ) -> DynamicImage {
+        let key = (op_index, img.width(), img.height());
+        if let Some((x, y, cw, ch)) = self.get(key) {
+            DynamicImage::ImageRgba8(image::imageops::crop_imm(&img, x, y, cw, ch).to_image())
+        } else {
+            let (cropped, trace) = crate::crop::crop_to_aspect_traced(
+                img,
+                tw,
+                th,
+                align.clone(),
+                ctx.face_provider,
+                ctx.focal_provider,
+            );
+            if let Some(trace) = trace {
+                self.set(key, trace.window);
+            }
+            cropped
+        }
     }
 
     fn set(&mut self, key: (usize, u32, u32), window: (u32, u32, u32, u32)) {
@@ -3526,11 +3559,10 @@ impl<'r, 'a> ChainState<'r, 'a> {
             // runs on.
             Operation::Page(_) => {}
             Operation::Size(size) => {
-                img = if self.fusion.is_some_and(|plan| plan.size_index == op_index) {
-                    let window = self
-                        .fused_window
-                        .take()
-                        .expect("the fusion plan pairs this resize with its crop");
+                // A pending fused window (issue #287) is the
+                // plan's crop, waiting for this resize: the plan
+                // admits one resize per chain, after the crop.
+                img = if let Some(window) = self.fused_window.take() {
                     apply_size_cropped(
                         img,
                         window,
@@ -3794,12 +3826,12 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
             cropped
         } else if *align == Align::Smart
-            && self
+            && let Some(windows) = self
                 .share
-                .as_ref()
-                .is_some_and(|s| s.smart_windows.is_some())
+                .as_deref_mut()
+                .and_then(|s| s.smart_windows.as_mut())
         {
-            self.shared_smart_crop(img, (tw, th), op_index, align)
+            windows.crop(img, (tw, th), op_index, align, self.ctx)
         } else {
             crate::crop::crop_to_aspect_with(
                 img,
@@ -3894,12 +3926,17 @@ impl<'r, 'a> ChainState<'r, 'a> {
         (tw, th): (u32, u32),
         canvas: Option<DynamicImage>,
     ) -> Result<DynamicImage, EngineError> {
-        let cropped = match detect_faces(&mut self.face_memo, &img, self.ctx) {
-            Ok(faces) if !faces.is_empty() => {
-                let face = *faces
-                    .iter()
-                    .max_by_key(|f| f.w as u64 * f.h as u64)
-                    .expect("faces is non-empty");
+        let faces = match detect_faces(&mut self.face_memo, &img, self.ctx) {
+            Ok(faces) => faces,
+            Err(EngineError::Inference(_)) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let largest = faces
+            .iter()
+            .max_by_key(|f| f.w as u64 * f.h as u64)
+            .copied();
+        let cropped = match largest {
+            Some(face) => {
                 if let Some(canvas) = canvas {
                     let (cropped, window) = crate::crop::crop_around_face_traced(
                         img,
@@ -3921,7 +3958,7 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     crate::crop::crop_around_face(img, tw, th, &face, self.directives.face_padding)
                 }
             }
-            Ok(_) | Err(EngineError::Inference(_)) => {
+            None => {
                 if let Some(canvas) = canvas {
                     let (cropped, trace) = crate::crop::crop_to_aspect_traced(
                         img,
@@ -3946,7 +3983,6 @@ impl<'r, 'a> ChainState<'r, 'a> {
                     )
                 }
             }
-            Err(e) => return Err(e),
         };
         Ok(cropped)
     }
@@ -4037,43 +4073,6 @@ impl<'r, 'a> ChainState<'r, 'a> {
             }
         };
         Ok(cropped)
-    }
-
-    /// A smart crop in an animated render sharing windows
-    /// across frames (issue #376): the first frame decides
-    /// through the traced crop (the trace reports the very
-    /// window the crop used) and later frames replay that
-    /// window verbatim, so the analysis runs once and the
-    /// framing cannot jitter.
-    fn shared_smart_crop(
-        &mut self,
-        img: DynamicImage,
-        (tw, th): (u32, u32),
-        op_index: usize,
-        align: &Align,
-    ) -> DynamicImage {
-        let windows = self
-            .share
-            .as_deref_mut()
-            .and_then(|s| s.smart_windows.as_mut())
-            .expect("the crop checked the option");
-        let key = (op_index, img.width(), img.height());
-        if let Some((x, y, cw, ch)) = windows.get(key) {
-            DynamicImage::ImageRgba8(image::imageops::crop_imm(&img, x, y, cw, ch).to_image())
-        } else {
-            let (cropped, trace) = crate::crop::crop_to_aspect_traced(
-                img,
-                tw,
-                th,
-                align.clone(),
-                self.ctx.face_provider,
-                self.ctx.focal_provider,
-            );
-            if let Some(trace) = trace {
-                windows.set(key, trace.window);
-            }
-            cropped
-        }
     }
 
     /// Apply one filter of a `filters:` segment: watermark
