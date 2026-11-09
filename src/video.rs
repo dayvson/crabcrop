@@ -76,6 +76,44 @@ pub const MAX_FPS: u32 = 100;
 /// page wants that video.
 pub const MAX_DURATION_MS: u64 = 600_000;
 
+/// The formats the video path encodes to (issue #568): the
+/// two video outputs, which only animated sources reach and
+/// only the external encoder produces. [`VideoEncoder::encode`]
+/// takes this, so the argv it builds has one arm per format
+/// and none it cannot reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoFormat {
+    Mp4,
+    WebM,
+}
+
+impl VideoFormat {
+    /// The video format `format` names, or `None` for an
+    /// image format. Every format is listed, so a new one has
+    /// to say which it is.
+    pub fn of(format: ImageFormat) -> Option<Self> {
+        match format {
+            ImageFormat::Mp4 => Some(VideoFormat::Mp4),
+            ImageFormat::WebM => Some(VideoFormat::WebM),
+            ImageFormat::Jpeg
+            | ImageFormat::Png
+            | ImageFormat::WebP
+            | ImageFormat::Jxl
+            | ImageFormat::Avif
+            | ImageFormat::Gif => None,
+        }
+    }
+}
+
+impl From<VideoFormat> for ImageFormat {
+    fn from(format: VideoFormat) -> Self {
+        match format {
+            VideoFormat::Mp4 => ImageFormat::Mp4,
+            VideoFormat::WebM => ImageFormat::WebM,
+        }
+    }
+}
+
 /// One frame on its way to the encoder: composited RGBA
 /// pixels (post-operation, full canvas) and the delay the
 /// source assigned it, in milliseconds.
@@ -288,7 +326,7 @@ impl VideoEncoder {
     /// encoded video leaves on stdout. MP4 over a pipe cannot
     /// carry a seek-back index, so the fragmented flags are
     /// part of the contract, not a tuning choice.
-    fn argv(&self, plan: &Plan, format: ImageFormat) -> Vec<String> {
+    fn argv(&self, plan: &Plan, format: VideoFormat) -> Vec<String> {
         let mut args: Vec<String> = [
             "-nostdin",
             "-v",
@@ -311,7 +349,7 @@ impl VideoEncoder {
         .map(|s| s.to_string())
         .collect();
         match format {
-            ImageFormat::Mp4 => args.extend(
+            VideoFormat::Mp4 => args.extend(
                 [
                     "-c:v",
                     "libx264",
@@ -327,7 +365,7 @@ impl VideoEncoder {
                 .iter()
                 .map(|s| s.to_string()),
             ),
-            ImageFormat::WebM => args.extend(
+            VideoFormat::WebM => args.extend(
                 [
                     "-c:v",
                     "libvpx-vp9",
@@ -341,7 +379,6 @@ impl VideoEncoder {
                 .iter()
                 .map(|s| s.to_string()),
             ),
-            _ => unreachable!("video output is mp4 or webm"),
         }
         args.push("pipe:1".to_string());
         args
@@ -352,7 +389,7 @@ impl VideoEncoder {
     pub fn encode(
         &self,
         frames: &[VideoFrame],
-        format: ImageFormat,
+        format: VideoFormat,
     ) -> Result<Vec<u8>, VideoError> {
         let plan = plan(frames)?;
         let argv = self.argv(&plan, format);
@@ -533,7 +570,7 @@ mod tests {
             .pixels
             .put_pixel(0, 0, image::Rgba([100, 200, 50, 128]));
         let frames = vec![first, frame(5, 3, [0, 0, 255, 255], 300)];
-        let out = encoder.encode(&frames, ImageFormat::Mp4).unwrap();
+        let out = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
         assert_eq!(out, b"FAKE-MP4-BYTES");
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         let args: Vec<&str> = argv.lines().collect();
@@ -630,7 +667,7 @@ mod tests {
             wide.pixels.put_pixel(16_381, y, image::Rgba(kept));
             wide.pixels.put_pixel(16_382, y, image::Rgba(dropped));
         }
-        encoder.encode(&[wide], ImageFormat::Mp4).unwrap();
+        encoder.encode(&[wide], VideoFormat::Mp4).unwrap();
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(argv.lines().any(|arg| arg == "16382x4"), "{argv}");
         let stdin = std::fs::read(&stdin_file).unwrap();
@@ -656,7 +693,7 @@ mod tests {
         );
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
         let frames = vec![frame(4, 4, [9, 9, 9, 255], 100)];
-        let out = encoder.encode(&frames, ImageFormat::WebM).unwrap();
+        let out = encoder.encode(&frames, VideoFormat::WebM).unwrap();
         assert_eq!(out, b"FAKE-WEBM");
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(argv.contains("libvpx-vp9"), "{argv}");
@@ -670,7 +707,7 @@ mod tests {
         let script = "#!/bin/sh\ncat > /dev/null\necho 'encoder exploded' >&2\nexit 3\n";
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
-        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
         assert!(matches!(err, VideoError::Failed(_)), "{err:?}");
         assert!(err.to_string().contains("exit status: 3"), "{err}");
         assert!(err.to_string().contains("encoder exploded"), "{err}");
@@ -681,14 +718,14 @@ mod tests {
         let script_path = fake_encoder(&dir, "#!/bin/sh\nprintf 'x'\n");
         let encoder = VideoEncoder::with_defaults(&script_path).unwrap();
         std::fs::remove_file(&script_path).unwrap();
-        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
         assert!(err.to_string().contains("could not be started"), "{err}");
 
         // Empty output is a failure, not an empty video.
         let dir = test_dir("fail-empty");
         let script = "#!/bin/sh\ncat > /dev/null\n";
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
-        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
         assert!(err.to_string().contains("no output"), "{err}");
     }
 
@@ -705,7 +742,7 @@ mod tests {
         );
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, &script)).unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
-        let out = encoder.encode(&frames, ImageFormat::Mp4).unwrap();
+        let out = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
         assert_eq!(out, b"FAKE-MP4");
         let cwd = std::fs::read_to_string(&cwd_file).unwrap();
         assert_eq!(
@@ -723,7 +760,7 @@ mod tests {
         let script = "#!/bin/sh\ncat > /dev/null\nhead -c 2000 /dev/zero | tr '\\000' x >&2\necho ' the real failure' >&2\nexit 1\n";
         let encoder = VideoEncoder::with_defaults(fake_encoder(&dir, script)).unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
-        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
         assert!(err.to_string().ends_with("x the real failure"), "{err}");
     }
 
@@ -734,7 +771,7 @@ mod tests {
         let encoder =
             VideoEncoder::new(fake_encoder(&dir, script), Duration::from_secs(30), 1024).unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
-        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
         assert!(
             err.to_string().contains("exceeded the 1024 byte cap"),
             "{err}"
@@ -753,7 +790,7 @@ mod tests {
         .unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
         let started = Instant::now();
-        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -783,7 +820,7 @@ mod tests {
         .unwrap();
         let frames = vec![frame(4, 2, [1, 2, 3, 255], 100)];
         let started = Instant::now();
-        let err = encoder.encode(&frames, ImageFormat::Mp4).unwrap_err();
+        let err = encoder.encode(&frames, VideoFormat::Mp4).unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -828,10 +865,10 @@ mod tests {
             frame(64, 48, [200, 40, 40, 255], 100),
             frame(64, 48, [40, 40, 200, 255], 100),
         ];
-        let mp4 = encoder.encode(&frames, ImageFormat::Mp4).unwrap();
+        let mp4 = encoder.encode(&frames, VideoFormat::Mp4).unwrap();
         assert!(mp4.len() > 100, "suspiciously small MP4: {}", mp4.len());
         assert_eq!(&mp4[4..8], b"ftyp", "MP4 has no ftyp box");
-        let webm = encoder.encode(&frames, ImageFormat::WebM).unwrap();
+        let webm = encoder.encode(&frames, VideoFormat::WebM).unwrap();
         assert!(webm.len() > 100, "suspiciously small WebM: {}", webm.len());
         assert_eq!(
             &webm[0..4],
