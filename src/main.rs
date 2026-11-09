@@ -11,10 +11,11 @@
 //!
 //! Boot is three steps (issue #477): [`Config::from_env`]
 //! (in `config.rs`) reads and validates every setting,
-//! [`build_state`] builds the stores and providers from
-//! them, and `run` binds and serves. Every environment
-//! variable is documented in `docs/configuration.md`, the
-//! single reference for configuration.
+//! [`open_stores`] and [`build_state`] build the stores and
+//! providers from them, and `run` binds and serves. Every
+//! environment variable is documented in
+//! `docs/configuration.md`, the single reference for
+//! configuration.
 
 #![forbid(unsafe_code)]
 
@@ -122,16 +123,18 @@ async fn start() -> Option<std::time::Instant> {
 /// the runtime must stop.
 async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let config = Config::from_env(|name| env::var(name).ok())?;
-    // The listener binds before anything is built: a taken
-    // port is a cheap failure and should not wait for the
-    // stores to open or the model embedding passes to be
-    // paid first (bind early, serve late).
+    // The result stores open, and then the listener binds,
+    // before the AI preload: a taken port or an unwritable
+    // directory is a cheap failure and should not wait for
+    // the model embedding passes to be paid first (bind
+    // early, serve late).
+    let stores = open_stores(&config)?;
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
     // The port the listener holds, which the listening line
     // names: the configured one, or for PORT=0 the free port
     // the kernel picked (issue #536).
     let port = listener.local_addr()?.port();
-    let state = build_state(&config)?;
+    let state = build_state(&config, stores)?;
     println!(
         "source fetch: cap {} MB, timeout {}s, buffer budget {} MB",
         config.fetch_cap_mb,
@@ -220,15 +223,21 @@ const AI_GATE_PERMITS: usize = 2;
 /// run one at a time, on top of the slow lane (issue #324).
 const ANIM_GATE_PERMITS: usize = 1;
 
-/// Build the server state from a validated configuration:
-/// the stores, every configured provider, and the loader,
-/// in the order boot has always built them, each printing
-/// its line when it is configured. A component that is
-/// configured but does not build (a store that does not
-/// open, a model that does not load, a tool that does not
-/// run) is fatal here, not a surprise for the first request
-/// that needs it.
-fn build_state(config: &Config) -> Result<AppState, ConfigError> {
+/// The result stores a configuration names, opened (see
+/// [`open_stores`]) for [`build_state`].
+struct Stores {
+    /// Disk result storage (`CRABCROP_RESULT_STORAGE_DIR`).
+    disk: Option<Arc<crate::storage::DiskStore>>,
+    /// Shared result storage (`CRABCROP_RESULT_BUCKET`).
+    shared: Option<Arc<crate::s3store::S3Store>>,
+}
+
+/// Open the result stores a validated configuration names,
+/// each printing its line. `run` opens them before it binds
+/// the listener, as boot always has, and before
+/// [`build_state`] loads any model: a store that does not
+/// open is a cheap failure, reported ahead of a taken port.
+fn open_stores(config: &Config) -> Result<Stores, ConfigError> {
     // The entry MAC key for the persistent tiers (issue
     // #190): derived from the current signing secret, so
     // entries planted by anyone without it read as misses,
@@ -238,7 +247,7 @@ fn build_state(config: &Config) -> Result<AppState, ConfigError> {
     let entry_key = crate::url::entry_key(&config.keyring.current);
     // Disk result storage, bounded by its own budget.
     // Opening indexes whatever a previous run left behind.
-    let store = match &config.result_storage {
+    let disk = match &config.result_storage {
         Some(storage) => {
             let store = crate::storage::DiskStore::open(
                 std::path::Path::new(&storage.dir),
@@ -258,7 +267,7 @@ fn build_state(config: &Config) -> Result<AppState, ConfigError> {
     // Shared result storage (issue #142): the bucket tier
     // reuses the source S3 configuration (endpoint, region,
     // and the AWS credentials from the environment).
-    let shared_store = match &config.result_bucket {
+    let shared = match &config.result_bucket {
         Some(shared) => {
             let store = crate::s3store::S3Store::new(
                 shared.bucket.clone(),
@@ -266,7 +275,7 @@ fn build_state(config: &Config) -> Result<AppState, ConfigError> {
                 config.sources.s3_endpoint.clone(),
                 config.sources.s3_region.clone(),
                 config.sources.aws_creds.clone(),
-                entry_key.clone(),
+                entry_key,
             )
             .map_err(|e| {
                 ConfigError::build(
@@ -282,7 +291,18 @@ fn build_state(config: &Config) -> Result<AppState, ConfigError> {
         }
         None => None,
     };
+    Ok(Stores { disk, shared })
+}
 
+/// Build the server state from a validated configuration
+/// and its opened stores: every configured provider and
+/// the loader, in the order boot has always built them,
+/// each printing its line when it is configured. A
+/// component that is configured but does not build (a
+/// model that does not load, a tool that does not run) is
+/// fatal here, not a surprise for the first request that
+/// needs it.
+fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError> {
     // AI models are configured, never downloaded, and preloaded
     // at boot: a model that is set but broken is a startup
     // error, not a surprise for the first request that uses it.
@@ -354,8 +374,8 @@ fn build_state(config: &Config) -> Result<AppState, ConfigError> {
         focal: ai.focal,
         font,
         fallback,
-        store,
-        shared_store,
+        store: stores.disk,
+        shared_store: stores.shared,
         upload: config.upload.clone(),
         meta_enabled: config.meta_enabled,
         ai_gate: Arc::new(tokio::sync::Semaphore::new(AI_GATE_PERMITS)),
@@ -2422,7 +2442,7 @@ mod tests {
             ("CRABCROP_META_MODE", "1"),
         ]))
         .unwrap();
-        let state = build_state(&config).unwrap();
+        let state = build_state(&config, open_stores(&config).unwrap()).unwrap();
         // The gate sizes are the documented constants.
         assert_eq!(state.ai_gate.available_permits(), AI_GATE_PERMITS);
         assert_eq!(state.anim_gate.available_permits(), ANIM_GATE_PERMITS);
@@ -2452,7 +2472,9 @@ mod tests {
             ("CRABCROP_FONT_PATH", font.as_str()),
         ]))
         .unwrap();
-        let err = build_state(&config).map(|_| ()).unwrap_err();
+        let err = build_state(&config, open_stores(&config).unwrap())
+            .map(|_| ())
+            .unwrap_err();
         assert!(
             matches!(
                 err,

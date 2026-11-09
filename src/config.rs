@@ -1,9 +1,9 @@
 //! The server's configuration (issue #477): every
 //! environment variable the server reads, parsed and
 //! validated in one place, [`Config::from_env`], before
-//! any store opens or any model loads. `build_state` in
-//! `main.rs` then builds the stores and providers from a
-//! [`Config`], and `run` binds and serves.
+//! any store opens or any model loads. `open_stores` and
+//! `build_state` in `main.rs` then build the stores and
+//! providers from a [`Config`], and `run` binds and serves.
 //!
 //! Every lookup goes through an injected `get` (a name to
 //! value lookup), so each step here is unit-tested without
@@ -270,8 +270,10 @@ impl Config {
     /// environment). Nothing is built here but the upload
     /// destination, whose validation is its construction
     /// (the directory is created and checked against the
-    /// file root, which it may become); the stores and
-    /// providers are `build_state`'s.
+    /// file root, which it may become, and the directory
+    /// is created when it does not exist yet); the result
+    /// stores are `open_stores`'s, and the providers
+    /// `build_state`'s.
     ///
     /// The settings are read in the order boot has always
     /// read them, so of two bad settings the same one is
