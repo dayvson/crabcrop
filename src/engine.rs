@@ -11,7 +11,8 @@ use image::DynamicImage;
 use crate::filters::EncodeOptions;
 use crate::quality::auto_quality;
 use crate::url::{
-    Align, Dimension, Filter, FormatOptions, ImageFormat, ImageSize, Operation, PadFill, Quality,
+    Align, Dimension, Filter, FormatOptions, ImageFormat, ImageSize, Operation, PadFill,
+    ResolvedQuality,
 };
 
 /// Register the JPEG XL decoder with the image crate, once.
@@ -848,6 +849,30 @@ struct StillEncode {
     ssim: Option<f64>,
 }
 
+/// A resolved quality directive as an encode runs it: the
+/// quality the encode uses (`None` keeps the encoder default)
+/// and the quality reported back, set when the service chose
+/// it. `quality(auto)` is chosen by `pick` and reported. With
+/// no directive in force, `save_data` steps the default down
+/// one notch and reports the step like an auto pick; an
+/// explicit `quality(...)` of either kind stands. The still
+/// and the animated WebP encodes both resolve through here.
+fn quality_in_force(
+    resolved: Option<ResolvedQuality>,
+    save_data: bool,
+    pick: impl FnOnce() -> u8,
+) -> (Option<u8>, Option<u8>) {
+    match resolved {
+        Some(ResolvedQuality::Value(q)) => (Some(q), None),
+        Some(ResolvedQuality::Auto) => {
+            let q = pick();
+            (Some(q), Some(q))
+        }
+        None if save_data => (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY)),
+        None => (None, None),
+    }
+}
+
 /// Decodes, resizes, and encodes images.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Engine;
@@ -1500,36 +1525,21 @@ impl Engine {
             .quality
             .as_ref()
             .and_then(|q| q.resolved_for(format));
-        let (encode_quality, chosen_quality) = match resolved_quality {
-            Some(Quality::Value(q)) => (Some(q), None),
-            Some(Quality::Auto) => {
-                let q = auto_quality(img);
-                (Some(q), Some(q))
-            }
-            // resolved_for never returns the list itself.
-            Some(Quality::PerFormat(_)) => {
-                unreachable!("resolved_for resolves per-format quality to a single value")
-            }
-            // Save-Data steps the default quality down one
-            // notch (80 to 70) on the formats that carry a
-            // quality, and reports the step like an auto pick.
-            // An explicit quality(...) of either kind stands.
-            None if ctx.save_data
-                && matches!(
-                    format,
-                    ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
-                ) =>
-            {
-                (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY))
-            }
-            None => (None, None),
-        };
+        // Save-Data steps the default quality down one notch
+        // (80 to 70) on the formats that carry a quality.
+        let save_data = ctx.save_data
+            && matches!(
+                format,
+                ImageFormat::Jpeg | ImageFormat::Jxl | ImageFormat::Avif | ImageFormat::WebP
+            );
+        let (encode_quality, chosen_quality) =
+            quality_in_force(resolved_quality, save_data, || auto_quality(img));
         // `quality(auto)` on a format with a decoder to verify
         // against (JPEG, JXL) closes the loop: encode, decode,
         // score with SSIMULACRA2, and bisect on quality until the
         // score lands in the target band. The heuristic pick is
         // the first guess. Other formats keep the one-shot pick.
-        let perceptual = matches!(resolved_quality, Some(Quality::Auto))
+        let perceptual = matches!(resolved_quality, Some(ResolvedQuality::Auto))
             && matches!(format, ImageFormat::Jpeg | ImageFormat::Jxl);
         StillQuality {
             encode_quality,
@@ -1765,26 +1775,16 @@ impl Engine {
         // unspecified quality down one notch. GIF output has no
         // quality lever, so nothing resolves for it.
         let (encode_quality, chosen_quality) = if format == ImageFormat::WebP {
-            match encode_opts
+            let resolved = encode_opts
                 .quality
                 .as_ref()
-                .and_then(|q| q.resolved_for(format))
-            {
-                Some(Quality::Value(q)) => (Some(q), None),
-                Some(Quality::Auto) => {
-                    let first = out_frames
-                        .first()
-                        .expect("process_animated is called with at least one frame");
-                    let q = auto_quality(&DynamicImage::ImageRgba8(first.buffer().clone()));
-                    (Some(q), Some(q))
-                }
-                // resolved_for never returns the list itself.
-                Some(Quality::PerFormat(_)) => {
-                    unreachable!("resolved_for resolves per-format quality to a single value")
-                }
-                None if ctx.save_data => (Some(SAVE_DATA_QUALITY), Some(SAVE_DATA_QUALITY)),
-                None => (None, None),
-            }
+                .and_then(|q| q.resolved_for(format));
+            quality_in_force(resolved, ctx.save_data, || {
+                let first = out_frames
+                    .first()
+                    .expect("process_animated is called with at least one frame");
+                auto_quality(&DynamicImage::ImageRgba8(first.buffer().clone()))
+            })
         } else {
             (None, None)
         };
