@@ -79,8 +79,9 @@ fn decode_failed(cause: impl std::fmt::Display) -> EngineError {
 /// at all. So this walks every item the decode can reach (the
 /// primary's derivation tree with its alpha and depth
 /// auxiliaries, the gain map item, and the primary's `altr`
-/// alternatives, which the decoder falls back to when the
-/// primary itself fails) and checks each one three times:
+/// alternatives with their own gain maps, which the decoder
+/// falls back to when the primary itself fails) and checks each
+/// one three times:
 ///
 /// - its codec: a coded item (or a tiled item's tiles) must be
 ///   HEVC, through [`check_hevc_coded`] (issue #466), so the
@@ -97,6 +98,7 @@ fn decode_failed(cause: impl std::fmt::Display) -> EngineError {
 /// its configuration record only.
 fn validate_decode_budget(bytes: &[u8]) -> Result<(), EngineError> {
     let file = oxideav_heif::HeifFile::parse_borrowed(bytes).map_err(decode_failed)?;
+    check_item_graphs(&file, bytes.len())?;
     let mut seen = std::collections::HashSet::new();
     if let Ok(node) = oxideav_heif::build_primary_graph(&file) {
         validate_node(&file, &node, &mut seen)?;
@@ -110,10 +112,16 @@ fn validate_decode_budget(bytes: &[u8]) -> Result<(), EngineError> {
     if let Ok(meta) = file.meta() {
         for group in meta.groups_containing(primary.id, b"altr") {
             for &alt in &group.entity_ids {
-                if alt != primary.id
-                    && let Ok(node) = oxideav_heif::build_graph(&file, alt)
-                {
+                if alt == primary.id {
+                    continue;
+                }
+                if let Ok(node) = oxideav_heif::build_graph(&file, alt) {
                     validate_node(&file, &node, &mut seen)?;
+                }
+                // The decode of an alternative decodes its gain
+                // map too, as it does the primary's.
+                if let Some(gain) = gain_map_node(&file, alt) {
+                    validate_node(&file, &gain, &mut seen)?;
                 }
             }
         }
@@ -121,19 +129,563 @@ fn validate_decode_budget(bytes: &[u8]) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// The gain map image of a primary that is not itself a `tmap`
-/// (a `tmap` primary's gain map is its second input, already in
-/// its graph): the second derivation input of the `tmap` item
-/// whose first input is the primary, mirroring the decoder's
-/// own lookup in `find_gain_map`.
+/// The most work the derivation-graph walks of one decode may
+/// do, in the units [`GraphCost`] counts: table entries scanned
+/// plus the property, payload, and name bytes read. A grid of
+/// 1,024 distinct tiles (the most 256 px tiles the decode
+/// budget holds) with a thumbnail and two metadata items costs
+/// about 4.5 million, some 15 times less.
+const MAX_GRAPH_WORK: u64 = 1 << 26;
+
+/// The most the graphs a decode builds may hold at once, in
+/// bytes as [`GraphCost`] estimates them. The same grid of
+/// 1,024 tiles, each with the usual four properties, holds
+/// about 12 MiB by that estimate, some 11 times less.
+const MAX_GRAPH_BYTES: u64 = 128 << 20;
+
+/// Refuse a file whose item graphs would cost more than
+/// [`MAX_GRAPH_WORK`] to build, or hold more than
+/// [`MAX_GRAPH_BYTES`] once built, before any of them is built.
+///
+/// oxideav-heif builds a derivation graph by visiting an item
+/// once for every reference that reaches it, with no memo, up
+/// to 65,536 visits. Each visit scans the file's item,
+/// association, and reference tables, looks up every metadata
+/// item that describes the item, parses its properties, and
+/// copies a derived item's payload. Each visit also adds a node
+/// to the graph, holding a copy of the item's entry (its name
+/// included), its parsed properties, and the entries of the
+/// metadata items that describe it. So an item that many
+/// references reach is walked, and held, many times over. The
+/// probe, the pre-decode validation, the colour lookup, and the
+/// decode itself each build these graphs.
+///
+/// This works out what the walks will cost from the tables
+/// alone: each item's own cost once, summed along the
+/// references with a memo, so the estimate is linear in the
+/// tables. Where the walk would stop (a reference cycle, a
+/// chain deeper than it follows), the estimate stops too.
+///
+/// The graphs counted are the ones the decode builds, each as
+/// many times as the decode holds it at once. The decode tries
+/// the primary item first and then, should that fail, each of
+/// the primary's `altr` alternatives in turn. Each try builds
+/// the item's graph, builds it a second time while holding the
+/// first, and then, while holding both, builds the graph of the
+/// item's gain map image: the second input of a `tmap` item,
+/// whether the item is that `tmap` or its first input. So a try
+/// counts the item's graph twice and the gain map's graph once
+/// more, with the `tmap` item's payload and properties, which
+/// the gain map lookup copies. The tries are added up, though
+/// each lets go of its graphs before the next starts.
+fn check_item_graphs<D: AsRef<[u8]>>(
+    file: &oxideav_heif::HeifFile<D>,
+    source_len: usize,
+) -> Result<(), EngineError> {
+    let total = decode_graph_cost(file, source_len);
+    if total.work > MAX_GRAPH_WORK {
+        return Err(decode_failed(format!(
+            "its item graph takes more than {MAX_GRAPH_WORK} steps to walk"
+        )));
+    }
+    if total.held > MAX_GRAPH_BYTES {
+        return Err(decode_failed(format!(
+            "its item graph would hold more than {} MiB once built",
+            MAX_GRAPH_BYTES >> 20
+        )));
+    }
+    Ok(())
+}
+
+/// What [`check_item_graphs`] holds against its bounds: the
+/// cost of every try the decode makes, added up, counted no
+/// further than past [`Cost::LIMIT`].
+fn decode_graph_cost<D: AsRef<[u8]>>(file: &oxideav_heif::HeifFile<D>, source_len: usize) -> Cost {
+    let (Ok(meta), Ok(primary)) = (file.meta(), file.primary_item()) else {
+        return Cost::default();
+    };
+    let mut cost = GraphCost::new(meta, source_len as u64);
+    let mut tries = vec![primary.id];
+    for group in meta.groups_containing(primary.id, b"altr") {
+        tries.extend(group.entity_ids.iter().filter(|&&id| id != primary.id));
+    }
+    let mut total = Cost::default();
+    for item in tries {
+        total = total.plus(cost.decode(item, Cost::LIMIT.less(total)));
+        if total.exceeds(Cost::LIMIT) {
+            break;
+        }
+    }
+    total
+}
+
+/// What walking part of an item graph costs: the work the walk
+/// does, and the bytes the graph it builds holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Cost {
+    work: u64,
+    held: u64,
+}
+
+impl Cost {
+    /// The most [`check_item_graphs`] lets the walks cost.
+    const LIMIT: Cost = Cost {
+        work: MAX_GRAPH_WORK,
+        held: MAX_GRAPH_BYTES,
+    };
+
+    fn work(work: u64) -> Cost {
+        Cost { work, held: 0 }
+    }
+
+    fn held(held: u64) -> Cost {
+        Cost { work: 0, held }
+    }
+
+    fn plus(self, other: Cost) -> Cost {
+        Cost {
+            work: self.work.saturating_add(other.work),
+            held: self.held.saturating_add(other.held),
+        }
+    }
+
+    /// What is left of `self` once `spent` is taken out of it.
+    fn less(self, spent: Cost) -> Cost {
+        Cost {
+            work: self.work.saturating_sub(spent.work),
+            held: self.held.saturating_sub(spent.held),
+        }
+    }
+
+    /// Whether either count is past `limit`'s.
+    fn exceeds(self, limit: Cost) -> bool {
+        self.work > limit.work || self.held > limit.held
+    }
+}
+
+/// The bytes a graph node takes in the list or box that holds
+/// it. The derivation inputs' list is sized to fit. The other
+/// lists grow as nodes are pushed: a list's first allocation
+/// holds four, and it never holds more than twice its length
+/// after, so [`GraphCost`] charges a node in one of those at
+/// four times this size.
+const NODE_BYTES: u64 = std::mem::size_of::<oxideav_heif::derived::ImageNode>() as u64;
+
+/// A property entry of a node, before what its parse holds.
+const ENTRY_BYTES: u64 = std::mem::size_of::<oxideav_heif::props::PropertyEntry>() as u64;
+
+/// A copy of an item's entry, before its strings.
+const INFO_BYTES: u64 = std::mem::size_of::<oxideav_heif::meta::ItemInfo>() as u64;
+
+/// The allocator's own overhead, charged once for each copy of
+/// an item's entry, each list a node starts, and each property
+/// whose parse holds anything of its body.
+const ALLOCATION_SLACK: u64 = 64;
+
+/// What a property costs each time a visit resolves it: the
+/// work of reading its body, and the bytes its parse holds
+/// besides its entry. A `tilC` property also names the
+/// properties of the tiles of a `tili` item, which a visit
+/// resolves too.
+struct PropertyCost {
+    parse: Cost,
+    /// The property index of each tile property a `tilC` names,
+    /// `0` (no property) included; `None` for any other property.
+    tile_properties: Option<Vec<u16>>,
+}
+
+impl PropertyCost {
+    fn of(raw: &oxideav_heif::meta::RawProperty) -> Self {
+        use oxideav_heif::props::Property;
+        let body = raw.body.len() as u64;
+        let parsed = Property::parse(raw);
+        // A parse keeps an ICC profile, or a box the parser does
+        // not know, as bytes: at most twice the body. Any other
+        // parse is held at up to 32 times its body, since two
+        // bytes of a parameter-set list become a 24-byte list of
+        // their own. A parse that fails ends the build. Each
+        // parse of a body that is not empty may also take an
+        // allocation of its own, which the allocator rounds up.
+        let factor = match &parsed {
+            Ok(Property::Unknown(_) | Property::Colr(_)) | Err(_) => 2,
+            Ok(_) => 32,
+        };
+        let slack = if body == 0 { 0 } else { ALLOCATION_SLACK };
+        let tile_properties = match parsed {
+            Ok(Property::TilC(tilc)) => Some(
+                tilc.in_file_tiles
+                    .map(|(_, list)| list.into_iter().map(|(_, index)| index).collect())
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        };
+        PropertyCost {
+            parse: Cost {
+                work: 1 + body,
+                held: body.saturating_mul(factor).saturating_add(slack),
+            },
+            tile_properties,
+        }
+    }
+
+    /// The cost of a property entry: the entry itself, which
+    /// holds the parse, and what the parse holds besides.
+    fn entry(&self) -> Cost {
+        self.parse.plus(Cost::held(ENTRY_BYTES))
+    }
+}
+
+/// The cost model behind [`check_item_graphs`], built in one
+/// pass over the tables: what every item visit scans and holds,
+/// what each item adds to that, and the references a visit
+/// follows, in the walk's own order (derivation inputs, then
+/// auxiliary images, then thumbnails).
+struct GraphCost {
+    /// The table entries every visit scans: the item list once
+    /// (the lookup), the associations once (the properties),
+    /// the references four times (inputs, auxiliaries,
+    /// thumbnails, metadata), and the targets of every
+    /// auxiliary, thumbnail, and metadata reference; and the
+    /// lists every node starts.
+    per_visit: Cost,
+    /// What a visit of each item adds: the copy of its entry,
+    /// its properties, an item lookup and a copied entry per
+    /// metadata item describing it, for a derived item a
+    /// location lookup and its payload, and for an item with an
+    /// auxiliary image, one more scan of the references and a
+    /// copy of its `prem` targets, which the alpha check reads.
+    own: std::collections::HashMap<u32, Cost>,
+    inputs: std::collections::HashMap<u32, Vec<u32>>,
+    auxiliaries: std::collections::HashMap<u32, Vec<u32>>,
+    thumbnails: std::collections::HashMap<u32, Vec<u32>>,
+    /// The `tmap` item whose gain map a decode of an item
+    /// reaches: the item itself when it is a `tmap`, else the
+    /// first `tmap` whose first input it is.
+    gain_maps: std::collections::HashMap<u32, u32>,
+    /// What one gain map lookup scans: the item list, and the
+    /// references once for each `tmap` item.
+    gain_lookup: u64,
+    /// The cost of every subtree walked to its end, but for the
+    /// node at its root, which its parent's list holds.
+    done: std::collections::HashMap<u32, Cost>,
+    /// The items on the current chain, for the cycle check.
+    chain: Vec<u32>,
+}
+
+impl GraphCost {
+    fn new(meta: &oxideav_heif::meta::Meta, source_len: u64) -> Self {
+        use oxideav_heif::meta::{self as heif, reference};
+        let items = meta.items.len() as u64;
+        // The entry each lookup finds: the first with the id.
+        let mut entries = std::collections::HashMap::new();
+        for item in &meta.items {
+            entries.entry(item.id).or_insert(item);
+        }
+        let entry_bytes = |id: u32| -> u64 {
+            entries.get(&id).map_or(0, |item| {
+                [
+                    Some(&item.name),
+                    item.content_type.as_ref(),
+                    item.content_encoding.as_ref(),
+                    item.item_uri_type.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|s| s.len() as u64)
+                .fold(0u64, u64::saturating_add)
+            })
+        };
+        let mut per_visit_work = items + meta.associations.len() as u64;
+        let mut own = std::collections::HashMap::<u32, Cost>::new();
+        let mut inputs = std::collections::HashMap::<u32, Vec<u32>>::new();
+        let mut auxiliaries = std::collections::HashMap::<u32, Vec<u32>>::new();
+        let mut thumbnails = std::collections::HashMap::<u32, Vec<u32>>::new();
+        let mut premultiplied = std::collections::HashMap::<u32, u64>::new();
+        for r in &meta.references {
+            per_visit_work += 4;
+            if r.reference_type == reference::DIMG {
+                inputs
+                    .entry(r.from_item_id)
+                    .or_default()
+                    .extend(&r.to_item_ids);
+                continue;
+            }
+            if r.reference_type == reference::PREM {
+                *premultiplied.entry(r.from_item_id).or_default() += r.to_item_ids.len() as u64;
+                continue;
+            }
+            let towards = match r.reference_type {
+                reference::AUXL => &mut auxiliaries,
+                reference::THMB => &mut thumbnails,
+                reference::CDSC => {
+                    per_visit_work += r.to_item_ids.len() as u64;
+                    // Each visit of a described item looks the
+                    // describing item up and keeps a copy of its
+                    // entry, in a list that grows by pushes.
+                    let strings = entry_bytes(r.from_item_id);
+                    let each = Cost {
+                        work: items.saturating_add(strings),
+                        held: (4 * INFO_BYTES + ALLOCATION_SLACK).saturating_add(strings),
+                    };
+                    let mut targets = r.to_item_ids.clone();
+                    targets.sort_unstable();
+                    targets.dedup();
+                    for target in targets {
+                        let entry = own.entry(target).or_default();
+                        *entry = entry.plus(each);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            per_visit_work += r.to_item_ids.len() as u64;
+            // A visit finds each reference box naming the item
+            // once, however often the box repeats it.
+            let mut targets = r.to_item_ids.clone();
+            targets.sort_unstable();
+            targets.dedup();
+            for target in targets {
+                towards.entry(target).or_default().push(r.from_item_id);
+            }
+        }
+        let properties: Vec<PropertyCost> = meta.properties.iter().map(PropertyCost::of).collect();
+        let property = |index: u16| -> Option<&PropertyCost> {
+            (index as usize)
+                .checked_sub(1)
+                .and_then(|i| properties.get(i))
+        };
+        let mut associated = std::collections::HashMap::<u32, u64>::new();
+        for row in &meta.associations {
+            let tiled = entries
+                .get(&row.item_id)
+                .is_some_and(|item| item.item_type == heif::ITEM_TYPE_TILI);
+            let mut cost = Cost::default();
+            for entry in &row.entries {
+                let Some(p) = property(entry.index) else {
+                    cost = cost.plus(Cost::work(1));
+                    continue;
+                };
+                cost = cost.plus(p.entry());
+                if tiled && let Some(tiles) = &p.tile_properties {
+                    // A `tili` visit copies its `tilC` and
+                    // resolves the tile properties it names into
+                    // a list sized to fit, with a slot for every
+                    // entry the `tilC` lists, an entry that names
+                    // no property included.
+                    cost = cost.plus(p.parse);
+                    if !tiles.is_empty() {
+                        let slots = (tiles.len() as u64).saturating_mul(ENTRY_BYTES);
+                        cost = cost.plus(Cost::held(slots.saturating_add(ALLOCATION_SLACK)));
+                    }
+                    for &index in tiles {
+                        cost = cost.plus(property(index).map_or(Cost::work(1), |t| t.parse));
+                    }
+                }
+            }
+            *associated.entry(row.item_id).or_default() += row.entries.len() as u64;
+            let entry = own.entry(row.item_id).or_default();
+            *entry = entry.plus(cost);
+        }
+        // An item's property entries go in a list that grows by
+        // pushes: room for four at first, never more than twice
+        // their number after. Their own size is in each entry's
+        // cost already.
+        for (&item, &count) in &associated {
+            let room = count.saturating_mul(2).max(4);
+            let entry = own.entry(item).or_default();
+            *entry = entry.plus(Cost::held(
+                room.saturating_sub(count).saturating_mul(ENTRY_BYTES),
+            ));
+        }
+        // A visit that finds an alpha auxiliary checks whether
+        // the item's samples are premultiplied: one more scan of
+        // the references, and a copy of the item's `prem`
+        // targets.
+        for &item in auxiliaries.keys() {
+            let scan = (meta.references.len() as u64)
+                .saturating_add(premultiplied.get(&item).copied().unwrap_or(0));
+            let entry = own.entry(item).or_default();
+            *entry = entry.plus(Cost::work(scan));
+        }
+        // The first location of each item, as the lookup finds it.
+        let mut locations = std::collections::HashMap::new();
+        for loc in &meta.locations {
+            locations.entry(loc.item_id).or_insert(loc);
+        }
+        for (&id, item) in &entries {
+            // Each visit copies the item's entry, its strings
+            // included.
+            let strings = entry_bytes(id);
+            let entry = own.entry(id).or_default();
+            *entry = entry.plus(Cost {
+                work: strings,
+                held: strings.saturating_add(ALLOCATION_SLACK),
+            });
+            let derived = [
+                heif::ITEM_TYPE_GRID,
+                heif::ITEM_TYPE_IOVL,
+                heif::ITEM_TYPE_CFEN,
+                heif::ITEM_TYPE_TMAP,
+            ]
+            .contains(&item.item_type);
+            if !derived {
+                continue;
+            }
+            let payload = locations.get(&id).map_or(0, |loc| {
+                loc.extents
+                    .iter()
+                    .map(|e| {
+                        if e.length == 0 {
+                            source_len
+                        } else {
+                            e.length.min(source_len)
+                        }
+                    })
+                    .fold(0u64, u64::saturating_add)
+            });
+            *entry = entry.plus(Cost {
+                work: (meta.locations.len() as u64).saturating_add(payload),
+                held: payload,
+            });
+        }
+        // The gain map lookup, as the decoder makes it.
+        let mut gain_maps = std::collections::HashMap::new();
+        for (&id, item) in &entries {
+            if item.item_type == heif::ITEM_TYPE_TMAP {
+                gain_maps.insert(id, id);
+            }
+        }
+        let mut tone_maps = 0u64;
+        for item in &meta.items {
+            if item.item_type != heif::ITEM_TYPE_TMAP {
+                continue;
+            }
+            tone_maps += 1;
+            if let Some(&base) = inputs.get(&item.id).and_then(|ids| ids.first()) {
+                gain_maps.entry(base).or_insert(item.id);
+            }
+        }
+        let gain_lookup = tone_maps
+            .saturating_mul(meta.references.len() as u64)
+            .saturating_add(items);
+        GraphCost {
+            per_visit: Cost {
+                work: per_visit_work,
+                held: ALLOCATION_SLACK,
+            },
+            own,
+            inputs,
+            auxiliaries,
+            thumbnails,
+            gain_maps,
+            gain_lookup,
+            done: std::collections::HashMap::new(),
+            chain: Vec::new(),
+        }
+    }
+
+    /// What one decode of `item` holds at its peak, and the
+    /// work of building what it holds: two copies of the item's
+    /// graph, then the graph of its gain map image (see
+    /// [`Self::gain_map`]) with the `tmap` item's payload and
+    /// properties. The decoder looks the gain map up twice and
+    /// builds its graph twice, but lets go of the first copy
+    /// before it builds the second, so that part counts twice
+    /// as work and once as bytes held.
+    fn decode(&mut self, item: u32, budget: Cost) -> Cost {
+        // A root is returned by value: its node is held once.
+        let graph = self.walk(item, 0, budget).plus(Cost::held(NODE_BYTES));
+        let lookups = Cost::work(self.gain_lookup.saturating_mul(2));
+        let mut cost = graph.plus(graph).plus(lookups);
+        if let Some((tmap, gain)) = self.gain_map(item) {
+            let mut extra = self.own.get(&tmap).copied().unwrap_or_default();
+            if let Some(gain) = gain {
+                let walked = self.walk(gain, 0, budget.less(cost).less(extra));
+                extra = extra.plus(walked).plus(Cost::held(NODE_BYTES));
+            }
+            cost = cost.plus(extra).plus(Cost::work(extra.work));
+        }
+        cost
+    }
+
+    /// The `tmap` item a decode of `item` takes its gain map
+    /// from, and the gain map image, that `tmap`'s second input,
+    /// should it have one.
+    fn gain_map(&self, item: u32) -> Option<(u32, Option<u32>)> {
+        let tmap = *self.gain_maps.get(&item)?;
+        let gain = self.inputs.get(&tmap).and_then(|ids| ids.get(1)).copied();
+        Some((tmap, gain))
+    }
+
+    /// The cost of walking the graph from `item`, reached at
+    /// `depth`, but for the node at its root. Past `budget` the
+    /// count stops early, as the caller refuses anything over it
+    /// anyway.
+    fn walk(&mut self, item: u32, depth: usize, budget: Cost) -> Cost {
+        self.walk_inner(item, depth, budget).0
+    }
+
+    /// [`Self::walk`], also saying whether the walk reached the
+    /// end of the subtree (`true`) or stops inside it, as the
+    /// graph builder stops at a cycle or past its depth cap. A
+    /// subtree that stops is not remembered: reached again at
+    /// another depth, it may not.
+    fn walk_inner(&mut self, item: u32, depth: usize, budget: Cost) -> (Cost, bool) {
+        if let Some(&cost) = self.done.get(&item) {
+            return (cost, true);
+        }
+        if depth > oxideav_heif::derived::MAX_DERIVATION_DEPTH || self.chain.contains(&item) {
+            return (Cost::default(), false);
+        }
+        let mut cost = self
+            .per_visit
+            .plus(self.own.get(&item).copied().unwrap_or_default());
+        // Each child with the bytes its node takes in this one:
+        // the inputs' list is sized to fit, the others grow.
+        let children: Vec<(u32, u64)> = [
+            (&self.inputs, NODE_BYTES),
+            (&self.auxiliaries, 4 * NODE_BYTES),
+            (&self.thumbnails, 4 * NODE_BYTES),
+        ]
+        .into_iter()
+        .filter_map(|(edges, node)| Some((edges.get(&item)?, node)))
+        .flat_map(|(ids, node)| ids.iter().map(move |&id| (id, node)))
+        .collect();
+        self.chain.push(item);
+        for (child, node) in children {
+            if cost.exceeds(budget) {
+                break;
+            }
+            cost = cost.plus(Cost::held(node));
+            let (child_cost, complete) = self.walk_inner(child, depth + 1, budget.less(cost));
+            cost = cost.plus(child_cost);
+            if !complete {
+                self.chain.pop();
+                return (cost, false);
+            }
+        }
+        self.chain.pop();
+        if !cost.exceeds(budget) {
+            self.done.insert(item, cost);
+        }
+        (cost, true)
+    }
+}
+
+/// The gain map image of an item the decode may output (the
+/// primary, or one of its `altr` alternatives) that is not
+/// itself a `tmap` (a `tmap` item's gain map is its second
+/// input, already in its graph): the second derivation input of
+/// the `tmap` item whose first input is that item, mirroring the
+/// decoder's own lookup in `find_gain_map`.
 fn gain_map_node<D: AsRef<[u8]>>(
     file: &oxideav_heif::HeifFile<D>,
-    primary_id: u32,
+    item_id: u32,
 ) -> Option<oxideav_heif::ImageNode> {
     let meta = file.meta().ok()?;
     let tmap = meta.items.iter().find(|item| {
         item.item_type == oxideav_heif::meta::ITEM_TYPE_TMAP
-            && meta.derivation_inputs(item.id).first() == Some(&primary_id)
+            && meta.derivation_inputs(item.id).first() == Some(&item_id)
     })?;
     let inputs = meta.derivation_inputs(tmap.id);
     oxideav_heif::build_graph(file, *inputs.get(1)?).ok()
@@ -336,6 +888,7 @@ fn cap_metadata(bytes: Option<Vec<u8>>, cap: usize) -> Option<Vec<u8>> {
 /// announces no size.
 pub(crate) fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let file = oxideav_heif::HeifFile::parse_borrowed(bytes).ok()?;
+    check_item_graphs(&file, bytes.len()).ok()?;
     let node = oxideav_heif::build_primary_graph(&file).ok()?;
     node.output_size().ok()
 }
@@ -412,6 +965,7 @@ pub(crate) fn decode_heic(bytes: &[u8]) -> Result<(DynamicImage, SourceMeta), En
 /// a new failure mode.
 fn vui_color(bytes: &[u8]) -> Option<oxideav_heif::ColorInfo> {
     let file = oxideav_heif::HeifFile::parse_borrowed(bytes).ok()?;
+    check_item_graphs(&file, bytes.len()).ok()?;
     let node = oxideav_heif::build_primary_graph(&file).ok()?;
     // The colour node mirrors the decoder's own choice: a
     // tone-mapped primary describes its base rendition's colour.
@@ -909,5 +1463,566 @@ mod tests {
             None
         );
         assert_eq!(cap_metadata(None, crate::color::MAX_META_BYTES), None);
+    }
+
+    #[test]
+    fn an_alternative_s_gain_map_is_held_to_the_decode_limits() {
+        // Should the primary (item 1) fail to decode, the decoder
+        // falls back to its `altr` alternative (item 2) and
+        // decodes that item's gain map (item 3, the second input
+        // of the `tmap` item 4) along with it. The gain map
+        // announces a size past the decode limit, so validation
+        // must refuse the file, though the gain map belongs to no
+        // graph the primary's or the alternative's walk reaches.
+        let infe = |id: u16, kind: &[u8; 4]| {
+            let mut body = id.to_be_bytes().to_vec();
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(kind);
+            body.push(0);
+            full_box(b"infe", 2, &body)
+        };
+        let ispe = |width: u32, height: u32| {
+            let mut body = width.to_be_bytes().to_vec();
+            body.extend_from_slice(&height.to_be_bytes());
+            full_box(b"ispe", 0, &body)
+        };
+        let mut meta = full_box(b"hdlr", 0, b"\0\0\0\0pict\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        meta.extend(full_box(b"pitm", 0, &1u16.to_be_bytes()));
+        let mut iinf = 4u16.to_be_bytes().to_vec();
+        for (id, kind) in [(1, b"hvc1"), (2, b"hvc1"), (3, b"hvc1"), (4, b"tmap")] {
+            iinf.extend(infe(id, kind));
+        }
+        meta.extend(full_box(b"iinf", 0, &iinf));
+        // The `tmap` item 4 derives from item 2 and gain map 3.
+        let dimg = [4u16, 2, 2, 3].map(u16::to_be_bytes).concat();
+        meta.extend(full_box(b"iref", 0, &bmff_box(b"dimg", &dimg)));
+        let mut iprp = bmff_box(b"ipco", &[ispe(64, 64), ispe(20_000, 48)].concat());
+        let mut ipma = 4u32.to_be_bytes().to_vec();
+        for (id, property) in [(1u16, 1u8), (2, 1), (3, 2), (4, 1)] {
+            ipma.extend_from_slice(&id.to_be_bytes());
+            ipma.extend_from_slice(&[1, property]);
+        }
+        iprp.extend(full_box(b"ipma", 0, &ipma));
+        meta.extend(bmff_box(b"iprp", &iprp));
+        // One `altr` group: group 100, items 1 and 2.
+        let altr = [100u32, 2, 1, 2].map(u32::to_be_bytes).concat();
+        meta.extend(bmff_box(b"grpl", &full_box(b"altr", 0, &altr)));
+        let mut bytes = bmff_box(b"ftyp", b"heic\0\0\0\0mif1heic");
+        bytes.extend(full_box(b"meta", 0, &meta));
+
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        let meta = file.meta().unwrap();
+        assert_eq!(meta.groups_containing(1, b"altr").len(), 1);
+        assert!(gain_map_node(&file, 1).is_none());
+        assert_eq!(gain_map_node(&file, 2).map(|node| node.item.id), Some(3));
+        match validate_decode_budget(&bytes) {
+            Err(EngineError::Decode(msg)) => {
+                assert!(msg.contains("item 3 announces 20000x48"), "{msg}")
+            }
+            other => panic!("expected the gain map refusal, got {other:?}"),
+        }
+    }
+
+    /// One ISO-BMFF box.
+    fn bmff_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// One full box: version 0, flags 0, unless `version` says.
+    fn full_box(kind: &[u8; 4], version: u8, body: &[u8]) -> Vec<u8> {
+        let mut inner = vec![version, 0, 0, 0];
+        inner.extend_from_slice(body);
+        bmff_box(kind, &inner)
+    }
+
+    /// A HEIF file whose primary item (1) is a `rows` x `columns`
+    /// grid whose every tile is the same image item (2), with
+    /// `described` metadata items, each one `cdsc` reference to
+    /// item 2. The container's structure is all there is: item
+    /// 2 carries no coded data, so only the graph walks run.
+    #[derive(Clone, Copy, Default)]
+    struct SharedTile {
+        rows: u8,
+        columns: u8,
+        described: u16,
+        /// The length of the tile item's name.
+        tile_name: usize,
+        /// The length of each describing item's name.
+        describer_name: usize,
+        /// Property entries the tile carries besides its `ispe`,
+        /// each naming the same empty property of a type the
+        /// parser does not know.
+        extra_entries: usize,
+        /// Makes the tile a `tili` item whose `tilC` lists 255
+        /// tile properties.
+        tile_properties: Option<TileProperties>,
+        /// Gives the tile an alpha auxiliary image, and a `prem`
+        /// reference that names it this many times.
+        premultiplied: Option<u16>,
+        /// Makes the primary item a `tmap` whose base image is
+        /// the tile and whose gain map image is the grid.
+        tone_mapped: bool,
+    }
+
+    /// What the 255 tile properties of a [`SharedTile`]'s `tilC`
+    /// name.
+    #[derive(Clone, Copy)]
+    enum TileProperties {
+        /// Each the same property, of this many bytes.
+        Named(usize),
+        /// No property at all: each entry's index is 0.
+        Unnamed,
+    }
+
+    impl SharedTile {
+        fn new(rows: u8, columns: u8) -> Self {
+            SharedTile {
+                rows,
+                columns,
+                ..SharedTile::default()
+            }
+        }
+
+        fn build(self) -> Vec<u8> {
+            let tiles = u16::from(self.rows) * u16::from(self.columns);
+            // Items 1 (the grid) and 2 (the tile), the describing
+            // items, then the alpha image and the `tmap` if any.
+            let mut next_id = 3 + self.described;
+            let mut take_id = || {
+                next_id += 1;
+                next_id - 1
+            };
+            let alpha_id = self.premultiplied.map(|_| take_id());
+            let tmap_id = self.tone_mapped.then(&mut take_id);
+            let mut out = bmff_box(b"ftyp", b"heic\0\0\0\0mif1heic");
+            let mut meta = full_box(b"hdlr", 0, b"\0\0\0\0pict\0\0\0\0\0\0\0\0\0\0\0\0\0");
+            meta.extend(full_box(b"pitm", 0, &tmap_id.unwrap_or(1).to_be_bytes()));
+            // iloc v1: the grid descriptor, 8 bytes at idat offset
+            // 0, which a `tmap` item reads as its payload too.
+            let located: Vec<u16> = std::iter::once(1).chain(tmap_id).collect();
+            let mut iloc = vec![0x44, 0x00];
+            iloc.extend_from_slice(&(located.len() as u16).to_be_bytes());
+            for id in located {
+                iloc.extend_from_slice(&id.to_be_bytes());
+                iloc.extend_from_slice(&[0, 1, 0, 0, 0, 1]);
+                iloc.extend_from_slice(&0u32.to_be_bytes());
+                iloc.extend_from_slice(&8u32.to_be_bytes());
+            }
+            meta.extend(full_box(b"iloc", 1, &iloc));
+            let infe = |id: u16, kind: &[u8; 4], name: usize| {
+                let mut body = id.to_be_bytes().to_vec();
+                body.extend_from_slice(&[0, 0]);
+                body.extend_from_slice(kind);
+                body.resize(body.len() + name, b'n');
+                body.push(0);
+                full_box(b"infe", 2, &body)
+            };
+            let tile_type = if self.tile_properties.is_some() {
+                b"tili"
+            } else {
+                b"hvc1"
+            };
+            let mut entries = vec![infe(1, b"grid", 0), infe(2, tile_type, self.tile_name)];
+            for id in 0..self.described {
+                entries.push(infe(3 + id, b"Exif", self.describer_name));
+            }
+            entries.extend(alpha_id.map(|id| infe(id, b"hvc1", 0)));
+            entries.extend(tmap_id.map(|id| infe(id, b"tmap", 0)));
+            let mut iinf = (entries.len() as u16).to_be_bytes().to_vec();
+            iinf.extend(entries.concat());
+            meta.extend(full_box(b"iinf", 0, &iinf));
+            // One reference box: its type, its source, its targets.
+            let reference = |kind: &[u8; 4], from: u16, to: &[u16]| {
+                let mut body = from.to_be_bytes().to_vec();
+                body.extend_from_slice(&(to.len() as u16).to_be_bytes());
+                for id in to {
+                    body.extend_from_slice(&id.to_be_bytes());
+                }
+                bmff_box(kind, &body)
+            };
+            let mut iref = reference(b"dimg", 1, &vec![2; usize::from(tiles)]);
+            for id in 0..self.described {
+                iref.extend(reference(b"cdsc", 3 + id, &[2]));
+            }
+            if let (Some(alpha), Some(count)) = (alpha_id, self.premultiplied) {
+                iref.extend(reference(b"auxl", alpha, &[2]));
+                iref.extend(reference(b"prem", 2, &vec![alpha; usize::from(count)]));
+            }
+            if let Some(tmap) = tmap_id {
+                iref.extend(reference(b"dimg", tmap, &[2, 1]));
+            }
+            meta.extend(full_box(b"iref", 0, &iref));
+            // The properties, numbered from 1 in `ipco` order.
+            let mut ispe = 64u32.to_be_bytes().to_vec();
+            ispe.extend_from_slice(&64u32.to_be_bytes());
+            let mut ipco = full_box(b"ispe", 0, &ispe);
+            let mut tile_entries = vec![0x01];
+            let mut next = 2u8;
+            let empty = next;
+            if self.extra_entries > 0 {
+                ipco.extend(bmff_box(b"zzzz", b""));
+                next += 1;
+            }
+            if let Some(names) = self.tile_properties {
+                let mut tilc = 64u32.to_be_bytes().to_vec();
+                tilc.extend_from_slice(&64u32.to_be_bytes());
+                tilc.push(0);
+                tilc.extend_from_slice(b"hvc1");
+                let tipa = match names {
+                    TileProperties::Named(bytes) => {
+                        let named = u16::from(next);
+                        ipco.extend(bmff_box(b"yyyy", &vec![7; bytes]));
+                        next += 1;
+                        // Flags 1: 16-bit property indices.
+                        let mut tipa = vec![0, 0, 0, 1, 255];
+                        for _ in 0..255 {
+                            tipa.extend_from_slice(&named.to_be_bytes());
+                        }
+                        tipa
+                    }
+                    // Flags 0: 8-bit property indices.
+                    TileProperties::Unnamed => [vec![0, 0, 0, 0, 255], vec![0; 255]].concat(),
+                };
+                tilc.extend(bmff_box(b"tipa", &tipa));
+                ipco.extend(full_box(b"tilC", 0, &tilc));
+                tile_entries.push(next);
+                next += 1;
+            }
+            let mut rows = vec![(2u16, tile_entries)];
+            if let Some(alpha) = alpha_id {
+                let urn = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
+                ipco.extend(full_box(b"auxC", 0, urn));
+                rows.push((alpha, vec![0x01, next]));
+            }
+            let mut iprp = bmff_box(b"ipco", &ipco);
+            let mut ipma = (rows.len() as u32).to_be_bytes().to_vec();
+            for (id, row) in rows {
+                ipma.extend_from_slice(&id.to_be_bytes());
+                ipma.push(row.len() as u8);
+                ipma.extend_from_slice(&row);
+            }
+            iprp.extend(full_box(b"ipma", 0, &ipma));
+            // One more `ipma` box (each with its own flags) for
+            // every 255 further entries.
+            let mut left = self.extra_entries;
+            let mut flags = 2u32;
+            while left > 0 {
+                let n = left.min(255);
+                left -= n;
+                let mut body = flags.to_be_bytes().to_vec();
+                body.extend_from_slice(&1u32.to_be_bytes());
+                body.extend_from_slice(&[0, 2, n as u8]);
+                body.resize(body.len() + n, empty);
+                iprp.extend(bmff_box(b"ipma", &body));
+                flags += 2;
+            }
+            meta.extend(bmff_box(b"iprp", &iprp));
+            let width = 64 * u16::from(self.columns);
+            let height = 64 * u16::from(self.rows);
+            let mut grid = vec![0, 0, self.rows - 1, self.columns - 1];
+            grid.extend_from_slice(&width.to_be_bytes());
+            grid.extend_from_slice(&height.to_be_bytes());
+            meta.extend(bmff_box(b"idat", &grid));
+            out.extend(full_box(b"meta", 0, &meta));
+            out
+        }
+    }
+
+    fn shared_tile_heif(rows: u8, columns: u8, described: u16) -> Vec<u8> {
+        SharedTile {
+            described,
+            ..SharedTile::new(rows, columns)
+        }
+        .build()
+    }
+
+    /// The cost [`check_item_graphs`] works out for the primary
+    /// item's graph.
+    fn primary_graph_cost(bytes: &[u8]) -> Cost {
+        let file = oxideav_heif::HeifFile::parse_borrowed(bytes).unwrap();
+        let meta = file.meta().unwrap();
+        let mut cost = GraphCost::new(meta, bytes.len() as u64);
+        let primary = file.primary_item().unwrap().id;
+        cost.walk(primary, 0, Cost::LIMIT)
+            .plus(Cost::held(NODE_BYTES))
+    }
+
+    #[test]
+    fn an_item_graph_that_revisits_a_described_tile_is_refused_before_it_is_built() {
+        // A 255x255 grid whose 65,025 tiles all name one item,
+        // which 64 metadata items describe. The graph builder
+        // visits the tile once per reference and looks up every
+        // describing item on each visit. The bound refuses it
+        // from the tables, before the builder runs, in the probe
+        // and the decode alike.
+        let bytes = shared_tile_heif(255, 255, 64);
+        let started = std::time::Instant::now();
+        assert_eq!(probe_dimensions(&bytes), None);
+        match decode_heic(&bytes) {
+            Err(EngineError::Decode(msg)) => assert!(msg.contains("item graph"), "{msg}"),
+            other => panic!("expected the item graph refusal, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the refusals took {:?}",
+            started.elapsed()
+        );
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        assert!(check_item_graphs(&file, bytes.len()).is_err());
+    }
+
+    #[test]
+    fn an_item_graph_too_large_to_hold_is_refused_before_it_is_built() {
+        // The builder copies an item into the graph on every
+        // visit, with its name, its parsed properties, and the
+        // entries of the items that describe it, and a `tili`
+        // visit also resolves each tile property its `tilC`
+        // names. Each of these graphs would hold more than the
+        // bound once built, and the check refuses it from the
+        // tables first. The grids are kept small enough that,
+        // were a check missing, the build would still end and
+        // the assertion fail.
+        let cases = [
+            (
+                "a long tile name",
+                SharedTile {
+                    tile_name: 8 << 10,
+                    ..SharedTile::new(128, 128)
+                },
+            ),
+            (
+                "a long name on the describing item",
+                SharedTile {
+                    described: 1,
+                    describer_name: 8 << 10,
+                    ..SharedTile::new(128, 128)
+                },
+            ),
+            (
+                "many property entries",
+                SharedTile {
+                    extra_entries: 1_000,
+                    ..SharedTile::new(32, 32)
+                },
+            ),
+            (
+                "tile properties",
+                SharedTile {
+                    tile_properties: Some(TileProperties::Named(64 << 10)),
+                    ..SharedTile::new(4, 4)
+                },
+            ),
+        ];
+        for (name, spec) in cases {
+            let bytes = spec.build();
+            let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+            match check_item_graphs(&file, bytes.len()) {
+                Err(EngineError::Decode(msg)) => {
+                    assert!(msg.contains("item graph"), "{name}: {msg}")
+                }
+                other => panic!("{name}: expected the item graph refusal, got {other:?}"),
+            }
+            assert_eq!(probe_dimensions(&bytes), None, "{name}");
+            assert!(decode_heic(&bytes).is_err(), "{name}");
+        }
+        // The property entries take little work to walk: what
+        // the graph would hold is what refuses them.
+        let entries = SharedTile {
+            extra_entries: 1_000,
+            ..SharedTile::new(32, 32)
+        }
+        .build();
+        let cost = primary_graph_cost(&entries);
+        assert!(cost.work < MAX_GRAPH_WORK / 10, "{cost:?}");
+        assert!(cost.held > MAX_GRAPH_BYTES, "{cost:?}");
+    }
+
+    #[test]
+    fn a_decode_is_charged_for_both_copies_of_the_graph_it_holds() {
+        // The decode builds the primary item's graph, then builds
+        // it again while it still holds the first copy. One copy
+        // of this graph is within the byte bound; the two are not,
+        // and the check refuses the file for what it would hold.
+        let bytes = SharedTile {
+            extra_entries: 1_000,
+            ..SharedTile::new(18, 18)
+        }
+        .build();
+        let one = primary_graph_cost(&bytes);
+        assert!(one.held < MAX_GRAPH_BYTES, "{one:?}");
+        assert!(one.work < MAX_GRAPH_WORK / 20, "{one:?}");
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        match check_item_graphs(&file, bytes.len()) {
+            Err(EngineError::Decode(msg)) => assert!(msg.contains("would hold"), "{msg}"),
+            other => panic!("expected the item graph refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tone_mapped_primary_is_charged_for_its_gain_map_graph_too() {
+        // A `tmap` primary's gain map image is its second input,
+        // already in its graph, and the decode builds the gain
+        // map's graph once more while it holds both copies of the
+        // primary's. Here the gain map image is the grid: the two
+        // copies of the primary's graph fit the byte bound, and
+        // the gain map's on top of them does not.
+        let bytes = SharedTile {
+            extra_entries: 1_000,
+            tone_mapped: true,
+            ..SharedTile::new(13, 13)
+        }
+        .build();
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        let meta = file.meta().unwrap();
+        let primary = file.primary_item().unwrap();
+        assert_eq!(primary.item_type, oxideav_heif::meta::ITEM_TYPE_TMAP);
+        assert_eq!(meta.derivation_inputs(primary.id), [2, 1]);
+        let mut cost = GraphCost::new(meta, bytes.len() as u64);
+        assert_eq!(cost.gain_map(primary.id), Some((primary.id, Some(1))));
+        let one = primary_graph_cost(&bytes);
+        let gain = cost.walk(1, 0, Cost::LIMIT).plus(Cost::held(NODE_BYTES));
+        assert!(2 * one.held < MAX_GRAPH_BYTES, "{one:?}");
+        assert!(
+            2 * one.held + gain.held > MAX_GRAPH_BYTES,
+            "{one:?} {gain:?}"
+        );
+        match check_item_graphs(&file, bytes.len()) {
+            Err(EngineError::Decode(msg)) => assert!(msg.contains("would hold"), "{msg}"),
+            other => panic!("expected the item graph refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tili_visit_is_charged_a_slot_for_every_tile_entry() {
+        // A `tili` visit resolves its tile properties into a list
+        // with room for every entry its `tilC` lists, an entry
+        // that names no property included. Here none of the
+        // entries names a property, so the room is all the list
+        // holds.
+        let bytes = SharedTile {
+            tile_properties: Some(TileProperties::Unnamed),
+            ..SharedTile::new(40, 40)
+        }
+        .build();
+        let one = primary_graph_cost(&bytes);
+        assert!(one.held >= 40 * 40 * 255 * ENTRY_BYTES, "{one:?}");
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        match check_item_graphs(&file, bytes.len()) {
+            Err(EngineError::Decode(msg)) => assert!(msg.contains("would hold"), "{msg}"),
+            other => panic!("expected the item graph refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_visit_that_finds_an_alpha_image_is_charged_for_the_prem_lookup() {
+        // A visit that finds an item's alpha image reads the
+        // item's `prem` references, copying their targets, to
+        // learn whether its samples are premultiplied. Here the
+        // tile's `prem` reference is a long one, and the grid
+        // visits the tile once for each of its cells.
+        let bytes = SharedTile {
+            premultiplied: Some(20_000),
+            ..SharedTile::new(64, 64)
+        }
+        .build();
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        // The builder takes that path on a visit of the tile.
+        let tile = oxideav_heif::build_graph(&file, 2).unwrap();
+        assert!(tile.alpha.is_some() && tile.premultiplied_alpha);
+        match check_item_graphs(&file, bytes.len()) {
+            Err(EngineError::Decode(msg)) => assert!(msg.contains("steps to walk"), "{msg}"),
+            other => panic!("expected the item graph refusal, got {other:?}"),
+        }
+        // The same graph with a `prem` reference of one target is
+        // well within both bounds.
+        let short = SharedTile {
+            premultiplied: Some(1),
+            ..SharedTile::new(64, 64)
+        }
+        .build();
+        let file = oxideav_heif::HeifFile::parse_borrowed(&short).unwrap();
+        let total = decode_graph_cost(&file, short.len());
+        assert!(total.work < MAX_GRAPH_WORK / 20, "{total:?}");
+        assert!(total.held < MAX_GRAPH_BYTES / 2, "{total:?}");
+    }
+
+    #[test]
+    fn a_property_with_a_body_is_charged_at_least_one_allocation() {
+        // A parse that keeps any of its body takes an allocation,
+        // and the allocator hands out no block smaller than 32
+        // bytes on a 64-bit target, however few bytes it holds:
+        // one byte of a box the parser does not know, or of an
+        // ICC profile.
+        const SMALLEST_BLOCK: u64 = 32;
+        for (box_type, body) in [(*b"zzzz", vec![7]), (*b"colr", b"prof\x07".to_vec())] {
+            let len = body.len() as u64;
+            let raw = oxideav_heif::meta::RawProperty::new(box_type, None, body, 8 + len as usize);
+            let cost = PropertyCost::of(&raw);
+            assert!(
+                cost.parse.held >= SMALLEST_BLOCK.max(len),
+                "{}: {:?}",
+                box_type.escape_ascii(),
+                cost.parse
+            );
+        }
+        // An empty body is kept without an allocation.
+        let empty = oxideav_heif::meta::RawProperty::new(*b"zzzz", None, Vec::new(), 8);
+        assert_eq!(PropertyCost::of(&empty).parse.held, 0);
+    }
+
+    #[test]
+    fn item_graphs_within_the_walk_budget_still_build() {
+        // The same shared tile with no metadata items costs a
+        // few cheap steps per visit and stays within the bound
+        // in a grid of as many 64 px tiles as the decode budget
+        // holds, as does a grid whose tiles are few, and tiles
+        // and describing items with names of a usual length: the
+        // probe sizes them all.
+        let named = SharedTile {
+            described: 2,
+            tile_name: 16,
+            describer_name: 16,
+            ..SharedTile::new(64, 64)
+        };
+        for spec in [
+            SharedTile::new(128, 128),
+            SharedTile {
+                described: 4,
+                ..SharedTile::new(16, 16)
+            },
+            named,
+        ] {
+            let bytes = spec.build();
+            let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+            check_item_graphs(&file, bytes.len()).unwrap();
+            let expected = (64 * u32::from(spec.columns), 64 * u32::from(spec.rows));
+            assert_eq!(probe_dimensions(&bytes), Some(expected));
+        }
+        // Every fixture passes, with room to spare, counted as
+        // the decode holds its graphs.
+        for bytes in [GRID, MAIN10, VUI_LIMITED, P3, ORIENT6] {
+            let file = oxideav_heif::HeifFile::parse_borrowed(bytes).unwrap();
+            let cost = decode_graph_cost(&file, bytes.len());
+            assert!(cost.work < MAX_GRAPH_WORK / 1000, "{cost:?}");
+            assert!(cost.held < MAX_GRAPH_BYTES / 1000, "{cost:?}");
+        }
+    }
+
+    #[test]
+    fn the_walk_estimate_stops_where_the_builder_stops() {
+        // A reference cycle: the builder refuses it at the
+        // repeat, and the estimate counts the walk up to there
+        // without looping.
+        let mut bytes = shared_tile_heif(1, 1, 0);
+        // Point the grid's one tile back at the grid itself.
+        let at = bytes.windows(4).position(|w| w == b"dimg").unwrap();
+        bytes[at + 8..at + 10].copy_from_slice(&1u16.to_be_bytes());
+        let file = oxideav_heif::HeifFile::parse_borrowed(&bytes).unwrap();
+        assert!(oxideav_heif::build_primary_graph(&file).is_err());
+        check_item_graphs(&file, bytes.len()).unwrap();
+        assert_eq!(probe_dimensions(&bytes), None);
     }
 }
