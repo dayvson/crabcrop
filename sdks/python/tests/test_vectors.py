@@ -13,12 +13,17 @@ from crabcrop_url import (  # noqa: E402
     build_sealed_url,
     build_srcset,
     build_url,
+    is_reserved_remainder,
+    purge_group_key,
+    purge_key,
     purge_group_signature,
     purge_signature,
     seal_url,
     seal_with_nonce,
     sign,
     unseal,
+    seal_key,
+    upload_key,
     upload_signature,
     sign_with_key_id,
     verify,
@@ -31,6 +36,11 @@ VECTORS = json.loads(
 SIGNED_VECTORS = [v for v in VECTORS if "signature" in v]
 SEALED_VECTORS = [v for v in VECTORS if v.get("sealed")]
 REFUSAL_VECTORS = [v for v in VECTORS if "refuses" in v]
+RESERVED_VECTORS = [v for v in VECTORS if v.get("reserved")]
+RESERVED_MESSAGE = (
+    'remainder begins with the reserved segment "crabcrop": '
+    "it is kept for key derivation, and no image URL may begin with it"
+)
 BROWSER_REWRITTEN = '"<>\\^`{|}'
 HAS_CRYPTOGRAPHY = __import__("importlib").util.find_spec("cryptography") is not None
 
@@ -82,6 +92,65 @@ class TestVectors(unittest.TestCase):
                     with self.assertRaises(ValueError) as caught:
                         call()
                     self.assertEqual(str(caught.exception), message)
+
+    def test_reserved_vectors(self):
+        # A remainder that begins with the reserved segment is
+        # refused by sign and by every builder, signed or not,
+        # keyed or not, plain or sealed, with the one message
+        # every implementation spells alike. The refusal comes
+        # before any sealing, so it needs no cryptography extra.
+        self.assertGreaterEqual(len(RESERVED_VECTORS), 9)
+        base = "https://img.example.com"
+        for v in RESERVED_VECTORS:
+            ops, src, rem = v["operations"], v["source"], v["remainder"]
+            self.assertTrue(is_reserved_remainder(rem))
+            calls = [
+                lambda: sign("s3cr3t", rem),
+                lambda: sign_with_key_id("s3cr3t", "k2", rem),
+                lambda: build_url(base, "s3cr3t", ops, src),
+                lambda: build_url(base, None, ops, src),
+                lambda: build_url(base, "s3cr3t", ops, src, key_id="k2"),
+                lambda: build_sealed_url(base, "s3cr3t", ops, src),
+                lambda: build_sealed_url(base, None, ops, src),
+                lambda: build_sealed_url(base, "s3cr3t", ops, src, key_id="k2"),
+            ]
+            for call in calls:
+                with self.subTest(description=v["description"]):
+                    with self.assertRaises(ValueError) as caught:
+                        call()
+                    self.assertEqual(str(caught.exception), RESERVED_MESSAGE)
+
+    def test_no_signer_returns_a_derived_subkey(self):
+        # Each subkey is HMAC(secret, label), the same function
+        # as sign(secret, label), so sign refuses every label.
+        secret = "label-test-secret-0123456789"
+        base = "https://img.example.com"
+        for label, subkey in [
+            ("crabcrop/purge-key", purge_key),
+            ("crabcrop/purge-group-key", purge_group_key),
+            ("crabcrop/upload-key", upload_key),
+            ("crabcrop/seal-key", seal_key),
+        ]:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    sign(secret, label)
+                with self.assertRaises(ValueError):
+                    build_url(base, secret, "", label)
+                with self.assertRaises(ValueError):
+                    build_url(base, secret, "crabcrop", label.split("/", 1)[1])
+                # A URL carrying the subkey as its signature
+                # does not verify.
+                self.assertFalse(verify(secret, subkey(secret).hex(), label))
+                self.assertFalse(verify(secret, "k:" + subkey(secret).hex(), label))
+        for remainder in [
+            "exp:1/crabcrop/purge-key",
+            "300x200/https://example.com/crabcrop/purge-key.jpg",
+            "CRABCROP/purge-key",
+            "crabcrop-assets/photo.jpg",
+        ]:
+            with self.subTest(remainder=remainder):
+                self.assertFalse(is_reserved_remainder(remainder))
+                self.assertRegex(sign(secret, remainder), r"^[0-9a-f]{64}$")
 
     def test_percent_encoded_source_builds_and_signs_as_written(self):
         # The spelling the refusal message asks for: nothing in

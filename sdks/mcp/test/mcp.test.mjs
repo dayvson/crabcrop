@@ -507,3 +507,42 @@ test("purge_result gives up on a hung endpoint", { timeout: 60000 }, async () =>
     hung.close();
   }
 });
+
+test("sign_url refuses a remainder that begins with the reserved segment", { timeout: 60000 }, async () => {
+  // Every derived subkey is HMAC(secret, "crabcrop/<x>-key"),
+  // the same function as an image signature, so the SDK's
+  // builder refuses a remainder under the reserved segment,
+  // and the tool answers an error that carries no signature.
+  const secret = "mcp-test-secret-0123456";
+  const client = await startMcp({ ...process.env, CRABCROP_BASE: "http://127.0.0.1:9", CRABCROP_SECRET: secret });
+  try {
+    for (const label of [
+      "crabcrop/purge-key",
+      "crabcrop/purge-group-key",
+      "crabcrop/upload-key",
+      "crabcrop/seal-key",
+      "crabcrop/entry-key",
+    ]) {
+      const subkey = createHmac("sha256", secret).update(label).digest("hex");
+      for (const args of [
+        { operations: "", source: label },
+        { operations: "", source: label, keyId: "current" },
+        { operations: "crabcrop", source: label.slice("crabcrop/".length) },
+      ]) {
+        const result = await client.request("tools/call", { name: "sign_url", arguments: args });
+        const text = result.content.map((c) => c.text).join("\n");
+        assert.equal(result.isError, true, `${JSON.stringify(args)}: ${text}`);
+        assert.match(text, /reserved segment "crabcrop"/);
+        assert.ok(!text.includes(subkey), `${JSON.stringify(args)} carries the subkey`);
+      }
+    }
+    // A source that only names a label further in still signs.
+    const ok = await client.call("sign_url", {
+      operations: "300x200",
+      source: "https://example.com/crabcrop/purge-key.jpg",
+    });
+    assert.match(ok, /^http:\/\/127\.0\.0\.1:9\/[0-9a-f]{64}\/300x200\//);
+  } finally {
+    client.child.kill();
+  }
+});

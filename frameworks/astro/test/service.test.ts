@@ -190,3 +190,17 @@ test("format and quality follow the SDK's grammar (issue #482)", async () => {
     quality: (quality: number) => service.getURL({ src: table.SRC, quality }, config),
   });
 });
+
+test("a source under the reserved segment is refused, never signed", () => {
+  // With no transform there are no operations, so src is the
+  // whole remainder; every derived subkey is the signature of
+  // a label such as crabcrop/upload-key.
+  const signed = cfg({ base: "https://images.example.com", secret: "test-secret" });
+  for (const src of ["crabcrop/upload-key", "crabcrop/entry-key", "crabcrop"]) {
+    assert.throws(() => service.getURL({ src }, signed), /reserved segment "crabcrop"/);
+    assert.throws(() => service.getURL({ src }, unsigned), /reserved segment "crabcrop"/);
+  }
+  const named = "https://cdn.example.com/crabcrop/upload-key.jpg";
+  const sig = createHmac("sha256", "test-secret").update(named, "utf8").digest("hex");
+  assert.equal(service.getURL({ src: named }, signed), `https://images.example.com/${sig}/${named}`);
+});

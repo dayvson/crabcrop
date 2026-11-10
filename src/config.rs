@@ -272,6 +272,9 @@ pub struct Config {
     pub provenance: Option<ProvenanceConfig>,
     /// Meta mode (issue #453).
     pub meta_enabled: bool,
+    /// Whether the server reads the client hint headers
+    /// (`CRABCROP_CLIENT_HINTS`).
+    pub client_hints: bool,
 }
 
 /// Disk result storage: `CRABCROP_RESULT_STORAGE_DIR`, with
@@ -531,6 +534,7 @@ impl Config {
         let pdf = pdf_config(&get)?;
         let provenance = provenance_config(&get)?;
         let meta_enabled = meta_mode_config(&get)?;
+        let client_hints = client_hints_config(&get)?;
         Ok(Config {
             keyring,
             allow_unsafe,
@@ -567,6 +571,7 @@ impl Config {
             pdf,
             provenance,
             meta_enabled,
+            client_hints,
         })
     }
 }
@@ -1532,6 +1537,18 @@ pub fn metadata_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, Con
 /// opts in to that cost rather than carrying it unasked.
 pub fn meta_mode_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, ConfigError> {
     parse_bool_value("CRABCROP_META_MODE", get("CRABCROP_META_MODE"), false)
+}
+
+/// Whether the server reads the client hint headers (`DPR`,
+/// `Sec-CH-DPR`, the four width hints, and `Save-Data`):
+/// `CRABCROP_CLIENT_HINTS`, on by default, so a deployment
+/// that serves browsers directly keeps the hint-sized
+/// responses it has always served. Off, every request for a
+/// URL gets the same bytes whatever hint headers it sends,
+/// which is what a CDN that cannot key its cache on those
+/// headers needs from its origin.
+pub fn client_hints_config(get: impl Fn(&str) -> Option<String>) -> Result<bool, ConfigError> {
+    parse_bool_value("CRABCROP_CLIENT_HINTS", get("CRABCROP_CLIENT_HINTS"), true)
 }
 
 /// The AI settings: every model path, checked for

@@ -345,6 +345,9 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
     if config.meta_enabled {
         println!("meta mode: on");
     }
+    if !config.client_hints {
+        println!("client hints: off");
+    }
 
     Ok(AppState {
         keyring: config.keyring.clone(),
@@ -394,6 +397,7 @@ fn build_state(config: &Config, stores: Stores) -> Result<AppState, ConfigError>
         avif_speed: config.avif_speed,
         jxl_speed: config.jxl_speed,
         width_step: config.width_step,
+        client_hints: config.client_hints,
         preserve_metadata: config.preserve_metadata,
         brand_color: config.brand_color,
         presets: config.presets.clone(),

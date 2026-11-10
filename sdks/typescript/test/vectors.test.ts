@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   buildSealedURL,
   buildSrcSet,
   buildURL,
+  isReservedRemainder,
   purgeGroupSignature,
   purgeSignature,
   seal,
@@ -32,6 +34,7 @@ const vectors = JSON.parse(
   operations?: string;
   source?: string;
   refuses?: { input: string; character: string };
+  reserved?: boolean;
 }[];
 
 for (const v of vectors) {
@@ -87,6 +90,9 @@ for (const v of vectors) {
     assert.throws(() => buildURL(base, null, operations, source), exact);
     assert.throws(() => buildURL(base, "s3cr3t", operations, source, { keyId: "k2" }), exact);
     assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source), exact);
+    // Plain JavaScript can pass no secret: the input is still
+    // refused first, as in the Rust and Python builders.
+    assert.throws(() => buildSealedURL(base, null as unknown as string, operations, source), exact);
     if (input === "source") {
       assert.throws(() => buildSrcSet(base, "s3cr3t", source, [320]), exact);
     }
@@ -94,6 +100,75 @@ for (const v of vectors) {
 }
 test("the spec carries the refusal vectors", () => {
   assert.ok(refusals >= 17, `${refusals} refusal vectors`);
+});
+
+// The reserved vectors: a remainder that begins with the
+// reserved segment is refused by sign and by every builder,
+// signed or not, keyed or not, plain or sealed, with the one
+// message every implementation spells alike. Every derived
+// subkey is the HMAC of such a remainder under the secret.
+const RESERVED = {
+  message:
+    'remainder begins with the reserved segment "crabcrop": it is kept for key derivation, and no image URL may begin with it',
+};
+let reserved = 0;
+for (const v of vectors) {
+  if (v.reserved !== true) {
+    continue;
+  }
+  reserved++;
+  const operations = v.operations as string;
+  const source = v.source as string;
+  test(`reserved vector: ${v.description}`, () => {
+    const base = "https://img.example.com";
+    assert.equal(isReservedRemainder(v.remainder), true);
+    assert.throws(() => sign("s3cr3t", v.remainder), RESERVED);
+    assert.throws(() => signWithKeyId("s3cr3t", "k2", v.remainder), RESERVED);
+    assert.throws(() => buildURL(base, "s3cr3t", operations, source), RESERVED);
+    assert.throws(() => buildURL(base, null, operations, source), RESERVED);
+    assert.throws(() => buildURL(base, "s3cr3t", operations, source, { keyId: "k2" }), RESERVED);
+    assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source), RESERVED);
+    assert.throws(() => buildSealedURL(base, null as unknown as string, operations, source), RESERVED);
+    assert.throws(() => buildSealedURL(base, "s3cr3t", operations, source, { keyId: "k2" }), RESERVED);
+  });
+}
+test("the spec carries the reserved vectors", () => {
+  assert.ok(reserved >= 9, `${reserved} reserved vectors`);
+});
+
+test("no signer returns a derived subkey", () => {
+  // Each subkey is HMAC(secret, label), the same function as
+  // sign(secret, label), so sign and the builders refuse every
+  // label.
+  const secret = "label-test-secret-0123456789";
+  const base = "https://img.example.com";
+  for (const label of [
+    "crabcrop/purge-key",
+    "crabcrop/purge-group-key",
+    "crabcrop/upload-key",
+    "crabcrop/seal-key",
+    "crabcrop/entry-key",
+  ]) {
+    assert.throws(() => sign(secret, label), RESERVED);
+    assert.throws(() => buildURL(base, secret, "", label), RESERVED);
+    assert.throws(() => buildURL(base, secret, "crabcrop", label.slice("crabcrop/".length)), RESERVED);
+    assert.throws(() => buildURL(base, secret, "", label, { keyId: "k" }), RESERVED);
+    // A URL carrying the subkey as its signature does not
+    // verify: the server refuses it whatever the signature.
+    const subkeyHex = createHmac("sha256", secret).update(label).digest("hex");
+    assert.equal(verifyUrlSignature(secret, `${base}/${subkeyHex}/${label}`), false);
+    assert.equal(verifyUrlSignature({ k: secret }, `${base}/k:${subkeyHex}/${label}`), false);
+  }
+  // Remainders that only name a label further in still sign.
+  for (const remainder of [
+    "exp:1/crabcrop/purge-key",
+    "300x200/https://example.com/crabcrop/purge-key.jpg",
+    "CRABCROP/purge-key",
+    "crabcrop-assets/photo.jpg",
+  ]) {
+    assert.equal(isReservedRemainder(remainder), false, remainder);
+    assert.match(sign(secret, remainder), /^[0-9a-f]{64}$/);
+  }
 });
 
 test("a percent-encoded source builds and signs as written (issue #472)", () => {
