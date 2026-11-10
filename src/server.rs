@@ -230,6 +230,11 @@ pub struct AppState {
     /// Quantization step for width client hints
     /// (`CRABCROP_WIDTH_STEP`).
     pub width_step: u32,
+    /// Whether the image path reads the client hint headers
+    /// (`CRABCROP_CLIENT_HINTS`, on by default). Off, every
+    /// hint header is ignored, image answers vary on
+    /// `Accept` alone, and no `Accept-CH` is advertised.
+    pub client_hints: bool,
     /// Metadata policy (`CRABCROP_METADATA=preserve`):
     /// copy source EXIF/XMP into JPEG and PNG outputs.
     pub preserve_metadata: bool,
@@ -394,6 +399,7 @@ impl std::fmt::Debug for AppState {
             avif_speed,
             jxl_speed,
             width_step,
+            client_hints,
             preserve_metadata,
             brand_color,
             presets,
@@ -458,24 +464,51 @@ async fn put_not_found(headers: HeaderMap) -> Response {
 }
 
 /// Headers applied to every response (audit PL-5, PL-6):
-/// `nosniff` everywhere, and `no-store` on the system
+/// `nosniff` everywhere, `no-store` on the system
 /// endpoints, whose contents are operational data, not
-/// cacheable content.
+/// cacheable content, and `no-store` on every error answer
+/// that does not already carry it.
+///
+/// An error describes one request at one moment (a source
+/// not there yet, a gate that was full, a header that asked
+/// for something this URL cannot serve), never what the URL
+/// is. Without cache headers a shared cache applies its own
+/// default to an error, and some store one for seconds to
+/// an hour under a key that leaves out the request headers
+/// the answer depended on, so every viewer of the URL would
+/// get it. Setting it here covers every route and the
+/// router's own answers (an unrouted method's `405`) in one
+/// place, so an error builder added later cannot miss it.
 async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let system = matches!(req.uri().path(), "/health" | "/metrics");
     let mut response = next.run(req).await;
+    let error = response.status().is_client_error() || response.status().is_server_error();
     let headers = response.headers_mut();
     headers.insert(
         "x-content-type-options",
         axum::http::HeaderValue::from_static("nosniff"),
     );
-    if system {
+    let stored_nowhere = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| has_directive(v, "no-store"));
+    if system || (error && !stored_nowhere) {
         headers.insert(
             header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
         );
     }
     response
+}
+
+/// Whether a `Cache-Control` value carries `directive`
+/// (compared without case, ignoring any argument).
+fn has_directive(cache_control: &str, directive: &str) -> bool {
+    cache_control.split(',').any(|d| {
+        d.split('=')
+            .next()
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case(directive))
+    })
 }
 
 async fn health() -> &'static str {
@@ -635,6 +668,45 @@ fn tier_metrics(state: &AppState) -> String {
     out
 }
 
+/// The DPR hint headers [`dpr_hint`] reads, the
+/// structured one first.
+const DPR_HINT_HEADERS: [&str; 2] = ["Sec-CH-DPR", "DPR"];
+
+/// The width hint headers [`width_hint`] reads, in the
+/// order it prefers them.
+const WIDTH_HINT_HEADERS: [&str; 4] = [
+    "Sec-CH-Width",
+    "Width",
+    "Sec-CH-Viewport-Width",
+    "Viewport-Width",
+];
+
+/// The header [`save_data_hint`] reads.
+const SAVE_DATA_HEADER: &str = "Save-Data";
+
+/// The `Vary` of every image-route answer while the server
+/// reads client hints: `Accept` and every header the hint
+/// readers above read, since each can change the bytes.
+const VARY_WITH_HINTS: &str = "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data";
+
+/// The `Vary` of every image-route answer with client hints
+/// off (`CRABCROP_CLIENT_HINTS=0`): no hint header is read,
+/// so only `Accept` can change an answer.
+const VARY_WITHOUT_HINTS: &str = "Accept";
+
+/// The `Vary` an image-route answer carries, success or
+/// error: an error's body follows `Accept` (plain text or
+/// the JSON envelope) and can follow a hint (a hinted size
+/// that runs past a limit or the deadline), just as an
+/// image does.
+fn image_vary(client_hints: bool) -> axum::http::HeaderValue {
+    axum::http::HeaderValue::from_static(if client_hints {
+        VARY_WITH_HINTS
+    } else {
+        VARY_WITHOUT_HINTS
+    })
+}
+
 /// The `DPR` client hint, when it names one of the settled
 /// factors. Anything else (absent, unparsable, out of set) is
 /// no hint: hints are advisory, never an error. A factor
@@ -642,9 +714,10 @@ fn tier_metrics(state: &AppState) -> String {
 /// in the engine rather than failing the request (issue
 /// #529).
 fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
+    let [first, legacy] = DPR_HINT_HEADERS;
     let raw = headers
-        .get("Sec-CH-DPR")
-        .or_else(|| headers.get("DPR"))
+        .get(first)
+        .or_else(|| headers.get(legacy))
         .and_then(|v| v.to_str().ok())?;
     raw.trim()
         .parse::<f32>()
@@ -659,12 +732,7 @@ fn dpr_hint(headers: &HeaderMap) -> Option<f32> {
 /// unparsable, or out-of-range value is no hint, never an
 /// error.
 fn width_hint(headers: &HeaderMap) -> Option<u32> {
-    for name in [
-        "Sec-CH-Width",
-        "Width",
-        "Sec-CH-Viewport-Width",
-        "Viewport-Width",
-    ] {
+    for name in WIDTH_HINT_HEADERS {
         let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) else {
             continue;
         };
@@ -706,7 +774,7 @@ fn quantize_width(width: u32, step: u32) -> u32 {
 /// Whether the client sent `Save-Data: on`.
 fn save_data_hint(headers: &HeaderMap) -> bool {
     headers
-        .get("Save-Data")
+        .get(SAVE_DATA_HEADER)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("on"))
 }
@@ -1025,8 +1093,9 @@ async fn explain_handle(
         probe,
         // The DPR hint is read as the image path reads it, so
         // the forecast steps a hinted factor down as the image
-        // request does (issue #529).
-        dpr_hint: dpr_hint(&headers),
+        // request does (issue #529), and not at all with
+        // client hints off.
+        dpr_hint: dpr_hint(&headers).filter(|_| state.client_hints),
         source_bytes: fetched.total_bytes.map(|n| n as usize),
         ops,
         merged_ops: merged,
@@ -2270,18 +2339,15 @@ fn generate_request_id() -> String {
     hex::encode(&digest[..8])
 }
 
-fn request_id_from(inbound: Option<&str>) -> String {
-    if let Some(value) = inbound {
-        let value = value.trim();
-        if (1..=128).contains(&value.len())
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return value.to_string();
-        }
-    }
-    generate_request_id()
+/// The request ID a client chose with `X-Request-Id`, when
+/// it is 1 to 128 letters, digits, `-` or `_`.
+fn client_request_id(inbound: Option<&str>) -> Option<String> {
+    let value = inbound?.trim();
+    ((1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    .then(|| value.to_string())
 }
 
 async fn handle(
@@ -2303,14 +2369,19 @@ async fn handle(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let request_id = request_id_from(headers.get("x-request-id").and_then(|v| v.to_str().ok()));
+    let chosen_id = client_request_id(headers.get("x-request-id").and_then(|v| v.to_str().ok()));
+    let request_id = chosen_id.clone().unwrap_or_else(generate_request_id);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let dpr = dpr_hint(&headers);
-    let width = width_hint(&headers);
-    let save_data = save_data_hint(&headers);
+    // With client hints off, no hint header is read at all:
+    // every request for a URL gets the same bytes, the one
+    // answer a cache that keys on the URL alone can hold.
+    let hints = state.client_hints;
+    let dpr = dpr_hint(&headers).filter(|_| hints);
+    let width = width_hint(&headers).filter(|_| hints);
+    let save_data = hints && save_data_hint(&headers);
     let (mut response, mut record) = serve(
         &state,
         path,
@@ -2324,10 +2395,27 @@ async fn handle(
     record.request_id = request_id.clone();
     record.status = response.status().as_u16();
     record.total = started.elapsed();
-    response.headers_mut().insert(
-        axum::http::HeaderName::from_static("x-request-id"),
-        request_id.parse().unwrap(),
-    );
+    // Every answer on this route, errors and meta included,
+    // names the request headers it may depend on.
+    response
+        .headers_mut()
+        .insert(header::VARY, image_vary(state.client_hints));
+    // An answer a shared cache may store reaches every later
+    // viewer of the URL with the headers it was stored with,
+    // so it never carries an ID the client chose: that
+    // client already has it, and the log line records it.
+    // An ID the server generated is still sent.
+    let shared = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| has_directive(v, "public"));
+    if chosen_id.is_none() || !shared {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-request-id"),
+            request_id.parse().unwrap(),
+        );
+    }
     state.metrics.record(&record);
     println!("{}", record.to_json());
     response
@@ -2415,6 +2503,7 @@ async fn serve(
         Ok(admitted) => admitted,
         Err(refusal) => return (refusal.answer(sealed, accept), record),
     };
+    let hint_shaped = negotiated.hint_shaped();
     let cache_key = cache_key_for(
         &state.config_fingerprint,
         &resolved.ops,
@@ -2443,14 +2532,52 @@ async fn serve(
         placeholders: negotiated.placeholders,
         hinted_width: negotiated.hinted_width,
         dpr_hint,
-        save_data,
+        // The engine steps on the same decision the key and
+        // the private marking take, never on the raw header:
+        // a render the header stepped where the key does not
+        // separate it would be stored, and served publicly,
+        // as the URL's plain answer.
+        save_data: negotiated.save_data_applies,
         accept: accept.map(str::to_string),
         groups: resolved.groups,
         cache_key,
         max_age: resolved.max_age,
         sealed,
     };
-    run_flight(state, path, work, if_none_match, record).await
+    let (mut response, record) = run_flight(state, path, work, if_none_match, record).await;
+    if hint_shaped {
+        keep_from_shared_caches(&mut response);
+    }
+    (response, record)
+}
+
+/// Make a public answer private, keeping its lifetime: an
+/// answer a client hint gives its own cache entry (see
+/// [`Negotiated::hint_shaped`]).
+///
+/// The hint headers are request headers any client sets,
+/// and many shared caches (CDNs among them) key on the URL
+/// and not on `Vary`, so a hint-shaped answer stored there
+/// would be the answer every later viewer of the URL gets,
+/// whatever their own headers say. A private answer is
+/// still kept by the browser that asked, for its whole
+/// lifetime, and the URL's hint-free answer stays public:
+/// it is the answer a cache that keys on the URL alone
+/// should hold. Answers that are not public (meta, errors,
+/// the fallback, the debug view) are left as they are.
+fn keep_from_shared_caches(response: &mut Response) {
+    let Some(rest) = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("public"))
+    else {
+        return;
+    };
+    let private = format!("private{rest}");
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, private.parse().unwrap());
 }
 
 /// A remainder the request may run.
@@ -2669,11 +2796,32 @@ struct Negotiated {
     effective_dpr: f32,
     /// The quantized width a width hint resolves to.
     hinted_width: Option<u32>,
-    /// Whether `Save-Data` changes the bytes.
+    /// Whether `Save-Data` applies: the engine steps the
+    /// quality of a format that carries one, and the key
+    /// separates the entry.
     save_data_applies: bool,
     meta: bool,
     debug: bool,
     placeholders: bool,
+}
+
+impl Negotiated {
+    /// Whether a client hint gives the answer its own cache
+    /// entry: a width hint sizes it, a DPR hint (not the
+    /// URL's own `dpr`) scales it, or `Save-Data` applies.
+    /// This is exactly when [`cache_key_for`] gives the key
+    /// a hint's suffix, so the answer is set apart from the
+    /// URL's hint-free answer by the same rule its cache
+    /// entry is. It can still match that answer byte for
+    /// byte (a width hint at or past the source width, a DPR
+    /// hint on a URL that sizes nothing, `Save-Data` on PNG
+    /// output), and is set apart all the same: whether the
+    /// bytes differ is only known after the render.
+    fn hint_shaped(&self) -> bool {
+        self.hinted_width.is_some()
+            || self.save_data_applies
+            || (self.directives.dpr.is_none() && self.effective_dpr != 1.0)
+    }
 }
 
 /// The third stage of [`serve`]: settle the directives,
@@ -2710,9 +2858,13 @@ fn negotiate(
     } else {
         width_hint.map(|w| quantize_width(w, state.width_step))
     };
-    // Save-Data changes the bytes exactly when the engine
-    // steps (hint present, no quality directive in the URL);
-    // the key separates those entries under the same rule.
+    // Save-Data applies when the hint is present and the URL
+    // names no quality directive. This one decision drives
+    // the engine's step (`MissWork::save_data`), the key's
+    // separate entry, and the private marking, so the three
+    // cannot disagree: a per-format list that names no value
+    // for the output format still counts as a directive, and
+    // the engine does not step it either.
     let save_data_applies = save_data && !directives.quality_directive;
 
     let preferred = negotiate_format(accept);
@@ -2894,9 +3046,10 @@ async fn run_flight(
     // cache lifetime all come from it) and the same header
     // inputs as the miss path sees them: the negotiated
     // format, not the raw Accept (on this path errors are
-    // plain text whatever it says), and the quantized
-    // width, not the raw hint, so browsers that phrase the
-    // same request differently still share one flight. The
+    // plain text whatever it says), the quantized width,
+    // not the raw hint, and whether Save-Data applies, not
+    // the raw header, so browsers that phrase the same
+    // request differently still share one flight. The
     // conditional header is left out: each waiter applies
     // its own. A waiter that cannot take the response
     // (another spelling of the key, a body past the share
@@ -2923,7 +3076,13 @@ async fn run_flight(
             record.cache_hit = true;
             record.bytes_out = hit.bytes.len();
             let etag = hit.etag.clone();
-            let mut response = respond(hit.format, hit.quality, hit.bytes, max_age);
+            let mut response = respond(
+                hit.format,
+                hit.quality,
+                hit.bytes,
+                max_age,
+                state.client_hints,
+            );
             attach_cache_headers(&mut response, cache_status, &groups, sealed);
             finalize_validators(&mut response, &etag, if_none_match);
             return (response, record);
@@ -3512,6 +3671,10 @@ struct MissWork {
     placeholders: bool,
     hinted_width: Option<u32>,
     dpr_hint: Option<f32>,
+    /// Whether Save-Data steps this render's quality:
+    /// [`Negotiated::save_data_applies`], the rule the cache
+    /// key and the private marking follow, not the raw
+    /// header.
     save_data: bool,
     accept: Option<String>,
     groups: Vec<String>,
@@ -3765,6 +3928,7 @@ async fn serve_miss(
             processed.quality,
             bytes::Bytes::from(processed.bytes),
             max_age,
+            state.client_hints,
         )
     };
     if !meta {
@@ -4386,6 +4550,7 @@ fn respond(
     quality: Option<u8>,
     bytes: bytes::Bytes,
     max_age: Option<u32>,
+    client_hints: bool,
 ) -> Response {
     let content_type = match format {
         ImageFormat::Jpeg => "image/jpeg",
@@ -4408,21 +4573,18 @@ fn respond(
         axum::http::HeaderValue::from_static(content_type),
     );
     headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
-    // The format may have been negotiated from the request's Accept.
-    headers.insert(
-        header::VARY,
-        axum::http::HeaderValue::from_static(
-            "Accept, DPR, Sec-CH-DPR, Sec-CH-Width, Sec-CH-Viewport-Width, Width, Viewport-Width, Save-Data",
-        ),
-    );
-    // Advertise the client hints the server reads, so
-    // browsers send them on later requests; without the
-    // advertisement only proxies and clients that set the
-    // hints manually ever benefit from them.
-    headers.insert(
-        axum::http::HeaderName::from_static("accept-ch"),
-        axum::http::HeaderValue::from_static("Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width"),
-    );
+    // `Vary` is set by `handle`, on every answer of the
+    // image route alike. Advertise the client hints the
+    // server reads, so browsers send them on later requests;
+    // without the advertisement only proxies and clients
+    // that set the hints manually ever benefit from them.
+    // With hints off there is nothing to advertise.
+    if client_hints {
+        headers.insert(
+            axum::http::HeaderName::from_static("accept-ch"),
+            axum::http::HeaderValue::from_static("Sec-CH-Width, Sec-CH-DPR, Sec-CH-Viewport-Width"),
+        );
+    }
     if let Some(q) = quality {
         headers.insert(
             axum::http::HeaderName::from_static("x-crabcrop-quality"),
@@ -4601,7 +4763,10 @@ fn load_error_response(e: LoadError, accept: Option<&str>) -> Response {
 /// answers the uniform refusal instead: the image path's
 /// [`Refusal::answer`] skips this builder, and the miss
 /// path's [`sealed_or`] drops the answer its failure
-/// built.
+/// built. Every error answer leaves with `Cache-Control:
+/// no-store`, which the router's response-header layer
+/// adds on every route, and on the image route with the
+/// same `Vary` as an image ([`image_vary`]).
 fn error_response(
     status: StatusCode,
     code: &str,
