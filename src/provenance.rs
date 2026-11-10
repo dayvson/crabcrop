@@ -115,9 +115,18 @@ struct TimedSigner {
 }
 
 impl TimedSigner {
-    /// A context whose resolver is the timed agent.
+    /// A context whose resolver is the timed agent. Its
+    /// builder also ignores ingredient errors (issue
+    /// #580): a source whose embedded manifest store does
+    /// not parse then loads as an ingredient carrying a
+    /// `general.error` status with the cause, instead of
+    /// failing the whole signing pass, and the render with
+    /// it, over bytes that are the source's fault.
     fn context(&self) -> Context {
-        Context::new().with_resolver(self.agent.clone())
+        Context::new()
+            .with_resolver(self.agent.clone())
+            .with_settings_value("builder.ignore_ingredient_errors", true)
+            .expect("a constant settings key and value")
     }
 
     /// A fresh signing pass over this signer.
@@ -218,8 +227,11 @@ pub enum SignError {
     /// a timestamp. A dependency outage, so a retry may
     /// clear it. Carries the cause.
     Authority(String),
-    /// Any other failure: the manifest, the ingredient,
-    /// or the output bytes. Carries the cause.
+    /// Any other failure: the manifest definition or the
+    /// output bytes. A source whose embedded manifest
+    /// does not parse is not a failure (issue #580): it
+    /// signs, with the parse failure recorded as a
+    /// `general.error` status on its ingredient.
     Failed(String),
 }
 
@@ -274,11 +286,14 @@ pub struct ProvenanceFacts {
 }
 
 /// Read and validate the manifest store embedded in an
-/// asset. `None` when the asset carries no manifest (or no
-/// parseable one); a present-but-failing manifest reads
-/// back with state `invalid`, never as absent. `format` is
-/// a MIME type hint: the reader detects the container from
-/// the bytes first and uses the hint only as a fallback.
+/// asset. `None` when the asset carries no manifest; a
+/// present-but-failing manifest reads back with state
+/// `invalid`, never as absent: one that parses but does
+/// not validate, and one whose store does not parse at
+/// all (which reports zero manifests and ingredients,
+/// since none could be read). `format` is a MIME type
+/// hint: the reader detects the container from the bytes
+/// first and uses the hint only as a fallback.
 ///
 /// The reader checks signatures and hashes, not trust
 /// lists: its context loads no trust anchors (the SDK's
@@ -287,10 +302,61 @@ pub struct ProvenanceFacts {
 /// certificate.
 pub fn read_manifest(bytes: &[u8], format: &str) -> Option<ManifestSummary> {
     let mut cursor = Cursor::new(bytes);
+    match Reader::from_context(Context::new()).with_stream(format, &mut cursor) {
+        Ok(reader) => Some(summarize(&reader)),
+        Err(e) if is_no_manifest(&e) => None,
+        // Bytes no detector names as an asset at all (a
+        // text file, an empty body) have no store to
+        // misread: the reader's complaint there is about
+        // the container, not a manifest, whatever shape
+        // it takes. A recognized container whose store
+        // the reader could not parse is the invalid case
+        // below.
+        Err(_) if sniff_format(bytes) == "application/octet-stream" => None,
+        Err(_) => Some(ManifestSummary {
+            state: "invalid",
+            signer: None,
+            manifests: 0,
+            ingredients: 0,
+        }),
+    }
+}
+
+/// Whether a reader error means the asset carries no
+/// manifest store, as opposed to a store that is present
+/// but does not parse: the same line the SDK itself
+/// draws when it loads an ingredient (issue #580).
+fn is_no_manifest(error: &c2pa::Error) -> bool {
+    matches!(
+        error,
+        c2pa::Error::JumbfNotFound | c2pa::Error::ProvenanceMissing | c2pa::Error::UnsupportedType
+    ) || matches!(error, c2pa::Error::BadParam(desc) if desc == "unrecognized file type")
+}
+
+/// The cause a signed output's ingredient records for a
+/// source manifest store that did not parse, if it
+/// records one: the SDK turns the failure into a
+/// `general.error` status on the ingredient when the
+/// signing context ignores ingredient errors (issue
+/// #580). The words are the SDK's own for what it could
+/// not read.
+fn ingredient_error(bytes: &[u8], format: &str) -> Option<String> {
+    let mut cursor = Cursor::new(bytes);
     let reader = Reader::from_context(Context::new())
         .with_stream(format, &mut cursor)
         .ok()?;
-    Some(summarize(&reader))
+    let ingredient = reader.active_manifest()?.ingredients().first()?;
+    let codes = ingredient.validation_results()?.active_manifest()?;
+    codes
+        .failure()
+        .iter()
+        .find(|status| status.code() == "general.error")
+        .map(|status| {
+            status
+                .explanation()
+                .map(str::to_string)
+                .unwrap_or_else(|| status.code().to_string())
+        })
 }
 
 /// The summary of the store `reader` read.
@@ -672,7 +738,22 @@ impl ProvenanceSigner {
                     failed(e)
                 }
             })?;
-        Ok(dest.into_inner())
+        let signed = dest.into_inner();
+        // A source whose manifest store did not parse is
+        // signed anyway, its ingredient carrying the
+        // failure as a `general.error` status (issue
+        // #580): name it in one log line, so the operator
+        // can tell the chain broke in the source's bytes
+        // and not in this server's signing.
+        if request.ingredient.is_some()
+            && let Some(cause) = ingredient_error(&signed, mime)
+        {
+            eprintln!(
+                "provenance: the source's manifest did not parse ({cause}); \
+                 the signed output records it as an error status on the source ingredient"
+            );
+        }
+        Ok(signed)
     }
 }
 
@@ -850,6 +931,201 @@ mod tests {
         signed.push(0);
         let summary = read_manifest(&signed, "image/png").expect("the manifest still parses");
         assert_eq!(summary.state, "invalid");
+    }
+
+    /// CRC-32 (IEEE), for building PNG chunks in tests.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// The self-test PNG with a well-formed `caBX` chunk
+    /// whose content is not a JUMBF store: the chunk's
+    /// own CRC is honest, what it carries is not.
+    fn png_with_garbage_manifest() -> Vec<u8> {
+        let png = SELF_TEST_PNG;
+        // The first chunk (IHDR) starts after the 8-byte
+        // signature: length, type, data, CRC.
+        let ihdr_len = u32::from_be_bytes(png[8..12].try_into().unwrap()) as usize;
+        let ihdr_end = 8 + 12 + ihdr_len;
+        let payload = b"this is not a jumbf store";
+        let mut out = Vec::with_capacity(png.len() + payload.len() + 12);
+        out.extend_from_slice(&png[..ihdr_end]);
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(b"caBX");
+        out.extend_from_slice(payload);
+        let mut crc_input = b"caBX".to_vec();
+        crc_input.extend_from_slice(payload);
+        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        out.extend_from_slice(&png[ihdr_end..]);
+        out
+    }
+
+    /// A minimal JPEG whose APP11 segment carries the
+    /// CAI scaffolding (the `JP` signature, a sequence
+    /// number, the store length, a `jumb` superbox and
+    /// the `c2pa` description UUID) around a manifest box
+    /// whose content is not a manifest store: a store is
+    /// there, and it does not parse.
+    fn jpeg_with_garbage_manifest() -> Vec<u8> {
+        let mut jumbf = Vec::new();
+        // The description box: UUID (the manifest store
+        // UUID starts with "c2pa"), the label, one toggle
+        // byte.
+        let mut jumd = Vec::new();
+        jumd.extend_from_slice(b"c2pa");
+        jumd.extend_from_slice(&[0x00; 12]);
+        jumd.extend_from_slice(b"c2pa\0");
+        jumd.push(0x03);
+        // The manifest box: a header and junk content.
+        let mut store = Vec::new();
+        store.extend_from_slice(&12u32.to_be_bytes());
+        store.extend_from_slice(b"c2pa");
+        store.extend_from_slice(b"junk");
+        // The superbox wraps both.
+        jumbf.extend_from_slice(&((8 + 8 + jumd.len() + store.len()) as u32).to_be_bytes());
+        jumbf.extend_from_slice(b"jumb");
+        jumbf.extend_from_slice(&((8 + jumd.len()) as u32).to_be_bytes());
+        jumbf.extend_from_slice(b"jumd");
+        jumbf.extend_from_slice(&jumd);
+        jumbf.extend_from_slice(&store);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"JP");
+        payload.extend_from_slice(&1u16.to_be_bytes());
+        payload.extend_from_slice(&(jumbf.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&jumbf);
+        let mut out = vec![0xFF, 0xD8];
+        out.extend_from_slice(&[0xFF, 0xEB]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    /// An SVG whose `c2pa:manifest` element holds text
+    /// that is not base64 (issue #580, the #564 formats).
+    fn svg_with_garbage_manifest() -> Vec<u8> {
+        br#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:c2pa="http://c2pa.org/manifest" width="10" height="10"><metadata><c2pa:manifest>not-base64!!!</c2pa:manifest></metadata><rect width="10" height="10"/></svg>"#
+            .to_vec()
+    }
+
+    /// A TIFF whose C2PA tag (in its own IFD, as the
+    /// format requires) points at bytes that are not a
+    /// manifest store (issue #580, the #564 formats).
+    fn tiff_with_garbage_manifest() -> Vec<u8> {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        // IFD0: one width entry; the next IFD is at 26.
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&256u16.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&10u32.to_le_bytes());
+        tiff.extend_from_slice(&26u32.to_le_bytes());
+        // IFD1 at 26: only the C2PA tag (UNDEFINED type),
+        // its data at 44.
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0xcd41u16.to_le_bytes());
+        tiff.extend_from_slice(&7u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&44u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(b"garbage!");
+        tiff
+    }
+
+    #[test]
+    fn a_source_whose_manifest_does_not_parse_still_signs() {
+        // Issue #580: the source's store is present but
+        // broken. The sign succeeds, the output reads
+        // valid, and the ingredient carries the failure
+        // as a general.error status, instead of the whole
+        // render answering 500 over the source's bytes.
+        let signer = test_signer();
+        for (source, format) in [
+            (png_with_garbage_manifest(), "image/png"),
+            (jpeg_with_garbage_manifest(), "image/jpeg"),
+            (svg_with_garbage_manifest(), "image/svg+xml"),
+            (tiff_with_garbage_manifest(), "image/tiff"),
+        ] {
+            let signed = signer
+                .sign(
+                    SELF_TEST_PNG,
+                    "image/png",
+                    &SignRequest {
+                        ingredient: Some((&source, format)),
+                        ai_edited: false,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("a {format} source with a broken manifest signs: {e}"));
+            let summary =
+                read_manifest(&signed, "image/png").expect("the output carries a manifest");
+            assert_eq!(summary.state, "valid");
+            assert_eq!(summary.ingredients, 1);
+            assert!(
+                ingredient_error(&signed, "image/png").is_some(),
+                "the {format} ingredient records a general.error status"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_manifest_reads_invalid_not_absent() {
+        // Issue #580: a store that is present but does
+        // not parse reads invalid, with nothing read from
+        // it, not as no manifest at all.
+        let summary = read_manifest(&png_with_garbage_manifest(), "image/png")
+            .expect("a present store reads back");
+        assert_eq!(summary.state, "invalid");
+        assert_eq!(summary.signer, None);
+        assert_eq!(summary.manifests, 0);
+        assert_eq!(summary.ingredients, 0);
+        let summary = read_manifest(&jpeg_with_garbage_manifest(), "image/jpeg")
+            .expect("a present store reads back");
+        assert_eq!(summary.state, "invalid");
+        let summary = read_manifest(&svg_with_garbage_manifest(), "image/svg+xml")
+            .expect("a present store reads back");
+        assert_eq!(summary.state, "invalid");
+        let summary = read_manifest(&tiff_with_garbage_manifest(), "image/tiff")
+            .expect("a present store reads back");
+        assert_eq!(summary.state, "invalid");
+    }
+
+    #[test]
+    fn a_tampered_source_still_signs_and_keeps_its_ingredient() {
+        // The control for issue #580: a manifest that
+        // parses but fails validation was never the
+        // failure, and still is not.
+        let signer = test_signer();
+        let mut parent = signer
+            .sign(SELF_TEST_PNG, "image/png", &plain())
+            .expect("parent signs");
+        parent.push(0);
+        let child = signer
+            .sign(
+                SELF_TEST_PNG,
+                "image/png",
+                &SignRequest {
+                    ingredient: Some((&parent, "image/png")),
+                    ai_edited: false,
+                },
+            )
+            .expect("child signs");
+        let summary = read_manifest(&child, "image/png").expect("the child carries a manifest");
+        assert_eq!(summary.state, "valid");
+        assert_eq!(summary.ingredients, 1);
     }
 
     #[test]

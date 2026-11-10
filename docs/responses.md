@@ -70,7 +70,7 @@ Operational failures carry these codes:
 | `source_too_large` | `502` | The source is larger than the fetch limit. |
 | `source_timeout` | `504` | The source fetch timed out. |
 | `decode_failed` | `502` | The fetched bytes could not be decoded as an image, including an SVG whose render worker crashed or ran out of memory, and an AVIF whose container the screen refused or whose decode worker failed. |
-| `encode_failed` | `500` | Encoding the output failed. |
+| `encode_failed` | `500` | Encoding the output failed, including a signing failure that is the server's own (a broken output, a bad identity). A source whose embedded C2PA manifest does not parse is not this: the render succeeds and signs, with the parse failure recorded on the source ingredient. |
 | `unsupported_operation` | `400` | The operation is not supported for this source or output. Also a request over the 100-operation cap, counted after presets expand and with the default operations merged in (see [the URL grammar](url-grammar.md#how-requests-work)); that one answers before any source fetch, with the body `request has <n> operations, over the 100 operation limit`. So does a request whose preset references would expand past 256 KiB of text, with the body `request expands to <n> bytes, over the 262144 byte limit`. |
 | `not_configured` | `501` | The operation needs a model or resource this server was not configured with. |
 | `inference_bad_output` | `502` | A model ran but produced output the server cannot use. |
@@ -82,7 +82,7 @@ Operational failures carry these codes:
 | `processing_timeout` | `504` | Processing ran past the process deadline. An SVG still rendering, or an AVIF still decoding, is killed with its worker process. |
 | `processing_failed` | `500` | The processing job itself failed. |
 | `server_busy` | `503` | A processing, slow-lane, AI, video, or animation gate, or the source buffer budget (`CRABCROP_SOURCE_BUFFER_MAX_MB`), waited past its timeout; the response carries `Retry-After`. |
-| `provenance_unavailable` | `503` | Signing the output failed because the C2PA timestamp authority (`CRABCROP_C2PA_TSA_URL`) did not answer within its bounds, refused the connection, or answered with something that is not a timestamp. The response carries `Retry-After: 30`. Any other signing failure is `encode_failed`. |
+| `provenance_unavailable` | `503` | Signing the output failed because the C2PA timestamp authority (`CRABCROP_C2PA_TSA_URL`) did not answer within its bounds, refused the connection, or answered with something that is not a timestamp. The response carries `Retry-After: 30`. Any other signing failure that is the server's own is `encode_failed`; a source whose embedded manifest does not parse still signs, with the failure recorded on its ingredient. |
 | `invalid_purge_group` | `400` | A purge-group name is empty or contains a slash. |
 | `uploads_not_configured` | `404` | A `PUT` to `/upload/...` on a server with no upload destination configured, whatever its signature. |
 | `invalid_upload_name` | `400` | The upload name is not valid. |

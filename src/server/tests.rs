@@ -9855,6 +9855,78 @@ async fn signing_server_signs_image_responses() {
     assert!(meta["provenance"]["source"].is_null());
 }
 
+/// The test PNG with a well-formed `caBX` chunk whose
+/// content is not a JUMBF store (issue #580): the chunk's
+/// own CRC is honest, what it carries is not.
+fn png_with_garbage_manifest() -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    let png = test_png();
+    let ihdr_len = u32::from_be_bytes(png[8..12].try_into().unwrap()) as usize;
+    let ihdr_end = 8 + 12 + ihdr_len;
+    let payload = b"this is not a jumbf store";
+    let mut out = Vec::with_capacity(png.len() + payload.len() + 12);
+    out.extend_from_slice(&png[..ihdr_end]);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(b"caBX");
+    out.extend_from_slice(payload);
+    let mut crc_input = b"caBX".to_vec();
+    crc_input.extend_from_slice(payload);
+    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    out.extend_from_slice(&png[ihdr_end..]);
+    out
+}
+
+#[tokio::test]
+async fn signing_server_signs_a_source_whose_manifest_does_not_parse() {
+    // Issue #580: the source's embedded manifest store
+    // is broken, and only the signing step reads it. The
+    // image itself is fine, so with signing on it now
+    // answers 200 with a signed image whose ingredient
+    // records the broken store, where it answered 500
+    // encode_failed.
+    let base = spawn_app_with_signer().await;
+    let src = spawn_bytes_server(png_with_garbage_manifest()).await;
+    let remainder = format!("40x24/{src}");
+    let url_path = format!("/{}/{remainder}", sign(&remainder));
+    let resp = client()
+        .get(format!("{base}{url_path}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.bytes().await.unwrap().to_vec();
+    let summary = crate::provenance::read_manifest(&bytes, "image/png")
+        .expect("the response carries a manifest");
+    assert_eq!(summary.state, "valid");
+    assert_eq!(summary.ingredients, 1);
+    // Meta agrees about the output, and names the
+    // source's store as present but unreadable: invalid,
+    // not null.
+    let resp = client()
+        .get(format!("{base}{url_path}"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let meta: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(meta["provenance"]["output"]["ingredients"], 1);
+    assert_eq!(meta["provenance"]["source"]["state"], "invalid");
+}
+
 /// The orientation HEIC fixture with its major brand
 /// rewritten to `mif1`, a generic HEIF brand the engine
 /// decodes as HEIC like `heic` (issue #564). Its
