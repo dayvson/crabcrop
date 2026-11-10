@@ -689,13 +689,15 @@ pub(in crate::server) async fn run_process(
 /// a signer is configured, sign the output. Byte
 /// preservation of a source manifest is impossible (the
 /// pipeline drops the segments it lives in), so the
-/// source's manifest rides into the output's manifest
-/// store as a parent ingredient instead, keeping the
-/// provenance chain intact. Signing covers still JPEG,
-/// PNG, WebP, and AVIF outputs; GIF, JPEG XL, video, and
-/// animated WebP outputs are served unsigned. A signing
-/// failure fails the request: serving unmarked output
-/// from a server configured to mark would be a silent
+/// output's manifest names the source as its parent
+/// ingredient instead, with the status the source's own
+/// manifest validated to, and none of the source's store,
+/// under either metadata policy (see
+/// `provenance::ProvenanceSigner::sign`). Signing covers
+/// still JPEG, PNG, WebP, and AVIF outputs; GIF, JPEG XL,
+/// video, and animated WebP outputs are served unsigned.
+/// A signing failure fails the request: serving unmarked
+/// output from a server configured to mark would be a silent
 /// policy break. A failed timestamp authority gets its own
 /// error, so the client hears an outage worth retrying
 /// rather than a broken encoder (issue #467).
@@ -723,15 +725,16 @@ pub(in crate::server) fn apply_provenance(
         let animated_webp = processed.format == ImageFormat::WebP
             && crate::provenance::webp_is_animated(&processed.bytes);
         if let (Some(mime), false) = (mime, animated_webp) {
-            // The source asset rides as a parent
-            // ingredient whenever it is an image (any
-            // format the engine's sniff names, which is the
-            // sniff it decodes by), manifest or not: the
-            // ingredient names its format, and carries its
-            // manifest store when it has one. Video and PDF
-            // sources are the only others: the output is a
-            // frame or page rendered from them, and starts
-            // a fresh chain (see provenance::sign).
+            // The source asset is the parent ingredient
+            // whenever it is an image (any format the
+            // engine's sniff names, which is the sniff it
+            // decodes by), manifest or not: the ingredient
+            // names its format, and records how its
+            // manifest store validated when it has one.
+            // Video and PDF sources are the only others:
+            // the output is a frame or page rendered from
+            // them, and starts a fresh chain (see
+            // provenance::sign).
             let ingredient =
                 crate::provenance::is_image(source_format).then_some((source_bytes, source_format));
             let request = crate::provenance::SignRequest {

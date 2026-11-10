@@ -9637,7 +9637,7 @@ fn provenance_step_signs_a_still_and_records_the_facts() {
 }
 
 #[test]
-fn provenance_step_carries_a_signed_source_chain() {
+fn provenance_step_names_a_signed_source_without_its_store() {
     let signer = crate::provenance::test_signer();
     let parent = signer
         .sign(
@@ -9657,7 +9657,10 @@ fn provenance_step_carries_a_signed_source_chain() {
     assert_eq!(source.state, "valid");
     let output = facts.output.expect("the output is signed");
     assert_eq!(output.state, "valid");
-    assert_eq!(output.manifests, 2, "the parent store rides along");
+    assert_eq!(
+        output.manifests, 1,
+        "the parent's store does not ride along"
+    );
     assert_eq!(output.ingredients, 1);
 }
 
@@ -9729,6 +9732,16 @@ async fn spawn_app_with_signer() -> String {
 async fn spawn_app_with_provenance_signer(
     signer: Arc<crate::provenance::ProvenanceSigner>,
 ) -> String {
+    spawn_signing_app(signer, false).await
+}
+
+/// An app that signs its outputs with `signer`, under the
+/// given metadata policy (`CRABCROP_METADATA=preserve` when
+/// `preserve_metadata`).
+async fn spawn_signing_app(
+    signer: Arc<crate::provenance::ProvenanceSigner>,
+    preserve_metadata: bool,
+) -> String {
     let state = AppState {
         keyring: crate::url::Keyring::single(SECRET.to_vec()),
         allow_unsafe: false,
@@ -9764,7 +9777,7 @@ async fn spawn_app_with_provenance_signer(
         avif_speed: crate::engine::DEFAULT_AVIF_SPEED,
         jxl_speed: crate::engine::DEFAULT_JXL_SPEED,
         width_step: 100,
-        preserve_metadata: false,
+        preserve_metadata,
         brand_color: None,
         presets: std::collections::HashMap::new(),
         only_presets: false,
@@ -9789,6 +9802,68 @@ async fn spawn_app_with_provenance_signer(
         axum::serve(listener, app(state)).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_signed_crop_or_redaction_carries_nothing_of_its_source() {
+    // The source is shaped like a camera export: a manifest
+    // store whose claim thumbnail is the whole frame, with
+    // EXIF location, a body serial and an author, plus an
+    // XMP instance ID. A crop keeps only the right half; a
+    // pixelated region covers the left. Under either
+    // metadata policy the signed output names its parent and
+    // carries nothing of the store: no thumbnail, no
+    // assertion, no title, and its size does not follow the
+    // store. The XMP instance ID is the one fact `preserve`
+    // keeps, in the XMP packet that policy copies.
+    let source = crate::provenance::test_source_with_credentials(256 * 1024);
+    let src = spawn_bytes_server(source).await;
+    for preserve in [false, true] {
+        let base = spawn_signing_app(crate::provenance::test_signer(), preserve).await;
+        for (ops, mime) in [
+            ("crop-rect:100x0:200x150", "image/jpeg"),
+            ("filters:pixelate_region(0,0,100,150)", "image/jpeg"),
+            ("crop-rect:100x0:200x150/filters:format(png)", "image/png"),
+        ] {
+            let remainder = format!("{ops}/{src}");
+            let url_path = format!("/{}/{remainder}", sign(&remainder));
+            let resp = client()
+                .get(format!("{base}{url_path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{ops}");
+            let bytes = resp.bytes().await.unwrap().to_vec();
+            for fact in crate::provenance::TEST_SOURCE_FACTS {
+                if preserve && fact.starts_with("xmp.iid:") {
+                    continue;
+                }
+                assert!(
+                    !bytes.windows(fact.len()).any(|w| w == fact.as_bytes()),
+                    "{ops} preserve={preserve} carries {fact}"
+                );
+            }
+            let jpeg_starts = bytes
+                .windows(3)
+                .filter(|w| *w == [0xFF, 0xD8, 0xFF])
+                .count();
+            let own = usize::from(mime == "image/jpeg");
+            assert_eq!(
+                jpeg_starts, own,
+                "{ops} preserve={preserve}: no embedded picture"
+            );
+            assert!(
+                bytes.len() < 64 * 1024,
+                "{ops} preserve={preserve}: a {}-byte output",
+                bytes.len()
+            );
+            let summary = crate::provenance::read_manifest(&bytes, mime)
+                .expect("the response carries a manifest");
+            assert_eq!(summary.state, "valid", "{ops} preserve={preserve}");
+            assert_eq!(summary.manifests, 1, "{ops} preserve={preserve}");
+            assert_eq!(summary.ingredients, 1, "{ops} preserve={preserve}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -9930,11 +10005,16 @@ fn signed_source(source: &[u8], format: &str) -> Vec<u8> {
 
 /// The output half of the provenance a signing server's
 /// meta document reports for `source` rendered to PNG, a
-/// signed format whatever the source's own is. The image
-/// response for the same URL is read back too: its active
-/// manifest must name one ingredient, the parent, in
+/// signed format whatever the source's own is, and the
+/// parent ingredient the image response's manifest names.
+/// The image response for the same URL is read back: its
+/// active manifest must name one ingredient, the parent, in
 /// `format`, the source's media type.
-async fn signed_png_provenance(name: &str, source: Vec<u8>, format: &str) -> serde_json::Value {
+async fn signed_png_provenance(
+    name: &str,
+    source: Vec<u8>,
+    format: &str,
+) -> (serde_json::Value, serde_json::Value) {
     let base = spawn_app_with_signer().await;
     let src = spawn_bytes_server(source).await;
     let remainder = format!("40x24/filters:format(png)/{src}");
@@ -9966,7 +10046,19 @@ async fn signed_png_provenance(name: &str, source: Vec<u8>, format: &str) -> ser
     );
     assert_eq!(ingredients[0]["relationship"], "parentOf", "{name}");
     assert_eq!(ingredients[0]["format"], format, "{name}");
-    output
+    (output, ingredients[0].clone())
+}
+
+/// Whether a parent ingredient records that the source's
+/// own manifest store was found and its signature checked.
+fn parent_store_was_read(parent: &serde_json::Value) -> bool {
+    parent["validation_results"]["activeManifest"]["success"]
+        .as_array()
+        .is_some_and(|codes| {
+            codes
+                .iter()
+                .any(|status| status["code"] == "claimSignature.validated")
+        })
 }
 
 #[tokio::test]
@@ -9976,7 +10068,7 @@ async fn a_mif1_heic_source_is_the_signed_outputs_parent_ingredient() {
     // only `heic` and `heix` and took a `mif1` file for a
     // video, so its output was signed as a fresh image
     // with no parent.
-    let output = signed_png_provenance("mif1 heic", mif1_heic(), "image/heic").await;
+    let (output, _) = signed_png_provenance("mif1 heic", mif1_heic(), "image/heic").await;
     assert_eq!(output["ingredients"], 1, "{output}");
 }
 
@@ -9985,29 +10077,36 @@ async fn a_container_jxl_source_is_the_signed_outputs_parent_ingredient() {
     // Issue #564: the provenance sniff checked a misspelled
     // container signature, so a JPEG XL in its box
     // container had no parent ingredient.
-    let output = signed_png_provenance("container jxl", container_jxl(), "image/jxl").await;
+    let (output, _) = signed_png_provenance("container jxl", container_jxl(), "image/jxl").await;
     assert_eq!(output["ingredients"], 1, "{output}");
 }
 
 #[tokio::test]
-async fn a_signed_container_jxl_sources_store_rides_into_the_output() {
+async fn a_signed_container_jxl_sources_store_is_read_for_the_output() {
     // The container is the JPEG XL form that carries a
     // manifest, and it was the one whose store was dropped
-    // (issue #564): now the source's own manifest rides
-    // into the output's store.
+    // (issue #564): now the source's own manifest is read,
+    // and the output's parent ingredient records how it
+    // validated. The store itself stays out of the output
+    // (issue #610).
     let source = signed_source(&container_jxl(), "image/jxl");
-    let output = signed_png_provenance("signed container jxl", source, "image/jxl").await;
-    assert_eq!(output["manifests"], 2, "the source's store rides: {output}");
+    let (output, parent) = signed_png_provenance("signed container jxl", source, "image/jxl").await;
+    assert_eq!(
+        output["manifests"], 1,
+        "the source's store stays out: {output}"
+    );
     assert_eq!(output["ingredients"], 1, "{output}");
+    assert!(parent_store_was_read(&parent), "{parent}");
 }
 
 #[tokio::test]
-async fn a_signed_svg_or_tiff_sources_store_rides_into_the_output() {
+async fn a_signed_svg_or_tiff_sources_store_is_read_for_the_output() {
     // The SDK reads a manifest from an SVG and from a TIFF,
     // but both were signed with no parent (issue #564), so
     // the store a signed one carried was dropped. Now each
-    // is the parent ingredient, and its store rides into
-    // the output's.
+    // is the parent ingredient, and the output records how
+    // its store validated, without carrying the store
+    // (issue #610).
     for (name, source, format) in [
         ("signed svg", SVG_SOURCE.to_vec(), "image/svg+xml"),
         (
@@ -10017,12 +10116,13 @@ async fn a_signed_svg_or_tiff_sources_store_rides_into_the_output() {
         ),
     ] {
         let source = signed_source(&source, format);
-        let output = signed_png_provenance(name, source, format).await;
+        let (output, parent) = signed_png_provenance(name, source, format).await;
         assert_eq!(
-            output["manifests"], 2,
-            "{name}: the source's store rides: {output}"
+            output["manifests"], 1,
+            "{name}: the source's store stays out: {output}"
         );
         assert_eq!(output["ingredients"], 1, "{name}: {output}");
+        assert!(parent_store_was_read(&parent), "{name}: {parent}");
     }
 }
 
@@ -10054,7 +10154,7 @@ async fn every_image_source_is_the_signed_outputs_parent_ingredient() {
         ),
         ("bare jxl", bare_jxl(), "image/jxl"),
     ] {
-        let output = signed_png_provenance(name, source, format).await;
+        let (output, _) = signed_png_provenance(name, source, format).await;
         assert_eq!(output["ingredients"], 1, "{name}: {output}");
     }
 }

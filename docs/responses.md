@@ -32,6 +32,8 @@ Metadata follows an operator policy, `CRABCROP_METADATA`:
 | `strip` (default) | Outputs carry no source metadata. |
 | `preserve` | JPEG outputs gain the source's EXIF, XMP, and Photoshop (IPTC) segments; PNG outputs gain EXIF and XMP (the XMP packet compressed if the source stored it compressed, plain text otherwise). Other output formats do not carry preserved metadata. |
 
+Neither policy copies a source's C2PA manifest store into an output. With output signing configured, the output's own manifest names the source as its parent ingredient and records how the source's manifest validated, and nothing else from it: see [Provenance (C2PA)](meta.md#provenance-c2pa).
+
 Preservation copies the source segments rather than re-serializing them, with one patch: the EXIF orientation is rewritten to 1, because the pixels were already rotated at decode and the original value would double-rotate in viewers. EXIF orientation itself is always honored at decode, under either policy.
 
 Reading a source's profile and metadata is bounded, because PNG stores the profile, and can store the XMP packet, compressed. Only the first profile (`iCCP`), EXIF (`eXIf`), and XMP packet of a PNG are read; repeats are skipped unread (libpng likewise honors only the first profile). A profile that inflates past 4 MiB, or an XMP packet past 256 KiB, is dropped rather than truncated, and all of one source's metadata inflates within a single 4.25 MiB budget. Under `strip`, the EXIF, XMP, and Photoshop segments of JPEG and PNG sources are not extracted at all (the EXIF orientation is still read and honored at decode); the profile always is, since it drives the color conversion.
