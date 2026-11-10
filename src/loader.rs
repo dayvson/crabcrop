@@ -1515,6 +1515,17 @@ impl Loader {
             // exists on disk.
             return Err(LoadError::NotFound);
         }
+        // A trailing slash asks for a directory. Linux refuses
+        // to resolve a regular file named that way, but macOS
+        // resolves it to the file, so the rule is applied here
+        // and every platform answers the same.
+        if relative.ends_with('/')
+            && !tokio::fs::metadata(&canonical)
+                .await
+                .is_ok_and(|meta| meta.is_dir())
+        {
+            return Err(LoadError::NotFound);
+        }
         let mut file = tokio::fs::File::open(&canonical)
             .await
             .map_err(map_file_error)?;
