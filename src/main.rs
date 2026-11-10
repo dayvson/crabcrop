@@ -152,9 +152,10 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     println!("crabcrop listening on port {port}");
     // Shutdown (issue #463): at SIGTERM or Ctrl-C the
     // listener closes, idle connections close, and requests
-    // in flight finish; then the background writes they and
-    // earlier requests left (shared-tier write-throughs,
-    // purges whose caller left) finish. One deadline, the
+    // in flight finish; then the background work they and
+    // earlier requests left (renders whose client left
+    // after they started, shared-tier write-throughs,
+    // purges whose caller left) finishes. One deadline, the
     // grace from the signal on, bounds both waits, and the
     // process exits at it with whatever is still running.
     // A second signal ends the drain at once.
@@ -173,7 +174,7 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + shutdown_grace;
     let signalled_again = shutdown_signal();
     println!(
-        "shutdown: draining requests and background writes for up to {}s",
+        "shutdown: draining requests and background work for up to {}s",
         shutdown_grace.as_secs()
     );
     let drain = async {
@@ -196,6 +197,14 @@ async fn run() -> Result<std::time::Instant, Box<dyn std::error::Error>> {
         eprintln!(
             "shutdown: {} background writes still running {when} are dropped",
             left.writes
+        );
+    }
+    if left.renders > 0 {
+        // A render whose client had gone, cut off before it
+        // was stored: the next request for it renders it.
+        eprintln!(
+            "shutdown: {} renders whose client left, still running {when}, are dropped unstored",
+            left.renders
         );
     }
     if left.walks > 0 {
